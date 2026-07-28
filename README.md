@@ -94,19 +94,36 @@ restart. Pass `fresh: true` when earlier findings would only mislead.
 
 ## What the reviewer can and cannot do
 
-The reviewer gets **read-only access** to the repository. It reads files and runs
-read-only shell commands (`git diff`, `git log`, `git show`, ripgrep), so you never need
-to paste code into the request.
+The reviewer gets **read-only access** to the repository, so you never need to paste code
+into the request. How that is enforced differs by reviewer, and the difference is worth
+understanding:
 
-It cannot write. This is enforced, not requested:
+- **Codex reviewer** — `--sandbox read-only`. Enforced by the OS, so it holds regardless
+  of what the model tries to run. The Codex reviewer keeps shell access.
+- **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
+  the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
+  Code's own tools and have no write or execute capability.
 
-- **Claude reviewer** — `--tools Read,Grep,Glob,Bash` removes the write tools from the
-  session entirely, and `--permission-mode dontAsk` denies any shell command outside the
-  read-only allow-list. Verified: the reviewer's `echo pwned > EVIL.txt` was blocked, no
-  file was created, and the run continued rather than hanging. Blocked commands are
-  reported back to you, so a review thinned by missing evidence is visible rather than
-  silent.
-- **Codex reviewer** — `--sandbox read-only`.
+The Claude reviewer has no shell by default, and that is a deliberate reversal. Claude's
+permission patterns match by **command prefix**, so `Bash(git diff:*)` permits *any*
+arguments to `git diff` — including `--output=<file>`, which writes. This was verified,
+not theorised: with that pattern allow-listed, the reviewer ran
+`git diff --output=PWNED_DIFF.txt HEAD~1 HEAD` and created a 354-byte file. `git log`,
+`git show` and `git blame` accept `--output` too, and the problem is not specific to git —
+read-oriented tools routinely have flags that write files or execute programs (ripgrep's
+`--pre` runs an external command). Shell redirection *is* caught by the permission parser
+(`git status --short > REDIR.txt` was denied), but that closes only the obvious hole.
+
+A prefix allow-list therefore cannot express "read-only", so the default grants no shell
+at all. If you want the Claude reviewer to run commands, opt in explicitly and understand
+that it is a soft boundary rather than a guarantee:
+
+```
+--tools "Read,Grep,Glob,Bash" --allow-tools "Read Grep Glob Bash(git diff:*)"
+```
+
+Any commands the reviewer attempted but was not permitted to run are reported back with
+the review, so an analysis thinned by missing evidence is visible rather than silent.
 
 By default the reviewer also loads **no MCP servers**. This matters because `codex exec`
 does start configured MCP servers (verified with a marker server that left a file behind),
@@ -177,7 +194,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 66 unit tests: no network, no model calls
+cargo test          # 77 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
@@ -198,5 +215,13 @@ Both directions pass against live CLIs.
 - **Prompts go over stdin**, not the command line, so a large review request cannot hit
   the Windows command-line length limit or a quoting bug.
 - **Sessions on disk, in-flight reviews in memory.** Review ids are per-process;
-  the session mapping outlives the process.
+  the session mapping outlives the process. Because two servers can share a project's
+  state directory, mutations take a cross-process lock file and every write goes to a
+  pid-unique temp file before an atomic replace. A session that cannot be persisted is
+  reported as a warning with the review, since the response otherwise promises a resume
+  that would not work.
+- **Timeout and cancel kill the process tree**, not just the direct child. On Windows a
+  killed parent orphans its descendants, and an orphan holding an inherited pipe would
+  keep our reader threads blocked forever. Output collection is bounded too, so a stuck
+  pipe degrades diagnostics instead of hanging the review.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

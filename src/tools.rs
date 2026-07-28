@@ -80,10 +80,6 @@ impl App {
 
         let ready = self.ensure_ready()?;
 
-        if let Some(existing) = self.registry.running_for_session(&session) {
-            return Err(errors::session_busy(&session, &existing));
-        }
-
         // Decide whether this is a new review or another turn on an existing one.
         let prior = if fresh {
             None
@@ -106,10 +102,12 @@ impl App {
             None => (None, 1, false),
         };
 
-        let id = self.registry.next_id();
-        let cancel = self
+        // Claiming the session and registering the review are one atomic step, so two
+        // concurrent calls cannot both start a review against the same conversation.
+        let (id, cancel) = self
             .registry
-            .start(id.clone(), session.clone(), turn, resumed);
+            .try_start(&session, turn, resumed)
+            .map_err(|existing| errors::session_busy(&session, &existing))?;
 
         let job = Job {
             cfg: Arc::clone(&self.cfg),
@@ -132,15 +130,11 @@ impl App {
         if let Err(e) = spawned {
             self.registry.finish(
                 &id,
-                Outcome {
-                    review: None,
-                    failure: Some(errors::spawn_failed(
-                        self.cfg.reviewer.as_str(),
-                        "worker thread",
-                        e.to_string(),
-                    )),
-                    denials: Vec::new(),
-                },
+                Outcome::failed(errors::spawn_failed(
+                    self.cfg.reviewer.as_str(),
+                    "worker thread",
+                    e.to_string(),
+                )),
             );
         }
 
@@ -259,6 +253,10 @@ impl App {
             self.cfg.describe_reviewer(),
             snapshot.elapsed.as_secs(),
         ));
+
+        for warning in &snapshot.warnings {
+            out.push_str(&format!("WARNING: {warning}\n\n"));
+        }
 
         if !snapshot.denials.is_empty() {
             out.push_str(&format!(
@@ -418,18 +416,10 @@ impl Job {
                             }
                             outcome
                         }
-                        Err(failure) => Outcome {
-                            review: None,
-                            failure: Some(failure),
-                            denials: Vec::new(),
-                        },
+                        Err(failure) => Outcome::failed(failure),
                     }
                 } else {
-                    Outcome {
-                        review: None,
-                        failure: Some(failure),
-                        denials: Vec::new(),
-                    }
+                    Outcome::failed(failure)
                 }
             }
         };
@@ -494,6 +484,9 @@ impl Job {
 
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
+        // A warning rather than stderr-only: the completed response tells the caller it
+        // can resume this session, so if it cannot, the caller has to hear about it.
+        let mut warnings = Vec::new();
         match &parsed.session_id {
             Some(session_id) => {
                 if let Err(e) = self.sessions.record_turn(
@@ -507,19 +500,34 @@ impl Job {
                     // The review itself succeeded; losing resumability is worth a
                     // warning but not worth discarding the review.
                     eprintln!("cross-review: warning: could not save session state: {e}");
+                    warnings.push(format!(
+                        "This review could not be saved, so session '{}' cannot be resumed: {e}. \
+                         The review below is still valid, but a follow-up call with this session \
+                         name will start a new review with no memory of it.",
+                        self.session
+                    ));
                 }
             }
-            None => eprintln!(
-                "cross-review: warning: the reviewer did not report a session id, so review \
-                 session '{}' cannot be resumed",
-                self.session
-            ),
+            None => {
+                eprintln!(
+                    "cross-review: warning: the reviewer did not report a session id, so review \
+                     session '{}' cannot be resumed",
+                    self.session
+                );
+                warnings.push(format!(
+                    "The reviewer did not report a session id, so session '{}' cannot be resumed. \
+                     The review below is still valid, but a follow-up call with this session name \
+                     will start a new review with no memory of it.",
+                    self.session
+                ));
+            }
         }
 
         Ok(Outcome {
             review: Some(parsed.text),
             failure: None,
             denials: parsed.denials,
+            warnings,
         })
     }
 }

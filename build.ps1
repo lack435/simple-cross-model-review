@@ -53,7 +53,28 @@ if (-not (Test-Path $built)) { throw "expected binary not found at $built" }
 $distDir = Join-Path $PSScriptRoot 'dist'
 if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
 $dist = Join-Path $distDir 'cross-review.exe'
-Copy-Item $built $dist -Force
+Copy-Item $built $dist -Force -ErrorAction SilentlyContinue
+
+# Verify the copy landed rather than trusting it. Windows locks a running executable, so
+# if an agent session currently has this MCP server open the copy fails -- and because
+# $ErrorActionPreference is 'Continue' here (see above), that failure would otherwise be
+# silent and ship a stale binary.
+$builtHash = (Get-FileHash $built -Algorithm SHA256).Hash
+$distHash = if (Test-Path $dist) { (Get-FileHash $dist -Algorithm SHA256).Hash } else { '' }
+if ($builtHash -ne $distHash) {
+    Write-Host ''
+    Write-Host "Could not stage $dist" -ForegroundColor Red
+    $holders = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $dist } |
+        ForEach-Object { "PID $($_.Id) (started $($_.StartTime))" }
+    if ($holders) {
+        Write-Host "It is locked by a running process:" -ForegroundColor Yellow
+        $holders | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        Write-Host "That is this MCP server. Disconnect it in your agent session (or stop the" -ForegroundColor Yellow
+        Write-Host "process) and run this script again." -ForegroundColor Yellow
+    }
+    throw "dist\cross-review.exe does not match the build output"
+}
 
 $size = [math]::Round((Get-Item $dist).Length / 1KB)
 Write-Host ''

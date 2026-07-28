@@ -67,20 +67,29 @@ impl ReviewerKind {
     }
 }
 
-/// Read-only shell commands the Claude reviewer is pre-approved to run.
-/// Anything outside this list is denied by the permission system rather than
-/// prompting (verified: a `echo pwned > EVIL.txt` attempt was blocked and the
-/// run continued), which is what gives us "read-only plus shell reads".
-pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = concat!(
-    "Read Grep Glob ",
-    "Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git status:*) ",
-    "Bash(git ls-files:*) Bash(git rev-parse:*) Bash(git blame:*) Bash(git branch:*) ",
-    "Bash(rg:*) Bash(findstr:*) Bash(dir:*) Bash(where:*) Bash(type:*)"
-);
+/// Tools the Claude reviewer is pre-approved to use.
+///
+/// Bash is deliberately absent. Claude's permission patterns match by command prefix,
+/// and `Bash(git diff:*)` therefore permits *any* arguments to `git diff` -- including
+/// `--output=<file>`, which writes. That was verified, not theorised: with
+/// `Bash(git diff:*)` allow-listed, the reviewer ran
+/// `git diff --output=PWNED_DIFF.txt HEAD~1 HEAD` and created a 354-byte file.
+/// `git log`, `git show` and `git blame` accept `--output` too.
+///
+/// The problem generalises past git: read-oriented tools routinely have flags that
+/// write files or execute programs (ripgrep's `--pre` runs an external command), so a
+/// prefix allow-list cannot express "read-only". Shell redirection *is* caught by the
+/// permission parser -- `git status --short > REDIR.txt` was denied -- but that only
+/// closes the obvious hole, not this one.
+///
+/// So the Claude reviewer gets Read, Grep and Glob: Claude Code's own tools, which have
+/// no write or execute capability at all. See `--allow-tools` to opt back into shell
+/// access, and the README for why the Codex reviewer can safely keep it.
+pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Read Grep Glob";
 
-/// Built-in tools the Claude reviewer may use at all. Omitting Write/Edit here
-/// removes them from the session entirely, so the model cannot even attempt a write.
-pub const DEFAULT_CLAUDE_TOOLS: &str = "Read,Grep,Glob,Bash";
+/// Built-in tools the Claude reviewer may use at all. Omitting Write, Edit and Bash
+/// here removes them from the session entirely, so the model has nothing to attempt.
+pub const DEFAULT_CLAUDE_TOOLS: &str = "Read,Grep,Glob";
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
@@ -457,10 +466,43 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
         assert!(!cfg.tools.contains("Write"));
         assert!(!cfg.tools.contains("Edit"));
+        assert!(!cfg.tools.contains("NotebookEdit"));
         assert!(cfg.tools.contains("Read"));
-        // Only read-only shell commands are pre-approved.
+    }
+
+    #[test]
+    fn default_claude_policy_grants_no_shell_access() {
+        // Regression guard for a verified breach: `Bash(git diff:*)` matches by prefix,
+        // so it permitted `git diff --output=PWNED_DIFF.txt` and a file was written.
+        // git log, show and blame accept --output as well, and the same class of hole
+        // exists in non-git tools, so no Bash pattern belongs in the default policy.
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert!(
+            !cfg.tools.contains("Bash"),
+            "Bash must not be in the default tool set: {}",
+            cfg.tools
+        );
+        assert!(
+            !cfg.allowed_tools.contains("Bash"),
+            "no Bash pattern may be pre-approved by default: {}",
+            cfg.allowed_tools
+        );
+    }
+
+    #[test]
+    fn shell_access_can_still_be_opted_into() {
+        // Escape hatch for users who accept the trade-off documented in the README.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]))
+        .expect("config");
+        assert!(cfg.tools.contains("Bash"));
         assert!(cfg.allowed_tools.contains("Bash(git diff:*)"));
-        assert!(!cfg.allowed_tools.contains("Bash(git commit"));
     }
 
     #[test]

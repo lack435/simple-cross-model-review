@@ -10,7 +10,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// How long to keep draining the output pipes after the child is gone. A descendant that
+/// inherited a pipe handle can hold it open past its parent's exit, so output collection
+/// is bounded rather than an unbounded join.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 use crate::config::{Config, ReviewerKind};
 use crate::errors::{self, Failure};
@@ -223,10 +229,13 @@ pub fn run(
         .stderr(Stdio::piped());
 
     let mut child: Child = command.spawn()?;
+    let pid = child.id();
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let payload = stdin_data.to_owned();
-    let writer = std::thread::spawn(move || {
+    // Deliberately never joined: if the child exits without reading the prompt, this
+    // thread stays blocked in write_all until the pipe closes. It owns nothing we need.
+    std::thread::spawn(move || {
         // A reviewer that exits early closes the pipe; that is not our error to report.
         let _ = stdin.write_all(payload.as_bytes());
         let _ = stdin.flush();
@@ -234,10 +243,16 @@ pub fn run(
     });
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-    let stdout_reader = std::thread::spawn(move || read_to_string_lossy(&mut stdout_pipe));
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = stdout_tx.send(read_to_string_lossy(&mut stdout_pipe));
+    });
 
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let stderr_reader = std::thread::spawn(move || read_to_string_lossy(&mut stderr_pipe));
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = stderr_tx.send(read_to_string_lossy(&mut stderr_pipe));
+    });
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -247,13 +262,20 @@ pub fn run(
         match child.try_wait()? {
             Some(status) => break Some(status),
             None => {
-                if cancel.load(Ordering::SeqCst) {
+                let stop = if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                if Instant::now() >= deadline {
+                    true
+                } else if Instant::now() >= deadline {
                     timed_out = true;
+                    true
+                } else {
+                    false
+                };
+
+                if stop {
+                    // Tree first: a reviewer CLI spawns helpers, and killing only the
+                    // direct child would leave them running and holding the pipes.
+                    kill_tree(pid);
                     let _ = child.kill();
                     break child.wait().ok();
                 }
@@ -262,9 +284,9 @@ pub fn run(
         }
     };
 
-    let _ = writer.join();
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let drain_by = Instant::now() + DRAIN_GRACE;
+    let stdout = collect(&stdout_rx, drain_by);
+    let stderr = collect(&stderr_rx, drain_by);
 
     Ok(RunOutcome {
         stdout,
@@ -282,6 +304,31 @@ fn read_to_string_lossy(reader: &mut impl std::io::Read) -> String {
     let mut buf = Vec::new();
     let _ = std::io::Read::read_to_end(reader, &mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Wait for a reader thread's output, giving up at `deadline` rather than blocking on a
+/// pipe that some surviving process still holds open.
+fn collect(rx: &mpsc::Receiver<String>, deadline: Instant) -> String {
+    // On timeout or a dropped sender there is nothing to report: either the reader had
+    // no output, or the pipe outlived our patience. The exit status still drives the
+    // outcome, so empty output degrades the diagnostics rather than hanging the worker.
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
+}
+
+/// Terminate a process and everything it spawned.
+///
+/// `Child::kill` is a single-process TerminateProcess, which on Windows orphans
+/// descendants rather than reaping them. An orphan that inherited a pipe handle keeps
+/// that pipe open, which is exactly the case `collect` must not block on. taskkill walks
+/// the tree and ships with Windows, so this adds nothing to install.
+fn kill_tree(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Turn a non-success run into the right `Failure`.
