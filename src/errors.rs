@@ -289,6 +289,26 @@ pub fn bad_request(summary: impl Into<String>) -> Failure {
     }
 }
 
+/// Another server process holds this named session.
+pub fn session_leased(session: &str, detail: String) -> Failure {
+    let mut failure = Failure {
+        code: "SESSION_BUSY",
+        summary: format!(
+            "Review session '{session}' is currently held by another cross-review server \
+             process, most likely a second agent session open on this same project."
+        ),
+        remediation: format!(
+            "Wait for the other review of session '{session}' to finish and retry, or start \
+             this review under a different session name."
+        ),
+        detail: None,
+    };
+    if !detail.trim().is_empty() {
+        failure = failure.with_detail(detail);
+    }
+    failure
+}
+
 /// A review is already in flight for this named session.
 pub fn session_busy(session: &str, review_id: &str) -> Failure {
     Failure {

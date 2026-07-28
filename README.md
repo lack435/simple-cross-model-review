@@ -94,8 +94,17 @@ restart. Pass `fresh: true` when earlier findings would only mislead.
 
 ## What the reviewer can and cannot do
 
-The reviewer gets **read-only access** to the repository, so you never need to paste code
-into the request. How that is enforced differs by reviewer, and the difference is worth
+The reviewer gets **read-only** access, so you never need to paste code into the request.
+
+Read-only, not repository-only. The reviewer's working directory is the project, so that
+is what it reads in practice, but the Claude reviewer's `Read`/`Grep`/`Glob` grants are not
+path-scoped and an absolute path outside the project would still be readable. Treat the
+boundary as "cannot modify anything", not "cannot see anything else". This matters little
+in the usual case — the reviewer runs as you, with the same reach as the agent that called
+it — but it is worth knowing before pointing a reviewer at a repository that sits next to
+secrets you would not want quoted back in a review.
+
+How the write boundary is enforced differs by reviewer, and the difference is worth
 understanding:
 
 - **Codex reviewer** — `--sandbox read-only`. Enforced by the OS, so it holds regardless
@@ -194,7 +203,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 77 unit tests: no network, no model calls
+cargo test          # 82 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
@@ -214,14 +223,23 @@ Both directions pass against live CLIs.
   self-contained binary possible.
 - **Prompts go over stdin**, not the command line, so a large review request cannot hit
   the Windows command-line length limit or a quoting bug.
-- **Sessions on disk, in-flight reviews in memory.** Review ids are per-process;
-  the session mapping outlives the process. Because two servers can share a project's
-  state directory, mutations take a cross-process lock file and every write goes to a
-  pid-unique temp file before an atomic replace. A session that cannot be persisted is
-  reported as a warning with the review, since the response otherwise promises a resume
-  that would not work.
-- **Timeout and cancel kill the process tree**, not just the direct child. On Windows a
-  killed parent orphans its descendants, and an orphan holding an inherited pipe would
-  keep our reader threads blocked forever. Output collection is bounded too, so a stuck
-  pipe degrades diagnostics instead of hanging the review.
+- **Sessions on disk, in-flight reviews in memory.** Review ids are per-process; the
+  session mapping outlives the process. Two servers can share a project's state
+  directory, so a named session is claimed with a cross-process lease held for the whole
+  review, and mutations of the state file take an exclusive lock across the
+  read-modify-write. Both locks are the OS's: the lock file is opened with a share mode
+  of zero, so exclusion is enforced by Windows and released even if the holder is killed.
+  That deliberately replaces an earlier version which tracked staleness itself — it could
+  steal a lock from a merely-paused process and then delete the new owner's lock.
+  Writes go to a pid-unique temp file and then an atomic replace, never unlinking the
+  live file first. A session that could not be persisted is reported as a warning with
+  the review, and the response then stops inviting a resume that would silently start over.
+- **The reviewer runs inside a job object**, so timeout, cancel, and even a clean exit
+  that leaves a helper behind all reap the whole process tree. On Windows killing a parent
+  orphans its descendants, and an orphan holding an inherited pipe would keep our reader
+  threads blocked forever. Output collection is bounded as well, so a stuck pipe degrades
+  diagnostics instead of hanging the review. Shelling out to `taskkill` was rejected: it
+  cannot help once the direct child has exited and the parent/child links are gone, and
+  invoking it by bare name is an execution hazard, because Windows resolves an unqualified
+  executable through the current directory — the repository under review — before System32.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

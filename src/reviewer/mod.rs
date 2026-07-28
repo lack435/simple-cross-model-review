@@ -229,7 +229,25 @@ pub fn run(
         .stderr(Stdio::piped());
 
     let mut child: Child = command.spawn()?;
-    let pid = child.id();
+
+    // Assign before the reviewer does any real work, so anything it spawns is inside the
+    // job and dies with it. Without this, a helper that outlives its parent keeps our
+    // pipes open and leaks across reviews.
+    let job = crate::winjob::JobObject::new();
+    match &job {
+        Some(job) => {
+            if !job.assign(&child) {
+                eprintln!(
+                    "cross-review: warning: could not put the reviewer in a job object; \
+                     processes it spawns may outlive it"
+                );
+            }
+        }
+        None => eprintln!(
+            "cross-review: warning: could not create a job object; processes the reviewer \
+             spawns may outlive it"
+        ),
+    }
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let payload = stdin_data.to_owned();
@@ -273,9 +291,11 @@ pub fn run(
                 };
 
                 if stop {
-                    // Tree first: a reviewer CLI spawns helpers, and killing only the
-                    // direct child would leave them running and holding the pipes.
-                    kill_tree(pid);
+                    // Whole tree, not just the direct child: helpers holding our pipes
+                    // would otherwise survive and stall output collection.
+                    if let Some(job) = &job {
+                        job.terminate();
+                    }
                     let _ = child.kill();
                     break child.wait().ok();
                 }
@@ -283,6 +303,14 @@ pub fn run(
             }
         }
     };
+
+    // The direct child is gone, so nothing still in the job can contribute output we
+    // would parse. Killing them now closes the pipes, which is what lets collection
+    // finish immediately instead of waiting out the grace period. This also covers the
+    // clean-exit-with-surviving-helper case, where there is no timeout to trigger it.
+    if let Some(job) = &job {
+        job.terminate();
+    }
 
     let drain_by = Instant::now() + DRAIN_GRACE;
     let stdout = collect(&stdout_rx, drain_by);
@@ -314,21 +342,6 @@ fn collect(rx: &mpsc::Receiver<String>, deadline: Instant) -> String {
     // outcome, so empty output degrades the diagnostics rather than hanging the worker.
     rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .unwrap_or_default()
-}
-
-/// Terminate a process and everything it spawned.
-///
-/// `Child::kill` is a single-process TerminateProcess, which on Windows orphans
-/// descendants rather than reaping them. An orphan that inherited a pipe handle keeps
-/// that pipe open, which is exactly the case `collect` must not block on. taskkill walks
-/// the tree and ships with Windows, so this adds nothing to install.
-fn kill_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// Turn a non-success run into the right `Failure`.

@@ -12,7 +12,10 @@ use crate::errors::{self, Failure};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{Outcome, Registry, Snapshot, Status};
 use crate::reviewer::{self, Reviewer};
-use crate::session::{now_unix, SessionStore};
+use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
+
+/// How long to wait for another server process to release a named session.
+const SESSION_LEASE_WAIT: Duration = Duration::from_secs(3);
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SESSION: &str = "default";
@@ -109,6 +112,23 @@ impl App {
             .try_start(&session, turn, resumed)
             .map_err(|existing| errors::session_busy(&session, &existing))?;
 
+        // The registry only covers this process. Two servers on the same project share a
+        // state directory, so without a cross-process lease both could resume the same
+        // reviewer conversation at once. Held until the review finishes.
+        let lease = match ExclusiveLock::acquire(
+            &session::session_lock_path(&self.cfg.state_dir, &session),
+            SESSION_LEASE_WAIT,
+        ) {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                self.registry.finish(
+                    &id,
+                    Outcome::failed(errors::session_leased(&session, e.to_string())),
+                );
+                return Err(errors::session_leased(&session, String::new()));
+            }
+        };
+
         let job = Job {
             cfg: Arc::clone(&self.cfg),
             reviewer: Arc::clone(&self.reviewer),
@@ -121,6 +141,7 @@ impl App {
             context_paths,
             turn,
             cancel,
+            _lease: lease,
         };
 
         let spawned = std::thread::Builder::new()
@@ -274,15 +295,29 @@ impl App {
         out.push_str(snapshot.review.as_deref().unwrap_or("(no review text)"));
         out.push_str("\n--- END REVIEW ---\n\n");
 
-        out.push_str(&format!(
+        out.push_str(
             "This is a second opinion from a different model, not a verdict you must obey. Act on \
              the findings you agree with. Where you think a finding is wrong, say so and explain \
-             why rather than changing code you believe is correct.\n\n\
-             After you have addressed the feedback, call cross_model_review again with session \
-             \"{}\" to have the same reviewer re-check the work with its earlier findings still in \
-             context.\n",
-            snapshot.session
-        ));
+             why rather than changing code you believe is correct.\n\n",
+        );
+
+        // Only promise continuity when it actually exists.
+        if snapshot.resumable {
+            out.push_str(&format!(
+                "After you have addressed the feedback, call cross_model_review again with session \
+                 \"{}\" to have the same reviewer re-check the work with its earlier findings still \
+                 in context.\n",
+                snapshot.session
+            ));
+        } else {
+            out.push_str(&format!(
+                "Note: this review was not saved as a resumable session, so calling \
+                 cross_model_review with session \"{}\" again will start a fresh review that does \
+                 not remember these findings. Include whatever context still matters in the new \
+                 instructions.\n",
+                snapshot.session
+            ));
+        }
         out
     }
 
@@ -389,6 +424,9 @@ struct Job {
     context_paths: Vec<String>,
     turn: u32,
     cancel: Arc<AtomicBool>,
+    /// Cross-process claim on the named session. Never read: it exists so that dropping
+    /// the job releases the session for other server processes.
+    _lease: Option<ExclusiveLock>,
 }
 
 impl Job {
@@ -484,12 +522,12 @@ impl Job {
 
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
-        // A warning rather than stderr-only: the completed response tells the caller it
-        // can resume this session, so if it cannot, the caller has to hear about it.
+        // Resumability is tracked rather than assumed: the completed response invites a
+        // follow-up on this session, so when that would not work the caller must be told.
         let mut warnings = Vec::new();
-        match &parsed.session_id {
+        let resumable = match &parsed.session_id {
             Some(session_id) => {
-                if let Err(e) = self.sessions.record_turn(
+                match self.sessions.record_turn(
                     &self.session,
                     self.cfg.reviewer.as_str(),
                     session_id,
@@ -497,16 +535,30 @@ impl Job {
                     &self.cfg.effort,
                     &self.cfg.cwd.to_string_lossy(),
                 ) {
-                    // The review itself succeeded; losing resumability is worth a
-                    // warning but not worth discarding the review.
-                    eprintln!("cross-review: warning: could not save session state: {e}");
-                    warnings.push(format!(
-                        "This review could not be saved, so session '{}' cannot be resumed: {e}. \
-                         The review below is still valid, but a follow-up call with this session \
-                         name will start a new review with no memory of it.",
-                        self.session
-                    ));
+                    Ok(_) => true,
+                    Err(e) => {
+                        // The review itself succeeded; losing resumability is worth a
+                        // warning but not worth discarding the review.
+                        eprintln!("cross-review: warning: could not save session state: {e}");
+                        warnings.push(format!(
+                            "This turn could not be saved to disk ({e}), so session '{}' may not \
+                             resume correctly. The review below is unaffected.",
+                            self.session
+                        ));
+                        false
+                    }
                 }
+            }
+            // On a resumed turn the stored mapping is still valid even if this turn did
+            // not report an id, so the session remains resumable. Only a *new* review
+            // with no id leaves nothing to resume.
+            None if resume_id.is_some() => {
+                eprintln!(
+                    "cross-review: warning: the reviewer reported no session id on a resumed \
+                     turn; keeping the existing mapping for session '{}'",
+                    self.session
+                );
+                true
             }
             None => {
                 eprintln!(
@@ -517,17 +569,19 @@ impl Job {
                 warnings.push(format!(
                     "The reviewer did not report a session id, so session '{}' cannot be resumed. \
                      The review below is still valid, but a follow-up call with this session name \
-                     will start a new review with no memory of it.",
+                     will start a fresh review with no memory of it.",
                     self.session
                 ));
+                false
             }
-        }
+        };
 
         Ok(Outcome {
             review: Some(parsed.text),
             failure: None,
             denials: parsed.denials,
             warnings,
+            resumable,
         })
     }
 }

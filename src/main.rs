@@ -10,6 +10,7 @@ mod registry;
 mod reviewer;
 mod session;
 mod tools;
+mod winjob;
 
 use std::sync::Arc;
 

@@ -5,7 +5,9 @@
 //! disk, so a review session survives an MCP server restart.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -16,11 +18,9 @@ use serde::{Deserialize, Serialize};
 /// Distinguishes temp files written by concurrent writers in this process.
 static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// How long to wait for another process to release the session file.
+/// How long to wait for another process to release the session file. Short: this only
+/// guards a read-modify-write of a small JSON file.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
-
-/// A lock older than this is assumed to belong to a process that died holding it.
-const LOCK_STALE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -61,6 +61,12 @@ impl SessionStore {
         &self.path
     }
 
+    /// A sibling of the state file rather than the state file itself: locking the file we
+    /// are about to atomically replace would fight with the replace.
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("json.lock")
+    }
+
     pub fn get(&self, name: &str) -> Option<SessionRecord> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.read().sessions.get(name).cloned()
@@ -84,7 +90,8 @@ impl SessionStore {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
         // process reading between the two would write back a snapshot missing this turn.
-        let _file_lock = FileLock::acquire(&self.path);
+        // A failure to lock is returned, not ignored, and reaches the caller as a warning.
+        let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
         let mut store = self.read();
         let now = now_unix();
 
@@ -120,7 +127,7 @@ impl SessionStore {
 
     pub fn forget(&self, name: &str) -> io::Result<bool> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _file_lock = FileLock::acquire(&self.path);
+        let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
         let mut store = self.read();
         let removed = store.sessions.remove(name).is_some();
         if removed {
@@ -181,55 +188,55 @@ impl SessionStore {
     }
 }
 
-/// A best-effort cross-process lock around the session file.
+/// An exclusive cross-process lock, backed by the OS rather than by bookkeeping.
 ///
-/// The in-process mutex cannot help here: two `cross-review` servers pointed at the same
-/// project share a state directory, and every mutation is a read-modify-write. Without
-/// this, two processes recording different sessions can each write back a snapshot taken
-/// before the other's change, silently dropping it.
+/// The in-process mutex cannot help across processes: two `cross-review` servers pointed
+/// at the same project share a state directory, and every mutation is a
+/// read-modify-write, so without a lock each can write back a snapshot taken before the
+/// other's change and silently drop it.
 ///
-/// Best-effort by design: a lock older than `LOCK_STALE` is stolen, because a crashed
-/// process must not make reviews unresumable forever, and failing to acquire does not
-/// abort the write. Losing a session mapping is recoverable; refusing to work is worse.
-struct FileLock {
-    path: PathBuf,
-    held: bool,
+/// Exclusivity comes from opening the lock file with a share mode of zero: while one
+/// process holds that handle, every other process's open fails. Two properties fall out
+/// of letting Windows own it. The lock is released when the handle closes, *including*
+/// when the process dies, so there is no such thing as a stale lock to reason about. And
+/// nothing ever deletes the lock file, so there is no window in which one process removes
+/// a lock another has just acquired.
+///
+/// An earlier version tracked liveness itself: it stole any lock older than 60 seconds and
+/// wrote anyway on timeout. Both were wrong. A process merely paused could have its lock
+/// stolen, and on drop it would then delete the *new* owner's lock; writing anyway simply
+/// reinstated the lost-update race the lock existed to prevent.
+pub struct ExclusiveLock {
+    // Held purely for its side effect: dropping it releases the lock.
+    _file: File,
 }
 
-impl FileLock {
-    fn acquire(target: &Path) -> Self {
-        let path = target.with_extension("lock");
-        let deadline = Instant::now() + LOCK_WAIT;
-
+impl ExclusiveLock {
+    /// Take the lock, retrying until `wait` elapses. Failure is returned rather than
+    /// ignored, so callers surface it instead of writing unprotected.
+    pub fn acquire(path: &Path, wait: Duration) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let deadline = Instant::now() + wait;
         loop {
-            match std::fs::OpenOptions::new()
+            match OpenOptions::new()
                 .write(true)
-                .create_new(true)
-                .open(&path)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(path)
             {
-                Ok(_) => return Self { path, held: true },
-                Err(_) => {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        let stale = meta
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.elapsed().ok())
-                            .map(|age| age > LOCK_STALE)
-                            .unwrap_or(false);
-                        if stale {
-                            // The holder died. Take it over.
-                            std::fs::remove_file(&path).ok();
-                            continue;
-                        }
-                    }
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(e) => {
                     if Instant::now() >= deadline {
-                        eprintln!(
-                            "cross-review: warning: could not acquire {} within {:?}; \
-                             writing session state anyway",
-                            path.display(),
-                            LOCK_WAIT
-                        );
-                        return Self { path, held: false };
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "another cross-review process is holding {} ({e})",
+                                path.display()
+                            ),
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -238,12 +245,21 @@ impl FileLock {
     }
 }
 
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        if self.held {
-            std::fs::remove_file(&self.path).ok();
-        }
-    }
+/// Lock path for a named review session, used to stop two server processes from
+/// resuming the same reviewer conversation at once.
+pub fn session_lock_path(state_dir: &Path, session: &str) -> PathBuf {
+    let safe: String = session
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    state_dir.join(format!("session-{safe}.lock"))
 }
 
 pub fn now_unix() -> u64 {
@@ -372,6 +388,58 @@ mod tests {
         let store = SessionStore::new(&dir);
         record(&store, "default", "thread-1");
         assert!(store.path().is_file());
+    }
+
+    #[test]
+    fn an_exclusive_lock_excludes_a_second_holder() {
+        let dir = temp_dir();
+        let path = dir.join("thing.lock");
+
+        let held = ExclusiveLock::acquire(&path, Duration::from_millis(50)).expect("first acquire");
+        // Windows enforces this through the share mode, so the second open fails while
+        // the first handle is alive. No staleness heuristic is involved.
+        let blocked = ExclusiveLock::acquire(&path, Duration::from_millis(100));
+        assert!(blocked.is_err(), "a second holder must be refused");
+
+        drop(held);
+        // Releasing the handle releases the lock; the file itself is never deleted, so
+        // there is no window where one process removes another's lock.
+        ExclusiveLock::acquire(&path, Duration::from_millis(500)).expect("acquire after release");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn recording_a_turn_holds_and_releases_the_lock() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        record(&store, "default", "thread-1");
+        // If the lock had leaked, this second write would time out.
+        record(&store, "default", "thread-1");
+        assert_eq!(store.get("default").unwrap().turns, 2);
+    }
+
+    #[test]
+    fn a_held_session_lock_blocks_a_second_claim() {
+        let dir = temp_dir();
+        let path = session_lock_path(&dir, "auth-work");
+        let _held = ExclusiveLock::acquire(&path, Duration::from_millis(50)).expect("acquire");
+        assert!(ExclusiveLock::acquire(&path, Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn session_lock_paths_are_distinct_and_filename_safe() {
+        let dir = temp_dir();
+        let a = session_lock_path(&dir, "auth-work");
+        let b = session_lock_path(&dir, "other");
+        assert_ne!(a, b);
+
+        // Names come from the calling agent, so path separators must not escape.
+        let nasty = session_lock_path(&dir, "../../etc/passwd");
+        let name = nasty.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert_eq!(nasty.parent(), Some(dir.as_path()));
     }
 
     #[test]

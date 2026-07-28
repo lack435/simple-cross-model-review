@@ -39,9 +39,12 @@ pub struct Review {
     /// Read-only commands the reviewer attempted but was not permitted to run. Surfaced
     /// so the caller can tell a thin review from a blocked one.
     pub denials: Vec<String>,
-    /// Problems that did not invalidate the review but that the caller must know about,
-    /// such as a session that could not be persisted and so cannot be resumed.
+    /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
+    /// Whether a follow-up call on this session name will actually reach the same
+    /// reviewer conversation. Tracked rather than assumed, so the response never invites
+    /// a resume that would silently start over.
+    pub resumable: bool,
     pub started: Instant,
     pub finished: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
@@ -60,6 +63,7 @@ pub struct Outcome {
     pub failure: Option<Failure>,
     pub denials: Vec<String>,
     pub warnings: Vec<String>,
+    pub resumable: bool,
 }
 
 impl Outcome {
@@ -69,6 +73,18 @@ impl Outcome {
             failure: Some(failure),
             denials: Vec::new(),
             warnings: Vec::new(),
+            resumable: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn completed(review: &str) -> Self {
+        Self {
+            review: Some(review.to_string()),
+            failure: None,
+            denials: Vec::new(),
+            warnings: Vec::new(),
+            resumable: true,
         }
     }
 }
@@ -126,6 +142,7 @@ impl Registry {
                 failure: None,
                 denials: Vec::new(),
                 warnings: Vec::new(),
+                resumable: false,
                 started: Instant::now(),
                 finished: None,
                 cancel: Arc::clone(&cancel),
@@ -143,6 +160,7 @@ impl Registry {
                 review.finished = Some(Instant::now());
                 review.denials = outcome.denials;
                 review.warnings = outcome.warnings;
+                review.resumable = outcome.resumable;
                 match outcome.failure {
                     Some(failure) => {
                         review.status = Status::Failed;
@@ -219,6 +237,7 @@ pub struct Snapshot {
     pub failure: Option<Failure>,
     pub denials: Vec<String>,
     pub warnings: Vec<String>,
+    pub resumable: bool,
     pub elapsed: Duration,
 }
 
@@ -234,6 +253,7 @@ impl Snapshot {
             failure: review.failure.clone(),
             denials: review.denials.clone(),
             warnings: review.warnings.clone(),
+            resumable: review.resumable,
             elapsed: review.elapsed(),
         }
     }
@@ -266,15 +286,7 @@ mod tests {
     fn a_session_is_reusable_once_its_review_finishes() {
         let registry = Registry::new();
         let (first, _c) = registry.try_start("default", 1, false).expect("first");
-        registry.finish(
-            &first,
-            Outcome {
-                review: Some("done".into()),
-                failure: None,
-                denials: Vec::new(),
-                warnings: Vec::new(),
-            },
-        );
+        registry.finish(&first, Outcome::completed("done"));
         let (second, _c) = registry.try_start("default", 2, true).expect("second turn");
         assert_ne!(second, first);
     }
@@ -312,15 +324,7 @@ mod tests {
             let id = id.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(150));
-                registry.finish(
-                    &id,
-                    Outcome {
-                        review: Some("late".into()),
-                        failure: None,
-                        denials: Vec::new(),
-                        warnings: Vec::new(),
-                    },
-                );
+                registry.finish(&id, Outcome::completed("late"));
             })
         };
 
@@ -372,10 +376,9 @@ mod tests {
         registry.finish(
             &id,
             Outcome {
-                review: Some("ok".into()),
-                failure: None,
-                denials: Vec::new(),
                 warnings: vec!["could not save session".into()],
+                resumable: false,
+                ..Outcome::completed("ok")
             },
         );
         let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
@@ -383,5 +386,17 @@ mod tests {
             snapshot.warnings,
             vec!["could not save session".to_string()]
         );
+        // A review that could not be persisted must not be advertised as resumable.
+        assert!(!snapshot.resumable);
+    }
+
+    #[test]
+    fn a_persisted_review_is_marked_resumable() {
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.finish(&id, Outcome::completed("ok"));
+        let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
+        assert!(snapshot.resumable);
+        assert!(snapshot.warnings.is_empty());
     }
 }
