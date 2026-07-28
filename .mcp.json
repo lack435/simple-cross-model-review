@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cross-review": {
+      "command": "dist\\cross-review.exe",
+      "args": [
+        "--reviewer", "codex",
+        "--model", "gpt-5.6-terra",
+        "--effort", "xhigh"
+      ]
+    }
+  }
+}
