@@ -71,7 +71,7 @@ impl Reviewer for CodexReviewer {
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.effort)]);
-        if cfg.isolate_mcp {
+        if cfg.isolate_reviewer {
             // `codex exec` does start configured MCP servers (verified: a marker server
             // ran and left a file), so a reviewer that also has cross-review registered
             // could call back into us. `-c mcp_servers={}` does not help -- dotted

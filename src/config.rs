@@ -92,19 +92,25 @@ pub const DEFAULT_CLAUDE_TOOLS: &str = "Read,Grep,Glob";
 ///
 /// Bare `Read`/`Grep`/`Glob` grants are not path-scoped: they permit any absolute path
 /// the user can read, which makes the boundary "cannot write" rather than "cannot leave
-/// the repository". Qualifying each rule with the working root fixes that, and it was
-/// verified for all three tools -- reading, grepping and globbing `C:\Windows` were each
-/// denied while the same operations inside the project succeeded.
+/// the repository". Scoping each rule fixes that. Verified for all three tools: reading,
+/// grepping and globbing `C:\Windows` were each denied, while the project root and its
+/// subdirectories stayed readable.
 ///
-/// Each rule is returned as its own string, and passed as its own argument, so a project
-/// path containing spaces or commas cannot be split apart by the CLI's list parsing.
-pub fn scoped_claude_rules(cwd: &Path) -> Vec<String> {
-    // Rules use forward slashes and a `//` prefix to denote an absolute path.
-    let root = cwd.to_string_lossy().replace('\\', "/");
-    let scope = format!("//{}/**", root.trim_end_matches('/'));
+/// The scope is deliberately *relative*. These rules are gitignore-style globs, so
+/// interpolating an absolute path into one makes the path's own characters significant: a
+/// project at `C:\work\[ab]` would produce `Read(//C:/work/[ab]/**)`, where `[ab]` is a
+/// character class matching the siblings `C:\work\a` and `C:\work\b` — simultaneously
+/// failing to read the real project and granting reads outside it. Absolute paths also
+/// have to survive UNC roots and drive roots. `./**` sidesteps all of it: nothing is
+/// interpolated, so there is nothing to escape. The reviewer's working directory is set
+/// to the project root, which is what `.` resolves against.
+///
+/// Each rule is returned separately and passed as its own argument, so a project path
+/// containing spaces or commas cannot be split apart by the CLI's list parsing.
+pub fn scoped_claude_rules() -> Vec<String> {
     ["Read", "Grep", "Glob"]
         .iter()
-        .map(|tool| format!("{tool}({scope})"))
+        .map(|tool| format!("{tool}(./**)"))
         .collect()
 }
 
@@ -132,11 +138,20 @@ pub struct Config {
     pub tools: String,
     pub preamble: Option<String>,
     pub no_preamble: bool,
-    /// Stop the reviewer from loading MCP servers. Without this, a reviewer that has
-    /// cross-review registered could call cross-review recursively. Costs the reviewer
-    /// its user-level config: for Claude that is only MCP servers, for Codex it is the
-    /// whole of config.toml (see the note in reviewer::codex).
-    pub isolate_mcp: bool,
+    /// Run the reviewer without the configuration it would normally pick up from the
+    /// project and the user.
+    ///
+    /// This is a security boundary, not tidiness. A reviewed repository can commit
+    /// configuration that executes commands: a `.claude/settings.json` hook runs a shell
+    /// command automatically, outside the tool allow-list entirely. Verified -- a
+    /// `SessionStart` hook committed to a project ran on a plain `claude -p` invocation.
+    /// It also stops a reviewer that has cross-review registered from recursing into it.
+    ///
+    /// The cost is that the reviewer loses project context it might have wanted, notably
+    /// CLAUDE.md. That file is attacker-controlled text aimed straight at the reviewer,
+    /// so excluding it is defensible on its own terms; pass the conventions that matter
+    /// in `instructions` instead.
+    pub isolate_reviewer: bool,
 }
 
 impl Config {
@@ -153,7 +168,7 @@ impl Config {
         let mut tools: Option<String> = None;
         let mut preamble_file: Option<PathBuf> = None;
         let mut no_preamble = false;
-        let mut isolate_mcp = true;
+        let mut isolate_reviewer = true;
 
         let mut i = 0;
         while i < args.len() {
@@ -199,7 +214,9 @@ impl Config {
                 "--tools" => tools = Some(take("--tools")?),
                 "--preamble-file" => preamble_file = Some(PathBuf::from(take("--preamble-file")?)),
                 "--no-preamble" => no_preamble = true,
-                "--allow-reviewer-mcp" => isolate_mcp = false,
+                // The original name only spoke of MCP; kept working because it is in
+                // published example configs.
+                "--allow-reviewer-config" | "--allow-reviewer-mcp" => isolate_reviewer = false,
                 other => return Err(format!("unknown argument '{other}' (try --help)")),
             }
             i += 1;
@@ -243,7 +260,7 @@ impl Config {
         // A user-supplied list is passed through as one argument; the CLI splits it.
         let allowed_tools = match allowed_tools {
             Some(list) => vec![list],
-            None => scoped_claude_rules(&cwd),
+            None => scoped_claude_rules(),
         };
         let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
 
@@ -260,7 +277,7 @@ impl Config {
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
             preamble,
             no_preamble,
-            isolate_mcp,
+            isolate_reviewer,
         })
     }
 
@@ -364,9 +381,13 @@ OPTIONS:
                               to the working root, so reads cannot leave the project.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
-  --allow-reviewer-mcp        Let the reviewer load its own MCP servers and user config.
-                              Off by default: a reviewer that also has cross-review
-                              registered would otherwise be able to recurse into it.
+  --allow-reviewer-config     Let the reviewer load project and user configuration
+                              (hooks, settings, plugins, skills, MCP servers, CLAUDE.md).
+                              Off by default, and it is a security boundary: a reviewed
+                              repository can commit a hook that runs a shell command
+                              with no tool call and so no permission check. Only pass
+                              this for repositories you already trust.
+                              (--allow-reviewer-mcp is an accepted older name.)
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
@@ -477,17 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn mcp_isolation_is_on_unless_opted_out() {
+    fn reviewer_isolation_is_on_unless_opted_out() {
         assert!(
             Config::from_args(&args(&["--reviewer", "codex"]))
                 .unwrap()
-                .isolate_mcp
+                .isolate_reviewer
         );
-        assert!(
-            !Config::from_args(&args(&["--reviewer", "codex", "--allow-reviewer-mcp"]))
-                .unwrap()
-                .isolate_mcp
-        );
+        // Both the current name and the older one must turn it off: the older one is in
+        // published example configs.
+        for flag in ["--allow-reviewer-config", "--allow-reviewer-mcp"] {
+            assert!(
+                !Config::from_args(&args(&["--reviewer", "codex", flag]))
+                    .unwrap()
+                    .isolate_reviewer,
+                "{flag} should disable isolation"
+            );
+        }
     }
 
     #[test]
@@ -524,9 +550,8 @@ mod tests {
         // "cannot write" rather than "cannot leave the project".
         let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
         assert_eq!(cfg.allowed_tools.len(), 3);
-        let root = cfg.cwd.to_string_lossy().replace('\\', "/");
         for tool in ["Read", "Grep", "Glob"] {
-            let expected = format!("{tool}(//{root}/**)");
+            let expected = format!("{tool}(./**)");
             assert!(
                 cfg.allowed_tools.contains(&expected),
                 "expected {expected} in {:?}",
@@ -536,13 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn scoped_rules_keep_a_path_with_spaces_in_one_piece() {
-        // Each rule is passed as its own argument, so a space must not split it.
-        let rules = scoped_claude_rules(Path::new(r"C:\Users\My Name\my repo"));
-        assert_eq!(rules.len(), 3);
-        assert!(rules
-            .iter()
-            .all(|r| r.contains("//C:/Users/My Name/my repo/**")));
+    fn scoped_rules_interpolate_no_path() {
+        // Rules are gitignore-style globs, so an absolute path would make its own
+        // characters significant: a project at C:\work\[ab] would yield a character class
+        // matching the siblings C:\work\a and C:\work\b. Relative scoping avoids the
+        // whole escaping problem, so no rule may contain a drive letter or separator.
+        for rule in scoped_claude_rules() {
+            assert!(!rule.contains(':'), "{rule} interpolates a path");
+            assert!(!rule.contains('\\'), "{rule} interpolates a path");
+            assert!(rule.ends_with("(./**)"), "{rule}");
+        }
     }
 
     #[test]

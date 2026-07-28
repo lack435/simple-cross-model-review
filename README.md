@@ -66,7 +66,7 @@ the single source of truth. There is no config file of our own to drift out of s
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
---allow-reviewer-mcp        Let the reviewer load its own MCP servers (see below).
+--allow-reviewer-config     Let the reviewer load project and user configuration.
 --doctor                    Check CLI and auth from a terminal, then exit.
 ```
 
@@ -104,10 +104,13 @@ How that is enforced differs by reviewer, and the difference is worth understand
 - **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
   the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
   Code's own tools and have no write or execute capability. Each is further scoped to the
-  working root (`Read(//C:/your/project/**)` and likewise for Grep and Glob), because a
-  bare grant is not path-scoped and would let the reviewer read any file you can. Verified
-  for all three: reading, grepping and globbing outside the project were each denied,
-  while the same operations inside it succeeded.
+  project (`Read(./**)` and likewise for Grep and Glob), because a bare grant is not
+  path-scoped and would let the reviewer read any file you can. Verified for all three:
+  reading, grepping and globbing outside the project were each denied, while the project
+  root and its subdirectories stayed readable. The scope is deliberately relative — these
+  are gitignore-style globs, so interpolating an absolute path would make the path's own
+  characters significant, and a project at `C:\work\[ab]` would turn into a character
+  class matching its siblings.
 
 The Claude reviewer has no shell by default, and that is a deliberate reversal. Claude's
 permission patterns match by **command prefix**, so `Bash(git diff:*)` permits *any*
@@ -130,18 +133,36 @@ that it is a soft boundary rather than a guarantee:
 Any commands the reviewer attempted but was not permitted to run are reported back with
 the review, so an analysis thinned by missing evidence is visible rather than silent.
 
-By default the reviewer also loads **no MCP servers**. This matters because `codex exec`
-does start configured MCP servers (verified with a marker server that left a file behind),
-so without isolation a reviewer that also has cross-review registered could call it
-recursively.
+### The reviewer runs without the project's configuration
 
-For the Claude reviewer this costs nothing but MCP servers (`--strict-mcp-config`). For
-the Codex reviewer it is `--ignore-user-config`, which skips the whole of the user's
-`config.toml` — the blunter option, chosen because `-c mcp_servers={}` does not work
-(dotted overrides merge into the existing table rather than replacing it). Auth still
-resolves from `CODEX_HOME`, and model, effort and sandbox are all passed explicitly, so a
-review is unaffected. `--allow-reviewer-mcp` turns isolation off if you would rather keep
-the reviewer's own configuration.
+The tool allow-list is not the only way a repository can get code to run. A committed
+`.claude/settings.json` can define a **hook**, and Claude executes that shell command
+automatically — no tool call, so no permission check, no allow-list. Verified: a
+`SessionStart` hook committed to a project ran on a plain `claude -p` invocation and
+created a file. Reviewing a repository would otherwise mean executing whatever that
+repository chose to define, which is precisely backwards for a tool whose job is to look
+at code you are unsure about.
+
+So the reviewer runs configuration-isolated by default:
+
+- **Claude reviewer** — `--safe-mode`, which disables hooks, settings, plugins, skills,
+  commands and MCP servers while leaving auth, model selection and permissions working
+  normally. (`--bare` would also do it but redefines authentication as API-key-only,
+  breaking subscription sign-in.) Verified end to end: with a hostile project committing
+  the hook above, the review completed normally and the hook did **not** run.
+- **Codex reviewer** — `--ignore-user-config`. Codex project hooks additionally require
+  persisted trust, and we never pass `--dangerously-bypass-hook-trust`.
+
+Isolation also stops a reviewer that has cross-review registered from recursing into it,
+which matters because `codex exec` does start configured MCP servers (verified with a
+marker server that left a file behind). For Codex, `-c mcp_servers={}` would not have
+worked — dotted overrides merge into the existing table rather than replacing it.
+
+The cost is that the reviewer loses project context it might have wanted, notably
+CLAUDE.md. That file is also attacker-controlled text aimed straight at the reviewer, so
+excluding it is defensible on its own terms; pass the conventions that matter in
+`instructions`. `--allow-reviewer-config` turns isolation off for repositories you already
+trust.
 
 ## When the reviewer is unavailable
 

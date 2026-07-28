@@ -79,9 +79,21 @@ impl Reviewer for ClaudeReviewer {
             cmd.arg(rule);
         }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);
-        if cfg.isolate_mcp {
-            // With no --mcp-config supplied this loads zero MCP servers, which keeps a
-            // reviewer that also has cross-review registered from calling back into us.
+        if cfg.isolate_reviewer {
+            // The tool allow-list is not the only way a repository can get code to run.
+            // A committed `.claude/settings.json` can define a hook, and Claude executes
+            // that shell command automatically -- no tool call, so no allow-list check.
+            // Verified: a `SessionStart` hook committed to a project ran on a plain
+            // `claude -p` invocation and created a file. Reviewing a repository would
+            // otherwise mean executing whatever that repository chose to define.
+            //
+            // --safe-mode disables hooks along with settings, plugins, skills, commands
+            // and MCP servers, while leaving auth, model selection and permissions
+            // working normally. --bare would also do it but redefines authentication
+            // (API key only, no OAuth), which would break subscription sign-in.
+            cmd.arg("--safe-mode");
+            // Redundant under --safe-mode, kept so MCP isolation does not silently
+            // depend on one flag's exact scope.
             cmd.arg("--strict-mcp-config");
         }
         if let Some(session_id) = resume {

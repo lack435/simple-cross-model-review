@@ -348,11 +348,11 @@ impl App {
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
         out.push_str(&format!("turn timeout:  {}s\n", self.cfg.timeout.as_secs()));
         out.push_str(&format!(
-            "mcp isolation: {}\n",
-            if self.cfg.isolate_mcp {
-                "on (reviewer loads no MCP servers)"
+            "isolation:     {}\n",
+            if self.cfg.isolate_reviewer {
+                "on (reviewer loads no project hooks, settings, plugins or MCP servers)"
             } else {
-                "off"
+                "OFF - the reviewer loads this project's configuration, including hooks"
             }
         ));
         out.push_str(&format!(
