@@ -281,6 +281,58 @@ impl Config {
         })
     }
 
+    /// True when the reviewer has any shell at all.
+    pub fn reviewer_has_shell(&self) -> bool {
+        match self.reviewer {
+            // Codex runs under a sandbox policy rather than a tool allow-list, so its
+            // shell is always present and always write-denied.
+            ReviewerKind::Codex => true,
+            // Claude's shell exists only if Bash was put back into the tool set.
+            ReviewerKind::Claude => self.tools.contains("Bash"),
+        }
+    }
+
+    /// What the reviewer can actually read and run, in its own words.
+    ///
+    /// This has to be generated rather than fixed: the Claude reviewer has no shell by
+    /// default, and a preamble that promised `git diff` was straightforwardly false. A
+    /// reviewer that believes it can run git will burn its turn finding out otherwise,
+    /// and a reviewer with no shell cannot compute a diff at all -- so it needs telling
+    /// to say that plainly instead of guessing at what changed.
+    pub fn reviewer_capabilities(&self) -> String {
+        let mut out = String::new();
+        match self.reviewer {
+            ReviewerKind::Codex => {
+                out.push_str(
+                    "You can read any file in this project and run read-only shell commands, \
+                     including `git diff`, `git log`, `git show` and ripgrep, so you can inspect \
+                     the change history yourself. Writes are blocked by the sandbox.",
+                );
+            }
+            ReviewerKind::Claude if self.reviewer_has_shell() => {
+                out.push_str(
+                    "You can read and search files in this project, and run the read-only shell \
+                     commands that have been allow-listed. Anything outside that list is denied \
+                     rather than queued for approval, so a refusal is final -- note it and move \
+                     on.",
+                );
+            }
+            ReviewerKind::Claude => {
+                out.push_str(
+                    "You can read and search files in this project, and nothing else: Read, Grep \
+                     and Glob, scoped to this directory tree.\n\n\
+                     You have no shell. You cannot run `git`, so you cannot obtain a diff or the \
+                     commit history, and you cannot reconstruct either from the `.git` directory \
+                     with the tools you have. If the request depends on seeing what changed and \
+                     the diff was not included in it, review the current state of the code and \
+                     say plainly, under \"What I could not check\", that you had no access to the \
+                     diff. Do not guess at what changed.",
+                );
+            }
+        }
+        out
+    }
+
     pub fn describe_reviewer(&self) -> String {
         format!(
             "{} ({}, model={}, effort={})",
@@ -588,6 +640,41 @@ mod tests {
         assert!(cfg.tools.contains("Bash"));
         // Passed through as a single argument for the CLI to split itself.
         assert_eq!(cfg.allowed_tools, vec!["Read Grep Glob Bash(git diff:*)"]);
+    }
+
+    #[test]
+    fn capabilities_are_stated_truthfully_per_reviewer() {
+        // A reviewer told it can run git when it cannot wastes its turn discovering that,
+        // and the caller is never told the diff had to be supplied. This was observed:
+        // a real review reported it could not run git diff, git log or git show.
+        let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert!(!claude.reviewer_has_shell());
+        let text = claude.reviewer_capabilities();
+        assert!(text.contains("no shell"), "{text}");
+        assert!(text.contains("cannot run `git`"), "{text}");
+        // And it must be told to say so rather than guess at the change.
+        assert!(text.contains("Do not guess"), "{text}");
+
+        let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(codex.reviewer_has_shell());
+        let text = codex.reviewer_capabilities();
+        assert!(text.contains("git diff"), "{text}");
+        assert!(!text.contains("no shell"), "{text}");
+    }
+
+    #[test]
+    fn claude_regains_shell_capability_when_bash_is_restored() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+        ]))
+        .expect("config");
+        assert!(cfg.reviewer_has_shell());
+        let text = cfg.reviewer_capabilities();
+        assert!(!text.contains("no shell"), "{text}");
+        assert!(text.contains("allow-listed"), "{text}");
     }
 
     #[test]

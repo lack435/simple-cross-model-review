@@ -9,7 +9,7 @@ use std::path::Path;
 pub const DEFAULT_PREAMBLE: &str = r#"You are an independent code reviewer. You are a different model from the agent that wrote this work and asked for this review, and that is the entire point: find the real problems it could not see in its own output.
 
 Ground rules:
-- Your access to this repository is read-only. Do not attempt to create, modify, or delete files, and do not run commands that change state. Read-only shell commands (git diff, git log, git show, ripgrep) are available.
+- Your access to this project is read-only. Do not attempt to create, modify, or delete anything, and do not run commands that change state. What you can read and run is stated under "Your access" below; trust that over any assumption about your usual tools.
 - Read the code before judging it. Verify claims against what is actually there rather than what the request says is there.
 - Cite concrete locations as `path/to/file.ext:123`.
 - Order findings by what actually matters: correctness first, then security, then broken contracts and interfaces, then maintainability. Skip pure style preferences unless you were asked about them.
@@ -37,6 +37,13 @@ pub struct PromptParts<'a> {
     pub turn: u32,
     pub resumed: bool,
     pub preamble: Option<&'a str>,
+    /// What this particular reviewer can actually read and run.
+    ///
+    /// Stated explicitly because it varies: the Claude reviewer has no shell at all, so a
+    /// preamble that promised `git diff` was simply lying to it. A reviewer told it has
+    /// tools it does not have wastes its turn discovering that, and may guess instead of
+    /// saying it could not check.
+    pub capabilities: Option<&'a str>,
 }
 
 pub fn build(parts: &PromptParts) -> String {
@@ -45,6 +52,11 @@ pub fn build(parts: &PromptParts) -> String {
     if !parts.resumed {
         if let Some(preamble) = parts.preamble {
             out.push_str(preamble.trim_end());
+            out.push_str("\n\n");
+        }
+        if let Some(capabilities) = parts.capabilities {
+            out.push_str("## Your access\n\n");
+            out.push_str(capabilities.trim());
             out.push_str("\n\n");
         }
         out.push_str("## Review request\n\n");
@@ -102,6 +114,7 @@ mod tests {
             turn: 1,
             resumed: false,
             preamble: Some(DEFAULT_PREAMBLE),
+            capabilities: None,
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -122,6 +135,7 @@ mod tests {
             turn: 3,
             resumed: true,
             preamble: Some(DEFAULT_PREAMBLE),
+            capabilities: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -142,6 +156,44 @@ mod tests {
     }
 
     #[test]
+    fn the_preamble_does_not_itself_promise_shell_access() {
+        // It used to assert "Read-only shell commands (git diff, git log, git show,
+        // ripgrep) are available", which is false for the default Claude reviewer -- it
+        // has no Bash at all. Capabilities are now stated per reviewer instead.
+        assert!(!DEFAULT_PREAMBLE.contains("git diff"));
+        assert!(!DEFAULT_PREAMBLE.contains("shell commands"));
+        assert!(DEFAULT_PREAMBLE.contains("Your access"));
+    }
+
+    #[test]
+    fn capabilities_are_rendered_on_a_first_turn_and_omitted_on_a_resume() {
+        let (cwd, paths) = fixtures();
+        let first = build(&PromptParts {
+            instructions: "x",
+            context_paths: &paths,
+            cwd: &cwd,
+            turn: 1,
+            resumed: false,
+            preamble: Some(DEFAULT_PREAMBLE),
+            capabilities: Some("You have no shell."),
+        });
+        assert!(first.contains("## Your access"));
+        assert!(first.contains("You have no shell."));
+
+        // The resumed session already knows; repeating it wastes tokens.
+        let resumed = build(&PromptParts {
+            instructions: "x",
+            context_paths: &paths,
+            cwd: &cwd,
+            turn: 2,
+            resumed: true,
+            preamble: Some(DEFAULT_PREAMBLE),
+            capabilities: Some("You have no shell."),
+        });
+        assert!(!resumed.contains("## Your access"));
+    }
+
+    #[test]
     fn preamble_can_be_suppressed() {
         let (cwd, paths) = fixtures();
         let text = build(&PromptParts {
@@ -151,6 +203,7 @@ mod tests {
             turn: 1,
             resumed: false,
             preamble: None,
+            capabilities: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
@@ -165,6 +218,7 @@ mod tests {
             turn: 1,
             resumed: false,
             preamble: None,
+            capabilities: None,
         });
         assert!(!text.contains("flagged"));
     }

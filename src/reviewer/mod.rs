@@ -6,11 +6,14 @@
 pub mod claude;
 pub mod codex;
 
+#[cfg(test)]
+mod argv_tests;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long to keep draining the output pipes after the child is gone. A descendant that
@@ -37,10 +40,21 @@ pub struct Invocation {
     pub last_message_file: Option<PathBuf>,
 }
 
+/// A directory to run non-review CLI invocations from, so they cannot pick up the
+/// reviewed project's configuration. The state directory is ours and always exists.
+pub fn neutral_dir(cfg: &Config) -> PathBuf {
+    if cfg.state_dir.is_dir() {
+        cfg.state_dir.clone()
+    } else {
+        // Falling back to the project would defeat the point, so prefer the temp dir.
+        std::env::temp_dir()
+    }
+}
+
 pub trait Reviewer: Send + Sync {
     /// Cheap check that the CLI exists and is signed in. Runs before we spend a
     /// model call, so an unconfigured machine fails fast and legibly.
-    fn auth_check(&self, bin: &Path) -> Result<String, Failure>;
+    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure>;
 
     fn invocation(
         &self,
@@ -260,17 +274,12 @@ pub fn run(
         drop(stdin);
     });
 
-    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = stdout_tx.send(read_to_string_lossy(&mut stdout_pipe));
-    });
-
-    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let (stderr_tx, stderr_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = stderr_tx.send(read_to_string_lossy(&mut stderr_pipe));
-    });
+    // Readers append into a shared buffer rather than returning at EOF. If a straggler
+    // holds a pipe open past the drain deadline we still get everything that arrived --
+    // returning at EOF meant abandoning the channel discarded the whole transcript, and
+    // for Claude, whose review is stdout-only, a completed review became EMPTY_REVIEW.
+    let stdout_buf = drain(child.stdout.take().expect("stdout was piped"));
+    let stderr_buf = drain(child.stderr.take().expect("stderr was piped"));
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -313,8 +322,8 @@ pub fn run(
     }
 
     let drain_by = Instant::now() + DRAIN_GRACE;
-    let stdout = collect(&stdout_rx, drain_by);
-    let stderr = collect(&stderr_rx, drain_by);
+    let stdout = collect(&stdout_buf, drain_by);
+    let stderr = collect(&stderr_buf, drain_by);
 
     Ok(RunOutcome {
         stdout,
@@ -326,22 +335,49 @@ pub fn run(
     })
 }
 
-/// CLI output is normally UTF-8, but a stray non-UTF-8 byte in a diagnostic must not
-/// lose us the whole message.
-fn read_to_string_lossy(reader: &mut impl std::io::Read) -> String {
-    let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(reader, &mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+/// Progress of one output pipe: the bytes so far, and whether the reader reached EOF.
+struct Drain {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
 }
 
-/// Wait for a reader thread's output, giving up at `deadline` rather than blocking on a
-/// pipe that some surviving process still holds open.
-fn collect(rx: &mpsc::Receiver<String>, deadline: Instant) -> String {
-    // On timeout or a dropped sender there is nothing to report: either the reader had
-    // no output, or the pipe outlived our patience. The exit status still drives the
-    // outcome, so empty output degrades the diagnostics rather than hanging the worker.
-    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap_or_default()
+/// Start draining a pipe into a shared buffer.
+///
+/// Reading incrementally rather than returning at EOF is what makes a partial transcript
+/// recoverable: whatever arrived before the deadline is already in the buffer.
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let writer_buf = Arc::clone(&buffer);
+    let writer_done = Arc::clone(&done);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => writer_buf
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+        writer_done.store(true, Ordering::SeqCst);
+    });
+
+    Drain { buffer, done }
+}
+
+/// Take what a pipe has produced, waiting until EOF or `deadline`, whichever comes first.
+///
+/// CLI output is normally UTF-8, but a stray non-UTF-8 byte in a diagnostic must not lose
+/// us the whole message, so decoding is lossy.
+fn collect(drain: &Drain, deadline: Instant) -> String {
+    while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let buffer = drain.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Turn a non-success run into the right `Failure`.
@@ -358,6 +394,7 @@ pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
         &cfg.model,
         &cfg.effort,
         out.exit,
+        &out.diagnostics(),
         &out.diagnostics(),
     )
 }

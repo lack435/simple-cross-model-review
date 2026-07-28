@@ -2,6 +2,15 @@
 //!
 //! One request, one response. The calling agent decides what to do with the feedback.
 
+// Windows-only by design: the tool drives Windows CLIs, uses job objects for process-tree
+// cleanup and share-mode locking for its state file. Said here so a build on another host
+// fails with the reason rather than a pile of unrelated-looking errors.
+#[cfg(not(windows))]
+compile_error!(
+    "cross-review targets Windows only: it depends on job objects and Windows file \
+     share-mode locking."
+);
+
 mod config;
 mod errors;
 mod mcp;

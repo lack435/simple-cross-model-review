@@ -365,14 +365,22 @@ impl Failure {
 /// Map a reviewer CLI's stderr/stdout onto a specific failure. Ordering matters:
 /// auth and quota problems are checked before the generic crash case so the user
 /// gets an actionable message instead of a raw stack trace.
+/// `evidence` is matched against; `detail` is what the user is shown.
+///
+/// They are separate because the reviewer's own prose must never drive classification. A
+/// partial review mentioning line 429, or the phrase "does not support", would otherwise
+/// be reported as RATE_LIMITED or MODEL_UNAVAILABLE, complete with remediation telling the
+/// user to change --model over a coincidence in text. Only the CLI's own stderr/stdout is
+/// evidence about what went wrong.
 pub fn classify(
     reviewer: &str,
     model: &str,
     effort: &str,
     exit: Option<i32>,
-    output: &str,
+    evidence: &str,
+    detail: &str,
 ) -> Failure {
-    let hay = output.to_ascii_lowercase();
+    let hay = evidence.to_ascii_lowercase();
 
     let has = |needles: &[&str]| needles.iter().any(|n| hay.contains(n));
 
@@ -388,7 +396,7 @@ pub fn classify(
         "credentials not found",
         "authentication required",
     ]) {
-        return not_authenticated(reviewer, output);
+        return not_authenticated(reviewer, detail);
     }
 
     if has(&[
@@ -400,7 +408,7 @@ pub fn classify(
         "expired credentials",
         "oauth token",
     ]) {
-        return auth_expired(reviewer, output);
+        return auth_expired(reviewer, detail);
     }
 
     if has(&[
@@ -412,7 +420,7 @@ pub fn classify(
         "too many requests",
         "overloaded",
     ]) {
-        return rate_limited(reviewer, output);
+        return rate_limited(reviewer, detail);
     }
 
     if has(&[
@@ -427,8 +435,8 @@ pub fn classify(
         "invalid effort",
         "not a valid value for",
     ]) {
-        return model_unavailable(reviewer, model, effort, output);
+        return model_unavailable(reviewer, model, effort, detail);
     }
 
-    reviewer_crashed(reviewer, exit, output)
+    reviewer_crashed(reviewer, exit, detail)
 }

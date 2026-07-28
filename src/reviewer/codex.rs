@@ -14,8 +14,13 @@ use crate::errors::{self, Failure};
 pub struct CodexReviewer;
 
 impl Reviewer for CodexReviewer {
-    fn auth_check(&self, bin: &Path) -> Result<String, Failure> {
+    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
+        // Run outside the project, like `invocation`, so this preflight is not the one
+        // invocation that loads the reviewed repository's configuration. `login status`
+        // takes no `--ignore-user-config`, and must not have one anyway: auth is exactly
+        // what it is checking.
+        cmd.current_dir(super::neutral_dir(cfg));
         cmd.arg("login").arg("status");
         let out =
             super::run(cmd, "", Duration::from_secs(30), &AtomicBool::new(false)).map_err(|e| {
@@ -59,8 +64,7 @@ impl Reviewer for CodexReviewer {
             }
             None => {
                 cmd.arg("-");
-                // Only the fresh-session form accepts a sandbox policy; a resumed
-                // session keeps the policy it was created with.
+                // `-s` exists only on the fresh-session form.
                 cmd.args(["-s", &cfg.sandbox]);
             }
         }
@@ -68,6 +72,13 @@ impl Reviewer for CodexReviewer {
         cmd.arg("--json");
         cmd.arg("--skip-git-repo-check");
         cmd.args(["-m", &cfg.model]);
+        // Stated on every turn, including resumes, via the config override that `resume`
+        // does accept. A resumed session does appear to retain the policy it was created
+        // with -- verified: a write attempt on turn 2 of a `-s read-only` session was
+        // refused -- but relying on that meant the sandbox was the one setting inherited
+        // by accident rather than asserted, while `-m` and effort were both re-passed.
+        // Verified that `resume` accepts this override and still refuses writes.
+        cmd.args(["-c", &format!("sandbox_mode=\"{}\"", cfg.sandbox)]);
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.effort)]);
@@ -77,7 +88,7 @@ impl Reviewer for CodexReviewer {
             // could call back into us. `-c mcp_servers={}` does not help -- dotted
             // overrides merge into the existing table rather than replacing it -- so skip
             // the user config entirely. Auth still resolves from CODEX_HOME, and model,
-            // effort and sandbox are all passed explicitly below.
+            // effort and sandbox are all passed explicitly above.
             cmd.arg("--ignore-user-config");
         }
         cmd.arg("-o").arg(&last_message_file);
@@ -112,6 +123,7 @@ impl Reviewer for CodexReviewer {
                 &cfg.model,
                 &cfg.effort,
                 out.exit,
+                &detail,
                 &detail,
             ));
         }

@@ -18,8 +18,18 @@ const DENIED_TOOLS: &str = "Edit,Write,NotebookEdit";
 pub struct ClaudeReviewer;
 
 impl Reviewer for ClaudeReviewer {
-    fn auth_check(&self, bin: &Path) -> Result<String, Failure> {
+    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
+        // Isolated and run outside the project, like `invocation`. The stated policy is
+        // that the reviewer CLI never loads the reviewed repository's configuration, and
+        // this preflight -- which runs before every review and on every status call -- was
+        // the one invocation that broke it by construction, inheriting the project as its
+        // working directory with no isolation flags.
+        cmd.current_dir(super::neutral_dir(cfg));
+        if cfg.isolate_reviewer {
+            cmd.arg("--safe-mode");
+            cmd.arg("--strict-mcp-config");
+        }
         cmd.arg("auth").arg("status");
         let out =
             super::run(cmd, "", Duration::from_secs(30), &AtomicBool::new(false)).map_err(|e| {
@@ -136,19 +146,24 @@ impl Reviewer for ClaudeReviewer {
             .unwrap_or(false);
         if is_error || !out.success {
             let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
-            let mut detail = out.diagnostics();
+
+            // Classify on the CLI's own output only. The model's `result` text goes into
+            // the displayed detail but must not be pattern-matched: a partial review that
+            // happens to mention line 429, or the phrase "does not support", would
+            // otherwise be reported as RATE_LIMITED or MODEL_UNAVAILABLE, sending the user
+            // off to edit --model over a coincidence in prose.
+            let mut evidence = out.diagnostics();
+            if !subtype.is_empty() {
+                evidence = format!("subtype: {subtype}\n{evidence}");
+            }
+            let mut detail = evidence.clone();
             if !text.is_empty() {
                 detail = format!("{detail}\n\n{text}");
             }
-            if !subtype.is_empty() {
-                detail = format!("subtype: {subtype}\n{detail}");
-            }
-            // A resume against an expired session reports the id as unknown.
-            if detail
-                .to_ascii_lowercase()
-                .contains("no conversation found")
-                || detail.to_ascii_lowercase().contains("session not found")
-            {
+            // A resume against an expired session reports the id as unknown. Matched on
+            // the CLI's own output, for the same reason as the classification below.
+            let lower = evidence.to_ascii_lowercase();
+            if lower.contains("no conversation found") || lower.contains("session not found") {
                 return Err(errors::session_not_found(
                     "(resumed session)",
                     session_id.as_deref().unwrap_or("unknown"),
@@ -159,6 +174,7 @@ impl Reviewer for ClaudeReviewer {
                 &cfg.model,
                 &cfg.effort,
                 out.exit,
+                &evidence,
                 &detail,
             ));
         }

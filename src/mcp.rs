@@ -217,8 +217,10 @@ fn send(writer: &Arc<Mutex<std::io::Stdout>>, message: Value) {
 
 fn server_instructions(app: &App) -> String {
     let cfg = app.cfg();
+    let reviewer = cfg.describe_reviewer();
     format!(
-        "This server sends your work to {} for an independent review, and returns what it says.\n\n\
+        "This server sends your work to {reviewer} for an independent review, and returns what it \
+         says.\n\n\
          Use it when you want a second pair of eyes from a different model: before handing \
          substantial work back to the user, after a change you are unsure about, or when the user \
          asks for a review.\n\n\
@@ -228,13 +230,30 @@ fn server_instructions(app: &App) -> String {
          reviewer that still remembers its earlier findings.\n\n\
          If a tool call comes back as an error, the review did not happen. Stop, and tell the \
          user what the error says. Do not review your own work in place of the external reviewer.",
-        cfg.describe_reviewer()
     )
 }
 
 fn tool_definitions(app: &App) -> Vec<Value> {
     let cfg = app.cfg();
     let reviewer = cfg.describe_reviewer();
+
+    // Stated accurately per reviewer, because it changes what the caller must supply. A
+    // reviewer with no shell cannot obtain a diff, and a description that implied
+    // otherwise invited requests like "review the branch diff" that silently could not be
+    // carried out -- with no permission denial to surface, since the tool is absent.
+    let access = if cfg.reviewer_has_shell() {
+        "The reviewer has read-only access to this repository: it can read files and run \
+         read-only shell commands such as `git diff` and `git log`, so it can inspect the \
+         change history itself. You do not need to paste code. Describe what changed and \
+         what you want scrutinised."
+    } else {
+        "The reviewer can read and search files in this repository, so you do not need to \
+         paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \
+         diff. If the review depends on what changed rather than on the current state of \
+         the code, include the diff or a precise description of the change in \
+         'instructions' -- otherwise the reviewer can only judge the code as it now \
+         stands, and will say so."
+    };
     let caller_hint = match cfg.reviewer {
         crate::config::ReviewerKind::Claude => {
             "The reviewer is a Claude model, so this is most useful when you are not one."
@@ -251,9 +270,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                 "Send work to {reviewer} for an independent code review. {caller_hint}\n\n\
                  Returns immediately with a review_id; the review itself runs in the background. \
                  Collect it with cross_model_review_result.\n\n\
-                 The reviewer has read-only access to this repository and can read files and run \
-                 read-only shell commands, so you do not need to paste code. Describe what \
-                 changed and what you want scrutinised.\n\n\
+                 {access}\n\n\
                  To re-review after acting on feedback, call this again with the same 'session' \
                  value: the reviewer keeps its earlier findings in context and will tell you what \
                  is now resolved.\n\n\

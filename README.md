@@ -98,20 +98,36 @@ restart. Pass `fresh: true` when earlier findings would only mislead.
 
 ## What the reviewer can and cannot do
 
-The reviewer gets **read-only access, confined to the project**, so you never need to
-paste code into the request.
+The reviewer cannot modify anything. Whether it can *read* outside the project differs by
+direction, and the asymmetry is worth knowing before you point either one at code you do
+not trust:
 
-How that is enforced differs by reviewer, and the difference is worth understanding:
+| | writes | reads outside the project | shell |
+| --- | --- | --- | --- |
+| **Claude reviewer** | denied | **denied** | none |
+| **Codex reviewer** | denied | **not confined** | yes |
 
-- **Codex reviewer** — `--sandbox read-only`. Enforced by the OS, so it holds regardless
-  of what the model tries to run. The Codex reviewer keeps shell access.
+- **Codex reviewer** — `--sandbox read-only`, plus the same policy restated as
+  `-c sandbox_mode` on resumed turns, since `-s` exists only on the fresh-session form.
+  Verified: a write was refused on turn 1 and again on turn 2 of a resumed session. What
+  this does *not* do is confine reads — a read-only sandbox prevents writes, and the Codex
+  reviewer keeps shell access, so it can read anything your account can and quote it into
+  the review text, which is returned to the caller verbatim. If you are reviewing a
+  repository you do not trust, prefer the Claude direction.
+
+  A caveat on enforcement: the README previously claimed this is enforced by the OS. What
+  I have actually verified is that the write was *refused* — I have not established
+  whether that refusal comes from the OS or from Codex's own policy layer, and Codex's
+  sandboxing has historically been Seatbelt/Landlock, i.e. macOS and Linux. Treat the
+  Codex write boundary as enforced by the CLI unless you have checked further.
 - **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
   the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
   Code's own tools and have no write or execute capability. Each is further scoped to the
   project (`Read(./**)` and likewise for Grep and Glob), because a bare grant is not
-  path-scoped and would let the reviewer read any file you can. Verified for all three:
-  reading, grepping and globbing outside the project were each denied, while the project
-  root and its subdirectories stayed readable. The scope is deliberately relative — these
+  path-scoped and would let the reviewer read any file you can. Verified for all three
+  tools and all three escapes: an absolute path outside the project, a `..`-relative path,
+  and a directory junction inside the project pointing out of it were each denied, while
+  the project root and its subdirectories stayed readable. The scope is deliberately relative — these
   are gitignore-style globs, so interpolating an absolute path would make the path's own
   characters significant, and a project at `C:\work\[ab]` would turn into a character
   class matching its siblings.
@@ -237,7 +253,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 86 unit tests: no network, no model calls
+cargo test          # 105 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
@@ -271,9 +287,13 @@ Both directions pass against live CLIs.
 - **The reviewer runs inside a job object**, so timeout, cancel, and even a clean exit
   that leaves a helper behind all reap the whole process tree. On Windows killing a parent
   orphans its descendants, and an orphan holding an inherited pipe would keep our reader
-  threads blocked forever. Output collection is bounded as well, so a stuck pipe degrades
-  diagnostics instead of hanging the review. Shelling out to `taskkill` was rejected: it
-  cannot help once the direct child has exited and the parent/child links are gone, and
-  invoking it by bare name is an execution hazard, because Windows resolves an unqualified
-  executable through the current directory — the repository under review — before System32.
+  threads blocked forever. Output collection is bounded in *time* as well, so a stuck pipe
+  degrades diagnostics instead of hanging the review: readers append into a shared buffer,
+  so whatever arrived before the deadline is still used rather than discarded. It is not
+  bounded in size — a reviewer emitting unbounded output would be held in memory.
+
+  Shelling out to `taskkill` was rejected: it cannot help once the direct child has exited
+  and the parent/child links are gone, and invoking it by bare name is an execution hazard,
+  because Windows resolves an unqualified executable through the current directory — the
+  repository under review — before System32.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

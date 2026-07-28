@@ -229,6 +229,16 @@ impl ExclusiveLock {
             {
                 Ok(file) => return Ok(Self { _file: file }),
                 Err(e) => {
+                    // Only a sharing conflict means "someone else holds it". Retrying an
+                    // access-denied or bad-path error would stall for the whole wait and
+                    // then report contention, telling the caller to pick a different
+                    // session name -- which would fail identically.
+                    if !is_sharing_conflict(&e) {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("cannot open lock file {}: {e}", path.display()),
+                        ));
+                    }
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -243,6 +253,17 @@ impl ExclusiveLock {
             }
         }
     }
+}
+
+/// Windows reports a lock held elsewhere as a sharing or lock violation. Anything else --
+/// a denied ACL, a missing volume, a read-only disk -- is a real error, not contention.
+fn is_sharing_conflict(e: &io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        e.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+    )
 }
 
 /// Lock path for a named review session, used to stop two server processes from
@@ -453,10 +474,19 @@ mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         record(&store, "default", "thread-1");
-        let leftover = store.path().with_extension("json.tmp");
+        // Enumerate the directory rather than probing one guessed name. The previous
+        // version asserted `sessions.json.tmp` did not exist, but temp files are named
+        // `sessions.<pid>.<seq>.tmp`, so it was asserting the absence of a path the code
+        // never creates -- it would have passed while every temp file leaked.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read state dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
         assert!(
-            !leftover.exists(),
-            "atomic write should rename, not leave a .tmp file"
+            leftovers.is_empty(),
+            "atomic write should rename, not leave temp files: {leftovers:?}"
         );
     }
 }

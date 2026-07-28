@@ -63,7 +63,7 @@ impl App {
             return Ok(cached);
         }
         let bin = reviewer::resolve_bin(&self.cfg)?;
-        let auth = self.reviewer.auth_check(&bin)?;
+        let auth = self.reviewer.auth_check(&bin, &self.cfg)?;
         let ready = Preflight { bin, auth };
         *self.preflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(ready.clone());
         Ok(ready)
@@ -494,6 +494,7 @@ impl Job {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
 
+        let capabilities = self.cfg.reviewer_capabilities();
         let text = prompt::build(&PromptParts {
             instructions: &self.instructions,
             context_paths: &self.context_paths,
@@ -501,6 +502,7 @@ impl Job {
             turn,
             resumed: resume_id.is_some(),
             preamble,
+            capabilities: Some(&capabilities),
         });
 
         let invocation = self

@@ -3,16 +3,13 @@
 # This is the reverse of .mcp.json: here Codex is the caller and Claude Opus 5 is the
 # reviewer, so the tool can be dogfooded in both directions from one checkout.
 #
-# Two things differ from the examples/ templates, both deliberate:
-#
-#   1. The command points at target\release\ rather than tools\. This repository *builds*
-#      cross-review.exe instead of vendoring it, so the freshly built binary is the one
-#      worth testing. Other projects should copy the released exe to tools\ and point
-#      there, as examples/codex-reviewed-by-claude shows. Run .\build.ps1 first.
-#
-#   2. dist\cross-review.exe is deliberately not used here. Windows locks a running
-#      executable, so while an agent session has the Claude-side MCP server open, dist\
-#      cannot be restaged and would serve a stale build.
+# Both directions point at dist\cross-review.exe on purpose. An earlier version pointed
+# here at target\release\ so the reverse test would always exercise a fresh build, which
+# backfired: Windows locks a running executable, so an open Codex session held the build
+# output and `cargo build --release` failed with "failed to remove file". Keeping both
+# servers on dist\ leaves target\ free, so building is never blocked; the cost is that
+# restaging dist\ requires unloading both agent sessions first, which build.ps1 detects and
+# reports by PID rather than silently shipping a stale binary.
 #
 # Prerequisite: Codex only loads project config for trusted folders. Approve this folder
 # when Codex first opens it, which writes
@@ -23,7 +20,7 @@
 # config. Verify from inside a session with cross_model_review_status.
 
 [mcp_servers.cross_review]
-command = "target\\release\\cross-review.exe"
+command = "dist\\cross-review.exe"
 args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
