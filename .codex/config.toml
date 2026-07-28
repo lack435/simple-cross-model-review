@@ -1,0 +1,32 @@
+# Project-level Codex configuration for cross-review's own repository.
+#
+# This is the reverse of .mcp.json: here Codex is the caller and Claude Opus 5 is the
+# reviewer, so the tool can be dogfooded in both directions from one checkout.
+#
+# Two things differ from the examples/ templates, both deliberate:
+#
+#   1. The command points at target\release\ rather than tools\. This repository *builds*
+#      cross-review.exe instead of vendoring it, so the freshly built binary is the one
+#      worth testing. Other projects should copy the released exe to tools\ and point
+#      there, as examples/codex-reviewed-by-claude shows. Run .\build.ps1 first.
+#
+#   2. dist\cross-review.exe is deliberately not used here. Windows locks a running
+#      executable, so while an agent session has the Claude-side MCP server open, dist\
+#      cannot be restaged and would serve a stale build.
+#
+# Prerequisite: Codex only loads project config for trusted folders. Approve this folder
+# when Codex first opens it, which writes
+#   [projects.'c:\dev\simple-cross-model-review']
+#   trust_level = "trusted"
+# into %USERPROFILE%\.codex\config.toml. Until that exists this file is ignored silently,
+# and `codex mcp list` will not show the server either way -- it reports only global
+# config. Verify from inside a session with cross_model_review_status.
+
+[mcp_servers.cross_review]
+command = "target\\release\\cross-review.exe"
+args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+
+# Reviews are collected by polling, so a tool call returns promptly and this budget only
+# covers a single request rather than a whole review.
+startup_timeout_sec = 30
+tool_timeout_sec = 400
