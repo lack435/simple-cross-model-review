@@ -41,14 +41,26 @@ pub struct Invocation {
 }
 
 /// A directory to run non-review CLI invocations from, so they cannot pick up the
-/// reviewed project's configuration. The state directory is ours and always exists.
+/// reviewed project's configuration.
+///
+/// The state directory is normally ours and well outside the project, but not always: it
+/// is user-settable via `--state-dir`, and its own fallback puts it under the project when
+/// `LOCALAPPDATA` is unset. A state directory inside the project would make this "neutral"
+/// directory anything but, so that case is rejected in favour of the temp directory.
 pub fn neutral_dir(cfg: &Config) -> PathBuf {
-    if cfg.state_dir.is_dir() {
+    if cfg.state_dir.is_dir() && !is_within(&cfg.state_dir, &cfg.cwd) {
         cfg.state_dir.clone()
     } else {
-        // Falling back to the project would defeat the point, so prefer the temp dir.
         std::env::temp_dir()
     }
+}
+
+/// Is `path` inside `root`? Compared case-insensitively, as Windows paths are.
+fn is_within(path: &Path, root: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
+    let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 pub trait Reviewer: Send + Sync {

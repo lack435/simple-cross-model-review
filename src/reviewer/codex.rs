@@ -108,22 +108,27 @@ impl Reviewer for CodexReviewer {
         let events = parse_events(&out.stdout);
 
         if !out.success {
+            // Evidence excludes stdout on purpose. The JSONL stream carries
+            // `agent_message` items, so classifying on it would let the reviewer's own
+            // prose choose the failure code -- a review mentioning 429 becoming
+            // RATE_LIMITED. Only stderr and the stream's own error events qualify.
+            let mut evidence = out.stderr.trim().to_string();
+            if !events.errors.is_empty() {
+                evidence = format!("{}\n{}", events.errors.join("\n"), evidence);
+            }
+
             let mut detail = out.diagnostics();
             if !events.errors.is_empty() {
                 detail = format!("{}\n\n{}", events.errors.join("\n"), detail);
             }
-            if detail.to_ascii_lowercase().contains("no session")
-                || detail.to_ascii_lowercase().contains("session not found")
-                || detail.to_ascii_lowercase().contains("no rollout")
-            {
-                return Err(errors::session_not_found("(resumed session)", "unknown"));
-            }
+
+            // An expired resume target is detected inside `classify`.
             return Err(errors::classify(
                 "codex",
                 &cfg.model,
                 &cfg.effort,
                 out.exit,
-                &detail,
+                &evidence,
                 &detail,
             ));
         }
@@ -333,6 +338,58 @@ mod tests {
             .expect("parse");
         assert_eq!(parsed.text, "## Verdict\nREQUEST CHANGES");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A failed run whose `agent_message` text contains a phrase the classifier matches.
+    ///
+    /// Same property as the Claude adapter: the JSONL stream carries the reviewer's own
+    /// prose, so classifying on stdout would let the review pick the failure code.
+    fn failure_with_agent_message(text: &str) -> RunOutcome {
+        let event = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": text},
+        });
+        RunOutcome {
+            stdout: format!(
+                "{{\"type\":\"thread.started\",\"thread_id\":\"t1\"}}\n{}\n",
+                event
+            ),
+            stderr: String::new(),
+            exit: Some(1),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn an_agent_message_mentioning_429_is_not_reported_as_rate_limited() {
+        let out = failure_with_agent_message(
+            "`server.rs:429` should return 429 when the quota is exhausted.",
+        );
+        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
+        assert!(err.detail.unwrap_or_default().contains("429"));
+    }
+
+    #[test]
+    fn an_agent_message_mentioning_a_missing_session_is_not_session_not_found() {
+        let out = failure_with_agent_message(
+            "The error path prints 'session not found' but the session exists.",
+        );
+        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
+    }
+
+    #[test]
+    fn a_stream_error_event_is_still_classified() {
+        // Error events are the CLI's own, so they remain evidence.
+        let mut out = failure_with_agent_message("ordinary review prose");
+        out.stdout.push_str(
+            "{\"type\":\"error\",\"message\":\"stream error: 429 rate limit exceeded\"}\n",
+        );
+        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "RATE_LIMITED");
     }
 
     #[test]

@@ -494,7 +494,14 @@ impl Job {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
 
+        // --no-preamble means "send my instructions with nothing added", so it has to
+        // suppress the capability section too, not just the preamble.
         let capabilities = self.cfg.reviewer_capabilities();
+        let capabilities = if self.cfg.no_preamble {
+            None
+        } else {
+            Some(capabilities.as_str())
+        };
         let text = prompt::build(&PromptParts {
             instructions: &self.instructions,
             context_paths: &self.context_paths,
@@ -502,7 +509,7 @@ impl Job {
             turn,
             resumed: resume_id.is_some(),
             preamble,
-            capabilities: Some(&capabilities),
+            capabilities,
         });
 
         let invocation = self

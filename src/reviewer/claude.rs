@@ -147,28 +147,31 @@ impl Reviewer for ClaudeReviewer {
         if is_error || !out.success {
             let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
 
-            // Classify on the CLI's own output only. The model's `result` text goes into
-            // the displayed detail but must not be pattern-matched: a partial review that
-            // happens to mention line 429, or the phrase "does not support", would
-            // otherwise be reported as RATE_LIMITED or MODEL_UNAVAILABLE, sending the user
-            // off to edit --model over a coincidence in prose.
-            let mut evidence = out.diagnostics();
+            // Evidence must contain nothing the model wrote: a partial review mentioning
+            // line 429, or the phrase "does not support", would otherwise be reported as
+            // RATE_LIMITED or MODEL_UNAVAILABLE, sending the user off to edit --model over
+            // a coincidence in prose.
+            //
+            // Note what does NOT qualify: `out.diagnostics()`, because it appends raw
+            // stdout and stdout here *is* the result JSON. An earlier version of this
+            // split used it and so still classified the review text -- dropping the
+            // explicit re-append of `text` achieved nothing on its own. Only stderr and
+            // fields the CLI itself owns are evidence.
+            let mut evidence = out.stderr.trim().to_string();
             if !subtype.is_empty() {
                 evidence = format!("subtype: {subtype}\n{evidence}");
             }
+            if let Some(status) = parsed.get("api_error_status").filter(|v| !v.is_null()) {
+                evidence = format!("api_error_status: {status}\n{evidence}");
+            }
+
+            // The review text is still shown, just never matched against.
             let mut detail = evidence.clone();
             if !text.is_empty() {
                 detail = format!("{detail}\n\n{text}");
             }
-            // A resume against an expired session reports the id as unknown. Matched on
-            // the CLI's own output, for the same reason as the classification below.
-            let lower = evidence.to_ascii_lowercase();
-            if lower.contains("no conversation found") || lower.contains("session not found") {
-                return Err(errors::session_not_found(
-                    "(resumed session)",
-                    session_id.as_deref().unwrap_or("unknown"),
-                ));
-            }
+            // An expired resume target is detected inside `classify`, which every failure
+            // path reaches -- including the one where stdout never parses.
             return Err(errors::classify(
                 "claude",
                 &cfg.model,
@@ -277,6 +280,93 @@ mod tests {
         assert_eq!(err.code, "EMPTY_REVIEW");
     }
 
+    /// A failed run whose review text contains a phrase the classifier looks for.
+    ///
+    /// These are the regressions that catch classifying on model prose. The first attempt
+    /// at the evidence/detail split passed `out.diagnostics()` as evidence, which appends
+    /// raw stdout -- and stdout here *is* the result JSON, so the review text was still
+    /// being matched. Only stderr and CLI-owned fields are evidence now.
+    fn failure_with_review_text(text: &str) -> RunOutcome {
+        let json = serde_json::json!({
+            "is_error": true,
+            "subtype": "error_during_execution",
+            "result": text,
+            "session_id": "s",
+            "api_error_status": null,
+        });
+        RunOutcome {
+            stdout: json.to_string(),
+            // Empty: nothing the CLI itself said went wrong.
+            stderr: String::new(),
+            exit: Some(1),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn a_review_mentioning_429_is_not_reported_as_rate_limited() {
+        let out = failure_with_review_text(
+            "## Findings\n- `src/lib.rs:429` returns 429 on quota exhaustion; too many requests \
+             are not retried.",
+        );
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
+        // The text is still shown to the user, just never matched against.
+        assert!(err.detail.unwrap_or_default().contains("429"));
+    }
+
+    #[test]
+    fn a_review_saying_does_not_support_is_not_reported_as_model_unavailable() {
+        let out = failure_with_review_text(
+            "The parser does not support nested groups; this is an invalid model of the grammar.",
+        );
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
+    }
+
+    #[test]
+    fn a_review_mentioning_a_missing_session_is_not_reported_as_session_not_found() {
+        let out = failure_with_review_text(
+            "`tools.rs:200` returns 'no conversation found' when the session not found branch is \
+             hit, which is confusing.",
+        );
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
+    }
+
+    #[test]
+    fn a_real_cli_error_on_stderr_is_still_classified() {
+        // The other half of the property: excluding model text must not blind us to the
+        // CLI's own diagnosis.
+        let mut out = failure_with_review_text("a perfectly ordinary review");
+        out.stderr = "Error: 429 Too Many Requests".into();
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "RATE_LIMITED");
+    }
+
+    #[test]
+    fn a_cli_reported_api_error_status_is_classified() {
+        let json = serde_json::json!({
+            "is_error": true,
+            "subtype": "error",
+            "result": "harmless prose",
+            "session_id": "s",
+            "api_error_status": 401,
+        });
+        let out = RunOutcome {
+            stdout: json.to_string(),
+            stderr: String::new(),
+            exit: Some(1),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+        };
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
+    }
+
     #[test]
     fn non_json_stdout_on_failure_is_classified_not_swallowed() {
         let mut out = outcome("Invalid API key · Please run /login", false);
@@ -287,10 +377,22 @@ mod tests {
 
     #[test]
     fn expired_resume_target_maps_to_session_not_found() {
-        let json = r#"{"is_error":true,"subtype":"error","result":"No conversation found with session ID abc","session_id":"abc"}"#;
-        let err = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
-            .unwrap_err();
+        // Fixture taken from the real thing: `claude -p --resume <bogus-uuid>` exits 1 with
+        // the message on stderr and stdout completely empty. The previous fixture put it in
+        // a `result` field of valid JSON, which the CLI never does -- so it exercised a
+        // branch that could not be reached in practice, and the automatic retry into a
+        // fresh session had in fact never worked.
+        let out = RunOutcome {
+            stdout: String::new(),
+            stderr: "No conversation found with session ID: \
+                     00000000-1111-2222-3333-444444444444"
+                .to_string(),
+            exit: Some(1),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+        };
+        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");
     }
 }

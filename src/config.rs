@@ -287,8 +287,13 @@ impl Config {
             // Codex runs under a sandbox policy rather than a tool allow-list, so its
             // shell is always present and always write-denied.
             ReviewerKind::Codex => true,
-            // Claude's shell exists only if Bash was put back into the tool set.
-            ReviewerKind::Claude => self.tools.contains("Bash"),
+            // Claude's shell exists only if Bash was put back into the tool set. Compared
+            // as whole entries, not as a substring: `BashOutput` is a separate tool that
+            // reads a background shell's output and grants no ability to run anything.
+            ReviewerKind::Claude => self
+                .tools
+                .split(',')
+                .any(|tool| tool.trim().eq_ignore_ascii_case("Bash")),
         }
     }
 
@@ -660,6 +665,21 @@ mod tests {
         let text = codex.reviewer_capabilities();
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
+    }
+
+    #[test]
+    fn shell_detection_matches_whole_tool_names() {
+        // BashOutput reads a background shell's output; it cannot run anything, so it must
+        // not be mistaken for shell access by a substring match.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,BashOutput",
+        ]))
+        .expect("config");
+        assert!(!cfg.reviewer_has_shell());
+        assert!(cfg.reviewer_capabilities().contains("no shell"));
     }
 
     #[test]

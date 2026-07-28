@@ -384,6 +384,20 @@ pub fn classify(
 
     let has = |needles: &[&str]| needles.iter().any(|n| hay.contains(n));
 
+    // Checked here rather than in each adapter, because a reviewer CLI can report an
+    // expired session on a path where its structured output never arrives. Claude reports
+    // it on stderr with stdout empty, so the JSON never parses and the adapter's own check
+    // was unreachable -- which meant the automatic retry into a fresh session could never
+    // fire, despite a test that appeared to cover it.
+    if has(&[
+        "no conversation found",
+        "session not found",
+        "no rollout",
+        "no session found",
+    ]) {
+        return session_not_found("(resumed session)", "unknown").with_detail(detail);
+    }
+
     if has(&[
         "not logged in",
         "not authenticated",

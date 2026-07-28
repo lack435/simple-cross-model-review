@@ -201,6 +201,25 @@ fn claude_argv_honours_an_explicit_tool_override() {
     );
 }
 
+#[test]
+fn the_auth_preflight_never_runs_inside_the_reviewed_project() {
+    // The reviewer CLI must not pick up the reviewed repository's configuration, and the
+    // preflight -- which runs before every review and on every status call -- was the one
+    // invocation that did. A state directory inside the project must not be used as the
+    // "neutral" directory either.
+    let inside = std::env::current_dir().expect("cwd").join("state-inside");
+    std::fs::create_dir_all(&inside).ok();
+    let cfg = config(&["claude", "--state-dir", &inside.to_string_lossy()]);
+    let neutral = crate::reviewer::neutral_dir(&cfg);
+    assert!(
+        !neutral.starts_with(&cfg.cwd),
+        "neutral dir {} must be outside {}",
+        neutral.display(),
+        cfg.cwd.display()
+    );
+    std::fs::remove_dir_all(&inside).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Codex
 // ---------------------------------------------------------------------------
