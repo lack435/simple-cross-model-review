@@ -67,7 +67,8 @@ impl ReviewerKind {
     }
 }
 
-/// Tools the Claude reviewer is pre-approved to use.
+/// Built-in tools the Claude reviewer may use at all. Omitting Write, Edit and Bash
+/// here removes them from the session entirely, so the model has nothing to attempt.
 ///
 /// Bash is deliberately absent. Claude's permission patterns match by command prefix,
 /// and `Bash(git diff:*)` therefore permits *any* arguments to `git diff` -- including
@@ -85,11 +86,27 @@ impl ReviewerKind {
 /// So the Claude reviewer gets Read, Grep and Glob: Claude Code's own tools, which have
 /// no write or execute capability at all. See `--allow-tools` to opt back into shell
 /// access, and the README for why the Codex reviewer can safely keep it.
-pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Read Grep Glob";
-
-/// Built-in tools the Claude reviewer may use at all. Omitting Write, Edit and Bash
-/// here removes them from the session entirely, so the model has nothing to attempt.
 pub const DEFAULT_CLAUDE_TOOLS: &str = "Read,Grep,Glob";
+
+/// Permission rules confining the Claude reviewer's reads to the working root.
+///
+/// Bare `Read`/`Grep`/`Glob` grants are not path-scoped: they permit any absolute path
+/// the user can read, which makes the boundary "cannot write" rather than "cannot leave
+/// the repository". Qualifying each rule with the working root fixes that, and it was
+/// verified for all three tools -- reading, grepping and globbing `C:\Windows` were each
+/// denied while the same operations inside the project succeeded.
+///
+/// Each rule is returned as its own string, and passed as its own argument, so a project
+/// path containing spaces or commas cannot be split apart by the CLI's list parsing.
+pub fn scoped_claude_rules(cwd: &Path) -> Vec<String> {
+    // Rules use forward slashes and a `//` prefix to denote an absolute path.
+    let root = cwd.to_string_lossy().replace('\\', "/");
+    let scope = format!("//{}/**", root.trim_end_matches('/'));
+    ["Read", "Grep", "Glob"]
+        .iter()
+        .map(|tool| format!("{tool}({scope})"))
+        .collect()
+}
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
@@ -109,8 +126,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Codex sandbox policy.
     pub sandbox: String,
-    /// Override for the Claude allow-list.
-    pub allowed_tools: String,
+    /// Claude permission rules, one per entry. Kept as separate strings so each reaches
+    /// the CLI as its own argument and a path with spaces cannot be mis-split.
+    pub allowed_tools: Vec<String>,
     pub tools: String,
     pub preamble: Option<String>,
     pub no_preamble: bool,
@@ -220,17 +238,25 @@ impl Config {
             None => None,
         };
 
+        // Computed before the struct literal because the default rules are derived from
+        // `cwd`, which the literal moves.
+        // A user-supplied list is passed through as one argument; the CLI splits it.
+        let allowed_tools = match allowed_tools {
+            Some(list) => vec![list],
+            None => scoped_claude_rules(&cwd),
+        };
+        let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
+
         Ok(Self {
             reviewer,
             model: model.unwrap_or_else(|| reviewer.default_model().to_string()),
             effort,
             bin,
-            state_dir: state_dir.unwrap_or_else(|| default_state_dir(&cwd)),
+            state_dir,
             cwd,
             timeout: Duration::from_secs(timeout_secs),
             sandbox,
-            allowed_tools: allowed_tools
-                .unwrap_or_else(|| DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()),
+            allowed_tools,
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
             preamble,
             no_preamble,
@@ -298,7 +324,7 @@ fn default_state_dir(cwd: &Path) -> PathBuf {
     }
 }
 
-fn fnv1a64(s: &str) -> u64 {
+pub fn fnv1a64(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         hash ^= *b as u64;
@@ -331,8 +357,11 @@ OPTIONS:
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
-  --tools <list>              Claude built-in tools. Default: Read,Grep,Glob,Bash
-  --allow-tools <list>        Claude permission allow-list (read-only commands).
+  --tools <list>              Claude built-in tools. Default: Read,Grep,Glob
+                              (no Bash: see the README on why a prefix allow-list
+                              cannot express read-only).
+  --allow-tools <list>        Claude permission rules. Default: Read/Grep/Glob scoped
+                              to the working root, so reads cannot leave the project.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-mcp        Let the reviewer load its own MCP servers and user config.
@@ -483,10 +512,37 @@ mod tests {
             cfg.tools
         );
         assert!(
-            !cfg.allowed_tools.contains("Bash"),
-            "no Bash pattern may be pre-approved by default: {}",
+            !cfg.allowed_tools.iter().any(|rule| rule.contains("Bash")),
+            "no Bash pattern may be pre-approved by default: {:?}",
             cfg.allowed_tools
         );
+    }
+
+    #[test]
+    fn default_read_rules_are_scoped_to_the_working_root() {
+        // Bare Read/Grep/Glob grants are not path-scoped, which would make the boundary
+        // "cannot write" rather than "cannot leave the project".
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert_eq!(cfg.allowed_tools.len(), 3);
+        let root = cfg.cwd.to_string_lossy().replace('\\', "/");
+        for tool in ["Read", "Grep", "Glob"] {
+            let expected = format!("{tool}(//{root}/**)");
+            assert!(
+                cfg.allowed_tools.contains(&expected),
+                "expected {expected} in {:?}",
+                cfg.allowed_tools
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_rules_keep_a_path_with_spaces_in_one_piece() {
+        // Each rule is passed as its own argument, so a space must not split it.
+        let rules = scoped_claude_rules(Path::new(r"C:\Users\My Name\my repo"));
+        assert_eq!(rules.len(), 3);
+        assert!(rules
+            .iter()
+            .all(|r| r.contains("//C:/Users/My Name/my repo/**")));
     }
 
     #[test]
@@ -502,7 +558,15 @@ mod tests {
         ]))
         .expect("config");
         assert!(cfg.tools.contains("Bash"));
-        assert!(cfg.allowed_tools.contains("Bash(git diff:*)"));
+        // Passed through as a single argument for the CLI to split itself.
+        assert_eq!(cfg.allowed_tools, vec!["Read Grep Glob Bash(git diff:*)"]);
+    }
+
+    #[test]
+    fn help_text_matches_the_real_defaults() {
+        // The help text claimed Bash was default long after it was removed.
+        assert!(USAGE.contains("Default: Read,Grep,Glob\n"));
+        assert!(!USAGE.contains("Read,Grep,Glob,Bash"));
     }
 
     #[test]

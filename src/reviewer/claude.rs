@@ -72,7 +72,12 @@ impl Reviewer for ClaudeReviewer {
         // non-interactive run can neither hang nor escalate.
         cmd.args(["--permission-mode", "dontAsk"]);
         cmd.args(["--tools", &cfg.tools]);
-        cmd.args(["--allowed-tools", &cfg.allowed_tools]);
+        // One argument per rule: a project path containing a space or comma would
+        // otherwise be split into fragments by the CLI's list parsing.
+        cmd.arg("--allowed-tools");
+        for rule in &cfg.allowed_tools {
+            cmd.arg(rule);
+        }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);
         if cfg.isolate_mcp {
             // With no --mcp-config supplied this loads zero MCP servers, which keeps a

@@ -289,6 +289,18 @@ pub fn bad_request(summary: impl Into<String>) -> Failure {
     }
 }
 
+/// The worker thread unwound without recording a result.
+pub fn worker_panicked(review_id: &str) -> Failure {
+    Failure::new(
+        "INTERNAL_ERROR",
+        format!("The cross-review worker for review '{review_id}' failed unexpectedly."),
+        "The cross-model review tool hit an internal error and the review did not \
+         complete. Retrying is reasonable; if it recurs, this is a bug in cross-review \
+         itself and the server's stderr output will contain the panic message.\n\n\
+         The review has NOT been performed.",
+    )
+}
+
 /// Another server process holds this named session.
 pub fn session_leased(session: &str, detail: String) -> Failure {
     let mut failure = Failure {

@@ -257,9 +257,15 @@ pub fn session_lock_path(state_dir: &Path, session: &str) -> PathBuf {
                 '_'
             }
         })
-        .take(64)
+        .take(48)
         .collect();
-    state_dir.join(format!("session-{safe}.lock"))
+    // Sanitising is lossy: `a/b` and `a?b` both flatten to `a_b`, and anything past the
+    // truncation point disappears. A hash of the whole original name keeps distinct
+    // sessions on distinct lock files, so they cannot spuriously report SESSION_BUSY.
+    state_dir.join(format!(
+        "session-{safe}-{:016x}.lock",
+        crate::config::fnv1a64(session)
+    ))
 }
 
 pub fn now_unix() -> u64 {

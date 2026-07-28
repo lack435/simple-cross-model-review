@@ -94,24 +94,20 @@ restart. Pass `fresh: true` when earlier findings would only mislead.
 
 ## What the reviewer can and cannot do
 
-The reviewer gets **read-only** access, so you never need to paste code into the request.
+The reviewer gets **read-only access, confined to the project**, so you never need to
+paste code into the request.
 
-Read-only, not repository-only. The reviewer's working directory is the project, so that
-is what it reads in practice, but the Claude reviewer's `Read`/`Grep`/`Glob` grants are not
-path-scoped and an absolute path outside the project would still be readable. Treat the
-boundary as "cannot modify anything", not "cannot see anything else". This matters little
-in the usual case — the reviewer runs as you, with the same reach as the agent that called
-it — but it is worth knowing before pointing a reviewer at a repository that sits next to
-secrets you would not want quoted back in a review.
-
-How the write boundary is enforced differs by reviewer, and the difference is worth
-understanding:
+How that is enforced differs by reviewer, and the difference is worth understanding:
 
 - **Codex reviewer** — `--sandbox read-only`. Enforced by the OS, so it holds regardless
   of what the model tries to run. The Codex reviewer keeps shell access.
 - **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
   the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
-  Code's own tools and have no write or execute capability.
+  Code's own tools and have no write or execute capability. Each is further scoped to the
+  working root (`Read(//C:/your/project/**)` and likewise for Grep and Glob), because a
+  bare grant is not path-scoped and would let the reviewer read any file you can. Verified
+  for all three: reading, grepping and globbing outside the project were each denied,
+  while the same operations inside it succeeded.
 
 The Claude reviewer has no shell by default, and that is a deliberate reversal. Claude's
 permission patterns match by **command prefix**, so `Bash(git diff:*)` permits *any*
@@ -203,7 +199,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 82 unit tests: no network, no model calls
+cargo test          # 85 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```

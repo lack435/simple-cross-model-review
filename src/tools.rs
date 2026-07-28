@@ -83,6 +83,17 @@ impl App {
 
         let ready = self.ensure_ready()?;
 
+        // The lease comes first, before the session record is read. Reading first would
+        // be a stale-read race: another server process can finish a `fresh` review, or
+        // rebind an expired session to a new id, while we are still waiting for the
+        // lease -- and we would then resume the old id and overwrite the newer mapping.
+        // Holding the lease across the read makes the state we act on the current state.
+        let lease = ExclusiveLock::acquire(
+            &session::session_lock_path(&self.cfg.state_dir, &session),
+            SESSION_LEASE_WAIT,
+        )
+        .map_err(|e| errors::session_leased(&session, e.to_string()))?;
+
         // Decide whether this is a new review or another turn on an existing one.
         let prior = if fresh {
             None
@@ -112,23 +123,6 @@ impl App {
             .try_start(&session, turn, resumed)
             .map_err(|existing| errors::session_busy(&session, &existing))?;
 
-        // The registry only covers this process. Two servers on the same project share a
-        // state directory, so without a cross-process lease both could resume the same
-        // reviewer conversation at once. Held until the review finishes.
-        let lease = match ExclusiveLock::acquire(
-            &session::session_lock_path(&self.cfg.state_dir, &session),
-            SESSION_LEASE_WAIT,
-        ) {
-            Ok(lease) => Some(lease),
-            Err(e) => {
-                self.registry.finish(
-                    &id,
-                    Outcome::failed(errors::session_leased(&session, e.to_string())),
-                );
-                return Err(errors::session_leased(&session, String::new()));
-            }
-        };
-
         let job = Job {
             cfg: Arc::clone(&self.cfg),
             reviewer: Arc::clone(&self.reviewer),
@@ -141,7 +135,7 @@ impl App {
             context_paths,
             turn,
             cancel,
-            _lease: lease,
+            _lease: Some(lease),
         };
 
         let spawned = std::thread::Builder::new()
@@ -429,8 +423,34 @@ struct Job {
     _lease: Option<ExclusiveLock>,
 }
 
+/// Records a failure if the worker thread unwinds before finishing.
+///
+/// Without this, a panic would leave the review `Running` for the life of the server:
+/// the lease is released when the `Job` drops, but the registry entry never reaches a
+/// terminal state, so every poll waits out its timeout and the session stays claimed.
+struct FinishGuard<'a> {
+    registry: &'a Registry,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for FinishGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .finish(self.id, Outcome::failed(errors::worker_panicked(self.id)));
+        }
+    }
+}
+
 impl Job {
     fn run(self, resume_id: Option<String>) {
+        let mut guard = FinishGuard {
+            registry: &self.registry,
+            id: &self.id,
+            armed: true,
+        };
+
         let outcome = match self.attempt(resume_id.as_deref(), self.turn) {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -462,6 +482,9 @@ impl Job {
             }
         };
         self.registry.finish(&self.id, outcome);
+        // Disarmed only once a terminal state is recorded, so the guard covers every
+        // path that could unwind before this point.
+        guard.armed = false;
     }
 
     fn attempt(&self, resume_id: Option<&str>, turn: u32) -> Result<Outcome, Failure> {
