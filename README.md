@@ -287,16 +287,17 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 105 unit tests: no network, no model calls
+cargo test          # 128 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
 
 `smoke.ps1` speaks real MCP over stdio to the built executable and checks the whole
 round trip: initialize, `tools/list`, a live review, a resumed follow-up review that
-proves the reviewer retained context, the error paths, and that session state landed on
-disk. It calls the reviewer model for real, so it costs tokens — it defaults to
-`--effort low` for that reason.
+proves the reviewer retained context, the error paths, a cancellation that must leave the
+request unanswered and the reviewer dead, and that session state landed on disk. It calls
+the reviewer model for real, so it costs tokens — it defaults to `--effort low` for that
+reason.
 
 Both directions pass against live CLIs.
 
@@ -330,4 +331,30 @@ Both directions pass against live CLIs.
   and the parent/child links are gone, and invoking it by bare name is an execution hazard,
   because Windows resolves an unqualified executable through the current directory — the
   repository under review — before System32.
+- **A cancelled request cancels its review.** `notifications/cancelled` suppresses the
+  response, as the spec requires, and stops the reviewer the request started or was
+  waiting on. Suppressing the response alone would be the cheap half: the reviewer would
+  keep working — and keep costing — for the rest of its timeout budget for a result
+  nobody will read, and would hold the session lease for just as long, so the next review
+  of that session is refused as busy in the meantime.
+
+  For a cancelled `cross_model_review` that is unarguable — the `review_id` was never
+  delivered, so nothing could ever collect the review. For a cancelled
+  `cross_model_review_result` it is a real trade: the caller does hold the `review_id`
+  and could have come back for it, but the protocol cannot distinguish a caller that will
+  from one that will not. **So the client's tool timeout must exceed `MAX_WAIT_SECS`
+  (300s), or a client giving up on a poll will destroy a review that was still coming.**
+  Both example configurations pin it and say why — `timeout` in `.mcp.json`,
+  `tool_timeout_sec` in `.codex/config.toml`. Pinning is not a no-op: a per-server
+  `timeout` *overrides* `MCP_TOOL_TIMEOUT`, so `600000` lowers the hard per-call ceiling
+  from that variable's ~28-hour default to ten minutes. That is still roughly double the
+  worst case any single call can reach — the 300s poll cap, a 30s auth preflight, a 3s
+  session lease wait — and it makes the margin explicit instead of inherited. The
+  30-minute idle window for a stdio server genuinely is unchanged, because a per-server
+  `timeout` acts as a floor on it rather than a cap.
+
+  Cancelling the review is also what ends the poll: the worker sees the flag within
+  100 ms, and the terminal state it records wakes the waiter. Promptly, not instantly —
+  a worker already past the child and writing session state finishes that first — but
+  bounded, so a suppressed response does not park a handler thread until shutdown.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

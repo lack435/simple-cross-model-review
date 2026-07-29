@@ -11,6 +11,7 @@ compile_error!(
      share-mode locking."
 );
 
+mod cancel;
 mod config;
 mod errors;
 mod mcp;

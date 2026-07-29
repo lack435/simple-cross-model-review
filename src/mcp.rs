@@ -6,11 +6,13 @@
 //!
 //! stdout carries protocol traffic only. Anything diagnostic goes to stderr.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use crate::cancel::RequestCancel;
 use crate::tools::{version_line, App, VERSION};
 
 /// Versions we can speak. They are equivalent for a tools-only server; we echo the
@@ -18,12 +20,18 @@ use crate::tools::{version_line, App, VERSION};
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const FALLBACK_PROTOCOL: &str = "2024-11-05";
 
+/// `tools/call` handlers still running, keyed by the client's request id, so that
+/// `notifications/cancelled` can reach the right one. Every other method is answered on
+/// the reader thread and has finished before the next line is even read.
+type Pending = Arc<Mutex<HashMap<String, Arc<RequestCancel>>>>;
+
 pub fn serve(app: Arc<App>) {
     let stdin = std::io::stdin();
     let writer = Arc::new(Mutex::new(std::io::stdout()));
     // Handler threads are joined at shutdown; exiting while one is mid-flight would
     // drop a response the client is still waiting on.
     let mut in_flight: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!(
         "{}: serving MCP on stdio, reviewer = {}",
@@ -73,7 +81,7 @@ pub fn serve(app: Arc<App>) {
         // A message with no id is a notification: acknowledge nothing.
         let Some(id) = id else {
             if method == "notifications/cancelled" {
-                eprintln!("cross-review: client cancelled a request");
+                handle_cancellation(&app, &pending, &params);
             }
             continue;
         };
@@ -82,12 +90,40 @@ pub fn serve(app: Arc<App>) {
             // Tool calls can block for minutes, so each gets its own thread. Without
             // this a long poll would stall pings and cancellations on the same pipe.
             "tools/call" => {
+                let key = request_key(&id);
+                let request = Arc::new(RequestCancel::new());
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone(), Arc::clone(&request));
+
                 let app = Arc::clone(&app);
                 let writer = Arc::clone(&writer);
+                let pending_here = Arc::clone(&pending);
+                let thread_key = key.clone();
                 let spawned = std::thread::Builder::new()
                     .name("tools-call".to_string())
                     .spawn(move || {
-                        let result = dispatch_tool(&app, &params);
+                        let mut entry = PendingEntry {
+                            pending: &pending_here,
+                            key: &thread_key,
+                            released: false,
+                        };
+                        let result = dispatch_tool(&app, &params, &request);
+                        // Released before the send, so a cancellation arriving after this
+                        // point finds nothing in the map at all.
+                        entry.release();
+                        // A cancelled request gets no response: the client has stopped
+                        // waiting for one, and the spec says not to send it. Claiming
+                        // rather than merely checking is what settles the one remaining
+                        // window -- a notification already past the map lookup and about
+                        // to call `cancel` -- so a response and a kill of the review it
+                        // named cannot both happen. A response that loses the race and
+                        // goes unsent is fine; the spec expects the client to tolerate
+                        // one either way.
+                        if !request.try_claim_response() {
+                            return;
+                        }
                         send(
                             &writer,
                             json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -98,7 +134,13 @@ pub fn serve(app: Arc<App>) {
                         in_flight.retain(|h| !h.is_finished());
                         in_flight.push(handle);
                     }
-                    Err(e) => eprintln!("cross-review: could not spawn handler thread: {e}"),
+                    Err(e) => {
+                        pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key);
+                        eprintln!("cross-review: could not spawn handler thread: {e}");
+                    }
                 }
             }
             _ => {
@@ -108,15 +150,135 @@ pub fn serve(app: Arc<App>) {
         }
     }
 
-    let pending = in_flight.iter().filter(|h| !h.is_finished()).count();
-    if pending > 0 {
-        eprintln!("cross-review: stdin closed, finishing {pending} in-flight tool call(s)");
+    let unfinished = in_flight.iter().filter(|h| !h.is_finished()).count();
+    if unfinished > 0 {
+        eprintln!("cross-review: stdin closed, finishing {unfinished} in-flight tool call(s)");
     }
     for handle in in_flight {
         let _ = handle.join();
     }
 
     eprintln!("cross-review: stdin closed, shutting down");
+}
+
+/// Removes a handler's entry from the pending map however the handler ends.
+///
+/// Normally `release` does it the moment the work is done. The `Drop` is the net for a
+/// `dispatch_tool` that unwinds, which would otherwise strand the entry for the life of
+/// the process -- the same hazard `FinishGuard` covers for the review worker.
+struct PendingEntry<'a> {
+    pending: &'a Pending,
+    key: &'a str,
+    released: bool,
+}
+
+impl PendingEntry<'_> {
+    fn release(&mut self) {
+        if !self.released {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(self.key);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Honour `notifications/cancelled`: stop the work and send no response.
+///
+/// Suppressing the response is what the spec asks for. Stopping the review is what saves
+/// money: a reviewer nobody is waiting on otherwise runs out its full timeout budget, and
+/// holds the session lease for just as long, so the next review of the same session is
+/// refused as busy until it expires.
+///
+/// Runs on the reader thread, which is also the only thread that inserts into the map.
+/// A notification therefore cannot overtake the insert for the request it names.
+fn handle_cancellation(app: &App, pending: &Pending, params: &Value) {
+    let reason = clamp(
+        params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason given"),
+    );
+
+    let Some(request_id) = params.get("requestId") else {
+        eprintln!("cross-review: ignoring notifications/cancelled with no requestId ({reason})");
+        return;
+    };
+    // The lookup uses the id exactly as sent; only the echo of it is clamped.
+    let key = request_key(request_id);
+    let shown = clamp(&key);
+
+    // Removed here rather than by the handler, so a duplicate notification for the same
+    // id finds nothing and cancels nothing. The handler's own removal is then a no-op.
+    let entry = pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    let Some(entry) = entry else {
+        // Routine, not an error: a cancellation racing a response that already went out
+        // lands here, as does one for a request answered on the reader thread -- which
+        // includes `initialize`, the one request the spec says must not be cancelled.
+        eprintln!(
+            "cross-review: cancellation for request {shown}, which is not in flight ({reason})"
+        );
+        return;
+    };
+
+    // stderr is the only visibility this path has, so the three outcomes are told apart:
+    // no review bound to the request, one that was still running, one already finished.
+    match entry.cancel() {
+        None => eprintln!("cross-review: request {shown} cancelled ({reason})"),
+        Some(review_id) if app.cancel_review(&review_id) => eprintln!(
+            "cross-review: request {shown} cancelled ({reason}); stopped review {review_id}"
+        ),
+        Some(review_id) => eprintln!(
+            "cross-review: request {shown} cancelled ({reason}); review {review_id} had already \
+             finished"
+        ),
+    }
+}
+
+/// A stable map key for a JSON-RPC id, which may be a string or a number.
+///
+/// Serialising rather than stringifying keeps `1` and `"1"` distinct, as the protocol
+/// requires: they are different requests and a client may legitimately have both open.
+fn request_key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// Bound a client-supplied string before it reaches our diagnostics. Not a security
+/// boundary -- just so a client cannot put an unbounded line, or something that renders
+/// as other than what it says, into a log a human is meant to read.
+///
+/// `is_control` alone covers only Cc, which leaves the zero-width and bidi-override
+/// characters that are the usual way to make a log line lie. std has no `is_format` and
+/// a unicode-tables dependency is not worth it here, so those blocks are named outright.
+fn clamp(text: &str) -> String {
+    const LIMIT: usize = 200;
+    let kept: Vec<char> = text
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c,
+                    '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}')
+        })
+        .collect();
+    let mut out: String = kept.iter().take(LIMIT).collect();
+    // Marked, so a clipped value is never mistaken for a complete one.
+    if kept.len() > LIMIT {
+        out.push('…');
+    }
+    out
 }
 
 fn handle_sync(app: &App, method: &str, params: &Value, id: &Value) -> Value {
@@ -166,7 +328,7 @@ fn handle_sync(app: &App, method: &str, params: &Value, id: &Value) -> Value {
 /// Tool failures are reported as `isError` results, not JSON-RPC errors: the calling
 /// model needs to read the remediation text, and protocol-level errors are not
 /// consistently surfaced to it.
-fn dispatch_tool(app: &App, params: &Value) -> Value {
+fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
         .get("arguments")
@@ -174,8 +336,8 @@ fn dispatch_tool(app: &App, params: &Value) -> Value {
         .unwrap_or_else(|| json!({}));
 
     let outcome = match name {
-        "cross_model_review" => app.start_review(&args),
-        "cross_model_review_result" => app.review_result(&args),
+        "cross_model_review" => app.start_review(&args, request),
+        "cross_model_review_result" => app.review_result(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
         other => {
@@ -466,9 +628,151 @@ mod tests {
         assert!(response.get("error").is_none());
     }
 
+    fn pending() -> Pending {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn a_numeric_and_a_string_request_id_are_different_requests() {
+        assert_ne!(request_key(&json!(1)), request_key(&json!("1")));
+    }
+
+    #[test]
+    fn cancelling_an_in_flight_request_flags_it_and_drops_it_from_the_map() {
+        let app = app();
+        let pending = pending();
+        let request = Arc::new(RequestCancel::new());
+        request.attach_review("rv-1-1");
+        pending
+            .lock()
+            .unwrap()
+            .insert(request_key(&json!(7)), Arc::clone(&request));
+
+        handle_cancellation(&app, &pending, &json!({"requestId": 7, "reason": "user"}));
+
+        assert!(!request.try_claim_response(), "no response may be sent");
+        // Dropped here so a duplicate notification cannot cancel anything twice, and so
+        // the handler thread's own removal is a no-op.
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_request_stops_the_review_it_is_bound_to() {
+        use std::sync::atomic::Ordering;
+
+        let app = app();
+        let (review_id, reviewer_cancel) = app
+            .registry()
+            .try_start("default", 1, false)
+            .expect("start");
+
+        let request = Arc::new(RequestCancel::new());
+        request.attach_review(&review_id);
+        let pending = pending();
+        pending
+            .lock()
+            .unwrap()
+            .insert(request_key(&json!(9)), Arc::clone(&request));
+
+        handle_cancellation(&app, &pending, &json!({"requestId": 9, "reason": "user"}));
+
+        // The half that costs money: the flag reviewer::run polls, not merely the
+        // request's own. Without it the child keeps working to its 900s budget.
+        assert!(reviewer_cancel.load(Ordering::SeqCst));
+        assert!(!request.try_claim_response());
+    }
+
+    #[test]
+    fn a_cancellation_mid_poll_ends_the_wait_rather_than_parking_the_thread() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let app = app();
+        let (review_id, reviewer_cancel) = app
+            .registry()
+            .try_start("default", 1, false)
+            .expect("start");
+
+        let request = Arc::new(RequestCancel::new());
+        let pending = pending();
+        pending
+            .lock()
+            .unwrap()
+            .insert(request_key(&json!(9)), Arc::clone(&request));
+
+        // Stands in for the review worker: watches its cancel flag the way reviewer::run
+        // does, and records a terminal state once it is set. That `finish` is what wakes
+        // the poll, so the test exercises the real chain rather than shortcutting it.
+        let worker = {
+            let app = Arc::clone(&app);
+            let review_id = review_id.clone();
+            std::thread::spawn(move || {
+                // Bounded: `cargo test` has no per-test timeout, so an unbounded spin
+                // would turn a broken invariant into a silent CI hang instead of a
+                // failure anyone can read.
+                let give_up = std::time::Instant::now() + Duration::from_secs(10);
+                while !reviewer_cancel.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < give_up,
+                        "the reviewer's cancel flag was never set"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                app.registry().finish(
+                    &review_id,
+                    crate::registry::Outcome::failed(crate::errors::cancelled()),
+                );
+            })
+        };
+
+        // A budget far longer than this test can take: if the cancellation fails to end
+        // the wait, this hangs rather than quietly passing.
+        let poller = {
+            let app = Arc::clone(&app);
+            let request = Arc::clone(&request);
+            let args = json!({"review_id": review_id, "wait_seconds": 300});
+            std::thread::spawn(move || {
+                app.review_result(&args, &request)
+                    .err()
+                    .map(|failure| failure.code)
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(100));
+        handle_cancellation(&app, &pending, &json!({"requestId": 9}));
+
+        worker.join().expect("worker");
+        assert_eq!(poller.join().expect("poller"), Some("CANCELLED"));
+        // Cancelled, so the handler thread would send nothing.
+        assert!(!request.try_claim_response());
+    }
+
+    #[test]
+    fn a_cancellation_for_an_unknown_request_is_ignored() {
+        let app = app();
+        let pending = pending();
+        let request = Arc::new(RequestCancel::new());
+        pending
+            .lock()
+            .unwrap()
+            .insert(request_key(&json!(7)), Arc::clone(&request));
+
+        // Racing a response that already went out, or a mismatched id: neither may take
+        // down an unrelated in-flight call.
+        handle_cancellation(&app, &pending, &json!({"requestId": "7"}));
+        handle_cancellation(&app, &pending, &json!({"reason": "no id at all"}));
+
+        assert!(request.try_claim_response(), "it may still be answered");
+        assert_eq!(pending.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn unknown_tool_is_an_is_error_result_not_a_protocol_error() {
-        let result = dispatch_tool(&app(), &json!({"name": "nope", "arguments": {}}));
+        let result = dispatch_tool(
+            &app(),
+            &json!({"name": "nope", "arguments": {}}),
+            &RequestCancel::new(),
+        );
         assert_eq!(result["isError"], true);
         assert!(result["content"][0]["text"]
             .as_str()
@@ -482,6 +786,7 @@ mod tests {
         let result = dispatch_tool(
             &app(),
             &json!({"name": "cross_model_review", "arguments": {}}),
+            &RequestCancel::new(),
         );
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -498,7 +803,11 @@ mod tests {
         ])
         .expect("config");
         let app = Arc::new(App::new(cfg));
-        let result = dispatch_tool(&app, &json!({"name": "cross_model_review_status"}));
+        let result = dispatch_tool(
+            &app,
+            &json!({"name": "cross_model_review_status"}),
+            &RequestCancel::new(),
+        );
         assert_eq!(result["isError"], false);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ready:         NO"));

@@ -81,13 +81,31 @@ $stderrSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceive
 $proc.BeginErrorReadLine()
 
 $script:nextId = 0
+$script:pendingRead = $null
 $failures = New-Object System.Collections.Generic.List[string]
+
+# One read at a time, and a read that times out stays outstanding rather than being
+# abandoned. An abandoned ReadLineAsync still consumes the next line the server writes,
+# which would silently shift every later response onto the wrong request -- and the
+# cancellation check below deliberately waits for a line that must never arrive.
+function Read-Line {
+    param([int]$TimeoutSeconds)
+    if (-not $script:pendingRead) { $script:pendingRead = $proc.StandardOutput.ReadLineAsync() }
+    if (-not $script:pendingRead.Wait([TimeSpan]::FromSeconds($TimeoutSeconds))) { return $null }
+    $line = $script:pendingRead.Result
+    $script:pendingRead = $null
+    if ($null -eq $line) { throw 'server closed stdout' }
+    return $line
+}
 
 function Send-Rpc {
     param(
         [Parameter(Mandatory)][string]$Method,
         $Params,
         [switch]$Notification,
+        # Write the request and return its id without reading the response, for the
+        # cases that need to interleave another message before collecting it.
+        [switch]$NoWait,
         [int]$TimeoutSeconds = 420
     )
 
@@ -103,15 +121,20 @@ function Send-Rpc {
     $stdin.Flush()
 
     if ($Notification) { return $null }
+    if ($NoWait) { return $script:nextId }
 
-    # ReadLineAsync so a hung server surfaces as a timeout instead of blocking forever.
-    $task = $proc.StandardOutput.ReadLineAsync()
-    if (-not $task.Wait([TimeSpan]::FromSeconds($TimeoutSeconds))) {
+    $line = Read-Line -TimeoutSeconds $TimeoutSeconds
+    if ($null -eq $line) {
         throw "timed out after ${TimeoutSeconds}s waiting for a response to '$Method'"
     }
-    $line = $task.Result
-    if ($null -eq $line) { throw "server closed stdout while handling '$Method'" }
-    return $line | ConvertFrom-Json
+    $parsed = $line | ConvertFrom-Json
+    # Responses are matched by id, not by position. The cancellation stage deliberately
+    # interleaves messages, so a suppressed response that turned out not to be suppressed
+    # would otherwise be read as the answer to the next request and quietly mislead.
+    if ($parsed.id -ne $message['id']) {
+        throw "response id $($parsed.id) does not answer '$Method' (id $($message['id'])): $line"
+    }
+    return $parsed
 }
 
 function Assert-That {
@@ -253,7 +276,50 @@ COUNTER=2
     $badMethod = Send-Rpc -Method 'not/a/method' -TimeoutSeconds 30
     Assert-That 'unknown method is a JSON-RPC error' ($badMethod.error.code -eq -32601)
 
-    Write-Host "`n=== 7. sessions persist on disk ===" -ForegroundColor Cyan
+    Write-Host "`n=== 7. notifications/cancelled ===" -ForegroundColor Cyan
+    # A separate session, so cancelling it cannot disturb the turn count checked below.
+    $doomed = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review'
+        arguments = @{
+            instructions = 'Smoke test of cancellation. Wait quietly; this will be cancelled.'
+            session      = 'smoke-cancel'
+            fresh        = $true
+        }
+    } -TimeoutSeconds 60
+    $doomedText = Get-ToolText $doomed
+    Assert-That 'a cancellable review started' ($doomed.result.isError -eq $false) $doomedText
+    $doomedId = ([regex]::Match($doomedText, 'review_id:\s*(\S+)')).Groups[1].Value
+
+    # Poll for it, then abandon the poll the way a real client does. wait_seconds is kept
+    # short on purpose: with a long wait, "no line arrived" would prove nothing, because a
+    # server that ignored the cancellation entirely would also still be waiting. At 20s
+    # the poll is certain to have returned by the time the window below closes, so silence
+    # can only mean the response was suppressed.
+    $pollId = Send-Rpc -Method 'tools/call' -NoWait -Params @{
+        name      = 'cross_model_review_result'
+        arguments = @{ review_id = $doomedId; wait_seconds = 20 }
+    }
+    Start-Sleep -Seconds 2
+    Send-Rpc -Method 'notifications/cancelled' -Notification -Params @{
+        requestId = $pollId; reason = 'smoke test'
+    } | Out-Null
+
+    $stray = Read-Line -TimeoutSeconds 40
+    Assert-That 'the cancelled poll is never answered' ($null -eq $stray) "got: $stray"
+
+    # And the reviewer itself must be dead, not still billing out its 600s budget.
+    $after = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review_result'
+        arguments = @{ review_id = $doomedId; wait_seconds = 15 }
+    } -TimeoutSeconds 60
+    $afterText = Get-ToolText $after
+    Assert-That 'the cancellation stopped the review' ($afterText -match 'CANCELLED') $afterText
+
+    $ping = Send-Rpc -Method 'ping' -TimeoutSeconds 30
+    Assert-That 'the server is still healthy afterwards' ($null -ne $ping.result) `
+        'the server stopped answering after handling a cancellation'
+
+    Write-Host "`n=== 8. sessions persist on disk ===" -ForegroundColor Cyan
     $sessionsFile = Join-Path $stateDir 'sessions.json'
     Assert-That 'session state was written' (Test-Path $sessionsFile) $sessionsFile
     if (Test-Path $sessionsFile) {

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::cancel::RequestCancel;
 use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -69,6 +70,13 @@ impl App {
         &self.cfg
     }
 
+    /// Register reviews without a reviewer CLI, so the cancellation paths can be tested
+    /// without spending a model call.
+    #[cfg(test)]
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
     fn ensure_ready(&self) -> Result<Preflight, Failure> {
         if let Some(cached) = self
             .preflight
@@ -89,7 +97,7 @@ impl App {
     // cross_model_review
     // -----------------------------------------------------------------------
 
-    pub fn start_review(&self, args: &Value) -> Result<String, Failure> {
+    pub fn start_review(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
         let instructions = string_arg(args, "instructions")
             .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
 
@@ -138,6 +146,17 @@ impl App {
             .registry
             .try_start(&session, turn, resumed)
             .map_err(|existing| errors::session_busy(&session, &existing))?;
+
+        // Bind the review to the request that created it before the worker starts, so a
+        // `notifications/cancelled` arriving mid-setup stops the reviewer instead of
+        // finding nothing to stop. If it already arrived, never spawn the CLI at all --
+        // but still record a terminal state, or the session stays claimed by a review
+        // that no worker will ever finish.
+        if request.attach_review(&id) {
+            self.registry
+                .finish(&id, Outcome::failed(errors::cancelled()));
+            return Err(errors::cancelled());
+        }
 
         let job = Job {
             cfg: Arc::clone(&self.cfg),
@@ -195,7 +214,7 @@ impl App {
     // cross_model_review_result
     // -----------------------------------------------------------------------
 
-    pub fn review_result(&self, args: &Value) -> Result<String, Failure> {
+    pub fn review_result(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
         let review_id = string_arg(args, "review_id");
         let session = string_arg(args, "session");
 
@@ -228,6 +247,27 @@ impl App {
                 ))
             }
         };
+
+        // Abandoning this call cancels the review it is waiting on. That is a deliberate
+        // trade, and it is the destructive direction: unlike the start call, the caller
+        // does hold the review_id and could have come back for it -- SESSION_BUSY even
+        // tells it to. It is made anyway because a review nobody is waiting on bills
+        // against its whole timeout budget and holds the session lease for just as long,
+        // and because the protocol cannot distinguish a caller that will return from one
+        // that will not. The client-side tool timeout must therefore exceed MAX_WAIT_SECS,
+        // which is why both example configurations pin it and say why.
+        //
+        // Binding the two here is also what ends this wait when the notification lands
+        // mid-poll: cancelling drives the worker to a terminal state, which wakes the
+        // condvar, so a suppressed response does not park a thread until shutdown.
+        //
+        // The binding is many requests to one review, so cancelling one of two concurrent
+        // polls ends the other as well. Left alone: agents poll a review sequentially, and
+        // the CANCELLED text the second one gets is accurate about what happened to it.
+        if request.attach_review(&id) {
+            self.registry.cancel(&id);
+            return Err(errors::cancelled());
+        }
 
         let snapshot = self
             .registry
@@ -400,6 +440,12 @@ impl App {
     // cross_model_review_cancel
     // -----------------------------------------------------------------------
 
+    /// Stop a review by id, reporting whether it was still running. Used by the tool
+    /// below and by the protocol layer when a client cancels the request that owns it.
+    pub fn cancel_review(&self, id: &str) -> bool {
+        self.registry.cancel(id)
+    }
+
     pub fn cancel(&self, args: &Value) -> Result<String, Failure> {
         let id = string_arg(args, "review_id")
             .ok_or_else(|| errors::bad_request("'review_id' is required."))?;
@@ -408,7 +454,7 @@ impl App {
                 "No review with review_id '{id}' exists in this server process."
             )));
         }
-        if self.registry.cancel(&id) {
+        if self.cancel_review(&id) {
             // Give the worker a moment to reap the child so the report is accurate.
             std::thread::sleep(Duration::from_millis(300));
             Ok(format!("Review '{id}' was cancelled. The reviewer process has been stopped and there is no review feedback.\n"))
@@ -712,7 +758,9 @@ mod tests {
     fn missing_instructions_is_a_request_error_not_a_stop_everything_failure() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let err = app.start_review(&json!({"session": "x"})).unwrap_err();
+        let err = app
+            .start_review(&json!({"session": "x"}), &RequestCancel::new())
+            .unwrap_err();
         assert_eq!(err.code, "BAD_REQUEST");
         assert!(err.is_agent_correctable());
         // The blunt stop-and-escalate wrapper is reserved for setup failures.
@@ -723,7 +771,9 @@ mod tests {
     fn result_without_an_identifier_is_rejected() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let err = app.review_result(&json!({})).unwrap_err();
+        let err = app
+            .review_result(&json!({}), &RequestCancel::new())
+            .unwrap_err();
         assert_eq!(err.code, "BAD_REQUEST");
     }
 
@@ -732,10 +782,47 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
         let err = app
-            .review_result(&json!({"review_id": "rv-nope-1"}))
+            .review_result(&json!({"review_id": "rv-nope-1"}), &RequestCancel::new())
             .unwrap_err();
         assert_eq!(err.code, "BAD_REQUEST");
         assert!(err.summary.contains("rv-nope-1"));
+    }
+
+    #[test]
+    fn a_cancelled_result_call_stops_the_review_it_was_waiting_on() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = App::new(cfg);
+        // Registered directly: starting one for real would need a reviewer CLI.
+        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+
+        let request = RequestCancel::new();
+        assert_eq!(request.cancel(), None);
+        // The client cancelled before the poll got as far as naming its review, so the
+        // poll itself must notice and stop it rather than wait out its budget.
+        let err = app
+            .review_result(&json!({"review_id": id, "wait_seconds": 300}), &request)
+            .unwrap_err();
+        assert_eq!(err.code, "CANCELLED");
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_live_result_call_leaves_its_review_alone() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = App::new(cfg);
+        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+
+        let request = RequestCancel::new();
+        let out = app
+            .review_result(
+                &json!({"review_id": id.clone(), "wait_seconds": 0}),
+                &request,
+            )
+            .expect("still running");
+        assert!(out.contains("status:    running"));
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        // Bound to the request, so a cancellation arriving now knows what to stop.
+        assert_eq!(request.cancel().as_deref(), Some(id.as_str()));
     }
 
     #[test]
