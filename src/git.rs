@@ -414,9 +414,9 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         Some(true) => {}
         Some(false) => {
             return Capture::warn(format!(
-                "{} is not a git repository, so the change under review could not be captured \
-                 and the reviewer was given no diff. It reviewed the current state of the code \
-                 instead.",
+                "{} is not inside a git work tree — a bare repository reports this too — so \
+                 the change under review could not be captured and the reviewer was given no \
+                 diff. It reviewed the current state of the code instead.",
                 cfg.cwd.display()
             ))
         }
@@ -1511,7 +1511,7 @@ mod tests {
         let capture = capture(&cfg, &idle());
         assert!(capture.change.is_none());
         assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
-        assert!(capture.warnings[0].contains("not a git repository"));
+        assert!(capture.warnings[0].contains("not inside a git work tree"));
     }
 
     /// Against real git, not against our beliefs about it.
@@ -1583,9 +1583,11 @@ mod tests {
             .change
             .is_none());
 
-        // Auto plus a reviewer that has its own shell: ours would be redundant.
+        // Auto plus a reviewer that has its own shell: ours would be redundant. Bash has
+        // to be permitted as well as present, or it has no usable shell and does need ours.
         let mut cfg = config_for(&dir, DiffMode::Auto);
         cfg.tools = "Read,Grep,Glob,Bash".to_string();
+        cfg.allowed_tools = vec!["Read Grep Glob Bash(git diff:*)".to_string()];
         assert!(capture(&cfg, &idle()).change.is_none());
     }
 

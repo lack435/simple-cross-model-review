@@ -108,7 +108,7 @@ root, so running `git` here costs the calling agent nothing:
 
 | `--diff` | What the reviewer is shown |
 | --- | --- |
-| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no shell** |
+| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no usable shell** |
 | `none` | nothing; supply your own in `instructions` |
 | `staged` | `git diff --cached` + status |
 | `HEAD` | as `auto`, regardless of whether the reviewer has a shell |
@@ -117,6 +117,12 @@ root, so running `git` here costs the calling agent nothing:
 
 The full command is `git diff --no-ext-diff --no-textconv --relative <rev> -- .`, and it is
 named verbatim in the reviewer's prompt so it can report what it was shown.
+
+"Usable" is doing work in that first row. The Codex reviewer always has one. The Claude
+reviewer has one only when `--tools` puts Bash in the session *and* `--allow-tools` permits
+it: it runs under `--permission-mode dontAsk`, so `--tools …,Bash` on its own leaves it a
+tool it can never call. `auto` requires both before it withholds the capture, since a
+reviewer with neither shell nor diff is the worst of the three outcomes.
 
 The last two rows are one `--diff` value apart and are not the same thing, because that is
 git's own semantics: `A..B` and `A...B` compare two commits, while a bare `A` compares A to
@@ -193,7 +199,7 @@ Notes on the edges, because they are where this would otherwise mislead:
   only if the job object could not be created or something outside it holds a handle.
 - **A capture that was configured and did not happen is reported to the caller**, as a
   warning alongside the review: no local `main` for a pinned `main...HEAD`, a working root
-  that is not a git repository, git missing from PATH, or any part of the capture that ran
+  that is not inside a git work tree, git missing from PATH, or any part of the capture that ran
   short. The reviewer is told it has no diff, but the caller is the party that asked for a
   review of a change, and a review of the current tree returned in silence reads exactly
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
@@ -402,7 +408,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 165 unit tests: no network, no model calls
+cargo test          # 166 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```

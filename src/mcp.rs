@@ -475,12 +475,24 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // `supplies_diff` is asked first because the two are not exclusive: `--diff HEAD` with
     // a shelled reviewer captures *and* hands over a change, which the shell branch would
     // have described as "inspect the change history itself" while a diff sat in the prompt.
+    // Said once, and only as strongly as the mechanism behind it. Codex's shell is confined
+    // by a sandbox policy whose write refusals are verified; Claude's is an opt-in
+    // allow-list, which `README.md` shows cannot express "read-only" at all. Calling both
+    // read-only would be the kind of unearned claim this project spends the README avoiding.
+    let shell_clause = match cfg.reviewer {
+        crate::config::ReviewerKind::Codex => "It has a read-only shell",
+        crate::config::ReviewerKind::Claude => {
+            "It has a shell, because one was enabled explicitly -- its allow-list is a soft \
+             boundary rather than a read-only guarantee"
+        }
+    };
+
     let access = if cfg.reviewer_has_shell() && !cfg.supplies_diff() {
-        "The reviewer has read-only access to this repository: it can read files and run \
-         read-only shell commands such as `git diff` and `git log`, so it can inspect the \
-         change history itself. You do not need to paste code. Describe what changed and \
-         what you want scrutinised."
-            .to_string()
+        format!(
+            "The reviewer can read and search files in this repository. {shell_clause}, so it \
+             can run `git diff` and `git log` and inspect the change history itself. You do \
+             not need to paste code. Describe what changed and what you want scrutinised."
+        )
     } else if cfg.supplies_diff() {
         // Worth stating positively. The caller pastes a diff because it believes it has
         // to; left to infer, it will keep spending its own context on one this server
@@ -498,19 +510,10 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // The shell clause is the one part that cannot be stated unconditionally here: a
         // capture is configured for both kinds of reviewer, but only one of them lacks a
         // shell, and telling the caller a shelled reviewer has none would be a plain lie.
-        // "read-only" is claimed only for Codex, whose sandbox policy is what enforces it.
-        // The Claude reviewer only has a shell when someone opted in with --tools, and the
-        // README is emphatic that a prefix allow-list cannot express read-only, so calling
-        // that one read-only here would be the kind of unearned claim this repo avoids.
-        let shell = match (cfg.reviewer_has_shell(), cfg.reviewer) {
-            (true, crate::config::ReviewerKind::Codex) => {
-                "It has a read-only shell, and it is also handed the change directly"
-            }
-            (true, crate::config::ReviewerKind::Claude) => {
-                "It has a shell, because one was enabled explicitly, and it is also handed \
-                 the change directly"
-            }
-            (false, _) => "It has NO shell of its own, but it does not need one for the change",
+        let shell = if cfg.reviewer_has_shell() {
+            format!("{shell_clause}, and it is also handed the change directly")
+        } else {
+            "It has NO shell of its own, but it does not need one for the change".to_string()
         };
         format!(
             "The reviewer can read and search files in this repository, so you do not need to \
@@ -790,11 +793,34 @@ mod tests {
         }
 
         // A reviewer with a shell and no capture configured fetches its own, and is told so.
-        let shelled = describe(&["--tools", "Read,Grep,Glob,Bash"]);
+        let shelled = describe(&[
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]);
         assert!(
-            shelled.contains("can inspect the change history itself"),
+            shelled.contains("inspect the change history itself"),
             "{shelled}"
         );
+        // And an opted-in Claude shell is never sold as read-only: the README shows a
+        // prefix allow-list cannot express that, so only Codex's sandbox earns the word.
+        assert!(!shelled.contains("read-only shell"), "{shelled}");
+        assert!(shelled.contains("soft boundary"), "{shelled}");
+
+        let codex_shell = {
+            let all: Vec<String> = ["--reviewer", "codex"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect();
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description")
+                .to_string()
+        };
+        assert!(codex_shell.contains("read-only shell"), "{codex_shell}");
 
         // Shell *and* capture is a real configuration (`README.md` advertises `--diff HEAD`
         // regardless of shell), and it used to fall into the shell branch, so the caller was
@@ -806,6 +832,8 @@ mod tests {
                 "claude",
                 "--tools",
                 "Read,Grep,Glob,Bash",
+                "--allow-tools",
+                "Read Grep Glob Bash(git diff:*)",
                 "--diff",
                 "main...HEAD",
             ],
