@@ -522,11 +522,32 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
     // its review; the caller needs them to know the review it is reading was made on
     // partial evidence, which it cannot see the prompt to discover for itself. Which of the
     // untracked omissions earn that second audience is decided in `OmissionReport`.
-    let warnings = notes
+    let mut warnings: Vec<String> = notes
         .iter()
         .chain(&omissions.capture_level)
-        .map(|note| format!("The captured change was incomplete: {note}"))
+        .map(|note| incomplete(note))
         .collect();
+
+    // Truncation is stated in the prompt, so the reviewer has it -- but the caller does
+    // not, and these are bounds on the evidence the review rests on. The status listing is
+    // the sharper of the two: under `--diff staged`, `tree_may_differ` decides per line, so
+    // a path past the cut cannot report the tree as differing from the diff and the answer
+    // can be a false "no". (Under a range it is an emptiness test, which truncation cannot
+    // flip.) Neither of these fires on an ordinary call: it takes a 400 KB diff or a 400 KB
+    // status to reach them.
+    if diff.truncated {
+        warnings.push(incomplete(&format!(
+            "the diff was cut short at the {MAX_DIFF_BYTES}-byte cap, so the reviewer was not \
+             shown all of it"
+        )));
+    }
+    if status.truncated {
+        warnings.push(incomplete(&format!(
+            "the `git status` listing was cut short at the {MAX_DIFF_BYTES}-byte cap, so paths \
+             past that point are in neither the prompt nor the check for a working tree that \
+             differs from the diff"
+        )));
+    }
 
     Capture {
         change: Some(Change {
@@ -546,6 +567,14 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         }),
         warnings,
     }
+}
+
+/// One caller-facing warning, phrased the one way.
+///
+/// Every shortfall reaches the caller through here, so a new one cannot arrive wearing a
+/// different form of words that an agent scanning the response has to recognise afresh.
+fn incomplete(note: &str) -> String {
+    format!("The captured change was incomplete: {note}")
 }
 
 /// Render a captured change as the prompt section the reviewer reads.
@@ -959,16 +988,18 @@ impl Omissions {
 /// What the omissions came to: every line the reviewer is shown, and the subset the caller
 /// is warned about.
 ///
-/// The split is not "big things and small things", it is who can still find out. A note
-/// naming one file goes to the reviewer, which is reading the prompt and can open the file
-/// itself. A statement about the *capture* -- the listing stopped early, files were dropped
-/// for want of budget -- goes to both, because the caller never sees the prompt and is the
-/// party deciding whether to act on the review. It would otherwise read a review made
-/// against a listing that stopped at path 200 exactly as it reads a complete one.
+/// The split is by scope, not by size. A note about one file describes something the
+/// reviewer can see the shape of: the file was listed, and the note says what happened to
+/// it. A statement about the *capture* says the listing itself is not the whole set, which
+/// is the one thing neither party can infer from what is present -- and the caller cannot
+/// even read the prompt to find it, so a review made against a listing that stopped early
+/// reads to it exactly like a review made against all of it.
 ///
-/// Per-file notes are deliberately *not* promoted. `blob.bin is binary` is true of nearly
-/// every working tree with a build artifact in it, and a warning that fires on every call
-/// is one the caller learns to skip -- which would cost the two above their audience.
+/// Which per-file notes to promote as well is a policy judgement rather than a fact about
+/// the code, and this is the conservative end of it: they are left to the prompt, so that
+/// the two above are what a caller sees when it sees anything at all. The cost of choosing
+/// the other end is that a warning arriving on ordinary calls is one the caller learns to
+/// skip past.
 #[derive(Default, Debug)]
 struct OmissionReport {
     notes: Vec<String>,
@@ -2057,5 +2088,89 @@ mod tests {
             change.untracked_omitted
         );
         assert!(captured.warnings.is_empty(), "{:?}", captured.warnings);
+    }
+
+    #[test]
+    fn spending_the_whole_content_budget_warns_the_caller_too() {
+        // The other half of the rule, through a real capture rather than through
+        // `OmissionReport` alone: a change that forwarded only the listing-cut-short note
+        // would pass every other test here.
+        let Some(dir) = repo_with_untracked_budget_spent(MAX_UNTRACKED_TOTAL_BYTES) else {
+            return;
+        };
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+
+        // The budget is gone before the last file, so it is skipped rather than truncated.
+        assert!(
+            !change.untracked.iter().any(|f| f.path == "zz-big.txt"),
+            "{:?}",
+            change.untracked.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("left out entirely")),
+            "{:?}",
+            captured.warnings
+        );
+    }
+
+    #[test]
+    fn a_truncated_diff_or_status_is_a_shortfall_the_caller_hears_about() {
+        // Both are stated in the prompt, so the reviewer has them; the caller cannot see
+        // the prompt. The status one carries a correctness edge as well as a disclosure
+        // one: under `--diff staged` the dirty-tree check reads the listing line by line,
+        // so a path past the cut cannot report the tree as differing from the diff.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+
+        // A committed file, then emptied: the diff is the whole of it as removals.
+        let big = "a line of text long enough that this does not take forever\n".repeat(10_000);
+        std::fs::write(dir.join("big.txt"), &big).expect("write");
+        assert!(git.run(&["add", "big.txt"]).is_some_and(|o| o.success));
+        assert!(git
+            .run(&["commit", "--quiet", "-m", "big"])
+            .is_some_and(|o| o.success));
+        std::fs::write(dir.join("big.txt"), "").expect("write");
+
+        // Enough distinct untracked paths that the status listing alone passes the cap.
+        // Names, not contents: `git status --porcelain` prints one line per path.
+        let name = "p".repeat(200);
+        for i in 0..(MAX_DIFF_BYTES / 200) + 20 {
+            std::fs::write(dir.join(format!("{name}{i:06}")), "x").expect("write");
+        }
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+        assert!(
+            change.diff.truncated,
+            "the fixture did not reach the diff cap"
+        );
+        assert!(
+            change.status.truncated,
+            "the fixture did not reach the status cap"
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("diff was cut short")),
+            "{:?}",
+            captured.warnings
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("`git status` listing was cut short")),
+            "{:?}",
+            captured.warnings
+        );
     }
 }

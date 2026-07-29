@@ -218,15 +218,20 @@ Notes on the edges, because they are where this would otherwise mislead:
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
   with a reviewer that has its own shell, so those stay silent.
 
-  The untracked capture warns on the same principle, and the line is drawn by who can still
-  find out. If the listing stopped at the examined cap, or files were dropped because the
-  total content cap ran out, the caller is told — it never sees the prompt, and a review
-  made against a listing that stopped at path 200 otherwise reads exactly like one made
-  against all of them. The per-file notes are *not* promoted: the reviewer is reading the
-  prompt and can open the file itself, and `blob.bin is binary` is true of nearly every
-  working tree with a build artifact in it, so promoting those would put a warning on almost
-  every call — and a warning that always fires is one the caller stops reading, which would
-  cost the other two their audience.
+  A capture that ran but was **bounded** warns too, and the line is scope. If the untracked
+  listing stopped early — at either the included cap or the examined one — or files were
+  dropped because the total content cap ran out, the caller is told, because that is the one
+  thing it cannot infer from what came back: a review made against a listing that stopped at
+  path 200 otherwise reads exactly like one made against all of them. A truncated diff or
+  status listing warns for the same reason, and the status one is the sharper: under
+  `--diff staged` the dirty-tree check reads it line by line, so a path past the cut cannot
+  report the tree as differing from the diff. Neither fires on an ordinary call — it takes
+  400 KB of diff or of status to reach them.
+
+  The per-file omission notes — this file is binary, unreadable, resolves outside the root —
+  stay in the prompt only. That is a policy judgement rather than a claim about the code:
+  they describe files the listing did reach, so the reviewer has their shape, and keeping
+  them out is what makes a warning mean the capture itself was short.
 
 ## Re-reviewing after you act on feedback
 
