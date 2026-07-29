@@ -306,22 +306,36 @@ pub fn worker_panicked(review_id: &str) -> Failure {
 
 /// The server could not start a thread to run a `tools/call` handler.
 ///
-/// The OS error goes in the summary rather than through `with_detail`, whose rendered
-/// header attributes the text to the reviewer CLI. Nothing was handed to the reviewer
-/// here; the failure is entirely on this side.
-pub fn handler_thread_unavailable(os_error: &str) -> Failure {
-    Failure::new(
-        "INTERNAL_ERROR",
-        format!(
-            "The cross-review server could not start a thread to handle the tool call \
-             ({os_error}), so nothing was sent to the reviewer."
-        ),
-        "The cross-model review tool could not start a handler thread. That is a resource \
-         limit on this machine -- memory, or the per-process thread cap -- and not a problem \
-         with the review setup, the reviewer CLI, or the request.\n\n\
-         Retrying is reasonable, especially after closing other work. If it recurs, the \
-         server's stderr output carries the underlying OS error.\n\n\
-         The review has NOT been performed.",
+/// Written out rather than built from a `Failure`, because both of that type's rendered
+/// forms would misstate this one. The stop-and-escalate form asserts "The external review
+/// did not run", which is false when the call that could not be handled was
+/// `cross_model_review_result` and the review it was collecting is still running; the
+/// agent-correctable form is headed "REQUEST REJECTED", which blames a request that was
+/// fine. What holds for all four tools is only that this call did not happen, and that no
+/// review anywhere changed state because of it. That is what this says.
+///
+/// The OS error is inlined here for the same reason `with_detail` is not used elsewhere on
+/// this path: its rendered header attributes the text to the reviewer CLI, which never saw
+/// this request.
+pub fn handler_thread_unavailable(tool: &str, os_error: &str) -> String {
+    let tool = if tool.is_empty() {
+        "cross-review"
+    } else {
+        tool
+    };
+    format!(
+        "TOOL CALL NOT HANDLED\n\
+         code: INTERNAL_ERROR\n\n\
+         The cross-review server could not start a thread to run the '{tool}' call \
+         ({os_error}), so the call did not happen.\n\n\
+         This is a resource limit on the machine running the server -- memory, or its cap on \
+         threads per process -- and not a problem with the review setup, the reviewer CLI, or \
+         the arguments. Nothing was sent to the reviewer, and no review changed state: one \
+         already in progress is still running and can still be collected with \
+         cross_model_review_result.\n\n\
+         Call the tool again. If it fails the same way a second time, stop and tell the user \
+         the machine has run out of thread or memory headroom, rather than carrying on \
+         without the review.\n"
     )
 }
 
