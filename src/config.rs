@@ -874,7 +874,8 @@ mod tests {
         let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
-        // Codex's shell is confined by a sandbox policy, so it may be called read-only.
+        // Codex's shell has its writes denied by the OS sandbox, so it may be called
+        // read-only. That says nothing about reads, which are not confined to the project.
         assert!(text.contains("read-only shell"), "{text}");
     }
 

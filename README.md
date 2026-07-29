@@ -276,12 +276,15 @@ not trust:
   `<file_system type="restricted"><entry access="read"><special>:root</special></entry>`,
   i.e. read the whole filesystem, and
   `-c 'permissions.p.filesystem={ ":workspace_roots" = "read" }' -c 'default_permissions="p"'`
-  narrows that to a single `<path>` entry naming the project root. It is advisory. The same
-  profile passed to `codex sandbox` as `-P p` still read a file outside the project, as did
-  a profile carrying an explicit `deny` entry on that exact directory, on both the
-  unelevated and the elevated backend. So this is a prompt-level hint that renders as a
-  policy, and wiring it in would make the table above read *confined* while the boundary
-  stayed open — the failure mode this file exists to avoid. It is not wired in.
+  narrows that to a single `<path>` entry naming the project root. It does not follow that
+  anything enforces it. The same profile passed to `codex sandbox` as `-P p` still read a
+  file outside the project, as did a profile carrying an explicit `deny` entry on that exact
+  directory, on both the unelevated and the elevated backend. That is a negative result for
+  `codex sandbox -P` specifically; the reviewer runs `codex exec`, which builds its sandbox
+  by its own path, and enforcement there was not separately probed. Either way it is not
+  wired in: the reachable evidence is a policy that renders and a read that succeeded
+  anyway, and wiring that in would make the table above read *confined* over a boundary
+  nobody has seen hold — the failure mode this file exists to avoid.
 
   Two more paths were ruled out rather than left unexamined. `--sandbox-state-readable-root`
   is named for exactly this, but it is a flag on `codex sandbox` that will not run without
@@ -290,11 +293,16 @@ not trust:
   `permissions.filesystem.deny_read`, which the binary describes as requiring the elevated
   backend, belongs to machine-managed enterprise requirements rather than user config; an
   MCP server editing machine-wide policy to confine its own child is not a trade worth
-  making. That leaves two options: keep documenting the gap, or take the Codex reviewer's
-  shell away as the Claude reviewer's was taken. The shell is why that direction exists —
-  it is the one that can review an uncommitted working tree — so it stays, and the Claude
-  direction remains the confined one. All of the above is one CLI version on one OS;
-  re-check it rather than inheriting it.
+  making. That left one option rather than two. Taking the shell away, as was done for the
+  Claude reviewer, is not something this CLI offers: `codex exec` has no flag for it, and
+  the `[tools]` config table holds two keys, `web_search` and
+  `experimental_request_user_input`, neither of them the shell. A Codex reviewer without a
+  shell would mean not driving it through `codex exec` at all. What the shell buys, in
+  exchange, is a reviewer that goes and looks — `git log`, `git show`, a file the capture
+  truncated, a diff drawn differently — instead of being held to the single capture that
+  `--diff` pins at server startup. So it stays, the gap stays documented, and the Claude
+  direction remains the confined one to point at a repository you do not trust. All of the
+  above is one CLI version on one OS; re-check it rather than inheriting it.
 - **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
   the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
   Code's own tools and have no write or execute capability. Each is further scoped to the
