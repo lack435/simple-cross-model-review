@@ -81,7 +81,8 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   when told to.
 - The reviewer reviews; it cannot fix. The Claude direction has no write-capable tool in the
   session at all; the Codex direction runs under a read-only policy whose write refusals are
-  verified, though enforcement there is the CLI's rather than demonstrably the OS's — see
+  enforced by the OS — Windows restricted token, verified with no model in the loop. Its
+  *reads* are still unconfined, and no CLI surface was found that would confine them; see
   `README.md`. Bring the findings back and act on them yourself.
 - After acting on feedback, call `cross_model_review` again with the **same session** so the
   reviewer reports what is resolved, what is still open, and what regressed. That request

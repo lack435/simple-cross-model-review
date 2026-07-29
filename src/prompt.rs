@@ -159,8 +159,10 @@ mod tests {
     #[test]
     fn preamble_points_the_reviewer_at_project_conventions() {
         // The reviewer runs configuration-isolated, so CLAUDE.md is not auto-loaded
-        // (verified). It has scoped read access though, so telling it to go and read the
-        // conventions recovers that context without weakening isolation.
+        // (verified). It can still read the project either way -- the Claude reviewer
+        // through tools scoped to it, the Codex reviewer through a shell that is not
+        // confined to it at all -- so telling it to go and read the conventions recovers
+        // that context without weakening isolation.
         assert!(DEFAULT_PREAMBLE.contains("CLAUDE.md"));
         assert!(DEFAULT_PREAMBLE.contains("AGENTS.md"));
         // And it must treat them as evidence, not as instructions to follow.

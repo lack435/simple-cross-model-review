@@ -491,10 +491,14 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // `supplies_diff` is asked first because the two are not exclusive: `--diff HEAD` with
     // a shelled reviewer captures *and* hands over a change, which the shell branch would
     // have described as "inspect the change history itself" while a diff sat in the prompt.
-    // Said once, and only as strongly as the mechanism behind it. Codex's shell is confined
-    // by a sandbox policy whose write refusals are verified; Claude's is an opt-in
+    // Said once, and only as strongly as the mechanism behind it. Codex's shell runs under a
+    // sandbox whose write refusals are the OS's -- verified; Claude's is an opt-in
     // allow-list, which `README.md` shows cannot express "read-only" at all. Calling both
     // read-only would be the kind of unearned claim this project spends the README avoiding.
+    //
+    // "Read-only" is a claim about writes and nothing more. Codex's *reads* are not confined
+    // to the project, and no way to confine them was found (`README.md`), so this clause must
+    // not grow into one that suggests otherwise.
     let shell_clause = match cfg.reviewer {
         crate::config::ReviewerKind::Codex => "It has a read-only shell",
         crate::config::ReviewerKind::Claude => {
