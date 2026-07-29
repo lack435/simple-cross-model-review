@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use crate::tools::{App, VERSION};
+use crate::tools::{version_line, App, VERSION};
 
 /// Versions we can speak. They are equivalent for a tools-only server; we echo the
 /// client's choice when we recognise it so a newer client is not downgraded.
@@ -26,7 +26,8 @@ pub fn serve(app: Arc<App>) {
     let mut in_flight: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     eprintln!(
-        "cross-review {VERSION}: serving MCP on stdio, reviewer = {}",
+        "{}: serving MCP on stdio, reviewer = {}",
+        version_line(),
         app.cfg().describe_reviewer()
     );
 

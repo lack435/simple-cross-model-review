@@ -20,6 +20,22 @@ const SESSION_LEASE_WAIT: Duration = Duration::from_secs(3);
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SESSION: &str = "default";
 
+/// Commit this binary was built from, when the build supplied one.
+///
+/// `CARGO_PKG_VERSION` alone cannot identify a build: it is pinned in Cargo.toml and
+/// changes only on a release, so two binaries built months apart report the same string.
+/// That made "is this binary current?" unanswerable, which mattered while the executable
+/// was committed. Release builds set this; a local `cargo build` leaves it unset.
+pub const BUILD: Option<&str> = option_env!("CROSS_REVIEW_BUILD");
+
+/// Version plus provenance, for `--version` and the status tool.
+pub fn version_line() -> String {
+    match BUILD {
+        Some(build) => format!("cross-review {VERSION} ({build})"),
+        None => format!("cross-review {VERSION} (local build)"),
+    }
+}
+
 #[derive(Clone)]
 struct Preflight {
     bin: PathBuf,
@@ -321,7 +337,7 @@ impl App {
 
     pub fn status(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("cross-review {VERSION}\n\n"));
+        out.push_str(&format!("{}\n\n", version_line()));
         out.push_str(&format!(
             "reviewer:      {}\n",
             self.cfg.describe_reviewer()

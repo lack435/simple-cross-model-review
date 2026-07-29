@@ -39,24 +39,17 @@ jobs:
       - name: Tests
         run: cargo test
 
-      - name: Release build
-        run: cargo build --release
-
-      # The committed binary is what consuming repositories vendor, so a stale or
-      # missing one is a real defect rather than a packaging detail.
-      - name: Committed binary is present and runnable
+      # Via build.ps1 so CI exercises the same build definition a release uses, including
+      # the --remap-path-prefix flags and its check that no home directory leaked in.
+      - name: Build and verify
         shell: pwsh
-        run: |
-          if (-not (Test-Path 'dist\cross-review.exe')) {
-            throw 'dist\cross-review.exe is missing. Run .\build.ps1 and commit the result.'
-          }
-          $committed = (& '.\dist\cross-review.exe' --version).Trim()
-          $built = (& '.\target\release\cross-review.exe' --version).Trim()
-          Write-Host "committed: $committed"
-          Write-Host "built:     $built"
-          if ($committed -ne $built) {
-            throw "dist\cross-review.exe reports '$committed' but the source builds '$built'. Run .\build.ps1 and commit the result."
-          }
+        env:
+          CROSS_REVIEW_BUILD: ${{ github.sha }}
+        run: .\build.ps1 -SkipChecks
+
+      - name: Report what was built
+        shell: pwsh
+        run: '& ''.\dist\cross-review.exe'' --version'
 
       # Guards the failure contract that the calling agent depends on: a missing
       # reviewer CLI must fail loudly rather than degrade into a same-model review.
@@ -69,7 +62,7 @@ jobs:
           )
           $inFile = Join-Path $env:RUNNER_TEMP 'mcp-in.txt'
           [System.IO.File]::WriteAllLines($inFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-          $out = @(Get-Content $inFile | & '.\target\release\cross-review.exe' --reviewer codex --bin 'C:\nope\codex.exe' 2>$null)
+          $out = @(Get-Content $inFile | & '.\dist\cross-review.exe' --reviewer codex --bin 'C:\nope\codex.exe' 2>$null)
           if ($out.Count -lt 2) { throw "expected two responses, got $($out.Count)" }
           $call = $out[1] | ConvertFrom-Json
           if ($call.result.isError -ne $true) { throw 'expected isError=true' }
@@ -78,8 +71,10 @@ jobs:
           if ($text -notmatch 'ACTION REQUIRED') { throw 'expected the stop-and-escalate instruction' }
           Write-Host 'failure contract holds'
 
+      # Every run leaves a downloadable binary, so the executable is obtainable from any
+      # commit without building locally -- which is what lets it stop being committed.
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: cross-review-exe
-          path: target/release/cross-review.exe
+          name: cross-review-${{ github.sha }}
+          path: dist/cross-review.exe
