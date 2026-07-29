@@ -21,16 +21,28 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 5 via
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
-- Give the reviewer the branch and base to diff itself, say what changed and why, and point
-  it at this file and `README.md`. It runs configuration-isolated, so `CLAUDE.md` is not
-  auto-loaded; it will read convention files when told to.
-- The reviewer reviews; it cannot fix — it has no write access. Bring its findings back and
-  act on them yourself.
+- **Getting the diff in front of the reviewer depends on which direction you are calling.**
+  The Codex reviewer has a shell, so give it the branch and base and let it run `git diff`
+  itself. The Claude reviewer has none: it cannot run `git` and cannot reconstruct a diff
+  from `.git` with Read, Grep and Glob, so put the diff in the instructions or it will
+  review the current state of the tree instead of your change.
+- Say what changed and why, and point the reviewer at this file and `README.md`. It runs
+  configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
+  when told to.
+- The reviewer reviews; it cannot fix. The Claude direction has no write-capable tool in the
+  session at all; the Codex direction runs under a read-only policy whose write refusals are
+  verified, though enforcement there is the CLI's rather than demonstrably the OS's — see
+  `README.md`. Bring the findings back and act on them yourself.
 - After acting on feedback, call `cross_model_review` again with the **same session** so the
-  reviewer reports what is resolved, what is still open, and what regressed. Only use
-  `fresh: true` when the earlier findings would mislead.
+  reviewer reports what is resolved, what is still open, and what regressed. That request
+  must carry every finding you dismissed and the evidence for dismissing it: a dismissal the
+  reviewer never sees is not a dismissal, it is a bypass. Only use `fresh: true` when the
+  earlier findings would mislead. If the response reports that the session had expired and
+  was replaced with a fresh one, the reviewer remembers nothing — re-supply the earlier
+  findings and your dismissals yourself.
 - Never approve, merge, or tell the user a PR is ready to merge without that review having
-  run and its findings resolved or explicitly dismissed with a reason.
+  run and its findings either resolved or disputed with concrete evidence the reviewer has
+  seen and answered.
 - If the review fails — `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `RATE_LIMITED`, any of the
   codes in the README — hand the user the remediation the tool returned, say the review did
   not run, and stop. Do not substitute your own read of the diff, and do not fall back to a
@@ -38,12 +50,26 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   the entire premise of this project. `cross_model_review_status` checks the reviewer CLI
   and auth for free, before anything is billed.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
-  and anything deliberately left alone.
+  and what is still disputed. Keep findings the reviewer has confirmed resolved separate
+  from ones you argued against — they are not the same claim.
 
-Dogfooding is also how the tool gets tested in anger. If the gate itself misbehaves —
-a failure code that misreports the reviewer's state, a resumed session that lost context, a
-response that reads badly to the calling agent — that is a bug in this repository, so report
-it rather than working around it.
+### When the gate itself is broken
+
+Dogfooding is also how the tool gets tested in anger. If the gate misbehaves — a failure
+code that misreports the reviewer's state, a resumed session that lost context, a response
+that reads badly to the calling agent — that is a bug in this repository, so report it
+rather than working around it.
+
+That leaves one deadlock worth naming: a PR that repairs the gate cannot pass through the
+gate it is repairing. The exception is narrow, and the maintainer authorises it per PR:
+
+- It covers a change that restores the gate, and nothing else. Not a rate limit, not a
+  reviewer that is slow or expensive, not findings you would rather not address.
+- Quote the failing output verbatim in the PR.
+- Get the review from a different model out of band under the same read-only constraints,
+  and record in the PR that it was obtained that way and from which model.
+- Once the repair makes a real review possible, run one on the exact final diff before the
+  merge.
 
 ## Before handing work back
 
