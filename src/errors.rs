@@ -304,6 +304,27 @@ pub fn worker_panicked(review_id: &str) -> Failure {
     )
 }
 
+/// The server could not start a thread to run a `tools/call` handler.
+///
+/// The OS error goes in the summary rather than through `with_detail`, whose rendered
+/// header attributes the text to the reviewer CLI. Nothing was handed to the reviewer
+/// here; the failure is entirely on this side.
+pub fn handler_thread_unavailable(os_error: &str) -> Failure {
+    Failure::new(
+        "INTERNAL_ERROR",
+        format!(
+            "The cross-review server could not start a thread to handle the tool call \
+             ({os_error}), so nothing was sent to the reviewer."
+        ),
+        "The cross-model review tool could not start a handler thread. That is a resource \
+         limit on this machine -- memory, or the per-process thread cap -- and not a problem \
+         with the review setup, the reviewer CLI, or the request.\n\n\
+         Retrying is reasonable, especially after closing other work. If it recurs, the \
+         server's stderr output carries the underlying OS error.\n\n\
+         The review has NOT been performed.",
+    )
+}
+
 /// Another server process holds this named session.
 pub fn session_leased(session: &str, detail: String) -> Failure {
     let mut failure = Failure {
