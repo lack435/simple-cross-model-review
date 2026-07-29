@@ -25,9 +25,13 @@ const FALLBACK_PROTOCOL: &str = "2024-11-05";
 /// the reader thread and has finished before the next line is even read.
 type Pending = Arc<Mutex<HashMap<String, Arc<RequestCancel>>>>;
 
+/// Where responses go. A trait object rather than `Stdout` so a test can read back what
+/// a response path actually wrote; in the server it is always stdout.
+type Writer = Arc<Mutex<dyn Write + Send>>;
+
 pub fn serve(app: Arc<App>) {
     let stdin = std::io::stdin();
-    let writer = Arc::new(Mutex::new(std::io::stdout()));
+    let writer: Writer = Arc::new(Mutex::new(std::io::stdout()));
     // Handler threads are joined at shutdown; exiting while one is mid-flight would
     // drop a response the client is still waiting on.
     let mut in_flight: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -90,57 +94,14 @@ pub fn serve(app: Arc<App>) {
             // Tool calls can block for minutes, so each gets its own thread. Without
             // this a long poll would stall pings and cancellations on the same pipe.
             "tools/call" => {
-                let key = request_key(&id);
-                let request = Arc::new(RequestCancel::new());
-                pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key.clone(), Arc::clone(&request));
-
-                let app = Arc::clone(&app);
-                let writer = Arc::clone(&writer);
-                let pending_here = Arc::clone(&pending);
-                let thread_key = key.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("tools-call".to_string())
-                    .spawn(move || {
-                        let mut entry = PendingEntry {
-                            pending: &pending_here,
-                            key: &thread_key,
-                            released: false,
-                        };
-                        let result = dispatch_tool(&app, &params, &request);
-                        // Released before the send, so a cancellation arriving after this
-                        // point finds nothing in the map at all.
-                        entry.release();
-                        // A cancelled request gets no response: the client has stopped
-                        // waiting for one, and the spec says not to send it. Claiming
-                        // rather than merely checking is what settles the one remaining
-                        // window -- a notification already past the map lookup and about
-                        // to call `cancel` -- so a response and a kill of the review it
-                        // named cannot both happen. A response that loses the race and
-                        // goes unsent is fine; the spec expects the client to tolerate
-                        // one either way.
-                        if !request.try_claim_response() {
-                            return;
-                        }
-                        send(
-                            &writer,
-                            json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                        );
-                    });
-                match spawned {
-                    Ok(handle) => {
-                        in_flight.retain(|h| !h.is_finished());
-                        in_flight.push(handle);
-                    }
-                    Err(e) => {
-                        pending
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&key);
-                        eprintln!("cross-review: could not spawn handler thread: {e}");
-                    }
+                // Reaped before the spawn, not after: on the failure path below there is
+                // no new handle to push, and a vector that only ever grows would hold an
+                // OS thread handle per finished call for the life of the process.
+                in_flight.retain(|h| !h.is_finished());
+                let builder = std::thread::Builder::new().name("tools-call".to_string());
+                if let Some(handle) = start_tool_call(builder, &app, &writer, &pending, id, params)
+                {
+                    in_flight.push(handle);
                 }
             }
             _ => {
@@ -159,6 +120,99 @@ pub fn serve(app: Arc<App>) {
     }
 
     eprintln!("cross-review: stdin closed, shutting down");
+}
+
+/// Runs one `tools/call` on its own thread, and answers the request itself if the thread
+/// cannot be started. Returns the handle to join at shutdown, or `None` when it answered.
+///
+/// Split out of `serve` for the sake of that second case. `serve` owns stdin and cannot be
+/// driven from a test, whereas this takes the `Builder` it spawns from -- and a `Builder`
+/// asked for an impossible stack fails deterministically, so the failure branch is
+/// reachable without the process having to actually run out of threads.
+///
+/// Call it from the reader thread. That is what makes the pending map safe to touch here
+/// without further synchronisation, since `handle_cancellation` runs there too; see the
+/// comment on the send below for what is at stake if it ever moves.
+fn start_tool_call(
+    builder: std::thread::Builder,
+    app: &Arc<App>,
+    writer: &Writer,
+    pending: &Pending,
+    id: Value,
+    params: Value,
+) -> Option<std::thread::JoinHandle<()>> {
+    let key = request_key(&id);
+    let request = Arc::new(RequestCancel::new());
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.clone(), Arc::clone(&request));
+
+    // Read off before `params` moves into the closure, for the failure message below.
+    let tool = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // The captures are cloned inside a block rather than shadowing the originals: a
+    // failed `spawn` drops the closure instead of handing it back, so `writer` and `id`
+    // have to survive it to answer the request.
+    let spawned = {
+        let app = Arc::clone(app);
+        let writer = Arc::clone(writer);
+        let pending_here = Arc::clone(pending);
+        let thread_key = key.clone();
+        let id = id.clone();
+        builder.spawn(move || {
+            let mut entry = PendingEntry {
+                pending: &pending_here,
+                key: &thread_key,
+                released: false,
+            };
+            let result = dispatch_tool(&app, &params, &request);
+            // Released before the send, so a cancellation arriving after this
+            // point finds nothing in the map at all.
+            entry.release();
+            // A cancelled request gets no response: the client has stopped
+            // waiting for one, and the spec says not to send it. Claiming
+            // rather than merely checking is what settles the one remaining
+            // window -- a notification already past the map lookup and about
+            // to call `cancel` -- so a response and a kill of the review it
+            // named cannot both happen. A response that loses the race and
+            // goes unsent is fine; the spec expects the client to tolerate
+            // one either way.
+            if !request.try_claim_response() {
+                return;
+            }
+            send(
+                &writer,
+                json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            );
+        })
+    };
+
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            eprintln!("cross-review: could not spawn handler thread: {e}");
+            // Unconditional, with no `try_claim_response`: the claim exists to settle a
+            // race with `handle_cancellation`, and there is none to settle when this is
+            // called from the reader thread -- `serve` is that thread and so is
+            // `handle_cancellation`, so nothing can have landed between the insert above
+            // and the remove just now. That is a precondition on the caller now rather
+            // than something this function can see, so it is stated in the doc comment.
+            // Off the reader thread the cost is only a response sent for a request that
+            // was cancelled in the window, which the spec tolerates: no review can be
+            // killed either way, since `attach_review` only runs inside `dispatch_tool`.
+            send(writer, handler_thread_unavailable_response(&id, &tool, &e));
+            None
+        }
+    }
 }
 
 /// Removes a handler's entry from the pending map however the handler ends.
@@ -358,11 +412,25 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
     }
 }
 
+/// The answer to a `tools/call` whose handler thread could not be started.
+///
+/// An `isError` result rather than a JSON-RPC error, even though a thread that will not
+/// start is a server fault and -32603 is what the protocol has for exactly that. The
+/// reason `dispatch_tool` gives is about who reads the text rather than whose fault it
+/// is, and that carries over: this reply is only useful if the calling model reads the
+/// remediation, and protocol-level errors are not consistently surfaced to it. Answering
+/// at all is the bulk of the fix -- sending nothing left the client to discover the
+/// failure by its own tool timeout, minutes later and with no cause attached.
+fn handler_thread_unavailable_response(id: &Value, tool: &str, error: &std::io::Error) -> Value {
+    let text = crate::errors::handler_thread_unavailable(tool, &error.to_string());
+    json!({"jsonrpc": "2.0", "id": id, "result": text_result(text, true)})
+}
+
 fn text_result(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
-fn send(writer: &Arc<Mutex<std::io::Stdout>>, message: Value) {
+fn send(writer: &Writer, message: Value) {
     let mut out = writer.lock().unwrap_or_else(|e| e.into_inner());
     let line = match serde_json::to_string(&message) {
         Ok(line) => line,
@@ -791,6 +859,99 @@ mod tests {
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("BAD_REQUEST"));
+    }
+
+    /// Collects what a response path writes, standing in for stdout.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+    impl Recorder {
+        fn writer(&self) -> Writer {
+            Arc::new(Mutex::new(self.clone()))
+        }
+
+        fn responses(&self) -> Vec<Value> {
+            let bytes = self.0.lock().unwrap().clone();
+            // Newline-delimited JSON is the whole transport, and this is the only test
+            // that reads bytes back, so the framing is checked rather than assumed. A
+            // message never contains a bare newline: serde escapes them inside strings.
+            assert!(
+                bytes.is_empty() || bytes.ends_with(b"\n"),
+                "every response must be newline-terminated"
+            );
+            String::from_utf8(bytes)
+                .expect("utf-8")
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each line is one JSON message"))
+                .collect()
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The regression this guards: a `tools/call` whose handler thread will not start used
+    /// to be logged and dropped, leaving the client to discover it by its own tool timeout.
+    ///
+    /// The failure is provoked rather than simulated. A `Builder` asking for a `usize::MAX`
+    /// stack is rejected by the OS outright -- on Windows, `os error 87` -- so `spawn`
+    /// returns `Err` deterministically, with no threads exhausted and nothing left running.
+    #[test]
+    fn a_handler_that_cannot_be_spawned_is_answered_rather_than_left_hanging() {
+        let recorder = Recorder::default();
+        let pending = pending();
+        // What the OS will say, asked of it rather than hardcoded: CI is Windows-only, but
+        // an assertion on "os error 87" would still be pinning one of several ways
+        // CreateThread can refuse.
+        let expected = std::thread::Builder::new()
+            .stack_size(usize::MAX)
+            .spawn(|| {})
+            .expect_err("an impossible stack size must be refused")
+            .to_string();
+
+        let handle = start_tool_call(
+            std::thread::Builder::new().stack_size(usize::MAX),
+            &app(),
+            &recorder.writer(),
+            &pending,
+            json!("req-11"),
+            json!({"name": "cross_model_review_result", "arguments": {}}),
+        );
+
+        assert!(handle.is_none(), "the guard stack size must defeat spawn");
+        // Nothing is left behind to be cancelled or joined.
+        assert!(pending.lock().unwrap().is_empty());
+
+        let responses = recorder.responses();
+        assert_eq!(responses.len(), 1, "exactly one response, and not none");
+        let response = &responses[0];
+        // Addressed to the request that would have gone unanswered, or the client cannot
+        // match it -- and as the same JSON type it was sent as.
+        assert_eq!(response["id"], "req-11");
+        assert_eq!(response["jsonrpc"], "2.0");
+        // An isError result, not a JSON-RPC error: see the response builder's comment.
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("INTERNAL_ERROR"));
+        // The tool is named, and the OS error carried through: stderr is the only other
+        // place either lands, and the caller cannot read stderr.
+        assert!(text.contains("cross_model_review_result"));
+        assert!(text.contains(&expected), "want {expected:?} in: {text}");
+        // The claim the shared stop-and-escalate text would have made here is false: this
+        // call never reached the reviewer, so a review already running is untouched. Nor
+        // may it presume one exists -- the same call from `cross_model_review` would be
+        // the first in the flow, with no review to collect.
+        assert!(!text.contains("The external review did not run"));
+        assert!(text.contains("any review already in progress is unaffected"));
     }
 
     #[test]

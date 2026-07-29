@@ -236,8 +236,10 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`SESSION_NOT_FOUND`, `CANCELLED`. Bad tool arguments get a plain correction instead,
-since that is the agent's own mistake and not something to escalate.
+`SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments get a plain
+correction instead, since that is the agent's own mistake and not something to escalate,
+and so does a tool call the server could not start a thread for -- neither says anything
+about the reviewer's state.
 
 An expired reviewer session is handled rather than escalated: the stale mapping is
 dropped, the review runs in a fresh session, and the response says so.

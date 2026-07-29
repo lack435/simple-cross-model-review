@@ -3,6 +3,12 @@
 //! When a review cannot happen, the calling agent must not paper over it by
 //! reviewing its own work. Every failure therefore carries a machine-readable code,
 //! a plain statement of what broke, and the exact remediation to relay to the user.
+//!
+//! `handler_thread_unavailable` is the one exception, and returns finished text rather
+//! than a `Failure`: it is the only failure here that is not about a review, so the
+//! sentences `Failure` renders around one do not fit. Its code is in the text but cannot
+//! be read off a field. Nothing matches on it today; a caller that needed to would be the
+//! signal to make it a `Failure` and give the type a render mode that suits it.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
@@ -301,6 +307,44 @@ pub fn worker_panicked(review_id: &str) -> Failure {
          complete. Retrying is reasonable; if it recurs, this is a bug in cross-review \
          itself and the server's stderr output will contain the panic message.\n\n\
          The review has NOT been performed.",
+    )
+}
+
+/// The server could not start a thread to run a `tools/call` handler.
+///
+/// The one failure here that is not about a review, which is why it is written out rather
+/// than built from a `Failure`: every render mode of that type hard-codes a sentence about
+/// the review, and both would misstate this. The stop-and-escalate form asserts "The
+/// external review did not run", false when the call that could not be handled was
+/// `cross_model_review_result` and the review it was collecting is still running; the
+/// agent-correctable form is headed "REQUEST REJECTED", which blames a request that was
+/// fine. What holds for all four tools is only that this call did not happen, and that no
+/// review anywhere changed state because of it. That is what this says, and it says nothing
+/// either way about whether a review exists.
+///
+/// The OS error is inlined here for the same reason `with_detail` is not used elsewhere on
+/// this path: its rendered header attributes the text to the reviewer CLI, which never saw
+/// this request.
+pub fn handler_thread_unavailable(tool: &str, os_error: &str) -> String {
+    let tool = if tool.is_empty() {
+        "cross-review"
+    } else {
+        tool
+    };
+    format!(
+        "TOOL CALL NOT HANDLED\n\
+         code: INTERNAL_ERROR\n\n\
+         The cross-review server could not start a thread to run the '{tool}' call \
+         ({os_error}), so the call did not happen.\n\n\
+         The operating system refused to create the thread. In practice that means the \
+         machine running the server is out of memory or has hit its cap on threads per \
+         process; either way it is not a problem with the review setup, the reviewer CLI, or \
+         the arguments. Nothing was sent to the reviewer, and no review changed state: any \
+         review already in progress is unaffected and can still be collected with \
+         cross_model_review_result.\n\n\
+         Call the tool again. If it fails the same way a second time, stop and tell the user \
+         the server cannot start threads on this machine, rather than carrying on without \
+         the review.\n"
     )
 }
 
