@@ -4,7 +4,7 @@
 //! `cross_model_review_result` long-polls here, so the calling agent waits on a
 //! condition variable instead of burning turns on a retry loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -117,19 +117,9 @@ impl Outcome {
 }
 
 /// Everything the registry mutates, under one lock.
-///
-/// The evicted-session set lives here rather than beside it so that dropping a review and
-/// recording that its session lost one cannot be observed half-done: a poll landing
-/// between the two would otherwise be told no review was ever started.
 #[derive(Default)]
 struct State {
     reviews: HashMap<String, Review>,
-    /// Sessions that have had a review evicted.
-    ///
-    /// Names only. A name is a handful of bytes standing in for the kilobytes of review
-    /// text it replaced, so this cannot reintroduce the growth the caps exist to prevent.
-    /// Ids need no equivalent -- see `Registry::was_issued`.
-    evicted_sessions: HashSet<String>,
     /// Completion order, assigned under the lock as each review finishes.
     ///
     /// Eviction ranks on this rather than on the finish `Instant`. Two reviews can land in
@@ -173,9 +163,8 @@ impl State {
             }
         }
 
-        for (id, session) in doomed {
+        for (id, _session) in doomed {
             self.reviews.remove(&id);
-            self.evicted_sessions.insert(session);
         }
     }
 }
@@ -316,21 +305,17 @@ impl Registry {
         if pid != std::process::id().to_string() {
             return false;
         }
+        // Canonical spelling only. `parse` accepts `0001` and `+1`, which would report an
+        // id this process never minted as one it evicted -- a smaller version of exactly
+        // the wrong answer this distinction exists to avoid.
         match seq.parse::<u64>() {
-            Ok(seq) => seq >= 1 && seq <= self.counter.load(Ordering::Relaxed),
+            Ok(parsed) => {
+                parsed.to_string() == seq
+                    && parsed >= 1
+                    && parsed <= self.counter.load(Ordering::Relaxed)
+            }
             Err(_) => false,
         }
-    }
-
-    /// Did this session have a review that has since been evicted?
-    ///
-    /// Answers the `session`-keyed form of the same question `lookup` answers for an id.
-    /// Without it, a caller polling by session name after the global cap emptied that
-    /// session is told no review was ever started for it -- the "never issued" advice
-    /// that eviction is specifically not supposed to produce.
-    pub fn session_had_evicted(&self, session: &str) -> bool {
-        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.evicted_sessions.contains(session)
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -570,6 +555,33 @@ mod tests {
         assert_eq!(registry.lookup("rv-999999999-1"), IdState::Unknown);
         let future = format!("rv-{}-999999", std::process::id());
         assert_eq!(registry.lookup(&future), IdState::Unknown);
+    }
+
+    #[test]
+    fn only_the_canonical_spelling_of_an_id_is_recognised() {
+        // `parse::<u64>` accepts `0001` and `+1`, so a lenient check would report an id
+        // this process never minted as one it evicted -- a smaller version of the wrong
+        // answer the whole distinction exists to avoid.
+        let registry = Registry::new();
+        let real = run_one(&registry, "s", 1);
+        let seq = real.rsplit('-').next().expect("counter");
+        assert_eq!(seq, "1");
+
+        let pid = std::process::id();
+        for alias in [
+            format!("rv-{pid}-0001"),
+            format!("rv-{pid}-+1"),
+            format!("rv-{pid}- 1"),
+            format!("rv-{pid}-1 "),
+        ] {
+            assert_eq!(
+                registry.lookup(&alias),
+                IdState::Unknown,
+                "{alias} was accepted as a real id"
+            );
+        }
+        // The canonical form is of course still recognised.
+        assert_eq!(registry.lookup(&real), IdState::Known);
     }
 
     #[test]

@@ -440,10 +440,23 @@ Both directions pass against live CLIs.
   session mapping outlives the process. Finished reviews are evicted once a session has
   more than three of them, or the process more than fifty, newest kept — a review holds
   its full text, and a long agent session doing many reviews would otherwise accumulate
-  all of them. Running reviews are never evicted: one is still owed to a caller. Evicted
-  ids are remembered (just the id), because "this finished and was discarded" and "this
-  was never issued" call for different advice, and a caller told the second has reason to
-  suspect it mangled the id and will go looking for a bug that is not there.
+  all of them. Running reviews are never evicted: one is still owed to a caller.
+
+  An evicted `review_id` is still recognised as one this process issued, because ids are
+  `rv-<pid>-<counter>` and the counter only increases — so recognition is derived from the
+  id's own form rather than from a list of what was discarded. That matters: "this
+  finished and was discarded" and "this was never issued" call for different advice, and a
+  caller told the second has reason to suspect it mangled the id and will go looking for a
+  bug that is not there. Deriving it means the distinction holds for the life of the
+  process; a list would have to be bounded, and its oldest entry falling off would turn a
+  valid id back into "never issued" precisely where a caller is least likely to question
+  it.
+
+  Looking a review up by **session name** cannot draw that distinction, and says so rather
+  than guessing. Telling the two apart there would mean retaining every session name that
+  ever had a review evicted, which is unbounded in the way the caps exist to prevent —
+  and caller-controlled, since the names are. So the session-keyed miss reports both
+  possibilities and points at `review_id`, which can tell them apart.
 
   Two servers can share a project's state directory, so a named session is claimed with a
   cross-process lease held for the whole review, and mutations of the state file take an

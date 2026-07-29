@@ -243,26 +243,23 @@ impl App {
                     )));
                 }
             },
-            (None, Some(name)) => match self.registry.latest_for_session(name) {
-                Some(id) => id,
-                // The session-keyed twin of the evicted-id case. The per-session cap can
-                // never empty a session, so only the process-wide cap reaches here -- but
-                // when it does, "no review has been started" is exactly the wrong thing
-                // to tell a caller whose review did run.
-                None if self.registry.session_had_evicted(name) => {
-                    return Err(errors::bad_request(format!(
-                        "Session '{name}' had a review, but it finished earlier and its result \
-                         has since been discarded to bound memory. It is not recoverable; start \
-                         a new review."
-                    )));
-                }
-                None => {
-                    return Err(errors::bad_request(format!(
-                        "No review has been started for session '{name}' in this server process. \
-                         Call cross_model_review first."
-                    )));
-                }
-            },
+            // Deliberately does not claim which of the two it is. Telling them apart
+            // would mean remembering every session name that ever had a review evicted,
+            // which is unbounded in exactly the way the retention caps exist to prevent --
+            // and the growth would be caller-controlled, since session names are. A
+            // `review_id` still gets the strict distinction, because that can be derived
+            // rather than stored; see `Registry::was_issued`. So this states both
+            // possibilities rather than guessing at one, which is the honest shape of what
+            // the server actually knows.
+            (None, Some(name)) => self.registry.latest_for_session(name).ok_or_else(|| {
+                errors::bad_request(format!(
+                    "No review is currently retained for session '{name}'. Either none was \
+                     started in this server process, or one finished and its result has since \
+                     been discarded to bound memory. Either way it is not recoverable: start a \
+                     new review. If you still hold the review_id, pass that instead — it can \
+                     tell the two apart."
+                ))
+            })?,
             (None, None) => {
                 return Err(errors::bad_request(
                     "Provide either 'review_id' (preferred) or 'session'.",
