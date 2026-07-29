@@ -133,8 +133,12 @@ impl DiffMode {
     }
 
     /// How the command reads in the prompt, so the reviewer knows exactly what it was
-    /// shown and can say so in its review. Derived from the real arguments rather than
-    /// written out again, so the two cannot drift.
+    /// shown and can say so in its review.
+    ///
+    /// Derived from the real arguments rather than written out again, so the part that
+    /// determines *what* is shown cannot drift from the label. The git-level options
+    /// added by `Git::run` (`--no-pager`, `-c core.fsmonitor=`) are not in it: they change
+    /// what git is allowed to execute, not what the reviewer is looking at.
     fn command_line(&self) -> String {
         let args = self.diff_args();
         if args.is_empty() {
@@ -169,6 +173,13 @@ pub struct Change {
     pub untracked: Vec<UntrackedFile>,
     /// Untracked files that exist but were not included, and why.
     pub untracked_omitted: Vec<String>,
+    /// Parts of the capture that did not run at all.
+    ///
+    /// The shared budget means exhausting it on one command silently disables the next,
+    /// and the reviewer cannot tell an absent untracked section from a working tree that
+    /// had no untracked files -- it has no shell to go and check. That is exactly the
+    /// silent shortfall this module refuses to produce anywhere else, so it is stated.
+    pub notes: Vec<String>,
 }
 
 /// Some text captured from git, plus whether it was cut short.
@@ -233,13 +244,21 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
         None => return None,
     };
 
+    let mut notes = Vec::new();
+
     let status = match git.run(&["status", "--porcelain", "--", "."]) {
         Some(out) if out.success => truncate(out.stdout, MAX_DIFF_BYTES),
-        _ => Section::empty(),
+        _ => {
+            notes.push(
+                "`git status` did not complete, so no status listing is included below."
+                    .to_string(),
+            );
+            Section::empty()
+        }
     };
 
     let (untracked, untracked_omitted) = if mode.includes_untracked() {
-        git.untracked()
+        git.untracked(&mut notes)
     } else {
         (Vec::new(), Vec::new())
     };
@@ -251,6 +270,7 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
         status,
         untracked,
         untracked_omitted,
+        notes,
     })
 }
 
@@ -283,8 +303,9 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
             // which is the same failure this feature exists to remove, pointing the other
             // way.
             out.push_str(
-                " Note that it covers **uncommitted** work only: if the change you were \
-                 asked to review has already been committed, it will not appear here.",
+                " Note that it covers **uncommitted** work only, and for a staged diff, \
+                 only work that has been staged: if the change you were asked to review \
+                 has already been committed, or was never staged, it will not appear here.",
             );
         }
         out.push_str(
@@ -339,6 +360,17 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
         out.push('\n');
     }
 
+    if !change.notes.is_empty() {
+        out.push_str("### Gaps in this capture\n\n");
+        for note in &change.notes {
+            out.push_str(&format!("- {note}\n"));
+        }
+        out.push_str(
+            "\nTreat these as things you were not shown, and say so under \"What I could not \
+             check\".\n\n",
+        );
+    }
+
     out
 }
 
@@ -382,16 +414,28 @@ impl<'a> Git<'a> {
     ///
     /// `--no-pager` rather than `GIT_PAGER=cat`: git does not page onto a pipe anyway, and
     /// naming an external binary we have not resolved would be the one way to make the
-    /// hypothetical problem real. `core.fsmonitor=` is defence in depth of the same kind
-    /// as `--no-ext-diff` — the reviewed repository's config can name a command there.
-    /// Unlike `diff.external`, that one is not verified here; it is one argument and it
-    /// closes a plausible path.
+    /// hypothetical problem real.
+    ///
+    /// `core.fsmonitor=` closes the same class as `--no-ext-diff`. Verified: with
+    /// `core.fsmonitor` pointing at a non-existent path in `.git/config`,
+    /// `git status --porcelain -- .` reported `cannot spawn` twice — git really does try
+    /// to execute what the repository names — and `-c core.fsmonitor=` removed the
+    /// attempt while status still worked.
+    ///
+    /// This is not a complete defence and is not claimed as one. `filter.<driver>.clean`
+    /// is a further vector that still runs (verified), and it cannot be closed by name
+    /// because the driver name comes from `.gitattributes`. All of these need write access
+    /// to `.git/config`, not merely a committed file; see the README.
     fn run(&self, args: &[&str]) -> Option<RunOutcome> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            // Deliberately does not claim what the reviewer received: exhausting the
+            // budget on `rev-parse` or on the diff means the capture is abandoned and the
+            // reviewer gets nothing at all, while exhausting it later leaves a partial
+            // capture whose gaps are listed in the prompt.
             eprintln!(
-                "cross-review: warning: capturing the change exceeded its {}s budget; \
-                 the reviewer was given what had been collected",
+                "cross-review: warning: capturing the change exceeded its {}s budget, so \
+                 part or all of it was skipped",
                 CAPTURE_BUDGET.as_secs()
             );
             return None;
@@ -427,10 +471,20 @@ impl<'a> Git<'a> {
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
-    fn untracked(&self) -> (Vec<UntrackedFile>, Vec<String>) {
+    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<UntrackedFile>, Vec<String>) {
         let listing = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
             Some(out) if out.success => out.stdout,
-            _ => return (Vec::new(), Vec::new()),
+            // An absent section reads as "there were none", and the reviewer has no shell
+            // with which to discover otherwise.
+            _ => {
+                notes.push(
+                    "Untracked files were not collected, because `git ls-files` did not \
+                     complete. There may be new files that neither the diff nor this prompt \
+                     shows."
+                        .to_string(),
+                );
+                return (Vec::new(), Vec::new());
+            }
         };
 
         // NUL-separated, so a path containing a newline -- legal, and a way to hide a file
@@ -858,6 +912,7 @@ mod tests {
             status: Section::empty(),
             untracked: Vec::new(),
             untracked_omitted: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -905,6 +960,7 @@ mod tests {
                 },
             }],
             untracked_omitted: vec!["`blob.bin` is binary".into()],
+            notes: Vec::new(),
         };
         let text = render(&change, Path::new("C:\\repo"), false);
         assert!(text.contains("diff above was truncated"), "{text}");
@@ -916,6 +972,28 @@ mod tests {
         assert!(text.contains("#### new.rs"), "{text}");
         assert!(text.contains("larger than the per-file cap"), "{text}");
         assert!(text.contains("is binary"), "{text}");
+    }
+
+    #[test]
+    fn a_capture_that_could_not_finish_says_which_part_is_missing() {
+        // The shared budget means running out on one command silently disables the next.
+        // An absent untracked section reads as "there were none", and a reviewer with no
+        // shell cannot go and check -- so the gap has to be named.
+        let change = Change {
+            notes: vec!["Untracked files were not collected".into()],
+            ..change_fixture()
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("### Gaps in this capture"), "{text}");
+        assert!(
+            text.contains("Untracked files were not collected"),
+            "{text}"
+        );
+        assert!(text.contains("What I could not check"), "{text}");
+
+        // And a complete capture does not grow an empty section claiming gaps.
+        let text = render(&change_fixture(), Path::new("C:\\repo"), false);
+        assert!(!text.contains("Gaps in this capture"), "{text}");
     }
 
     #[test]
@@ -1037,8 +1115,12 @@ mod tests {
         let outside = temp_dir();
         std::fs::write(outside.join("secret.txt"), "not yours\n").expect("write");
 
+        // Absolute path, not a bare `cmd`: resolving a program name against the calling
+        // executable's directory is the hazard `reviewer::on_path` exists to avoid, and
+        // this codebase should not break its own rule even in a test.
+        let comspec = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let link = dir.join("escape");
-        let made = Command::new("cmd")
+        let made = Command::new(format!(r"{comspec}\System32\cmd.exe"))
             .args(["/c", "mklink", "/J"])
             .arg(&link)
             .arg(&outside)

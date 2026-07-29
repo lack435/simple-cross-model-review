@@ -133,9 +133,16 @@ Notes on the edges, because they are where this would otherwise mislead:
 
   This is a boundary worth being plain about: git has no "ignore this repository's config"
   switch, so unlike the reviewer — which runs configuration-isolated — the server does read
-  the reviewed repository's git config when it captures. The known execution vectors are
-  closed by name (`diff.external`, textconv drivers, and `core.fsmonitor` defensively), and
-  they need write access to `.git/config`, not merely a committed file. If that is not a
+  the reviewed repository's git config when it captures.
+
+  What is closed is the vectors that *can* be closed by name: `diff.external`, textconv
+  drivers, and `core.fsmonitor` (also verified — with `core.fsmonitor` pointing at a
+  missing path, `git status` reported `cannot spawn`; `-c core.fsmonitor=` removed the
+  attempt). **That list is not a completeness proof.** `filter.<driver>.clean` still runs —
+  verified against the hardened command line — and cannot be closed the same way, because
+  the driver name comes from `.gitattributes` rather than from a fixed key. All of these
+  need write access to `.git/config`, not merely a committed file, so a plain `git clone`
+  of a hostile repository does not reach them; an archive or a zip does. If that is not a
   trade you want, `--diff none`.
 - **git is resolved from PATH, never from beside the executable.** Windows program
   resolution searches the calling executable's own directory *first*, and this binary is
