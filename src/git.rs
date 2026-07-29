@@ -147,14 +147,54 @@ impl DiffMode {
         format!("git diff {}", args.join(" "))
     }
 
+    /// Whether the diff this mode produces has the *working tree* as one of its endpoints.
+    ///
+    /// This is git's own semantics and it does not follow the keyword/revision split, which
+    /// is why it is asked as its own question. `git diff A..B` and `git diff A...B` compare
+    /// two commits; a bare `git diff A` compares A **to the working tree**. So `HEAD~3` --
+    /// documented and tested here as a revision -- picks up uncommitted edits, while
+    /// `main...HEAD` does not. Verified: with one tracked file dirty, `git diff HEAD~3`
+    /// gained a file and a line and `git diff main...HEAD` did not.
+    fn compares_against_working_tree(&self) -> bool {
+        match self {
+            Self::Auto | Self::Head => true,
+            Self::None | Self::Staged => false,
+            Self::Rev(rev) => !rev.contains(".."),
+        }
+    }
+
     /// Whether untracked files belong with this diff.
     ///
-    /// They do for the working-tree modes, where "what I changed" includes files git has
-    /// never seen -- the case a diff structurally cannot cover. They do not for `staged`
-    /// or an explicit range, where the caller named a specific set of changes and an
-    /// untracked file is not in it.
+    /// They do when the diff's endpoint is the working tree, where "what I changed"
+    /// includes files git has never seen -- the case a diff structurally cannot cover. They
+    /// do not for `staged` or a two-endpoint range, which name a specific set of changes
+    /// that an untracked file is not in.
     fn includes_untracked(&self) -> bool {
-        matches!(self, Self::Auto | Self::Head)
+        self.compares_against_working_tree()
+    }
+
+    /// Whether the files the reviewer can *read* may differ from the diff it was handed.
+    ///
+    /// The reviewer holds a diff and has read access to the live tree. When those are the
+    /// same revision it can trust both; when they are not, it will otherwise reconcile a
+    /// hunk against a file that no longer matches and report the difference as a finding --
+    /// and it is the party least able to check, having neither history nor a shell.
+    ///
+    /// Answered from the porcelain status rather than from the mode alone, because the two
+    /// non-working-tree modes disagree about what counts. For a two-endpoint range anything
+    /// uncommitted is outside the diff. For `staged`, a file that is staged and nothing else
+    /// matches the diff exactly; it is the *worktree* column -- an `MM`, or an untracked
+    /// file -- that means the tree has moved past the index.
+    fn tree_may_differ(&self, status: &str) -> bool {
+        match self {
+            _ if self.compares_against_working_tree() => false,
+            Self::None => false,
+            Self::Staged => status.lines().any(|line| {
+                let cols = line.as_bytes();
+                cols.len() > 1 && (cols[0] == b'?' || (cols[1] != b' ' && cols[1] != b'\r'))
+            }),
+            _ => !status.trim().is_empty(),
+        }
     }
 
     /// Whether this mode can only ever show uncommitted work, which is what the reviewer
@@ -191,6 +231,17 @@ impl DiffMode {
                 "Note that only staged work is supplied as a diff. `git status` may still \
                  list unstaged or untracked paths, but their contents are not sent.",
             ),
+            // A bare revision is *not* the same shape as a range, however alike they look
+            // on the command line: `git diff HEAD~3` diffs that commit against the working
+            // tree, so it carries uncommitted work and needs untracked files with it.
+            Self::Rev(rev) if self.compares_against_working_tree() => (
+                format!(
+                    "`git diff {rev}`, which compares that revision to your **working tree**, \
+                     plus `git status` and the contents of untracked files"
+                ),
+                "Note that this covers everything since that revision, committed or not, so \
+                 you do not need to commit first.",
+            ),
             Self::Rev(rev) => (
                 format!("`git diff {rev}` and `git status`"),
                 "Note that only that range is supplied as a diff, so commit what you want \
@@ -205,6 +256,8 @@ impl DiffMode {
 pub struct Change {
     pub command: String,
     pub working_tree_only: bool,
+    /// The live tree may not be the revision the diff describes. See `tree_may_differ`.
+    pub tree_may_differ: bool,
     pub diff: Section,
     pub status: Section,
     pub untracked: Vec<UntrackedFile>,
@@ -357,6 +410,7 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         change: Some(Change {
             command: mode.command_line(),
             working_tree_only: mode.working_tree_only(),
+            tree_may_differ: mode.tree_may_differ(&status.text),
             diff,
             status,
             untracked,
@@ -422,17 +476,13 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
         out.push_str(
             "Paths here are relative to the repository root, not to the directory above.\n\n",
         );
-        // A range or `staged` diff describes a revision; the status describes the tree, and
-        // the files this reviewer can open describe the tree too. When those disagree, the
-        // reviewer is the party that will misread it -- it would otherwise reconcile a diff
-        // hunk against a file that no longer matches and report the difference as a finding.
         // The caller is warned about this shape by `caller_summary`, but a caller that
         // forgets is exactly the case this section exists to survive.
-        if !change.working_tree_only {
+        if change.tree_may_differ {
             out.push_str(
-                "This listing is not empty, so the working tree has changes that are **not** in \
-                 the diff above. The diff is a committed revision; the status and any file you \
-                 read reflect the current tree, which is a different revision. Do not treat a \
+                "The working tree has changes that are **not** in the diff above. The diff \
+                 describes one revision; the status and any file you read reflect the current \
+                 tree, which is a different one. Do not treat a \
                  mismatch between them as a finding -- review the diff, and say plainly that \
                  the tree was dirty and which parts of it you could not account for.\n\n",
             );
@@ -1016,6 +1066,7 @@ mod tests {
         Change {
             command: "git diff HEAD".into(),
             working_tree_only: true,
+            tree_may_differ: false,
             diff: Section::empty(),
             status: Section::empty(),
             untracked: Vec::new(),
@@ -1031,6 +1082,7 @@ mod tests {
         // party that cannot check, having neither the commit history nor a shell.
         let mut change = change_fixture();
         change.working_tree_only = false;
+        change.tree_may_differ = true;
         change.command = "git diff main...HEAD".into();
         change.status = Section {
             text: " M src/main.rs\n".into(),
@@ -1038,19 +1090,60 @@ mod tests {
         };
         let text = render(&change, Path::new("C:\\repo"), false);
         assert!(text.contains("not** in the diff above"), "{text}");
-        assert!(text.contains("different revision"), "{text}");
+        assert!(text.contains("a different one"), "{text}");
 
-        // A working-tree mode has no such mismatch: the diff and the tree are the same
-        // revision, so the warning would be false.
-        change.working_tree_only = true;
+        change.tree_may_differ = false;
         let text = render(&change, Path::new("C:\\repo"), false);
-        assert!(!text.contains("different revision"), "{text}");
+        assert!(!text.contains("not** in the diff above"), "{text}");
+    }
 
-        // Neither does a clean tree under a range: nothing to be out of step with.
-        change.working_tree_only = false;
-        change.status = Section::empty();
-        let text = render(&change, Path::new("C:\\repo"), false);
-        assert!(!text.contains("different revision"), "{text}");
+    /// Which modes can put the reviewer out of step with the tree it can read.
+    ///
+    /// The mode alone is not enough, and the two that need a status are the two that were
+    /// wrong: `staged` matches the tree exactly when everything staged is all there is, and
+    /// a bare revision diffs against the working tree, so it never disagrees with it.
+    #[test]
+    fn only_a_diff_that_is_not_the_live_tree_warns_about_the_live_tree() {
+        let dirty = " M src/main.rs\n";
+        let staged_only = "M  src/main.rs\n";
+        let staged_then_edited = "MM src/main.rs\n";
+        let untracked = "?? notes.txt\n";
+
+        // A two-endpoint range: anything uncommitted at all is outside the diff.
+        let range = DiffMode::Rev("main...HEAD".into());
+        assert!(range.tree_may_differ(dirty));
+        assert!(range.tree_may_differ(staged_only));
+        assert!(!range.tree_may_differ(""));
+
+        // `staged`: the index *is* the diff, so a purely staged tree matches it. It is the
+        // worktree column, or an untracked file, that means the tree has moved past it.
+        let staged = DiffMode::Staged;
+        assert!(!staged.tree_may_differ(staged_only));
+        assert!(staged.tree_may_differ(staged_then_edited));
+        assert!(staged.tree_may_differ(dirty));
+        assert!(staged.tree_may_differ(untracked));
+
+        // The working-tree modes and a bare revision all diff *against* the tree.
+        for mode in [
+            DiffMode::Auto,
+            DiffMode::Head,
+            DiffMode::Rev("HEAD~3".into()),
+            DiffMode::Rev("main".into()),
+        ] {
+            assert!(!mode.tree_may_differ(dirty), "{mode:?}");
+            assert!(!mode.tree_may_differ(untracked), "{mode:?}");
+        }
+    }
+
+    /// A bare revision carries uncommitted work, so it needs untracked files with it for
+    /// the same reason `HEAD` does; a two-endpoint range named a set that excludes them.
+    #[test]
+    fn untracked_files_follow_the_diffs_endpoint_not_the_keyword() {
+        assert!(DiffMode::Rev("HEAD~3".into()).includes_untracked());
+        assert!(DiffMode::Head.includes_untracked());
+        assert!(!DiffMode::Rev("main...HEAD".into()).includes_untracked());
+        assert!(!DiffMode::Rev("main..HEAD".into()).includes_untracked());
+        assert!(!DiffMode::Staged.includes_untracked());
     }
 
     #[test]
@@ -1081,6 +1174,7 @@ mod tests {
         let change = Change {
             command: "git diff HEAD".into(),
             working_tree_only: true,
+            tree_may_differ: false,
             diff: Section {
                 text: "+something".into(),
                 truncated: true,
@@ -1239,6 +1333,50 @@ mod tests {
         assert!(capture.change.is_none());
         assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
         assert!(capture.warnings[0].contains("not a git repository"));
+    }
+
+    /// Against real git, not against our beliefs about it.
+    ///
+    /// The distinction this rests on is git's, and it is easy to state backwards: a bare
+    /// `git diff <rev>` has the working tree as its second endpoint, so it carries
+    /// uncommitted edits, while `<rev>...HEAD` compares two commits and cannot.
+    #[test]
+    fn a_bare_revision_captures_uncommitted_work_and_a_range_does_not() {
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        // `repo_with_a_change` leaves tracked.txt modified but uncommitted, and HEAD is the
+        // only commit, so both specs below have the same commit-to-commit content: none.
+        let bare = capture(&config_for(&dir, DiffMode::Rev("HEAD".into())), &idle())
+            .change
+            .expect("a change");
+        assert!(
+            bare.diff.text.contains("modified"),
+            "a bare revision should carry the uncommitted edit: {}",
+            bare.diff.text
+        );
+        assert!(
+            bare.untracked.iter().any(|f| f.path.contains("untracked")),
+            "and the untracked file with it"
+        );
+        assert!(!bare.tree_may_differ);
+
+        let ranged = capture(
+            &config_for(&dir, DiffMode::Rev("HEAD..HEAD".into())),
+            &idle(),
+        )
+        .change
+        .expect("a change");
+        assert!(
+            ranged.diff.text.trim().is_empty(),
+            "a two-endpoint range must not see the working tree: {}",
+            ranged.diff.text
+        );
+        assert!(ranged.untracked.is_empty());
+        assert!(
+            ranged.tree_may_differ,
+            "and the reviewer must be told the tree it can read is not that revision"
+        );
     }
 
     #[test]

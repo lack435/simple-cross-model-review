@@ -112,10 +112,17 @@ root, so running `git` here costs the calling agent nothing:
 | `none` | nothing; supply your own in `instructions` |
 | `staged` | `git diff --cached` + status |
 | `HEAD` | as `auto`, regardless of whether the reviewer has a shell |
-| *any revision* | `git diff <rev>` + status, e.g. `main...HEAD` or `HEAD~3` |
+| *a range* | `git diff <a>...<b>` + status, e.g. `main...HEAD` — two commits, so no working tree and no untracked files |
+| *a bare revision* | `git diff <rev>` + status + untracked contents, e.g. `HEAD~3` — that commit **against the working tree** |
 
 The full command is `git diff --no-ext-diff --no-textconv --relative <rev> -- .`, and it is
 named verbatim in the reviewer's prompt so it can report what it was shown.
+
+The last two rows are one `--diff` value apart and are not the same thing, because that is
+git's own semantics: `A..B` and `A...B` compare two commits, while a bare `A` compares A to
+the working tree. So `--diff HEAD~3` carries your uncommitted edits and `--diff main...HEAD`
+cannot. Both the caller's description and the reviewer's prompt follow the endpoint rather
+than the spelling.
 
 Notes on the edges, because they are where this would otherwise mislead:
 
@@ -389,7 +396,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 159 unit tests: no network, no model calls
+cargo test          # 162 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```

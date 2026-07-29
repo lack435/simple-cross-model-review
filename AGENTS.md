@@ -38,13 +38,24 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
     handed `git status`, so it would be reviewing one revision through a diff and another
     through the tree. The reviewer is now told when that has happened; do not make it rely
     on that.
-  - **`main` there is the *local* ref, so fetch and fast-forward it first**
-    (`git fetch origin && git branch -f main origin/main`). A stale local `main` does not
-    fail — it silently widens the capture to include everything merged since, and the
-    reviewer spends its turn on code the PR did not touch. This has happened: a review of
-    this PR was handed 1707 insertions instead of 208. If your PR is stacked on something
-    other than `main`, the pinned range is simply wrong for it; say so in `instructions` and
-    treat the review accordingly, or run it from a checkout where the pin fits.
+  - **`main` there is the *local* ref, so fetch and check it is current first.** A stale
+    local `main` does not fail — it silently widens the capture to include everything merged
+    since, and the reviewer spends its turn on code the PR did not touch. This has happened:
+    a review of this PR was handed 1707 insertions instead of 208. Nothing in the response
+    distinguishes that from a large PR, so the check is yours to make:
+
+    ```powershell
+    git fetch origin
+    git merge-base --is-ancestor main origin/main; if ($?) { git branch -f main origin/main } else { "local main has diverged - stop" }
+    ```
+
+    The guard matters: `git branch -f` on a diverged `main` discards the local tip rather
+    than fast-forwarding. If it reports divergence, sort that out before reviewing.
+  - **If your PR is not based on `main`, this entry cannot gate it.** The base is pinned in
+    the server arguments, so a review of `main...HEAD` on a stacked branch takes in the PR
+    underneath as well and would pass the gate without the PR's own diff ever being reviewed
+    alone. Point a checkout's `--diff` at the real base, and say in `instructions` what the
+    base is. Do not describe the mismatch and proceed.
   - For mid-development review of work that is not committed yet, open a Claude Code session
     against this checkout and call from there — that direction gets the Codex reviewer, which
     has a shell and can see the working tree. A Codex session cannot reach it by changing

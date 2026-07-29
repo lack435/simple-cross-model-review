@@ -40,11 +40,13 @@ args = [
 # handed `git status` alongside the range, so an uncommitted edit does not go unseen -- it
 # gets seen out of step with the diff, which is worse.
 #
-# `main` here is the *local* ref. Fetch and fast-forward it before reviewing: a stale local
-# main does not fail, it quietly widens the range to include everything merged since, and
-# the reviewer spends its turn on code the branch never touched. Nothing in the response
-# distinguishes that from a large PR. A branch based on something other than main needs a
-# different pin; there is no per-call override.
+# `main` here is the *local* ref. Fetch and check it is current before reviewing: a stale
+# local main does not fail, it quietly widens the range to include everything merged since,
+# and the reviewer spends its turn on code the branch never touched. Nothing in the response
+# distinguishes that from a large PR. Guard the fast-forward with
+# `git merge-base --is-ancestor main origin/main` -- `git branch -f` on a diverged main
+# discards the local tip. A branch based on something other than main needs a different pin;
+# there is no per-call override, so it cannot be gated from this entry.
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
 # covers a single request rather than a whole review. It must still exceed the 300s cap on

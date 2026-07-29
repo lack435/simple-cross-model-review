@@ -738,9 +738,11 @@ mod tests {
         // contents of anything dirty or untracked do not. Asserted as those facts rather
         // than as one banned phrase, so a rewording that breaks the contract cannot pass
         // by avoiding the old words.
+        // `HEAD~3` is deliberately absent: a bare revision diffs against the working tree,
+        // so it belongs with the working-tree modes below, not with the two-endpoint ranges.
         for (spec, diff_label) in [
             ("main...HEAD", "`git diff main...HEAD`"),
-            ("HEAD~3", "`git diff HEAD~3`"),
+            ("main..HEAD", "`git diff main..HEAD`"),
             ("staged", "`git diff --cached`"),
         ] {
             let text = describe(&["--diff", spec]);
@@ -756,6 +758,16 @@ mod tests {
             );
             assert!(!text.contains("covers uncommitted work"), "{spec}: {text}");
         }
+
+        // A bare revision compares against the working tree, so the caller must not be told
+        // to commit first -- it would be describing a range it did not configure.
+        let bare = describe(&["--diff", "HEAD~3"]);
+        assert!(bare.contains("working tree**"), "{bare}");
+        assert!(bare.contains("the contents of untracked files"), "{bare}");
+        assert!(
+            !bare.contains("commit what you want reviewed first"),
+            "{bare}"
+        );
 
         // The working-tree modes do supply untracked contents, and say so. `auto` reaches
         // this because the Claude reviewer has no shell to fetch a diff itself.
