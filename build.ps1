@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  Build cross-review.exe and stage it in dist/ for committing.
+  Build cross-review.exe and stage it in dist/ for local use.
 
 .DESCRIPTION
   Runs fmt, clippy and the tests, then builds the release binary and copies it to
-  dist/cross-review.exe. That copy is committed so consuming repositories can vendor
-  the executable and need nothing installed.
+  dist/cross-review.exe. That copy is gitignored: releases are published by CI, and this
+  staging path exists so the project's own MCP configs resolve after a local build.
 #>
 [CmdletBinding()]
 param(
@@ -45,8 +45,9 @@ if (-not $SkipChecks) {
 
 # Strip local absolute paths out of the binary. rustc embeds the source path of every
 # crate for panic locations, so an unremapped build ships the building user's home
-# directory -- e.g. C:\Users\<you>\.cargo\registry\... -- inside a binary this project
-# deliberately commits to public repositories.
+# directory -- e.g. C:\Users\<you>\.cargo\registry\... -- inside a binary that gets
+# published and vendored into other repositories. This ran in CI too, so a release
+# carries the runner's paths no more than a local build carries yours.
 #
 # CARGO_ENCODED_RUSTFLAGS rather than RUSTFLAGS because the latter is space-separated,
 # which would split a home directory containing a space. The separator is a literal 0x1f.
@@ -91,8 +92,8 @@ if ($builtHash -ne $distHash) {
     throw "dist\cross-review.exe does not match the build output"
 }
 
-# The binary is committed and published, so verify the remapping actually took rather
-# than trusting the flags reached rustc.
+# The binary is published and vendored elsewhere, so verify the remapping actually took
+# rather than trusting that the flags reached rustc.
 $leaked = Select-String -Path $dist -Pattern ([regex]::Escape($env:USERPROFILE)) -SimpleMatch -Quiet -ErrorAction SilentlyContinue
 if ($leaked) {
     throw "$dist still contains $env:USERPROFILE - path remapping did not take effect"
@@ -104,3 +105,5 @@ Write-Host "Staged $dist ($size KB)" -ForegroundColor Green
 & $dist --version
 Write-Host ''
 Write-Host 'To vendor into a project:  copy dist\cross-review.exe <project>\tools\'
+Write-Host 'dist\ is gitignored. Published releases come from CI on a v* tag:'
+Write-Host '  git tag v0.1.0 && git push origin v0.1.0'

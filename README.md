@@ -42,8 +42,16 @@ This repository has both wired up for itself, so it can be dogfooded in either d
 [`.mcp.json`](.mcp.json) (Claude asks Codex) and [`.codex/config.toml`](.codex/config.toml)
 (Codex asks Claude).
 
-Both come down to two steps: copy `cross-review.exe` into `tools\` in your project, and
-add one entry to a project config file. Both are committed, so a fresh clone works.
+Both come down to two steps: put `cross-review.exe` in `tools\` in your project, and add
+one entry to a project config file. Commit both, so a fresh clone of *your* project needs
+no setup at all.
+
+Get the executable from the [Releases page](../../releases) — download `cross-review.exe`
+and check it against `SHA256SUMS.txt`. It is not committed to this repository: a committed
+binary cannot be kept honest, because a running MCP server locks the file, CI cannot tell
+a stale copy from a current one while the version is pinned, and it embedded the builder's
+home directory. `cross-review.exe --version` reports the commit it was built from. To
+build it yourself instead, see [Building](#building).
 
 > Codex only loads project-level config for **trusted** folders — the
 > `[projects.'c:\path'] trust_level = "trusted"` entry it writes when you first approve
@@ -242,7 +250,29 @@ Requires Rust (stable, MSVC). Everything else is vendored.
 ```
 
 That runs `cargo fmt --check`, clippy with warnings as errors, the tests, and a release
-build, then stages `dist\cross-review.exe` — the copy committed for vendoring.
+build, then stages `dist\cross-review.exe`. `dist\` is gitignored; the staged copy exists
+so this repository's own MCP configs resolve, and as the thing you vendor elsewhere.
+
+The build remaps `--remap-path-prefix` over the cargo and rustup homes, because rustc
+otherwise embeds the builder's home directory in the binary for panic locations. It fails
+if that path survives, so a published artifact cannot carry it.
+
+### Releasing
+
+Releases are built and published by CI, not from a workstation:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+That runs the full checks, builds with paths remapped, re-verifies the `CLI_NOT_FOUND`
+failure contract against the exact binary being shipped, and publishes it to the Releases
+page with `SHA256SUMS.txt`. It refuses to publish if the tag and the `Cargo.toml` version
+disagree. `workflow_dispatch` runs everything except the publish, as a dry run.
+
+Released binaries report their provenance: `cross-review 0.1.0 (<commit sha>)`. A local
+build says `(local build)` rather than implying a provenance it does not have — the
+version alone cannot distinguish two builds, since it is pinned in `Cargo.toml`.
 
 Check a setup from a terminal without starting an agent:
 
