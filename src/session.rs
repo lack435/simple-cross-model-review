@@ -299,18 +299,12 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::testutil::TempDir;
 
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-
-    /// A fresh directory per test so they can run in parallel.
-    fn temp_dir() -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join("cross-review-session-tests")
-            .join(format!("{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A fresh directory per test so they can run in parallel. See `crate::testutil` for
+    /// why it is both cleared on the way in and removed on the way out.
+    fn temp_dir() -> TempDir {
+        crate::testutil::temp_dir("cross-review-session-tests")
     }
 
     fn record(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {
@@ -411,7 +405,10 @@ mod tests {
 
     #[test]
     fn writing_creates_missing_parent_directories() {
-        let dir = temp_dir().join("nested").join("deeper");
+        // The guard has to outlive the path derived from it: bound to a temporary, it
+        // would drop at the end of this statement and take the directory with it.
+        let root = temp_dir();
+        let dir = root.join("nested").join("deeper");
         let store = SessionStore::new(&dir);
         record(&store, "default", "thread-1");
         assert!(store.path().is_file());

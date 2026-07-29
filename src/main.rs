@@ -20,6 +20,8 @@ mod prompt;
 mod registry;
 mod reviewer;
 mod session;
+#[cfg(test)]
+mod testutil;
 mod tools;
 mod winjob;
 

@@ -969,19 +969,13 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::testutil::TempDir;
 
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-
-    /// A fresh directory per test so they can run in parallel.
-    fn temp_dir() -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join("cross-review-git-tests")
-            .join(format!("{}-{}", std::process::id(), n));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A fresh directory per test so they can run in parallel. See `crate::testutil` for
+    /// why it is both cleared on the way in and removed on the way out -- it matters more
+    /// here than anywhere else, because these directories hold whole git repositories.
+    fn temp_dir() -> TempDir {
+        crate::testutil::temp_dir("cross-review-git-tests")
     }
 
     fn idle() -> AtomicBool {
@@ -996,7 +990,7 @@ mod tests {
     /// cannot be, and that is exactly where this feature fails silently -- a diff that
     /// never arrives leaves a reviewer confidently grading the wrong thing. No network and
     /// no model call, so the suite stays offline.
-    fn repo_with_a_change() -> Option<PathBuf> {
+    fn repo_with_a_change() -> Option<TempDir> {
         let dir = temp_dir();
         let cancel = idle();
         let git = Git::new(&dir, &cancel)?;
@@ -1664,7 +1658,7 @@ mod tests {
         let made = Command::new(format!(r"{comspec}\System32\cmd.exe"))
             .args(["/c", "mklink", "/J"])
             .arg(&link)
-            .arg(&outside)
+            .arg(outside.as_path())
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
