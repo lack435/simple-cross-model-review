@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::git::DiffMode;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReviewerKind {
     Claude,
@@ -152,6 +154,14 @@ pub struct Config {
     /// so excluding it is defensible on its own terms; pass the conventions that matter
     /// in `instructions` instead.
     pub isolate_reviewer: bool,
+    /// What the server captures and hands the reviewer as "the change".
+    ///
+    /// Defaults to `auto`, which supplies a working-tree diff only when the reviewer has
+    /// no shell to fetch one itself. That closes a real asymmetry: most reviews are
+    /// reviews *of a change*, and without this the caller of a shell-less reviewer had to
+    /// paste the diff into `instructions` -- spending its own context on it, missing
+    /// untracked files, and getting a confident review of the current tree when it forgot.
+    pub diff: DiffMode,
 }
 
 impl Config {
@@ -169,6 +179,7 @@ impl Config {
         let mut preamble_file: Option<PathBuf> = None;
         let mut no_preamble = false;
         let mut isolate_reviewer = true;
+        let mut diff = DiffMode::Auto;
 
         let mut i = 0;
         while i < args.len() {
@@ -212,6 +223,7 @@ impl Config {
                 "--sandbox" => sandbox = take("--sandbox")?,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
                 "--tools" => tools = Some(take("--tools")?),
+                "--diff" => diff = DiffMode::parse(&take("--diff")?)?,
                 "--preamble-file" => preamble_file = Some(PathBuf::from(take("--preamble-file")?)),
                 "--no-preamble" => no_preamble = true,
                 // The original name only spoke of MCP; kept working because it is in
@@ -278,6 +290,7 @@ impl Config {
             preamble,
             no_preamble,
             isolate_reviewer,
+            diff,
         })
     }
 
@@ -297,6 +310,22 @@ impl Config {
         }
     }
 
+    /// Whether this configuration intends to hand the reviewer a diff.
+    ///
+    /// Intent only: whether one actually arrives depends on the working root being a git
+    /// repository, which is a runtime question. `auto` supplies a diff exactly when the
+    /// reviewer cannot fetch one itself, so a reviewer with a shell is left to do its own
+    /// looking rather than being handed a stale snapshot alongside live access.
+    pub fn supplies_diff(&self) -> bool {
+        // Matched exhaustively: a new mode should have to state its answer here rather
+        // than opt itself in by falling through a wildcard.
+        match self.diff {
+            DiffMode::None => false,
+            DiffMode::Auto => !self.reviewer_has_shell(),
+            DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
+        }
+    }
+
     /// What the reviewer can actually read and run, in its own words.
     ///
     /// This has to be generated rather than fixed: the Claude reviewer has no shell by
@@ -304,7 +333,11 @@ impl Config {
     /// reviewer that believes it can run git will burn its turn finding out otherwise,
     /// and a reviewer with no shell cannot compute a diff at all -- so it needs telling
     /// to say that plainly instead of guessing at what changed.
-    pub fn reviewer_capabilities(&self) -> String {
+    ///
+    /// `diff_supplied` is the *runtime* answer, not `supplies_diff()`: a configured diff
+    /// that could not be captured (no git, not a repository) must not be announced, or the
+    /// reviewer goes looking below for a section that is not there.
+    pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
         let mut out = String::new();
         match self.reviewer {
             ReviewerKind::Codex => {
@@ -326,14 +359,27 @@ impl Config {
                 out.push_str(
                     "You can read and search files in this project, and nothing else: Read, Grep \
                      and Glob, scoped to this directory tree.\n\n\
-                     You have no shell. You cannot run `git`, so you cannot obtain a diff or the \
-                     commit history, and you cannot reconstruct either from the `.git` directory \
-                     with the tools you have. If the request depends on seeing what changed and \
-                     the diff was not included in it, review the current state of the code and \
-                     say plainly, under \"What I could not check\", that you had no access to the \
-                     diff. Do not guess at what changed.",
+                     You have no shell. You cannot run `git`, so you cannot obtain the commit \
+                     history yourself, and you cannot reconstruct it from the `.git` directory \
+                     with the tools you have.",
                 );
             }
+        }
+
+        if diff_supplied {
+            out.push_str(
+                "\n\nYou do not need a shell for the change itself: it was captured for you and \
+                 appears below under \"Change under review\". Review that, not your guess at what \
+                 changed. If judging it needs history the section does not include, say so under \
+                 \"What I could not check\".",
+            );
+        } else if !self.reviewer_has_shell() {
+            out.push_str(
+                "\n\nIf the request depends on seeing what changed and the diff was not included \
+                 in it, review the current state of the code and say plainly, under \"What I \
+                 could not check\", that you had no access to the diff. Do not guess at what \
+                 changed.",
+            );
         }
         out
     }
@@ -436,6 +482,15 @@ OPTIONS:
                               cannot express read-only).
   --allow-tools <list>        Claude permission rules. Default: Read/Grep/Glob scoped
                               to the working root, so reads cannot leave the project.
+  --diff <spec>               What to capture and hand the reviewer as "the change".
+                              auto    supply a working-tree diff only when the reviewer
+                                      has no shell to fetch one itself (default)
+                              none    supply nothing; paste your own into 'instructions'
+                              staged  git diff --cached
+                              HEAD    git diff HEAD, plus untracked file contents
+                              <rev>   any revision or range, e.g. main...HEAD
+                              Skipped silently when the working root is not a git
+                              repository. Not affected by --no-preamble; use --diff none.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration
@@ -654,7 +709,7 @@ mod tests {
         // a real review reported it could not run git diff, git log or git show.
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
         assert!(!claude.reviewer_has_shell());
-        let text = claude.reviewer_capabilities();
+        let text = claude.reviewer_capabilities(false);
         assert!(text.contains("no shell"), "{text}");
         assert!(text.contains("cannot run `git`"), "{text}");
         // And it must be told to say so rather than guess at the change.
@@ -662,9 +717,69 @@ mod tests {
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert!(codex.reviewer_has_shell());
-        let text = codex.reviewer_capabilities();
+        let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
+    }
+
+    #[test]
+    fn a_supplied_diff_replaces_the_no_diff_warning() {
+        // The two must never both appear. "You had no access to the diff" alongside a
+        // diff is exactly the confusion that makes a reviewer hedge a finding it could
+        // have verified.
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        let text = cfg.reviewer_capabilities(true);
+        assert!(text.contains("Change under review"), "{text}");
+        assert!(!text.contains("Do not guess"), "{text}");
+        assert!(!text.contains("no access to the diff"), "{text}");
+        // It still has no shell, and still needs to say so about anything else.
+        assert!(text.contains("no shell"), "{text}");
+    }
+
+    #[test]
+    fn auto_supplies_a_diff_only_to_a_reviewer_that_cannot_fetch_one() {
+        // The whole asymmetry this closes: Codex can run git diff itself, Claude cannot.
+        let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert!(claude.supplies_diff());
+
+        let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(!codex.supplies_diff());
+
+        // And a Claude reviewer that has been given Bash back can fetch its own.
+        let with_bash = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+        ]))
+        .expect("config");
+        assert!(!with_bash.supplies_diff());
+    }
+
+    #[test]
+    fn an_explicit_diff_mode_overrides_the_auto_decision_in_both_directions() {
+        // A caller who curates its own diff must be able to turn ours off, and one that
+        // wants a specific range must get it even when the reviewer has a shell.
+        let off =
+            Config::from_args(&args(&["--reviewer", "claude", "--diff", "none"])).expect("config");
+        assert!(!off.supplies_diff());
+
+        let ranged = Config::from_args(&args(&["--reviewer", "codex", "--diff", "main...HEAD"]))
+            .expect("config");
+        assert!(ranged.supplies_diff());
+        assert_eq!(ranged.diff, DiffMode::Rev("main...HEAD".into()));
+    }
+
+    #[test]
+    fn diff_defaults_to_auto_and_rejects_an_option_shaped_value() {
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert_eq!(cfg.diff, DiffMode::Auto);
+
+        // `git diff --output=<file>` writes, so the value cannot be allowed to become a
+        // git option -- the same prefix-matching hole that kept Bash out of the defaults.
+        let err = Config::from_args(&args(&["--reviewer", "claude", "--diff", "--output=x"]))
+            .unwrap_err();
+        assert!(err.contains("git option"), "{err}");
     }
 
     #[test]
@@ -679,7 +794,7 @@ mod tests {
         ]))
         .expect("config");
         assert!(!cfg.reviewer_has_shell());
-        assert!(cfg.reviewer_capabilities().contains("no shell"));
+        assert!(cfg.reviewer_capabilities(false).contains("no shell"));
     }
 
     #[test]
@@ -692,7 +807,7 @@ mod tests {
         ]))
         .expect("config");
         assert!(cfg.reviewer_has_shell());
-        let text = cfg.reviewer_capabilities();
+        let text = cfg.reviewer_capabilities(false);
         assert!(!text.contains("no shell"), "{text}");
         assert!(text.contains("allow-listed"), "{text}");
     }

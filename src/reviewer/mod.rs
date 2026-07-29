@@ -56,7 +56,10 @@ pub fn neutral_dir(cfg: &Config) -> PathBuf {
 }
 
 /// Is `path` inside `root`? Compared case-insensitively, as Windows paths are.
-fn is_within(path: &Path, root: &Path) -> bool {
+///
+/// Shared with the diff capture, which uses it as a security check rather than a
+/// convenience, so there is deliberately one implementation and not two.
+pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.trim_end_matches('/');
@@ -148,6 +151,37 @@ pub fn resolve_bin(cfg: &Config) -> Result<PathBuf, Failure> {
     }
 
     Err(errors::cli_not_found(cfg.reviewer.as_str(), &tried))
+}
+
+/// Locate `stem` on PATH, and nowhere else.
+///
+/// `Command::new("git")` will not do. Windows program resolution searches the *calling
+/// executable's own directory* before PATH, and this binary is designed to be vendored
+/// into the repository it reviews -- the README's own instruction is to copy
+/// `cross-review.exe` into a project's `tools\`. A `tools\git.exe` committed to a hostile
+/// repository would then run as the user, with no sandbox, no job-object policy and none
+/// of the configuration isolation the rest of this tool is built on, which is precisely
+/// backwards for a program whose job is to look at code you are unsure about.
+///
+/// Verified on Windows 11 with a stand-in `git.exe`: placed next to the calling
+/// executable it was executed in preference to the real git on PATH; placed in the child
+/// process's working directory it was not. So the application directory is the hazard,
+/// and resolving against PATH ourselves is what removes it.
+pub fn on_path(stem: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exts = path_exts();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for ext in &exts {
+            let candidate = dir.join(format!("{stem}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn path_exts() -> Vec<String> {

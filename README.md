@@ -79,6 +79,9 @@ the single source of truth. There is no config file of our own to drift out of s
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.
+--diff <spec>               What to capture as "the change". auto|none|staged|HEAD|<rev>.
+                            Default auto: supply a diff only when the reviewer has no
+                            shell to fetch one itself.
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -90,6 +93,89 @@ Defaults are `claude-opus-5` at `high` and `gpt-5.6-terra` at `xhigh`.
 
 > Pin models by full id. `--model opus` resolves to an older model — verified: it
 > reported `claude-opus-4-8`, not Opus 5.
+
+## The change under review is fetched for you
+
+Most reviews are reviews *of a change*, not of a tree. The Codex reviewer has a read-only
+shell and can run `git diff` itself; the Claude reviewer has none and cannot. Left alone,
+that asymmetry pushes the work onto the caller, which has to paste a diff into
+`instructions` — spending the *caller's* context on it, missing untracked files entirely,
+and, when it is forgotten, getting back a confident review of the current tree rather than
+of the change.
+
+So the server fetches it. It is already a process on your machine with a known working
+root, so running `git` here costs the calling agent nothing:
+
+| `--diff` | What the reviewer is shown |
+| --- | --- |
+| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no shell** |
+| `none` | nothing; supply your own in `instructions` |
+| `staged` | `git diff --cached` + status |
+| `HEAD` | as `auto`, regardless of whether the reviewer has a shell |
+| *any revision* | `git diff <rev>` + status, e.g. `main...HEAD` or `HEAD~3` |
+
+The full command is `git diff --no-ext-diff --no-textconv --relative <rev> -- .`, and it is
+named verbatim in the reviewer's prompt so it can report what it was shown.
+
+Notes on the edges, because they are where this would otherwise mislead:
+
+- **The capture is scoped to the working root**, not to the whole repository —
+  `--relative` and the trailing `-- .`. That matters when `--cwd` is a subdirectory: the
+  reviewer's reads are scoped there too, so without it the diff would name `sub/file.rs`
+  to a reviewer that can only open `file.rs`. (`git status --porcelain` has no
+  `--relative`; its paths stay repository-root-relative, and the prompt says so.)
+- **The reviewed repository does not get to choose what runs.** `--no-ext-diff` and
+  `--no-textconv` are there because a repository's own `.git/config` can name a command
+  for git to execute during a diff. Verified: with `diff.external` set, `git diff HEAD -- .`
+  ran the configured command *and* exited 0 having printed nothing — so the capture would
+  have reported a clean tree, which is the exact failure this feature exists to remove.
+  With the flags, the command did not run and the real diff appeared.
+
+  This is a boundary worth being plain about: git has no "ignore this repository's config"
+  switch, so unlike the reviewer — which runs configuration-isolated — the server does read
+  the reviewed repository's git config when it captures.
+
+  What is closed is the vectors that *can* be closed by name: `diff.external`, textconv
+  drivers, and `core.fsmonitor` (also verified — with `core.fsmonitor` pointing at a
+  missing path, `git status` reported `cannot spawn`; `-c core.fsmonitor=` removed the
+  attempt). **That list is not a completeness proof.** `filter.<driver>.clean` still runs —
+  verified against the hardened command line — and cannot be closed the same way, because
+  the driver name comes from `.gitattributes` rather than from a fixed key. All of these
+  need write access to `.git/config`, not merely a committed file, so a plain `git clone`
+  of a hostile repository does not reach them; an archive or a zip does. If that is not a
+  trade you want, `--diff none`.
+- **git is resolved from PATH, never from beside the executable.** Windows program
+  resolution searches the calling executable's own directory *first*, and this binary is
+  meant to be vendored into the repository it reviews (`tools\cross-review.exe`). Verified:
+  a stand-in `git.exe` next to the caller was run in preference to the real git; one in the
+  child's working directory was not. So a committed `tools\git.exe` would otherwise have
+  executed as you.
+- **Untracked files ride with the working-tree modes only** (`auto`, `HEAD`). They are the
+  case a diff structurally cannot cover, so a working-tree review needs them; a `staged`
+  diff or an explicit range named a specific set of changes, and an untracked file is not
+  in either. An untracked symlink or junction resolving outside the working root is skipped
+  and reported, so this cannot route around the reviewer's read confinement.
+- **An empty diff is still reported**, explicitly, as an empty diff — and, for the
+  working-tree modes, with the reason it might be empty. A reviewer told nothing reviews
+  the current code and calls that a review of the change; a reviewer told only "empty"
+  reports there was no change, which is wrong in the commonest flow of all, where the work
+  has already been committed. Use `--diff <range>` for that.
+- **Truncation is stated in the prompt**, for the diff, the status listing and each
+  untracked file. Caps: 400 KB diff, 200 KB untracked contents total, 60 KB per file, 50
+  files included, 200 paths examined, 20 lines of "what was left out". Binary files are
+  named, not included. Files are read up to their cap rather than read whole and then cut.
+  A silently short diff would be worse than none.
+- **The capture is labelled as evidence, not instructions**, for the same reason CLAUDE.md
+  is — a diff from a repository you do not trust is a prompt injection surface. File
+  contents go inside a fence long enough that nothing in them can close it early, and
+  untracked *filenames* are stripped of backticks and control characters before they are
+  interpolated into a heading.
+- **A `--diff` value can never become a git option.** Anything starting with `-` is
+  rejected at startup, because `git diff --output=<file>` writes.
+- **The whole capture shares a 60-second budget**, not one timeout per command, so a wedged
+  repository cannot hold the session lease for a multiple of any number written here.
+- Skipped silently when the working root is not a git repository, or when git is not
+  installed. `--no-preamble` does not turn it off; `--diff none` does.
 
 ## Re-reviewing after you act on feedback
 
@@ -164,6 +250,11 @@ that it is a soft boundary rather than a guarantee:
 
 Any commands the reviewer attempted but was not permitted to run are reported back with
 the review, so an analysis thinned by missing evidence is visible rather than silent.
+
+What no shell costs the Claude reviewer is the diff, and that is bought back by the server
+fetching it — see [the change under review is fetched for you](#the-change-under-review-is-fetched-for-you).
+The reviewer is told which of the two situations it is in, so it never claims to have seen
+a diff it was not shown, or reports one missing that is sitting in its prompt.
 
 ### The reviewer runs without the project's configuration
 
