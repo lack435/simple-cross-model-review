@@ -212,11 +212,29 @@ Notes on the edges, because they are where this would otherwise mislead:
   only if the job object could not be created or something outside it holds a handle.
 - **A capture that was configured and did not happen is reported to the caller**, as a
   warning alongside the review: no local `main` for a pinned `main...HEAD`, a working root
-  that is not inside a git work tree, git missing from PATH, or any part of the capture that ran
-  short. The reviewer is told it has no diff, but the caller is the party that asked for a
+  that is not inside a git work tree, git missing from PATH, or any **capture-level** part of
+  it that ran short — the qualifier is load-bearing, and the next two paragraphs are what it
+  means. The reviewer is told it has no diff, but the caller is the party that asked for a
   review of a change, and a review of the current tree returned in silence reads exactly
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
   with a reviewer that has its own shell, so those stay silent.
+
+  So does a capture-level *bound*, not just a part that failed to run. If the untracked
+  listing stopped early — at either the included cap or the examined one — or files were
+  dropped because the total content cap ran out, the caller is told, because that is the one
+  thing it cannot infer from what came back: a review made against a listing that stopped at
+  path 200 otherwise reads exactly like one made against all of them. A truncated diff or
+  status listing warns for the same reason, and the status one is the sharper: under
+  `--diff staged` the dirty-tree check reads it line by line, so a path past the cut cannot
+  report the tree as differing from the diff. Neither fires on an ordinary call — it takes
+  400 KB of diff or of status to reach them.
+
+  What is bounded *per file* stays in the prompt only: the omission notes — this file is
+  binary, unreadable, resolves outside the root — and an untracked file cut short at the
+  60 KB cap or at what was left of the total, which is marked where its contents are shown
+  and nowhere else. That is a policy judgement rather than a claim about the code: those
+  files were all reached by the listing, so the reviewer has their shape, and keeping them
+  out of the warnings is what makes a warning mean the capture itself was short.
 
 ## Re-reviewing after you act on feedback
 

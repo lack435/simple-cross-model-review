@@ -512,19 +512,42 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         }
     };
 
-    let (untracked, untracked_omitted) = if mode.includes_untracked() {
+    let (untracked, omissions) = if mode.includes_untracked() {
         git.untracked(&mut notes)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), OmissionReport::default())
     };
 
     // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
     // its review; the caller needs them to know the review it is reading was made on
-    // partial evidence, which it cannot see the prompt to discover for itself.
-    let warnings = notes
+    // partial evidence, which it cannot see the prompt to discover for itself. Which of the
+    // untracked omissions earn that second audience is decided in `OmissionReport`.
+    let mut warnings: Vec<String> = notes
         .iter()
-        .map(|note| format!("The captured change was incomplete: {note}"))
+        .chain(&omissions.capture_level)
+        .map(|note| incomplete(note))
         .collect();
+
+    // Truncation is stated in the prompt, so the reviewer has it -- but the caller does
+    // not, and these are bounds on the evidence the review rests on. The status listing is
+    // the sharper of the two: under `--diff staged`, `tree_may_differ` decides per line, so
+    // a path past the cut cannot report the tree as differing from the diff and the answer
+    // can be a false "no". (Under a range it is an emptiness test, which truncation cannot
+    // flip.) Neither of these fires on an ordinary call: it takes a 400 KB diff or a 400 KB
+    // status to reach them.
+    if diff.truncated {
+        warnings.push(incomplete(&format!(
+            "the diff was cut short at the {MAX_DIFF_BYTES}-byte cap, so the reviewer was not \
+             shown all of it"
+        )));
+    }
+    if status.truncated {
+        warnings.push(incomplete(&format!(
+            "the `git status` listing was cut short at the {MAX_DIFF_BYTES}-byte cap, so paths \
+             past that point are in neither the prompt nor the check for a working tree that \
+             differs from the diff"
+        )));
+    }
 
     Capture {
         change: Some(Change {
@@ -539,11 +562,23 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
             diff,
             status,
             untracked,
-            untracked_omitted,
+            untracked_omitted: omissions.notes,
             notes,
         }),
         warnings,
     }
+}
+
+/// One warning about a *capture-level* shortfall, phrased the one way.
+///
+/// Every shortfall the caller is told about comes through here, so a new one cannot arrive
+/// wearing a different form of words that an agent scanning the response has to recognise
+/// afresh. Which shortfalls those are is decided elsewhere and is narrower than "everything
+/// that was left out": per-file omissions stay in the prompt, for the reasons on
+/// `OmissionReport`. A capture that did not happen at all is a different claim again and
+/// says so in its own words -- see `Capture::warn`.
+fn incomplete(note: &str) -> String {
+    format!("The captured change was incomplete: {note}")
 }
 
 /// Render a captured change as the prompt section the reviewer reads.
@@ -779,7 +814,7 @@ impl<'a> Git<'a> {
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
-    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<UntrackedFile>, Vec<String>) {
+    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<UntrackedFile>, OmissionReport) {
         let listing = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
             Some(out) if out.success => out.stdout,
             // An absent section reads as "there were none", and the reviewer has no shell
@@ -791,7 +826,7 @@ impl<'a> Git<'a> {
                      shows."
                         .to_string(),
                 );
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), OmissionReport::default());
             }
         };
 
@@ -924,24 +959,55 @@ impl Omissions {
         ));
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> OmissionReport {
         if self.suppressed > 0 {
             self.notes
                 .push(format!("... and {} further note(s)", self.suppressed));
         }
-        // Last, because these describe the capture rather than one more file in it.
+
+        // Last, because these describe the capture rather than one more file in it -- and
+        // for the same reason they are the ones the caller is warned about. Built once and
+        // used for both, so the line in the prompt and the line in the warning are the same
+        // string and cannot drift into describing the capture two different ways.
+        let mut capture_level = Vec::new();
         if self.content_cap_skips > 0 {
-            self.notes.push(format!(
+            capture_level.push(format!(
                 "{} untracked file(s) were left out entirely: the total untracked-content cap \
                  of {} bytes was reached",
                 self.content_cap_skips, MAX_UNTRACKED_TOTAL_BYTES
             ));
         }
         if let Some(note) = self.listing_cut_short.take() {
-            self.notes.push(note);
+            capture_level.push(note);
         }
-        self.notes
+        self.notes.extend(capture_level.iter().cloned());
+
+        OmissionReport {
+            notes: self.notes,
+            capture_level,
+        }
     }
+}
+
+/// What the omissions came to: every line the reviewer is shown, and the subset the caller
+/// is warned about.
+///
+/// The split is by scope, not by size. A note about one file describes something the
+/// reviewer can see the shape of: the file was listed, and the note says what happened to
+/// it. A statement about the *capture* says the listing itself is not the whole set, which
+/// is the one thing neither party can infer from what is present -- and the caller cannot
+/// even read the prompt to find it, so a review made against a listing that stopped early
+/// reads to it exactly like a review made against all of it.
+///
+/// Which per-file notes to promote as well is a policy judgement rather than a fact about
+/// the code, and this is the conservative end of it: they are left to the prompt, so that
+/// the two above are what a caller sees when it sees anything at all. The cost of choosing
+/// the other end is that a warning arriving on ordinary calls is one the caller learns to
+/// skip past.
+#[derive(Default, Debug)]
+struct OmissionReport {
+    notes: Vec<String>,
+    capture_level: Vec<String>,
 }
 
 /// How far the next untracked file may be read, and whether that bound is the total budget
@@ -1254,7 +1320,7 @@ mod tests {
         for i in 0..500 {
             omissions.push(format!("note {i}"));
         }
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 1);
         assert!(notes.last().unwrap().contains("further note"), "{notes:?}");
     }
@@ -1270,7 +1336,7 @@ mod tests {
         }
         omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
 
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 2);
         // Last, and outside the "... and N further note(s)" summary rather than inside it.
         assert!(
@@ -1297,7 +1363,7 @@ mod tests {
         omissions.content_cap_skipped("a.txt");
         omissions.content_cap_skipped("b.txt");
 
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         let aggregate = notes.last().unwrap();
         assert!(aggregate.contains("2 untracked file(s)"), "{notes:?}");
         assert!(
@@ -1310,6 +1376,53 @@ mod tests {
             "{notes:?}"
         );
         assert!(!notes.iter().any(|n| n.contains("a.txt")), "{notes:?}");
+    }
+
+    #[test]
+    fn only_the_capture_level_omissions_are_offered_to_the_caller() {
+        let mut omissions = Omissions::default();
+        omissions.push("`escape` was skipped: it resolves outside the working root".into());
+        omissions.push("`blob.bin` is binary".into());
+        omissions.content_cap_skipped("a.txt");
+        omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
+
+        let report = omissions.finish();
+
+        // Two statements about the capture, and neither per-file note among them. That
+        // exclusion is the policy this test exists to hold in place: a warning is meant to
+        // mean the capture itself was short, so what does not change that answer stays in
+        // the prompt.
+        assert_eq!(report.capture_level.len(), 2, "{report:?}");
+        assert!(
+            !report.capture_level.iter().any(|w| {
+                w.contains("a.txt") || w.contains("blob.bin") || w.contains("working root")
+            }),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .capture_level
+                .iter()
+                .any(|w| w.contains("1 untracked file(s) were left out entirely")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .capture_level
+                .iter()
+                .any(|w| w.contains("were not examined")),
+            "{report:?}"
+        );
+
+        // The reviewer still sees everything, the caller's lines included, and sees them
+        // spelled exactly as the caller does.
+        for warning in &report.capture_level {
+            assert!(report.notes.contains(warning), "{report:?}");
+        }
+        assert!(
+            report.notes.iter().any(|n| n.contains("blob.bin")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -1933,9 +2046,8 @@ mod tests {
             std::fs::write(dir.join(format!("blob-{i:04}.bin")), [0u8, 1, 2]).expect("write");
         }
 
-        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
-            .change
-            .expect("a change");
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
 
         assert!(
             change
@@ -1944,6 +2056,126 @@ mod tests {
                 .any(|note| note.contains("were not examined")),
             "{:?}",
             change.untracked_omitted
+        );
+        // And the caller, which cannot see the prompt, is told the review it is about to
+        // read was made against a listing that stopped early.
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("were not examined")),
+            "{:?}",
+            captured.warnings
+        );
+    }
+
+    #[test]
+    fn an_ordinary_skipped_file_does_not_warn_the_caller() {
+        // The guard on the rule above, at capture level. A file the listing reached and
+        // then skipped does not make the listing partial, so it is not what a warning is
+        // for -- and this is the assertion that stops "warn about everything" arriving
+        // later as an obvious improvement.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        std::fs::write(dir.join("blob.bin"), [0u8, 1, 2]).expect("write");
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+
+        // The reviewer is told, because it is reading the prompt and can open the file.
+        assert!(
+            change
+                .untracked_omitted
+                .iter()
+                .any(|note| note.contains("is binary")),
+            "{:?}",
+            change.untracked_omitted
+        );
+        assert!(captured.warnings.is_empty(), "{:?}", captured.warnings);
+    }
+
+    #[test]
+    fn spending_the_whole_content_budget_warns_the_caller_too() {
+        // The other half of the rule, through a real capture rather than through
+        // `OmissionReport` alone: a change that forwarded only the listing-cut-short note
+        // would pass every other test here.
+        let Some(dir) = repo_with_untracked_budget_spent(MAX_UNTRACKED_TOTAL_BYTES) else {
+            return;
+        };
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+
+        // The budget is gone before the last file, so it is skipped rather than truncated.
+        assert!(
+            !change.untracked.iter().any(|f| f.path == "zz-big.txt"),
+            "{:?}",
+            change.untracked.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("left out entirely")),
+            "{:?}",
+            captured.warnings
+        );
+    }
+
+    #[test]
+    fn a_truncated_diff_or_status_is_a_shortfall_the_caller_hears_about() {
+        // Both are stated in the prompt, so the reviewer has them; the caller cannot see
+        // the prompt. The status one carries a correctness edge as well as a disclosure
+        // one: under `--diff staged` the dirty-tree check reads the listing line by line,
+        // so a path past the cut cannot report the tree as differing from the diff.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+
+        // A committed file, then emptied: the diff is the whole of it as removals.
+        let big = "a line of text long enough that this does not take forever\n".repeat(10_000);
+        std::fs::write(dir.join("big.txt"), &big).expect("write");
+        assert!(git.run(&["add", "big.txt"]).is_some_and(|o| o.success));
+        assert!(git
+            .run(&["commit", "--quiet", "-m", "big"])
+            .is_some_and(|o| o.success));
+        std::fs::write(dir.join("big.txt"), "").expect("write");
+
+        // Enough distinct untracked paths that the status listing alone passes the cap.
+        // Names, not contents: `git status --porcelain` prints one line per path.
+        let name = "p".repeat(200);
+        for i in 0..(MAX_DIFF_BYTES / 200) + 20 {
+            std::fs::write(dir.join(format!("{name}{i:06}")), "x").expect("write");
+        }
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+        assert!(
+            change.diff.truncated,
+            "the fixture did not reach the diff cap"
+        );
+        assert!(
+            change.status.truncated,
+            "the fixture did not reach the status cap"
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("diff was cut short")),
+            "{:?}",
+            captured.warnings
+        );
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("`git status` listing was cut short")),
+            "{:?}",
+            captured.warnings
         );
     }
 }
