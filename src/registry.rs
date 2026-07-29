@@ -79,8 +79,8 @@ pub struct Review {
     pub started: Instant,
     pub finished: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
-    /// Order in which this process issued the review. Used to break eviction ties that
-    /// `Instant` cannot: two reviews can finish inside the same tick.
+    /// Order in which this process issued the review. Breaks eviction ties that the
+    /// finish time cannot: two reviews can finish inside the same `Instant` tick.
     seq: u64,
 }
 
@@ -141,24 +141,40 @@ impl State {
     /// Running reviews are never touched: one is by definition still owed to a caller,
     /// and removing it would strand a poll on an id that has no terminal state to reach.
     fn evict(&mut self) {
-        let mut terminal: Vec<(String, String, u64)> = self
+        let mut terminal: Vec<(String, String, Instant, u64)> = self
             .reviews
             .values()
             .filter(|r| r.status != Status::Running)
-            .map(|r| (r.id.clone(), r.session.clone(), r.seq))
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    r.session.clone(),
+                    r.finished.unwrap_or(r.started),
+                    r.seq,
+                )
+            })
             .collect();
         // Newest first, so "keep the most recent N" is a prefix.
         //
-        // Ordered by the issue counter rather than by the finish time: two reviews can
-        // finish inside the same `Instant` tick, and ties would then fall back to
-        // `HashMap::values()` order, which is randomly seeded per process. That would make
-        // both the eviction order and the tests that assert it nondeterministic.
-        terminal.sort_by_key(|(_, _, seq)| std::cmp::Reverse(*seq));
+        // Ranked by *finish* time, with the issue counter only as a tiebreaker. Ranking by
+        // the counter alone looks equivalent -- within a session it is, since a session
+        // admits one running review at a time -- but across sessions it loses the property
+        // that matters: a review that started early and ran long has the lowest counter,
+        // so at the moment it finished it would rank oldest, and the sweep triggered by
+        // its own `finish` could evict it before its caller ever collected it.
+        //
+        // The tiebreaker is not decoration. Two reviews can finish inside one `Instant`
+        // tick, and ties would otherwise fall back to `HashMap::values()` order, which is
+        // randomly seeded per process -- making both the eviction order and any test of it
+        // nondeterministic.
+        terminal.sort_by_key(|(_, _, finished, seq)| {
+            (std::cmp::Reverse(*finished), std::cmp::Reverse(*seq))
+        });
 
         let mut per_session: HashMap<String, usize> = HashMap::new();
         let mut kept = 0usize;
         let mut doomed = Vec::new();
-        for (id, session, _) in terminal {
+        for (id, session, _, _) in terminal {
             let seen = per_session.entry(session.clone()).or_insert(0);
             *seen += 1;
             if *seen > MAX_TERMINAL_PER_SESSION || kept >= MAX_TERMINAL_TOTAL {
@@ -457,6 +473,34 @@ mod tests {
             .wait(&running, Duration::from_millis(1))
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
+    }
+
+    #[test]
+    fn a_long_running_review_is_not_evicted_by_the_sweep_its_own_finish_triggers() {
+        // Ranking by issue order alone would do exactly that: a review started early and
+        // running long holds the lowest counter, so at the moment it finished it would
+        // rank oldest and be swept by its own `finish` -- before its caller, which is
+        // still holding the id it was handed, could collect it. Recency has to be the
+        // primary key; the counter is only a tiebreaker.
+        let registry = Registry::new();
+        let (slow, _c) = registry.try_start("slow", 1, false).expect("start");
+
+        // Enough traffic elsewhere, all of it started *and* finished after `slow` began,
+        // to fill the process-wide cap.
+        for n in 0..MAX_TERMINAL_TOTAL {
+            run_one(&registry, &format!("busy-{n}"), 1);
+        }
+
+        registry.finish(&slow, Outcome::completed("worth having"));
+        assert_eq!(
+            registry.lookup(&slow),
+            IdState::Known,
+            "the review that just finished was evicted by its own sweep"
+        );
+        let snapshot = registry
+            .wait(&slow, Duration::from_millis(1))
+            .expect("snapshot");
+        assert_eq!(snapshot.review.as_deref(), Some("worth having"));
     }
 
     #[test]

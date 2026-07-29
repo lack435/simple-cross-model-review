@@ -684,12 +684,13 @@ impl Job {
             std::fs::remove_file(path).ok();
         }
 
-        let parsed = result?;
+        let mut parsed = result?;
 
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
         // Resumability is tracked rather than assumed: the completed response invites a
         // follow-up on this session, so when that would not work the caller must be told.
+
         // Carried first, so a review made without the change under review says so before
         // anything else. These are not failures -- the review ran -- but a caller that
         // asked for a review of a diff and silently got a review of the tree is the one
@@ -698,7 +699,7 @@ impl Job {
         // Then whatever the adapter noticed, so a run that hit the output cap but still
         // produced a usable review reports that rather than looking untroubled. Second
         // because it is about how the review was collected, not about what was reviewed.
-        warnings.extend(parsed.warnings.clone());
+        warnings.extend(std::mem::take(&mut parsed.warnings));
         let resumable = match &parsed.session_id {
             Some(session_id) => {
                 match self.sessions.record_turn(

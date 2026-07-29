@@ -139,28 +139,15 @@ impl Reviewer for CodexReviewer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let mut warnings = Vec::new();
         let text = match from_file {
-            // The file is written by the CLI, not through our pipes, so a capped event
-            // stream costs nothing when the file survived. It is still worth saying: an
-            // 8 MiB transcript is abnormal, and the caller should hear about it even
-            // though the verdict itself came through intact.
-            Some(text) => {
-                if out.truncated() {
-                    warnings.push(
-                        "The reviewer's transcript exceeded the output cap and was truncated. \
-                         The review below came from the CLI's own final-message file, so it is \
-                         complete, but anything that only appeared in the transcript is lost."
-                            .to_string(),
-                    );
-                }
-                text
-            }
+            // The final-message file is written by the CLI directly, not through the pipes
+            // we cap, so a capped event stream does not put this review in doubt.
+            Some(text) => text,
             None => {
-                // No file, so the fallback is the event stream -- and under truncation
-                // that stream is not trustworthy. `last_message` would be the last one
-                // that *fit*, so the reviewer's actual conclusion may be among the bytes
-                // discarded, and returning an earlier message as the verdict would be a
+                // Without the file the fallback is the event stream -- and under truncation
+                // that stream is not trustworthy. `last_message` would be the last one that
+                // *fit*, so the reviewer's actual conclusion may be among the discarded
+                // bytes, and returning an earlier message as the verdict would be a
                 // silently wrong review rather than a visible failure.
                 if let Some(truncated) = super::truncation_failure(cfg, out) {
                     return Err(truncated);
@@ -176,6 +163,24 @@ impl Reviewer for CodexReviewer {
                 events.errors.join("\n")
             };
             return Err(errors::empty_review("codex", detail));
+        }
+
+        // Outside the match, so every surviving-review path reports the cap -- including
+        // the one where only stderr was capped and the review came from the event stream.
+        //
+        // Note what this does *not* claim. That our cap did not touch the final-message
+        // file is structural: we cap only bytes read from the pipes. Whether the CLI
+        // finished writing that file is a different question, it has not been observed
+        // for a run that produced this much output, and it is not asserted here.
+        let mut warnings = Vec::new();
+        if out.truncated() {
+            warnings.push(
+                "The reviewer produced more output than the collection cap allows, so its \
+                 transcript was truncated. The review below is reported as the reviewer gave \
+                 it, but anything that appeared only in the transcript is lost, and output at \
+                 that volume is itself abnormal."
+                    .to_string(),
+            );
         }
 
         Ok(Parsed {

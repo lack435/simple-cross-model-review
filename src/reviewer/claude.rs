@@ -191,14 +191,16 @@ impl Reviewer for ClaudeReviewer {
             return Err(errors::empty_review("claude", out.diagnostics()));
         }
 
-        // Reaching here with a truncated run means the result JSON parsed anyway, so only
-        // stderr was capped. The review is intact; the caller is told regardless, because
-        // that much output is abnormal and worth knowing about.
+        // Gated on stderr, which is what the message describes. A truncated *stdout* is
+        // already impossible here -- it would not have parsed as a complete JSON document
+        // -- but gating on the union would make the wording true only by that inference,
+        // and a reader should not have to reconstruct an argument to check a claim.
         let mut warnings = Vec::new();
-        if out.truncated() {
+        if out.stderr_truncated {
             warnings.push(
                 "The reviewer's diagnostic output exceeded the cap and was truncated. The review \
-                 below parsed intact, so it is complete."
+                 itself parsed intact, so it is unaffected, but output at that volume is \
+                 abnormal."
                     .to_string(),
             );
         }

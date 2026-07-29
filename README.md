@@ -361,8 +361,9 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments get a plain
-correction instead, since that is the agent's own mistake and not something to escalate,
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments
+get a plain correction instead, since that is the agent's own mistake and not something to
+escalate,
 and so does a tool call the server could not start a thread for -- neither says anything
 about the reviewer's state.
 
@@ -446,8 +447,9 @@ Both directions pass against live CLIs.
 
   Two servers can share a project's state directory, so a named session is claimed with a
   cross-process lease held for the whole review, and mutations of the state file take an
-  exclusive lock across the read-modify-write. Both locks are the OS's: the lock file is opened with a share mode
-  of zero, so exclusion is enforced by Windows and released even if the holder is killed.
+  exclusive lock across the read-modify-write. Both locks are the OS's: the lock file is
+  opened with a share mode of zero, so exclusion is enforced by Windows and released even
+  if the holder is killed.
   That deliberately replaces an earlier version which tracked staleness itself — it could
   steal a lock from a merely-paused process and then delete the new owner's lock.
   Writes go to a pid-unique temp file and then an atomic replace, never unlinking the
