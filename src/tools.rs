@@ -12,7 +12,9 @@ use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
 use crate::git;
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
-use crate::registry::{IdState, Outcome, Registry, Snapshot, Status, MAX_TERMINAL_PER_SESSION};
+use crate::registry::{
+    IdState, Outcome, Registry, Snapshot, Status, MAX_TERMINAL_PER_SESSION, MAX_TERMINAL_TOTAL,
+};
 use crate::reviewer::{self, Reviewer};
 use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
 
@@ -232,15 +234,7 @@ impl App {
                 // new review", but a caller told its id was never issued has reason to
                 // suspect it mangled the id, and will go looking for a bug that is not
                 // there.
-                IdState::Evicted => {
-                    return Err(errors::bad_request(format!(
-                        "Review '{id}' finished earlier and its result has since been discarded: \
-                         this server keeps only the {MAX_TERMINAL_PER_SESSION} most recent \
-                         finished reviews per session, so that a long agent session does not \
-                         accumulate every review it has ever run. The id was valid; the review is \
-                         not recoverable. Start a new review instead."
-                    )));
-                }
+                IdState::Evicted => return Err(evicted_error(id)),
                 IdState::Unknown => {
                     return Err(errors::bad_request(format!(
                         "No review with review_id '{id}' exists in this server process. Review \
@@ -249,12 +243,26 @@ impl App {
                     )));
                 }
             },
-            (None, Some(name)) => self.registry.latest_for_session(name).ok_or_else(|| {
-                errors::bad_request(format!(
-                    "No review has been started for session '{name}' in this server process. \
-                     Call cross_model_review first."
-                ))
-            })?,
+            (None, Some(name)) => match self.registry.latest_for_session(name) {
+                Some(id) => id,
+                // The session-keyed twin of the evicted-id case. The per-session cap can
+                // never empty a session, so only the process-wide cap reaches here -- but
+                // when it does, "no review has been started" is exactly the wrong thing
+                // to tell a caller whose review did run.
+                None if self.registry.session_had_evicted(name) => {
+                    return Err(errors::bad_request(format!(
+                        "Session '{name}' had a review, but it finished earlier and its result \
+                         has since been discarded to bound memory. It is not recoverable; start \
+                         a new review."
+                    )));
+                }
+                None => {
+                    return Err(errors::bad_request(format!(
+                        "No review has been started for session '{name}' in this server process. \
+                         Call cross_model_review first."
+                    )));
+                }
+            },
             (None, None) => {
                 return Err(errors::bad_request(
                     "Provide either 'review_id' (preferred) or 'session'.",
@@ -283,10 +291,21 @@ impl App {
             return Err(errors::cancelled());
         }
 
-        let snapshot = self
-            .registry
-            .wait(&id, Duration::from_secs(wait))
-            .ok_or_else(|| errors::bad_request(format!("Review '{id}' is no longer tracked.")))?;
+        // `wait` can return None for an id that was Known a moment ago: a concurrent
+        // finish elsewhere sweeps the caps, and this id can be what it drops. Re-checking
+        // costs one lock and keeps the distinction the lookup above just drew, instead of
+        // collapsing it into an opaque "no longer tracked".
+        let snapshot = match self.registry.wait(&id, Duration::from_secs(wait)) {
+            Some(snapshot) => snapshot,
+            None if self.registry.lookup(&id) == IdState::Evicted => {
+                return Err(evicted_error(&id));
+            }
+            None => {
+                return Err(errors::bad_request(format!(
+                    "Review '{id}' is no longer tracked."
+                )))
+            }
+        };
 
         match snapshot.status {
             Status::Running => Ok(self.render_running(&snapshot, wait)),
@@ -676,6 +695,10 @@ impl Job {
         // asked for a review of a diff and silently got a review of the tree is the one
         // way this tool can be wrong without anything appearing to go wrong.
         let mut warnings = capture_warnings.to_vec();
+        // Then whatever the adapter noticed, so a run that hit the output cap but still
+        // produced a usable review reports that rather than looking untroubled. Second
+        // because it is about how the review was collected, not about what was reviewed.
+        warnings.extend(parsed.warnings.clone());
         let resumable = match &parsed.session_id {
             Some(session_id) => {
                 match self.sessions.record_turn(
@@ -740,6 +763,22 @@ impl Job {
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
+
+/// What to tell a caller holding the id of a review that has been evicted.
+///
+/// Names both caps, not just the per-session one. Either can be the reason, and a caller
+/// that ran a single review in this session, told it keeps "only the 3 most recent per
+/// session", can see that the explanation does not fit -- which undermines the message at
+/// exactly the moment it is meant to be believed.
+fn evicted_error(id: &str) -> Failure {
+    errors::bad_request(format!(
+        "Review '{id}' finished earlier and its result has since been discarded: this server \
+         keeps the {MAX_TERMINAL_PER_SESSION} most recent finished reviews per session and \
+         {MAX_TERMINAL_TOTAL} in total, so that a long agent session does not accumulate every \
+         review it has ever run. The id was valid; the review is not recoverable. Start a new \
+         review instead."
+    ))
+}
 
 fn string_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key)
@@ -843,6 +882,57 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "BAD_REQUEST");
         assert!(err.summary.contains("rv-nope-1"));
+    }
+
+    /// Finish enough reviews on one session to push its oldest past the retention cap.
+    fn app_with_an_evicted_review(session: &str) -> (App, String) {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = App::new(cfg);
+        let mut ids = Vec::new();
+        for turn in 1..=MAX_TERMINAL_PER_SESSION as u32 + 1 {
+            let (id, _c) = app
+                .registry()
+                .try_start(session, turn, turn > 1)
+                .expect("start");
+            app.registry()
+                .finish(&id, Outcome::failed(errors::cancelled()));
+            ids.push(id);
+        }
+        (app, ids.remove(0))
+    }
+
+    #[test]
+    fn an_evicted_review_id_is_not_reported_as_one_that_never_existed() {
+        // What the caller is told is the whole point of the retention change: this
+        // message is what stops a calling agent silently proceeding, and "no such id"
+        // would send it looking for a bug in how it stored the id instead.
+        let (app, evicted) = app_with_an_evicted_review("default");
+        let err = app
+            .review_result(&json!({"review_id": evicted}), &RequestCancel::new())
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains(&evicted), "{}", err.summary);
+        assert!(err.summary.contains("discarded"), "{}", err.summary);
+        assert!(!err.summary.contains("No review with"), "{}", err.summary);
+        // Both caps are named, because either can be the reason and a caller that ran one
+        // review in this session can see that the per-session cap does not explain it.
+        assert!(
+            err.summary.contains(&MAX_TERMINAL_PER_SESSION.to_string())
+                && err.summary.contains(&MAX_TERMINAL_TOTAL.to_string()),
+            "{}",
+            err.summary
+        );
+    }
+
+    #[test]
+    fn cancelling_an_evicted_review_says_there_is_nothing_to_stop() {
+        // An evicted review is a finished one, so this is not an error at all -- and
+        // reporting it as an unknown id would suggest the caller got the id wrong.
+        let (app, evicted) = app_with_an_evicted_review("default");
+        let message = app
+            .cancel(&json!({"review_id": evicted}))
+            .expect("not an error");
+        assert!(message.contains("nothing to cancel"), "{message}");
     }
 
     #[test]

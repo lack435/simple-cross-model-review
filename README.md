@@ -361,7 +361,7 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments get a plain
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments get a plain
 correction instead, since that is the agent's own mistake and not something to escalate,
 and so does a tool call the server could not start a thread for -- neither says anything
 about the reviewer's state.
@@ -442,10 +442,11 @@ Both directions pass against live CLIs.
   all of them. Running reviews are never evicted: one is still owed to a caller. Evicted
   ids are remembered (just the id), because "this finished and was discarded" and "this
   was never issued" call for different advice, and a caller told the second has reason to
-  suspect it mangled the id and will go looking for a bug that is not there. Two servers can share a project's state
-  directory, so a named session is claimed with a cross-process lease held for the whole
-  review, and mutations of the state file take an exclusive lock across the
-  read-modify-write. Both locks are the OS's: the lock file is opened with a share mode
+  suspect it mangled the id and will go looking for a bug that is not there.
+
+  Two servers can share a project's state directory, so a named session is claimed with a
+  cross-process lease held for the whole review, and mutations of the state file take an
+  exclusive lock across the read-modify-write. Both locks are the OS's: the lock file is opened with a share mode
   of zero, so exclusion is enforced by Windows and released even if the holder is killed.
   That deliberately replaces an earlier version which tracked staleness itself — it could
   steal a lock from a merely-paused process and then delete the new owner's lock.
@@ -462,11 +463,16 @@ Both directions pass against live CLIs.
   It is bounded in size too, at 8 MiB per stream. Note what that does *not* mean: the
   reader keeps reading past the cap and throws the bytes away, because a reader that
   stopped would fill the pipe and block the child for ever — trading unbounded memory for
-  a hung review, which is the worse bargain. Hitting the cap is recorded and reported, as
-  `OUTPUT_TRUNCATED` rather than as `EMPTY_REVIEW`: an empty review means the CLI wrote
-  nothing and a retry is reasonable, a truncated one means it wrote far too much and a
-  retry will do the same again. Real transcripts are kilobytes, so reaching 8 MiB means
-  something has gone wrong; the point is that it fails legibly.
+  a hung review, which is the worse bargain.
+
+  Hitting the cap is always reported, but not always as a failure. When the review cannot
+  be recovered from what was kept, it is `OUTPUT_TRUNCATED` rather than `EMPTY_REVIEW` —
+  an empty review means the CLI wrote nothing and a retry is reasonable, a truncated one
+  means it wrote far too much and a retry will do the same again. When the review survives
+  anyway — Codex writes its final message to a file, which our pipe cap cannot affect —
+  the review is returned with a warning saying the transcript was truncated. Real
+  transcripts are kilobytes, so reaching 8 MiB means something has gone wrong either way;
+  the point is that it never passes unmentioned.
 
   Shelling out to `taskkill` was rejected: it cannot help once the direct child has exited
   and the parent/child links are gone, and invoking it by bare name is an execution hazard,

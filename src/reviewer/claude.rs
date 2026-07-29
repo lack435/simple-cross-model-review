@@ -191,10 +191,23 @@ impl Reviewer for ClaudeReviewer {
             return Err(errors::empty_review("claude", out.diagnostics()));
         }
 
+        // Reaching here with a truncated run means the result JSON parsed anyway, so only
+        // stderr was capped. The review is intact; the caller is told regardless, because
+        // that much output is abnormal and worth knowing about.
+        let mut warnings = Vec::new();
+        if out.truncated() {
+            warnings.push(
+                "The reviewer's diagnostic output exceeded the cap and was truncated. The review \
+                 below parsed intact, so it is complete."
+                    .to_string(),
+            );
+        }
+
         Ok(Parsed {
             text,
             session_id,
             denials: collect_denials(&parsed),
+            warnings,
         })
     }
 }
@@ -247,7 +260,8 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -260,7 +274,7 @@ mod tests {
         // `r##"` literal alike.
         let cut_short = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"## Verdi";
         let truncated = RunOutcome {
-            truncated: true,
+            stdout_truncated: true,
             ..outcome(cut_short, true)
         };
         let failure = ClaudeReviewer
@@ -333,7 +347,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -394,7 +409,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
@@ -424,7 +440,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");

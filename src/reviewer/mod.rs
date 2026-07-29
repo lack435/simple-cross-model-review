@@ -41,6 +41,8 @@ pub struct Parsed {
     pub session_id: Option<String>,
     /// Tool calls the reviewer was not permitted to make.
     pub denials: Vec<String>,
+    /// Problems that did not invalidate the review but that the caller must know about.
+    pub warnings: Vec<String>,
 }
 
 pub struct Invocation {
@@ -261,18 +263,26 @@ pub struct RunOutcome {
     pub success: bool,
     pub timed_out: bool,
     pub cancelled: bool,
-    /// Either output stream hit the size cap, so what is above is not all of it.
-    pub truncated: bool,
+    /// stdout hit the size cap. Kept apart from stderr because both adapters read the
+    /// review itself from stdout, so only this one makes a review unrecoverable.
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 impl RunOutcome {
+    /// Did either stream hit the cap? For "is the review recoverable", ask
+    /// `stdout_truncated` instead -- a flooded stderr says nothing about the review.
+    pub fn truncated(&self) -> bool {
+        self.stdout_truncated || self.stderr_truncated
+    }
+
     /// stderr first: that is where CLIs put the reason they failed.
     pub fn diagnostics(&self) -> String {
         let mut out = String::new();
         // Stated first, because everything below it is now evidence of unknown
         // completeness and a reader who learns that afterwards has already drawn
         // conclusions from it.
-        if self.truncated {
+        if self.truncated() {
             out.push_str(&format!(
                 "[cross-review: the reviewer's output exceeded {} MiB and was truncated; what \
                  follows is incomplete]\n\n",
@@ -393,7 +403,8 @@ pub fn run(
     let stderr = collect(&stderr_buf, drain_by);
 
     Ok(RunOutcome {
-        truncated: stdout.truncated || stderr.truncated,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -486,7 +497,10 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
 /// cap has to be named rather than left to surface as "the CLI wrote nothing", which is
 /// the opposite of what happened and points the caller at a useless retry.
 pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
-    out.truncated.then(|| {
+    // Gated on stdout alone. A run whose stderr flooded but whose stdout is simply empty
+    // failed for some other reason, and reporting it as truncation would tell the caller
+    // not to retry when retrying is exactly right.
+    out.stdout_truncated.then(|| {
         errors::output_truncated(
             cfg.reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),
@@ -572,14 +586,16 @@ mod drain_tests {
             success: false,
             timed_out: false,
             cancelled: false,
-            truncated: true,
+            stdout_truncated: true,
+            stderr_truncated: false,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
         assert!(diagnostics.contains("truncated"), "{diagnostics}");
 
         let intact = RunOutcome {
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
             ..out
         };
         assert!(!intact.diagnostics().contains("truncated"));
@@ -598,13 +614,15 @@ mod drain_tests {
             success: true,
             timed_out: false,
             cancelled: false,
-            truncated: true,
+            stdout_truncated: true,
+            stderr_truncated: false,
         };
         let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
 
         let intact = RunOutcome {
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
             ..out
         };
         assert!(truncation_failure(&cfg, &intact).is_none());

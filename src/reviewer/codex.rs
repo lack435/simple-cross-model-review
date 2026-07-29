@@ -139,17 +139,37 @@ impl Reviewer for CodexReviewer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let text = from_file
-            .or_else(|| events.last_message.clone())
-            .unwrap_or_default();
+        let mut warnings = Vec::new();
+        let text = match from_file {
+            // The file is written by the CLI, not through our pipes, so a capped event
+            // stream costs nothing when the file survived. It is still worth saying: an
+            // 8 MiB transcript is abnormal, and the caller should hear about it even
+            // though the verdict itself came through intact.
+            Some(text) => {
+                if out.truncated() {
+                    warnings.push(
+                        "The reviewer's transcript exceeded the output cap and was truncated. \
+                         The review below came from the CLI's own final-message file, so it is \
+                         complete, but anything that only appeared in the transcript is lost."
+                            .to_string(),
+                    );
+                }
+                text
+            }
+            None => {
+                // No file, so the fallback is the event stream -- and under truncation
+                // that stream is not trustworthy. `last_message` would be the last one
+                // that *fit*, so the reviewer's actual conclusion may be among the bytes
+                // discarded, and returning an earlier message as the verdict would be a
+                // silently wrong review rather than a visible failure.
+                if let Some(truncated) = super::truncation_failure(cfg, out) {
+                    return Err(truncated);
+                }
+                events.last_message.clone().unwrap_or_default()
+            }
+        };
 
         if text.is_empty() {
-            // Only once the file has been tried and found wanting. The final-message file
-            // is written by the CLI and is unaffected by our pipe cap, so a truncated
-            // event stream that still yielded a review is not a failure at all.
-            if let Some(truncated) = super::truncation_failure(cfg, out) {
-                return Err(truncated);
-            }
             let detail = if events.errors.is_empty() {
                 out.diagnostics()
             } else {
@@ -162,6 +182,7 @@ impl Reviewer for CodexReviewer {
             text,
             session_id: events.thread_id,
             denials: Vec::new(),
+            warnings,
         })
     }
 }
@@ -254,7 +275,8 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -366,7 +388,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -430,7 +453,7 @@ mod tests {
         // written by the CLI and is unaffected by our pipe cap, so a truncated stream that
         // still yielded a review must not be a failure at all.
         let truncated = RunOutcome {
-            truncated: true,
+            stdout_truncated: true,
             ..outcome(r#"{"type":"turn.completed"}"#, true)
         };
         let err = CodexReviewer.parse(&cfg(), &truncated, None).unwrap_err();

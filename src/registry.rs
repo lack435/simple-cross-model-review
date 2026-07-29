@@ -24,10 +24,10 @@ pub const MAX_TERMINAL_PER_SESSION: usize = 3;
 /// review per name for ever.
 pub const MAX_TERMINAL_TOTAL: usize = 50;
 
-/// Ids remembered after their review is evicted.
+/// Reviews remembered after eviction: their id and session name, nothing else.
 ///
-/// Only the id is kept, so this is bounded and tiny. It exists because "this id was
-/// evicted" and "this id never existed" call for different advice, and a caller told the
+/// Bounded and tiny, because none of the review itself is kept. It exists because "this
+/// was evicted" and "this never existed" call for different advice, and a caller told the
 /// wrong one may go looking for a bug in how it stored the id.
 const MAX_REMEMBERED_EVICTIONS: usize = 500;
 
@@ -79,6 +79,9 @@ pub struct Review {
     pub started: Instant,
     pub finished: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    /// Order in which this process issued the review. Used to break eviction ties that
+    /// `Instant` cannot: two reviews can finish inside the same tick.
+    seq: u64,
 }
 
 impl Review {
@@ -128,7 +131,8 @@ impl Outcome {
 #[derive(Default)]
 struct State {
     reviews: HashMap<String, Review>,
-    evicted: VecDeque<String>,
+    /// Id and session of each evicted review, newest last.
+    evicted: VecDeque<(String, String)>,
 }
 
 impl State {
@@ -137,40 +141,39 @@ impl State {
     /// Running reviews are never touched: one is by definition still owed to a caller,
     /// and removing it would strand a poll on an id that has no terminal state to reach.
     fn evict(&mut self) {
-        let mut terminal: Vec<(String, String, Instant)> = self
+        let mut terminal: Vec<(String, String, u64)> = self
             .reviews
             .values()
             .filter(|r| r.status != Status::Running)
-            .map(|r| {
-                (
-                    r.id.clone(),
-                    r.session.clone(),
-                    r.finished.unwrap_or(r.started),
-                )
-            })
+            .map(|r| (r.id.clone(), r.session.clone(), r.seq))
             .collect();
         // Newest first, so "keep the most recent N" is a prefix.
-        terminal.sort_by_key(|(_, _, at)| std::cmp::Reverse(*at));
+        //
+        // Ordered by the issue counter rather than by the finish time: two reviews can
+        // finish inside the same `Instant` tick, and ties would then fall back to
+        // `HashMap::values()` order, which is randomly seeded per process. That would make
+        // both the eviction order and the tests that assert it nondeterministic.
+        terminal.sort_by_key(|(_, _, seq)| std::cmp::Reverse(*seq));
 
         let mut per_session: HashMap<String, usize> = HashMap::new();
         let mut kept = 0usize;
         let mut doomed = Vec::new();
         for (id, session, _) in terminal {
-            let seen = per_session.entry(session).or_insert(0);
+            let seen = per_session.entry(session.clone()).or_insert(0);
             *seen += 1;
             if *seen > MAX_TERMINAL_PER_SESSION || kept >= MAX_TERMINAL_TOTAL {
-                doomed.push(id);
+                doomed.push((id, session));
             } else {
                 kept += 1;
             }
         }
 
-        for id in doomed {
+        for (id, session) in doomed {
             self.reviews.remove(&id);
             if self.evicted.len() >= MAX_REMEMBERED_EVICTIONS {
                 self.evicted.pop_front();
             }
-            self.evicted.push_back(id);
+            self.evicted.push_back((id, session));
         }
     }
 }
@@ -211,11 +214,8 @@ impl Registry {
 
         // Ids are unique per process and readable in logs. No RNG dependency: the
         // process id plus a monotonic counter is already collision-free here.
-        let id = format!(
-            "rv-{}-{}",
-            std::process::id(),
-            self.counter.fetch_add(1, Ordering::Relaxed) + 1
-        );
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("rv-{}-{}", std::process::id(), seq);
         let cancel = Arc::new(AtomicBool::new(false));
         guard.reviews.insert(
             id.clone(),
@@ -233,6 +233,7 @@ impl Registry {
                 started: Instant::now(),
                 finished: None,
                 cancel: Arc::clone(&cancel),
+                seq,
             },
         );
         drop(guard);
@@ -282,11 +283,22 @@ impl Registry {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.reviews.contains_key(id) {
             IdState::Known
-        } else if guard.evicted.iter().any(|evicted| evicted == id) {
+        } else if guard.evicted.iter().any(|(evicted, _)| evicted == id) {
             IdState::Evicted
         } else {
             IdState::Unknown
         }
+    }
+
+    /// Did this session have a review that has since been evicted?
+    ///
+    /// Answers the `session`-keyed form of the same question `lookup` answers for an id.
+    /// Without it, a caller polling by session name after the global cap emptied that
+    /// session is told no review was ever started for it -- the "never issued" advice
+    /// that eviction is specifically not supposed to produce.
+    pub fn session_had_evicted(&self, session: &str) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.evicted.iter().any(|(_, name)| name == session)
     }
 
     pub fn cancel(&self, id: &str) -> bool {
