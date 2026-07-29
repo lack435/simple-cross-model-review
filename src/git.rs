@@ -53,6 +53,31 @@ const MAX_OMISSION_NOTES: usize = 20;
 /// Longest untracked path rendered into the prompt.
 const MAX_PATH_LABEL: usize = 200;
 
+/// The revision-set operator a spec *ends* with, if any.
+///
+/// Terminal only, and that is the whole point of the function. These operators turn a
+/// revision into a two-endpoint range, so they change what is captured -- but they are also
+/// ordinary characters that appear inside legitimate revisions. `:/^!release` selects the
+/// most recent commit whose message begins `!release`, compares against the working tree
+/// like any other single revision, and merely happens to contain `^!` in its regex. Matching
+/// anywhere would refuse it for a reason that is not true of it.
+fn revision_set_suffix(spec: &str) -> Option<&'static str> {
+    if spec.ends_with("^!") {
+        return Some("^!");
+    }
+    if spec.ends_with("^@") {
+        return Some("^@");
+    }
+    // `^-` takes an optional parent number: `HEAD^-` and `HEAD^-2` are both the form.
+    if spec
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .ends_with("^-")
+    {
+        return Some("^-");
+    }
+    None
+}
+
 /// What to hand the reviewer as "the change".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffMode {
@@ -90,10 +115,7 @@ impl DiffMode {
         // reported 5 files and `git diff HEAD~1` reported 6, so misreading one as the other
         // is not cosmetic. Bare `^` and `~` parent notation stays legal: `HEAD^` is a single
         // revision and behaves like `HEAD~1`.
-        if let Some(found) = ["^!", "^@", "^-"]
-            .iter()
-            .find(|set| trimmed.contains(**set))
-        {
+        if let Some(found) = revision_set_suffix(trimmed) {
             return Err(format!(
                 "--diff '{trimmed}' uses git's revision-set shorthand ('{found}'), which cannot \
                  be told apart from a working-tree comparison without asking git. Pass an \
@@ -1164,10 +1186,18 @@ mod tests {
     /// silently changes what the reviewer is shown and what the caller is told.
     #[test]
     fn revision_set_shorthand_is_refused_rather_than_misclassified() {
-        for spec in ["HEAD^!", "HEAD^@", "HEAD^-", "main^!"] {
+        for spec in ["HEAD^!", "HEAD^@", "HEAD^-", "HEAD^-2", "main^!"] {
             let err = DiffMode::parse(spec).unwrap_err();
             assert!(err.contains("revision-set shorthand"), "{spec}: {err}");
             assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+        }
+
+        // Terminal only. These characters are ordinary inside a revision: `:/^!release`
+        // selects a commit by message and compares against the working tree like any other
+        // single revision, so refusing it would be refusing something that is not the form.
+        for spec in [":/^!release", ":/^-fix", "HEAD^{/^!release}"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(mode.compares_against_working_tree(), "{spec}");
         }
 
         // Parent notation is not revision-set syntax and stays legal: these are single
