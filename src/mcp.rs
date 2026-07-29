@@ -129,6 +129,10 @@ pub fn serve(app: Arc<App>) {
 /// driven from a test, whereas this takes the `Builder` it spawns from -- and a `Builder`
 /// asked for an impossible stack fails deterministically, so the failure branch is
 /// reachable without the process having to actually run out of threads.
+///
+/// Call it from the reader thread. That is what makes the pending map safe to touch here
+/// without further synchronisation, since `handle_cancellation` runs there too; see the
+/// comment on the send below for what is at stake if it ever moves.
 fn start_tool_call(
     builder: std::thread::Builder,
     app: &Arc<App>,
@@ -197,9 +201,14 @@ fn start_tool_call(
                 .remove(&key);
             eprintln!("cross-review: could not spawn handler thread: {e}");
             // Unconditional, with no `try_claim_response`: the claim exists to settle a
-            // race with `handle_cancellation`, and there is none to settle here. That
-            // runs on this same thread, so nothing can have landed between the insert
-            // above and the remove just now.
+            // race with `handle_cancellation`, and there is none to settle when this is
+            // called from the reader thread -- `serve` is that thread and so is
+            // `handle_cancellation`, so nothing can have landed between the insert above
+            // and the remove just now. That is a precondition on the caller now rather
+            // than something this function can see, so it is stated in the doc comment.
+            // Off the reader thread the cost is only a response sent for a request that
+            // was cancelled in the window, which the spec tolerates: no review can be
+            // killed either way, since `attach_review` only runs inside `dispatch_tool`.
             send(writer, handler_thread_unavailable_response(&id, &tool, &e));
             None
         }
@@ -862,8 +871,15 @@ mod tests {
         }
 
         fn responses(&self) -> Vec<Value> {
-            let bytes = self.0.lock().unwrap();
-            String::from_utf8(bytes.clone())
+            let bytes = self.0.lock().unwrap().clone();
+            // Newline-delimited JSON is the whole transport, and this is the only test
+            // that reads bytes back, so the framing is checked rather than assumed. A
+            // message never contains a bare newline: serde escapes them inside strings.
+            assert!(
+                bytes.is_empty() || bytes.ends_with(b"\n"),
+                "every response must be newline-terminated"
+            );
+            String::from_utf8(bytes)
                 .expect("utf-8")
                 .lines()
                 .map(|l| serde_json::from_str(l).expect("each line is one JSON message"))
@@ -891,6 +907,14 @@ mod tests {
     fn a_handler_that_cannot_be_spawned_is_answered_rather_than_left_hanging() {
         let recorder = Recorder::default();
         let pending = pending();
+        // What the OS will say, asked of it rather than hardcoded: CI is Windows-only, but
+        // an assertion on "os error 87" would still be pinning one of several ways
+        // CreateThread can refuse.
+        let expected = std::thread::Builder::new()
+            .stack_size(usize::MAX)
+            .spawn(|| {})
+            .expect_err("an impossible stack size must be refused")
+            .to_string();
 
         let handle = start_tool_call(
             std::thread::Builder::new().stack_size(usize::MAX),
@@ -921,11 +945,13 @@ mod tests {
         // The tool is named, and the OS error carried through: stderr is the only other
         // place either lands, and the caller cannot read stderr.
         assert!(text.contains("cross_model_review_result"));
-        assert!(text.contains("os error 87") || text.contains("cannot"));
+        assert!(text.contains(&expected), "want {expected:?} in: {text}");
         // The claim the shared stop-and-escalate text would have made here is false: this
-        // call never reached the reviewer, so a review already running is untouched.
+        // call never reached the reviewer, so a review already running is untouched. Nor
+        // may it presume one exists -- the same call from `cross_model_review` would be
+        // the first in the flow, with no review to collect.
         assert!(!text.contains("The external review did not run"));
-        assert!(text.contains("no review changed state"));
+        assert!(text.contains("any review already in progress is unaffected"));
     }
 
     #[test]
