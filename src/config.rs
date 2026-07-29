@@ -116,6 +116,45 @@ pub fn scoped_claude_rules() -> Vec<String> {
         .collect()
 }
 
+/// Whether one `--allow-tools` value grants Bash.
+///
+/// Three shapes have to work. Our defaults arrive as separate scoped entries; a
+/// user-supplied list arrives as one string for the CLI to split, and the CLI accepts both
+/// whitespace and commas as separators. Getting this wrong is not symmetrical -- a missed
+/// grant only costs a redundant capture, while a false one withholds the diff from a
+/// reviewer that cannot fetch it -- but a false negative still tells the caller the reviewer
+/// has no shell when it has one, so both are worth getting right.
+///
+/// Separators are recognised at paren depth zero only, since a grant's own argument may
+/// contain either: `Bash(git diff:*)` has a space in it, and a pattern may have a comma.
+/// Entries are compared whole, so `BashOutput` -- which reads a background shell's output
+/// and can run nothing -- is not mistaken for a shell.
+fn permits_bash(rule: &str) -> bool {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut grants = Vec::new();
+    for (i, ch) in rule.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                grants.push(&rule[start..i]);
+                start = i + ch.len_utf8();
+            }
+            c if depth == 0 && c.is_whitespace() => {
+                grants.push(&rule[start..i]);
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    grants.push(&rule[start..]);
+    grants
+        .into_iter()
+        .map(str::trim)
+        .any(|grant| grant == "Bash" || grant.starts_with("Bash("))
+}
+
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 300;
@@ -300,13 +339,29 @@ impl Config {
             // Codex runs under a sandbox policy rather than a tool allow-list, so its
             // shell is always present and always write-denied.
             ReviewerKind::Codex => true,
-            // Claude's shell exists only if Bash was put back into the tool set. Compared
-            // as whole entries, not as a substring: `BashOutput` is a separate tool that
-            // reads a background shell's output and grants no ability to run anything.
-            ReviewerKind::Claude => self
-                .tools
-                .split(',')
-                .any(|tool| tool.trim().eq_ignore_ascii_case("Bash")),
+            // Claude's shell has to be both present *and* permitted, and those are two
+            // different flags. `--tools ...,Bash` puts the tool in the session;
+            // `--allowed-tools` decides what may run, and the reviewer runs under
+            // `--permission-mode dontAsk`, so a rule that does not mention Bash denies it
+            // outright rather than prompting. `--tools ...,Bash` on its own therefore gives
+            // the reviewer a tool it can never use -- and answering "yes, it has a shell"
+            // there makes `--diff auto` withhold the capture too, leaving it with neither.
+            //
+            // So the answer is conservative in the direction that costs nothing: unless a
+            // shell is established, the diff gets supplied.
+            //
+            // Entries are compared whole, not as substrings: `BashOutput` is a separate
+            // tool that reads a background shell's output and can run nothing.
+            // Both halves compare exactly, and they must agree: a case-insensitive tool
+            // check against a case-sensitive rule check made `--tools ...,bash
+            // --allow-tools bash` "in the session but not permitted", which is a
+            // contradiction rather than an answer. Exact is the right convention of the
+            // two, because the CLI's own tool names are exact -- so `bash` most likely
+            // enables nothing, and calling that a shell would be the unsafe direction.
+            ReviewerKind::Claude => {
+                let in_session = self.tools.split(',').any(|tool| tool.trim() == "Bash");
+                in_session && self.allowed_tools.iter().any(|rule| permits_bash(rule))
+            }
         }
     }
 
@@ -348,11 +403,18 @@ impl Config {
                 );
             }
             ReviewerKind::Claude if self.reviewer_has_shell() => {
+                // Not "read-only", unlike the Codex arm above. That one is a sandbox
+                // policy; this one is a prefix allow-list, which this file's own
+                // `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified,
+                // with `Bash(git diff:*)` permitting `git diff --output=<file>` and
+                // creating a file. Telling the reviewer otherwise would be handing it a
+                // false security boundary in the one message it has to trust.
                 out.push_str(
-                    "You can read and search files in this project, and run the read-only shell \
-                     commands that have been allow-listed. Anything outside that list is denied \
-                     rather than queued for approval, so a refusal is final -- note it and move \
-                     on.",
+                    "You can read and search files in this project, and run the shell commands \
+                     that have been allow-listed -- that list is a prefix match, not a \
+                     read-only guarantee, so do not treat it as one. Anything outside it is \
+                     denied rather than queued for approval, so a refusal is final -- note it \
+                     and move on.",
                 );
             }
             ReviewerKind::Claude => {
@@ -479,18 +541,33 @@ OPTIONS:
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
   --tools <list>              Claude built-in tools. Default: Read,Grep,Glob
                               (no Bash: see the README on why a prefix allow-list
-                              cannot express read-only).
+                              cannot express read-only). Bash here is not enough on
+                              its own -- it also needs an --allow-tools rule, since
+                              the reviewer runs under dontAsk and is otherwise
+                              handed a tool it can never call.
   --allow-tools <list>        Claude permission rules. Default: Read/Grep/Glob scoped
                               to the working root, so reads cannot leave the project.
   --diff <spec>               What to capture and hand the reviewer as "the change".
                               auto    supply a working-tree diff only when the reviewer
-                                      has no shell to fetch one itself (default)
+                                      has no usable shell to fetch one itself -- i.e.
+                                      Claude without Bash both enabled and allow-listed.
+                                      The Codex reviewer always has one, so auto supplies
+                                      nothing there. (default)
                               none    supply nothing; paste your own into 'instructions'
                               staged  git diff --cached
                               HEAD    git diff HEAD, plus untracked file contents
-                              <rev>   any revision or range, e.g. main...HEAD
-                              Skipped silently when the working root is not a git
-                              repository. Not affected by --no-preamble; use --diff none.
+                              a..b    two commits, e.g. main...HEAD: no working tree,
+                                      no untracked files
+                              <rev>   that commit against the WORKING TREE, e.g. HEAD~3,
+                                      plus untracked file contents -- git's own semantics,
+                                      not ours. Two spellings are rejected because nothing
+                                      distinguishes them from the other shape: revision-set
+                                      shorthand (^!, ^@, ^-), which is a range with no ..
+                                      to see, and :/<pattern> containing .., which is a
+                                      range whose left end is a message search.
+                              A capture that was configured and could not be produced is
+                              reported to the caller with the review, not skipped in
+                              silence. Not affected by --no-preamble; use --diff none.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration
@@ -700,6 +777,83 @@ mod tests {
         assert!(cfg.tools.contains("Bash"));
         // Passed through as a single argument for the CLI to split itself.
         assert_eq!(cfg.allowed_tools, vec!["Read Grep Glob Bash(git diff:*)"]);
+        assert!(cfg.reviewer_has_shell());
+    }
+
+    /// A Claude shell needs the tool *and* a permission rule, and getting this wrong is
+    /// expensive in one specific direction: `--diff auto` withholds the capture from a
+    /// reviewer believed to have a shell, so a Bash that `dontAsk` denies would leave it
+    /// with no shell and no diff at all.
+    #[test]
+    fn a_claude_shell_needs_both_the_tool_and_a_rule_permitting_it() {
+        // In the session, but nothing permits it: the default rules are Read/Grep/Glob, and
+        // the reviewer runs under `--permission-mode dontAsk`, so Bash is denied.
+        let listed_only = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+        ]))
+        .expect("config");
+        assert!(!listed_only.reviewer_has_shell());
+        assert!(
+            listed_only.supplies_diff(),
+            "and the diff must be supplied, since it has no usable shell"
+        );
+
+        // Permitted but absent from the session is the same answer for the other reason.
+        let permitted_only = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]))
+        .expect("config");
+        assert!(!permitted_only.reviewer_has_shell());
+
+        // A bare `Bash` grant counts, as well as a scoped one.
+        let bare = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Bash",
+        ]))
+        .expect("config");
+        assert!(bare.reviewer_has_shell());
+
+        // The CLI accepts commas as well as whitespace in a supplied list, and a grant's
+        // own argument may contain either, so separators count only outside parentheses.
+        for list in [
+            "Read,Grep,Glob,Bash(git diff:*)",
+            "Read Grep Glob Bash(git log --format=a,b)",
+            "Bash",
+        ] {
+            let cfg = Config::from_args(&args(&[
+                "--reviewer",
+                "claude",
+                "--tools",
+                "Read,Grep,Glob,Bash",
+                "--allow-tools",
+                list,
+            ]))
+            .expect("config");
+            assert!(cfg.reviewer_has_shell(), "{list}");
+        }
+
+        // `BashOutput` reads a background shell's output and can run nothing, so neither
+        // half of the question may match it as a substring.
+        let lookalike = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,BashOutput",
+            "--allow-tools",
+            "Read,BashOutput",
+        ]))
+        .expect("config");
+        assert!(!lookalike.reviewer_has_shell());
     }
 
     #[test]
@@ -720,6 +874,36 @@ mod tests {
         let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
+        // Codex's shell is confined by a sandbox policy, so it may be called read-only.
+        assert!(text.contains("read-only shell"), "{text}");
+    }
+
+    /// The prompt the reviewer itself reads must not claim a boundary the mechanism does
+    /// not provide. Codex's shell is a sandbox policy; Claude's is a prefix allow-list,
+    /// which `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified, with
+    /// `Bash(git diff:*)` permitting `--output=<file>` and creating a file.
+    #[test]
+    fn an_opted_in_claude_shell_is_never_described_to_it_as_read_only() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]))
+        .expect("config");
+        assert!(cfg.reviewer_has_shell());
+
+        let text = cfg.reviewer_capabilities(false);
+        // The word may appear only where it is being denied, never as a description of
+        // what the shell is.
+        assert!(!text.contains("read-only shell"), "{text}");
+        assert!(!text.contains("run the read-only"), "{text}");
+        assert!(text.contains("prefix match"), "{text}");
+        assert!(text.contains("not a read-only guarantee"), "{text}");
+        // The denial behaviour still has to be stated: refusals are final, not queued.
+        assert!(text.contains("a refusal is final"), "{text}");
     }
 
     #[test]
@@ -745,12 +929,15 @@ mod tests {
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert!(!codex.supplies_diff());
 
-        // And a Claude reviewer that has been given Bash back can fetch its own.
+        // And a Claude reviewer given Bash back -- in the session *and* permitted, since
+        // either alone leaves it unable to run anything -- can fetch its own.
         let with_bash = Config::from_args(&args(&[
             "--reviewer",
             "claude",
             "--tools",
             "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
         ]))
         .expect("config");
         assert!(!with_bash.supplies_diff());
@@ -799,11 +986,14 @@ mod tests {
 
     #[test]
     fn claude_regains_shell_capability_when_bash_is_restored() {
+        // Both halves: `--tools` puts Bash in the session, `--allow-tools` permits it.
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "claude",
             "--tools",
             "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
         ]))
         .expect("config");
         assert!(cfg.reviewer_has_shell());

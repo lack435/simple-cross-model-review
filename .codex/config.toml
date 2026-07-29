@@ -21,7 +21,32 @@
 
 [mcp_servers.cross_review]
 command = "dist\\cross-review.exe"
-args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+args = [
+    "--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high",
+    "--diff", "main...HEAD",
+]
+
+# The Claude reviewer has no shell, so the server captures the change for it. The default
+# --diff auto captures the working tree, which is empty exactly when a PR is ready to review
+# -- the work is committed by then. AGENTS.md makes cross-review the merge gate, so this
+# entry is pinned to the branch against its base instead, which is what a PR review needs.
+#
+# The cost is the other half: --diff is a startup flag rather than a per-call argument, so
+# this entry cannot also capture uncommitted work. Mid-development review of a dirty tree
+# goes the other direction, where the Codex reviewer has a shell and can look for itself.
+#
+# So commit before every review through this entry, re-reviews included, and check that
+# `git status --porcelain` is empty first. The reviewer reads the live working tree and is
+# handed `git status` alongside the range, so an uncommitted edit does not go unseen -- it
+# gets seen out of step with the diff, which is worse.
+#
+# `main` here is the *local* ref. Fetch and check it is current before reviewing: a stale
+# local main does not fail, it quietly widens the range to include everything merged since,
+# and the reviewer spends its turn on code the branch never touched. Nothing in the response
+# distinguishes that from a large PR. Guard the fast-forward with
+# `git merge-base --is-ancestor main origin/main` -- `git branch -f` on a diverged main
+# discards the local tip. A branch based on something other than main needs a different pin;
+# there is no per-call override, so it cannot be gated from this entry.
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
 # covers a single request rather than a whole review. It must still exceed the 300s cap on

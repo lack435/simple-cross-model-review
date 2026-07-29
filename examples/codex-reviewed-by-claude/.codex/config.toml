@@ -15,6 +15,16 @@
 command = "tools/cross-review.exe"
 args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
 
+# The Claude reviewer has no shell, so the server captures the change and hands it over.
+# The default captures the working tree, which suits reviewing work in progress but is
+# empty once the work is committed -- so for reviewing a branch, add the range you want:
+#
+#   args = [..., "--diff", "main...HEAD"]
+#
+# It is a startup flag, not a per-call argument, so one entry cannot do both. `main` there
+# is the local ref: fetch and fast-forward it first, or the range quietly widens to include
+# everything merged since. See "The change under review is fetched for you" in the README.
+
 # Reviews are collected by polling, so a tool call returns promptly and this budget
 # only has to cover a single request rather than a whole review. It must still exceed the
 # 300s cap on a single cross_model_review_result poll: the server honours

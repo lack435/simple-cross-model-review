@@ -108,14 +108,27 @@ root, so running `git` here costs the calling agent nothing:
 
 | `--diff` | What the reviewer is shown |
 | --- | --- |
-| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no shell** |
+| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no usable shell** |
 | `none` | nothing; supply your own in `instructions` |
 | `staged` | `git diff --cached` + status |
 | `HEAD` | as `auto`, regardless of whether the reviewer has a shell |
-| *any revision* | `git diff <rev>` + status, e.g. `main...HEAD` or `HEAD~3` |
+| *a range* | `git diff <a>...<b>` + status, e.g. `main...HEAD` — two commits, so no working tree and no untracked files |
+| *a bare revision* | `git diff <rev>` + status + untracked contents, e.g. `HEAD~3` — that commit **against the working tree** |
 
 The full command is `git diff --no-ext-diff --no-textconv --relative <rev> -- .`, and it is
 named verbatim in the reviewer's prompt so it can report what it was shown.
+
+"Usable" is doing work in that first row. The Codex reviewer always has one. The Claude
+reviewer has one only when `--tools` puts Bash in the session *and* `--allow-tools` permits
+it: it runs under `--permission-mode dontAsk`, so `--tools …,Bash` on its own leaves it a
+tool it can never call. `auto` requires both before it withholds the capture, since a
+reviewer with neither shell nor diff is the worst of the three outcomes.
+
+The last two rows are one `--diff` value apart and are not the same thing, because that is
+git's own semantics: `A..B` and `A...B` compare two commits, while a bare `A` compares A to
+the working tree. So `--diff HEAD~3` carries your uncommitted edits and `--diff main...HEAD`
+cannot. Both the caller's description and the reviewer's prompt follow the endpoint rather
+than the spelling.
 
 Notes on the edges, because they are where this would otherwise mislead:
 
@@ -150,11 +163,13 @@ Notes on the edges, because they are where this would otherwise mislead:
   a stand-in `git.exe` next to the caller was run in preference to the real git; one in the
   child's working directory was not. So a committed `tools\git.exe` would otherwise have
   executed as you.
-- **Untracked files ride with the working-tree modes only** (`auto`, `HEAD`). They are the
-  case a diff structurally cannot cover, so a working-tree review needs them; a `staged`
-  diff or an explicit range named a specific set of changes, and an untracked file is not
-  in either. An untracked symlink or junction resolving outside the working root is skipped
-  and reported, so this cannot route around the reviewer's read confinement.
+- **Untracked files ride with every mode whose diff endpoint is the working tree** — `auto`,
+  `HEAD`, and a bare revision such as `HEAD~3`, which is why that row of the table differs
+  from the range above it. They are the case a diff structurally cannot cover, so a review
+  against the tree needs them; a `staged` diff or a two-endpoint range named a specific set
+  of changes, and an untracked file is not in either. An untracked symlink or junction
+  resolving outside the working root is skipped and reported, so this cannot route around
+  the reviewer's read confinement.
 - **An empty diff is still reported**, explicitly, as an empty diff — and, for the
   working-tree modes, with the reason it might be empty. A reviewer told nothing reviews
   the current code and calls that a review of the change; a reviewer told only "empty"
@@ -171,11 +186,30 @@ Notes on the edges, because they are where this would otherwise mislead:
   untracked *filenames* are stripped of backticks and control characters before they are
   interpolated into a heading.
 - **A `--diff` value can never become a git option.** Anything starting with `-` is
-  rejected at startup, because `git diff --output=<file>` writes.
+  rejected at startup, because `git diff --output=<file>` writes. Git's revision-*set*
+  shorthand — `^!`, `^@`, `^-` — is rejected there too: those are two-endpoint ranges
+  containing no `..` to detect, so they would be read as working-tree comparisons and change
+  what the reviewer is shown. Verified: with a tracked file dirty, `git diff HEAD^!` reported
+  5 files and `git diff HEAD~1` reported 6. Parent notation (`HEAD^`, `HEAD^^`) is untouched.
+  So is the reverse case, `:/<pattern>` containing `..`: git splits a revision on the first
+  `..`, so `:/fix..HEAD` is a range whose left endpoint is a commit-message search, and
+  nothing distinguishes it from a search for a pattern that contains `..`. Verified too —
+  `git rev-parse ':/fix..HEAD'` returned two endpoints, and `git diff ':/fix..HEAD'` ignored
+  a dirty file that `git diff ':/fix'` picked up. A brace-scoped search (`HEAD^{/a..b}`) is
+  unambiguous and stays legal, because the braces say where the pattern ends.
 - **The whole capture shares a 60-second budget**, not one timeout per command, so a wedged
-  repository cannot hold the session lease for a multiple of any number written here.
-- Skipped silently when the working root is not a git repository, or when git is not
-  installed. `--no-preamble` does not turn it off; `--diff none` does.
+  repository cannot spend four independent timeouts. The budget bounds the git commands
+  themselves; each invocation can additionally spend up to the 10-second output drain grace
+  after its child is reaped, which is outside the shared deadline. In practice that is
+  unreachable — the job object closes the pipes and collection returns at once — so it bites
+  only if the job object could not be created or something outside it holds a handle.
+- **A capture that was configured and did not happen is reported to the caller**, as a
+  warning alongside the review: no local `main` for a pinned `main...HEAD`, a working root
+  that is not inside a git work tree, git missing from PATH, or any part of the capture that ran
+  short. The reviewer is told it has no diff, but the caller is the party that asked for a
+  review of a change, and a review of the current tree returned in silence reads exactly
+  like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
+  with a reviewer that has its own shell, so those stay silent.
 
 ## Re-reviewing after you act on feedback
 
@@ -380,7 +414,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 128 unit tests: no network, no model calls
+cargo test          # 167 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```

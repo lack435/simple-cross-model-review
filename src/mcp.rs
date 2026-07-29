@@ -472,11 +472,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // reviewer with no shell cannot obtain a diff, and a description that implied
     // otherwise invited requests like "review the branch diff" that silently could not be
     // carried out -- with no permission denial to surface, since the tool is absent.
-    let access = if cfg.reviewer_has_shell() {
-        "The reviewer has read-only access to this repository: it can read files and run \
-         read-only shell commands such as `git diff` and `git log`, so it can inspect the \
-         change history itself. You do not need to paste code. Describe what changed and \
-         what you want scrutinised."
+    // `supplies_diff` is asked first because the two are not exclusive: `--diff HEAD` with
+    // a shelled reviewer captures *and* hands over a change, which the shell branch would
+    // have described as "inspect the change history itself" while a diff sat in the prompt.
+    // Said once, and only as strongly as the mechanism behind it. Codex's shell is confined
+    // by a sandbox policy whose write refusals are verified; Claude's is an opt-in
+    // allow-list, which `README.md` shows cannot express "read-only" at all. Calling both
+    // read-only would be the kind of unearned claim this project spends the README avoiding.
+    let shell_clause = match cfg.reviewer {
+        crate::config::ReviewerKind::Codex => "It has a read-only shell",
+        crate::config::ReviewerKind::Claude => {
+            "It has a shell, because one was enabled explicitly -- its allow-list is a soft \
+             boundary rather than a read-only guarantee"
+        }
+    };
+
+    let access = if cfg.reviewer_has_shell() && !cfg.supplies_diff() {
+        format!(
+            "The reviewer can read and search files in this repository. {shell_clause}, so it \
+             can run `git diff` and `git log` and inspect the change history itself. You do \
+             not need to paste code. Describe what changed and what you want scrutinised."
+        )
     } else if cfg.supplies_diff() {
         // Worth stating positively. The caller pastes a diff because it believes it has
         // to; left to infer, it will keep spending its own context on one this server
@@ -486,14 +502,26 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // repository, which is only known at capture time. The reviewer is told the
         // runtime answer; the caller can only be told the intent, so it must not be
         // promised more than that.
-        "The reviewer can read and search files in this repository, so you do not need to \
-         paste whole files. It has NO shell of its own, but it does not need one for the \
-         change: when the working root is a git repository, this server captures the \
-         working-tree diff, `git status`, and the contents of untracked files, and hands \
-         them to the reviewer with your request. Do not paste a diff into 'instructions' \
-         -- describe the intent of the change and what you want scrutinised instead. Note \
-         that the capture covers uncommitted work; if what you want reviewed is already \
-         committed, say so in 'instructions'."
+        // What is captured is what `--diff` selects, so the description asks the mode
+        // rather than restating one of them: under `--diff staged` or a range this text
+        // otherwise promised a working-tree capture with untracked files that those modes
+        // deliberately exclude.
+        let (captures, caveat) = cfg.diff.caller_summary();
+        // The shell clause is the one part that cannot be stated unconditionally here: a
+        // capture is configured for both kinds of reviewer, but only one of them lacks a
+        // shell, and telling the caller a shelled reviewer has none would be a plain lie.
+        let shell = if cfg.reviewer_has_shell() {
+            format!("{shell_clause}, and it is also handed the change directly")
+        } else {
+            "It has NO shell of its own, but it does not need one for the change".to_string()
+        };
+        format!(
+            "The reviewer can read and search files in this repository, so you do not need to \
+             paste whole files. {shell}: when the working root is a git repository, this server \
+             captures {captures}, and hands them to the reviewer with your request. Do not paste \
+             a diff into 'instructions' -- describe the intent of the change and what you want \
+             scrutinised instead. {caveat}"
+        )
     } else {
         "The reviewer can read and search files in this repository, so you do not need to \
          paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \
@@ -501,6 +529,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
          the code, include the diff or a precise description of the change in \
          'instructions' -- otherwise the reviewer can only judge the code as it now \
          stands, and will say so."
+            .to_string()
     };
     let caller_hint = match cfg.reviewer {
         crate::config::ReviewerKind::Claude => {
@@ -698,6 +727,126 @@ mod tests {
         let tool = &response["result"]["tools"][0];
         assert_eq!(tool["inputSchema"]["required"][0], "instructions");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    /// The caller is told what `--diff` actually captures. A description hardcoded to the
+    /// working-tree modes told a `--diff main...HEAD` caller that untracked files and
+    /// uncommitted work were included, which is exactly backwards for a range.
+    #[test]
+    fn review_tool_description_matches_the_configured_diff_mode() {
+        let describe = |args: &[&str]| {
+            let mut all: Vec<String> = vec!["--reviewer".into(), "claude".into()];
+            all.extend(args.iter().map(|a| (*a).to_string()));
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description")
+                .to_string()
+        };
+
+        // The contract for the modes that supply something other than the working tree:
+        // the named revision is the diff, `git status` still comes with it, and the
+        // contents of anything dirty or untracked do not. Asserted as those facts rather
+        // than as one banned phrase, so a rewording that breaks the contract cannot pass
+        // by avoiding the old words.
+        // `HEAD~3` is deliberately absent: a bare revision diffs against the working tree,
+        // so it belongs with the working-tree modes below, not with the two-endpoint ranges.
+        for (spec, diff_label) in [
+            ("main...HEAD", "`git diff main...HEAD`"),
+            ("main..HEAD", "`git diff main..HEAD`"),
+            ("staged", "`git diff --cached`"),
+        ] {
+            let text = describe(&["--diff", spec]);
+            assert!(text.contains(diff_label), "{spec}: {text}");
+            assert!(text.contains("`git status`"), "{spec}: {text}");
+            assert!(
+                text.contains("their contents are not sent"),
+                "{spec}: {text}"
+            );
+            assert!(
+                !text.contains("the contents of untracked files"),
+                "{spec}: {text}"
+            );
+            assert!(!text.contains("covers uncommitted work"), "{spec}: {text}");
+        }
+
+        // A bare revision compares against the working tree, so the caller must not be told
+        // to commit first -- it would be describing a range it did not configure.
+        let bare = describe(&["--diff", "HEAD~3"]);
+        assert!(bare.contains("working tree**"), "{bare}");
+        assert!(bare.contains("the contents of untracked files"), "{bare}");
+        assert!(
+            !bare.contains("commit what you want reviewed first"),
+            "{bare}"
+        );
+
+        // The working-tree modes do supply untracked contents, and say so. `auto` reaches
+        // this because the Claude reviewer has no shell to fetch a diff itself.
+        for spec in [vec![], vec!["--diff", "HEAD"]] {
+            let text = describe(&spec);
+            assert!(
+                text.contains("the contents of untracked files"),
+                "{spec:?}: {text}"
+            );
+            assert!(text.contains("covers uncommitted work"), "{spec:?}: {text}");
+        }
+
+        // A reviewer with a shell and no capture configured fetches its own, and is told so.
+        let shelled = describe(&[
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]);
+        assert!(
+            shelled.contains("inspect the change history itself"),
+            "{shelled}"
+        );
+        // And an opted-in Claude shell is never sold as read-only: the README shows a
+        // prefix allow-list cannot express that, so only Codex's sandbox earns the word.
+        assert!(!shelled.contains("read-only shell"), "{shelled}");
+        assert!(shelled.contains("soft boundary"), "{shelled}");
+
+        let codex_shell = {
+            let all: Vec<String> = ["--reviewer", "codex"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect();
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description")
+                .to_string()
+        };
+        assert!(codex_shell.contains("read-only shell"), "{codex_shell}");
+
+        // Shell *and* capture is a real configuration (`README.md` advertises `--diff HEAD`
+        // regardless of shell), and it used to fall into the shell branch, so the caller was
+        // never told about a capture that was happening.
+        for args in [
+            vec!["--reviewer", "codex", "--diff", "HEAD"],
+            vec![
+                "--reviewer",
+                "claude",
+                "--tools",
+                "Read,Grep,Glob,Bash",
+                "--allow-tools",
+                "Read Grep Glob Bash(git diff:*)",
+                "--diff",
+                "main...HEAD",
+            ],
+        ] {
+            let all: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            let text = response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description");
+            assert!(text.contains("this server captures"), "{args:?}: {text}");
+            assert!(!text.contains("NO shell"), "{args:?}: {text}");
+        }
     }
 
     #[test]

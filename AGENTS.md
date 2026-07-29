@@ -12,24 +12,129 @@ the small self-contained binary is a feature, so do not add crates casually. See
 
 ## Pull requests
 
-**Every PR must be reviewed by an Opus subagent before it is approved to merge.** This is a
-blocking gate, not a suggestion.
+**Every PR must be reviewed by a different model through this repository's own
+`cross-review` MCP server before it is approved to merge.** This is a blocking gate, not a
+suggestion. We eat our own dog food: the merge gate for cross-review is cross-review.
 
-- Spawn the review with the `Agent` tool using `model: "opus"`, giving it the PR's full
-  diff (or the branch and base to diff itself) plus this file and `README.md` as context.
-- The subagent reviews; it does not fix. Bring its findings back and act on them yourself.
+- Call `cross_model_review` with a session named for the branch or PR, and collect it with
+  `cross_model_review_result`. Both directions are already wired up in this checkout —
+  Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 5 via
+  [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
+  not write the diff.
+- **Getting the diff in front of the reviewer depends on which direction you are calling.**
+  The Codex reviewer has a read-only shell, so give it the branch and base and let it run
+  `git diff` itself. The Claude reviewer still has no shell, but no longer needs one: the
+  server captures the change and hands it over with the request. Do not paste a diff into
+  `instructions` in either direction — describe the intent and what you want scrutinised,
+  and let the reviewer or the server fetch the code.
+- **For the Claude direction, the gate reviews what is committed.** What gets captured is
+  fixed by `--diff` on the server entry, not chosen per call, and
+  [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
+  branch against its base rather than the default working-tree capture, which is empty once
+  the work is committed. Four things follow, and the first two are pre-flight:
+  - **Commit, and check `git status --porcelain` is empty, before every call in that
+    direction — the first review and each re-review.** A dirty tree is worse than it looks:
+    the capture is the committed range, but the reviewer can read the live files and is
+    handed `git status`, so it would be reviewing one revision through a diff and another
+    through the tree. The reviewer is now told when that has happened; do not make it rely
+    on that.
+  - **`main` there is the *local* ref, so fetch and check it is current first.** A stale
+    local `main` does not fail — it silently widens the capture to include everything merged
+    since, and the reviewer spends its turn on code the PR did not touch. This has happened:
+    a review of this PR was handed 1707 insertions instead of 208. Nothing in the response
+    distinguishes that from a large PR, so the check is yours to make:
+
+    ```powershell
+    git fetch origin
+    if ($LASTEXITCODE -ne 0) { throw "fetch failed - origin/main may be stale, stop" }
+    git merge-base --is-ancestor main origin/main
+    if ($LASTEXITCODE -eq 1) { throw "local main has diverged - sort that out first" }
+    if ($LASTEXITCODE -ne 0) { throw "could not compare main to origin/main - stop" }
+    git branch -f main origin/main
+    if ((git rev-parse main) -ne (git rev-parse origin/main)) { throw "main was not updated - stop" }
+    ```
+
+    Every check earns its line. A failed `fetch` leaves `origin/main` at whatever it was
+    last time, so the ancestor test passes against a stale ref and reports everything
+    current — the exact failure this preflight exists to catch, wearing the costume of a
+    passing check. `--is-ancestor` exits 1 for "no" and 128 for an error, so a missing
+    `origin` would otherwise be reported as divergence. `git branch -f` on a diverged `main`
+    discards the local tip rather than refusing, and it fails outright when `main` is the
+    branch you have checked out — so the last line confirms the ref actually moved rather
+    than trusting that it did. Use `$LASTEXITCODE`, not `$?`: for native commands in
+    Windows PowerShell, `$?` can be set from the error stream.
+  - **If your PR is not based on `main`, this entry cannot gate it.** The base is pinned in
+    the server arguments, so a review of `main...HEAD` on a stacked branch takes in the PR
+    underneath as well and would pass the gate without the PR's own diff ever being reviewed
+    alone. Do not describe the mismatch and proceed. Register a second server under a
+    different `[mcp_servers.…]` name, with `--diff` pointing at the real base, in your
+    **global** `%USERPROFILE%\.codex\config.toml` — not in this repository's
+    [`.codex/config.toml`](.codex/config.toml), which is tracked, so editing it would either
+    dirty the tree the bullet above requires to be clean or land a config change inside the
+    PR being gated.
+  - For mid-development review of work that is not committed yet, open a Claude Code session
+    against this checkout and call from there — that direction gets the Codex reviewer, which
+    has a shell and can see the working tree. A Codex session cannot reach it by changing
+    arguments; it is a different server entry.
+- Say what changed and why, and point the reviewer at this file and `README.md`. It runs
+  configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
+  when told to.
+- The reviewer reviews; it cannot fix. The Claude direction has no write-capable tool in the
+  session at all; the Codex direction runs under a read-only policy whose write refusals are
+  verified, though enforcement there is the CLI's rather than demonstrably the OS's — see
+  `README.md`. Bring the findings back and act on them yourself.
+- After acting on feedback, call `cross_model_review` again with the **same session** so the
+  reviewer reports what is resolved, what is still open, and what regressed. That request
+  must carry every finding you dismissed and the evidence for dismissing it: a dismissal the
+  reviewer never sees is not a dismissal, it is a bypass. Only use `fresh: true` when the
+  earlier findings would mislead. If the response reports that the session had expired and
+  was replaced with a fresh one, the reviewer remembers nothing — re-supply the earlier
+  findings and your dismissals yourself.
 - Never approve, merge, or tell the user a PR is ready to merge without that review having
-  run and its findings resolved or explicitly dismissed with a reason.
-- If the subagent cannot run, say so and stop. Do not substitute your own read of the diff
-  for the Opus review — a model reviewing its own work shares its own blind spots, which is
-  the entire premise of this project.
+  run and its findings either resolved or disputed with concrete evidence the reviewer has
+  seen and answered.
+- If the review fails — `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `RATE_LIMITED`, any of the
+  codes in the README — hand the user the remediation the tool returned, say the review did
+  not run, and stop. Do not substitute your own read of the diff, and do not fall back to a
+  same-model subagent: a model reviewing its own work shares its own blind spots, which is
+  the entire premise of this project. `cross_model_review_status` checks the reviewer CLI
+  and auth for free, before anything is billed.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
-  and anything deliberately left alone.
+  and what is still disputed. Keep findings the reviewer has confirmed resolved separate
+  from ones you argued against — they are not the same claim.
 
-This gate is separate from the `cross-review` MCP server. That tool is for cross-*model*
-feedback during development (Claude asks Codex here, Codex asks Claude via
-`.codex/config.toml`); the Opus subagent review is the merge gate. Use both — they catch
-different things.
+### When the gate itself is broken
+
+Dogfooding is also how the tool gets tested in anger. If the gate misbehaves — a failure
+code that misreports the reviewer's state, a resumed session that lost context, a response
+that reads badly to the calling agent — that is a bug in this repository, so report it
+rather than working around it.
+
+That leaves one deadlock worth naming: a PR that repairs the gate cannot pass through the
+gate it is repairing. There is an exception for exactly that case, and **you cannot invoke
+it on your own judgement.** Every condition below is an artifact you must be able to point
+at. If any one of them is missing, stop and tell the user which one:
+
+- **A human maintainer authorised the use of this exception, for this named PR**, in the PR
+  itself or in a direct instruction to you. Approval to work on, approve, or merge the PR is
+  not that: "go ahead with #15" authorises the work, not the bypass. Nor may you infer it
+  from the situation being urgent, from the repair being obviously correct, or from a
+  previous PR having been authorised. If you are unsure whether you have it, you do not have
+  it — ask.
+- **The PR is the minimum repair to the gate and nothing else.** Split unrelated work out
+  into its own PR, which goes through the normal gate. A repair with a tidy-up bundled into
+  it does not qualify; neither does a rate limit, a reviewer that is slow or expensive, or
+  findings you would rather not address.
+- **The failing output is quoted verbatim in the PR** — the code and the full message, not
+  a paraphrase of what went wrong.
+- **A different model reviewed it out of band, under the same read-only constraints**, and
+  the PR carries the request and the response in full, naming the model and how it was
+  confined. A claim that this happened is not the artifact; the transcript is.
+- **The repaired gate reviews the exact final diff before the merge.** If the repair works,
+  this is possible — so it is required, and it is what actually closes the exception. If it
+  does not work, the repair has not been demonstrated and the PR does not qualify: say so
+  and stop. A repair that cannot pass through the gate it claims to have fixed is a claim,
+  not a repair.
 
 ## Before handing work back
 

@@ -53,6 +53,63 @@ const MAX_OMISSION_NOTES: usize = 20;
 /// Longest untracked path rendered into the prompt.
 const MAX_PATH_LABEL: usize = 200;
 
+/// The revision-set operator a spec *ends* with, if any.
+///
+/// Terminal only, and that is the whole point of the function. These operators turn a
+/// revision into a two-endpoint range, so they change what is captured -- but they are also
+/// ordinary characters that appear inside legitimate revisions. `:/^!release` selects the
+/// most recent commit whose message begins `!release`, compares against the working tree
+/// like any other single revision, and merely happens to contain `^!` in its regex. Matching
+/// anywhere would refuse it for a reason that is not true of it.
+fn revision_set_suffix(spec: &str) -> Option<&'static str> {
+    if spec.ends_with("^!") {
+        return Some("^!");
+    }
+    if spec.ends_with("^@") {
+        return Some("^@");
+    }
+    // `^-` takes an optional parent number: `HEAD^-` and `HEAD^-2` are both the form.
+    if spec
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .ends_with("^-")
+    {
+        return Some("^-");
+    }
+    None
+}
+
+/// Whether a spec names two endpoints, i.e. whether its `..` is a range operator.
+///
+/// The mirror of `revision_set_suffix`, and the same mistake pointing the other way: `..`
+/// is a range operator most of the time and ordinary text the rest of it. `HEAD^{/a..b}`
+/// searches commit messages for "a..b" within one ref and compares that single commit
+/// against the working tree; reading it as a range would drop untracked capture and raise a
+/// dirty-tree warning that is simply false.
+fn is_two_endpoint(spec: &str) -> bool {
+    // `:/` searches from any ref, and everything after it is the pattern -- unless it also
+    // contains `..`, where git splits on the first one and reads the search as a range's
+    // left endpoint instead. `parse` refuses that spelling outright, so this is normally
+    // unreachable; it answers anyway, and answers "range", because `DiffMode::Rev` is
+    // directly constructible and an invariant enforced only by call ordering across two
+    // functions is one edit away from being silently untrue. "Range" is the safe answer:
+    // it withholds untracked contents and keeps the dirty-tree warning on.
+    if spec.starts_with(":/") {
+        return spec.contains("..");
+    }
+    // Elsewhere, dots inside `^{...}` belong to whatever the braces contain.
+    let mut depth = 0usize;
+    let bytes = spec.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'.' if depth == 0 && bytes.get(i + 1) == Some(&b'.') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// What to hand the reviewer as "the change".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffMode {
@@ -81,6 +138,36 @@ impl DiffMode {
             return Err(format!(
                 "--diff '{trimmed}' looks like a git option, not a revision. Pass \
                  auto, none, staged, HEAD, or a revision range such as 'main...HEAD'."
+            ));
+        }
+        // Revision-*set* shorthand is refused rather than guessed at. Whether a spec is a
+        // two-endpoint range decides three things -- untracked capture, the dirty-tree
+        // warning, and what the caller is told -- and `^!`, `^@` and `^-` are ranges that
+        // contain no `..` to see. Verified: with a tracked file dirty, `git diff HEAD^!`
+        // reported 5 files and `git diff HEAD~1` reported 6, so misreading one as the other
+        // is not cosmetic. Bare `^` and `~` parent notation stays legal: `HEAD^` is a single
+        // revision and behaves like `HEAD~1`.
+        if let Some(found) = revision_set_suffix(trimmed) {
+            return Err(format!(
+                "--diff '{trimmed}' uses git's revision-set shorthand ('{found}'), which cannot \
+                 be told apart from a working-tree comparison without asking git. Pass an \
+                 explicit two-endpoint range instead, such as 'HEAD~1..HEAD'."
+            ));
+        }
+        // A commit-message search can be the *left endpoint* of a range, which makes `:/`
+        // ambiguous rather than always-a-single-revision: git splits on the first `..`, so
+        // `:/fix..bug` searches for "fix..bug" while `:/fix..HEAD` is a range from the
+        // commit matching "fix". Verified: `git rev-parse ':/fix..HEAD'` returned two
+        // endpoints, and `git diff ':/fix..HEAD'` ignored a dirty file that `git diff
+        // ':/fix'` picked up. Guessing wrong here is the unsafe direction -- it would ship
+        // untracked contents as part of a commit-to-commit change and suppress the
+        // dirty-tree warning -- so it is refused, like the other ambiguity above.
+        if trimmed.starts_with(":/") && trimmed.contains("..") {
+            return Err(format!(
+                "--diff '{trimmed}' is ambiguous: git splits a revision on the first '..', so \
+                 this is a range whose left endpoint is a commit-message search rather than a \
+                 search for a pattern containing '..'. Name the endpoint commit explicitly, \
+                 such as 'HEAD~1..HEAD'."
             ));
         }
         // Keyword match is case-insensitive, which means a branch or tag literally named
@@ -147,14 +234,60 @@ impl DiffMode {
         format!("git diff {}", args.join(" "))
     }
 
+    /// Whether the diff this mode produces has the *working tree* as one of its endpoints.
+    ///
+    /// This is git's own semantics and it does not follow the keyword/revision split, which
+    /// is why it is asked as its own question. `git diff A..B` and `git diff A...B` compare
+    /// two commits; a bare `git diff A` compares A **to the working tree**. So `HEAD~3` --
+    /// documented and tested here as a revision -- picks up uncommitted edits, while
+    /// `main...HEAD` does not. Verified: with one tracked file dirty, `git diff HEAD~3`
+    /// gained a file and a line and `git diff main...HEAD` did not.
+    ///
+    /// Both halves of the test are narrower than they look: `parse` has already refused the
+    /// two-endpoint spellings that carry no dots (`^!`, `^@`, `^-`), and `is_two_endpoint`
+    /// declines a `..` inside `^{…}`, where the braces bound the pattern. A leading `:/`
+    /// with `..` it reads *as* a range — `parse` refuses that spec, so the classifier only
+    /// sees one by direct construction, and a range is the safe answer for it.
+    fn compares_against_working_tree(&self) -> bool {
+        match self {
+            Self::Auto | Self::Head => true,
+            Self::None | Self::Staged => false,
+            Self::Rev(rev) => !is_two_endpoint(rev),
+        }
+    }
+
     /// Whether untracked files belong with this diff.
     ///
-    /// They do for the working-tree modes, where "what I changed" includes files git has
-    /// never seen -- the case a diff structurally cannot cover. They do not for `staged`
-    /// or an explicit range, where the caller named a specific set of changes and an
-    /// untracked file is not in it.
+    /// They do when the diff's endpoint is the working tree, where "what I changed"
+    /// includes files git has never seen -- the case a diff structurally cannot cover. They
+    /// do not for `staged` or a two-endpoint range, which name a specific set of changes
+    /// that an untracked file is not in.
     fn includes_untracked(&self) -> bool {
-        matches!(self, Self::Auto | Self::Head)
+        self.compares_against_working_tree()
+    }
+
+    /// Whether the files the reviewer can *read* may differ from the diff it was handed.
+    ///
+    /// The reviewer holds a diff and has read access to the live tree. When those are the
+    /// same revision it can trust both; when they are not, it will otherwise reconcile a
+    /// hunk against a file that no longer matches and report the difference as a finding --
+    /// and it is the party least able to check, having neither history nor a shell.
+    ///
+    /// Answered from the porcelain status rather than from the mode alone, because the two
+    /// non-working-tree modes disagree about what counts. For a two-endpoint range anything
+    /// uncommitted is outside the diff. For `staged`, a file that is staged and nothing else
+    /// matches the diff exactly; it is the *worktree* column -- an `MM`, or an untracked
+    /// file -- that means the tree has moved past the index.
+    fn tree_may_differ(&self, status: &str) -> bool {
+        match self {
+            _ if self.compares_against_working_tree() => false,
+            Self::None => false,
+            Self::Staged => status.lines().any(|line| {
+                let cols = line.as_bytes();
+                cols.len() > 1 && (cols[0] == b'?' || (cols[1] != b' ' && cols[1] != b'\r'))
+            }),
+            _ => !status.trim().is_empty(),
+        }
     }
 
     /// Whether this mode can only ever show uncommitted work, which is what the reviewer
@@ -162,12 +295,65 @@ impl DiffMode {
     fn working_tree_only(&self) -> bool {
         matches!(self, Self::Auto | Self::Head | Self::Staged)
     }
+
+    /// What the *caller* is told the capture contains, and what it therefore does not.
+    ///
+    /// The reviewer is shown the exact command line; the caller needs the shape of it, to
+    /// decide what to put in `instructions`. This lives beside `diff_args` on purpose: a
+    /// new mode has to answer here in the same edit that gives it a capture, rather than
+    /// leaving the tool description advertising one that no longer happens. The mismatch
+    /// is not hypothetical -- the description was written for `auto` and kept claiming
+    /// working-tree and untracked-file capture under `--diff staged` and under a range,
+    /// which is the opposite of what those modes do.
+    pub fn caller_summary(&self) -> (String, &'static str) {
+        match self {
+            // Never reached from the tool description, which asks only when a diff is
+            // actually supplied, but answered rather than left to a wildcard.
+            Self::None => (String::new(), ""),
+            Self::Auto | Self::Head => (
+                "the working-tree diff, `git status`, and the contents of untracked files".into(),
+                "Note that the capture covers uncommitted work; if what you want reviewed is \
+                 already committed, say so in 'instructions'.",
+            ),
+            // These two say what is *not* supplied carefully, because `git status` is
+            // captured for every mode: the reviewer is shown that unstaged and untracked
+            // paths exist. It is their content that is missing, and a caller told flatly
+            // that they are "not included" would be surprised by a review that names them.
+            Self::Staged => (
+                "the staged diff (`git diff --cached`) and `git status`".into(),
+                "Note that only staged work is supplied as a diff. `git status` may still \
+                 list unstaged or untracked paths, but their contents are not sent.",
+            ),
+            // A bare revision is *not* the same shape as a range, however alike they look
+            // on the command line: `git diff HEAD~3` diffs that commit against the working
+            // tree, so it carries uncommitted work and needs untracked files with it.
+            Self::Rev(rev) if self.compares_against_working_tree() => (
+                format!(
+                    "`git diff {rev}`, which compares that revision to your **working tree**, \
+                     plus `git status` and the contents of untracked files"
+                ),
+                "Note that this covers everything since that revision, committed or not, so \
+                 you do not need to commit first.",
+            ),
+            Self::Rev(rev) => (
+                format!("`git diff {rev}` and `git status`"),
+                "Note that only that range is supplied as a diff, so commit what you want \
+                 reviewed first. `git status` may still list uncommitted or untracked paths, \
+                 but their contents are not sent.",
+            ),
+        }
+    }
 }
 
 /// A captured change, ready to be rendered into the prompt.
 pub struct Change {
     pub command: String,
     pub working_tree_only: bool,
+    /// The live tree may not be the revision the diff describes. See `tree_may_differ`.
+    pub tree_may_differ: bool,
+    /// Whether `git status` actually ran. When it did not, `tree_may_differ` is an
+    /// assumption rather than an observation, and the reviewer is told which it is.
+    pub tree_state_known: bool,
     pub diff: Section,
     pub status: Section,
     pub untracked: Vec<UntrackedFile>,
@@ -202,25 +388,70 @@ pub struct UntrackedFile {
     pub body: Section,
 }
 
-/// Capture the change under review, or `None` when there is nothing to supply.
+/// The result of trying to capture the change: what was captured, and what the *caller*
+/// has to be told about what was not.
 ///
-/// `None` means the feature is off (`--diff none`), the reviewer can fetch its own diff
-/// (`--diff auto` with a shell), git is unavailable, or the working root is not a git
-/// repository. Those are all normal and silent from the caller's point of view; a git
-/// invocation that fails for some other reason is reported on stderr and skipped, because
-/// a review without a diff is still a review and failing the call would be worse.
+/// The warnings are the point of the struct. A configuration that intends to supply a diff
+/// and then cannot is the one case where silence is dangerous: the review still runs, the
+/// reviewer is honestly told it has no diff, and the calling agent -- which asked for a
+/// review of a change and is told nothing -- reads a review of the current tree as a review
+/// of its branch. `AGENTS.md` makes this the blocking merge gate and tells the caller not to
+/// paste a diff, so the caller cannot be left inferring from silence that the capture
+/// worked. stderr does not reach it; `Outcome::warnings` does.
+#[derive(Default)]
+pub struct Capture {
+    pub change: Option<Change>,
+    pub warnings: Vec<String>,
+}
+
+impl Capture {
+    fn warn(warning: String) -> Self {
+        Self {
+            change: None,
+            warnings: vec![warning],
+        }
+    }
+}
+
+/// Capture the change under review.
+///
+/// `change` is `None` when the feature is off (`--diff none`) or the reviewer can fetch its
+/// own diff (`--diff auto` with a shell) -- both silent, because nothing was promised -- and
+/// when a capture that *was* intended could not be produced, which is warned about instead.
 ///
 /// An *empty* diff is not `None`. A clean tree is a fact the reviewer needs: told nothing,
 /// it reviews the current code and calls that a review of the change.
-pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
+pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
     if !cfg.supplies_diff() {
-        return None;
+        return Capture::default();
     }
     let mode = &cfg.diff;
-    let git = Git::new(&cfg.cwd, cancel)?;
+    let Some(git) = Git::new(&cfg.cwd, cancel) else {
+        return Capture::warn(
+            "git is not on PATH, so the change under review could not be captured and the \
+             reviewer was given no diff. It reviewed the current state of the code instead."
+                .to_string(),
+        );
+    };
 
-    if !git.is_work_tree() {
-        return None;
+    match git.is_work_tree() {
+        Some(true) => {}
+        Some(false) => {
+            return Capture::warn(format!(
+                "{} is not inside a git work tree — a bare repository reports this too — so \
+                 the change under review could not be captured and the reviewer was given no \
+                 diff. It reviewed the current state of the code instead.",
+                cfg.cwd.display()
+            ))
+        }
+        None => {
+            return Capture::warn(
+                "git could not be run to check the working root, so the change under review \
+                 was not captured and the reviewer was given no diff. It reviewed the current \
+                 state of the code instead."
+                    .to_string(),
+            )
+        }
     }
 
     let mut diff_args = vec!["diff"];
@@ -232,28 +463,44 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
             // configured `--diff main...HEAD` and would otherwise get silently nothing.
             // Cancellation is not that -- it kills git on the way out, and reporting the
             // configuration as broken because the caller hung up would be a false lead.
-            if !out.cancelled {
-                eprintln!(
-                    "cross-review: warning: `{}` failed, so no diff was supplied: {}",
-                    mode.command_line(),
-                    first_line(&out.diagnostics())
-                );
+            if out.cancelled {
+                return Capture::default();
             }
-            return None;
+            let reason = first_line(&out.diagnostics());
+            eprintln!(
+                "cross-review: warning: `{}` failed, so no diff was supplied: {reason}",
+                mode.command_line(),
+            );
+            return Capture::warn(format!(
+                "`{}` failed, so the reviewer was given no diff and reviewed the current \
+                 state of the code instead: {reason}",
+                mode.command_line(),
+            ));
         }
-        None => return None,
+        None => {
+            return Capture::warn(format!(
+                "`{}` could not be run to completion, so the reviewer was given no diff and \
+                 reviewed the current state of the code instead.",
+                mode.command_line(),
+            ))
+        }
     };
 
     let mut notes = Vec::new();
 
-    let status = match git.run(&["status", "--porcelain", "--", "."]) {
-        Some(out) if out.success => truncate(out.stdout, MAX_DIFF_BYTES),
+    // Whether the tree agrees with the diff is decided from the status, so a status that
+    // did not run is "unknown", never "clean". Defaulting the other way would suppress the
+    // dirty-tree warning in the one case where nothing else can reveal it -- the reviewer
+    // would hold a committed diff, read a tree that might be a different revision, and be
+    // told only that some command failed.
+    let (status, status_known) = match git.run(&["status", "--porcelain", "--", "."]) {
+        Some(out) if out.success => (truncate(out.stdout, MAX_DIFF_BYTES), true),
         _ => {
             notes.push(
                 "`git status` did not complete, so no status listing is included below."
                     .to_string(),
             );
-            Section::empty()
+            (Section::empty(), false)
         }
     };
 
@@ -263,15 +510,32 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
         (Vec::new(), Vec::new())
     };
 
-    Some(Change {
-        command: mode.command_line(),
-        working_tree_only: mode.working_tree_only(),
-        diff,
-        status,
-        untracked,
-        untracked_omitted,
-        notes,
-    })
+    // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
+    // its review; the caller needs them to know the review it is reading was made on
+    // partial evidence, which it cannot see the prompt to discover for itself.
+    let warnings = notes
+        .iter()
+        .map(|note| format!("The captured change was incomplete: {note}"))
+        .collect();
+
+    Capture {
+        change: Some(Change {
+            command: mode.command_line(),
+            working_tree_only: mode.working_tree_only(),
+            tree_may_differ: if status_known {
+                mode.tree_may_differ(&status.text)
+            } else {
+                !mode.compares_against_working_tree()
+            },
+            tree_state_known: status_known,
+            diff,
+            status,
+            untracked,
+            untracked_omitted,
+            notes,
+        }),
+        warnings,
+    }
 }
 
 /// Render a captured change as the prompt section the reviewer reads.
@@ -322,6 +586,35 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
             );
         }
         out.push('\n');
+    }
+
+    // Outside the status block on purpose. A status that could not be read is exactly when
+    // the reviewer most needs telling that the tree may not be the diff, and it is also
+    // when there is no listing to hang the warning off.
+    //
+    // The instruction is deliberately not "do not report this". A dirty file can contain a
+    // real defect, and the preamble tells the reviewer not to soften one; what is wanted is
+    // correct attribution, not silence.
+    if change.tree_may_differ {
+        // Heading and opening sentence are written together, in one branch, because they
+        // make the same claim at two strengths: a definite heading over an "unknown" body
+        // is exactly the drift this section keeps closing elsewhere, and the heading is the
+        // part a reviewer skims and quotes back. Splitting them into adjacent `if`s on the
+        // same flag is one careless edit away from that.
+        out.push_str(if change.tree_state_known {
+            "### The tree you can read is not the diff above\n\n\
+             The working tree has changes that are **not** in the diff above. "
+        } else {
+            "### The tree you can read may not be the diff above\n\n\
+             `git status` did not complete, so whether the working tree matches the diff \
+             above is **unknown** -- treat it as though it does not. "
+        });
+        out.push_str(
+            "The diff describes one revision; any file you read reflects the current tree, \
+             which may be a different one. Do not report a mismatch between them as a defect \
+             in the change: attribute it to the tree, name the paths you could not account \
+             for, and say so if one of them looks like a problem in its own right.\n\n",
+        );
     }
 
     if !change.status.text.trim().is_empty() {
@@ -463,11 +756,13 @@ impl<'a> Git<'a> {
     /// Answered by git rather than by looking for a `.git` entry, because a worktree
     /// checkout and a submodule both have a `.git` *file*, and a subdirectory of a
     /// repository has neither.
-    fn is_work_tree(&self) -> bool {
-        match self.run(&["rev-parse", "--is-inside-work-tree"]) {
-            Some(out) => out.success && out.stdout.trim() == "true",
-            None => false,
-        }
+    /// `None` means the question could not be *asked* -- git would not run, or the budget
+    /// was gone -- which is not the same answer as "no". It used to collapse into `false`
+    /// and cost only a silent skip; now that the caller is told why no diff arrived, the
+    /// difference is a confident wrong diagnosis pointing at a repository that is fine.
+    fn is_work_tree(&self) -> Option<bool> {
+        let out = self.run(&["rev-parse", "--is-inside-work-tree"])?;
+        Some(out.success && out.stdout.trim() == "true")
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
@@ -908,12 +1203,179 @@ mod tests {
         Change {
             command: "git diff HEAD".into(),
             working_tree_only: true,
+            tree_may_differ: false,
+            tree_state_known: true,
             diff: Section::empty(),
             status: Section::empty(),
             untracked: Vec::new(),
             untracked_omitted: Vec::new(),
             notes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_dirty_tree_under_a_range_is_flagged_to_the_reviewer_as_a_second_revision() {
+        // The reviewer holds a committed diff and can read the live files. Told nothing,
+        // it reconciles the two and reports the difference as a finding -- and it is the
+        // party that cannot check, having neither the commit history nor a shell.
+        let mut change = change_fixture();
+        change.working_tree_only = false;
+        change.tree_may_differ = true;
+        change.command = "git diff main...HEAD".into();
+        change.status = Section {
+            text: " M src/main.rs\n".into(),
+            truncated: false,
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("not** in the diff above"), "{text}");
+        assert!(text.contains("a different one"), "{text}");
+
+        change.tree_may_differ = false;
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(!text.contains("not** in the diff above"), "{text}");
+    }
+
+    /// Which modes can put the reviewer out of step with the tree it can read.
+    ///
+    /// The mode alone is not enough, and the two that need a status are the two that were
+    /// wrong: `staged` matches the tree exactly when everything staged is all there is, and
+    /// a bare revision diffs against the working tree, so it never disagrees with it.
+    #[test]
+    fn only_a_diff_that_is_not_the_live_tree_warns_about_the_live_tree() {
+        let dirty = " M src/main.rs\n";
+        let staged_only = "M  src/main.rs\n";
+        let staged_then_edited = "MM src/main.rs\n";
+        let untracked = "?? notes.txt\n";
+
+        // A two-endpoint range: anything uncommitted at all is outside the diff.
+        let range = DiffMode::Rev("main...HEAD".into());
+        assert!(range.tree_may_differ(dirty));
+        assert!(range.tree_may_differ(staged_only));
+        assert!(!range.tree_may_differ(""));
+
+        // `staged`: the index *is* the diff, so a purely staged tree matches it. It is the
+        // worktree column, or an untracked file, that means the tree has moved past it.
+        let staged = DiffMode::Staged;
+        assert!(!staged.tree_may_differ(staged_only));
+        assert!(staged.tree_may_differ(staged_then_edited));
+        assert!(staged.tree_may_differ(dirty));
+        assert!(staged.tree_may_differ(untracked));
+
+        // The working-tree modes and a bare revision all diff *against* the tree.
+        for mode in [
+            DiffMode::Auto,
+            DiffMode::Head,
+            DiffMode::Rev("HEAD~3".into()),
+            DiffMode::Rev("main".into()),
+        ] {
+            assert!(!mode.tree_may_differ(dirty), "{mode:?}");
+            assert!(!mode.tree_may_differ(untracked), "{mode:?}");
+        }
+    }
+
+    /// A bare revision carries uncommitted work, so it needs untracked files with it for
+    /// the same reason `HEAD` does; a two-endpoint range named a set that excludes them.
+    /// `^!` is a range with no dots in it, so the dotted test cannot see it. Verified
+    /// against real git: with a tracked file dirty, `git diff HEAD^!` reported 5 files and
+    /// `git diff HEAD~1` reported 6. Refused rather than guessed at, since guessing wrong
+    /// silently changes what the reviewer is shown and what the caller is told.
+    #[test]
+    fn revision_set_shorthand_is_refused_rather_than_misclassified() {
+        for spec in ["HEAD^!", "HEAD^@", "HEAD^-", "HEAD^-2", "main^!"] {
+            let err = DiffMode::parse(spec).unwrap_err();
+            assert!(err.contains("revision-set shorthand"), "{spec}: {err}");
+            assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+        }
+
+        // A commit-message search can be a range's *left* endpoint, and git splits on the
+        // first `..`, so `:/fix..HEAD` is a range while `:/fix..bug` is not a distinction
+        // this can make. Verified: `git rev-parse ':/fix..HEAD'` returned two endpoints,
+        // and `git diff ':/fix..HEAD'` ignored a dirty file that `git diff ':/fix'` picked
+        // up -- so guessing "single revision" would ship untracked contents as part of a
+        // commit-to-commit change.
+        for spec in [":/fix..HEAD", ":/fix..bug", ":/a..b"] {
+            let err = DiffMode::parse(spec).unwrap_err();
+            assert!(err.contains("ambiguous"), "{spec}: {err}");
+            assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+
+            // And the classifier answers safely on its own, rather than relying on having
+            // been called after `parse`. `DiffMode::Rev` is directly constructible, so an
+            // invariant held only by call ordering is one edit from being untrue: this
+            // withholds untracked contents and keeps the dirty-tree warning on.
+            let unchecked = DiffMode::Rev(spec.to_string());
+            assert!(!unchecked.compares_against_working_tree(), "{spec}");
+            assert!(!unchecked.includes_untracked(), "{spec}");
+            assert!(unchecked.tree_may_differ(" M src/main.rs\n"), "{spec}");
+        }
+
+        // Terminal only. These characters are ordinary inside a revision: `:/^!release`
+        // selects a commit by message and compares against the working tree like any other
+        // single revision, so refusing it would be refusing something that is not the form.
+        for spec in [":/^!release", ":/^-fix", "HEAD^{/^!release}"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(mode.compares_against_working_tree(), "{spec}");
+        }
+
+        // Parent notation is not revision-set syntax and stays legal: these are single
+        // revisions, and behave exactly like `HEAD~1` and `HEAD~2`.
+        for spec in ["HEAD^", "HEAD^^", "main^"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(mode.compares_against_working_tree(), "{spec}");
+        }
+    }
+
+    /// The mirror of the `^!` case: `..` is a range operator most of the time and ordinary
+    /// text the rest of it. Reading a commit-message search as a range would drop untracked
+    /// capture and raise a dirty-tree warning that is false.
+    ///
+    /// `:/…` with dots is refused at parse time *and* classified as a range if it reaches
+    /// the classifier anyway — see the parse test — because git splits it on the first `..`
+    /// and the two readings are not distinguishable. Scoped searches are unambiguous,
+    /// because the braces say where the pattern ends.
+    #[test]
+    fn a_dotted_commit_message_search_is_not_a_range() {
+        for spec in ["HEAD^{/a..b}", "main^{/fix..bug}"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(mode.compares_against_working_tree(), "{spec}");
+            assert!(mode.includes_untracked(), "{spec}");
+            assert!(!mode.tree_may_differ(" M src/main.rs\n"), "{spec}");
+        }
+
+        for spec in ["main...HEAD", "main..HEAD", "HEAD~3..HEAD"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(!mode.compares_against_working_tree(), "{spec}");
+        }
+    }
+
+    /// A status that did not run means the tree's state is unknown, and unknown must not
+    /// collapse into clean: that is the one path where nothing else can reveal that the
+    /// reviewer is reading a different revision from the one it was handed.
+    #[test]
+    fn an_unreadable_status_is_treated_as_a_tree_that_may_have_moved() {
+        let mut change = change_fixture();
+        change.command = "git diff main...HEAD".into();
+        change.working_tree_only = false;
+        change.tree_may_differ = true;
+        change.tree_state_known = false;
+        change.status = Section::empty();
+
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("**unknown**"), "{text}");
+        assert!(text.contains("as though it does not"), "{text}");
+
+        // And it is attribution that is asked for, not silence -- the preamble tells the
+        // reviewer not to soften a real defect, so this must not tell it to drop one.
+        assert!(text.contains("in its own right"), "{text}");
+        assert!(!text.contains("Do not treat a mismatch"), "{text}");
+    }
+
+    #[test]
+    fn untracked_files_follow_the_diffs_endpoint_not_the_keyword() {
+        assert!(DiffMode::Rev("HEAD~3".into()).includes_untracked());
+        assert!(DiffMode::Head.includes_untracked());
+        assert!(!DiffMode::Rev("main...HEAD".into()).includes_untracked());
+        assert!(!DiffMode::Rev("main..HEAD".into()).includes_untracked());
+        assert!(!DiffMode::Staged.includes_untracked());
     }
 
     #[test]
@@ -944,6 +1406,8 @@ mod tests {
         let change = Change {
             command: "git diff HEAD".into(),
             working_tree_only: true,
+            tree_may_differ: false,
+            tree_state_known: true,
             diff: Section {
                 text: "+something".into(),
                 truncated: true,
@@ -1026,7 +1490,7 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
 
         assert!(
             change.diff.text.contains("-original"),
@@ -1064,7 +1528,7 @@ mod tests {
         };
         // `--diff staged` against a tree with nothing staged.
         let cfg = config_for(&dir, DiffMode::Staged);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
         assert!(change.diff.text.trim().is_empty(), "{}", change.diff.text);
         // Untracked files do not belong with a staged diff.
         assert!(change.untracked.is_empty());
@@ -1081,14 +1545,87 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Rev("no-such-branch".into()));
-        assert!(capture(&cfg, &idle()).is_none());
+        let capture = capture(&cfg, &idle());
+        assert!(capture.change.is_none());
+
+        // Reported to the *caller*, not only to stderr. The review still runs, so nothing
+        // fails; without this the calling agent reads a review of the current tree as a
+        // review of the range it configured, which is the silent degradation the whole
+        // module exists to prevent.
+        assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
+        let warning = &capture.warnings[0];
+        assert!(warning.contains("no-such-branch"), "{warning}");
+        assert!(warning.contains("no diff"), "{warning}");
     }
 
     #[test]
-    fn capture_skips_a_directory_that_is_not_a_repository() {
+    fn a_directory_that_is_not_a_repository_warns_the_caller() {
         let dir = temp_dir();
         let cfg = config_for(&dir, DiffMode::Head);
-        assert!(capture(&cfg, &idle()).is_none());
+        let capture = capture(&cfg, &idle());
+        assert!(capture.change.is_none());
+        assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
+        assert!(capture.warnings[0].contains("not inside a git work tree"));
+    }
+
+    /// Against real git, not against our beliefs about it.
+    ///
+    /// The distinction this rests on is git's, and it is easy to state backwards: a bare
+    /// `git diff <rev>` has the working tree as its second endpoint, so it carries
+    /// uncommitted edits, while `<rev>...HEAD` compares two commits and cannot.
+    #[test]
+    fn a_bare_revision_captures_uncommitted_work_and_a_range_does_not() {
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        // `repo_with_a_change` leaves tracked.txt modified but uncommitted, and HEAD is the
+        // only commit, so both specs below have the same commit-to-commit content: none.
+        let bare = capture(&config_for(&dir, DiffMode::Rev("HEAD".into())), &idle())
+            .change
+            .expect("a change");
+        assert!(
+            bare.diff.text.contains("modified"),
+            "a bare revision should carry the uncommitted edit: {}",
+            bare.diff.text
+        );
+        assert!(
+            bare.untracked.iter().any(|f| f.path.contains("untracked")),
+            "and the untracked file with it"
+        );
+        assert!(!bare.tree_may_differ);
+
+        let ranged = capture(
+            &config_for(&dir, DiffMode::Rev("HEAD..HEAD".into())),
+            &idle(),
+        )
+        .change
+        .expect("a change");
+        assert!(
+            ranged.diff.text.trim().is_empty(),
+            "a two-endpoint range must not see the working tree: {}",
+            ranged.diff.text
+        );
+        assert!(ranged.untracked.is_empty());
+        assert!(
+            ranged.tree_may_differ,
+            "and the reviewer must be told the tree it can read is not that revision"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_was_never_configured_warns_about_nothing() {
+        // The two silent cases have to stay silent: nothing was promised, so a warning
+        // would be noise on every single call.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+            .warnings
+            .is_empty());
+
+        let mut cfg = config_for(&dir, DiffMode::Auto);
+        cfg.tools = "Read,Grep,Glob,Bash".to_string();
+        assert!(capture(&cfg, &idle()).warnings.is_empty());
     }
 
     #[test]
@@ -1096,12 +1633,16 @@ mod tests {
         let Some(dir) = repo_with_a_change() else {
             return;
         };
-        assert!(capture(&config_for(&dir, DiffMode::None), &idle()).is_none());
+        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+            .change
+            .is_none());
 
-        // Auto plus a reviewer that has its own shell: ours would be redundant.
+        // Auto plus a reviewer that has its own shell: ours would be redundant. Bash has
+        // to be permitted as well as present, or it has no usable shell and does need ours.
         let mut cfg = config_for(&dir, DiffMode::Auto);
         cfg.tools = "Read,Grep,Glob,Bash".to_string();
-        assert!(capture(&cfg, &idle()).is_none());
+        cfg.allowed_tools = vec!["Read Grep Glob Bash(git diff:*)".to_string()];
+        assert!(capture(&cfg, &idle()).change.is_none());
     }
 
     #[test]
@@ -1133,7 +1674,7 @@ mod tests {
         }
 
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
 
         for file in &change.untracked {
             assert!(
