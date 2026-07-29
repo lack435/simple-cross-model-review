@@ -218,7 +218,7 @@ Notes on the edges, because they are where this would otherwise mislead:
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
   with a reviewer that has its own shell, so those stay silent.
 
-  A capture that ran but was **bounded** warns too, and the line is scope. If the untracked
+  A **capture-level** bound warns too, and that qualifier is the whole of the rule. If the untracked
   listing stopped early — at either the included cap or the examined one — or files were
   dropped because the total content cap ran out, the caller is told, because that is the one
   thing it cannot infer from what came back: a review made against a listing that stopped at
@@ -228,10 +228,12 @@ Notes on the edges, because they are where this would otherwise mislead:
   report the tree as differing from the diff. Neither fires on an ordinary call — it takes
   400 KB of diff or of status to reach them.
 
-  The per-file omission notes — this file is binary, unreadable, resolves outside the root —
-  stay in the prompt only. That is a policy judgement rather than a claim about the code:
-  they describe files the listing did reach, so the reviewer has their shape, and keeping
-  them out is what makes a warning mean the capture itself was short.
+  What is bounded *per file* stays in the prompt only: the omission notes — this file is
+  binary, unreadable, resolves outside the root — and an untracked file cut short at the
+  60 KB cap or at what was left of the total, which is marked where its contents are shown
+  and nowhere else. That is a policy judgement rather than a claim about the code: those
+  files were all reached by the listing, so the reviewer has their shape, and keeping them
+  out of the warnings is what makes a warning mean the capture itself was short.
 
 ## Re-reviewing after you act on feedback
 
