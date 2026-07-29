@@ -569,10 +569,12 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
     }
 }
 
-/// One caller-facing warning, phrased the one way.
+/// One warning about a capture that ran and came back short, phrased the one way.
 ///
-/// Every shortfall reaches the caller through here, so a new one cannot arrive wearing a
-/// different form of words that an agent scanning the response has to recognise afresh.
+/// Every *incomplete* capture reaches the caller through here, so a new shortfall cannot
+/// arrive wearing a different form of words that an agent scanning the response has to
+/// recognise afresh. A capture that did not happen at all is a different claim and says so
+/// in its own words -- see `Capture::warn`, which is where those go.
 fn incomplete(note: &str) -> String {
     format!("The captured change was incomplete: {note}")
 }
