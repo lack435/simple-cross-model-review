@@ -73,6 +73,12 @@ impl App {
         &self.cfg
     }
 
+    /// Release anything parked in a long poll: stdin has closed and the process is on its
+    /// way out, so a waiter's remaining budget is time nobody is waiting for.
+    pub fn begin_shutdown(&self) {
+        self.registry.begin_shutdown();
+    }
+
     /// Register reviews without a reviewer CLI, so the cancellation paths can be tested
     /// without spending a model call.
     #[cfg(test)]
@@ -315,16 +321,32 @@ impl App {
     }
 
     fn render_running(&self, snapshot: &Snapshot, waited: u64) -> String {
+        // Two different reasons to be looking at a running review, and inviting a retry is
+        // only right for one of them. A wait ended by shutdown will get no second call:
+        // the process is exiting and review ids do not survive it, so saying "call again"
+        // would be advice the caller cannot act on.
+        let next = if snapshot.shutting_down {
+            "This server's stdin has closed, so it is shutting down and this wait ended \
+             early. The review will not be delivered, and its review_id does not survive \
+             the server process.\n\n\
+             Do not proceed as though the review had come back. Start a new review once the \
+             server is running again."
+                .to_string()
+        } else {
+            format!(
+                "The reviewer is still working. This call waited {waited}s. Call \
+                 cross_model_review_result again with the same review_id to keep waiting.\n\n\
+                 Do not start a second review for this session, and do not proceed as though \
+                 the review had come back."
+            )
+        };
         format!(
             "status:    {}\n\
              review_id: {}\n\
              session:   {} (turn {})\n\
              reviewer:  {}\n\
              elapsed:   {}s of a {}s budget\n\n\
-             The reviewer is still working. This call waited {waited}s. Call \
-             cross_model_review_result again with the same review_id to keep waiting.\n\n\
-             Do not start a second review for this session, and do not proceed as though the \
-             review had come back.\n",
+             {next}\n",
             snapshot.status.as_str(),
             snapshot.id,
             snapshot.session,
@@ -1011,6 +1033,38 @@ mod tests {
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
         // Bound to the request, so a cancellation arriving now knows what to stop.
         assert_eq!(request.cancel().as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn shutdown_ends_a_long_poll_and_says_why() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = Arc::new(App::new(cfg));
+        let (id, _cancel) = app.registry.try_start("default", 1, false).expect("start");
+
+        // A budget far longer than this test needs, so only the shutdown can end the poll
+        // in time for the assertions below to hold.
+        let poller = {
+            let app = Arc::clone(&app);
+            let args = json!({"review_id": id, "wait_seconds": 30});
+            std::thread::spawn(move || app.review_result(&args, &RequestCancel::new()))
+        };
+
+        let started = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(100));
+        app.begin_shutdown();
+
+        let out = poller.join().expect("poller").expect("still running");
+        // Timed as well as read: a snapshot taken at the deadline would carry the same
+        // shutdown text, so only the elapsed time distinguishes a woken poll from one that
+        // sat out its full budget.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown did not end the poll"
+        );
+        assert!(out.contains("status:    running"));
+        // The caller must not be told to call again: nothing will be there to answer.
+        assert!(out.contains("shutting down"));
+        assert!(!out.contains("Call cross_model_review_result again"));
     }
 
     #[test]

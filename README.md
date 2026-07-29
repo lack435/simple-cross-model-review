@@ -518,5 +518,16 @@ Both directions pass against live CLIs.
   Cancelling the review is also what ends the poll: the worker sees the flag within
   100 ms, and the terminal state it records wakes the waiter. Promptly, not instantly —
   a worker already past the child and writing session state finishes that first — but
-  bounded, so a suppressed response does not park a handler thread until shutdown.
+  bounded, so a suppressed response does not park a handler thread.
+- **Closing stdin ends a long poll immediately.** `serve` joins every in-flight `tools/call`
+  before returning, because exiting mid-flight dropped responses a client was still waiting
+  on. A poll parked on a review has no deadline worth honouring once the client is gone, so
+  stdin closure sets a shutdown flag that waiters observe alongside their own deadline —
+  otherwise a `wait_seconds: 300` call held the process open for the rest of the five
+  minutes and then wrote to a stdout nobody was reading. The flag is published under the
+  same mutex the condition variable uses; set outside it, a waiter that had read it but not
+  yet parked would miss the wake and sleep out its budget regardless. A review that reaches
+  a terminal state in that same moment still returns its result rather than a running
+  snapshot, and a poll cut short says the server is shutting down instead of inviting a
+  retry that nothing will answer.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

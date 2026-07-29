@@ -111,6 +111,11 @@ pub fn serve(app: Arc<App>) {
         }
     }
 
+    // Before the join, not after: a `cross_model_review_result` parked in `Registry::wait`
+    // has no other way to learn stdin has closed, so a 300s budget would hold the join
+    // below for the rest of it and then write to a stdout nobody is reading.
+    app.begin_shutdown();
+
     let unfinished = in_flight.iter().filter(|h| !h.is_finished()).count();
     if unfinished > 0 {
         eprintln!("cross-review: stdin closed, finishing {unfinished} in-flight tool call(s)");

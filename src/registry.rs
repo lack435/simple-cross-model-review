@@ -132,6 +132,13 @@ struct State {
     /// on that would place it oldest at the very moment it finished, and the sweep
     /// triggered by its own `finish` could evict it before its caller could collect it.
     finishes: u64,
+    /// Set once stdin has closed and the process is on its way out. Waiters observe it
+    /// alongside their own deadline, so shutdown does not have to outlast a long poll.
+    ///
+    /// It lives in here rather than beside the condvar as an `AtomicBool` so that it
+    /// cannot be touched without the lock — which is what makes it race-free, not its
+    /// atomicity. See `begin_shutdown`.
+    shutdown: bool,
 }
 
 impl State {
@@ -329,19 +336,45 @@ impl Registry {
         }
     }
 
-    /// Block until this review leaves `Running`, or until `timeout` elapses.
-    /// Returns a snapshot either way.
+    /// Tell parked waiters that the process is going away, so `serve` can join their
+    /// handler threads instead of waiting out their deadlines.
+    ///
+    /// The flag is set under the same lock the condition variable waits on, and released
+    /// before the notify. Setting it outside that lock would reintroduce the stall this
+    /// exists to remove: a waiter that had read the flag but not yet reached `wait_timeout`
+    /// still holds the lock, so a `notify_all` from here would land before it joined the
+    /// wait set, be lost, and leave it sleeping out its full remaining budget anyway.
+    /// Keeping the flag inside `State` is what makes that ordering the only spelling
+    /// available.
+    pub fn begin_shutdown(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.shutdown = true;
+        drop(guard);
+        self.changed.notify_all();
+    }
+
+    /// Block until this review leaves `Running`, until `timeout` elapses, or until
+    /// shutdown begins. Returns a snapshot in every case.
     pub fn wait(&self, id: &str, timeout: Duration) -> Option<Snapshot> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            // Copied out per iteration, not hoisted: it lives under this lock, and
+            // `begin_shutdown` needs the lock to set it, so re-reading it here is what
+            // makes a shutdown that lands mid-wait visible on the next wake.
+            let shutting_down = guard.shutdown;
             let review = guard.reviews.get(id)?;
             if review.status != Status::Running {
-                return Some(Snapshot::of(review));
+                return Some(Snapshot::of(review, shutting_down));
+            }
+            // Tested after the terminal state above, so a review that landed in the same
+            // moment stdin closed is still returned as the result it is.
+            if shutting_down {
+                return Some(Snapshot::of(review, shutting_down));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Some(Snapshot::of(review));
+                return Some(Snapshot::of(review, shutting_down));
             }
             let (next, _) = self
                 .changed
@@ -366,10 +399,14 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     pub resumable: bool,
     pub elapsed: Duration,
+    /// The server had begun shutting down when this was taken. A `Running` snapshot with
+    /// this set means the wait was cut short, not that the caller's budget ran out — and
+    /// that no later call can collect the review, because the process is exiting.
+    pub shutting_down: bool,
 }
 
 impl Snapshot {
-    fn of(review: &Review) -> Self {
+    fn of(review: &Review, shutting_down: bool) -> Self {
         Self {
             id: review.id.clone(),
             session: review.session.clone(),
@@ -382,6 +419,7 @@ impl Snapshot {
             warnings: review.warnings.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
+            shutting_down,
         }
     }
 }
@@ -677,6 +715,67 @@ mod tests {
             .wait(&id, Duration::from_millis(50))
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
+    }
+
+    #[test]
+    fn shutdown_wakes_a_parked_waiter() {
+        // The regression: `serve` joins in-flight handlers, so a poll parked here with a
+        // 300s budget used to hold the process open for the rest of it after stdin closed.
+        let registry = Arc::new(Registry::new());
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+
+        let closer = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                registry.begin_shutdown();
+            })
+        };
+
+        // Long enough that only the shutdown can plausibly end it, short enough that a
+        // regression fails on the assertion below rather than stalling CI for minutes.
+        let started = Instant::now();
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        closer.join().expect("closer");
+        assert_eq!(snapshot.status, Status::Running);
+        assert!(snapshot.shutting_down);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown did not end the wait"
+        );
+    }
+
+    #[test]
+    fn a_wait_begun_after_shutdown_does_not_park_at_all() {
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.begin_shutdown();
+
+        let started = Instant::now();
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        assert_eq!(snapshot.status, Status::Running);
+        assert!(snapshot.shutting_down);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_review_that_finished_is_still_returned_during_shutdown() {
+        // Ordering inside `wait`: a review completing in the same moment stdin closes must
+        // hand back its text, not a running snapshot that discards it.
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.begin_shutdown();
+        registry.finish(&id, Outcome::completed("just in time"));
+
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        assert_eq!(snapshot.status, Status::Completed);
+        assert_eq!(snapshot.review.as_deref(), Some("just in time"));
     }
 
     #[test]
