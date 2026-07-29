@@ -45,12 +45,16 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
     distinguishes that from a large PR, so the check is yours to make:
 
     ```powershell
-    git fetch origin
-    git merge-base --is-ancestor main origin/main; if ($?) { git branch -f main origin/main } else { "local main has diverged - stop" }
+    git fetch origin; if (-not $?) { throw "fetch failed - origin/main may be stale, stop" }
+    git merge-base --is-ancestor main origin/main; if (-not $?) { throw "local main has diverged - stop" }
+    git branch -f main origin/main
     ```
 
-    The guard matters: `git branch -f` on a diverged `main` discards the local tip rather
-    than fast-forwarding. If it reports divergence, sort that out before reviewing.
+    Both guards matter, and neither is theoretical. A failed `fetch` leaves `origin/main` at
+    whatever it was last time, so the ancestor check passes against a stale ref and reports
+    everything as current — the exact failure the preflight exists to catch, wearing the
+    costume of a passing check. And `git branch -f` on a diverged `main` discards the local
+    tip rather than refusing.
   - **If your PR is not based on `main`, this entry cannot gate it.** The base is pinned in
     the server arguments, so a review of `main...HEAD` on a stacked branch takes in the PR
     underneath as well and would pass the gate without the PR's own diff ever being reviewed

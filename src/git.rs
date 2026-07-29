@@ -83,6 +83,23 @@ impl DiffMode {
                  auto, none, staged, HEAD, or a revision range such as 'main...HEAD'."
             ));
         }
+        // Revision-*set* shorthand is refused rather than guessed at. Whether a spec is a
+        // two-endpoint range decides three things -- untracked capture, the dirty-tree
+        // warning, and what the caller is told -- and `^!`, `^@` and `^-` are ranges that
+        // contain no `..` to see. Verified: with a tracked file dirty, `git diff HEAD^!`
+        // reported 5 files and `git diff HEAD~1` reported 6, so misreading one as the other
+        // is not cosmetic. Bare `^` and `~` parent notation stays legal: `HEAD^` is a single
+        // revision and behaves like `HEAD~1`.
+        if let Some(found) = ["^!", "^@", "^-"]
+            .iter()
+            .find(|set| trimmed.contains(**set))
+        {
+            return Err(format!(
+                "--diff '{trimmed}' uses git's revision-set shorthand ('{found}'), which cannot \
+                 be told apart from a working-tree comparison without asking git. Pass an \
+                 explicit two-endpoint range instead, such as 'HEAD~1..HEAD'."
+            ));
+        }
         // Keyword match is case-insensitive, which means a branch or tag literally named
         // `auto`, `none`, `off`, `staged`, `cached` or `head` cannot be passed here. Live
         // with it: those are not plausible branch names, and spelling the keywords
@@ -155,6 +172,10 @@ impl DiffMode {
     /// documented and tested here as a revision -- picks up uncommitted edits, while
     /// `main...HEAD` does not. Verified: with one tracked file dirty, `git diff HEAD~3`
     /// gained a file and a line and `git diff main...HEAD` did not.
+    ///
+    /// The dotted test is sufficient only because `parse` has already refused the other
+    /// two-endpoint spellings (`^!`, `^@`, `^-`), which carry no dots to detect. Anything
+    /// reaching here without `..` really is a single revision.
     fn compares_against_working_tree(&self) -> bool {
         match self {
             Self::Auto | Self::Head => true,
@@ -1137,6 +1158,26 @@ mod tests {
 
     /// A bare revision carries uncommitted work, so it needs untracked files with it for
     /// the same reason `HEAD` does; a two-endpoint range named a set that excludes them.
+    /// `^!` is a range with no dots in it, so the dotted test cannot see it. Verified
+    /// against real git: with a tracked file dirty, `git diff HEAD^!` reported 5 files and
+    /// `git diff HEAD~1` reported 6. Refused rather than guessed at, since guessing wrong
+    /// silently changes what the reviewer is shown and what the caller is told.
+    #[test]
+    fn revision_set_shorthand_is_refused_rather_than_misclassified() {
+        for spec in ["HEAD^!", "HEAD^@", "HEAD^-", "main^!"] {
+            let err = DiffMode::parse(spec).unwrap_err();
+            assert!(err.contains("revision-set shorthand"), "{spec}: {err}");
+            assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+        }
+
+        // Parent notation is not revision-set syntax and stays legal: these are single
+        // revisions, and behave exactly like `HEAD~1` and `HEAD~2`.
+        for spec in ["HEAD^", "HEAD^^", "main^"] {
+            let mode = DiffMode::parse(spec).expect(spec);
+            assert!(mode.compares_against_working_tree(), "{spec}");
+        }
+    }
+
     #[test]
     fn untracked_files_follow_the_diffs_endpoint_not_the_keyword() {
         assert!(DiffMode::Rev("HEAD~3".into()).includes_untracked());

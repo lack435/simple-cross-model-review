@@ -157,11 +157,13 @@ Notes on the edges, because they are where this would otherwise mislead:
   a stand-in `git.exe` next to the caller was run in preference to the real git; one in the
   child's working directory was not. So a committed `tools\git.exe` would otherwise have
   executed as you.
-- **Untracked files ride with the working-tree modes only** (`auto`, `HEAD`). They are the
-  case a diff structurally cannot cover, so a working-tree review needs them; a `staged`
-  diff or an explicit range named a specific set of changes, and an untracked file is not
-  in either. An untracked symlink or junction resolving outside the working root is skipped
-  and reported, so this cannot route around the reviewer's read confinement.
+- **Untracked files ride with every mode whose diff endpoint is the working tree** — `auto`,
+  `HEAD`, and a bare revision such as `HEAD~3`, which is why that row of the table differs
+  from the range above it. They are the case a diff structurally cannot cover, so a review
+  against the tree needs them; a `staged` diff or a two-endpoint range named a specific set
+  of changes, and an untracked file is not in either. An untracked symlink or junction
+  resolving outside the working root is skipped and reported, so this cannot route around
+  the reviewer's read confinement.
 - **An empty diff is still reported**, explicitly, as an empty diff — and, for the
   working-tree modes, with the reason it might be empty. A reviewer told nothing reviews
   the current code and calls that a review of the change; a reviewer told only "empty"
@@ -178,7 +180,11 @@ Notes on the edges, because they are where this would otherwise mislead:
   untracked *filenames* are stripped of backticks and control characters before they are
   interpolated into a heading.
 - **A `--diff` value can never become a git option.** Anything starting with `-` is
-  rejected at startup, because `git diff --output=<file>` writes.
+  rejected at startup, because `git diff --output=<file>` writes. Git's revision-*set*
+  shorthand — `^!`, `^@`, `^-` — is rejected there too: those are two-endpoint ranges
+  containing no `..` to detect, so they would be read as working-tree comparisons and change
+  what the reviewer is shown. Verified: with a tracked file dirty, `git diff HEAD^!` reported
+  5 files and `git diff HEAD~1` reported 6. Parent notation (`HEAD^`, `HEAD^^`) is untouched.
 - **The whole capture shares a 60-second budget**, not one timeout per command, so a wedged
   repository cannot spend four independent timeouts. The budget bounds the git commands
   themselves; each invocation can additionally spend up to the 10-second output drain grace
@@ -396,7 +402,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 162 unit tests: no network, no model calls
+cargo test          # 163 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
