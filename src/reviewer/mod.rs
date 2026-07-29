@@ -560,18 +560,50 @@ mod drain_tests {
         assert!(collected.truncated);
     }
 
+    /// A reader that records how many bytes were actually taken from it.
+    struct Counting {
+        remaining: usize,
+        taken: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            self.taken.fetch_add(n, Ordering::SeqCst);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
     #[test]
     fn the_whole_pipe_is_still_consumed_after_the_cap() {
         // The reader must keep reading and discard, not stop: a reader that stopped would
         // fill the pipe and block the child for ever, trading unbounded memory for a hung
-        // review. Reaching EOF is what proves it kept going -- `done` is only set when the
-        // read loop ends.
-        let drain = drain(std::io::Cursor::new(vec![b'x'; MAX_OUTPUT_BYTES * 2]));
-        let collected = collect(&drain, Instant::now() + Duration::from_secs(5));
+        // review.
+        //
+        // Asserted by counting bytes taken from the source, not by checking `done`. `done`
+        // is set whenever the read loop exits, so it is also set by a `break` at the cap --
+        // which is precisely the regression this test exists to catch, and which it would
+        // therefore have passed.
+        let source = MAX_OUTPUT_BYTES * 2;
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain = drain(Counting {
+            remaining: source,
+            taken: Arc::clone(&taken),
+        });
+        let collected = collect(&drain, Instant::now() + Duration::from_secs(10));
+
         assert!(collected.truncated);
-        assert!(
-            drain.done.load(Ordering::SeqCst),
-            "reader stopped at the cap instead of draining to EOF"
+        assert_eq!(
+            collected.text.len(),
+            MAX_OUTPUT_BYTES,
+            "buffer exceeded the cap"
+        );
+        assert_eq!(
+            taken.load(Ordering::SeqCst),
+            source,
+            "the reader stopped at the cap instead of draining the pipe"
         );
     }
 

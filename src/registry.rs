@@ -4,7 +4,7 @@
 //! `cross_model_review_result` long-polls here, so the calling agent waits on a
 //! condition variable instead of burning turns on a retry loop.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -23,13 +23,6 @@ pub const MAX_TERMINAL_PER_SESSION: usize = 3;
 /// caller and a caller that invents a new one each time would otherwise accumulate one
 /// review per name for ever.
 pub const MAX_TERMINAL_TOTAL: usize = 50;
-
-/// Reviews remembered after eviction: their id and session name, nothing else.
-///
-/// Bounded and tiny, because none of the review itself is kept. It exists because "this
-/// was evicted" and "this never existed" call for different advice, and a caller told the
-/// wrong one may go looking for a bug in how it stored the id.
-const MAX_REMEMBERED_EVICTIONS: usize = 500;
 
 /// What the registry knows about an id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -79,9 +72,9 @@ pub struct Review {
     pub started: Instant,
     pub finished: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
-    /// Order in which this process issued the review. Breaks eviction ties that the
-    /// finish time cannot: two reviews can finish inside the same `Instant` tick.
-    seq: u64,
+    /// Order in which this process finished the review, or 0 while it is still running.
+    /// Assigned under the registry lock; see `State::finishes`.
+    finish_seq: u64,
 }
 
 impl Review {
@@ -125,14 +118,30 @@ impl Outcome {
 
 /// Everything the registry mutates, under one lock.
 ///
-/// The evicted-id list lives here rather than beside it so that dropping a review and
-/// recording that it was dropped cannot be observed half-done: a poll landing between the
-/// two would otherwise be told the id never existed.
+/// The evicted-session set lives here rather than beside it so that dropping a review and
+/// recording that its session lost one cannot be observed half-done: a poll landing
+/// between the two would otherwise be told no review was ever started.
 #[derive(Default)]
 struct State {
     reviews: HashMap<String, Review>,
-    /// Id and session of each evicted review, newest last.
-    evicted: VecDeque<(String, String)>,
+    /// Sessions that have had a review evicted.
+    ///
+    /// Names only. A name is a handful of bytes standing in for the kilobytes of review
+    /// text it replaced, so this cannot reintroduce the growth the caps exist to prevent.
+    /// Ids need no equivalent -- see `Registry::was_issued`.
+    evicted_sessions: HashSet<String>,
+    /// Completion order, assigned under the lock as each review finishes.
+    ///
+    /// Eviction ranks on this rather than on the finish `Instant`. Two reviews can land in
+    /// the same clock tick, and ties would then fall back to `HashMap::values()` order,
+    /// which is randomly seeded per process; a counter is total and monotonic by
+    /// construction, so there are no ties to break and no dependence on clock resolution.
+    ///
+    /// It is *completion* order, not issue order. Issue order is not the same thing: a
+    /// review that started early and ran long holds the lowest issue counter, so ranking
+    /// on that would place it oldest at the very moment it finished, and the sweep
+    /// triggered by its own `finish` could evict it before its caller could collect it.
+    finishes: u64,
 }
 
 impl State {
@@ -141,40 +150,20 @@ impl State {
     /// Running reviews are never touched: one is by definition still owed to a caller,
     /// and removing it would strand a poll on an id that has no terminal state to reach.
     fn evict(&mut self) {
-        let mut terminal: Vec<(String, String, Instant, u64)> = self
+        let mut terminal: Vec<(String, String, u64)> = self
             .reviews
             .values()
             .filter(|r| r.status != Status::Running)
-            .map(|r| {
-                (
-                    r.id.clone(),
-                    r.session.clone(),
-                    r.finished.unwrap_or(r.started),
-                    r.seq,
-                )
-            })
+            .map(|r| (r.id.clone(), r.session.clone(), r.finish_seq))
             .collect();
-        // Newest first, so "keep the most recent N" is a prefix.
-        //
-        // Ranked by *finish* time, with the issue counter only as a tiebreaker. Ranking by
-        // the counter alone looks equivalent -- within a session it is, since a session
-        // admits one running review at a time -- but across sessions it loses the property
-        // that matters: a review that started early and ran long has the lowest counter,
-        // so at the moment it finished it would rank oldest, and the sweep triggered by
-        // its own `finish` could evict it before its caller ever collected it.
-        //
-        // The tiebreaker is not decoration. Two reviews can finish inside one `Instant`
-        // tick, and ties would otherwise fall back to `HashMap::values()` order, which is
-        // randomly seeded per process -- making both the eviction order and any test of it
-        // nondeterministic.
-        terminal.sort_by_key(|(_, _, finished, seq)| {
-            (std::cmp::Reverse(*finished), std::cmp::Reverse(*seq))
-        });
+        // Most recently finished first, so "keep the newest N" is a prefix. See
+        // `State::finishes` for why this key and not the finish time.
+        terminal.sort_by_key(|(_, _, finish_seq)| std::cmp::Reverse(*finish_seq));
 
         let mut per_session: HashMap<String, usize> = HashMap::new();
         let mut kept = 0usize;
         let mut doomed = Vec::new();
-        for (id, session, _, _) in terminal {
+        for (id, session, _) in terminal {
             let seen = per_session.entry(session.clone()).or_insert(0);
             *seen += 1;
             if *seen > MAX_TERMINAL_PER_SESSION || kept >= MAX_TERMINAL_TOTAL {
@@ -186,10 +175,7 @@ impl State {
 
         for (id, session) in doomed {
             self.reviews.remove(&id);
-            if self.evicted.len() >= MAX_REMEMBERED_EVICTIONS {
-                self.evicted.pop_front();
-            }
-            self.evicted.push_back((id, session));
+            self.evicted_sessions.insert(session);
         }
     }
 }
@@ -249,7 +235,7 @@ impl Registry {
                 started: Instant::now(),
                 finished: None,
                 cancel: Arc::clone(&cancel),
-                seq,
+                finish_seq: 0,
             },
         );
         drop(guard);
@@ -260,8 +246,11 @@ impl Registry {
     pub fn finish(&self, id: &str, outcome: Outcome) {
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.finishes += 1;
+            let finish_seq = guard.finishes;
             if let Some(review) = guard.reviews.get_mut(id) {
                 review.finished = Some(Instant::now());
+                review.finish_seq = finish_seq;
                 review.denials = outcome.denials;
                 review.warnings = outcome.warnings;
                 review.resumable = outcome.resumable;
@@ -299,10 +288,37 @@ impl Registry {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.reviews.contains_key(id) {
             IdState::Known
-        } else if guard.evicted.iter().any(|(evicted, _)| evicted == id) {
+        } else if self.was_issued(id) {
             IdState::Evicted
         } else {
             IdState::Unknown
+        }
+    }
+
+    /// Was this id minted by this process?
+    ///
+    /// Derived from the id rather than remembered, which is what makes the evicted/unknown
+    /// distinction hold for the whole process lifetime. A list of tombstones would have to
+    /// be bounded, and the oldest entry falling off would silently turn a valid id back
+    /// into "never existed" -- reintroducing exactly the misleading message the
+    /// distinction exists to prevent, at the point where the caller is least likely to
+    /// question it.
+    ///
+    /// Ids are `rv-<pid>-<counter>` and the counter only ever increases, so membership is
+    /// a parse and two comparisons.
+    fn was_issued(&self, id: &str) -> bool {
+        let Some(rest) = id.strip_prefix("rv-") else {
+            return false;
+        };
+        let Some((pid, seq)) = rest.split_once('-') else {
+            return false;
+        };
+        if pid != std::process::id().to_string() {
+            return false;
+        }
+        match seq.parse::<u64>() {
+            Ok(seq) => seq >= 1 && seq <= self.counter.load(Ordering::Relaxed),
+            Err(_) => false,
         }
     }
 
@@ -314,7 +330,7 @@ impl Registry {
     /// that eviction is specifically not supposed to produce.
     pub fn session_had_evicted(&self, session: &str) -> bool {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.evicted.iter().any(|(_, name)| name == session)
+        guard.evicted_sessions.contains(session)
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -501,6 +517,59 @@ mod tests {
             .wait(&slow, Duration::from_millis(1))
             .expect("snapshot");
         assert_eq!(snapshot.review.as_deref(), Some("worth having"));
+    }
+
+    #[test]
+    fn eviction_order_does_not_depend_on_the_clock_at_all() {
+        // Ranking on the finish `Instant` left a hole: reviews landing in one clock tick
+        // compare equal, so a long-running review could still be outranked by later
+        // arrivals whose only advantage was a tiebreaker. Completion order is assigned
+        // under the lock, so there are no ties to break and the clock is not consulted.
+        let registry = Registry::new();
+        let (slow, _c) = registry.try_start("slow", 1, false).expect("start");
+        for n in 0..MAX_TERMINAL_TOTAL {
+            run_one(&registry, &format!("busy-{n}"), 1);
+        }
+        registry.finish(&slow, Outcome::completed("worth having"));
+
+        // Whatever the clock did, `slow` finished last and is therefore ranked first.
+        assert_eq!(registry.lookup(&slow), IdState::Known);
+        // Nothing in the sweep reads a timestamp: the finish times of the busy reviews are
+        // free to be identical to each other and to `slow`.
+        let snapshot = registry
+            .wait(&slow, Duration::from_millis(1))
+            .expect("snapshot");
+        assert_eq!(snapshot.review.as_deref(), Some("worth having"));
+    }
+
+    #[test]
+    fn an_evicted_id_stays_distinguishable_however_many_evictions_follow() {
+        // A bounded list of tombstones would drop its oldest entry, turning a valid id
+        // back into "never existed" -- the misleading message the distinction exists to
+        // prevent, arriving at the point a caller is least likely to question it. The
+        // answer is derived from the id instead, so it holds for the process lifetime.
+        let registry = Registry::new();
+        let first = run_one(&registry, "first", 1);
+        assert_eq!(registry.lookup(&first), IdState::Known);
+
+        // Far more evictions than any tombstone list would have held.
+        for n in 0..600 {
+            run_one(&registry, &format!("later-{n}"), 1);
+        }
+        assert_eq!(
+            registry.lookup(&first),
+            IdState::Evicted,
+            "an old id decayed into Unknown once enough evictions followed"
+        );
+
+        // An id this process never minted is still Unknown, so the distinction is real
+        // and not just "anything shaped like an id".
+        assert_eq!(registry.lookup("rv-999999-1"), IdState::Unknown);
+        assert_eq!(registry.lookup("not-an-id"), IdState::Unknown);
+        // Nor may it claim ids it has not issued yet.
+        assert_eq!(registry.lookup("rv-999999999-1"), IdState::Unknown);
+        let future = format!("rv-{}-999999", std::process::id());
+        assert_eq!(registry.lookup(&future), IdState::Unknown);
     }
 
     #[test]

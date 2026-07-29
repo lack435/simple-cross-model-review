@@ -191,16 +191,19 @@ impl Reviewer for ClaudeReviewer {
             return Err(errors::empty_review("claude", out.diagnostics()));
         }
 
-        // Gated on stderr, which is what the message describes. A truncated *stdout* is
-        // already impossible here -- it would not have parsed as a complete JSON document
-        // -- but gating on the union would make the wording true only by that inference,
-        // and a reader should not have to reconstruct an argument to check a claim.
+        // Gated on either stream. An earlier revision gated on stderr alone, reasoning that
+        // a truncated stdout could not have parsed -- but it can: a complete result
+        // document followed by enough trailing whitespace to reach the cap trims back to
+        // valid JSON, with bytes discarded after it. The review is intact in that case, so
+        // this is a warning and not a failure, but the cap was hit and the README promises
+        // that is never silent.
         let mut warnings = Vec::new();
-        if out.stderr_truncated {
+        if out.truncated() {
             warnings.push(
-                "The reviewer's diagnostic output exceeded the cap and was truncated. The review \
-                 itself parsed intact, so it is unaffected, but output at that volume is \
-                 abnormal."
+                "The reviewer produced more output than the collection cap allows, so its \
+                 output was truncated. The review itself parsed as a complete document, so it \
+                 is intact, but anything the reviewer wrote beyond the cap is lost and output \
+                 at that volume is abnormal."
                     .to_string(),
             );
         }
@@ -290,6 +293,39 @@ mod tests {
             .parse(&cfg(), &outcome(cut_short, true), None)
             .expect_err("still a failure");
         assert_eq!(failure.code, "EMPTY_REVIEW");
+    }
+
+    #[test]
+    fn a_capped_stdout_that_still_parses_is_reported_as_a_warning() {
+        // The case that makes gating on stderr alone wrong: a complete result document
+        // followed by trailing whitespace up to the cap trims back to valid JSON, so the
+        // review parses and is intact -- but stdout *was* truncated, and the README
+        // promises that hitting the cap is never silent.
+        let padded = format!(
+            "{}{}",
+            r#"{"type":"result","subtype":"success","result":"APPROVE","session_id":"s-1"}"#,
+            " ".repeat(64)
+        );
+        let truncated = RunOutcome {
+            stdout_truncated: true,
+            ..outcome(&padded, true)
+        };
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &truncated, None)
+            .expect("a complete document still parses");
+        assert_eq!(parsed.text, "APPROVE");
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert!(
+            parsed.warnings[0].contains("truncated"),
+            "{:?}",
+            parsed.warnings
+        );
+
+        // And an untruncated run of the same shape carries no warning.
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &outcome(&padded, true), None)
+            .expect("parse");
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 
     #[test]
