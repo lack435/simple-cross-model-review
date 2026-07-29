@@ -317,10 +317,12 @@ impl Config {
     /// reviewer cannot fetch one itself, so a reviewer with a shell is left to do its own
     /// looking rather than being handed a stale snapshot alongside live access.
     pub fn supplies_diff(&self) -> bool {
+        // Matched exhaustively: a new mode should have to state its answer here rather
+        // than opt itself in by falling through a wildcard.
         match self.diff {
             DiffMode::None => false,
             DiffMode::Auto => !self.reviewer_has_shell(),
-            _ => true,
+            DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
         }
     }
 

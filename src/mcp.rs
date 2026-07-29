@@ -413,12 +413,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // Worth stating positively. The caller pastes a diff because it believes it has
         // to; left to infer, it will keep spending its own context on one this server
         // already fetched.
+        // Qualified rather than flat: `supplies_diff` is the configured intent, and
+        // whether a diff actually arrives depends on the working root being a git
+        // repository, which is only known at capture time. The reviewer is told the
+        // runtime answer; the caller can only be told the intent, so it must not be
+        // promised more than that.
         "The reviewer can read and search files in this repository, so you do not need to \
          paste whole files. It has NO shell of its own, but it does not need one for the \
-         change: this server captures the working-tree diff, `git status`, and the \
-         contents of untracked files, and hands them to the reviewer with your request. \
-         Do not paste a diff into 'instructions' -- describe the intent of the change and \
-         what you want scrutinised instead."
+         change: when the working root is a git repository, this server captures the \
+         working-tree diff, `git status`, and the contents of untracked files, and hands \
+         them to the reviewer with your request. Do not paste a diff into 'instructions' \
+         -- describe the intent of the change and what you want scrutinised instead. Note \
+         that the capture covers uncommitted work; if what you want reviewed is already \
+         committed, say so in 'instructions'."
     } else {
         "The reviewer can read and search files in this repository, so you do not need to \
          paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \
