@@ -218,6 +218,16 @@ Notes on the edges, because they are where this would otherwise mislead:
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
   with a reviewer that has its own shell, so those stay silent.
 
+  The untracked capture warns on the same principle, and the line is drawn by who can still
+  find out. If the listing stopped at the examined cap, or files were dropped because the
+  total content cap ran out, the caller is told — it never sees the prompt, and a review
+  made against a listing that stopped at path 200 otherwise reads exactly like one made
+  against all of them. The per-file notes are *not* promoted: the reviewer is reading the
+  prompt and can open the file itself, and `blob.bin is binary` is true of nearly every
+  working tree with a build artifact in it, so promoting those would put a warning on almost
+  every call — and a warning that always fires is one the caller stops reading, which would
+  cost the other two their audience.
+
 ## Re-reviewing after you act on feedback
 
 Sessions are named, and you choose the names. Calling `cross_model_review` again with

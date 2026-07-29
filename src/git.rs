@@ -512,17 +512,19 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         }
     };
 
-    let (untracked, untracked_omitted) = if mode.includes_untracked() {
+    let (untracked, omissions) = if mode.includes_untracked() {
         git.untracked(&mut notes)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), OmissionReport::default())
     };
 
     // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
     // its review; the caller needs them to know the review it is reading was made on
-    // partial evidence, which it cannot see the prompt to discover for itself.
+    // partial evidence, which it cannot see the prompt to discover for itself. Which of the
+    // untracked omissions earn that second audience is decided in `OmissionReport`.
     let warnings = notes
         .iter()
+        .chain(&omissions.capture_level)
         .map(|note| format!("The captured change was incomplete: {note}"))
         .collect();
 
@@ -539,7 +541,7 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
             diff,
             status,
             untracked,
-            untracked_omitted,
+            untracked_omitted: omissions.notes,
             notes,
         }),
         warnings,
@@ -779,7 +781,7 @@ impl<'a> Git<'a> {
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
-    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<UntrackedFile>, Vec<String>) {
+    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<UntrackedFile>, OmissionReport) {
         let listing = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
             Some(out) if out.success => out.stdout,
             // An absent section reads as "there were none", and the reviewer has no shell
@@ -791,7 +793,7 @@ impl<'a> Git<'a> {
                      shows."
                         .to_string(),
                 );
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), OmissionReport::default());
             }
         };
 
@@ -924,24 +926,53 @@ impl Omissions {
         ));
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> OmissionReport {
         if self.suppressed > 0 {
             self.notes
                 .push(format!("... and {} further note(s)", self.suppressed));
         }
-        // Last, because these describe the capture rather than one more file in it.
+
+        // Last, because these describe the capture rather than one more file in it -- and
+        // for the same reason they are the ones the caller is warned about. Built once and
+        // used for both, so the line in the prompt and the line in the warning are the same
+        // string and cannot drift into describing the capture two different ways.
+        let mut capture_level = Vec::new();
         if self.content_cap_skips > 0 {
-            self.notes.push(format!(
+            capture_level.push(format!(
                 "{} untracked file(s) were left out entirely: the total untracked-content cap \
                  of {} bytes was reached",
                 self.content_cap_skips, MAX_UNTRACKED_TOTAL_BYTES
             ));
         }
         if let Some(note) = self.listing_cut_short.take() {
-            self.notes.push(note);
+            capture_level.push(note);
         }
-        self.notes
+        self.notes.extend(capture_level.iter().cloned());
+
+        OmissionReport {
+            notes: self.notes,
+            capture_level,
+        }
     }
+}
+
+/// What the omissions came to: every line the reviewer is shown, and the subset the caller
+/// is warned about.
+///
+/// The split is not "big things and small things", it is who can still find out. A note
+/// naming one file goes to the reviewer, which is reading the prompt and can open the file
+/// itself. A statement about the *capture* -- the listing stopped early, files were dropped
+/// for want of budget -- goes to both, because the caller never sees the prompt and is the
+/// party deciding whether to act on the review. It would otherwise read a review made
+/// against a listing that stopped at path 200 exactly as it reads a complete one.
+///
+/// Per-file notes are deliberately *not* promoted. `blob.bin is binary` is true of nearly
+/// every working tree with a build artifact in it, and a warning that fires on every call
+/// is one the caller learns to skip -- which would cost the two above their audience.
+#[derive(Default, Debug)]
+struct OmissionReport {
+    notes: Vec<String>,
+    capture_level: Vec<String>,
 }
 
 /// How far the next untracked file may be read, and whether that bound is the total budget
@@ -1254,7 +1285,7 @@ mod tests {
         for i in 0..500 {
             omissions.push(format!("note {i}"));
         }
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 1);
         assert!(notes.last().unwrap().contains("further note"), "{notes:?}");
     }
@@ -1270,7 +1301,7 @@ mod tests {
         }
         omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
 
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 2);
         // Last, and outside the "... and N further note(s)" summary rather than inside it.
         assert!(
@@ -1297,7 +1328,7 @@ mod tests {
         omissions.content_cap_skipped("a.txt");
         omissions.content_cap_skipped("b.txt");
 
-        let notes = omissions.finish();
+        let notes = omissions.finish().notes;
         let aggregate = notes.last().unwrap();
         assert!(aggregate.contains("2 untracked file(s)"), "{notes:?}");
         assert!(
@@ -1310,6 +1341,52 @@ mod tests {
             "{notes:?}"
         );
         assert!(!notes.iter().any(|n| n.contains("a.txt")), "{notes:?}");
+    }
+
+    #[test]
+    fn only_the_capture_level_omissions_are_offered_to_the_caller() {
+        let mut omissions = Omissions::default();
+        omissions.push("`escape` was skipped: it resolves outside the working root".into());
+        omissions.push("`blob.bin` is binary".into());
+        omissions.content_cap_skipped("a.txt");
+        omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
+
+        let report = omissions.finish();
+
+        // Two statements about the capture, and neither per-file note among them: a warning
+        // that fires on every working tree with a build artifact in it is one the caller
+        // stops reading, which would cost these two their audience.
+        assert_eq!(report.capture_level.len(), 2, "{report:?}");
+        assert!(
+            !report.capture_level.iter().any(|w| {
+                w.contains("a.txt") || w.contains("blob.bin") || w.contains("working root")
+            }),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .capture_level
+                .iter()
+                .any(|w| w.contains("1 untracked file(s) were left out entirely")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .capture_level
+                .iter()
+                .any(|w| w.contains("were not examined")),
+            "{report:?}"
+        );
+
+        // The reviewer still sees everything, the caller's lines included, and sees them
+        // spelled exactly as the caller does.
+        for warning in &report.capture_level {
+            assert!(report.notes.contains(warning), "{report:?}");
+        }
+        assert!(
+            report.notes.iter().any(|n| n.contains("blob.bin")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -1933,9 +2010,8 @@ mod tests {
             std::fs::write(dir.join(format!("blob-{i:04}.bin")), [0u8, 1, 2]).expect("write");
         }
 
-        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
-            .change
-            .expect("a change");
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
 
         assert!(
             change
@@ -1945,5 +2021,41 @@ mod tests {
             "{:?}",
             change.untracked_omitted
         );
+        // And the caller, which cannot see the prompt, is told the review it is about to
+        // read was made against a listing that stopped early.
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|w| w.contains("were not examined")),
+            "{:?}",
+            captured.warnings
+        );
+    }
+
+    #[test]
+    fn an_ordinary_skipped_file_does_not_warn_the_caller() {
+        // The guard on the rule above. A binary untracked file is true of nearly every
+        // working tree with a build artifact in it, so promoting per-file notes would put a
+        // warning on almost every review -- and a warning that always fires is one the
+        // caller stops reading, which is what the capture-level warnings cannot afford.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        std::fs::write(dir.join("blob.bin"), [0u8, 1, 2]).expect("write");
+
+        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let change = captured.change.as_ref().expect("a change");
+
+        // The reviewer is told, because it is reading the prompt and can open the file.
+        assert!(
+            change
+                .untracked_omitted
+                .iter()
+                .any(|note| note.contains("is binary")),
+            "{:?}",
+            change.untracked_omitted
+        );
+        assert!(captured.warnings.is_empty(), "{:?}", captured.warnings);
     }
 }
