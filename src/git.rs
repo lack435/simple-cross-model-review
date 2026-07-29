@@ -1089,7 +1089,7 @@ mod tests {
     ///
     /// Filenames are chosen so `git ls-files` reaches the filler first: it sorts its
     /// output, and the arithmetic depends on that order.
-    fn repo_with_untracked_budget_spent(spent: usize) -> Option<PathBuf> {
+    fn repo_with_untracked_budget_spent(spent: usize) -> Option<TempDir> {
         let dir = repo_with_a_change()?;
         // The fixture's own untracked file would make the sums below depend on its size.
         std::fs::remove_file(dir.join("untracked.txt")).expect("remove");
