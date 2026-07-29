@@ -65,10 +65,12 @@ gate it is repairing. There is an exception for exactly that case, and **you can
 it on your own judgement.** Every condition below is an artifact you must be able to point
 at. If any one of them is missing, stop and tell the user which one:
 
-- **A human maintainer authorised this specific PR**, in the PR itself or in a direct
-  instruction to you. You may not infer authorisation from the situation being urgent, from
-  the repair being obviously correct, or from a previous PR having been authorised. If you
-  are unsure whether you have it, you do not have it — ask.
+- **A human maintainer authorised the use of this exception, for this named PR**, in the PR
+  itself or in a direct instruction to you. Approval to work on, approve, or merge the PR is
+  not that: "go ahead with #15" authorises the work, not the bypass. Nor may you infer it
+  from the situation being urgent, from the repair being obviously correct, or from a
+  previous PR having been authorised. If you are unsure whether you have it, you do not have
+  it — ask.
 - **The PR is the minimum repair to the gate and nothing else.** Split unrelated work out
   into its own PR, which goes through the normal gate. A repair with a tidy-up bundled into
   it does not qualify; neither does a rate limit, a reviewer that is slow or expensive, or
