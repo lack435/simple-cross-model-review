@@ -386,6 +386,14 @@ impl Section {
 pub struct UntrackedFile {
     pub path: String,
     pub body: Section,
+    /// Which cap cut `body` short, when it was cut at all.
+    ///
+    /// The per-file cap and whatever is left of the total are the same code path -- the
+    /// read is capped at the smaller of the two -- so a file cut by an exhausted total
+    /// budget is indistinguishable from a large one unless this is carried. Naming the
+    /// wrong cap tells the reviewer this file is bigger than the per-file cap when it may
+    /// be a few hundred bytes.
+    pub cut_by_total_cap: bool,
 }
 
 /// The result of trying to capture the change: what was captured, and what the *caller*
@@ -639,7 +647,12 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
             out.push_str(&format!("#### {}\n\n", safe_label(&file.path)));
             push_fenced(&mut out, "", &file.body.text);
             if file.body.truncated {
-                out.push_str("\n(truncated -- this file was larger than the per-file cap.)\n");
+                out.push_str(if file.cut_by_total_cap {
+                    "\n(truncated -- the total untracked-content cap ran out partway through \
+                     this file.)\n"
+                } else {
+                    "\n(truncated -- this file was larger than the per-file cap.)\n"
+                });
             }
             out.push('\n');
         }
@@ -799,7 +812,7 @@ impl<'a> Git<'a> {
 
         for (examined, path) in paths.iter().enumerate() {
             if examined >= MAX_UNTRACKED_EXAMINED || files.len() >= MAX_UNTRACKED_FILES {
-                omitted.push(format!(
+                omitted.set_listing_cut_short(format!(
                     "{} further untracked file(s) were not examined (caps: {} included, {} \
                      examined)",
                     paths.len() - examined,
@@ -831,13 +844,10 @@ impl<'a> Git<'a> {
             }
 
             if budget == 0 {
-                omitted.push(format!(
-                    "`{}` -- the total untracked-content cap was reached",
-                    safe_label(path)
-                ));
+                omitted.content_cap_skipped(&safe_label(path));
                 continue;
             }
-            let cap = MAX_UNTRACKED_FILE_BYTES.min(budget);
+            let (cap, cut_by_total_cap) = read_cap(budget);
 
             // Capped as it is read, not after: an untracked multi-gigabyte artifact is a
             // perfectly ordinary thing to find in a working tree, and reading it whole to
@@ -860,6 +870,7 @@ impl<'a> Git<'a> {
             files.push(UntrackedFile {
                 path: (*path).to_string(),
                 body,
+                cut_by_total_cap,
             });
         }
 
@@ -869,10 +880,23 @@ impl<'a> Git<'a> {
 
 /// Omission notes, capped so that explaining what was skipped cannot itself flood the
 /// prompt: these are one line per file, and a working tree can hold a great many.
+///
+/// The cap covers the per-file notes only. The two facts about the capture *as a whole* --
+/// that the listing stopped early, and that the total content cap was reached -- are held
+/// apart from it and always rendered, because both are established only after per-file
+/// notes have had every chance to take the slots. Twenty examined paths that are binary,
+/// unreadable, or resolve outside the root fill them exactly, and then the fact that
+/// hundreds more were never looked at, or that files were dropped for want of budget, is
+/// the thing that goes missing. A suppressed *file* leaves the count behind and the
+/// reviewer still knows something was omitted; a suppressed statement about the capture
+/// leaves it looking complete. That second one is the silent shortfall this module refuses
+/// to produce; see `Change::notes`.
 #[derive(Default)]
 struct Omissions {
     notes: Vec<String>,
     suppressed: usize,
+    listing_cut_short: Option<String>,
+    content_cap_skips: usize,
 }
 
 impl Omissions {
@@ -884,13 +908,56 @@ impl Omissions {
         }
     }
 
+    /// Record that the listing was truncated. Exempt from the cap, and it survives any
+    /// number of per-file notes.
+    fn set_listing_cut_short(&mut self, note: String) {
+        self.listing_cut_short = Some(note);
+    }
+
+    /// Record a file dropped because the total content cap was reached. Named if a slot is
+    /// free -- the reviewer can read the project, so a name is something it can act on --
+    /// and counted either way, since the count is what is exempt.
+    fn content_cap_skipped(&mut self, label: &str) {
+        self.content_cap_skips += 1;
+        self.push(format!(
+            "`{label}` -- the total untracked-content cap was reached"
+        ));
+    }
+
     fn finish(mut self) -> Vec<String> {
         if self.suppressed > 0 {
             self.notes
                 .push(format!("... and {} further note(s)", self.suppressed));
         }
+        // Last, because these describe the capture rather than one more file in it.
+        if self.content_cap_skips > 0 {
+            self.notes.push(format!(
+                "{} untracked file(s) were left out entirely: the total untracked-content cap \
+                 of {} bytes was reached",
+                self.content_cap_skips, MAX_UNTRACKED_TOTAL_BYTES
+            ));
+        }
+        if let Some(note) = self.listing_cut_short.take() {
+            self.notes.push(note);
+        }
         self.notes
     }
+}
+
+/// How far the next untracked file may be read, and whether that bound is the total budget
+/// rather than the per-file cap.
+///
+/// Whichever is tighter bounds the read, so a file cut short by an exhausted total looks
+/// exactly like an oversized one. Which it was decides what the prompt may claim about the
+/// file, so the decision is made here, where it can be tested at the boundary directly:
+/// the capture-level test for it has to arrange a real repository's byte totals and then
+/// leans on `git ls-files` returning sorted paths, which is observed behaviour rather than
+/// a documented guarantee.
+fn read_cap(budget: usize) -> (usize, bool) {
+    (
+        MAX_UNTRACKED_FILE_BYTES.min(budget),
+        budget < MAX_UNTRACKED_FILE_BYTES,
+    )
 }
 
 /// Read at most `cap` bytes, reporting whether there were more.
@@ -1014,6 +1081,32 @@ mod tests {
 
         std::fs::write(dir.join("tracked.txt"), "modified\n").expect("write");
         std::fs::write(dir.join("untracked.txt"), "brand new\n").expect("write");
+        Some(dir)
+    }
+
+    /// A repository whose untracked content has already spent `spent` bytes of the total
+    /// cap by the time `zz-big.txt` -- larger than any cap -- is reached.
+    ///
+    /// Filenames are chosen so `git ls-files` reaches the filler first: it sorts its
+    /// output, and the arithmetic depends on that order.
+    fn repo_with_untracked_budget_spent(spent: usize) -> Option<TempDir> {
+        let dir = repo_with_a_change()?;
+        // The fixture's own untracked file would make the sums below depend on its size.
+        std::fs::remove_file(dir.join("untracked.txt")).expect("remove");
+
+        let mut left = spent;
+        let mut i = 0;
+        while left > 0 {
+            let n = left.min(MAX_UNTRACKED_FILE_BYTES);
+            std::fs::write(dir.join(format!("fill-{i}.txt")), vec![b'x'; n]).expect("write");
+            left -= n;
+            i += 1;
+        }
+        std::fs::write(
+            dir.join("zz-big.txt"),
+            vec![b'y'; MAX_UNTRACKED_FILE_BYTES + 10_000],
+        )
+        .expect("write");
         Some(dir)
     }
 
@@ -1164,6 +1257,59 @@ mod tests {
         let notes = omissions.finish();
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 1);
         assert!(notes.last().unwrap().contains("further note"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_listing_being_cut_short_outlives_the_note_cap() {
+        // The note is written after every per-file note, so if it shared the cap it would
+        // be suppressed in exactly the case it reports: a tree with more untracked files
+        // than we will look at.
+        let mut omissions = Omissions::default();
+        for i in 0..500 {
+            omissions.push(format!("note {i}"));
+        }
+        omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
+
+        let notes = omissions.finish();
+        assert_eq!(notes.len(), MAX_OMISSION_NOTES + 2);
+        // Last, and outside the "... and N further note(s)" summary rather than inside it.
+        assert!(
+            notes.last().unwrap().contains("were not examined"),
+            "{notes:?}"
+        );
+        // And the per-file cap still holds: the exemption is for this one note only.
+        assert_eq!(
+            notes.iter().filter(|n| n.starts_with("note ")).count(),
+            MAX_OMISSION_NOTES
+        );
+    }
+
+    #[test]
+    fn running_out_of_content_budget_is_stated_even_with_every_slot_taken() {
+        // Every per-file note here is suppressed, so nothing names the file -- but the
+        // capture must still say content was dropped. Without the count, a tree whose
+        // first twenty examined paths are binary and whose budget then runs out reads as a
+        // complete listing with a bare "... and N further note(s)" beside it.
+        let mut omissions = Omissions::default();
+        for i in 0..MAX_OMISSION_NOTES {
+            omissions.push(format!("note {i}"));
+        }
+        omissions.content_cap_skipped("a.txt");
+        omissions.content_cap_skipped("b.txt");
+
+        let notes = omissions.finish();
+        let aggregate = notes.last().unwrap();
+        assert!(aggregate.contains("2 untracked file(s)"), "{notes:?}");
+        assert!(
+            aggregate.contains("total untracked-content cap"),
+            "{notes:?}"
+        );
+        // Suppressed as per-file notes, counted as an aggregate: both, not either.
+        assert!(
+            notes.iter().any(|n| n.contains("2 further note(s)")),
+            "{notes:?}"
+        );
+        assert!(!notes.iter().any(|n| n.contains("a.txt")), "{notes:?}");
     }
 
     #[test]
@@ -1416,6 +1562,7 @@ mod tests {
                     text: "fn main() {}".into(),
                     truncated: true,
                 },
+                cut_by_total_cap: false,
             }],
             untracked_omitted: vec!["`blob.bin` is binary".into()],
             notes: Vec::new(),
@@ -1430,6 +1577,89 @@ mod tests {
         assert!(text.contains("#### new.rs"), "{text}");
         assert!(text.contains("larger than the per-file cap"), "{text}");
         assert!(text.contains("is binary"), "{text}");
+    }
+
+    #[test]
+    fn a_file_cut_by_the_total_cap_is_not_reported_as_a_large_file() {
+        // The read is capped at the smaller of the per-file cap and what is left of the
+        // total, so a 200-byte file can come back short. Naming the per-file cap there
+        // would tell the reviewer it is over 60 KB, which is a claim about the file rather
+        // than about the capture.
+        let change = Change {
+            untracked: vec![UntrackedFile {
+                path: "new.rs".into(),
+                body: Section {
+                    text: "fn main() {}".into(),
+                    truncated: true,
+                },
+                cut_by_total_cap: true,
+            }],
+            ..change_fixture()
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("total untracked-content cap"), "{text}");
+        assert!(!text.contains("larger than the per-file cap"), "{text}");
+    }
+
+    #[test]
+    fn the_tighter_of_the_two_caps_bounds_the_read_and_is_named_correctly() {
+        // The boundary itself, away from any repository: the capture-level test below
+        // needs `git ls-files` to return sorted paths for its arithmetic to hold, and that
+        // is observed rather than documented.
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES + 1),
+            (MAX_UNTRACKED_FILE_BYTES, false)
+        );
+        // Coincident: the file's own cap is the true reason, so it is the one named.
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES),
+            (MAX_UNTRACKED_FILE_BYTES, false)
+        );
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES - 1),
+            (MAX_UNTRACKED_FILE_BYTES - 1, true)
+        );
+        assert_eq!(read_cap(1), (1, true));
+    }
+
+    #[test]
+    fn which_cap_cut_a_file_short_is_decided_by_the_real_budget() {
+        // The rendering test sets the flag by hand and the test above pins the boundary in
+        // isolation; this one checks the two are wired together, over a real capture.
+        let spent = MAX_UNTRACKED_TOTAL_BYTES - MAX_UNTRACKED_FILE_BYTES;
+
+        // Exactly the per-file cap is left, so the two limits coincide and the per-file
+        // wording is the true one.
+        let Some(dir) = repo_with_untracked_budget_spent(spent) else {
+            return;
+        };
+        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+            .change
+            .expect("a change");
+        let big = change
+            .untracked
+            .iter()
+            .find(|f| f.path == "zz-big.txt")
+            .expect("the big file was included");
+        assert!(big.body.truncated);
+        assert!(!big.cut_by_total_cap, "{:?}", change.untracked_omitted);
+
+        // A little less, and it is the total that cut the file, not its size.
+        let Some(dir) = repo_with_untracked_budget_spent(spent + 5_000) else {
+            return;
+        };
+        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+            .change
+            .expect("a change");
+        let big = change
+            .untracked
+            .iter()
+            .find(|f| f.path == "zz-big.txt")
+            .expect("the big file was included");
+        assert!(big.body.truncated);
+        assert!(big.cut_by_total_cap, "{:?}", change.untracked_omitted);
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("total untracked-content cap"), "{text}");
     }
 
     #[test]
@@ -1684,6 +1914,34 @@ mod tests {
                 .untracked_omitted
                 .iter()
                 .any(|note| note.contains("outside the working root")),
+            "{:?}",
+            change.untracked_omitted
+        );
+    }
+
+    #[test]
+    fn a_flood_of_untracked_files_still_reports_that_the_listing_was_cut_short() {
+        // The case the examined cap exists for. Every file here is binary, so each one
+        // spends a per-file omission note before the cap on the listing is reached -- and
+        // the note about the listing is written last. If it took a slot like any other,
+        // the reviewer would be told about twenty skipped files and never that there were
+        // hundreds more it was not told about.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        for i in 0..MAX_UNTRACKED_EXAMINED + 50 {
+            std::fs::write(dir.join(format!("blob-{i:04}.bin")), [0u8, 1, 2]).expect("write");
+        }
+
+        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+            .change
+            .expect("a change");
+
+        assert!(
+            change
+                .untracked_omitted
+                .iter()
+                .any(|note| note.contains("were not examined")),
             "{:?}",
             change.untracked_omitted
         );
