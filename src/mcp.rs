@@ -723,22 +723,40 @@ mod tests {
                 .to_string()
         };
 
-        let ranged = describe(&["--diff", "main...HEAD"]);
-        assert!(ranged.contains("`git diff main...HEAD`"), "{ranged}");
-        assert!(!ranged.contains("untracked files, and hands"), "{ranged}");
-        assert!(
-            ranged.contains("commit what you want reviewed first"),
-            "{ranged}"
-        );
+        // The contract for the modes that supply something other than the working tree:
+        // the named revision is the diff, `git status` still comes with it, and the
+        // contents of anything dirty or untracked do not. Asserted as those facts rather
+        // than as one banned phrase, so a rewording that breaks the contract cannot pass
+        // by avoiding the old words.
+        for (spec, diff_label) in [
+            ("main...HEAD", "`git diff main...HEAD`"),
+            ("HEAD~3", "`git diff HEAD~3`"),
+            ("staged", "`git diff --cached`"),
+        ] {
+            let text = describe(&["--diff", spec]);
+            assert!(text.contains(diff_label), "{spec}: {text}");
+            assert!(text.contains("`git status`"), "{spec}: {text}");
+            assert!(
+                text.contains("their contents are not sent"),
+                "{spec}: {text}"
+            );
+            assert!(
+                !text.contains("the contents of untracked files"),
+                "{spec}: {text}"
+            );
+            assert!(!text.contains("covers uncommitted work"), "{spec}: {text}");
+        }
 
-        let staged = describe(&["--diff", "staged"]);
-        assert!(staged.contains("`git diff --cached`"), "{staged}");
-        assert!(staged.contains("staged work only"), "{staged}");
-
-        // The default for a shell-less reviewer still describes the working tree.
-        let auto = describe(&[]);
-        assert!(auto.contains("the contents of untracked files"), "{auto}");
-        assert!(auto.contains("covers uncommitted work"), "{auto}");
+        // The working-tree modes do supply untracked contents, and say so. `auto` reaches
+        // this because the Claude reviewer has no shell to fetch a diff itself.
+        for spec in [vec![], vec!["--diff", "HEAD"]] {
+            let text = describe(&spec);
+            assert!(
+                text.contains("the contents of untracked files"),
+                "{spec:?}: {text}"
+            );
+            assert!(text.contains("covers uncommitted work"), "{spec:?}: {text}");
+        }
 
         // A reviewer with a shell fetches its own, and is told so instead.
         let shelled = describe(&["--tools", "Read,Grep,Glob,Bash"]);

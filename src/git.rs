@@ -182,15 +182,20 @@ impl DiffMode {
                 "Note that the capture covers uncommitted work; if what you want reviewed is \
                  already committed, say so in 'instructions'.",
             ),
+            // These two say what is *not* supplied carefully, because `git status` is
+            // captured for every mode: the reviewer is shown that unstaged and untracked
+            // paths exist. It is their content that is missing, and a caller told flatly
+            // that they are "not included" would be surprised by a review that names them.
             Self::Staged => (
                 "the staged diff (`git diff --cached`) and `git status`".into(),
-                "Note that the capture covers staged work only: unstaged edits and untracked \
-                 files are not in it.",
+                "Note that only staged work is supplied as a diff. `git status` may still \
+                 list unstaged or untracked paths, but their contents are not sent.",
             ),
             Self::Rev(rev) => (
                 format!("`git diff {rev}` and `git status`"),
-                "Note that the capture is that range and nothing else: uncommitted edits and \
-                 untracked files are not in it, so commit what you want reviewed first.",
+                "Note that only that range is supplied as a diff, so commit what you want \
+                 reviewed first. `git status` may still list uncommitted or untracked paths, \
+                 but their contents are not sent.",
             ),
         }
     }
