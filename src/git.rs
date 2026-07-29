@@ -386,6 +386,14 @@ impl Section {
 pub struct UntrackedFile {
     pub path: String,
     pub body: Section,
+    /// Which cap cut `body` short, when it was cut at all.
+    ///
+    /// The per-file cap and whatever is left of the total are the same code path -- the
+    /// read is capped at the smaller of the two -- so a file cut by an exhausted total
+    /// budget is indistinguishable from a large one unless this is carried. Naming the
+    /// wrong cap tells the reviewer this file is bigger than the per-file cap when it may
+    /// be a few hundred bytes.
+    pub cut_by_total_cap: bool,
 }
 
 /// The result of trying to capture the change: what was captured, and what the *caller*
@@ -639,7 +647,12 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
             out.push_str(&format!("#### {}\n\n", safe_label(&file.path)));
             push_fenced(&mut out, "", &file.body.text);
             if file.body.truncated {
-                out.push_str("\n(truncated -- this file was larger than the per-file cap.)\n");
+                out.push_str(if file.cut_by_total_cap {
+                    "\n(truncated -- the total untracked-content cap ran out partway through \
+                     this file.)\n"
+                } else {
+                    "\n(truncated -- this file was larger than the per-file cap.)\n"
+                });
             }
             out.push('\n');
         }
@@ -837,7 +850,10 @@ impl<'a> Git<'a> {
                 ));
                 continue;
             }
+            // Whichever cap is tighter bounds the read; which one it was decides what the
+            // prompt may claim about a file that comes back short.
             let cap = MAX_UNTRACKED_FILE_BYTES.min(budget);
+            let cut_by_total_cap = budget < MAX_UNTRACKED_FILE_BYTES;
 
             // Capped as it is read, not after: an untracked multi-gigabyte artifact is a
             // perfectly ordinary thing to find in a working tree, and reading it whole to
@@ -860,6 +876,7 @@ impl<'a> Git<'a> {
             files.push(UntrackedFile {
                 path: (*path).to_string(),
                 body,
+                cut_by_total_cap,
             });
         }
 
@@ -873,10 +890,11 @@ impl<'a> Git<'a> {
 /// The cap covers the per-file notes only. The note saying the *listing itself* stopped
 /// early is held separately and always rendered, because it is written last -- after up to
 /// `MAX_UNTRACKED_EXAMINED` files have had their chance to take every slot -- so sharing
-/// the cap would suppress it in precisely the case it exists to report: a working tree with
-/// thousands of untracked files, where the reviewer would be handed twenty individual
-/// skipped files and never told the listing was cut short at all. That is the silent
-/// shortfall this module refuses to produce; see `Change::notes`.
+/// the cap would suppress it in precisely the case that fills those slots: a tree holding
+/// more than twenty untracked files that are binary, unreadable, or resolve outside the
+/// root, ahead of hundreds more the listing never reached. The reviewer would then be
+/// handed twenty individual skipped files and never told the listing was cut short at all,
+/// which is the silent shortfall this module refuses to produce; see `Change::notes`.
 #[derive(Default)]
 struct Omissions {
     notes: Vec<String>,
@@ -1198,8 +1216,9 @@ mod tests {
 
         let notes = omissions.finish();
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 2);
+        // Last, and outside the "... and N further note(s)" summary rather than inside it.
         assert!(
-            notes.iter().any(|n| n.contains("were not examined")),
+            notes.last().unwrap().contains("were not examined"),
             "{notes:?}"
         );
         // And the per-file cap still holds: the exemption is for this one note only.
@@ -1459,6 +1478,7 @@ mod tests {
                     text: "fn main() {}".into(),
                     truncated: true,
                 },
+                cut_by_total_cap: false,
             }],
             untracked_omitted: vec!["`blob.bin` is binary".into()],
             notes: Vec::new(),
@@ -1473,6 +1493,28 @@ mod tests {
         assert!(text.contains("#### new.rs"), "{text}");
         assert!(text.contains("larger than the per-file cap"), "{text}");
         assert!(text.contains("is binary"), "{text}");
+    }
+
+    #[test]
+    fn a_file_cut_by_the_total_cap_is_not_reported_as_a_large_file() {
+        // The read is capped at the smaller of the per-file cap and what is left of the
+        // total, so a 200-byte file can come back short. Naming the per-file cap there
+        // would tell the reviewer it is over 60 KB, which is a claim about the file rather
+        // than about the capture.
+        let change = Change {
+            untracked: vec![UntrackedFile {
+                path: "new.rs".into(),
+                body: Section {
+                    text: "fn main() {}".into(),
+                    truncated: true,
+                },
+                cut_by_total_cap: true,
+            }],
+            ..change_fixture()
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("total untracked-content cap"), "{text}");
+        assert!(!text.contains("larger than the per-file cap"), "{text}");
     }
 
     #[test]
