@@ -24,7 +24,7 @@ mod winjob;
 use std::sync::Arc;
 
 use config::{Config, USAGE};
-use tools::{App, VERSION};
+use tools::{version_line, App};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,7 +34,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("cross-review {VERSION}");
+        println!("{}", version_line());
         return;
     }
 

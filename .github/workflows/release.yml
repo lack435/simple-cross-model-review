@@ -1,0 +1,119 @@
+name: Release
+
+# Tag-driven, not push-driven: publishing an executable that other repositories will
+# vendor should be a deliberate act, not a side effect of merging.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# workflow_dispatch is offered for a dry run, which builds and verifies everything but
+# publishes nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup show
+
+      # The tag and Cargo.toml must agree. Without this a `v0.2.0` release could ship a
+      # binary that reports 0.1.0 -- precisely the kind of quietly-wrong artifact this
+      # project has been bitten by before.
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $crate = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          Write-Host "tag: $tag   Cargo.toml: $crate"
+          if ($tag -ne "v$crate") {
+            throw "tag $tag does not match Cargo.toml version $crate. Bump Cargo.toml, or retag."
+          }
+
+      # build.ps1 rather than a bare cargo invocation, deliberately: it is the single
+      # definition of how this binary is built, including the --remap-path-prefix flags
+      # that keep the builder's home directory out of a published artifact. It also runs
+      # fmt, clippy and the tests, and fails if the staged binary still leaks a path.
+      - name: Build and verify
+        shell: pwsh
+        env:
+          # Lets a released binary identify the commit it came from. CARGO_PKG_VERSION
+          # alone cannot: it is pinned in Cargo.toml, so it does not change between
+          # builds of different source.
+          CROSS_REVIEW_BUILD: ${{ github.sha }}
+        run: .\build.ps1
+
+      - name: Report what was built
+        shell: pwsh
+        run: |
+          & '.\dist\cross-review.exe' --version
+          & '.\dist\cross-review.exe' --help | Select-Object -First 3
+
+      # Guards the failure contract a calling agent depends on: a missing reviewer CLI
+      # must fail loudly rather than degrade into the agent reviewing its own work.
+      - name: Missing reviewer CLI still fails loudly
+        shell: pwsh
+        run: |
+          $lines = @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{"instructions":"x"}}}'
+          )
+          $inFile = Join-Path $env:RUNNER_TEMP 'mcp-in.txt'
+          [System.IO.File]::WriteAllLines($inFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
+          $out = @(Get-Content $inFile | & '.\dist\cross-review.exe' --reviewer codex --bin 'C:\nope\codex.exe' 2>$null)
+          $call = $out[1] | ConvertFrom-Json
+          if ($call.result.isError -ne $true) { throw 'expected isError=true' }
+          $text = $call.result.content[0].text
+          if ($text -notmatch 'CLI_NOT_FOUND') { throw "expected CLI_NOT_FOUND, got: $text" }
+          if ($text -notmatch 'ACTION REQUIRED') { throw 'expected the stop-and-escalate instruction' }
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash 'dist\cross-review.exe' -Algorithm SHA256).Hash.ToLower()
+          "$hash  cross-review.exe" | Out-File -FilePath 'dist\SHA256SUMS.txt' -Encoding ascii
+          Get-Content 'dist\SHA256SUMS.txt'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-review-${{ github.sha }}
+          path: |
+            dist/cross-review.exe
+            dist/SHA256SUMS.txt
+
+      # gh is preinstalled on GitHub-hosted runners, so no third-party action is needed
+      # to publish. One less dependency in the path that produces a binary other people
+      # will run.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $notes = @"
+          Windows x86_64. Single self-contained executable: no Node, no Python, no DLLs.
+
+          **Install:** download ``cross-review.exe``, commit it into your project at
+          ``tools\cross-review.exe``, and add one entry to your project's MCP config. See
+          the examples in the repository for both directions.
+
+          Verify the download against ``SHA256SUMS.txt``. The binary reports its build
+          commit via ``cross-review.exe --version``.
+
+          Built from ${{ github.sha }}.
+          "@
+          gh release create '${{ github.ref_name }}' `
+            'dist\cross-review.exe' `
+            'dist\SHA256SUMS.txt' `
+            --title 'cross-review ${{ github.ref_name }}' `
+            --notes $notes `
+            --verify-tag
