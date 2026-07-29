@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::cancel::RequestCancel;
 use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
+use crate::git;
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{Outcome, Registry, Snapshot, Status};
 use crate::reviewer::{self, Reviewer};
@@ -513,7 +514,13 @@ impl Job {
             armed: true,
         };
 
-        let outcome = match self.attempt(resume_id.as_deref(), self.turn) {
+        // Captured once, before either attempt: the retry below re-runs the same review
+        // in a new reviewer session, so re-running git for it would only spend time and
+        // risk showing the two turns different trees.
+        let change = git::capture(&self.cfg, &self.cancel)
+            .map(|change| git::render(&change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
+
+        let outcome = match self.attempt(resume_id.as_deref(), self.turn, change.as_deref()) {
             Ok(outcome) => outcome,
             Err(failure) => {
                 // A resume target that has expired is recoverable: drop the stale
@@ -526,7 +533,7 @@ impl Job {
                          reviewer session",
                         self.session
                     );
-                    match self.attempt(None, 1) {
+                    match self.attempt(None, 1, change.as_deref()) {
                         Ok(mut outcome) => {
                             if let Some(review) = outcome.review.take() {
                                 outcome.review = Some(format!(
@@ -549,7 +556,12 @@ impl Job {
         guard.armed = false;
     }
 
-    fn attempt(&self, resume_id: Option<&str>, turn: u32) -> Result<Outcome, Failure> {
+    fn attempt(
+        &self,
+        resume_id: Option<&str>,
+        turn: u32,
+        change: Option<&str>,
+    ) -> Result<Outcome, Failure> {
         let preamble = if self.cfg.no_preamble {
             None
         } else {
@@ -557,8 +569,13 @@ impl Job {
         };
 
         // --no-preamble means "send my instructions with nothing added", so it has to
-        // suppress the capability section too, not just the preamble.
-        let capabilities = self.cfg.reviewer_capabilities();
+        // suppress the capability section too, not just the preamble. It does not
+        // suppress the change: that is evidence the reviewer cannot fetch, not framing
+        // we chose to add, and `--diff none` is the switch for turning it off.
+        //
+        // The capability text is told what was actually captured rather than what was
+        // configured, so a diff that could not be produced is never announced.
+        let capabilities = self.cfg.reviewer_capabilities(change.is_some());
         let capabilities = if self.cfg.no_preamble {
             None
         } else {
@@ -572,6 +589,7 @@ impl Job {
             resumed: resume_id.is_some(),
             preamble,
             capabilities,
+            change,
         });
 
         let invocation = self

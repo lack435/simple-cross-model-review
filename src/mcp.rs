@@ -409,6 +409,16 @@ fn tool_definitions(app: &App) -> Vec<Value> {
          read-only shell commands such as `git diff` and `git log`, so it can inspect the \
          change history itself. You do not need to paste code. Describe what changed and \
          what you want scrutinised."
+    } else if cfg.supplies_diff() {
+        // Worth stating positively. The caller pastes a diff because it believes it has
+        // to; left to infer, it will keep spending its own context on one this server
+        // already fetched.
+        "The reviewer can read and search files in this repository, so you do not need to \
+         paste whole files. It has NO shell of its own, but it does not need one for the \
+         change: this server captures the working-tree diff, `git status`, and the \
+         contents of untracked files, and hands them to the reviewer with your request. \
+         Do not paste a diff into 'instructions' -- describe the intent of the change and \
+         what you want scrutinised instead."
     } else {
         "The reviewer can read and search files in this repository, so you do not need to \
          paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \

@@ -79,6 +79,9 @@ the single source of truth. There is no config file of our own to drift out of s
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.
+--diff <spec>               What to capture as "the change". auto|none|staged|HEAD|<rev>.
+                            Default auto: supply a diff only when the reviewer has no
+                            shell to fetch one itself.
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -90,6 +93,49 @@ Defaults are `claude-opus-5` at `high` and `gpt-5.6-terra` at `xhigh`.
 
 > Pin models by full id. `--model opus` resolves to an older model — verified: it
 > reported `claude-opus-4-8`, not Opus 5.
+
+## The change under review is fetched for you
+
+Most reviews are reviews *of a change*, not of a tree. The Codex reviewer has a read-only
+shell and can run `git diff` itself; the Claude reviewer has none and cannot. Left alone,
+that asymmetry pushes the work onto the caller, which has to paste a diff into
+`instructions` — spending the *caller's* context on it, missing untracked files entirely,
+and, when it is forgotten, getting back a confident review of the current tree rather than
+of the change.
+
+So the server fetches it. It is already a process on your machine with a known working
+root, so running `git` here costs the calling agent nothing:
+
+| `--diff` | What the reviewer is shown |
+| --- | --- |
+| `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no shell** |
+| `none` | nothing; supply your own in `instructions` |
+| `staged` | `git diff --cached` + status |
+| `HEAD` | as `auto`, regardless of whether the reviewer has a shell |
+| *any revision* | `git diff <rev>` + status, e.g. `main...HEAD` or `HEAD~3` |
+
+Notes on the edges, because they are where this would otherwise mislead:
+
+- **The capture is scoped to the working root**, not to the whole repository — the diff
+  runs as `git diff <rev> -- .`. That matters when `--cwd` is a subdirectory: the
+  reviewer's reads are scoped there too, so a wider diff would show it changes to files it
+  cannot open. The exact command is named in the prompt, so the reviewer can report what
+  it was shown.
+- **Untracked files ride with the working-tree modes only** (`auto`, `HEAD`). They are the
+  case a diff structurally cannot cover, so a working-tree review needs them; a `staged`
+  diff or an explicit range named a specific set of changes, and an untracked file is not
+  in either.
+- **An empty diff is still reported**, explicitly, as an empty diff. A reviewer told
+  nothing reviews the current code and calls that a review of the change.
+- **Truncation is stated in the prompt.** The diff is capped at 400 KB and untracked
+  contents at 200 KB total (60 KB per file, 50 files); binary files are named but not
+  included. A silently short diff would be worse than none.
+- **The capture is labelled as evidence, not instructions**, for the same reason CLAUDE.md
+  is — a diff from a repository you do not trust is a prompt injection surface.
+- **A `--diff` value can never become a git option.** Anything starting with `-` is
+  rejected at startup, because `git diff --output=<file>` writes.
+- Skipped silently when the working root is not a git repository, or when git is not
+  installed. `--no-preamble` does not turn it off; `--diff none` does.
 
 ## Re-reviewing after you act on feedback
 
@@ -164,6 +210,11 @@ that it is a soft boundary rather than a guarantee:
 
 Any commands the reviewer attempted but was not permitted to run are reported back with
 the review, so an analysis thinned by missing evidence is visible rather than silent.
+
+What no shell costs the Claude reviewer is the diff, and that is bought back by the server
+fetching it — see [the change under review is fetched for you](#the-change-under-review-is-fetched-for-you).
+The reviewer is told which of the two situations it is in, so it never claims to have seen
+a diff it was not shown, or reports one missing that is sitting in its prompt.
 
 ### The reviewer runs without the project's configuration
 

@@ -56,7 +56,10 @@ pub fn neutral_dir(cfg: &Config) -> PathBuf {
 }
 
 /// Is `path` inside `root`? Compared case-insensitively, as Windows paths are.
-fn is_within(path: &Path, root: &Path) -> bool {
+///
+/// Shared with the diff capture, which uses it as a security check rather than a
+/// convenience, so there is deliberately one implementation and not two.
+pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.trim_end_matches('/');

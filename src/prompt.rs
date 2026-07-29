@@ -44,6 +44,10 @@ pub struct PromptParts<'a> {
     /// tools it does not have wastes its turn discovering that, and may guess instead of
     /// saying it could not check.
     pub capabilities: Option<&'a str>,
+    /// The change under review, captured by the server because the reviewer could not
+    /// fetch it itself. Rendered on every turn, not just the first: a follow-up review
+    /// exists precisely because the working tree moved on since the last one.
+    pub change: Option<&'a str>,
 }
 
 pub fn build(parts: &PromptParts) -> String {
@@ -81,6 +85,12 @@ pub fn build(parts: &PromptParts) -> String {
         );
     }
 
+    if let Some(change) = parts.change {
+        out.push('\n');
+        out.push_str(change.trim_end());
+        out.push('\n');
+    }
+
     if !parts.resumed {
         out.push_str(&format!(
             "\n## Working directory\n\n{}\n",
@@ -115,6 +125,7 @@ mod tests {
             resumed: false,
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: None,
+            change: None,
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -136,6 +147,7 @@ mod tests {
             resumed: true,
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: None,
+            change: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -176,6 +188,7 @@ mod tests {
             resumed: false,
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: Some("You have no shell."),
+            change: None,
         });
         assert!(first.contains("## Your access"));
         assert!(first.contains("You have no shell."));
@@ -189,6 +202,7 @@ mod tests {
             resumed: true,
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: Some("You have no shell."),
+            change: None,
         });
         assert!(!resumed.contains("## Your access"));
     }
@@ -204,9 +218,52 @@ mod tests {
             resumed: false,
             preamble: None,
             capabilities: None,
+            change: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
+    }
+
+    #[test]
+    fn the_change_section_is_rendered_on_a_resumed_turn_too() {
+        // Unlike the preamble and the capability list, the change is not something the
+        // resumed session already knows: a follow-up review exists precisely because the
+        // working tree moved on, so the old diff is the wrong one.
+        let (cwd, paths) = fixtures();
+        for resumed in [false, true] {
+            let text = build(&PromptParts {
+                instructions: "x",
+                context_paths: &paths,
+                cwd: &cwd,
+                turn: 2,
+                resumed,
+                preamble: Some(DEFAULT_PREAMBLE),
+                capabilities: None,
+                change: Some("## Change under review\n\n+ added a line\n"),
+            });
+            assert!(text.contains("## Change under review"), "resumed={resumed}");
+            assert!(text.contains("+ added a line"), "resumed={resumed}");
+        }
+    }
+
+    #[test]
+    fn the_change_section_precedes_the_follow_up_instruction() {
+        // The last thing a resumed reviewer reads should be what to do, not a wall of
+        // diff.
+        let (cwd, paths) = fixtures();
+        let text = build(&PromptParts {
+            instructions: "x",
+            context_paths: &paths,
+            cwd: &cwd,
+            turn: 2,
+            resumed: true,
+            preamble: None,
+            capabilities: None,
+            change: Some("## Change under review\n\n+ y\n"),
+        });
+        let change_at = text.find("## Change under review").expect("change section");
+        let guidance_at = text.find("follow-up turn").expect("guidance");
+        assert!(change_at < guidance_at, "{text}");
     }
 
     #[test]
@@ -219,6 +276,7 @@ mod tests {
             resumed: false,
             preamble: None,
             capabilities: None,
+            change: None,
         });
         assert!(!text.contains("flagged"));
     }

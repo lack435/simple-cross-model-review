@@ -14,6 +14,7 @@ compile_error!(
 mod cancel;
 mod config;
 mod errors;
+mod git;
 mod mcp;
 mod prompt;
 mod registry;
