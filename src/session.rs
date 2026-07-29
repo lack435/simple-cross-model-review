@@ -304,11 +304,17 @@ mod tests {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     /// A fresh directory per test so they can run in parallel.
+    ///
+    /// Cleared before use: the name is only unique per (pid, counter), Windows recycles
+    /// process ids, and an aborted run leaves its directories behind. Without the clear a
+    /// later run that draws a matching pid inherits the earlier run's `sessions.json` and
+    /// lock files, and the session tests assert against state they did not create.
     fn temp_dir() -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
             .join("cross-review-session-tests")
             .join(format!("{}-{}", std::process::id(), n));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
