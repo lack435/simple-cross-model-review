@@ -569,12 +569,14 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
     }
 }
 
-/// One warning about a capture that ran and came back short, phrased the one way.
+/// One warning about a *capture-level* shortfall, phrased the one way.
 ///
-/// Every *incomplete* capture reaches the caller through here, so a new shortfall cannot
-/// arrive wearing a different form of words that an agent scanning the response has to
-/// recognise afresh. A capture that did not happen at all is a different claim and says so
-/// in its own words -- see `Capture::warn`, which is where those go.
+/// Every shortfall the caller is told about comes through here, so a new one cannot arrive
+/// wearing a different form of words that an agent scanning the response has to recognise
+/// afresh. Which shortfalls those are is decided elsewhere and is narrower than "everything
+/// that was left out": per-file omissions stay in the prompt, for the reasons on
+/// `OmissionReport`. A capture that did not happen at all is a different claim again and
+/// says so in its own words -- see `Capture::warn`.
 fn incomplete(note: &str) -> String {
     format!("The captured change was incomplete: {note}")
 }
@@ -1386,9 +1388,10 @@ mod tests {
 
         let report = omissions.finish();
 
-        // Two statements about the capture, and neither per-file note among them: a warning
-        // that fires on every working tree with a build artifact in it is one the caller
-        // stops reading, which would cost these two their audience.
+        // Two statements about the capture, and neither per-file note among them. That
+        // exclusion is the policy this test exists to hold in place: a warning is meant to
+        // mean the capture itself was short, so what does not change that answer stays in
+        // the prompt.
         assert_eq!(report.capture_level.len(), 2, "{report:?}");
         assert!(
             !report.capture_level.iter().any(|w| {
@@ -2068,10 +2071,10 @@ mod tests {
 
     #[test]
     fn an_ordinary_skipped_file_does_not_warn_the_caller() {
-        // The guard on the rule above. A binary untracked file is true of nearly every
-        // working tree with a build artifact in it, so promoting per-file notes would put a
-        // warning on almost every review -- and a warning that always fires is one the
-        // caller stops reading, which is what the capture-level warnings cannot afford.
+        // The guard on the rule above, at capture level. A file the listing reached and
+        // then skipped does not make the listing partial, so it is not what a warning is
+        // for -- and this is the assertion that stops "warn about everything" arriving
+        // later as an obvious improvement.
         let Some(dir) = repo_with_a_change() else {
             return;
         };
