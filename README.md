@@ -191,6 +191,12 @@ Notes on the edges, because they are where this would otherwise mislead:
   containing no `..` to detect, so they would be read as working-tree comparisons and change
   what the reviewer is shown. Verified: with a tracked file dirty, `git diff HEAD^!` reported
   5 files and `git diff HEAD~1` reported 6. Parent notation (`HEAD^`, `HEAD^^`) is untouched.
+  So is the reverse case, `:/<pattern>` containing `..`: git splits a revision on the first
+  `..`, so `:/fix..HEAD` is a range whose left endpoint is a commit-message search, and
+  nothing distinguishes it from a search for a pattern that contains `..`. Verified too —
+  `git rev-parse ':/fix..HEAD'` returned two endpoints, and `git diff ':/fix..HEAD'` ignored
+  a dirty file that `git diff ':/fix'` picked up. A brace-scoped search (`HEAD^{/a..b}`) is
+  unambiguous and stays legal, because the braces say where the pattern ends.
 - **The whole capture shares a 60-second budget**, not one timeout per command, so a wedged
   repository cannot spend four independent timeouts. The budget bounds the git commands
   themselves; each invocation can additionally spend up to the 10-second output drain grace

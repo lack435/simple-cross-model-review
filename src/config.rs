@@ -352,11 +352,14 @@ impl Config {
             //
             // Entries are compared whole, not as substrings: `BashOutput` is a separate
             // tool that reads a background shell's output and can run nothing.
+            // Both halves compare exactly, and they must agree: a case-insensitive tool
+            // check against a case-sensitive rule check made `--tools ...,bash
+            // --allow-tools bash` "in the session but not permitted", which is a
+            // contradiction rather than an answer. Exact is the right convention of the
+            // two, because the CLI's own tool names are exact -- so `bash` most likely
+            // enables nothing, and calling that a shell would be the unsafe direction.
             ReviewerKind::Claude => {
-                let in_session = self
-                    .tools
-                    .split(',')
-                    .any(|tool| tool.trim().eq_ignore_ascii_case("Bash"));
+                let in_session = self.tools.split(',').any(|tool| tool.trim() == "Bash");
                 in_session && self.allowed_tools.iter().any(|rule| permits_bash(rule))
             }
         }
@@ -531,12 +534,17 @@ OPTIONS:
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
   --tools <list>              Claude built-in tools. Default: Read,Grep,Glob
                               (no Bash: see the README on why a prefix allow-list
-                              cannot express read-only).
+                              cannot express read-only). Bash here is not enough on
+                              its own -- it also needs an --allow-tools rule, since
+                              the reviewer runs under dontAsk and is otherwise
+                              handed a tool it can never call.
   --allow-tools <list>        Claude permission rules. Default: Read/Grep/Glob scoped
                               to the working root, so reads cannot leave the project.
   --diff <spec>               What to capture and hand the reviewer as "the change".
                               auto    supply a working-tree diff only when the reviewer
-                                      has no shell to fetch one itself (default)
+                                      has no usable shell to fetch one itself, i.e.
+                                      Codex, or Claude without Bash both enabled and
+                                      allow-listed (default)
                               none    supply nothing; paste your own into 'instructions'
                               staged  git diff --cached
                               HEAD    git diff HEAD, plus untracked file contents

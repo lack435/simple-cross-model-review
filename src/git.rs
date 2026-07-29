@@ -81,12 +81,14 @@ fn revision_set_suffix(spec: &str) -> Option<&'static str> {
 /// Whether a spec names two endpoints, i.e. whether its `..` is a range operator.
 ///
 /// The mirror of `revision_set_suffix`, and the same mistake pointing the other way: `..`
-/// is a range operator most of the time and ordinary text the rest of it. `:/fix..bug`
-/// searches commit messages for "fix..bug" and compares that single commit against the
-/// working tree; `HEAD^{/a..b}` is the same shape scoped to one ref. Reading either as a
-/// range would drop untracked capture and raise a dirty-tree warning that is simply false.
+/// is a range operator most of the time and ordinary text the rest of it. `HEAD^{/a..b}`
+/// searches commit messages for "a..b" within one ref and compares that single commit
+/// against the working tree; reading it as a range would drop untracked capture and raise a
+/// dirty-tree warning that is simply false.
 fn is_two_endpoint(spec: &str) -> bool {
-    // `:/` searches from any ref, so everything after it is the pattern.
+    // `:/` searches from any ref, and everything after it is the pattern -- but only
+    // because `parse` has already refused the `:/…..…` case, where git would split on the
+    // first `..` and read the search as a range's left endpoint instead.
     if spec.starts_with(":/") {
         return false;
     }
@@ -146,6 +148,22 @@ impl DiffMode {
                 "--diff '{trimmed}' uses git's revision-set shorthand ('{found}'), which cannot \
                  be told apart from a working-tree comparison without asking git. Pass an \
                  explicit two-endpoint range instead, such as 'HEAD~1..HEAD'."
+            ));
+        }
+        // A commit-message search can be the *left endpoint* of a range, which makes `:/`
+        // ambiguous rather than always-a-single-revision: git splits on the first `..`, so
+        // `:/fix..bug` searches for "fix..bug" while `:/fix..HEAD` is a range from the
+        // commit matching "fix". Verified: `git rev-parse ':/fix..HEAD'` returned two
+        // endpoints, and `git diff ':/fix..HEAD'` ignored a dirty file that `git diff
+        // ':/fix'` picked up. Guessing wrong here is the unsafe direction -- it would ship
+        // untracked contents as part of a commit-to-commit change and suppress the
+        // dirty-tree warning -- so it is refused, like the other ambiguity above.
+        if trimmed.starts_with(":/") && trimmed.contains("..") {
+            return Err(format!(
+                "--diff '{trimmed}' is ambiguous: git splits a revision on the first '..', so \
+                 this is a range whose left endpoint is a commit-message search rather than a \
+                 search for a pattern containing '..'. Name the endpoint commit explicitly, \
+                 such as 'HEAD~1..HEAD'."
             ));
         }
         // Keyword match is case-insensitive, which means a branch or tag literally named
@@ -572,7 +590,14 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
     // real defect, and the preamble tells the reviewer not to soften one; what is wanted is
     // correct attribution, not silence.
     if change.tree_may_differ {
-        out.push_str("### The tree you can read is not the diff above\n\n");
+        // The heading follows the same branch as the body: asserting the tree *is* different
+        // when the status could not be read would be claiming what was not established, and
+        // a heading is the part a reviewer skims and quotes back.
+        if change.tree_state_known {
+            out.push_str("### The tree you can read is not the diff above\n\n");
+        } else {
+            out.push_str("### The tree you can read may not be the diff above\n\n");
+        }
         if change.tree_state_known {
             out.push_str("The working tree has changes that are **not** in the diff above. ");
         } else {
@@ -1259,6 +1284,18 @@ mod tests {
             assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
         }
 
+        // A commit-message search can be a range's *left* endpoint, and git splits on the
+        // first `..`, so `:/fix..HEAD` is a range while `:/fix..bug` is not a distinction
+        // this can make. Verified: `git rev-parse ':/fix..HEAD'` returned two endpoints,
+        // and `git diff ':/fix..HEAD'` ignored a dirty file that `git diff ':/fix'` picked
+        // up -- so guessing "single revision" would ship untracked contents as part of a
+        // commit-to-commit change.
+        for spec in [":/fix..HEAD", ":/fix..bug", ":/a..b"] {
+            let err = DiffMode::parse(spec).unwrap_err();
+            assert!(err.contains("ambiguous"), "{spec}: {err}");
+            assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+        }
+
         // Terminal only. These characters are ordinary inside a revision: `:/^!release`
         // selects a commit by message and compares against the working tree like any other
         // single revision, so refusing it would be refusing something that is not the form.
@@ -1278,9 +1315,13 @@ mod tests {
     /// The mirror of the `^!` case: `..` is a range operator most of the time and ordinary
     /// text the rest of it. Reading a commit-message search as a range would drop untracked
     /// capture and raise a dirty-tree warning that is false.
+    ///
+    /// `:/…` with dots is refused rather than classified — see the parse test — because git
+    /// splits it on the first `..` and the two readings are not distinguishable. Scoped
+    /// searches are unambiguous, because the braces say where the pattern ends.
     #[test]
     fn a_dotted_commit_message_search_is_not_a_range() {
-        for spec in [":/fix..bug", ":/a..b", "HEAD^{/a..b}"] {
+        for spec in ["HEAD^{/a..b}", "main^{/fix..bug}"] {
             let mode = DiffMode::parse(spec).expect(spec);
             assert!(mode.compares_against_working_tree(), "{spec}");
             assert!(mode.includes_untracked(), "{spec}");
