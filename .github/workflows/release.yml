@@ -79,8 +79,20 @@ jobs:
         shell: pwsh
         run: |
           $hash = (Get-FileHash 'dist\cross-review.exe' -Algorithm SHA256).Hash.ToLower()
-          "$hash  cross-review.exe" | Out-File -FilePath 'dist\SHA256SUMS.txt' -Encoding ascii
-          Get-Content 'dist\SHA256SUMS.txt'
+          $path = Join-Path $PWD 'dist\SHA256SUMS.txt'
+
+          # LF and no BOM, written explicitly. PowerShell's Out-File emits CRLF, and
+          # `sha256sum -c` treats the trailing CR as part of the filename -- so the file
+          # published for v0.1.0 failed to verify with "cross-review.exe: FAILED open or
+          # read" despite containing the correct hash.
+          [System.IO.File]::WriteAllText($path, "$hash  cross-review.exe`n", (New-Object System.Text.UTF8Encoding($false)))
+
+          # Guard the format, since the failure is invisible on Windows and only shows up
+          # for whoever tries to verify the download.
+          $bytes = [System.IO.File]::ReadAllBytes($path)
+          if ($bytes -contains 13) { throw 'SHA256SUMS.txt contains a CR; sha256sum -c would fail on it' }
+          if ($bytes[0] -eq 0xEF) { throw 'SHA256SUMS.txt has a BOM; sha256sum -c would fail on it' }
+          Get-Content $path
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

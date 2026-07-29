@@ -47,7 +47,11 @@ one entry to a project config file. Commit both, so a fresh clone of *your* proj
 no setup at all.
 
 Get the executable from the [Releases page](../../releases) — download `cross-review.exe`
-and check it against `SHA256SUMS.txt`. It is not committed to this repository: a committed
+and check it against `SHA256SUMS.txt`:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+``` It is not committed to this repository: a committed
 binary cannot be kept honest, because a running MCP server locks the file, CI cannot tell
 a stale copy from a current one while the version is pinned, and it embedded the builder's
 home directory. `cross-review.exe --version` reports the commit it was built from. To
