@@ -243,8 +243,8 @@ not trust:
 
 | | writes | reads outside the project | shell |
 | --- | --- | --- | --- |
-| **Claude reviewer** | denied | **denied** | none |
-| **Codex reviewer** | denied | **not confined** | yes |
+| **Claude reviewer** | denied (no such tool) | **denied** | none |
+| **Codex reviewer** | denied (OS sandbox) | **not confined** | yes |
 
 - **Codex reviewer** — `--sandbox read-only`, plus the same policy restated as
   `-c sandbox_mode` on resumed turns, since `-s` exists only on the fresh-session form.
@@ -254,11 +254,47 @@ not trust:
   the review text, which is returned to the caller verbatim. If you are reviewing a
   repository you do not trust, prefer the Claude direction.
 
-  A caveat on enforcement: the README previously claimed this is enforced by the OS. What
-  I have actually verified is that the write was *refused* — I have not established
-  whether that refusal comes from the OS or from Codex's own policy layer, and Codex's
-  sandboxing has historically been Seatbelt/Landlock, i.e. macOS and Linux. Treat the
-  Codex write boundary as enforced by the CLI unless you have checked further.
+  **The write boundary is the OS's.** This was previously hedged as "the CLI's, unless you
+  have checked further", because only the refusal had been observed and not what refused
+  it. It has now been checked, against Codex 0.145.0 on Windows 11. `codex sandbox` runs a
+  command under the same sandbox with **no model and no agent policy layer in the loop**,
+  which is what makes it a usable probe: under `-c sandbox_mode="read-only"`, a redirect to
+  a new file was refused with `Access is denied.` — reported by `cmd` itself, from a Win32
+  access-denied, and no file appeared. That held for a target outside the project and for
+  one inside it, so it is not the workspace boundary doing the work. Codex's own help calls
+  this the "Windows restricted token sandbox", and the refusal survives
+  `-c windows.sandbox="unelevated"`, which is the backend the reviewer actually gets —
+  `--ignore-user-config` skips the `[windows] sandbox` setting in your own config, so the
+  boundary does not depend on it. Seatbelt and Landlock are the macOS and Linux
+  implementations; Windows has its own, and it is enforcing.
+
+  **Read confinement was investigated and there is nothing here to enforce it.** Codex
+  0.145.0 does have a filesystem permission surface — `[permissions.<name>.filesystem]`
+  maps a path, a glob, or a special root such as `:workspace_roots` to `read`, `write` or
+  `deny` — and it does narrow the policy the *model* is shown. Verified with
+  `codex debug prompt-input`: the default `read-only` mode renders
+  `<file_system type="restricted"><entry access="read"><special>:root</special></entry>`,
+  i.e. read the whole filesystem, and
+  `-c 'permissions.p.filesystem={ ":workspace_roots" = "read" }' -c 'default_permissions="p"'`
+  narrows that to a single `<path>` entry naming the project root. It is advisory. The same
+  profile passed to `codex sandbox` as `-P p` still read a file outside the project, as did
+  a profile carrying an explicit `deny` entry on that exact directory, on both the
+  unelevated and the elevated backend. So this is a prompt-level hint that renders as a
+  policy, and wiring it in would make the table above read *confined* while the boundary
+  stayed open — the failure mode this file exists to avoid. It is not wired in.
+
+  Two more paths were ruled out rather than left unexamined. `--sandbox-state-readable-root`
+  is named for exactly this, but it is a flag on `codex sandbox` that will not run without
+  `--sandbox-state-json` — internal plumbing for the app server, not a surface `codex exec`
+  exposes, so what it would enforce was never reached. And
+  `permissions.filesystem.deny_read`, which the binary describes as requiring the elevated
+  backend, belongs to machine-managed enterprise requirements rather than user config; an
+  MCP server editing machine-wide policy to confine its own child is not a trade worth
+  making. That leaves two options: keep documenting the gap, or take the Codex reviewer's
+  shell away as the Claude reviewer's was taken. The shell is why that direction exists —
+  it is the one that can review an uncommitted working tree — so it stays, and the Claude
+  direction remains the confined one. All of the above is one CLI version on one OS;
+  re-check it rather than inheriting it.
 - **Claude reviewer** — `--tools Read,Grep,Glob`. Write tools *and* Bash are absent from
   the session entirely, so there is nothing to attempt. Read, Grep and Glob are Claude
   Code's own tools and have no write or execute capability. Each is further scoped to the
