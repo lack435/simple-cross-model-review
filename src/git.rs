@@ -847,10 +847,7 @@ impl<'a> Git<'a> {
                 omitted.content_cap_skipped(&safe_label(path));
                 continue;
             }
-            // Whichever cap is tighter bounds the read; which one it was decides what the
-            // prompt may claim about a file that comes back short.
-            let cap = MAX_UNTRACKED_FILE_BYTES.min(budget);
-            let cut_by_total_cap = budget < MAX_UNTRACKED_FILE_BYTES;
+            let (cap, cut_by_total_cap) = read_cap(budget);
 
             // Capped as it is read, not after: an untracked multi-gigabyte artifact is a
             // perfectly ordinary thing to find in a working tree, and reading it whole to
@@ -945,6 +942,22 @@ impl Omissions {
         }
         self.notes
     }
+}
+
+/// How far the next untracked file may be read, and whether that bound is the total budget
+/// rather than the per-file cap.
+///
+/// Whichever is tighter bounds the read, so a file cut short by an exhausted total looks
+/// exactly like an oversized one. Which it was decides what the prompt may claim about the
+/// file, so the decision is made here, where it can be tested at the boundary directly:
+/// the capture-level test for it has to arrange a real repository's byte totals and then
+/// leans on `git ls-files` returning sorted paths, which is observed behaviour rather than
+/// a documented guarantee.
+fn read_cap(budget: usize) -> (usize, bool) {
+    (
+        MAX_UNTRACKED_FILE_BYTES.min(budget),
+        budget < MAX_UNTRACKED_FILE_BYTES,
+    )
 }
 
 /// Read at most `cap` bytes, reporting whether there were more.
@@ -1589,9 +1602,30 @@ mod tests {
     }
 
     #[test]
+    fn the_tighter_of_the_two_caps_bounds_the_read_and_is_named_correctly() {
+        // The boundary itself, away from any repository: the capture-level test below
+        // needs `git ls-files` to return sorted paths for its arithmetic to hold, and that
+        // is observed rather than documented.
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES + 1),
+            (MAX_UNTRACKED_FILE_BYTES, false)
+        );
+        // Coincident: the file's own cap is the true reason, so it is the one named.
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES),
+            (MAX_UNTRACKED_FILE_BYTES, false)
+        );
+        assert_eq!(
+            read_cap(MAX_UNTRACKED_FILE_BYTES - 1),
+            (MAX_UNTRACKED_FILE_BYTES - 1, true)
+        );
+        assert_eq!(read_cap(1), (1, true));
+    }
+
+    #[test]
     fn which_cap_cut_a_file_short_is_decided_by_the_real_budget() {
-        // The test above sets the flag by hand, which proves the rendering and nothing
-        // about the boundary that sets it. This one makes a real capture work it out.
+        // The rendering test sets the flag by hand and the test above pins the boundary in
+        // isolation; this one checks the two are wired together, over a real capture.
         let spent = MAX_UNTRACKED_TOTAL_BYTES - MAX_UNTRACKED_FILE_BYTES;
 
         // Exactly the per-file cap is left, so the two limits coincide and the per-file

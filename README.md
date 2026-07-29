@@ -178,8 +178,9 @@ Notes on the edges, because they are where this would otherwise mislead:
 - **Truncation is stated in the prompt**, for the diff, the status listing and each
   untracked file. Caps: 400 KB diff, 200 KB untracked contents total, 60 KB per file, 50
   files included, 200 paths examined, 20 per-file lines of "what was left out". Binary
-  files are named, not included. Files are read up to their cap rather than read whole and
-  then cut, and a truncated file names the cap that actually cut it — the read is bounded
+  files are not included, and are named individually as far as those 20 lines reach — past
+  that they are counted rather than named. Files are read up to their cap rather than read
+  whole and then cut, and a truncated file names the cap that actually cut it — the read is bounded
   by whatever is smaller, so calling it the per-file cap would claim a 200-byte file is
   over 60 KB. That last cap covers the per-file lines only: the statements about the
   capture *itself* — the listing stopped early, files were dropped for want of budget —
