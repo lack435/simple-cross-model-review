@@ -205,8 +205,11 @@ pub fn cancelled() -> Failure {
     Failure::new(
         "CANCELLED",
         "The review was cancelled before it finished.",
-        "The cross-model review was cancelled, so there is no review feedback. Start a new \
-         review if one is still needed.",
+        "The cross-model review was cancelled, so there is no review feedback. Either \
+         cross_model_review_cancel was called, or the request waiting on the review was \
+         abandoned by the client -- an interrupted turn or a client-side tool timeout \
+         does that, and cancels the review with it. Start a new review if one is still \
+         needed.",
     )
 }
 

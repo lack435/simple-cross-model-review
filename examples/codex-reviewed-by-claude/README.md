@@ -25,6 +25,11 @@ The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 5.
 
    Relative paths resolve against the project root, so this config travels with the repo.
 
+   `tool_timeout_sec` must stay above 300, the cap on a single
+   `cross_model_review_result` poll. The server honours `notifications/cancelled` by
+   stopping the reviewer, so a client that gives up on a poll first would discard a
+   review that was still coming.
+
 3. Reopen the project in Codex.
 
 4. Ask Codex to call `cross_model_review_status`. It should report `ready: yes` along

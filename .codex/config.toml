@@ -24,6 +24,9 @@ command = "dist\\cross-review.exe"
 args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
-# covers a single request rather than a whole review.
+# covers a single request rather than a whole review. It must still exceed the 300s cap on
+# a single cross_model_review_result poll: the server honours notifications/cancelled by
+# stopping the reviewer, so a client that gives up first would discard a review that was
+# still coming.
 startup_timeout_sec = 30
 tool_timeout_sec = 400
