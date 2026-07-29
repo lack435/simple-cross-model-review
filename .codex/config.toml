@@ -21,7 +21,19 @@
 
 [mcp_servers.cross_review]
 command = "dist\\cross-review.exe"
-args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+args = [
+    "--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high",
+    "--diff", "main...HEAD",
+]
+
+# The Claude reviewer has no shell, so the server captures the change for it. The default
+# --diff auto captures the working tree, which is empty exactly when a PR is ready to review
+# -- the work is committed by then. AGENTS.md makes cross-review the merge gate, so this
+# entry is pinned to the branch against its base instead, which is what a PR review needs.
+#
+# The cost is the other half: --diff is a startup flag rather than a per-call argument, so
+# this entry cannot also capture uncommitted work. Mid-development review of a dirty tree
+# goes the other direction, where the Codex reviewer has a shell and can look for itself.
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
 # covers a single request rather than a whole review. It must still exceed the 300s cap on

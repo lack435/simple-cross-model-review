@@ -22,10 +22,20 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
 - **Getting the diff in front of the reviewer depends on which direction you are calling.**
-  The Codex reviewer has a shell, so give it the branch and base and let it run `git diff`
-  itself. The Claude reviewer has none: it cannot run `git` and cannot reconstruct a diff
-  from `.git` with Read, Grep and Glob, so put the diff in the instructions or it will
-  review the current state of the tree instead of your change.
+  The Codex reviewer has a read-only shell, so give it the branch and base and let it run
+  `git diff` itself. The Claude reviewer still has no shell, but no longer needs one: the
+  server captures the change and hands it over with the request. Do not paste a diff into
+  `instructions` in either direction — describe the intent and what you want scrutinised,
+  and let the reviewer or the server fetch the code.
+- **For the Claude direction, the gate reviews what is committed.** What gets captured is
+  fixed by `--diff` on the server entry, not chosen per call, and
+  [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
+  branch against its base rather than the default working-tree capture, which is empty once
+  the work is committed. So commit before asking for the gate review: uncommitted edits are
+  not in that range, and the reviewer will report on the branch without them rather than
+  notice they are missing. For mid-development review of work that is *not* committed yet,
+  call from the Claude side instead — the Codex reviewer has a shell and can see the working
+  tree.
 - Say what changed and why, and point the reviewer at this file and `README.md`. It runs
   configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
   when told to.
