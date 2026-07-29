@@ -799,7 +799,7 @@ impl<'a> Git<'a> {
 
         for (examined, path) in paths.iter().enumerate() {
             if examined >= MAX_UNTRACKED_EXAMINED || files.len() >= MAX_UNTRACKED_FILES {
-                omitted.push(format!(
+                omitted.set_listing_cut_short(format!(
                     "{} further untracked file(s) were not examined (caps: {} included, {} \
                      examined)",
                     paths.len() - examined,
@@ -869,10 +869,19 @@ impl<'a> Git<'a> {
 
 /// Omission notes, capped so that explaining what was skipped cannot itself flood the
 /// prompt: these are one line per file, and a working tree can hold a great many.
+///
+/// The cap covers the per-file notes only. The note saying the *listing itself* stopped
+/// early is held separately and always rendered, because it is written last -- after up to
+/// `MAX_UNTRACKED_EXAMINED` files have had their chance to take every slot -- so sharing
+/// the cap would suppress it in precisely the case it exists to report: a working tree with
+/// thousands of untracked files, where the reviewer would be handed twenty individual
+/// skipped files and never told the listing was cut short at all. That is the silent
+/// shortfall this module refuses to produce; see `Change::notes`.
 #[derive(Default)]
 struct Omissions {
     notes: Vec<String>,
     suppressed: usize,
+    listing_cut_short: Option<String>,
 }
 
 impl Omissions {
@@ -884,10 +893,20 @@ impl Omissions {
         }
     }
 
+    /// Record that the listing was truncated. Exempt from the cap, and it survives any
+    /// number of per-file notes.
+    fn set_listing_cut_short(&mut self, note: String) {
+        self.listing_cut_short = Some(note);
+    }
+
     fn finish(mut self) -> Vec<String> {
         if self.suppressed > 0 {
             self.notes
                 .push(format!("... and {} further note(s)", self.suppressed));
+        }
+        // Last, because it describes the whole listing rather than one more file in it.
+        if let Some(note) = self.listing_cut_short.take() {
+            self.notes.push(note);
         }
         self.notes
     }
@@ -1164,6 +1183,30 @@ mod tests {
         let notes = omissions.finish();
         assert_eq!(notes.len(), MAX_OMISSION_NOTES + 1);
         assert!(notes.last().unwrap().contains("further note"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_listing_being_cut_short_outlives_the_note_cap() {
+        // The note is written after every per-file note, so if it shared the cap it would
+        // be suppressed in exactly the case it reports: a tree with more untracked files
+        // than we will look at.
+        let mut omissions = Omissions::default();
+        for i in 0..500 {
+            omissions.push(format!("note {i}"));
+        }
+        omissions.set_listing_cut_short("300 further untracked file(s) were not examined".into());
+
+        let notes = omissions.finish();
+        assert_eq!(notes.len(), MAX_OMISSION_NOTES + 2);
+        assert!(
+            notes.iter().any(|n| n.contains("were not examined")),
+            "{notes:?}"
+        );
+        // And the per-file cap still holds: the exemption is for this one note only.
+        assert_eq!(
+            notes.iter().filter(|n| n.starts_with("note ")).count(),
+            MAX_OMISSION_NOTES
+        );
     }
 
     #[test]
@@ -1684,6 +1727,34 @@ mod tests {
                 .untracked_omitted
                 .iter()
                 .any(|note| note.contains("outside the working root")),
+            "{:?}",
+            change.untracked_omitted
+        );
+    }
+
+    #[test]
+    fn a_flood_of_untracked_files_still_reports_that_the_listing_was_cut_short() {
+        // The case the examined cap exists for. Every file here is binary, so each one
+        // spends a per-file omission note before the cap on the listing is reached -- and
+        // the note about the listing is written last. If it took a slot like any other,
+        // the reviewer would be told about twenty skipped files and never that there were
+        // hundreds more it was not told about.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        for i in 0..MAX_UNTRACKED_EXAMINED + 50 {
+            std::fs::write(dir.join(format!("blob-{i:04}.bin")), [0u8, 1, 2]).expect("write");
+        }
+
+        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+            .change
+            .expect("a change");
+
+        assert!(
+            change
+                .untracked_omitted
+                .iter()
+                .any(|note| note.contains("were not examined")),
             "{:?}",
             change.untracked_omitted
         );
