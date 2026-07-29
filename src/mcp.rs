@@ -498,10 +498,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // The shell clause is the one part that cannot be stated unconditionally here: a
         // capture is configured for both kinds of reviewer, but only one of them lacks a
         // shell, and telling the caller a shelled reviewer has none would be a plain lie.
-        let shell = if cfg.reviewer_has_shell() {
-            "It has a read-only shell, and it is also handed the change directly"
-        } else {
-            "It has NO shell of its own, but it does not need one for the change"
+        // "read-only" is claimed only for Codex, whose sandbox policy is what enforces it.
+        // The Claude reviewer only has a shell when someone opted in with --tools, and the
+        // README is emphatic that a prefix allow-list cannot express read-only, so calling
+        // that one read-only here would be the kind of unearned claim this repo avoids.
+        let shell = match (cfg.reviewer_has_shell(), cfg.reviewer) {
+            (true, crate::config::ReviewerKind::Codex) => {
+                "It has a read-only shell, and it is also handed the change directly"
+            }
+            (true, crate::config::ReviewerKind::Claude) => {
+                "It has a shell, because one was enabled explicitly, and it is also handed \
+                 the change directly"
+            }
+            (false, _) => "It has NO shell of its own, but it does not need one for the change",
         };
         format!(
             "The reviewer can read and search files in this repository, so you do not need to \

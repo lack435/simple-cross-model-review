@@ -402,7 +402,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 163 unit tests: no network, no model calls
+cargo test          # 165 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```

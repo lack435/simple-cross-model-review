@@ -488,9 +488,15 @@ OPTIONS:
                               none    supply nothing; paste your own into 'instructions'
                               staged  git diff --cached
                               HEAD    git diff HEAD, plus untracked file contents
-                              <rev>   any revision or range, e.g. main...HEAD
-                              Skipped silently when the working root is not a git
-                              repository. Not affected by --no-preamble; use --diff none.
+                              a..b    two commits, e.g. main...HEAD: no working tree,
+                                      no untracked files
+                              <rev>   that commit against the WORKING TREE, e.g. HEAD~3,
+                                      plus untracked file contents -- git's own semantics,
+                                      not ours. Revision-set shorthand (^!, ^@, ^-) is
+                                      rejected, since it is a range with no .. to see.
+                              A capture that was configured and could not be produced is
+                              reported to the caller with the review, not skipped in
+                              silence. Not affected by --no-preamble; use --diff none.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration

@@ -31,7 +31,7 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   fixed by `--diff` on the server entry, not chosen per call, and
   [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
   branch against its base rather than the default working-tree capture, which is empty once
-  the work is committed. Three things follow, and the first two are pre-flight:
+  the work is committed. Four things follow, and the first two are pre-flight:
   - **Commit, and check `git status --porcelain` is empty, before every call in that
     direction — the first review and each re-review.** A dirty tree is worse than it looks:
     the capture is the committed range, but the reviewer can read the live files and is
@@ -45,21 +45,33 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
     distinguishes that from a large PR, so the check is yours to make:
 
     ```powershell
-    git fetch origin; if (-not $?) { throw "fetch failed - origin/main may be stale, stop" }
-    git merge-base --is-ancestor main origin/main; if (-not $?) { throw "local main has diverged - stop" }
+    git fetch origin
+    if ($LASTEXITCODE -ne 0) { throw "fetch failed - origin/main may be stale, stop" }
+    git merge-base --is-ancestor main origin/main
+    if ($LASTEXITCODE -eq 1) { throw "local main has diverged - sort that out first" }
+    if ($LASTEXITCODE -ne 0) { throw "could not compare main to origin/main - stop" }
     git branch -f main origin/main
+    if ((git rev-parse main) -ne (git rev-parse origin/main)) { throw "main was not updated - stop" }
     ```
 
-    Both guards matter, and neither is theoretical. A failed `fetch` leaves `origin/main` at
-    whatever it was last time, so the ancestor check passes against a stale ref and reports
-    everything as current — the exact failure the preflight exists to catch, wearing the
-    costume of a passing check. And `git branch -f` on a diverged `main` discards the local
-    tip rather than refusing.
+    Every check earns its line. A failed `fetch` leaves `origin/main` at whatever it was
+    last time, so the ancestor test passes against a stale ref and reports everything
+    current — the exact failure this preflight exists to catch, wearing the costume of a
+    passing check. `--is-ancestor` exits 1 for "no" and 128 for an error, so a missing
+    `origin` would otherwise be reported as divergence. `git branch -f` on a diverged `main`
+    discards the local tip rather than refusing, and it fails outright when `main` is the
+    branch you have checked out — so the last line confirms the ref actually moved rather
+    than trusting that it did. Use `$LASTEXITCODE`, not `$?`: for native commands in
+    Windows PowerShell, `$?` can be set from the error stream.
   - **If your PR is not based on `main`, this entry cannot gate it.** The base is pinned in
     the server arguments, so a review of `main...HEAD` on a stacked branch takes in the PR
     underneath as well and would pass the gate without the PR's own diff ever being reviewed
-    alone. Point a checkout's `--diff` at the real base, and say in `instructions` what the
-    base is. Do not describe the mismatch and proceed.
+    alone. Do not describe the mismatch and proceed. Register a second server under a
+    different `[mcp_servers.…]` name, with `--diff` pointing at the real base, in your
+    **global** `%USERPROFILE%\.codex\config.toml` — not in this repository's
+    [`.codex/config.toml`](.codex/config.toml), which is tracked, so editing it would either
+    dirty the tree the bullet above requires to be clean or land a config change inside the
+    PR being gated.
   - For mid-development review of work that is not committed yet, open a Claude Code session
     against this checkout and call from there — that direction gets the Codex reviewer, which
     has a shell and can see the working tree. A Codex session cannot reach it by changing
