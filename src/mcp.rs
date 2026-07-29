@@ -477,6 +477,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
          read-only shell commands such as `git diff` and `git log`, so it can inspect the \
          change history itself. You do not need to paste code. Describe what changed and \
          what you want scrutinised."
+            .to_string()
     } else if cfg.supplies_diff() {
         // Worth stating positively. The caller pastes a diff because it believes it has
         // to; left to infer, it will keep spending its own context on one this server
@@ -486,14 +487,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // repository, which is only known at capture time. The reviewer is told the
         // runtime answer; the caller can only be told the intent, so it must not be
         // promised more than that.
-        "The reviewer can read and search files in this repository, so you do not need to \
-         paste whole files. It has NO shell of its own, but it does not need one for the \
-         change: when the working root is a git repository, this server captures the \
-         working-tree diff, `git status`, and the contents of untracked files, and hands \
-         them to the reviewer with your request. Do not paste a diff into 'instructions' \
-         -- describe the intent of the change and what you want scrutinised instead. Note \
-         that the capture covers uncommitted work; if what you want reviewed is already \
-         committed, say so in 'instructions'."
+        // What is captured is what `--diff` selects, so the description asks the mode
+        // rather than restating one of them: under `--diff staged` or a range this text
+        // otherwise promised a working-tree capture with untracked files that those modes
+        // deliberately exclude.
+        let (captures, caveat) = cfg.diff.caller_summary();
+        format!(
+            "The reviewer can read and search files in this repository, so you do not need to \
+             paste whole files. It has NO shell of its own, but it does not need one for the \
+             change: when the working root is a git repository, this server captures \
+             {captures}, and hands them to the reviewer with your request. Do not paste a diff \
+             into 'instructions' -- describe the intent of the change and what you want \
+             scrutinised instead. {caveat}"
+        )
     } else {
         "The reviewer can read and search files in this repository, so you do not need to \
          paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \
@@ -501,6 +507,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
          the code, include the diff or a precise description of the change in \
          'instructions' -- otherwise the reviewer can only judge the code as it now \
          stands, and will say so."
+            .to_string()
     };
     let caller_hint = match cfg.reviewer {
         crate::config::ReviewerKind::Claude => {
@@ -698,6 +705,47 @@ mod tests {
         let tool = &response["result"]["tools"][0];
         assert_eq!(tool["inputSchema"]["required"][0], "instructions");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    /// The caller is told what `--diff` actually captures. A description hardcoded to the
+    /// working-tree modes told a `--diff main...HEAD` caller that untracked files and
+    /// uncommitted work were included, which is exactly backwards for a range.
+    #[test]
+    fn review_tool_description_matches_the_configured_diff_mode() {
+        let describe = |args: &[&str]| {
+            let mut all: Vec<String> = vec!["--reviewer".into(), "claude".into()];
+            all.extend(args.iter().map(|a| (*a).to_string()));
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description")
+                .to_string()
+        };
+
+        let ranged = describe(&["--diff", "main...HEAD"]);
+        assert!(ranged.contains("`git diff main...HEAD`"), "{ranged}");
+        assert!(!ranged.contains("untracked files, and hands"), "{ranged}");
+        assert!(
+            ranged.contains("commit what you want reviewed first"),
+            "{ranged}"
+        );
+
+        let staged = describe(&["--diff", "staged"]);
+        assert!(staged.contains("`git diff --cached`"), "{staged}");
+        assert!(staged.contains("staged work only"), "{staged}");
+
+        // The default for a shell-less reviewer still describes the working tree.
+        let auto = describe(&[]);
+        assert!(auto.contains("the contents of untracked files"), "{auto}");
+        assert!(auto.contains("covers uncommitted work"), "{auto}");
+
+        // A reviewer with a shell fetches its own, and is told so instead.
+        let shelled = describe(&["--tools", "Read,Grep,Glob,Bash"]);
+        assert!(
+            shelled.contains("can inspect the change history itself"),
+            "{shelled}"
+        );
     }
 
     #[test]

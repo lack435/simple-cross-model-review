@@ -34,6 +34,11 @@ args = [
 # The cost is the other half: --diff is a startup flag rather than a per-call argument, so
 # this entry cannot also capture uncommitted work. Mid-development review of a dirty tree
 # goes the other direction, where the Codex reviewer has a shell and can look for itself.
+#
+# So commit before every review through this entry, re-reviews included, and check that
+# `git status --porcelain` is empty first. The reviewer reads the live working tree and is
+# handed `git status` alongside the range, so an uncommitted edit does not go unseen -- it
+# gets seen out of step with the diff, which is worse.
 
 # Reviews are collected by polling, so a tool call returns promptly and this budget only
 # covers a single request rather than a whole review. It must still exceed the 300s cap on

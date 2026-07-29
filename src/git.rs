@@ -162,6 +162,38 @@ impl DiffMode {
     fn working_tree_only(&self) -> bool {
         matches!(self, Self::Auto | Self::Head | Self::Staged)
     }
+
+    /// What the *caller* is told the capture contains, and what it therefore does not.
+    ///
+    /// The reviewer is shown the exact command line; the caller needs the shape of it, to
+    /// decide what to put in `instructions`. This lives beside `diff_args` on purpose: a
+    /// new mode has to answer here in the same edit that gives it a capture, rather than
+    /// leaving the tool description advertising one that no longer happens. The mismatch
+    /// is not hypothetical -- the description was written for `auto` and kept claiming
+    /// working-tree and untracked-file capture under `--diff staged` and under a range,
+    /// which is the opposite of what those modes do.
+    pub fn caller_summary(&self) -> (String, &'static str) {
+        match self {
+            // Never reached from the tool description, which asks only when a diff is
+            // actually supplied, but answered rather than left to a wildcard.
+            Self::None => (String::new(), ""),
+            Self::Auto | Self::Head => (
+                "the working-tree diff, `git status`, and the contents of untracked files".into(),
+                "Note that the capture covers uncommitted work; if what you want reviewed is \
+                 already committed, say so in 'instructions'.",
+            ),
+            Self::Staged => (
+                "the staged diff (`git diff --cached`) and `git status`".into(),
+                "Note that the capture covers staged work only: unstaged edits and untracked \
+                 files are not in it.",
+            ),
+            Self::Rev(rev) => (
+                format!("`git diff {rev}` and `git status`"),
+                "Note that the capture is that range and nothing else: uncommitted edits and \
+                 untracked files are not in it, so commit what you want reviewed first.",
+            ),
+        }
+    }
 }
 
 /// A captured change, ready to be rendered into the prompt.

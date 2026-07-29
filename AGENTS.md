@@ -31,11 +31,14 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   fixed by `--diff` on the server entry, not chosen per call, and
   [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
   branch against its base rather than the default working-tree capture, which is empty once
-  the work is committed. So commit before asking for the gate review: uncommitted edits are
-  not in that range, and the reviewer will report on the branch without them rather than
-  notice they are missing. For mid-development review of work that is *not* committed yet,
-  call from the Claude side instead — the Codex reviewer has a shell and can see the working
-  tree.
+  the work is committed. **Commit, and check `git status --porcelain` is empty, before every
+  call in that direction — the first review and each re-review.** A dirty tree is worse than
+  it looks there: the capture is the committed range, but the reviewer can read the live
+  files and is handed `git status`, so it would be reviewing one revision through a diff and
+  another through the tree. For mid-development review of work that is not committed yet,
+  open a Claude Code session against this checkout and call from there — that direction gets
+  the Codex reviewer, which has a shell and can see the working tree. A Codex session cannot
+  reach it by changing arguments; it is a different server entry.
 - Say what changed and why, and point the reviewer at this file and `README.md`. It runs
   configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
   when told to.
