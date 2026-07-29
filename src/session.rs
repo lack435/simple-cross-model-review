@@ -305,18 +305,37 @@ mod tests {
 
     /// A fresh directory per test so they can run in parallel.
     ///
-    /// Cleared before use: the name is only unique per (pid, counter), Windows recycles
-    /// process ids, and an aborted run leaves its directories behind. Without the clear a
-    /// later run that draws a matching pid inherits the earlier run's `sessions.json` and
-    /// lock files, and the session tests assert against state they did not create.
+    /// The name is unique only per (pid, counter), Windows recycles process ids, and a run
+    /// that aborts leaves its directories behind -- so without the clear a later run
+    /// inherits an earlier one's `sessions.json` and lock files and asserts against state
+    /// it did not create. Verified 2026-07-28: an aborted run left ~239 directories, the
+    /// next run drew a matching pid and five session tests failed, and the same tests
+    /// passed again under a fresh pid.
+    ///
+    /// Clearing on creation rather than on teardown is deliberate: teardown does not run
+    /// when the harness aborts, which is exactly the case above. Clearing *this* directory
+    /// and not the shared parent is also deliberate -- two live runs cannot share a pid,
+    /// so a per-pid clear can never delete a concurrent run's state, while a sweep of the
+    /// parent would. The cost is that directories accumulate; %TEMP% is swept elsewhere.
     fn temp_dir() -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
             .join("cross-review-session-tests")
             .join(format!("{}-{}", std::process::id(), n));
-        std::fs::remove_dir_all(&dir).ok();
+        clear(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// Remove `dir` if it exists. A clear that fails for any other reason leaves inherited
+    /// state in place -- the failure this guards against -- so it is reported here rather
+    /// than left to surface as an unexplained assertion failure further down the test.
+    fn clear(dir: &Path) {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => panic!("clear temp dir {}: {e}", dir.display()),
+        }
     }
 
     fn record(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {

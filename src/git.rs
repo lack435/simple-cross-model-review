@@ -974,12 +974,20 @@ mod tests {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     /// A fresh directory per test so they can run in parallel.
+    ///
+    /// Cleared before use for the reason spelled out on the same helper in `session.rs`:
+    /// the name is unique only per (pid, counter) and Windows recycles process ids, so a
+    /// run that aborts can otherwise hand its leftovers to a later one.
     fn temp_dir() -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
             .join("cross-review-git-tests")
             .join(format!("{}-{}", std::process::id(), n));
-        std::fs::remove_dir_all(&dir).ok();
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("clear temp dir {}: {e}", dir.display()),
+        }
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
