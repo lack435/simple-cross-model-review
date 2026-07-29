@@ -194,6 +194,14 @@ pub struct Registry {
     state: Mutex<State>,
     changed: Condvar,
     counter: AtomicU64,
+    /// Bumped immediately before each `wait_timeout`, while the state lock is still held.
+    ///
+    /// That timing is the whole point, and it is what lets a test prove a waiter has parked
+    /// rather than assume it: a test that has seen this counter move knows the waiter holds
+    /// the lock and is about to park, so anything it does next that needs the lock cannot
+    /// proceed until `wait_timeout` has atomically released it and joined the wait set.
+    #[cfg(test)]
+    parks: AtomicU64,
 }
 
 impl Registry {
@@ -379,17 +387,10 @@ impl Registry {
         self.changed.notify_all();
     }
 
-    /// Raise the flag without waking anyone.
-    ///
-    /// Only for the test that has to establish that a waiter really is parked rather than
-    /// assume a sleep was long enough. A waiter inside `wait_timeout` cannot observe the
-    /// flag until something wakes it, so "still waiting once this has been called" is proof
-    /// it had parked. Nothing in the server may use this: raising the flag without a notify
-    /// is precisely the bug `begin_shutdown` exists to avoid.
+    /// How many times a waiter has reached the point of parking. See `Registry::parks`.
     #[cfg(test)]
-    fn set_shutdown_without_waking(&self) {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.shutdown = true;
+    fn parks(&self) -> u64 {
+        self.parks.load(Ordering::SeqCst)
     }
 
     /// Block until this review leaves `Running`, until `timeout` elapses, or until
@@ -415,6 +416,10 @@ impl Registry {
             if remaining.is_zero() {
                 return Some(Snapshot::of(review, shutting_down));
             }
+            // Recorded while the lock is still held, so a test can tell "about to park"
+            // from "not scheduled yet". See `Registry::parks`.
+            #[cfg(test)]
+            self.parks.fetch_add(1, Ordering::SeqCst);
             let (next, _) = self
                 .changed
                 .wait_timeout(guard, remaining)
@@ -786,15 +791,17 @@ mod tests {
         );
     }
 
-    /// Proves the wake path rather than trusting a sleep. The test above assumes 150 ms was
-    /// enough for the waiter to reach `wait_timeout`; on a loaded box it might not have
-    /// been, and the test would then quietly be re-testing the case below instead — passing
-    /// even if `begin_shutdown` never notified.
+    /// Proves the wake path instead of trusting a sleep, which the test above cannot: it
+    /// assumes 150 ms was enough for the waiter to reach `wait_timeout`, and on a loaded box
+    /// a waiter that was never scheduled at all is indistinguishable from a parked one — so
+    /// it would pass even with `notify_all` deleted.
     ///
-    /// Here the flag is set with no wake first. A waiter still waiting at that point can
-    /// only be one that had already parked, because it cannot see a flag set after its last
-    /// read. That makes the precondition an assertion instead of a guess, and the real
-    /// `begin_shutdown` that follows is then the only thing that can free it.
+    /// The lock is what settles it. The waiter records `parks` while still holding the state
+    /// lock, so once this thread has seen that counter move, `begin_shutdown` cannot get the
+    /// lock until `wait_timeout` has released it — and `wait_timeout` releases it and joins
+    /// the condvar's wait set as one atomic step. The flag is therefore raised only after
+    /// the waiter is provably in the wait set, which leaves the notify as the only thing
+    /// that can free it before the 30s deadline.
     #[test]
     fn a_provably_parked_waiter_is_freed_by_the_notify() {
         let registry = Arc::new(Registry::new());
@@ -806,14 +813,16 @@ mod tests {
             std::thread::spawn(move || registry.wait(&id, Duration::from_secs(30)))
         };
 
-        std::thread::sleep(Duration::from_millis(150));
-        registry.set_shutdown_without_waking();
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(
-            !poller.is_finished(),
-            "the waiter had not parked, so this test cannot prove what it claims -- it \
-             observed the flag on a pass through the loop instead of from a wake"
-        );
+        // Bounded: `cargo test` has no per-test timeout, so an unbounded spin would turn a
+        // waiter that never parks into a silent CI hang instead of a readable failure.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while registry.parks() == 0 {
+            assert!(
+                Instant::now() < give_up,
+                "no waiter ever reached the point of parking"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         let started = Instant::now();
         registry.begin_shutdown();

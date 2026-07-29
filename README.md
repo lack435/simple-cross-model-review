@@ -361,7 +361,8 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `SERVER_SHUTTING_DOWN`,
+`INTERNAL_ERROR`. Bad tool arguments
 get a plain correction instead, since that is the agent's own mistake and not something to
 escalate,
 and so does a tool call the server could not start a thread for -- neither says anything
@@ -531,11 +532,13 @@ Both directions pass against live CLIs.
   snapshot, and a poll cut short says the server is shutting down instead of inviting a
   retry that nothing will answer.
 
-  A review already in flight is refused a second reprieve: `try_start` rejects once the
-  flag is up, under the same lock that raises it, because a review registered after stdin
-  closed could never be collected — the process exits as soon as the handler returns, so
-  starting one would bill a reviewer turn for a result with nowhere to go and answer
-  "review started" to a caller that will never see it.
+  A start call still in flight is refused rather than granted a reprieve: `try_start`
+  rejects with `SERVER_SHUTTING_DOWN` once the flag is up, under the same lock that raises
+  it, because a review registered after stdin closed could never be collected — the server
+  drains the calls already running and then exits, so starting one would bill a reviewer
+  turn for a result with nowhere to go and answer "review started" to a caller that will
+  never see it. A handler can genuinely arrive there that late: it may have spent the
+  interval in the auth preflight or waiting for the session lease.
 
   What it costs: an in-flight review is abandoned rather than allowed to finish. Worker
   threads are never joined, so one that was seconds from persisting its session mapping
