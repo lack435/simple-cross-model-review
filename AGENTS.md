@@ -12,24 +12,38 @@ the small self-contained binary is a feature, so do not add crates casually. See
 
 ## Pull requests
 
-**Every PR must be reviewed by an Opus subagent before it is approved to merge.** This is a
-blocking gate, not a suggestion.
+**Every PR must be reviewed by a different model through this repository's own
+`cross-review` MCP server before it is approved to merge.** This is a blocking gate, not a
+suggestion. We eat our own dog food: the merge gate for cross-review is cross-review.
 
-- Spawn the review with the `Agent` tool using `model: "opus"`, giving it the PR's full
-  diff (or the branch and base to diff itself) plus this file and `README.md` as context.
-- The subagent reviews; it does not fix. Bring its findings back and act on them yourself.
+- Call `cross_model_review` with a session named for the branch or PR, and collect it with
+  `cross_model_review_result`. Both directions are already wired up in this checkout —
+  Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 5 via
+  [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
+  not write the diff.
+- Give the reviewer the branch and base to diff itself, say what changed and why, and point
+  it at this file and `README.md`. It runs configuration-isolated, so `CLAUDE.md` is not
+  auto-loaded; it will read convention files when told to.
+- The reviewer reviews; it cannot fix — it has no write access. Bring its findings back and
+  act on them yourself.
+- After acting on feedback, call `cross_model_review` again with the **same session** so the
+  reviewer reports what is resolved, what is still open, and what regressed. Only use
+  `fresh: true` when the earlier findings would mislead.
 - Never approve, merge, or tell the user a PR is ready to merge without that review having
   run and its findings resolved or explicitly dismissed with a reason.
-- If the subagent cannot run, say so and stop. Do not substitute your own read of the diff
-  for the Opus review — a model reviewing its own work shares its own blind spots, which is
-  the entire premise of this project.
+- If the review fails — `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `RATE_LIMITED`, any of the
+  codes in the README — hand the user the remediation the tool returned, say the review did
+  not run, and stop. Do not substitute your own read of the diff, and do not fall back to a
+  same-model subagent: a model reviewing its own work shares its own blind spots, which is
+  the entire premise of this project. `cross_model_review_status` checks the reviewer CLI
+  and auth for free, before anything is billed.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
   and anything deliberately left alone.
 
-This gate is separate from the `cross-review` MCP server. That tool is for cross-*model*
-feedback during development (Claude asks Codex here, Codex asks Claude via
-`.codex/config.toml`); the Opus subagent review is the merge gate. Use both — they catch
-different things.
+Dogfooding is also how the tool gets tested in anger. If the gate itself misbehaves —
+a failure code that misreports the reviewer's state, a resumed session that lost context, a
+response that reads badly to the calling agent — that is a bug in this repository, so report
+it rather than working around it.
 
 ## Before handing work back
 
