@@ -245,7 +245,9 @@ impl DiffMode {
     ///
     /// Both halves of the test are narrower than they look: `parse` has already refused the
     /// two-endpoint spellings that carry no dots (`^!`, `^@`, `^-`), and `is_two_endpoint`
-    /// declines to read a `..` that is part of a commit-message search rather than a range.
+    /// declines a `..` inside `^{…}`, where the braces bound the pattern. A leading `:/`
+    /// with `..` it reads *as* a range — `parse` refuses that spec, so the classifier only
+    /// sees one by direct construction, and a range is the safe answer for it.
     fn compares_against_working_tree(&self) -> bool {
         match self {
             Self::Auto | Self::Head => true,
@@ -1326,9 +1328,10 @@ mod tests {
     /// text the rest of it. Reading a commit-message search as a range would drop untracked
     /// capture and raise a dirty-tree warning that is false.
     ///
-    /// `:/…` with dots is refused rather than classified — see the parse test — because git
-    /// splits it on the first `..` and the two readings are not distinguishable. Scoped
-    /// searches are unambiguous, because the braces say where the pattern ends.
+    /// `:/…` with dots is refused at parse time *and* classified as a range if it reaches
+    /// the classifier anyway — see the parse test — because git splits it on the first `..`
+    /// and the two readings are not distinguishable. Scoped searches are unambiguous,
+    /// because the braces say where the pattern ends.
     #[test]
     fn a_dotted_commit_message_search_is_not_a_range() {
         for spec in ["HEAD^{/a..b}", "main^{/fix..bug}"] {
