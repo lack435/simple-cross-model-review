@@ -531,8 +531,18 @@ Both directions pass against live CLIs.
   snapshot, and a poll cut short says the server is shutting down instead of inviting a
   retry that nothing will answer.
 
+  A review already in flight is refused a second reprieve: `try_start` rejects once the
+  flag is up, under the same lock that raises it, because a review registered after stdin
+  closed could never be collected — the process exits as soon as the handler returns, so
+  starting one would bill a reviewer turn for a result with nowhere to go and answer
+  "review started" to a caller that will never see it.
+
   What it costs: an in-flight review is abandoned rather than allowed to finish. Worker
   threads are never joined, so one that was seconds from persisting its session mapping
-  loses it, and the reviewer tree dies with the job handle. Holding a process open for
-  minutes on the chance of salvaging a mapping is the worse trade.
+  loses it. Its reviewer process is left to the job object, which is best-effort rather
+  than guaranteed — job creation and assignment both continue with a warning when they
+  fail, so a reviewer that never joined a job is not reaped by the handle closing. Nothing
+  cancels the worker on this path, so no child is explicitly killed either. Holding a
+  process open for minutes on the chance of salvaging a session mapping is still the worse
+  trade.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

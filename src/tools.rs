@@ -13,7 +13,8 @@ use crate::errors::{self, Failure};
 use crate::git;
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{
-    IdState, Outcome, Registry, Snapshot, Status, MAX_TERMINAL_PER_SESSION, MAX_TERMINAL_TOTAL,
+    IdState, Outcome, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
+    MAX_TERMINAL_TOTAL,
 };
 use crate::reviewer::{self, Reviewer};
 use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
@@ -150,11 +151,17 @@ impl App {
         };
 
         // Claiming the session and registering the review are one atomic step, so two
-        // concurrent calls cannot both start a review against the same conversation.
+        // concurrent calls cannot both start a review against the same conversation. It
+        // can also refuse because the server is going away: this handler may have spent
+        // the preflight or the lease wait crossing stdin's closure, and a review started
+        // on the other side of that could never be collected.
         let (id, cancel) = self
             .registry
             .try_start(&session, turn, resumed)
-            .map_err(|existing| errors::session_busy(&session, &existing))?;
+            .map_err(|refused| match refused {
+                StartRefused::Busy(existing) => errors::session_busy(&session, &existing),
+                StartRefused::ShuttingDown => errors::server_shutting_down(),
+            })?;
 
         // Bind the review to the request that created it before the worker starts, so a
         // `notifications/cancelled` arriving mid-setup stops the reviewer instead of

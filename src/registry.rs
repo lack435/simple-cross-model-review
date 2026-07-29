@@ -24,6 +24,16 @@ pub const MAX_TERMINAL_PER_SESSION: usize = 3;
 /// review per name for ever.
 pub const MAX_TERMINAL_TOTAL: usize = 50;
 
+/// Why a review could not be registered.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StartRefused {
+    /// The session already has a review in flight. Carries that review's id, which the
+    /// caller is told to collect or cancel.
+    Busy(String),
+    /// Stdin has closed and the process is on its way out.
+    ShuttingDown,
+}
+
 /// What the registry knows about an id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IdState {
@@ -197,20 +207,33 @@ impl Registry {
     /// The check and the insert happen under a single lock acquisition. Doing them
     /// separately would let two concurrent `tools/call` handlers both see an idle
     /// session and both start a review against the same reviewer conversation.
+    ///
+    /// Refuses outright once shutdown has begun. A handler can reach here after stdin
+    /// closed — it may have spent the interval in the auth preflight or waiting for the
+    /// session lease — and a review registered at that point can never be collected,
+    /// because the process exits as soon as the handler returns. Starting one would spend
+    /// a reviewer turn on a result with nowhere to go, and answer "review started" to a
+    /// caller that will never see the review. Tested here, under the lock that publishes
+    /// the flag, rather than by the caller beforehand: a pre-check outside it would leave
+    /// exactly the window this closes.
     pub fn try_start(
         &self,
         session: &str,
         turn: u32,
         resumed: bool,
-    ) -> Result<(String, Arc<AtomicBool>), String> {
+    ) -> Result<(String, Arc<AtomicBool>), StartRefused> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        if guard.shutdown {
+            return Err(StartRefused::ShuttingDown);
+        }
 
         if let Some(running) = guard
             .reviews
             .values()
             .find(|r| r.session == session && r.status == Status::Running)
         {
-            return Err(running.id.clone());
+            return Err(StartRefused::Busy(running.id.clone()));
         }
 
         // Ids are unique per process and readable in logs. No RNG dependency: the
@@ -356,6 +379,19 @@ impl Registry {
         self.changed.notify_all();
     }
 
+    /// Raise the flag without waking anyone.
+    ///
+    /// Only for the test that has to establish that a waiter really is parked rather than
+    /// assume a sleep was long enough. A waiter inside `wait_timeout` cannot observe the
+    /// flag until something wakes it, so "still waiting once this has been called" is proof
+    /// it had parked. Nothing in the server may use this: raising the flag without a notify
+    /// is precisely the bug `begin_shutdown` exists to avoid.
+    #[cfg(test)]
+    fn set_shutdown_without_waking(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.shutdown = true;
+    }
+
     /// Block until this review leaves `Running`, until `timeout` elapses, or until
     /// shutdown begins. Returns a snapshot in every case.
     pub fn wait(&self, id: &str, timeout: Duration) -> Option<Snapshot> {
@@ -440,7 +476,7 @@ mod tests {
         // The check and insert are atomic, so the second claim must be refused and must
         // name the review already holding the session.
         let refused = registry.try_start("default", 2, true).unwrap_err();
-        assert_eq!(refused, first);
+        assert_eq!(refused, StartRefused::Busy(first));
     }
 
     /// Start and immediately finish a review on `session`, returning its id.
@@ -747,6 +783,59 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "shutdown did not end the wait"
+        );
+    }
+
+    /// Proves the wake path rather than trusting a sleep. The test above assumes 150 ms was
+    /// enough for the waiter to reach `wait_timeout`; on a loaded box it might not have
+    /// been, and the test would then quietly be re-testing the case below instead — passing
+    /// even if `begin_shutdown` never notified.
+    ///
+    /// Here the flag is set with no wake first. A waiter still waiting at that point can
+    /// only be one that had already parked, because it cannot see a flag set after its last
+    /// read. That makes the precondition an assertion instead of a guess, and the real
+    /// `begin_shutdown` that follows is then the only thing that can free it.
+    #[test]
+    fn a_provably_parked_waiter_is_freed_by_the_notify() {
+        let registry = Arc::new(Registry::new());
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+
+        let poller = {
+            let registry = Arc::clone(&registry);
+            let id = id.clone();
+            std::thread::spawn(move || registry.wait(&id, Duration::from_secs(30)))
+        };
+
+        std::thread::sleep(Duration::from_millis(150));
+        registry.set_shutdown_without_waking();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !poller.is_finished(),
+            "the waiter had not parked, so this test cannot prove what it claims -- it \
+             observed the flag on a pass through the loop instead of from a wake"
+        );
+
+        let started = Instant::now();
+        registry.begin_shutdown();
+        let snapshot = poller.join().expect("poller").expect("snapshot");
+        assert!(snapshot.shutting_down);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the notify did not free a waiter that was definitely parked"
+        );
+    }
+
+    #[test]
+    fn shutdown_refuses_a_review_that_could_never_be_collected() {
+        // The other half of shutdown: a handler can arrive here after stdin closed, having
+        // spent the interval in preflight or waiting for the session lease. Registering the
+        // review would answer "review started" and then exit, billing a reviewer turn for a
+        // result with nowhere to go.
+        let registry = Registry::new();
+        registry.begin_shutdown();
+        assert_eq!(
+            registry.try_start("default", 1, false).unwrap_err(),
+            StartRefused::ShuttingDown
         );
     }
 
