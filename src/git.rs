@@ -239,25 +239,59 @@ pub struct UntrackedFile {
     pub body: Section,
 }
 
-/// Capture the change under review, or `None` when there is nothing to supply.
+/// The result of trying to capture the change: what was captured, and what the *caller*
+/// has to be told about what was not.
 ///
-/// `None` means the feature is off (`--diff none`), the reviewer can fetch its own diff
-/// (`--diff auto` with a shell), git is unavailable, or the working root is not a git
-/// repository. Those are all normal and silent from the caller's point of view; a git
-/// invocation that fails for some other reason is reported on stderr and skipped, because
-/// a review without a diff is still a review and failing the call would be worse.
+/// The warnings are the point of the struct. A configuration that intends to supply a diff
+/// and then cannot is the one case where silence is dangerous: the review still runs, the
+/// reviewer is honestly told it has no diff, and the calling agent -- which asked for a
+/// review of a change and is told nothing -- reads a review of the current tree as a review
+/// of its branch. `AGENTS.md` makes this the blocking merge gate and tells the caller not to
+/// paste a diff, so the caller cannot be left inferring from silence that the capture
+/// worked. stderr does not reach it; `Outcome::warnings` does.
+#[derive(Default)]
+pub struct Capture {
+    pub change: Option<Change>,
+    pub warnings: Vec<String>,
+}
+
+impl Capture {
+    fn warn(warning: String) -> Self {
+        Self {
+            change: None,
+            warnings: vec![warning],
+        }
+    }
+}
+
+/// Capture the change under review.
+///
+/// `change` is `None` when the feature is off (`--diff none`) or the reviewer can fetch its
+/// own diff (`--diff auto` with a shell) -- both silent, because nothing was promised -- and
+/// when a capture that *was* intended could not be produced, which is warned about instead.
 ///
 /// An *empty* diff is not `None`. A clean tree is a fact the reviewer needs: told nothing,
 /// it reviews the current code and calls that a review of the change.
-pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
+pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
     if !cfg.supplies_diff() {
-        return None;
+        return Capture::default();
     }
     let mode = &cfg.diff;
-    let git = Git::new(&cfg.cwd, cancel)?;
+    let Some(git) = Git::new(&cfg.cwd, cancel) else {
+        return Capture::warn(
+            "git is not on PATH, so the change under review could not be captured and the \
+             reviewer was given no diff. It reviewed the current state of the code instead."
+                .to_string(),
+        );
+    };
 
     if !git.is_work_tree() {
-        return None;
+        return Capture::warn(format!(
+            "{} is not a git repository, so the change under review could not be captured \
+             and the reviewer was given no diff. It reviewed the current state of the code \
+             instead.",
+            cfg.cwd.display()
+        ));
     }
 
     let mut diff_args = vec!["diff"];
@@ -269,16 +303,27 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
             // configured `--diff main...HEAD` and would otherwise get silently nothing.
             // Cancellation is not that -- it kills git on the way out, and reporting the
             // configuration as broken because the caller hung up would be a false lead.
-            if !out.cancelled {
-                eprintln!(
-                    "cross-review: warning: `{}` failed, so no diff was supplied: {}",
-                    mode.command_line(),
-                    first_line(&out.diagnostics())
-                );
+            if out.cancelled {
+                return Capture::default();
             }
-            return None;
+            let reason = first_line(&out.diagnostics());
+            eprintln!(
+                "cross-review: warning: `{}` failed, so no diff was supplied: {reason}",
+                mode.command_line(),
+            );
+            return Capture::warn(format!(
+                "`{}` failed, so the reviewer was given no diff and reviewed the current \
+                 state of the code instead: {reason}",
+                mode.command_line(),
+            ));
         }
-        None => return None,
+        None => {
+            return Capture::warn(format!(
+                "`{}` could not be run to completion, so the reviewer was given no diff and \
+                 reviewed the current state of the code instead.",
+                mode.command_line(),
+            ))
+        }
     };
 
     let mut notes = Vec::new();
@@ -300,15 +345,26 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Option<Change> {
         (Vec::new(), Vec::new())
     };
 
-    Some(Change {
-        command: mode.command_line(),
-        working_tree_only: mode.working_tree_only(),
-        diff,
-        status,
-        untracked,
-        untracked_omitted,
-        notes,
-    })
+    // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
+    // its review; the caller needs them to know the review it is reading was made on
+    // partial evidence, which it cannot see the prompt to discover for itself.
+    let warnings = notes
+        .iter()
+        .map(|note| format!("The captured change was incomplete: {note}"))
+        .collect();
+
+    Capture {
+        change: Some(Change {
+            command: mode.command_line(),
+            working_tree_only: mode.working_tree_only(),
+            diff,
+            status,
+            untracked,
+            untracked_omitted,
+            notes,
+        }),
+        warnings,
+    }
 }
 
 /// Render a captured change as the prompt section the reviewer reads.
@@ -366,6 +422,21 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
         out.push_str(
             "Paths here are relative to the repository root, not to the directory above.\n\n",
         );
+        // A range or `staged` diff describes a revision; the status describes the tree, and
+        // the files this reviewer can open describe the tree too. When those disagree, the
+        // reviewer is the party that will misread it -- it would otherwise reconcile a diff
+        // hunk against a file that no longer matches and report the difference as a finding.
+        // The caller is warned about this shape by `caller_summary`, but a caller that
+        // forgets is exactly the case this section exists to survive.
+        if !change.working_tree_only {
+            out.push_str(
+                "This listing is not empty, so the working tree has changes that are **not** in \
+                 the diff above. The diff is a committed revision; the status and any file you \
+                 read reflect the current tree, which is a different revision. Do not treat a \
+                 mismatch between them as a finding -- review the diff, and say plainly that \
+                 the tree was dirty and which parts of it you could not account for.\n\n",
+            );
+        }
         push_fenced(&mut out, "", &change.status.text);
         if change.status.truncated {
             out.push_str("\n(truncated -- this listing exceeded the size cap.)\n");
@@ -954,6 +1025,35 @@ mod tests {
     }
 
     #[test]
+    fn a_dirty_tree_under_a_range_is_flagged_to_the_reviewer_as_a_second_revision() {
+        // The reviewer holds a committed diff and can read the live files. Told nothing,
+        // it reconciles the two and reports the difference as a finding -- and it is the
+        // party that cannot check, having neither the commit history nor a shell.
+        let mut change = change_fixture();
+        change.working_tree_only = false;
+        change.command = "git diff main...HEAD".into();
+        change.status = Section {
+            text: " M src/main.rs\n".into(),
+            truncated: false,
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(text.contains("not** in the diff above"), "{text}");
+        assert!(text.contains("different revision"), "{text}");
+
+        // A working-tree mode has no such mismatch: the diff and the tree are the same
+        // revision, so the warning would be false.
+        change.working_tree_only = true;
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(!text.contains("different revision"), "{text}");
+
+        // Neither does a clean tree under a range: nothing to be out of step with.
+        change.working_tree_only = false;
+        change.status = Section::empty();
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(!text.contains("different revision"), "{text}");
+    }
+
+    #[test]
     fn an_empty_diff_says_so_and_names_what_it_could_not_have_covered() {
         // Told nothing, a reviewer reviews the current code and calls that a review of
         // the change. Told only "empty", it reports there was no change -- which is wrong
@@ -1063,7 +1163,7 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
 
         assert!(
             change.diff.text.contains("-original"),
@@ -1101,7 +1201,7 @@ mod tests {
         };
         // `--diff staged` against a tree with nothing staged.
         let cfg = config_for(&dir, DiffMode::Staged);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
         assert!(change.diff.text.trim().is_empty(), "{}", change.diff.text);
         // Untracked files do not belong with a staged diff.
         assert!(change.untracked.is_empty());
@@ -1118,14 +1218,43 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Rev("no-such-branch".into()));
-        assert!(capture(&cfg, &idle()).is_none());
+        let capture = capture(&cfg, &idle());
+        assert!(capture.change.is_none());
+
+        // Reported to the *caller*, not only to stderr. The review still runs, so nothing
+        // fails; without this the calling agent reads a review of the current tree as a
+        // review of the range it configured, which is the silent degradation the whole
+        // module exists to prevent.
+        assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
+        let warning = &capture.warnings[0];
+        assert!(warning.contains("no-such-branch"), "{warning}");
+        assert!(warning.contains("no diff"), "{warning}");
     }
 
     #[test]
-    fn capture_skips_a_directory_that_is_not_a_repository() {
+    fn a_directory_that_is_not_a_repository_warns_the_caller() {
         let dir = temp_dir();
         let cfg = config_for(&dir, DiffMode::Head);
-        assert!(capture(&cfg, &idle()).is_none());
+        let capture = capture(&cfg, &idle());
+        assert!(capture.change.is_none());
+        assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
+        assert!(capture.warnings[0].contains("not a git repository"));
+    }
+
+    #[test]
+    fn a_capture_that_was_never_configured_warns_about_nothing() {
+        // The two silent cases have to stay silent: nothing was promised, so a warning
+        // would be noise on every single call.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+            .warnings
+            .is_empty());
+
+        let mut cfg = config_for(&dir, DiffMode::Auto);
+        cfg.tools = "Read,Grep,Glob,Bash".to_string();
+        assert!(capture(&cfg, &idle()).warnings.is_empty());
     }
 
     #[test]
@@ -1133,12 +1262,14 @@ mod tests {
         let Some(dir) = repo_with_a_change() else {
             return;
         };
-        assert!(capture(&config_for(&dir, DiffMode::None), &idle()).is_none());
+        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+            .change
+            .is_none());
 
         // Auto plus a reviewer that has its own shell: ours would be redundant.
         let mut cfg = config_for(&dir, DiffMode::Auto);
         cfg.tools = "Read,Grep,Glob,Bash".to_string();
-        assert!(capture(&cfg, &idle()).is_none());
+        assert!(capture(&cfg, &idle()).change.is_none());
     }
 
     #[test]
@@ -1170,7 +1301,7 @@ mod tests {
         }
 
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).expect("a change");
+        let change = capture(&cfg, &idle()).change.expect("a change");
 
         for file in &change.untracked {
             assert!(

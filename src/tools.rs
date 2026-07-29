@@ -517,10 +517,19 @@ impl Job {
         // Captured once, before either attempt: the retry below re-runs the same review
         // in a new reviewer session, so re-running git for it would only spend time and
         // risk showing the two turns different trees.
-        let change = git::capture(&self.cfg, &self.cancel)
-            .map(|change| git::render(&change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
+        let capture = git::capture(&self.cfg, &self.cancel);
+        let change = capture
+            .change
+            .as_ref()
+            .map(|change| git::render(change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
+        let capture_warnings = capture.warnings;
 
-        let outcome = match self.attempt(resume_id.as_deref(), self.turn, change.as_deref()) {
+        let outcome = match self.attempt(
+            resume_id.as_deref(),
+            self.turn,
+            change.as_deref(),
+            &capture_warnings,
+        ) {
             Ok(outcome) => outcome,
             Err(failure) => {
                 // A resume target that has expired is recoverable: drop the stale
@@ -533,7 +542,7 @@ impl Job {
                          reviewer session",
                         self.session
                     );
-                    match self.attempt(None, 1, change.as_deref()) {
+                    match self.attempt(None, 1, change.as_deref(), &capture_warnings) {
                         Ok(mut outcome) => {
                             if let Some(review) = outcome.review.take() {
                                 outcome.review = Some(format!(
@@ -561,6 +570,7 @@ impl Job {
         resume_id: Option<&str>,
         turn: u32,
         change: Option<&str>,
+        capture_warnings: &[String],
     ) -> Result<Outcome, Failure> {
         let preamble = if self.cfg.no_preamble {
             None
@@ -636,7 +646,11 @@ impl Job {
         // turn never leaves a session pointing at a conversation that went nowhere.
         // Resumability is tracked rather than assumed: the completed response invites a
         // follow-up on this session, so when that would not work the caller must be told.
-        let mut warnings = Vec::new();
+        // Carried first, so a review made without the change under review says so before
+        // anything else. These are not failures -- the review ran -- but a caller that
+        // asked for a review of a diff and silently got a review of the tree is the one
+        // way this tool can be wrong without anything appearing to go wrong.
+        let mut warnings = capture_warnings.to_vec();
         let resumable = match &parsed.session_id {
             Some(session_id) => {
                 match self.sessions.record_turn(

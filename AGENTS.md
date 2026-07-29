@@ -31,14 +31,24 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   fixed by `--diff` on the server entry, not chosen per call, and
   [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
   branch against its base rather than the default working-tree capture, which is empty once
-  the work is committed. **Commit, and check `git status --porcelain` is empty, before every
-  call in that direction — the first review and each re-review.** A dirty tree is worse than
-  it looks there: the capture is the committed range, but the reviewer can read the live
-  files and is handed `git status`, so it would be reviewing one revision through a diff and
-  another through the tree. For mid-development review of work that is not committed yet,
-  open a Claude Code session against this checkout and call from there — that direction gets
-  the Codex reviewer, which has a shell and can see the working tree. A Codex session cannot
-  reach it by changing arguments; it is a different server entry.
+  the work is committed. Three things follow, and the first two are pre-flight:
+  - **Commit, and check `git status --porcelain` is empty, before every call in that
+    direction — the first review and each re-review.** A dirty tree is worse than it looks:
+    the capture is the committed range, but the reviewer can read the live files and is
+    handed `git status`, so it would be reviewing one revision through a diff and another
+    through the tree. The reviewer is now told when that has happened; do not make it rely
+    on that.
+  - **`main` there is the *local* ref, so fetch and fast-forward it first**
+    (`git fetch origin && git branch -f main origin/main`). A stale local `main` does not
+    fail — it silently widens the capture to include everything merged since, and the
+    reviewer spends its turn on code the PR did not touch. This has happened: a review of
+    this PR was handed 1707 insertions instead of 208. If your PR is stacked on something
+    other than `main`, the pinned range is simply wrong for it; say so in `instructions` and
+    treat the review accordingly, or run it from a checkout where the pin fits.
+  - For mid-development review of work that is not committed yet, open a Claude Code session
+    against this checkout and call from there — that direction gets the Codex reviewer, which
+    has a shell and can see the working tree. A Codex session cannot reach it by changing
+    arguments; it is a different server entry.
 - Say what changed and why, and point the reviewer at this file and `README.md`. It runs
   configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
   when told to.
@@ -94,7 +104,10 @@ at. If any one of them is missing, stop and tell the user which one:
   the PR carries the request and the response in full, naming the model and how it was
   confined. A claim that this happened is not the artifact; the transcript is.
 - **The repaired gate reviews the exact final diff before the merge.** If the repair works,
-  this is possible — so it is required, and it is what actually closes the exception.
+  this is possible — so it is required, and it is what actually closes the exception. If it
+  does not work, the repair has not been demonstrated and the PR does not qualify: say so
+  and stop. A repair that cannot pass through the gate it claims to have fixed is a claim,
+  not a repair.
 
 ## Before handing work back
 

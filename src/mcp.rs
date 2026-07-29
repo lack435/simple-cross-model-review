@@ -472,7 +472,10 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // reviewer with no shell cannot obtain a diff, and a description that implied
     // otherwise invited requests like "review the branch diff" that silently could not be
     // carried out -- with no permission denial to surface, since the tool is absent.
-    let access = if cfg.reviewer_has_shell() {
+    // `supplies_diff` is asked first because the two are not exclusive: `--diff HEAD` with
+    // a shelled reviewer captures *and* hands over a change, which the shell branch would
+    // have described as "inspect the change history itself" while a diff sat in the prompt.
+    let access = if cfg.reviewer_has_shell() && !cfg.supplies_diff() {
         "The reviewer has read-only access to this repository: it can read files and run \
          read-only shell commands such as `git diff` and `git log`, so it can inspect the \
          change history itself. You do not need to paste code. Describe what changed and \
@@ -492,12 +495,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // otherwise promised a working-tree capture with untracked files that those modes
         // deliberately exclude.
         let (captures, caveat) = cfg.diff.caller_summary();
+        // The shell clause is the one part that cannot be stated unconditionally here: a
+        // capture is configured for both kinds of reviewer, but only one of them lacks a
+        // shell, and telling the caller a shelled reviewer has none would be a plain lie.
+        let shell = if cfg.reviewer_has_shell() {
+            "It has a read-only shell, and it is also handed the change directly"
+        } else {
+            "It has NO shell of its own, but it does not need one for the change"
+        };
         format!(
             "The reviewer can read and search files in this repository, so you do not need to \
-             paste whole files. It has NO shell of its own, but it does not need one for the \
-             change: when the working root is a git repository, this server captures \
-             {captures}, and hands them to the reviewer with your request. Do not paste a diff \
-             into 'instructions' -- describe the intent of the change and what you want \
+             paste whole files. {shell}: when the working root is a git repository, this server \
+             captures {captures}, and hands them to the reviewer with your request. Do not paste \
+             a diff into 'instructions' -- describe the intent of the change and what you want \
              scrutinised instead. {caveat}"
         )
     } else {
@@ -758,12 +768,36 @@ mod tests {
             assert!(text.contains("covers uncommitted work"), "{spec:?}: {text}");
         }
 
-        // A reviewer with a shell fetches its own, and is told so instead.
+        // A reviewer with a shell and no capture configured fetches its own, and is told so.
         let shelled = describe(&["--tools", "Read,Grep,Glob,Bash"]);
         assert!(
             shelled.contains("can inspect the change history itself"),
             "{shelled}"
         );
+
+        // Shell *and* capture is a real configuration (`README.md` advertises `--diff HEAD`
+        // regardless of shell), and it used to fall into the shell branch, so the caller was
+        // never told about a capture that was happening.
+        for args in [
+            vec!["--reviewer", "codex", "--diff", "HEAD"],
+            vec![
+                "--reviewer",
+                "claude",
+                "--tools",
+                "Read,Grep,Glob,Bash",
+                "--diff",
+                "main...HEAD",
+            ],
+        ] {
+            let all: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
+            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
+            let text = response["result"]["tools"][0]["description"]
+                .as_str()
+                .expect("description");
+            assert!(text.contains("this server captures"), "{args:?}: {text}");
+            assert!(!text.contains("NO shell"), "{args:?}: {text}");
+        }
     }
 
     #[test]

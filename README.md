@@ -173,9 +173,18 @@ Notes on the edges, because they are where this would otherwise mislead:
 - **A `--diff` value can never become a git option.** Anything starting with `-` is
   rejected at startup, because `git diff --output=<file>` writes.
 - **The whole capture shares a 60-second budget**, not one timeout per command, so a wedged
-  repository cannot hold the session lease for a multiple of any number written here.
-- Skipped silently when the working root is not a git repository, or when git is not
-  installed. `--no-preamble` does not turn it off; `--diff none` does.
+  repository cannot spend four independent timeouts. The budget bounds the git commands
+  themselves; each invocation can additionally spend up to the 10-second output drain grace
+  after its child is reaped, which is outside the shared deadline. In practice that is
+  unreachable — the job object closes the pipes and collection returns at once — so it bites
+  only if the job object could not be created or something outside it holds a handle.
+- **A capture that was configured and did not happen is reported to the caller**, as a
+  warning alongside the review: no local `main` for a pinned `main...HEAD`, a working root
+  that is not a git repository, git missing from PATH, or any part of the capture that ran
+  short. The reviewer is told it has no diff, but the caller is the party that asked for a
+  review of a change, and a review of the current tree returned in silence reads exactly
+  like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
+  with a reviewer that has its own shell, so those stay silent.
 
 ## Re-reviewing after you act on feedback
 
@@ -380,7 +389,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 128 unit tests: no network, no model calls
+cargo test          # 159 unit tests: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
