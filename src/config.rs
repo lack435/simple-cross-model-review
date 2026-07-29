@@ -116,6 +116,45 @@ pub fn scoped_claude_rules() -> Vec<String> {
         .collect()
 }
 
+/// Whether one `--allow-tools` value grants Bash.
+///
+/// Three shapes have to work. Our defaults arrive as separate scoped entries; a
+/// user-supplied list arrives as one string for the CLI to split, and the CLI accepts both
+/// whitespace and commas as separators. Getting this wrong is not symmetrical -- a missed
+/// grant only costs a redundant capture, while a false one withholds the diff from a
+/// reviewer that cannot fetch it -- but a false negative still tells the caller the reviewer
+/// has no shell when it has one, so both are worth getting right.
+///
+/// Separators are recognised at paren depth zero only, since a grant's own argument may
+/// contain either: `Bash(git diff:*)` has a space in it, and a pattern may have a comma.
+/// Entries are compared whole, so `BashOutput` -- which reads a background shell's output
+/// and can run nothing -- is not mistaken for a shell.
+fn permits_bash(rule: &str) -> bool {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut grants = Vec::new();
+    for (i, ch) in rule.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                grants.push(&rule[start..i]);
+                start = i + ch.len_utf8();
+            }
+            c if depth == 0 && c.is_whitespace() => {
+                grants.push(&rule[start..i]);
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    grants.push(&rule[start..]);
+    grants
+        .into_iter()
+        .map(str::trim)
+        .any(|grant| grant == "Bash" || grant.starts_with("Bash("))
+}
+
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 300;
@@ -318,11 +357,7 @@ impl Config {
                     .tools
                     .split(',')
                     .any(|tool| tool.trim().eq_ignore_ascii_case("Bash"));
-                let permitted = self.allowed_tools.iter().any(|rule| {
-                    rule.split_whitespace()
-                        .any(|grant| grant == "Bash" || grant.starts_with("Bash("))
-                });
-                in_session && permitted
+                in_session && self.allowed_tools.iter().any(|rule| permits_bash(rule))
             }
         }
     }
@@ -769,6 +804,25 @@ mod tests {
         .expect("config");
         assert!(bare.reviewer_has_shell());
 
+        // The CLI accepts commas as well as whitespace in a supplied list, and a grant's
+        // own argument may contain either, so separators count only outside parentheses.
+        for list in [
+            "Read,Grep,Glob,Bash(git diff:*)",
+            "Read Grep Glob Bash(git log --format=a,b)",
+            "Bash",
+        ] {
+            let cfg = Config::from_args(&args(&[
+                "--reviewer",
+                "claude",
+                "--tools",
+                "Read,Grep,Glob,Bash",
+                "--allow-tools",
+                list,
+            ]))
+            .expect("config");
+            assert!(cfg.reviewer_has_shell(), "{list}");
+        }
+
         // `BashOutput` reads a background shell's output and can run nothing, so neither
         // half of the question may match it as a substring.
         let lookalike = Config::from_args(&args(&[
@@ -777,7 +831,7 @@ mod tests {
             "--tools",
             "Read,Grep,Glob,BashOutput",
             "--allow-tools",
-            "Read BashOutput",
+            "Read,BashOutput",
         ]))
         .expect("config");
         assert!(!lookalike.reviewer_has_shell());
