@@ -923,6 +923,49 @@ mod tests {
     }
 
     #[test]
+    fn a_session_with_no_retained_result_gets_one_clear_message_either_way() {
+        // This wording replaced the retained-session distinction, which could not be kept
+        // without unbounded caller-controlled growth. It is the one place in the change
+        // where the caller is told less than before, so what it *is* told has to hold: the
+        // two cases must be indistinguishable, and both must point at the identifier that
+        // can still tell them apart.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = App::new(cfg);
+
+        // A session this process never saw.
+        let never = app
+            .review_result(&json!({"session": "never-used"}), &RequestCancel::new())
+            .unwrap_err();
+
+        // A session whose only review was evicted by the process-wide cap.
+        for n in 0..=MAX_TERMINAL_TOTAL {
+            let session = format!("session-{n}");
+            let (id, _c) = app.registry().try_start(&session, 1, false).expect("start");
+            app.registry()
+                .finish(&id, Outcome::failed(errors::cancelled()));
+        }
+        let evicted = app
+            .review_result(&json!({"session": "session-0"}), &RequestCancel::new())
+            .unwrap_err();
+
+        for (label, err) in [("never started", never), ("evicted", evicted)] {
+            assert_eq!(err.code, "BAD_REQUEST", "{label}");
+            assert!(
+                err.summary.contains("currently retained"),
+                "{label}: {}",
+                err.summary
+            );
+            assert!(
+                err.summary.contains("review_id"),
+                "{label}: {}",
+                err.summary
+            );
+            // It must not pick one of the two possibilities and assert it.
+            assert!(err.summary.contains("Either"), "{label}: {}", err.summary);
+        }
+    }
+
+    #[test]
     fn cancelling_an_evicted_review_says_there_is_nothing_to_stop() {
         // An evicted review is a finished one, so this is not an error at all -- and
         // reporting it as an unknown id would suggest the caller got the id wrong.
