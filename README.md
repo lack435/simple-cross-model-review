@@ -530,4 +530,9 @@ Both directions pass against live CLIs.
   a terminal state in that same moment still returns its result rather than a running
   snapshot, and a poll cut short says the server is shutting down instead of inviting a
   retry that nothing will answer.
+
+  What it costs: an in-flight review is abandoned rather than allowed to finish. Worker
+  threads are never joined, so one that was seconds from persisting its session mapping
+  loses it, and the reviewer tree dies with the job handle. Holding a process open for
+  minutes on the chance of salvaging a mapping is the worse trade.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

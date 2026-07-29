@@ -284,7 +284,7 @@ impl App {
         //
         // Binding the two here is also what ends this wait when the notification lands
         // mid-poll: cancelling drives the worker to a terminal state, which wakes the
-        // condvar, so a suppressed response does not park a thread until shutdown.
+        // condvar, so a suppressed response does not park a handler thread.
         //
         // The binding is many requests to one review, so cancelling one of two concurrent
         // polls ends the other as well. Left alone: agents poll a review sequentially, and
@@ -326,9 +326,9 @@ impl App {
         // the process is exiting and review ids do not survive it, so saying "call again"
         // would be advice the caller cannot act on.
         let next = if snapshot.shutting_down {
-            "This server's stdin has closed, so it is shutting down and this wait ended \
-             early. The review will not be delivered, and its review_id does not survive \
-             the server process.\n\n\
+            "This server's stdin is no longer readable, so it is shutting down and this \
+             wait will not be extended. The review will not be delivered, and its \
+             review_id does not survive the server process.\n\n\
              Do not proceed as though the review had come back. Start a new review once the \
              server is running again."
                 .to_string()

@@ -111,9 +111,22 @@ pub fn serve(app: Arc<App>) {
         }
     }
 
-    // Before the join, not after: a `cross_model_review_result` parked in `Registry::wait`
-    // has no other way to learn stdin has closed, so a 300s budget would hold the join
-    // below for the rest of it and then write to a stdout nobody is reading.
+    drain_in_flight(&app, in_flight);
+
+    eprintln!("cross-review: stdin closed, shutting down");
+}
+
+/// Releases parked waiters, then joins every handler thread.
+///
+/// Split out of `serve` for the same reason `start_tool_call` was: `serve` owns stdin and
+/// cannot be driven from a test, and the order of these two steps is the whole of the fix
+/// for a shutdown that used to wait out a long poll. Releasing after the join would
+/// reinstate that silently -- every registry-level test would still pass -- so the ordering
+/// needs a test of its own, and a test needs a seam.
+fn drain_in_flight(app: &Arc<App>, in_flight: Vec<std::thread::JoinHandle<()>>) {
+    // A `cross_model_review_result` parked in `Registry::wait` has no other way to learn
+    // stdin has closed, so a 300s budget would hold the join below for the rest of it and
+    // then write to a stdout nobody is reading.
     app.begin_shutdown();
 
     let unfinished = in_flight.iter().filter(|h| !h.is_finished()).count();
@@ -123,8 +136,6 @@ pub fn serve(app: Arc<App>) {
     for handle in in_flight {
         let _ = handle.join();
     }
-
-    eprintln!("cross-review: stdin closed, shutting down");
 }
 
 /// Runs one `tools/call` on its own thread, and answers the request itself if the thread
@@ -984,6 +995,38 @@ mod tests {
         assert_eq!(poller.join().expect("poller"), Some("CANCELLED"));
         // Cancelled, so the handler thread would send nothing.
         assert!(!request.try_claim_response());
+    }
+
+    /// The ordering `drain_in_flight` exists to hold: waiters are released before the join,
+    /// not after. Moving the release below the join leaves every registry-level test green
+    /// and silently restores a five-minute shutdown, so it is pinned here.
+    #[test]
+    fn draining_releases_a_parked_poll_before_joining_it() {
+        use std::time::Duration;
+
+        let app = app();
+        let (id, _cancel) = app
+            .registry()
+            .try_start("default", 1, false)
+            .expect("start");
+
+        let handle = {
+            let app = Arc::clone(&app);
+            let args = json!({"review_id": id, "wait_seconds": 30});
+            std::thread::spawn(move || {
+                let _ = app.review_result(&args, &RequestCancel::new());
+            })
+        };
+
+        // Long enough for the poll to actually reach `Registry::wait`, so the join below
+        // is joining a parked thread rather than one that has not got there yet.
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        drain_in_flight(&app, vec![handle]);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the join waited out the poll's budget"
+        );
     }
 
     #[test]

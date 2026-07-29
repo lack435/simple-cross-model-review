@@ -137,7 +137,10 @@ struct State {
     ///
     /// It lives in here rather than beside the condvar as an `AtomicBool` so that it
     /// cannot be touched without the lock — which is what makes it race-free, not its
-    /// atomicity. See `begin_shutdown`.
+    /// atomicity. An `Atomic` would read as "safe from anywhere" and is exactly the trap:
+    /// publishing it outside the lock, or hoisting the read in `wait` out of the loop,
+    /// would compile and would reinstate a lost wakeup too narrow for a test to catch.
+    /// See `begin_shutdown`.
     shutdown: bool,
 }
 
