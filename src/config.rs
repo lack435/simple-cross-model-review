@@ -549,9 +549,10 @@ OPTIONS:
                               to the working root, so reads cannot leave the project.
   --diff <spec>               What to capture and hand the reviewer as "the change".
                               auto    supply a working-tree diff only when the reviewer
-                                      has no usable shell to fetch one itself, i.e.
-                                      Codex, or Claude without Bash both enabled and
-                                      allow-listed (default)
+                                      has no usable shell to fetch one itself -- i.e.
+                                      Claude without Bash both enabled and allow-listed.
+                                      The Codex reviewer always has one, so auto supplies
+                                      nothing there. (default)
                               none    supply nothing; paste your own into 'instructions'
                               staged  git diff --cached
                               HEAD    git diff HEAD, plus untracked file contents
@@ -559,8 +560,11 @@ OPTIONS:
                                       no untracked files
                               <rev>   that commit against the WORKING TREE, e.g. HEAD~3,
                                       plus untracked file contents -- git's own semantics,
-                                      not ours. Revision-set shorthand (^!, ^@, ^-) is
-                                      rejected, since it is a range with no .. to see.
+                                      not ours. Two spellings are rejected because nothing
+                                      distinguishes them from the other shape: revision-set
+                                      shorthand (^!, ^@, ^-), which is a range with no ..
+                                      to see, and :/<pattern> containing .., which is a
+                                      range whose left end is a message search.
                               A capture that was configured and could not be produced is
                               reported to the caller with the review, not skipped in
                               silence. Not affected by --no-preamble; use --diff none.

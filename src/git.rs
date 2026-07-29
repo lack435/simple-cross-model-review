@@ -86,11 +86,15 @@ fn revision_set_suffix(spec: &str) -> Option<&'static str> {
 /// against the working tree; reading it as a range would drop untracked capture and raise a
 /// dirty-tree warning that is simply false.
 fn is_two_endpoint(spec: &str) -> bool {
-    // `:/` searches from any ref, and everything after it is the pattern -- but only
-    // because `parse` has already refused the `:/…..…` case, where git would split on the
-    // first `..` and read the search as a range's left endpoint instead.
+    // `:/` searches from any ref, and everything after it is the pattern -- unless it also
+    // contains `..`, where git splits on the first one and reads the search as a range's
+    // left endpoint instead. `parse` refuses that spelling outright, so this is normally
+    // unreachable; it answers anyway, and answers "range", because `DiffMode::Rev` is
+    // directly constructible and an invariant enforced only by call ordering across two
+    // functions is one edit away from being silently untrue. "Range" is the safe answer:
+    // it withholds untracked contents and keeps the dirty-tree warning on.
     if spec.starts_with(":/") {
-        return false;
+        return spec.contains("..");
     }
     // Elsewhere, dots inside `^{...}` belong to whatever the braces contain.
     let mut depth = 0usize;
@@ -590,22 +594,19 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
     // real defect, and the preamble tells the reviewer not to soften one; what is wanted is
     // correct attribution, not silence.
     if change.tree_may_differ {
-        // The heading follows the same branch as the body: asserting the tree *is* different
-        // when the status could not be read would be claiming what was not established, and
-        // a heading is the part a reviewer skims and quotes back.
-        if change.tree_state_known {
-            out.push_str("### The tree you can read is not the diff above\n\n");
+        // Heading and opening sentence are written together, in one branch, because they
+        // make the same claim at two strengths: a definite heading over an "unknown" body
+        // is exactly the drift this section keeps closing elsewhere, and the heading is the
+        // part a reviewer skims and quotes back. Splitting them into adjacent `if`s on the
+        // same flag is one careless edit away from that.
+        out.push_str(if change.tree_state_known {
+            "### The tree you can read is not the diff above\n\n\
+             The working tree has changes that are **not** in the diff above. "
         } else {
-            out.push_str("### The tree you can read may not be the diff above\n\n");
-        }
-        if change.tree_state_known {
-            out.push_str("The working tree has changes that are **not** in the diff above. ");
-        } else {
-            out.push_str(
-                "`git status` did not complete, so whether the working tree matches the diff \
-                 above is **unknown** -- treat it as though it does not. ",
-            );
-        }
+            "### The tree you can read may not be the diff above\n\n\
+             `git status` did not complete, so whether the working tree matches the diff \
+             above is **unknown** -- treat it as though it does not. "
+        });
         out.push_str(
             "The diff describes one revision; any file you read reflects the current tree, \
              which may be a different one. Do not report a mismatch between them as a defect \
@@ -1294,6 +1295,15 @@ mod tests {
             let err = DiffMode::parse(spec).unwrap_err();
             assert!(err.contains("ambiguous"), "{spec}: {err}");
             assert!(err.contains("HEAD~1..HEAD"), "{spec}: {err}");
+
+            // And the classifier answers safely on its own, rather than relying on having
+            // been called after `parse`. `DiffMode::Rev` is directly constructible, so an
+            // invariant held only by call ordering is one edit from being untrue: this
+            // withholds untracked contents and keeps the dirty-tree warning on.
+            let unchecked = DiffMode::Rev(spec.to_string());
+            assert!(!unchecked.compares_against_working_tree(), "{spec}");
+            assert!(!unchecked.includes_untracked(), "{spec}");
+            assert!(unchecked.tree_may_differ(" M src/main.rs\n"), "{spec}");
         }
 
         // Terminal only. These characters are ordinary inside a revision: `:/^!release`
