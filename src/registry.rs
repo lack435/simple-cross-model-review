@@ -24,6 +24,16 @@ pub const MAX_TERMINAL_PER_SESSION: usize = 3;
 /// review per name for ever.
 pub const MAX_TERMINAL_TOTAL: usize = 50;
 
+/// Why a review could not be registered.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StartRefused {
+    /// The session already has a review in flight. Carries that review's id, which the
+    /// caller is told to collect or cancel.
+    Busy(String),
+    /// Stdin has closed and the process is on its way out.
+    ShuttingDown,
+}
+
 /// What the registry knows about an id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IdState {
@@ -132,6 +142,16 @@ struct State {
     /// on that would place it oldest at the very moment it finished, and the sweep
     /// triggered by its own `finish` could evict it before its caller could collect it.
     finishes: u64,
+    /// Set once stdin has closed and the process is on its way out. Waiters observe it
+    /// alongside their own deadline, so shutdown does not have to outlast a long poll.
+    ///
+    /// It lives in here rather than beside the condvar as an `AtomicBool` so that it
+    /// cannot be touched without the lock — which is what makes it race-free, not its
+    /// atomicity. An `Atomic` would read as "safe from anywhere" and is exactly the trap:
+    /// publishing it outside the lock, or hoisting the read in `wait` out of the loop,
+    /// would compile and would reinstate a lost wakeup too narrow for a test to catch.
+    /// See `begin_shutdown`.
+    shutdown: bool,
 }
 
 impl State {
@@ -174,6 +194,14 @@ pub struct Registry {
     state: Mutex<State>,
     changed: Condvar,
     counter: AtomicU64,
+    /// Bumped immediately before each `wait_timeout`, while the state lock is still held.
+    ///
+    /// That timing is the whole point, and it is what lets a test prove a waiter has parked
+    /// rather than assume it: a test that has seen this counter move knows the waiter holds
+    /// the lock and is about to park, so anything it does next that needs the lock cannot
+    /// proceed until `wait_timeout` has atomically released it and joined the wait set.
+    #[cfg(test)]
+    parks: AtomicU64,
 }
 
 impl Registry {
@@ -187,20 +215,33 @@ impl Registry {
     /// The check and the insert happen under a single lock acquisition. Doing them
     /// separately would let two concurrent `tools/call` handlers both see an idle
     /// session and both start a review against the same reviewer conversation.
+    ///
+    /// Refuses outright once shutdown has begun. A handler can reach here after stdin
+    /// closed — it may have spent the interval in the auth preflight or waiting for the
+    /// session lease — and a review registered at that point can never be collected,
+    /// because the process exits as soon as the handler returns. Starting one would spend
+    /// a reviewer turn on a result with nowhere to go, and answer "review started" to a
+    /// caller that will never see the review. Tested here, under the lock that publishes
+    /// the flag, rather than by the caller beforehand: a pre-check outside it would leave
+    /// exactly the window this closes.
     pub fn try_start(
         &self,
         session: &str,
         turn: u32,
         resumed: bool,
-    ) -> Result<(String, Arc<AtomicBool>), String> {
+    ) -> Result<(String, Arc<AtomicBool>), StartRefused> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        if guard.shutdown {
+            return Err(StartRefused::ShuttingDown);
+        }
 
         if let Some(running) = guard
             .reviews
             .values()
             .find(|r| r.session == session && r.status == Status::Running)
         {
-            return Err(running.id.clone());
+            return Err(StartRefused::Busy(running.id.clone()));
         }
 
         // Ids are unique per process and readable in logs. No RNG dependency: the
@@ -329,20 +370,56 @@ impl Registry {
         }
     }
 
-    /// Block until this review leaves `Running`, or until `timeout` elapses.
-    /// Returns a snapshot either way.
+    /// Tell parked waiters that the process is going away, so `serve` can join their
+    /// handler threads instead of waiting out their deadlines.
+    ///
+    /// The flag is set under the same lock the condition variable waits on, and released
+    /// before the notify. Setting it outside that lock would reintroduce the stall this
+    /// exists to remove: a waiter that had read the flag but not yet reached `wait_timeout`
+    /// still holds the lock, so a `notify_all` from here would land before it joined the
+    /// wait set, be lost, and leave it sleeping out its full remaining budget anyway.
+    /// Keeping the flag inside `State` is what makes that ordering the only spelling
+    /// available.
+    pub fn begin_shutdown(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.shutdown = true;
+        drop(guard);
+        self.changed.notify_all();
+    }
+
+    /// How many times a waiter has reached the point of parking. See `Registry::parks`.
+    #[cfg(test)]
+    fn parks(&self) -> u64 {
+        self.parks.load(Ordering::SeqCst)
+    }
+
+    /// Block until this review leaves `Running`, until `timeout` elapses, or until
+    /// shutdown begins. Returns a snapshot in every case.
     pub fn wait(&self, id: &str, timeout: Duration) -> Option<Snapshot> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            // Copied out per iteration, not hoisted: it lives under this lock, and
+            // `begin_shutdown` needs the lock to set it, so re-reading it here is what
+            // makes a shutdown that lands mid-wait visible on the next wake.
+            let shutting_down = guard.shutdown;
             let review = guard.reviews.get(id)?;
             if review.status != Status::Running {
-                return Some(Snapshot::of(review));
+                return Some(Snapshot::of(review, shutting_down));
+            }
+            // Tested after the terminal state above, so a review that landed in the same
+            // moment stdin closed is still returned as the result it is.
+            if shutting_down {
+                return Some(Snapshot::of(review, shutting_down));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Some(Snapshot::of(review));
+                return Some(Snapshot::of(review, shutting_down));
             }
+            // Recorded while the lock is still held, so a test can tell "about to park"
+            // from "not scheduled yet". See `Registry::parks`.
+            #[cfg(test)]
+            self.parks.fetch_add(1, Ordering::SeqCst);
             let (next, _) = self
                 .changed
                 .wait_timeout(guard, remaining)
@@ -366,10 +443,14 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     pub resumable: bool,
     pub elapsed: Duration,
+    /// The server had begun shutting down when this was taken. A `Running` snapshot with
+    /// this set means the wait was cut short, not that the caller's budget ran out — and
+    /// that no later call can collect the review, because the process is exiting.
+    pub shutting_down: bool,
 }
 
 impl Snapshot {
-    fn of(review: &Review) -> Self {
+    fn of(review: &Review, shutting_down: bool) -> Self {
         Self {
             id: review.id.clone(),
             session: review.session.clone(),
@@ -382,6 +463,7 @@ impl Snapshot {
             warnings: review.warnings.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
+            shutting_down,
         }
     }
 }
@@ -399,7 +481,7 @@ mod tests {
         // The check and insert are atomic, so the second claim must be refused and must
         // name the review already holding the session.
         let refused = registry.try_start("default", 2, true).unwrap_err();
-        assert_eq!(refused, first);
+        assert_eq!(refused, StartRefused::Busy(first));
     }
 
     /// Start and immediately finish a review on `session`, returning its id.
@@ -677,6 +759,124 @@ mod tests {
             .wait(&id, Duration::from_millis(50))
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
+    }
+
+    #[test]
+    fn shutdown_wakes_a_parked_waiter() {
+        // The regression: `serve` joins in-flight handlers, so a poll parked here with a
+        // 300s budget used to hold the process open for the rest of it after stdin closed.
+        let registry = Arc::new(Registry::new());
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+
+        let closer = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                registry.begin_shutdown();
+            })
+        };
+
+        // Long enough that only the shutdown can plausibly end it, short enough that a
+        // regression fails on the assertion below rather than stalling CI for minutes.
+        let started = Instant::now();
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        closer.join().expect("closer");
+        assert_eq!(snapshot.status, Status::Running);
+        assert!(snapshot.shutting_down);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown did not end the wait"
+        );
+    }
+
+    /// Proves the wake path instead of trusting a sleep, which the test above cannot: it
+    /// assumes 150 ms was enough for the waiter to reach `wait_timeout`, and on a loaded box
+    /// a waiter that was never scheduled at all is indistinguishable from a parked one — so
+    /// it would pass even with `notify_all` deleted.
+    ///
+    /// The lock is what settles it. The waiter records `parks` while still holding the state
+    /// lock, so once this thread has seen that counter move, `begin_shutdown` cannot get the
+    /// lock until `wait_timeout` has released it — and `wait_timeout` releases it and joins
+    /// the condvar's wait set as one atomic step. The flag is therefore raised only after
+    /// the waiter is provably in the wait set, which leaves the notify as the only thing
+    /// that can free it before the 30s deadline.
+    #[test]
+    fn a_provably_parked_waiter_is_freed_by_the_notify() {
+        let registry = Arc::new(Registry::new());
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+
+        let poller = {
+            let registry = Arc::clone(&registry);
+            let id = id.clone();
+            std::thread::spawn(move || registry.wait(&id, Duration::from_secs(30)))
+        };
+
+        // Bounded: `cargo test` has no per-test timeout, so an unbounded spin would turn a
+        // waiter that never parks into a silent CI hang instead of a readable failure.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while registry.parks() == 0 {
+            assert!(
+                Instant::now() < give_up,
+                "no waiter ever reached the point of parking"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        registry.begin_shutdown();
+        let snapshot = poller.join().expect("poller").expect("snapshot");
+        assert!(snapshot.shutting_down);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the notify did not free a waiter that was definitely parked"
+        );
+    }
+
+    #[test]
+    fn shutdown_refuses_a_review_that_could_never_be_collected() {
+        // The other half of shutdown: a handler can arrive here after stdin closed, having
+        // spent the interval in preflight or waiting for the session lease. Registering the
+        // review would answer "review started" and then exit, billing a reviewer turn for a
+        // result with nowhere to go.
+        let registry = Registry::new();
+        registry.begin_shutdown();
+        assert_eq!(
+            registry.try_start("default", 1, false).unwrap_err(),
+            StartRefused::ShuttingDown
+        );
+    }
+
+    #[test]
+    fn a_wait_begun_after_shutdown_does_not_park_at_all() {
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.begin_shutdown();
+
+        let started = Instant::now();
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        assert_eq!(snapshot.status, Status::Running);
+        assert!(snapshot.shutting_down);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_review_that_finished_is_still_returned_during_shutdown() {
+        // Ordering inside `wait`: a review completing in the same moment stdin closes must
+        // hand back its text, not a running snapshot that discards it.
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.begin_shutdown();
+        registry.finish(&id, Outcome::completed("just in time"));
+
+        let snapshot = registry
+            .wait(&id, Duration::from_secs(30))
+            .expect("snapshot");
+        assert_eq!(snapshot.status, Status::Completed);
+        assert_eq!(snapshot.review.as_deref(), Some("just in time"));
     }
 
     #[test]

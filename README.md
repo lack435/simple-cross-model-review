@@ -361,7 +361,8 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `SERVER_SHUTTING_DOWN`,
+`INTERNAL_ERROR`. Bad tool arguments
 get a plain correction instead, since that is the agent's own mistake and not something to
 escalate,
 and so does a tool call the server could not start a thread for -- neither says anything
@@ -518,5 +519,33 @@ Both directions pass against live CLIs.
   Cancelling the review is also what ends the poll: the worker sees the flag within
   100 ms, and the terminal state it records wakes the waiter. Promptly, not instantly —
   a worker already past the child and writing session state finishes that first — but
-  bounded, so a suppressed response does not park a handler thread until shutdown.
+  bounded, so a suppressed response does not park a handler thread.
+- **Closing stdin ends a long poll immediately.** `serve` joins every in-flight `tools/call`
+  before returning, because exiting mid-flight dropped responses a client was still waiting
+  on. A poll parked on a review has no deadline worth honouring once the client is gone, so
+  stdin closure sets a shutdown flag that waiters observe alongside their own deadline —
+  otherwise a `wait_seconds: 300` call held the process open for the rest of the five
+  minutes and then wrote to a stdout nobody was reading. The flag is published under the
+  same mutex the condition variable uses; set outside it, a waiter that had read it but not
+  yet parked would miss the wake and sleep out its budget regardless. A review that reaches
+  a terminal state in that same moment still returns its result rather than a running
+  snapshot, and a poll cut short says the server is shutting down instead of inviting a
+  retry that nothing will answer.
+
+  A start call still in flight is refused rather than granted a reprieve: `try_start`
+  rejects with `SERVER_SHUTTING_DOWN` once the flag is up, under the same lock that raises
+  it, because a review registered after stdin closed could never be collected — the server
+  drains the calls already running and then exits, so starting one would bill a reviewer
+  turn for a result with nowhere to go and answer "review started" to a caller that will
+  never see it. A handler can genuinely arrive there that late: it may have spent the
+  interval in the auth preflight or waiting for the session lease.
+
+  What it costs: an in-flight review is abandoned rather than allowed to finish. Worker
+  threads are never joined, so one that was seconds from persisting its session mapping
+  loses it. Its reviewer process is left to the job object, which is best-effort rather
+  than guaranteed — job creation and assignment both continue with a warning when they
+  fail, so a reviewer that never joined a job is not reaped by the handle closing. Nothing
+  cancels the worker on this path, so no child is explicitly killed either. Holding a
+  process open for minutes on the chance of salvaging a session mapping is still the worse
+  trade.
 - **stdout is protocol traffic only.** Diagnostics go to stderr.

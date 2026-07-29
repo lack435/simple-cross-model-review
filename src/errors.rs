@@ -393,6 +393,28 @@ pub fn session_leased(session: &str, detail: String) -> Failure {
     failure
 }
 
+/// Stdin has closed, so the review was refused rather than started with nowhere to go.
+///
+/// Reported instead of starting the reviewer because the server is on its way out: the
+/// `review_id` would be unusable, and the reviewer turn would be billed for a result
+/// nothing could collect.
+pub fn server_shutting_down() -> Failure {
+    Failure {
+        code: "SERVER_SHUTTING_DOWN",
+        summary: "This server's stdin is no longer readable, so it is shutting down and did \
+                  not start the review. It is draining the calls already in flight and will \
+                  then exit, so a review started now could not be collected: review ids do \
+                  not survive the server process."
+            .to_string(),
+        remediation: "Nothing was spent and there is no review to collect. Reconnect to the \
+                      cross-review MCP server and start the review again. If this arrived \
+                      unprompted, the client closed the connection while the call was still \
+                      in flight."
+            .to_string(),
+        detail: None,
+    }
+}
+
 /// A review is already in flight for this named session.
 pub fn session_busy(session: &str, review_id: &str) -> Failure {
     Failure {
