@@ -177,9 +177,15 @@ Notes on the edges, because they are where this would otherwise mislead:
   has already been committed. Use `--diff <range>` for that.
 - **Truncation is stated in the prompt**, for the diff, the status listing and each
   untracked file. Caps: 400 KB diff, 200 KB untracked contents total, 60 KB per file, 50
-  files included, 200 paths examined, 20 lines of "what was left out". Binary files are
-  named, not included. Files are read up to their cap rather than read whole and then cut.
-  A silently short diff would be worse than none.
+  files included, 200 paths examined, 20 per-file lines of "what was left out". Binary
+  files are named, not included. Files are read up to their cap rather than read whole and
+  then cut, and a truncated file names the cap that actually cut it — the read is bounded
+  by whatever is smaller, so calling it the per-file cap would claim a 200-byte file is
+  over 60 KB. That last cap covers the per-file lines only: the statements about the
+  capture *itself* — the listing stopped early, files were dropped for want of budget —
+  are established only after every per-file line has had its chance at a slot, so they are
+  carried separately and the cap cannot suppress them. A silently short diff would be
+  worse than none.
 - **The capture is labelled as evidence, not instructions**, for the same reason CLAUDE.md
   is — a diff from a repository you do not trust is a prompt injection surface. File
   contents go inside a fence long enough that nothing in them can close it early, and
