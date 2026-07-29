@@ -212,13 +212,14 @@ Notes on the edges, because they are where this would otherwise mislead:
   only if the job object could not be created or something outside it holds a handle.
 - **A capture that was configured and did not happen is reported to the caller**, as a
   warning alongside the review: no local `main` for a pinned `main...HEAD`, a working root
-  that is not inside a git work tree, git missing from PATH, or any part of the capture that ran
-  short. The reviewer is told it has no diff, but the caller is the party that asked for a
+  that is not inside a git work tree, git missing from PATH, or any **capture-level** part of
+  it that ran short — the qualifier is load-bearing, and the next two paragraphs are what it
+  means. The reviewer is told it has no diff, but the caller is the party that asked for a
   review of a change, and a review of the current tree returned in silence reads exactly
   like the review it asked for. Nothing was ever promised for `--diff none`, or for `auto`
   with a reviewer that has its own shell, so those stay silent.
 
-  A **capture-level** bound warns too, and that qualifier is the whole of the rule. If the untracked
+  So does a capture-level *bound*, not just a part that failed to run. If the untracked
   listing stopped early — at either the included cap or the examined one — or files were
   dropped because the total content cap ran out, the caller is told, because that is the one
   thing it cannot infer from what came back: a review made against a listing that stopped at
