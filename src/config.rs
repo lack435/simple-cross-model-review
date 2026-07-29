@@ -403,11 +403,18 @@ impl Config {
                 );
             }
             ReviewerKind::Claude if self.reviewer_has_shell() => {
+                // Not "read-only", unlike the Codex arm above. That one is a sandbox
+                // policy; this one is a prefix allow-list, which this file's own
+                // `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified,
+                // with `Bash(git diff:*)` permitting `git diff --output=<file>` and
+                // creating a file. Telling the reviewer otherwise would be handing it a
+                // false security boundary in the one message it has to trust.
                 out.push_str(
-                    "You can read and search files in this project, and run the read-only shell \
-                     commands that have been allow-listed. Anything outside that list is denied \
-                     rather than queued for approval, so a refusal is final -- note it and move \
-                     on.",
+                    "You can read and search files in this project, and run the shell commands \
+                     that have been allow-listed -- that list is a prefix match, not a \
+                     read-only guarantee, so do not treat it as one. Anything outside it is \
+                     denied rather than queued for approval, so a refusal is final -- note it \
+                     and move on.",
                 );
             }
             ReviewerKind::Claude => {
@@ -863,6 +870,36 @@ mod tests {
         let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
+        // Codex's shell is confined by a sandbox policy, so it may be called read-only.
+        assert!(text.contains("read-only shell"), "{text}");
+    }
+
+    /// The prompt the reviewer itself reads must not claim a boundary the mechanism does
+    /// not provide. Codex's shell is a sandbox policy; Claude's is a prefix allow-list,
+    /// which `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified, with
+    /// `Bash(git diff:*)` permitting `--output=<file>` and creating a file.
+    #[test]
+    fn an_opted_in_claude_shell_is_never_described_to_it_as_read_only() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allow-tools",
+            "Read Grep Glob Bash(git diff:*)",
+        ]))
+        .expect("config");
+        assert!(cfg.reviewer_has_shell());
+
+        let text = cfg.reviewer_capabilities(false);
+        // The word may appear only where it is being denied, never as a description of
+        // what the shell is.
+        assert!(!text.contains("read-only shell"), "{text}");
+        assert!(!text.contains("run the read-only"), "{text}");
+        assert!(text.contains("prefix match"), "{text}");
+        assert!(text.contains("not a read-only guarantee"), "{text}");
+        // The denial behaviour still has to be stated: refusals are final, not queued.
+        assert!(text.contains("a refusal is final"), "{text}");
     }
 
     #[test]
