@@ -61,15 +61,25 @@ that reads badly to the calling agent — that is a bug in this repository, so r
 rather than working around it.
 
 That leaves one deadlock worth naming: a PR that repairs the gate cannot pass through the
-gate it is repairing. The exception is narrow, and the maintainer authorises it per PR:
+gate it is repairing. There is an exception for exactly that case, and **you cannot invoke
+it on your own judgement.** Every condition below is an artifact you must be able to point
+at. If any one of them is missing, stop and tell the user which one:
 
-- It covers a change that restores the gate, and nothing else. Not a rate limit, not a
-  reviewer that is slow or expensive, not findings you would rather not address.
-- Quote the failing output verbatim in the PR.
-- Get the review from a different model out of band under the same read-only constraints,
-  and record in the PR that it was obtained that way and from which model.
-- Once the repair makes a real review possible, run one on the exact final diff before the
-  merge.
+- **A human maintainer authorised this specific PR**, in the PR itself or in a direct
+  instruction to you. You may not infer authorisation from the situation being urgent, from
+  the repair being obviously correct, or from a previous PR having been authorised. If you
+  are unsure whether you have it, you do not have it — ask.
+- **The PR is the minimum repair to the gate and nothing else.** Split unrelated work out
+  into its own PR, which goes through the normal gate. A repair with a tidy-up bundled into
+  it does not qualify; neither does a rate limit, a reviewer that is slow or expensive, or
+  findings you would rather not address.
+- **The failing output is quoted verbatim in the PR** — the code and the full message, not
+  a paraphrase of what went wrong.
+- **A different model reviewed it out of band, under the same read-only constraints**, and
+  the PR carries the request and the response in full, naming the model and how it was
+  confined. A claim that this happened is not the artifact; the transcript is.
+- **The repaired gate reviews the exact final diff before the merge.** If the repair works,
+  this is possible — so it is required, and it is what actually closes the exception.
 
 ## Before handing work back
 
