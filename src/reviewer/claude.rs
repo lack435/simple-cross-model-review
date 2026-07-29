@@ -121,8 +121,13 @@ impl Reviewer for ClaudeReviewer {
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
+        // The review is stdout-only for this reviewer, so a stdout that hit the cap is
+        // not a parse failure to diagnose -- it is a document with its end missing, and
+        // saying so is the only accurate report available.
         let parsed: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
-            if out.success {
+            if let Some(truncated) = super::truncation_failure(cfg, out) {
+                truncated
+            } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
             } else {
                 super::failure_for(cfg, out)
@@ -242,7 +247,33 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
+            truncated: false,
         }
+    }
+
+    #[test]
+    fn a_truncated_stdout_is_reported_as_truncation_not_as_an_empty_review() {
+        // This reviewer's review is stdout-only, so a stdout that hit the cap is a
+        // document with its end missing -- not a CLI that wrote nothing. EMPTY_REVIEW
+        // would send the caller to retry something that will do the same thing again.
+        // Escaped rather than raw: the value contains `"##`, which closes an `r#"` and an
+        // `r##"` literal alike.
+        let cut_short = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"## Verdi";
+        let truncated = RunOutcome {
+            truncated: true,
+            ..outcome(cut_short, true)
+        };
+        let failure = ClaudeReviewer
+            .parse(&cfg(), &truncated, None)
+            .expect_err("truncated JSON cannot parse");
+        assert_eq!(failure.code, "OUTPUT_TRUNCATED");
+
+        // The same unparseable stdout without the cap having been hit is still an empty
+        // review, so the new code cannot swallow the old diagnosis.
+        let failure = ClaudeReviewer
+            .parse(&cfg(), &outcome(cut_short, true), None)
+            .expect_err("still a failure");
+        assert_eq!(failure.code, "EMPTY_REVIEW");
     }
 
     #[test]
@@ -302,6 +333,7 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            truncated: false,
         }
     }
 
@@ -362,6 +394,7 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
@@ -391,6 +424,7 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");

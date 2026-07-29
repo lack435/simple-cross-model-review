@@ -12,7 +12,7 @@ use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
 use crate::git;
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
-use crate::registry::{Outcome, Registry, Snapshot, Status};
+use crate::registry::{IdState, Outcome, Registry, Snapshot, Status, MAX_TERMINAL_PER_SESSION};
 use crate::reviewer::{self, Reviewer};
 use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
 
@@ -226,16 +226,29 @@ impl App {
             .min(MAX_WAIT_SECS);
 
         let id = match (&review_id, &session) {
-            (Some(id), _) => {
-                if !self.registry.exists(id) {
+            (Some(id), _) => match self.registry.lookup(id) {
+                IdState::Known => id.clone(),
+                // Distinguished from "never existed" deliberately. Both end in "start a
+                // new review", but a caller told its id was never issued has reason to
+                // suspect it mangled the id, and will go looking for a bug that is not
+                // there.
+                IdState::Evicted => {
+                    return Err(errors::bad_request(format!(
+                        "Review '{id}' finished earlier and its result has since been discarded: \
+                         this server keeps only the {MAX_TERMINAL_PER_SESSION} most recent \
+                         finished reviews per session, so that a long agent session does not \
+                         accumulate every review it has ever run. The id was valid; the review is \
+                         not recoverable. Start a new review instead."
+                    )));
+                }
+                IdState::Unknown => {
                     return Err(errors::bad_request(format!(
                         "No review with review_id '{id}' exists in this server process. Review \
                          ids do not survive a restart of the MCP server; start a new review \
                          instead."
                     )));
                 }
-                id.clone()
-            }
+            },
             (None, Some(name)) => self.registry.latest_for_session(name).ok_or_else(|| {
                 errors::bad_request(format!(
                     "No review has been started for session '{name}' in this server process. \
@@ -450,10 +463,22 @@ impl App {
     pub fn cancel(&self, args: &Value) -> Result<String, Failure> {
         let id = string_arg(args, "review_id")
             .ok_or_else(|| errors::bad_request("'review_id' is required."))?;
-        if !self.registry.exists(&id) {
-            return Err(errors::bad_request(format!(
-                "No review with review_id '{id}' exists in this server process."
-            )));
+        match self.registry.lookup(&id) {
+            IdState::Known => {}
+            // An evicted review is a finished one, so the honest answer is the same as
+            // for any other finished review: there is nothing to stop. Reporting it as
+            // an unknown id would suggest the caller got the id wrong.
+            IdState::Evicted => {
+                return Ok(format!(
+                    "Review '{id}' finished earlier and its result has since been discarded, so \
+                     there is nothing to cancel.\n"
+                ));
+            }
+            IdState::Unknown => {
+                return Err(errors::bad_request(format!(
+                    "No review with review_id '{id}' exists in this server process."
+                )));
+            }
         }
         if self.cancel_review(&id) {
             // Give the worker a moment to reap the child so the report is accurate.

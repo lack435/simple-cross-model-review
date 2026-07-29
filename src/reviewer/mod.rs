@@ -21,6 +21,15 @@ use std::time::{Duration, Instant};
 /// is bounded rather than an unbounded join.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
+/// Ceiling on what we keep from one output pipe.
+///
+/// Collection was bounded in time but not in size: a reviewer emitting output
+/// continuously was held in memory until it stopped or the deadline passed. Deliberately
+/// far above anything observed -- real transcripts are kilobytes, and Codex's event stream
+/// is the largest of them by a wide margin -- so reaching this means something has gone
+/// wrong, and the point is that it fails legibly rather than eating the machine.
+const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 use crate::config::{Config, ReviewerKind};
 use crate::errors::{self, Failure};
 
@@ -252,12 +261,24 @@ pub struct RunOutcome {
     pub success: bool,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// Either output stream hit the size cap, so what is above is not all of it.
+    pub truncated: bool,
 }
 
 impl RunOutcome {
     /// stderr first: that is where CLIs put the reason they failed.
     pub fn diagnostics(&self) -> String {
         let mut out = String::new();
+        // Stated first, because everything below it is now evidence of unknown
+        // completeness and a reader who learns that afterwards has already drawn
+        // conclusions from it.
+        if self.truncated {
+            out.push_str(&format!(
+                "[cross-review: the reviewer's output exceeded {} MiB and was truncated; what \
+                 follows is incomplete]\n\n",
+                MAX_OUTPUT_BYTES / (1024 * 1024)
+            ));
+        }
         if !self.stderr.trim().is_empty() {
             out.push_str(self.stderr.trim());
         }
@@ -372,8 +393,9 @@ pub fn run(
     let stderr = collect(&stderr_buf, drain_by);
 
     Ok(RunOutcome {
-        stdout,
-        stderr,
+        truncated: stdout.truncated || stderr.truncated,
+        stdout: stdout.text,
+        stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
         success: status.map(|s| s.success()).unwrap_or(false) && !timed_out && !cancelled,
         timed_out,
@@ -381,49 +403,96 @@ pub fn run(
     })
 }
 
-/// Progress of one output pipe: the bytes so far, and whether the reader reached EOF.
+/// Progress of one output pipe: the bytes so far, whether the reader reached EOF, and
+/// whether it had to start discarding.
 struct Drain {
     buffer: Arc<Mutex<Vec<u8>>>,
     done: Arc<AtomicBool>,
+    truncated: Arc<AtomicBool>,
 }
 
 /// Start draining a pipe into a shared buffer.
 ///
 /// Reading incrementally rather than returning at EOF is what makes a partial transcript
 /// recoverable: whatever arrived before the deadline is already in the buffer.
+///
+/// The buffer is capped, but the *reading* is not. Once the cap is reached the reader
+/// keeps consuming the pipe and throws the bytes away, because a reader that stopped
+/// would fill the pipe and block the child forever -- trading unbounded memory for a
+/// hung review, which is a worse bargain. Reaching the cap is recorded, so a transcript
+/// that lost its middle is reported as truncated rather than as merely short.
 fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
+    let truncated = Arc::new(AtomicBool::new(false));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
+    let writer_truncated = Arc::clone(&truncated);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => writer_buf
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
+                    if room == 0 {
+                        writer_truncated.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                    if n > room {
+                        writer_truncated.store(true, Ordering::SeqCst);
+                    }
+                    buffer.extend_from_slice(&chunk[..n.min(room)]);
+                }
             }
         }
         writer_done.store(true, Ordering::SeqCst);
     });
 
-    Drain { buffer, done }
+    Drain {
+        buffer,
+        done,
+        truncated,
+    }
+}
+
+/// One pipe's output, and whether the cap threw any of it away.
+struct Collected {
+    text: String,
+    truncated: bool,
 }
 
 /// Take what a pipe has produced, waiting until EOF or `deadline`, whichever comes first.
 ///
 /// CLI output is normally UTF-8, but a stray non-UTF-8 byte in a diagnostic must not lose
 /// us the whole message, so decoding is lossy.
-fn collect(drain: &Drain, deadline: Instant) -> String {
+fn collect(drain: &Drain, deadline: Instant) -> Collected {
     while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     let buffer = drain.buffer.lock().unwrap_or_else(|e| e.into_inner());
-    String::from_utf8_lossy(&buffer).into_owned()
+    Collected {
+        text: String::from_utf8_lossy(&buffer).into_owned(),
+        truncated: drain.truncated.load(Ordering::SeqCst),
+    }
+}
+
+/// The failure to report when output was capped, if it was.
+///
+/// Checked ahead of `EMPTY_REVIEW` by both adapters. Truncation makes every downstream
+/// diagnosis unreliable -- a JSON document cut in half parses as nothing at all -- so the
+/// cap has to be named rather than left to surface as "the CLI wrote nothing", which is
+/// the opposite of what happened and points the caller at a useless retry.
+pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
+    out.truncated.then(|| {
+        errors::output_truncated(
+            cfg.reviewer.as_str(),
+            MAX_OUTPUT_BYTES / (1024 * 1024),
+            out.diagnostics(),
+        )
+    })
 }
 
 /// Turn a non-success run into the right `Failure`.
@@ -450,4 +519,94 @@ pub fn tmp_file(cfg: &Config, tmp_id: &str, name: &str) -> std::io::Result<PathB
     let dir = cfg.tmp_dir();
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{tmp_id}-{name}")))
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    fn drained(bytes: Vec<u8>) -> Collected {
+        let drain = drain(std::io::Cursor::new(bytes));
+        collect(&drain, Instant::now() + Duration::from_secs(5))
+    }
+
+    #[test]
+    fn output_under_the_cap_is_kept_whole_and_not_flagged() {
+        let collected = drained(b"a normal transcript".to_vec());
+        assert_eq!(collected.text, "a normal transcript");
+        assert!(!collected.truncated);
+    }
+
+    #[test]
+    fn output_over_the_cap_is_bounded_and_flagged() {
+        // Collection was bounded in time but not in size, so a reviewer emitting output
+        // continuously was held in memory until it stopped.
+        let collected = drained(vec![b'x'; MAX_OUTPUT_BYTES + 4096]);
+        assert_eq!(collected.text.len(), MAX_OUTPUT_BYTES);
+        assert!(collected.truncated);
+    }
+
+    #[test]
+    fn the_whole_pipe_is_still_consumed_after_the_cap() {
+        // The reader must keep reading and discard, not stop: a reader that stopped would
+        // fill the pipe and block the child for ever, trading unbounded memory for a hung
+        // review. Reaching EOF is what proves it kept going -- `done` is only set when the
+        // read loop ends.
+        let drain = drain(std::io::Cursor::new(vec![b'x'; MAX_OUTPUT_BYTES * 2]));
+        let collected = collect(&drain, Instant::now() + Duration::from_secs(5));
+        assert!(collected.truncated);
+        assert!(
+            drain.done.load(Ordering::SeqCst),
+            "reader stopped at the cap instead of draining to EOF"
+        );
+    }
+
+    #[test]
+    fn a_cap_hit_on_either_stream_is_stated_before_the_evidence() {
+        // Everything after it is evidence of unknown completeness, and a reader who
+        // learns that afterwards has already drawn conclusions from it.
+        let out = RunOutcome {
+            stdout: "partial".into(),
+            stderr: "boom".into(),
+            exit: Some(1),
+            success: false,
+            timed_out: false,
+            cancelled: false,
+            truncated: true,
+        };
+        let diagnostics = out.diagnostics();
+        assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
+        assert!(diagnostics.contains("truncated"), "{diagnostics}");
+
+        let intact = RunOutcome {
+            truncated: false,
+            ..out
+        };
+        assert!(!intact.diagnostics().contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_is_reported_under_its_own_code_not_as_an_empty_review() {
+        // An empty review means the CLI wrote nothing and retrying is reasonable. A
+        // truncated one means it wrote far too much, and retrying does the same again.
+        let cfg =
+            Config::from_args(&["--reviewer".to_string(), "claude".to_string()]).expect("config");
+        let out = RunOutcome {
+            stdout: "{\"result\": \"half a doc".into(),
+            stderr: String::new(),
+            exit: Some(0),
+            success: true,
+            timed_out: false,
+            cancelled: false,
+            truncated: true,
+        };
+        let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
+        assert_eq!(failure.code, "OUTPUT_TRUNCATED");
+
+        let intact = RunOutcome {
+            truncated: false,
+            ..out
+        };
+        assert!(truncation_failure(&cfg, &intact).is_none());
+    }
 }
