@@ -1,0 +1,21 @@
+# Project-level Codex configuration: register cross-review as an MCP server so Codex
+# can send work to Claude Opus 5 for an independent review.
+#
+# Commit this at <your-project>\.codex\config.toml, alongside tools\cross-review.exe.
+# Relative paths resolve against the project root, so this entry travels with the repo
+# and a fresh clone needs no per-machine setup.
+#
+# Prerequisite: the folder must be trusted. Codex records that in your global config as
+#   [projects.'c:\path\to\your-project']
+#   trust_level = "trusted"
+# which it writes when you approve the folder on first open. An untrusted folder's
+# project config is not loaded.
+
+[mcp_servers.cross_review]
+command = "tools/cross-review.exe"
+args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+
+# Reviews are collected by polling, so a tool call returns promptly and this budget
+# only has to cover a single request rather than a whole review.
+startup_timeout_sec = 30
+tool_timeout_sec = 400

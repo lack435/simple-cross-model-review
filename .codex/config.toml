@@ -1,0 +1,29 @@
+# Project-level Codex configuration for cross-review's own repository.
+#
+# This is the reverse of .mcp.json: here Codex is the caller and Claude Opus 5 is the
+# reviewer, so the tool can be dogfooded in both directions from one checkout.
+#
+# Both directions point at dist\cross-review.exe on purpose. An earlier version pointed
+# here at target\release\ so the reverse test would always exercise a fresh build, which
+# backfired: Windows locks a running executable, so an open Codex session held the build
+# output and `cargo build --release` failed with "failed to remove file". Keeping both
+# servers on dist\ leaves target\ free, so building is never blocked; the cost is that
+# restaging dist\ requires unloading both agent sessions first, which build.ps1 detects and
+# reports by PID rather than silently shipping a stale binary.
+#
+# Prerequisite: Codex only loads project config for trusted folders. Approve this folder
+# when Codex first opens it, which writes
+#   [projects.'c:\dev\simple-cross-model-review']
+#   trust_level = "trusted"
+# into %USERPROFILE%\.codex\config.toml. Until that exists this file is ignored silently,
+# and `codex mcp list` will not show the server either way -- it reports only global
+# config. Verify from inside a session with cross_model_review_status.
+
+[mcp_servers.cross_review]
+command = "dist\\cross-review.exe"
+args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+
+# Reviews are collected by polling, so a tool call returns promptly and this budget only
+# covers a single request rather than a whole review.
+startup_timeout_sec = 30
+tool_timeout_sec = 400
