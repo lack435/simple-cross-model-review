@@ -271,6 +271,31 @@ pub fn empty_review(reviewer: &str, detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// The reviewer produced more output than we are willing to hold, and what we kept could
+/// not be made sense of.
+///
+/// Separate from `EMPTY_REVIEW` because the advice differs. An empty review means the CLI
+/// wrote nothing and retrying is reasonable; a truncated one means it wrote far too much,
+/// and the half we kept parsed as nothing. Reporting the second as the first sends the
+/// caller to retry an operation that will do the same thing again.
+pub fn output_truncated(reviewer: &str, megabytes: usize, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "OUTPUT_TRUNCATED",
+        format!(
+            "The '{reviewer}' CLI produced more than {megabytes} MiB of output, so it was \
+             truncated and the review could not be read from what remained."
+        ),
+        format!(
+            "The cross-model review produced far more output than a review should. Collection is \
+             capped at {megabytes} MiB per stream, so the transcript is incomplete and the \
+             reviewer's own result could not be recovered from it.\n\n\
+             This is not a normal failure: real reviews are kilobytes. Report it to the user \
+             rather than retrying blindly, and do not continue as if the review had passed."
+        ),
+    )
+    .with_detail(detail)
+}
+
 pub fn session_not_found(session: &str, id: &str) -> Failure {
     Failure::new(
         "SESSION_NOT_FOUND",

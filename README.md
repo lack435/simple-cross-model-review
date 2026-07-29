@@ -361,8 +361,9 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments get a plain
-correction instead, since that is the agent's own mistake and not something to escalate,
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `INTERNAL_ERROR`. Bad tool arguments
+get a plain correction instead, since that is the agent's own mistake and not something to
+escalate,
 and so does a tool call the server could not start a thread for -- neither says anything
 about the reviewer's state.
 
@@ -414,7 +415,7 @@ Check a setup from a terminal without starting an agent:
 ## Testing
 
 ```powershell
-cargo test          # 167 unit tests: no network, no model calls
+cargo test          # unit tests only: no network, no model calls
 .\smoke.ps1 -Reviewer codex     # end to end against the real CLI
 .\smoke.ps1 -Reviewer claude
 ```
@@ -436,11 +437,32 @@ Both directions pass against live CLIs.
 - **Prompts go over stdin**, not the command line, so a large review request cannot hit
   the Windows command-line length limit or a quoting bug.
 - **Sessions on disk, in-flight reviews in memory.** Review ids are per-process; the
-  session mapping outlives the process. Two servers can share a project's state
-  directory, so a named session is claimed with a cross-process lease held for the whole
-  review, and mutations of the state file take an exclusive lock across the
-  read-modify-write. Both locks are the OS's: the lock file is opened with a share mode
-  of zero, so exclusion is enforced by Windows and released even if the holder is killed.
+  session mapping outlives the process. Finished reviews are evicted once a session has
+  more than three of them, or the process more than fifty, newest kept — a review holds
+  its full text, and a long agent session doing many reviews would otherwise accumulate
+  all of them. Running reviews are never evicted: one is still owed to a caller.
+
+  An evicted `review_id` is still recognised as one this process issued, because ids are
+  `rv-<pid>-<counter>` and the counter only increases — so recognition is derived from the
+  id's own form rather than from a list of what was discarded. That matters: "this
+  finished and was discarded" and "this was never issued" call for different advice, and a
+  caller told the second has reason to suspect it mangled the id and will go looking for a
+  bug that is not there. Deriving it means the distinction holds for the life of the
+  process; a list would have to be bounded, and its oldest entry falling off would turn a
+  valid id back into "never issued" precisely where a caller is least likely to question
+  it.
+
+  Looking a review up by **session name** cannot draw that distinction, and says so rather
+  than guessing. Telling the two apart there would mean retaining every session name that
+  ever had a review evicted, which is unbounded in the way the caps exist to prevent —
+  and caller-controlled, since the names are. So the session-keyed miss reports both
+  possibilities and points at `review_id`, which can tell them apart.
+
+  Two servers can share a project's state directory, so a named session is claimed with a
+  cross-process lease held for the whole review, and mutations of the state file take an
+  exclusive lock across the read-modify-write. Both locks are the OS's: the lock file is
+  opened with a share mode of zero, so exclusion is enforced by Windows and released even
+  if the holder is killed.
   That deliberately replaces an earlier version which tracked staleness itself — it could
   steal a lock from a merely-paused process and then delete the new owner's lock.
   Writes go to a pid-unique temp file and then an atomic replace, never unlinking the
@@ -451,8 +473,21 @@ Both directions pass against live CLIs.
   orphans its descendants, and an orphan holding an inherited pipe would keep our reader
   threads blocked forever. Output collection is bounded in *time* as well, so a stuck pipe
   degrades diagnostics instead of hanging the review: readers append into a shared buffer,
-  so whatever arrived before the deadline is still used rather than discarded. It is not
-  bounded in size — a reviewer emitting unbounded output would be held in memory.
+  so whatever arrived before the deadline is still used rather than discarded.
+
+  It is bounded in size too, at 8 MiB per stream. Note what that does *not* mean: the
+  reader keeps reading past the cap and throws the bytes away, because a reader that
+  stopped would fill the pipe and block the child for ever — trading unbounded memory for
+  a hung review, which is the worse bargain.
+
+  Hitting the cap is always reported, but not always as a failure. When the review cannot
+  be recovered from what was kept, it is `OUTPUT_TRUNCATED` rather than `EMPTY_REVIEW` —
+  an empty review means the CLI wrote nothing and a retry is reasonable, a truncated one
+  means it wrote far too much and a retry will do the same again. When the review survives
+  anyway — Codex writes its final message to a file, which our pipe cap cannot affect —
+  the review is returned with a warning saying the transcript was truncated. Real
+  transcripts are kilobytes, so reaching 8 MiB means something has gone wrong either way;
+  the point is that it never passes unmentioned.
 
   Shelling out to `taskkill` was rejected: it cannot help once the direct child has exited
   and the parent/child links are gone, and invoking it by bare name is an execution hazard,

@@ -121,8 +121,13 @@ impl Reviewer for ClaudeReviewer {
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
+        // The review is stdout-only for this reviewer, so a stdout that hit the cap is
+        // not a parse failure to diagnose -- it is a document with its end missing, and
+        // saying so is the only accurate report available.
         let parsed: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
-            if out.success {
+            if let Some(truncated) = super::truncation_failure(cfg, out) {
+                truncated
+            } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
             } else {
                 super::failure_for(cfg, out)
@@ -186,10 +191,28 @@ impl Reviewer for ClaudeReviewer {
             return Err(errors::empty_review("claude", out.diagnostics()));
         }
 
+        // Gated on either stream. An earlier revision gated on stderr alone, reasoning that
+        // a truncated stdout could not have parsed -- but it can: a complete result
+        // document followed by enough trailing whitespace to reach the cap trims back to
+        // valid JSON, with bytes discarded after it. The review is intact in that case, so
+        // this is a warning and not a failure, but the cap was hit and the README promises
+        // that is never silent.
+        let mut warnings = Vec::new();
+        if out.truncated() {
+            warnings.push(
+                "The reviewer produced more output than the collection cap allows, so its \
+                 output was truncated. The review itself parsed as a complete document, so it \
+                 is intact, but anything the reviewer wrote beyond the cap is lost and output \
+                 at that volume is abnormal."
+                    .to_string(),
+            );
+        }
+
         Ok(Parsed {
             text,
             session_id,
             denials: collect_denials(&parsed),
+            warnings,
         })
     }
 }
@@ -242,7 +265,67 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
+    }
+
+    #[test]
+    fn a_truncated_stdout_is_reported_as_truncation_not_as_an_empty_review() {
+        // This reviewer's review is stdout-only, so a stdout that hit the cap is a
+        // document with its end missing -- not a CLI that wrote nothing. EMPTY_REVIEW
+        // would send the caller to retry something that will do the same thing again.
+        // Escaped rather than raw: the value contains `"##`, which closes an `r#"` and an
+        // `r##"` literal alike.
+        let cut_short = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"## Verdi";
+        let truncated = RunOutcome {
+            stdout_truncated: true,
+            ..outcome(cut_short, true)
+        };
+        let failure = ClaudeReviewer
+            .parse(&cfg(), &truncated, None)
+            .expect_err("truncated JSON cannot parse");
+        assert_eq!(failure.code, "OUTPUT_TRUNCATED");
+
+        // The same unparseable stdout without the cap having been hit is still an empty
+        // review, so the new code cannot swallow the old diagnosis.
+        let failure = ClaudeReviewer
+            .parse(&cfg(), &outcome(cut_short, true), None)
+            .expect_err("still a failure");
+        assert_eq!(failure.code, "EMPTY_REVIEW");
+    }
+
+    #[test]
+    fn a_capped_stdout_that_still_parses_is_reported_as_a_warning() {
+        // The case that makes gating on stderr alone wrong: a complete result document
+        // followed by trailing whitespace up to the cap trims back to valid JSON, so the
+        // review parses and is intact -- but stdout *was* truncated, and the README
+        // promises that hitting the cap is never silent.
+        let padded = format!(
+            "{}{}",
+            r#"{"type":"result","subtype":"success","result":"APPROVE","session_id":"s-1"}"#,
+            " ".repeat(64)
+        );
+        let truncated = RunOutcome {
+            stdout_truncated: true,
+            ..outcome(&padded, true)
+        };
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &truncated, None)
+            .expect("a complete document still parses");
+        assert_eq!(parsed.text, "APPROVE");
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert!(
+            parsed.warnings[0].contains("truncated"),
+            "{:?}",
+            parsed.warnings
+        );
+
+        // And an untruncated run of the same shape carries no warning.
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &outcome(&padded, true), None)
+            .expect("parse");
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 
     #[test]
@@ -302,6 +385,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -362,6 +447,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
@@ -391,6 +478,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");

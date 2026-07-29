@@ -139,9 +139,22 @@ impl Reviewer for CodexReviewer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let text = from_file
-            .or_else(|| events.last_message.clone())
-            .unwrap_or_default();
+        let text = match from_file {
+            // The final-message file is written by the CLI directly, not through the pipes
+            // we cap, so a capped event stream does not put this review in doubt.
+            Some(text) => text,
+            None => {
+                // Without the file the fallback is the event stream -- and under truncation
+                // that stream is not trustworthy. `last_message` would be the last one that
+                // *fit*, so the reviewer's actual conclusion may be among the discarded
+                // bytes, and returning an earlier message as the verdict would be a
+                // silently wrong review rather than a visible failure.
+                if let Some(truncated) = super::truncation_failure(cfg, out) {
+                    return Err(truncated);
+                }
+                events.last_message.clone().unwrap_or_default()
+            }
+        };
 
         if text.is_empty() {
             let detail = if events.errors.is_empty() {
@@ -152,10 +165,29 @@ impl Reviewer for CodexReviewer {
             return Err(errors::empty_review("codex", detail));
         }
 
+        // Outside the match, so every surviving-review path reports the cap -- including
+        // the one where only stderr was capped and the review came from the event stream.
+        //
+        // Note what this does *not* claim. That our cap did not touch the final-message
+        // file is structural: we cap only bytes read from the pipes. Whether the CLI
+        // finished writing that file is a different question, it has not been observed
+        // for a run that produced this much output, and it is not asserted here.
+        let mut warnings = Vec::new();
+        if out.truncated() {
+            warnings.push(
+                "The reviewer produced more output than the collection cap allows, so its \
+                 transcript was truncated. The review below is reported as the reviewer gave \
+                 it, but anything that appeared only in the transcript is lost, and output at \
+                 that volume is itself abnormal."
+                    .to_string(),
+            );
+        }
+
         Ok(Parsed {
             text,
             session_id: events.thread_id,
             denials: Vec::new(),
+            warnings,
         })
     }
 }
@@ -248,6 +280,8 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -359,6 +393,8 @@ mod tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         }
     }
 
@@ -414,5 +450,29 @@ mod tests {
             .parse(&cfg(), &outcome(r#"{"type":"turn.completed"}"#, true), None)
             .unwrap_err();
         assert_eq!(err.code, "EMPTY_REVIEW");
+    }
+
+    #[test]
+    fn a_truncated_event_stream_with_no_message_is_reported_as_truncation() {
+        // Only once the final-message file has been tried and found wanting: that file is
+        // written by the CLI and is unaffected by our pipe cap, so a truncated stream that
+        // still yielded a review must not be a failure at all.
+        let truncated = RunOutcome {
+            stdout_truncated: true,
+            ..outcome(r#"{"type":"turn.completed"}"#, true)
+        };
+        let err = CodexReviewer.parse(&cfg(), &truncated, None).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_TRUNCATED");
+
+        // A truncated stream whose review did survive in the file is a success.
+        let dir = std::env::temp_dir().join("cross-review-codex-truncation-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join(format!("{}-last.txt", std::process::id()));
+        std::fs::write(&file, "## Verdict\nAPPROVE").expect("write");
+        let parsed = CodexReviewer
+            .parse(&cfg(), &truncated, Some(&file))
+            .expect("the file is authoritative");
+        assert_eq!(parsed.text, "## Verdict\nAPPROVE");
+        std::fs::remove_file(&file).ok();
     }
 }
