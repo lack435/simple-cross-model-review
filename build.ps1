@@ -43,7 +43,22 @@ if (-not $SkipChecks) {
     if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
 }
 
-Write-Host '==> cargo build --release' -ForegroundColor Cyan
+# Strip local absolute paths out of the binary. rustc embeds the source path of every
+# crate for panic locations, so an unremapped build ships the building user's home
+# directory -- e.g. C:\Users\<you>\.cargo\registry\... -- inside a binary this project
+# deliberately commits to public repositories.
+#
+# CARGO_ENCODED_RUSTFLAGS rather than RUSTFLAGS because the latter is space-separated,
+# which would split a home directory containing a space. The separator is a literal 0x1f.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
+$unit = [char]0x1f
+$env:CARGO_ENCODED_RUSTFLAGS = @(
+    "--remap-path-prefix=$cargoHome=/cargo"
+    "--remap-path-prefix=$rustupHome=/rustup"
+) -join $unit
+
+Write-Host '==> cargo build --release (paths remapped)' -ForegroundColor Cyan
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
 
@@ -74,6 +89,13 @@ if ($builtHash -ne $distHash) {
         Write-Host "process) and run this script again." -ForegroundColor Yellow
     }
     throw "dist\cross-review.exe does not match the build output"
+}
+
+# The binary is committed and published, so verify the remapping actually took rather
+# than trusting the flags reached rustc.
+$leaked = Select-String -Path $dist -Pattern ([regex]::Escape($env:USERPROFILE)) -SimpleMatch -Quiet -ErrorAction SilentlyContinue
+if ($leaked) {
+    throw "$dist still contains $env:USERPROFILE - path remapping did not take effect"
 }
 
 $size = [math]::Round((Get-Item $dist).Length / 1KB)
