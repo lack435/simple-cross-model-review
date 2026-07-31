@@ -21,13 +21,24 @@ This makes that a single tool call.
 | Tool | Purpose |
 | --- | --- |
 | `cross_model_review` | Start a review. Returns a `review_id` immediately. |
-| `cross_model_review_result` | Wait for and return the review. Long-polls, so one call is usually enough. |
+| `cross_model_review_result` | Wait for and return the review, with live progress when the client supports it. |
 | `cross_model_review_status` | Is the reviewer CLI installed and signed in? Costs nothing, calls no model. |
 | `cross_model_review_cancel` | Stop a review that is still running. |
 
-Reviews are asynchronous because a serious review of real work takes minutes. Starting
-and collecting are separate calls, so the harness is never blocked on a single
-long-running request.
+Reviews are asynchronous because a serious review of real work takes time. Most reviews
+take at least five minutes, and complex changes can take 20 minutes or longer; a running
+review in that window is normal, not a reason to cancel or start over. Starting and
+collecting are separate calls, so the harness is never blocked on a single long-running
+request. The default per-turn hard limit is 30 minutes and can be changed with
+`--timeout-seconds`.
+
+While `cross_model_review_result` is open, the server emits standard MCP
+`notifications/progress` every 30 seconds when the client supplied a progress token. The
+updates report observed facts rather than a guessed percentage: the current pipeline phase,
+elapsed time, how recently the reviewer process was confirmed alive, and how much streamed
+output has arrived. Some reviewers emit nothing until completion, so zero output is called
+out without treating it as a stall. Clients without MCP progress support still receive the
+same snapshot whenever a long poll returns `status=running`.
 
 ## Setup
 
@@ -75,7 +86,7 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
---timeout-seconds <n>       Per-turn budget. Default 900.
+--timeout-seconds <n>       Per-turn budget. Default 1800.
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.

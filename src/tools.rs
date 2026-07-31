@@ -13,7 +13,7 @@ use crate::errors::{self, Failure};
 use crate::git;
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{
-    IdState, Outcome, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
+    IdState, Outcome, Phase, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
     MAX_TERMINAL_TOTAL,
 };
 use crate::reviewer::{self, Reviewer};
@@ -215,13 +215,19 @@ impl App {
                 "new".to_string()
             }
         ));
-        out.push_str(&format!("reviewer:  {}\n\n", self.cfg.describe_reviewer()));
+        out.push_str(&format!("reviewer:  {}\n", self.cfg.describe_reviewer()));
+        out.push_str(&format!(
+            "turn budget: {}\n\n",
+            fmt_elapsed(self.cfg.timeout)
+        ));
         out.push_str(&format!(
             "Collect it with cross_model_review_result using review_id \"{id}\". That call waits \
-             for the review rather than returning immediately, so one call with wait_seconds \
-             set to 120 or more is usually enough. If it comes back with status=running, call it \
-             again.\n\n\
-             Reviews of substantial work commonly take one to several minutes.\n"
+             for the review and reports progress while it is open when the MCP client supports \
+             progress notifications. Use wait_seconds=300; if it returns status=running, call it \
+             again with the same review_id.\n\n\
+             Most reviews take at least five minutes, and complex changes can take 20 minutes or \
+             longer. A running status during that window is normal and is not a reason to start \
+             over or cancel the review.\n"
         ));
         Ok(out)
     }
@@ -353,6 +359,7 @@ impl App {
              session:   {} (turn {})\n\
              reviewer:  {}\n\
              elapsed:   {}s of a {}s budget\n\n\
+             progress:  {}\n\n\
              {next}\n",
             snapshot.status.as_str(),
             snapshot.id,
@@ -361,7 +368,21 @@ impl App {
             self.cfg.describe_reviewer(),
             snapshot.elapsed.as_secs(),
             self.cfg.timeout.as_secs(),
+            render_progress(snapshot, self.cfg.timeout),
         )
+    }
+
+    /// A concise live snapshot for MCP `notifications/progress`.
+    ///
+    /// Invalid or already-finished identifiers return no message: the result call itself
+    /// owns the authoritative error or terminal response, and a speculative notification
+    /// must not race it with a contradictory claim.
+    pub fn review_progress(&self, args: &Value) -> Option<String> {
+        let id = string_arg(args, "review_id").or_else(|| {
+            string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
+        })?;
+        let snapshot = self.registry.snapshot(&id)?;
+        (snapshot.status == Status::Running).then(|| render_progress(&snapshot, self.cfg.timeout))
     }
 
     fn render_completed(&self, snapshot: &Snapshot) -> String {
@@ -593,6 +614,7 @@ impl Job {
             .as_ref()
             .map(|change| git::render(change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
         let capture_warnings = capture.warnings;
+        self.registry.set_phase(&self.id, Phase::Launching);
 
         let outcome = match self.attempt(
             resume_id.as_deref(),
@@ -612,6 +634,7 @@ impl Job {
                          reviewer session",
                         self.session
                     );
+                    self.registry.set_phase(&self.id, Phase::Launching);
                     match self.attempt(None, 1, change.as_deref(), &capture_warnings) {
                         Ok(mut outcome) => {
                             if let Some(review) = outcome.review.take() {
@@ -685,14 +708,24 @@ impl Job {
 
         let last_message_file = invocation.last_message_file.clone();
 
-        let run =
-            reviewer::run(invocation.command, &text, self.cfg.timeout, &self.cancel).map_err(|e| {
-                errors::spawn_failed(
-                    self.cfg.reviewer.as_str(),
-                    &self.bin.display().to_string(),
-                    e.to_string(),
-                )
-            });
+        let run = reviewer::run_observed(
+            invocation.command,
+            &text,
+            self.cfg.timeout,
+            &self.cancel,
+            |activity| {
+                self.registry
+                    .report_activity(&self.id, activity.output_bytes);
+            },
+        )
+        .map_err(|e| {
+            errors::spawn_failed(
+                self.cfg.reviewer.as_str(),
+                &self.bin.display().to_string(),
+                e.to_string(),
+            )
+        });
+        self.registry.set_phase(&self.id, Phase::Finalizing);
 
         let result = match run {
             Ok(out) => {
@@ -839,6 +872,59 @@ fn fmt_age(secs: u64) -> String {
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+fn fmt_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!(
+            "{}h {:02}m {:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        ),
+    }
+}
+
+fn render_progress(snapshot: &Snapshot, turn_budget: Duration) -> String {
+    let observed = if snapshot.phase == Phase::Reviewing {
+        "reviewer process confirmed alive"
+    } else {
+        "worker phase updated"
+    };
+    let mut message = format!(
+        "{} for {}; {} elapsed overall; {observed} {} ago",
+        snapshot.phase.as_str(),
+        fmt_elapsed(snapshot.phase_elapsed),
+        fmt_elapsed(snapshot.elapsed),
+        fmt_elapsed(snapshot.activity_age),
+    );
+    if snapshot.output_bytes > 0 {
+        message.push_str(&format!(
+            "; {} of reviewer output received",
+            fmt_bytes(snapshot.output_bytes)
+        ));
+    } else if snapshot.phase == Phase::Reviewing {
+        message.push_str("; no streamed output yet (some reviewers emit only on completion)");
+    }
+    message.push_str(&format!(
+        ". Long reviews are normal; complex changes can take 20 minutes or longer. This turn's \
+         configured budget is {}.",
+        fmt_elapsed(turn_budget)
+    ));
+    message
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 

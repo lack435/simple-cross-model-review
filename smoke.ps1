@@ -82,6 +82,7 @@ $proc.BeginErrorReadLine()
 
 $script:nextId = 0
 $script:pendingRead = $null
+$script:progressMessages = New-Object System.Collections.Generic.List[object]
 $failures = New-Object System.Collections.Generic.List[string]
 
 # One read at a time, and a read that times out stays outstanding rather than being
@@ -123,18 +124,27 @@ function Send-Rpc {
     if ($Notification) { return $null }
     if ($NoWait) { return $script:nextId }
 
-    $line = Read-Line -TimeoutSeconds $TimeoutSeconds
-    if ($null -eq $line) {
-        throw "timed out after ${TimeoutSeconds}s waiting for a response to '$Method'"
+    while ($true) {
+        $line = Read-Line -TimeoutSeconds $TimeoutSeconds
+        if ($null -eq $line) {
+            throw "timed out after ${TimeoutSeconds}s waiting for a response to '$Method'"
+        }
+        $parsed = $line | ConvertFrom-Json
+        # Progress is a notification rather than a response, so consume and display it
+        # without losing the response still owed to this request.
+        if ($parsed.method -eq 'notifications/progress') {
+            $script:progressMessages.Add($parsed)
+            Write-Host "  progress: $($parsed.params.message)" -ForegroundColor DarkGray
+            continue
+        }
+        # Responses are matched by id, not by position. The cancellation stage deliberately
+        # interleaves messages, so a suppressed response that turned out not to be suppressed
+        # would otherwise be read as the answer to the next request and quietly mislead.
+        if ($parsed.id -ne $message['id']) {
+            throw "response id $($parsed.id) does not answer '$Method' (id $($message['id'])): $line"
+        }
+        return $parsed
     }
-    $parsed = $line | ConvertFrom-Json
-    # Responses are matched by id, not by position. The cancellation stage deliberately
-    # interleaves messages, so a suppressed response that turned out not to be suppressed
-    # would otherwise be read as the answer to the next request and quietly mislead.
-    if ($parsed.id -ne $message['id']) {
-        throw "response id $($parsed.id) does not answer '$Method' (id $($message['id'])): $line"
-    }
-    return $parsed
 }
 
 function Assert-That {
@@ -211,10 +221,12 @@ COUNTER=1
 
     Write-Host '  waiting for the reviewer...' -ForegroundColor DarkGray
     $collected = $null
+    $progressBefore = $script:progressMessages.Count
     for ($attempt = 1; $attempt -le 6; $attempt++) {
         $collected = Send-Rpc -Method 'tools/call' -Params @{
             name      = 'cross_model_review_result'
             arguments = @{ review_id = $reviewId; wait_seconds = 120 }
+            _meta     = @{ progressToken = "smoke-first-$attempt" }
         } -TimeoutSeconds 300
         $text = Get-ToolText $collected
         if ($text -notmatch 'status:\s+running') { break }
@@ -225,6 +237,8 @@ COUNTER=1
     Assert-That 'review reports completed status' ($resultText -match 'status:\s+completed') $resultText
     Assert-That 'the reviewer actually answered' ($resultText -match 'SMOKE-OK') $resultText
     Assert-That 'review body is delimited' ($resultText -match 'BEGIN REVIEW') $resultText
+    Assert-That 'the wait emitted MCP progress notifications' `
+        ($script:progressMessages.Count -gt $progressBefore)
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
@@ -246,10 +260,12 @@ COUNTER=2
     $resumeId = ([regex]::Match($resumeText, 'review_id:\s*(\S+)')).Groups[1].Value
 
     $collected2 = $null
+    $resumeProgressBefore = $script:progressMessages.Count
     for ($attempt = 1; $attempt -le 6; $attempt++) {
         $collected2 = Send-Rpc -Method 'tools/call' -Params @{
             name      = 'cross_model_review_result'
             arguments = @{ review_id = $resumeId; wait_seconds = 120 }
+            _meta     = @{ progressToken = "smoke-resume-$attempt" }
         } -TimeoutSeconds 300
         $text = Get-ToolText $collected2
         if ($text -notmatch 'status:\s+running') { break }
@@ -258,6 +274,8 @@ COUNTER=2
     $resumeResult = Get-ToolText $collected2
     Assert-That 'resumed review completed' ($resumeResult -match 'status:\s+completed') $resumeResult
     Assert-That 'reviewer remembered the earlier turn' ($resumeResult -match 'COUNTER=2') $resumeResult
+    Assert-That 'the resumed wait emitted MCP progress notifications' `
+        ($script:progressMessages.Count -gt $resumeProgressBefore)
     Write-Host $resumeResult
 
     Write-Host "`n=== 6. error handling ===" -ForegroundColor Cyan

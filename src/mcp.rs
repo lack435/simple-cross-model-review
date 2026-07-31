@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -28,6 +29,10 @@ type Pending = Arc<Mutex<HashMap<String, Arc<RequestCancel>>>>;
 /// Where responses go. A trait object rather than `Stdout` so a test can read back what
 /// a response path actually wrote; in the server it is always stdout.
 type Writer = Arc<Mutex<dyn Write + Send>>;
+
+/// Progress updates are intentionally sparse: enough to prove the wait is live without
+/// turning a twenty-minute review into a flood of protocol messages.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn serve(app: Arc<App>) {
     let stdin = std::io::stdin();
@@ -186,7 +191,12 @@ fn start_tool_call(
                 key: &thread_key,
                 released: false,
             };
+            let progress = ProgressReporter::start(&app, &writer, &params);
             let result = dispatch_tool(&app, &params, &request);
+            // Stop and join before sending the response. The MCP progress contract says
+            // notifications stop after completion; joining closes the race rather than
+            // merely making a late notification unlikely.
+            drop(progress);
             // Released before the send, so a cancellation arriving after this
             // point finds nothing in the map at all.
             entry.release();
@@ -229,6 +239,110 @@ fn start_tool_call(
             None
         }
     }
+}
+
+/// Periodic MCP `notifications/progress` for a long-running result call.
+///
+/// MCP makes this opt-in: the client places an opaque `progressToken` in request metadata.
+/// When it does not, this object is never created and the transport stays exactly as it was.
+struct ProgressReporter {
+    done: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressReporter {
+    fn start(app: &Arc<App>, writer: &Writer, params: &Value) -> Option<Self> {
+        Self::start_with_interval(app, writer, params, PROGRESS_INTERVAL)
+    }
+
+    fn start_with_interval(
+        app: &Arc<App>,
+        writer: &Writer,
+        params: &Value,
+        interval: Duration,
+    ) -> Option<Self> {
+        if params.get("name").and_then(Value::as_str) != Some("cross_model_review_result") {
+            return None;
+        }
+        let token = params
+            .get("_meta")
+            .and_then(|meta| meta.get("progressToken"))
+            .filter(|token| token.is_string() || token.is_number())?
+            .clone();
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        // Do not announce a wait that the result call is about to reject, or a review that
+        // already finished between calls.
+        let initial = app.review_progress(&args)?;
+
+        send_progress(writer, &token, 0, initial);
+
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_done = Arc::clone(&done);
+        let app = Arc::clone(app);
+        let writer = Arc::clone(writer);
+        let handle = std::thread::Builder::new()
+            .name("review-progress".to_string())
+            .spawn(move || {
+                let (lock, changed) = &*thread_done;
+                let mut complete = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let mut progress = 0u64;
+                loop {
+                    let (next, waited) = changed
+                        .wait_timeout(complete, interval)
+                        .unwrap_or_else(|e| e.into_inner());
+                    complete = next;
+                    if *complete {
+                        break;
+                    }
+                    if !waited.timed_out() {
+                        continue;
+                    }
+                    let Some(message) = app.review_progress(&args) else {
+                        break;
+                    };
+                    progress = progress.saturating_add(1);
+                    // Sent while holding the completion lock. `Drop` cannot mark the
+                    // reporter done until this finishes, which guarantees that no
+                    // notification can slip out after the final tool response.
+                    send_progress(&writer, &token, progress, message);
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            done,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        let (lock, changed) = &*self.done;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        changed.notify_all();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn send_progress(writer: &Writer, token: &Value, progress: u64, message: String) {
+    send(
+        writer,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": token,
+                "progress": progress,
+                "message": message,
+            }
+        }),
+    );
 }
 
 /// Removes a handler's entry from the pending map however the handler ends.
@@ -472,7 +586,10 @@ fn server_instructions(app: &App) -> String {
          substantial work back to the user, after a change you are unsure about, or when the user \
          asks for a review.\n\n\
          Reviews are asynchronous. cross_model_review starts one and returns a review_id; \
-         cross_model_review_result waits for and returns the review. Sessions are named, so \
+         cross_model_review_result waits for and returns the review, with periodic progress \
+         notifications when the client supports them. Most reviews take at least five minutes; \
+         complex changes can take 20 minutes or longer, so a running status is expected. Sessions \
+         are named, so \
          calling cross_model_review again with the same session name gives you a re-review from a \
          reviewer that still remembers its earlier findings.\n\n\
          If a tool call comes back as an error, the review did not happen. Stop, and tell the \
@@ -614,10 +731,13 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_result",
             "description": format!(
-                "Wait for and return the review from {reviewer}.\n\n\
-                 This call blocks while the reviewer works, up to wait_seconds, so a single call \
-                 usually suffices. If it returns status=running, call it again with the same \
-                 review_id.\n\n\
+                 "Wait for and return the review from {reviewer}.\n\n\
+                  This call blocks while the reviewer works, up to wait_seconds. When the MCP \
+                  client supplies a progress token, it emits live phase, elapsed-time, reviewer \
+                  liveness, and output-activity updates during the wait. If it returns \
+                  status=running, that is normal; call it again with the same review_id. Most \
+                  reviews take at least five minutes, and complex changes can take 20 minutes or \
+                  longer.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),
@@ -640,7 +760,8 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                         "maximum": crate::config::MAX_WAIT_SECS,
                         "description": format!(
                             "How long to wait for the review before returning. Defaults to {}, \
-                             capped at {}. Prefer a large value: waiting once beats polling.",
+                             capped at {}. Prefer the maximum: progress notifications make a long \
+                             wait observable without frequent polling.",
                             crate::config::DEFAULT_WAIT_SECS,
                             crate::config::MAX_WAIT_SECS
                         )
@@ -931,7 +1052,7 @@ mod tests {
         handle_cancellation(&app, &pending, &json!({"requestId": 9, "reason": "user"}));
 
         // The half that costs money: the flag reviewer::run polls, not merely the
-        // request's own. Without it the child keeps working to its 900s budget.
+        // request's own. Without it the child keeps working to its full turn budget.
         assert!(reviewer_cancel.load(Ordering::SeqCst));
         assert!(!request.try_claim_response());
     }
@@ -1113,6 +1234,98 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_result_wait_emits_standard_progress_until_the_call_finishes() {
+        let app = app();
+        let (review_id, _cancel) = app
+            .registry()
+            .try_start("progress", 1, false)
+            .expect("start");
+        app.registry().report_activity(&review_id, 4096);
+
+        let recorder = Recorder::default();
+        let writer = recorder.writer();
+        let params = json!({
+            "name": "cross_model_review_result",
+            "arguments": {"review_id": review_id},
+            "_meta": {"progressToken": "progress-7"}
+        });
+        let reporter = ProgressReporter::start_with_interval(
+            &app,
+            &writer,
+            &params,
+            Duration::from_millis(20),
+        )
+        .expect("progress reporter");
+
+        // Bounded rather than sleeping for an assumed number of scheduler slices.
+        let give_up = std::time::Instant::now() + Duration::from_secs(2);
+        while recorder.responses().len() < 3 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "progress notifications did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(reporter);
+
+        let notifications = recorder.responses();
+        assert!(notifications.len() >= 3);
+        for (index, notification) in notifications.iter().enumerate() {
+            assert_eq!(notification["method"], "notifications/progress");
+            assert_eq!(notification["params"]["progressToken"], "progress-7");
+            assert_eq!(notification["params"]["progress"], index as u64);
+            let message = notification["params"]["message"]
+                .as_str()
+                .expect("progress message");
+            assert!(message.contains("reviewer process running"), "{message}");
+            assert!(message.contains("4 KiB"), "{message}");
+            assert!(message.contains("20 minutes or longer"), "{message}");
+        }
+
+        // Drop joins the reporter before the tool response would be sent, so completion
+        // is a hard boundary rather than a best-effort flag checked by a sleeping thread.
+        let after_drop = notifications.len();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(recorder.responses().len(), after_drop);
+    }
+
+    #[test]
+    fn progress_is_opt_in_and_only_for_a_live_result_wait() {
+        let app = app();
+        let (review_id, _cancel) = app
+            .registry()
+            .try_start("progress", 1, false)
+            .expect("start");
+        let recorder = Recorder::default();
+        let writer = recorder.writer();
+
+        let no_token = json!({
+            "name": "cross_model_review_result",
+            "arguments": {"review_id": review_id}
+        });
+        assert!(ProgressReporter::start_with_interval(
+            &app,
+            &writer,
+            &no_token,
+            Duration::from_millis(1)
+        )
+        .is_none());
+
+        let wrong_tool = json!({
+            "name": "cross_model_review_status",
+            "_meta": {"progressToken": 9}
+        });
+        assert!(ProgressReporter::start_with_interval(
+            &app,
+            &writer,
+            &wrong_tool,
+            Duration::from_millis(1)
+        )
+        .is_none());
+        assert!(recorder.responses().is_empty());
     }
 
     /// The regression this guards: a `tools/call` whose handler thread will not start used

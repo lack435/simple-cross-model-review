@@ -155,7 +155,7 @@ fn permits_bash(rule: &str) -> bool {
         .any(|grant| grant == "Bash" || grant.starts_with("Bash("))
 }
 
-pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 300;
 
@@ -535,7 +535,7 @@ OPTIONS:
                               codex:  low|medium|high|xhigh|max|ultra    (default xhigh)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
-  --timeout-seconds <n>       Hard kill for a single review turn. Default: 900.
+  --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800.
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
