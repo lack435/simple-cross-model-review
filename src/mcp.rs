@@ -191,7 +191,7 @@ fn start_tool_call(
                 key: &thread_key,
                 released: false,
             };
-            let progress = ProgressReporter::start(&app, &writer, &params);
+            let progress = ProgressReporter::start(&app, &writer, &params, &request);
             let result = dispatch_tool(&app, &params, &request);
             // Stop and join before sending the response. The MCP progress contract says
             // notifications stop after completion; joining closes the race rather than
@@ -251,14 +251,20 @@ struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    fn start(app: &Arc<App>, writer: &Writer, params: &Value) -> Option<Self> {
-        Self::start_with_interval(app, writer, params, PROGRESS_INTERVAL)
+    fn start(
+        app: &Arc<App>,
+        writer: &Writer,
+        params: &Value,
+        request: &Arc<RequestCancel>,
+    ) -> Option<Self> {
+        Self::start_with_interval(app, writer, params, request, PROGRESS_INTERVAL)
     }
 
     fn start_with_interval(
         app: &Arc<App>,
         writer: &Writer,
         params: &Value,
+        request: &Arc<RequestCancel>,
         interval: Duration,
     ) -> Option<Self> {
         if params.get("name").and_then(Value::as_str) != Some("cross_model_review_result") {
@@ -275,6 +281,9 @@ impl ProgressReporter {
             .unwrap_or_else(|| json!({}));
         // Do not announce a wait that the result call is about to reject, or a review that
         // already finished between calls.
+        if request.is_cancelled() {
+            return None;
+        }
         let initial = app.review_progress(&args)?;
 
         send_progress(writer, &token, 0, initial);
@@ -283,6 +292,7 @@ impl ProgressReporter {
         let thread_done = Arc::clone(&done);
         let app = Arc::clone(app);
         let writer = Arc::clone(writer);
+        let request = Arc::clone(request);
         let handle = std::thread::Builder::new()
             .name("review-progress".to_string())
             .spawn(move || {
@@ -299,6 +309,9 @@ impl ProgressReporter {
                     }
                     if !waited.timed_out() {
                         continue;
+                    }
+                    if request.is_cancelled() {
+                        break;
                     }
                     let Some(message) = app.review_progress(&args) else {
                         break;
@@ -331,6 +344,10 @@ impl Drop for ProgressReporter {
 }
 
 fn send_progress(writer: &Writer, token: &Value, progress: u64, message: String) {
+    // `message` joined notifications/progress in MCP 2025-03-26. It is sent to the
+    // 2024-11-05 fallback too as an additive field on purpose: MCP request/notification
+    // parameter objects are extensible, and omitting it would reduce a progress update to
+    // an unexplained counter for old clients. Clients that do not know the field ignore it.
     send(
         writer,
         json!({
@@ -587,9 +604,9 @@ fn server_instructions(app: &App) -> String {
          asks for a review.\n\n\
          Reviews are asynchronous. cross_model_review starts one and returns a review_id; \
          cross_model_review_result waits for and returns the review, with periodic progress \
-         notifications when the client supports them. Most reviews take at least five minutes; \
-         complex changes can take 20 minutes or longer, so a running status is expected. Sessions \
-         are named, so \
+         notifications when the client supports them. In this project's usage, reviews commonly \
+         take at least five minutes; complex changes can take 20 minutes or longer, so a running \
+         status is expected. Sessions are named, so \
          calling cross_model_review again with the same session name gives you a re-review from a \
          reviewer that still remembers its earlier findings.\n\n\
          If a tool call comes back as an error, the review did not happen. Stop, and tell the \
@@ -731,13 +748,13 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_result",
             "description": format!(
-                 "Wait for and return the review from {reviewer}.\n\n\
-                  This call blocks while the reviewer works, up to wait_seconds. When the MCP \
-                  client supplies a progress token, it emits live phase, elapsed-time, reviewer \
-                  liveness, and output-activity updates during the wait. If it returns \
-                  status=running, that is normal; call it again with the same review_id. Most \
-                  reviews take at least five minutes, and complex changes can take 20 minutes or \
-                  longer.\n\n\
+                "Wait for and return the review from {reviewer}.\n\n\
+                 This call blocks while the reviewer works, up to wait_seconds. When the MCP \
+                 client supplies a progress token, it emits live phase, elapsed-time, reviewer \
+                 liveness, and output-activity updates during the wait. If it returns \
+                 status=running, that is normal; call it again with the same review_id. In this \
+                 project's usage, reviews commonly take at least five minutes, and complex changes \
+                 can take 20 minutes or longer.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),
@@ -1211,14 +1228,15 @@ mod tests {
 
         fn responses(&self) -> Vec<Value> {
             let bytes = self.0.lock().unwrap().clone();
-            // Newline-delimited JSON is the whole transport, and this is the only test
-            // that reads bytes back, so the framing is checked rather than assumed. A
-            // message never contains a bare newline: serde escapes them inside strings.
-            assert!(
-                bytes.is_empty() || bytes.ends_with(b"\n"),
-                "every response must be newline-terminated"
-            );
-            String::from_utf8(bytes)
+            // A writer may be between writeln!'s JSON-body write and its newline write.
+            // Parse only complete frames so polling this recorder from another thread does
+            // not turn that harmless instant into a flaky parse failure.
+            let complete = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|last| &bytes[..=last])
+                .unwrap_or_default();
+            String::from_utf8(complete.to_vec())
                 .expect("utf-8")
                 .lines()
                 .map(|l| serde_json::from_str(l).expect("each line is one JSON message"))
@@ -1247,6 +1265,7 @@ mod tests {
 
         let recorder = Recorder::default();
         let writer = recorder.writer();
+        let request = Arc::new(RequestCancel::new());
         let params = json!({
             "name": "cross_model_review_result",
             "arguments": {"review_id": review_id},
@@ -1256,6 +1275,7 @@ mod tests {
             &app,
             &writer,
             &params,
+            &request,
             Duration::from_millis(20),
         )
         .expect("progress reporter");
@@ -1293,6 +1313,41 @@ mod tests {
     }
 
     #[test]
+    fn progress_stops_when_the_client_cancels_the_request() {
+        let app = app();
+        let (review_id, _cancel) = app
+            .registry()
+            .try_start("cancel-progress", 1, false)
+            .expect("start");
+        let recorder = Recorder::default();
+        let writer = recorder.writer();
+        let request = Arc::new(RequestCancel::new());
+        let params = json!({
+            "name": "cross_model_review_result",
+            "arguments": {"review_id": review_id},
+            "_meta": {"progressToken": "cancel-progress"}
+        });
+        let reporter = ProgressReporter::start_with_interval(
+            &app,
+            &writer,
+            &params,
+            &request,
+            Duration::from_millis(20),
+        )
+        .expect("progress reporter");
+        assert_eq!(recorder.responses().len(), 1, "initial notification");
+
+        request.cancel();
+        std::thread::sleep(Duration::from_millis(60));
+        drop(reporter);
+        assert_eq!(
+            recorder.responses().len(),
+            1,
+            "a cancelled request received another progress notification"
+        );
+    }
+
+    #[test]
     fn progress_is_opt_in_and_only_for_a_live_result_wait() {
         let app = app();
         let (review_id, _cancel) = app
@@ -1306,10 +1361,30 @@ mod tests {
             "name": "cross_model_review_result",
             "arguments": {"review_id": review_id}
         });
+        let request = Arc::new(RequestCancel::new());
         assert!(ProgressReporter::start_with_interval(
             &app,
             &writer,
             &no_token,
+            &request,
+            Duration::from_millis(1)
+        )
+        .is_none());
+
+        app.registry().finish(
+            &review_id,
+            crate::registry::Outcome::failed(crate::errors::cancelled()),
+        );
+        let finished = json!({
+            "name": "cross_model_review_result",
+            "arguments": {"review_id": review_id},
+            "_meta": {"progressToken": "already-finished"}
+        });
+        assert!(ProgressReporter::start_with_interval(
+            &app,
+            &writer,
+            &finished,
+            &request,
             Duration::from_millis(1)
         )
         .is_none());
@@ -1322,6 +1397,7 @@ mod tests {
             &app,
             &writer,
             &wrong_tool,
+            &request,
             Duration::from_millis(1)
         )
         .is_none());

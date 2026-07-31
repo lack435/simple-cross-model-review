@@ -69,6 +69,7 @@ impl Status {
 /// a caller distinguish a live, long-running review from a request that disappeared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
+    Preparing,
     Capturing,
     Launching,
     Reviewing,
@@ -78,6 +79,7 @@ pub enum Phase {
 impl Phase {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Preparing => "preparing the review",
             Self::Capturing => "capturing the change",
             Self::Launching => "launching the reviewer",
             Self::Reviewing => "reviewer process running",
@@ -299,7 +301,7 @@ impl Registry {
                 resumable: false,
                 started: now,
                 finished: None,
-                phase: Phase::Capturing,
+                phase: Phase::Preparing,
                 phase_started: now,
                 last_activity: now,
                 output_bytes: 0,
@@ -870,7 +872,7 @@ mod tests {
         let (id, _c) = registry.try_start("default", 1, false).expect("start");
 
         let preparing = registry.snapshot(&id).expect("snapshot");
-        assert_eq!(preparing.phase, Phase::Capturing);
+        assert_eq!(preparing.phase, Phase::Preparing);
         assert_eq!(preparing.output_bytes, 0);
 
         registry.set_phase(&id, Phase::Launching);

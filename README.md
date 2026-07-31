@@ -25,12 +25,13 @@ This makes that a single tool call.
 | `cross_model_review_status` | Is the reviewer CLI installed and signed in? Costs nothing, calls no model. |
 | `cross_model_review_cancel` | Stop a review that is still running. |
 
-Reviews are asynchronous because a serious review of real work takes time. Most reviews
-take at least five minutes, and complex changes can take 20 minutes or longer; a running
-review in that window is normal, not a reason to cancel or start over. Starting and
-collecting are separate calls, so the harness is never blocked on a single long-running
-request. The default per-turn hard limit is 30 minutes and can be changed with
-`--timeout-seconds`.
+Reviews are asynchronous because a serious review of real work takes time. In this
+project's usage, reviews commonly take at least five minutes, and complex changes can take
+20 minutes or longer; a running review in that window is normal, not a reason to cancel or
+start over. Starting and collecting are separate calls, so the harness is never blocked on
+a single long-running request. The default per-turn hard limit is 30 minutes and can be
+changed with `--timeout-seconds`. Raising that limit also lets a wedged reviewer bill and
+hold its session lease for longer before the server stops it.
 
 While `cross_model_review_result` is open, the server emits standard MCP
 `notifications/progress` every 30 seconds when the client supplied a progress token. The

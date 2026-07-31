@@ -124,8 +124,15 @@ function Send-Rpc {
     if ($Notification) { return $null }
     if ($NoWait) { return $script:nextId }
 
+    # One deadline for the request. Progress notifications prove liveness but must not
+    # reset the harness timeout forever if the server never sends a terminal response.
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($true) {
-        $line = Read-Line -TimeoutSeconds $TimeoutSeconds
+        $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+        if ($remaining -le 0) {
+            throw "timed out after ${TimeoutSeconds}s waiting for a response to '$Method'"
+        }
+        $line = Read-Line -TimeoutSeconds $remaining
         if ($null -eq $line) {
             throw "timed out after ${TimeoutSeconds}s waiting for a response to '$Method'"
         }

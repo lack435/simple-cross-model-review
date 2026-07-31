@@ -216,18 +216,15 @@ impl App {
             }
         ));
         out.push_str(&format!("reviewer:  {}\n", self.cfg.describe_reviewer()));
-        out.push_str(&format!(
-            "turn budget: {}\n\n",
-            fmt_elapsed(self.cfg.timeout)
-        ));
+        out.push_str(&format!("budget:    {}\n\n", fmt_elapsed(self.cfg.timeout)));
         out.push_str(&format!(
             "Collect it with cross_model_review_result using review_id \"{id}\". That call waits \
              for the review and reports progress while it is open when the MCP client supports \
              progress notifications. Use wait_seconds=300; if it returns status=running, call it \
              again with the same review_id.\n\n\
-             Most reviews take at least five minutes, and complex changes can take 20 minutes or \
-             longer. A running status during that window is normal and is not a reason to start \
-             over or cancel the review.\n"
+             In this project's usage, reviews commonly take at least five minutes, and complex \
+             changes can take 20 minutes or longer. A running status during that window is normal \
+             and is not a reason to start over or cancel the review.\n"
         ));
         Ok(out)
     }
@@ -368,7 +365,7 @@ impl App {
             self.cfg.describe_reviewer(),
             snapshot.elapsed.as_secs(),
             self.cfg.timeout.as_secs(),
-            render_progress(snapshot, self.cfg.timeout),
+            render_progress(snapshot, self.cfg.timeout, !snapshot.shutting_down),
         )
     }
 
@@ -382,7 +379,8 @@ impl App {
             string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
         })?;
         let snapshot = self.registry.snapshot(&id)?;
-        (snapshot.status == Status::Running).then(|| render_progress(&snapshot, self.cfg.timeout))
+        (snapshot.status == Status::Running)
+            .then(|| render_progress(&snapshot, self.cfg.timeout, !snapshot.shutting_down))
     }
 
     fn render_completed(&self, snapshot: &Snapshot) -> String {
@@ -608,6 +606,9 @@ impl Job {
         // Captured once, before either attempt: the retry below re-runs the same review
         // in a new reviewer session, so re-running git for it would only spend time and
         // risk showing the two turns different trees.
+        if self.cfg.supplies_diff() {
+            self.registry.set_phase(&self.id, Phase::Capturing);
+        }
         let capture = git::capture(&self.cfg, &self.cancel);
         let change = capture
             .change
@@ -889,7 +890,7 @@ fn fmt_elapsed(duration: Duration) -> String {
     }
 }
 
-fn render_progress(snapshot: &Snapshot, turn_budget: Duration) -> String {
+fn render_progress(snapshot: &Snapshot, turn_budget: Duration, reassure: bool) -> String {
     let observed = if snapshot.phase == Phase::Reviewing {
         "reviewer process confirmed alive"
     } else {
@@ -910,11 +911,14 @@ fn render_progress(snapshot: &Snapshot, turn_budget: Duration) -> String {
     } else if snapshot.phase == Phase::Reviewing {
         message.push_str("; no streamed output yet (some reviewers emit only on completion)");
     }
-    message.push_str(&format!(
-        ". Long reviews are normal; complex changes can take 20 minutes or longer. This turn's \
-         configured budget is {}.",
-        fmt_elapsed(turn_budget)
-    ));
+    message.push('.');
+    if reassure {
+        message.push_str(&format!(
+            " In this project's usage, long reviews are normal and complex changes can take 20 \
+             minutes or longer. This turn's configured budget is {}.",
+            fmt_elapsed(turn_budget)
+        ));
+    }
     message
 }
 
@@ -1123,6 +1127,8 @@ mod tests {
             )
             .expect("still running");
         assert!(out.contains("status:    running"));
+        assert!(out.contains("progress:  preparing the review"), "{out}");
+        assert!(out.contains("configured budget"), "{out}");
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
         // Bound to the request, so a cancellation arriving now knows what to stop.
         assert_eq!(request.cancel().as_deref(), Some(id.as_str()));
@@ -1158,6 +1164,10 @@ mod tests {
         // The caller must not be told to call again: nothing will be there to answer.
         assert!(out.contains("shutting down"));
         assert!(!out.contains("Call cross_model_review_result again"));
+        assert!(
+            !out.contains("long reviews are normal"),
+            "shutdown advice contradicted itself: {out}"
+        );
     }
 
     #[test]
@@ -1178,5 +1188,20 @@ mod tests {
         assert_eq!(fmt_age(90), "1m ago");
         assert_eq!(fmt_age(7200), "2h ago");
         assert_eq!(fmt_age(200_000), "2d ago");
+    }
+
+    #[test]
+    fn elapsed_formatting_handles_unit_boundaries() {
+        assert_eq!(fmt_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(3600)), "1h 00m 00s");
+    }
+
+    #[test]
+    fn byte_formatting_handles_unit_boundaries() {
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        assert_eq!(fmt_bytes(1024), "1 KiB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MiB");
     }
 }
