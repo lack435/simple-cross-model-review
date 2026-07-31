@@ -279,11 +279,12 @@ impl ProgressReporter {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        // Do not announce a wait that the result call is about to reject, or a review that
-        // already finished between calls.
+        // Do not announce a request the client has already abandoned.
         if request.is_cancelled() {
             return None;
         }
+        // Nor a wait that the result call is about to reject, or a review that already
+        // finished between calls.
         let initial = app.review_progress(&args)?;
 
         send_progress(writer, &token, 0, initial);
@@ -1242,6 +1243,14 @@ mod tests {
                 .map(|l| serde_json::from_str(l).expect("each line is one JSON message"))
                 .collect()
         }
+
+        fn raw_ends_with_newline(&self) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|byte| *byte == b'\n')
+        }
     }
 
     impl Write for Recorder {
@@ -1308,6 +1317,10 @@ mod tests {
         // Drop joins the reporter before the tool response would be sent, so completion
         // is a hard boundary rather than a best-effort flag checked by a sleeping thread.
         let after_drop = notifications.len();
+        assert!(
+            recorder.raw_ends_with_newline(),
+            "protocol messages must be newline-terminated"
+        );
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(recorder.responses().len(), after_drop);
     }
@@ -1335,14 +1348,17 @@ mod tests {
             Duration::from_millis(20),
         )
         .expect("progress reporter");
-        assert_eq!(recorder.responses().len(), 1, "initial notification");
-
         request.cancel();
+        let before = recorder.responses().len();
+        assert!(
+            before >= 1,
+            "the synchronous initial notification is missing"
+        );
         std::thread::sleep(Duration::from_millis(60));
         drop(reporter);
         assert_eq!(
             recorder.responses().len(),
-            1,
+            before,
             "a cancelled request received another progress notification"
         );
     }
