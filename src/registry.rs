@@ -62,6 +62,32 @@ impl Status {
     }
 }
 
+/// The observable part of the worker pipeline while a review is running.
+///
+/// These are deliberately phases rather than percentages. Reviewer turns vary too much
+/// in size to estimate completion honestly, but naming the work currently under way lets
+/// a caller distinguish a live, long-running review from a request that disappeared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    Preparing,
+    Capturing,
+    Launching,
+    Reviewing,
+    Finalizing,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing the review",
+            Self::Capturing => "capturing the change",
+            Self::Launching => "launching the reviewer",
+            Self::Reviewing => "reviewer process running",
+            Self::Finalizing => "processing the reviewer response",
+        }
+    }
+}
+
 pub struct Review {
     pub id: String,
     pub session: String,
@@ -81,6 +107,16 @@ pub struct Review {
     pub resumable: bool,
     pub started: Instant,
     pub finished: Option<Instant>,
+    pub phase: Phase,
+    pub phase_started: Instant,
+    /// Most recent point at which the worker changed phase or confirmed the reviewer
+    /// process was still alive. Liveness is not claimed as forward progress: streamed
+    /// output is tracked separately below.
+    pub last_activity: Instant,
+    /// Bytes observed on the reviewer's stdout and stderr pipes so far. This is evidence
+    /// of activity, not a completion estimate: Claude commonly emits nothing until the
+    /// final response, while Codex emits a JSONL event stream as it works.
+    pub output_bytes: usize,
     pub cancel: Arc<AtomicBool>,
     /// Order in which this process finished the review, or 0 while it is still running.
     /// Assigned under the registry lock; see `State::finishes`.
@@ -249,6 +285,7 @@ impl Registry {
         let seq = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let id = format!("rv-{}-{}", std::process::id(), seq);
         let cancel = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
         guard.reviews.insert(
             id.clone(),
             Review {
@@ -262,8 +299,12 @@ impl Registry {
                 denials: Vec::new(),
                 warnings: Vec::new(),
                 resumable: false,
-                started: Instant::now(),
+                started: now,
                 finished: None,
+                phase: Phase::Preparing,
+                phase_started: now,
+                last_activity: now,
+                output_bytes: 0,
                 cancel: Arc::clone(&cancel),
                 finish_seq: 0,
             },
@@ -271,6 +312,53 @@ impl Registry {
         drop(guard);
         self.changed.notify_all();
         Ok((id, cancel))
+    }
+
+    /// Move a running review into another observable phase.
+    pub fn set_phase(&self, id: &str, phase: Phase) {
+        let changed = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.reviews.get_mut(id) {
+                Some(review) if review.status == Status::Running => {
+                    let now = Instant::now();
+                    review.phase = phase;
+                    review.phase_started = now;
+                    review.last_activity = now;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Record a liveness check and the amount of reviewer output observed so far.
+    pub fn report_activity(&self, id: &str, output_bytes: usize) {
+        let changed = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.reviews.get_mut(id) {
+                Some(review) if review.status == Status::Running => {
+                    let phase_changed = review.phase != Phase::Reviewing;
+                    let output_changed = review.output_bytes != output_bytes;
+                    let now = Instant::now();
+                    review.phase = Phase::Reviewing;
+                    if phase_changed {
+                        review.phase_started = now;
+                    }
+                    review.last_activity = now;
+                    review.output_bytes = output_bytes;
+                    phase_changed || output_changed
+                }
+                _ => false,
+            }
+        };
+        // A heartbeat with no new output does not need to wake a terminal-state waiter.
+        // MCP progress reporters read a fresh snapshot on their own interval.
+        if changed {
+            self.changed.notify_all();
+        }
     }
 
     pub fn finish(&self, id: &str, outcome: Outcome) {
@@ -323,6 +411,15 @@ impl Registry {
         } else {
             IdState::Unknown
         }
+    }
+
+    /// Current state without waiting. Used for out-of-band MCP progress notifications.
+    pub fn snapshot(&self, id: &str) -> Option<Snapshot> {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .reviews
+            .get(id)
+            .map(|review| Snapshot::of(review, guard.shutdown))
     }
 
     /// Was this id minted by this process?
@@ -443,6 +540,10 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     pub resumable: bool,
     pub elapsed: Duration,
+    pub phase: Phase,
+    pub phase_elapsed: Duration,
+    pub activity_age: Duration,
+    pub output_bytes: usize,
     /// The server had begun shutting down when this was taken. A `Running` snapshot with
     /// this set means the wait was cut short, not that the caller's budget ran out — and
     /// that no later call can collect the review, because the process is exiting.
@@ -463,6 +564,10 @@ impl Snapshot {
             warnings: review.warnings.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
+            phase: review.phase,
+            phase_elapsed: review.phase_started.elapsed(),
+            activity_age: review.last_activity.elapsed(),
+            output_bytes: review.output_bytes,
             shutting_down,
         }
     }
@@ -759,6 +864,32 @@ mod tests {
             .wait(&id, Duration::from_millis(50))
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
+    }
+
+    #[test]
+    fn snapshots_expose_observed_phase_liveness_and_output() {
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+
+        let preparing = registry.snapshot(&id).expect("snapshot");
+        assert_eq!(preparing.phase, Phase::Preparing);
+        assert_eq!(preparing.output_bytes, 0);
+
+        registry.set_phase(&id, Phase::Launching);
+        registry.report_activity(&id, 12_345);
+        let reviewing = registry.snapshot(&id).expect("snapshot");
+        assert_eq!(reviewing.phase, Phase::Reviewing);
+        assert_eq!(reviewing.output_bytes, 12_345);
+        assert!(
+            reviewing.activity_age < Duration::from_secs(1),
+            "the activity report did not refresh liveness"
+        );
+
+        registry.set_phase(&id, Phase::Finalizing);
+        assert_eq!(
+            registry.snapshot(&id).expect("snapshot").phase,
+            Phase::Finalizing
+        );
     }
 
     #[test]

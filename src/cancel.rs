@@ -73,6 +73,15 @@ impl RequestCancel {
         state.review_id.clone()
     }
 
+    /// Has the client abandoned this request?
+    ///
+    /// Progress notifications use this as a best-effort pre-send check. The lock is never
+    /// held across stdout: a client that stopped draining it must not stall the protocol
+    /// reader and prevent cancellation of every other request.
+    pub fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -128,6 +137,15 @@ mod tests {
         let request = RequestCancel::new();
         request.attach_review("rv-1-5");
         assert_eq!(request.cancel().as_deref(), Some("rv-1-5"));
+        assert!(!request.try_claim_response());
+    }
+
+    #[test]
+    fn cancellation_state_is_observable_without_claiming_a_response() {
+        let request = RequestCancel::new();
+        assert!(!request.is_cancelled());
+        request.cancel();
+        assert!(request.is_cancelled());
         assert!(!request.try_claim_response());
     }
 }

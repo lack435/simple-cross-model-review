@@ -269,6 +269,14 @@ pub struct RunOutcome {
     pub stderr_truncated: bool,
 }
 
+/// Observable liveness from a reviewer child process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activity {
+    /// Bytes retained from both output pipes so far. This stops growing at the collection
+    /// cap even though the pipes continue to be drained.
+    pub output_bytes: usize,
+}
+
 impl RunOutcome {
     /// Did either stream hit the cap? For "is the review recoverable", ask
     /// `stdout_truncated` instead -- a flooded stderr says nothing about the review.
@@ -309,10 +317,25 @@ impl RunOutcome {
 /// prompt can fill the child's stdin buffer while the child is blocked writing
 /// output that nobody is reading.
 pub fn run(
+    command: Command,
+    stdin_data: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> std::io::Result<RunOutcome> {
+    run_observed(command, stdin_data, timeout, cancel, |_| {})
+}
+
+/// Run a reviewer child and periodically report that it was observed alive.
+///
+/// The callback runs only after `try_wait` says the child is still running. It therefore
+/// gives the registry a real liveness signal rather than a timer attached to a worker
+/// thread that might itself be stuck before process launch.
+pub fn run_observed(
     mut command: Command,
     stdin_data: &str,
     timeout: Duration,
     cancel: &AtomicBool,
+    mut on_activity: impl FnMut(Activity),
 ) -> std::io::Result<RunOutcome> {
     command
         .stdin(Stdio::piped())
@@ -361,15 +384,23 @@ pub fn run(
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut next_activity = Instant::now();
 
     let status = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
             None => {
+                let now = Instant::now();
+                if now >= next_activity {
+                    on_activity(Activity {
+                        output_bytes: stdout_buf.len() + stderr_buf.len(),
+                    });
+                    next_activity = now + Duration::from_secs(5);
+                }
                 let stop = if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
                     true
-                } else if Instant::now() >= deadline {
+                } else if now >= deadline {
                     timed_out = true;
                     true
                 } else {
@@ -420,6 +451,12 @@ struct Drain {
     buffer: Arc<Mutex<Vec<u8>>>,
     done: Arc<AtomicBool>,
     truncated: Arc<AtomicBool>,
+}
+
+impl Drain {
+    fn len(&self) -> usize {
+        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 /// Start draining a pipe into a shared buffer.
