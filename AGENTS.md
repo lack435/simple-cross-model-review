@@ -159,7 +159,7 @@ shipping a stale binary.
 
 - **Never commit `cross-review.exe`.** `dist\` is gitignored; releases are built and
   published by the tag-driven CI workflow, never from a workstation.
-- **Pin models by full id** (`claude-opus-5`, `gpt-5.6-terra`). Aliases resolve to older
+- **Pin models by full id** (`claude-opus-4-8`, `gpt-5.6-luna`). Aliases resolve to older
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **The reviewer's isolation and read-only posture are security boundaries.** The tool

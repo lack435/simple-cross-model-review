@@ -103,7 +103,7 @@ the single source of truth. There is no config file of our own to drift out of s
 --usage                     Print the recorded usage summary, then exit.
 ```
 
-Defaults are `claude-opus-5` at `high` and `gpt-5.6-terra` at `xhigh`.
+Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 
 > Pin models by full id. `--model opus` resolves to an older model — verified: it
 > reported `claude-opus-4-8`, not Opus 5.

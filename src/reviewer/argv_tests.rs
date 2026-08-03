@@ -81,11 +81,11 @@ fn claude_runs_in_the_project_and_uses_the_resolved_binary() {
 
 #[test]
 fn claude_argv_carries_the_pinned_model_and_effort() {
-    let cfg = config(&["claude", "--model", "claude-opus-5", "--effort", "xhigh"]);
+    let cfg = config(&["claude", "--model", "claude-opus-4-8", "--effort", "xhigh"]);
     let args = argv(&ClaudeReviewer, &cfg, None);
     assert_eq!(
         value_after(&args, "--model").as_deref(),
-        Some("claude-opus-5")
+        Some("claude-opus-4-8")
     );
     assert_eq!(value_after(&args, "--effort").as_deref(), Some("xhigh"));
     assert!(
@@ -264,10 +264,10 @@ fn codex_argv_states_the_sandbox_on_every_turn_including_resumes() {
 
 #[test]
 fn codex_argv_carries_model_and_effort_on_both_paths() {
-    let cfg = config(&["codex", "--model", "gpt-5.6-terra", "--effort", "xhigh"]);
+    let cfg = config(&["codex", "--model", "gpt-5.6-luna", "--effort", "xhigh"]);
     for resume in [None, Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")] {
         let args = argv(&CodexReviewer, &cfg, resume);
-        assert_eq!(value_after(&args, "-m").as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(value_after(&args, "-m").as_deref(), Some("gpt-5.6-luna"));
         assert!(
             args.contains(&"model_reasoning_effort=\"xhigh\"".to_string()),
             "{args:?}"
