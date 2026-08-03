@@ -380,6 +380,48 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_baseline_survives_and_advances_across_turns() {
+        // The cumulative baseline a turn stores is what the next turn reads back to
+        // difference against. A turn that kept the mapping but never advanced this -- the
+        // old id-less-resume path -- left the next turn subtracting against a stale total.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let turn_one = crate::metrics::Usage {
+            input_tokens: Some(190_000),
+            ..Default::default()
+        };
+        let turn_two = crate::metrics::Usage {
+            input_tokens: Some(250_000),
+            ..Default::default()
+        };
+        let facts = |usage| TurnFacts {
+            reviewer: "codex",
+            cli_session_id: "thread-1",
+            model: "gpt-5.6-terra",
+            effort: "xhigh",
+            cwd: "C:\\repo",
+            cumulative_usage: Some(usage),
+        };
+        store
+            .record_turn("default", facts(turn_one))
+            .expect("turn 1");
+        assert_eq!(
+            store.get("default").unwrap().cumulative_usage,
+            Some(turn_one)
+        );
+        store
+            .record_turn("default", facts(turn_two))
+            .expect("turn 2");
+        let rec = store.get("default").unwrap();
+        assert_eq!(rec.turns, 2);
+        assert_eq!(
+            rec.cumulative_usage,
+            Some(turn_two),
+            "the baseline advances to the latest running total"
+        );
+    }
+
+    #[test]
     fn rebinding_a_name_to_a_new_reviewer_session_restarts_the_count() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);

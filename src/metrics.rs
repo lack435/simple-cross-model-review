@@ -116,6 +116,20 @@ impl Usage {
         *self == Self::default()
     }
 
+    /// Did this reading report any running total worth keeping as a baseline?
+    ///
+    /// Only the cumulative fields count -- the token and cost totals, not `api_calls` or
+    /// `api_duration_ms`, which describe a single invocation and are never subtracted. A
+    /// reading with nothing cumulative in it must not overwrite a baseline that has a real
+    /// total, or the next turn subtracts against nothing and re-counts the whole thread.
+    pub fn has_cumulative_counters(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cost_usd.is_some()
+    }
+
     /// A one-line summary for the review response and the log.
     pub fn summary(&self) -> String {
         let field = |v: Option<u64>| match v {
@@ -157,13 +171,18 @@ pub fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// This turn's usage, from two cumulative readings of a thread that reports totals.
 ///
-/// Saturating throughout. A later total below an earlier one should be impossible, but if
-/// a CLI ever resets or reorders its counters, a wrapped `u64` would record a turn that
-/// cost eighteen quintillion tokens -- a number wrong enough to discredit the whole log,
-/// where a zero is merely uninformative.
+/// A later total below an earlier one should be impossible: a running total only grows. If
+/// a CLI ever resets or reorders its counters, the per-turn delta is not zero -- it is
+/// *unknowable*, so the field is left unreported rather than asserted as a measured zero.
+/// A saturating zero would sit next to genuinely measured zeros and read as one of them,
+/// which is the exact falsehood this module's `Option` fields exist to prevent; `None` says
+/// "cannot say" instead. (A wrapped `u64` -- eighteen quintillion tokens -- would be worse
+/// still, which is why the naive subtraction is never used.)
 pub fn subtract(total: Usage, prior: Usage) -> Usage {
     let sub = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (Some(a), Some(b)) => Some(a.saturating_sub(b)),
+        // `checked_sub` is `None` exactly when the counter went backwards -- the unknowable
+        // case -- and `Some(a - b)` otherwise.
+        (Some(a), Some(b)) => a.checked_sub(b),
         // Nothing to subtract, so the newer reading stands as reported.
         (a, None) => a,
         (None, _) => None,
@@ -174,7 +193,10 @@ pub fn subtract(total: Usage, prior: Usage) -> Usage {
         cache_creation_tokens: sub(total.cache_creation_tokens, prior.cache_creation_tokens),
         cache_read_tokens: sub(total.cache_read_tokens, prior.cache_read_tokens),
         cost_usd: match (total.cost_usd, prior.cost_usd) {
-            (Some(a), Some(b)) => Some((a - b).max(0.0)),
+            // Same rule as the token counters: a cost that went backwards is unknowable, not
+            // zero, so it is left unreported rather than clamped to a measured-looking $0.00.
+            (Some(a), Some(b)) if a >= b => Some(a - b),
+            (Some(_), Some(_)) => None,
             (a, None) => a,
             (None, _) => None,
         },
@@ -182,6 +204,77 @@ pub fn subtract(total: Usage, prior: Usage) -> Usage {
         // invocation that just ran, so they pass through untouched.
         api_calls: total.api_calls,
         api_duration_ms: total.api_duration_ms,
+    }
+}
+
+/// Fold a newer cumulative reading onto the baseline kept for the next turn.
+///
+/// A later reading that omits a counter the thread already reported must not erase it: the
+/// baseline is what the *next* turn subtracts against, and a `None` where a running total
+/// used to sit would make that turn's delta the whole total again. `Some` in `newer` wins;
+/// where `newer` is silent, the value `older` already knew stands. The call count and
+/// duration are not running totals, so the newer invocation's own values carry.
+pub fn merge_cumulative(older: Usage, newer: Usage) -> Usage {
+    let keep = |old: Option<u64>, new: Option<u64>| new.or(old);
+    Usage {
+        input_tokens: keep(older.input_tokens, newer.input_tokens),
+        output_tokens: keep(older.output_tokens, newer.output_tokens),
+        cache_creation_tokens: keep(older.cache_creation_tokens, newer.cache_creation_tokens),
+        cache_read_tokens: keep(older.cache_read_tokens, newer.cache_read_tokens),
+        cost_usd: newer.cost_usd.or(older.cost_usd),
+        api_calls: newer.api_calls,
+        api_duration_ms: newer.api_duration_ms,
+    }
+}
+
+/// The result of reconciling a cumulative reading against the previous turn's baseline.
+pub struct Reconciled {
+    /// What to record as this turn's cost. Empty (all `None`) when it cannot be recovered.
+    pub per_turn: Usage,
+    /// The running total to store for the next turn to subtract against, or `None` when
+    /// the reading carried nothing worth keeping as one.
+    pub baseline: Option<Usage>,
+    /// True when the per-turn cost could not be recovered and the caller should say so.
+    pub unknown: bool,
+}
+
+/// Turn a cumulative reviewer's running total into this turn's cost and the next turn's
+/// baseline.
+///
+/// `total` is the thread's running total this turn; `baseline` is what the previous turn
+/// stored. `resumed` is the one bit that separates the two ways a baseline can be missing,
+/// and they are not the same fact:
+///
+/// - A genuine first turn has no baseline because nothing preceded it, so the running total
+///   *is* this turn's cost.
+/// - A thread whose baseline predates usage tracking has no baseline because it was never
+///   recorded, and its running total is *every* turn's cost, not this one's. Reporting it
+///   would be an overcount dressed as a measurement -- so the turn is left unreported and
+///   the total is kept only to seed the next turn.
+///
+/// The expired-session retry relies on the first case: it is a fresh, non-resumed thread
+/// handed `None`, so its total is correctly taken as turn one's cost rather than differenced
+/// against the dead thread it replaced.
+pub fn reconcile_cumulative(total: Usage, baseline: Option<Usage>, resumed: bool) -> Reconciled {
+    match baseline {
+        // Fold the reading onto the baseline rather than replacing it, so a turn that
+        // reported fewer counters than the last does not drop the running total the next
+        // turn needs to subtract against.
+        Some(prior) => Reconciled {
+            per_turn: subtract(total, prior),
+            baseline: Some(merge_cumulative(prior, total)),
+            unknown: false,
+        },
+        None if resumed => Reconciled {
+            per_turn: Usage::default(),
+            baseline: total.has_cumulative_counters().then_some(total),
+            unknown: true,
+        },
+        None => Reconciled {
+            per_turn: total,
+            baseline: total.has_cumulative_counters().then_some(total),
+            unknown: false,
+        },
     }
 }
 
@@ -1205,10 +1298,11 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_that_goes_backwards_yields_zero_rather_than_wrapping() {
-        // Should be impossible. If a CLI ever resets or reorders its counters, a wrapped
-        // `u64` would record a turn costing eighteen quintillion tokens -- wrong enough
-        // to discredit the whole log, where a zero is merely uninformative.
+    fn a_counter_that_goes_backwards_is_unreported_not_a_measured_zero() {
+        // A running total only grows, so a backwards counter should be impossible. If a CLI
+        // ever resets or reorders its counters the per-turn delta is unknowable -- and an
+        // unknowable figure is `None`, not a `Some(0)` that would sit next to genuinely
+        // measured zeros and read as one. (A wrapped `u64` would be worse still.)
         let smaller = Usage {
             input_tokens: Some(10),
             output_tokens: Some(1),
@@ -1224,10 +1318,24 @@ mod tests {
             ..Usage::default()
         };
         let backwards = subtract(smaller, larger);
-        assert_eq!(backwards.input_tokens, Some(0));
-        assert_eq!(backwards.output_tokens, Some(0));
-        assert_eq!(backwards.cache_read_tokens, Some(0));
-        assert_eq!(backwards.cost_usd, Some(0.0));
+        assert_eq!(backwards.input_tokens, None);
+        assert_eq!(backwards.output_tokens, None);
+        assert_eq!(backwards.cache_read_tokens, None);
+        assert_eq!(backwards.cost_usd, None);
+    }
+
+    #[test]
+    fn a_counter_that_holds_steady_is_a_measured_zero_not_unreported() {
+        // The boundary: an equal reading is a real, measured zero-cost turn and must stay
+        // `Some(0)`. Only a strictly decreasing counter is the unknowable case.
+        let steady = Usage {
+            input_tokens: Some(500),
+            cost_usd: Some(2.0),
+            ..Usage::default()
+        };
+        let delta = subtract(steady, steady);
+        assert_eq!(delta.input_tokens, Some(0));
+        assert_eq!(delta.cost_usd, Some(0.0));
     }
 
     #[test]
@@ -1244,6 +1352,135 @@ mod tests {
         assert_eq!(out.input_tokens, Some(4_269));
         assert_eq!(out.cache_read_tokens, Some(22_016));
         assert_eq!(out.output_tokens, None, "absent stays absent");
+    }
+
+    #[test]
+    fn merge_carries_forward_a_component_the_newer_reading_omits() {
+        // A later reading that does not repeat a counter must not erase it from the
+        // baseline: the next turn subtracts against this, and a `None` where a running
+        // total used to be would make that turn's delta the whole total again.
+        let older = Usage {
+            input_tokens: Some(100),
+            cache_read_tokens: Some(50),
+            ..Usage::default()
+        };
+        let newer = Usage {
+            input_tokens: Some(180),
+            // cache_read omitted this turn.
+            ..Usage::default()
+        };
+        let merged = merge_cumulative(older, newer);
+        assert_eq!(merged.input_tokens, Some(180), "newer value wins");
+        assert_eq!(
+            merged.cache_read_tokens,
+            Some(50),
+            "the omitted counter is kept, not dropped"
+        );
+    }
+
+    #[test]
+    fn an_empty_reading_never_overwrites_a_real_baseline() {
+        // A Codex turn that emits no usage event still parses as a cumulative reading. It
+        // must not wipe the baseline to nothing, or the next turn re-counts the thread.
+        let baseline = Usage {
+            input_tokens: Some(1_000),
+            cache_read_tokens: Some(500),
+            cost_usd: Some(2.0),
+            ..Usage::default()
+        };
+        assert_eq!(
+            merge_cumulative(baseline, Usage::default()),
+            baseline,
+            "an empty reading leaves the baseline untouched"
+        );
+    }
+
+    #[test]
+    fn has_cumulative_counters_ignores_the_call_count() {
+        // `api_calls` describes one invocation and is never subtracted, so a reading that
+        // carries only a call count is not a baseline worth storing.
+        let calls_only = Usage {
+            api_calls: Some(3),
+            ..Usage::default()
+        };
+        assert!(!Usage::default().has_cumulative_counters());
+        assert!(!calls_only.has_cumulative_counters());
+        assert!(Usage {
+            input_tokens: Some(1),
+            ..Usage::default()
+        }
+        .has_cumulative_counters());
+    }
+
+    #[test]
+    fn reconcile_first_turn_takes_the_running_total_as_this_turns_cost() {
+        // No baseline and not a resume: nothing preceded this thread, so the running total
+        // is exactly this turn's cost. This is also the expired-session retry's path -- a
+        // fresh, non-resumed thread handed `None`.
+        let total = Usage {
+            input_tokens: Some(190_000),
+            cost_usd: Some(2.81),
+            ..Usage::default()
+        };
+        let r = reconcile_cumulative(total, None, false);
+        assert!(!r.unknown);
+        assert_eq!(r.per_turn, total, "the total is this turn's cost");
+        assert_eq!(r.baseline, Some(total), "and seeds the next turn");
+    }
+
+    #[test]
+    fn reconcile_resumed_thread_with_no_baseline_reports_nothing_and_seeds() {
+        // A session whose baseline predates usage tracking: the running total is *every*
+        // turn's cost, not this one's. Reporting it would be an overcount dressed as a
+        // measurement -- the old code called this a "floor" when it is a ceiling.
+        let total = Usage {
+            input_tokens: Some(970_000),
+            cost_usd: Some(14.07),
+            ..Usage::default()
+        };
+        let r = reconcile_cumulative(total, None, true);
+        assert!(r.unknown, "the caller must be told the turn is unmeasured");
+        assert_eq!(
+            r.per_turn,
+            Usage::default(),
+            "no per-turn figure is invented from a running total"
+        );
+        assert_eq!(
+            r.baseline,
+            Some(total),
+            "but the total is kept so the next turn is measured"
+        );
+    }
+
+    #[test]
+    fn reconcile_differences_against_a_known_baseline() {
+        let baseline = Usage {
+            input_tokens: Some(190_000),
+            cache_read_tokens: Some(100_000),
+            ..Usage::default()
+        };
+        let total = Usage {
+            input_tokens: Some(250_000),
+            cache_read_tokens: Some(140_000),
+            ..Usage::default()
+        };
+        let r = reconcile_cumulative(total, Some(baseline), true);
+        assert!(!r.unknown);
+        assert_eq!(r.per_turn.input_tokens, Some(60_000));
+        assert_eq!(r.per_turn.cache_read_tokens, Some(40_000));
+        assert_eq!(
+            r.baseline,
+            Some(total),
+            "the baseline advances to the total"
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_persist_an_empty_first_reading_as_a_baseline() {
+        // A first turn that reported no counters has nothing to carry: storing `Some({})`
+        // as a baseline would let a later `merge` treat it as a real zero total.
+        let r = reconcile_cumulative(Usage::default(), None, false);
+        assert_eq!(r.baseline, None);
     }
 
     #[test]

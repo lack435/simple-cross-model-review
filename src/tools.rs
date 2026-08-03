@@ -718,6 +718,7 @@ impl Job {
         let outcome = match self.attempt(
             resume_id.as_deref(),
             self.turn,
+            self.prior_cumulative,
             change.as_deref(),
             &capture_warnings,
             &mut facts.prompt_bytes,
@@ -740,9 +741,14 @@ impl Job {
                     // says a discarded attempt was also billed.
                     facts = AttemptFacts::after_expired_session();
                     self.registry.set_phase(&self.id, Phase::Launching);
+                    // No baseline: the retry is a brand new reviewer thread, so subtracting
+                    // the expired thread's running total from it would record this turn as a
+                    // cross-thread delta -- near zero when the fresh total is smaller, junk
+                    // when it is larger.
                     match self.attempt(
                         None,
                         1,
+                        None,
                         change.as_deref(),
                         &capture_warnings,
                         &mut facts.prompt_bytes,
@@ -858,6 +864,7 @@ impl Job {
         &self,
         resume_id: Option<&str>,
         turn: u32,
+        baseline: Option<crate::metrics::Usage>,
         change: Option<&str>,
         capture_warnings: &[String],
         prompt_bytes: &mut usize,
@@ -949,16 +956,33 @@ impl Job {
         // the difference from the last one. Without this the first turn looks right and
         // every later one is inflated by everything before it -- which is exactly what
         // happened, and it is invisible in a single figure.
-        let reported_cumulative = parsed.usage_is_cumulative.then_some(parsed.usage);
-        if let Some(total) = reported_cumulative {
-            parsed.usage = match self.prior_cumulative {
-                Some(prior) => metrics::subtract(total, prior),
-                // First turn on this session, or a session recorded before the cumulative
-                // was tracked: the running total is this turn's cost, or the best
-                // available floor for it.
-                None => total,
-            };
-        }
+        //
+        // The baseline is passed in, not read from the job, so the expired-session retry --
+        // a brand new thread -- gets `None` and never differences against a dead thread.
+        // `baseline_to_persist` is what the next turn will subtract against, and it is
+        // recorded only when this reading actually carried a running total. The whole
+        // reconciliation is a pure function so its every branch can be tested without a
+        // live reviewer -- see `metrics::reconcile_cumulative`.
+        let mut usage_warning: Option<String> = None;
+        let baseline_to_persist = if let Some(total) =
+            parsed.usage_is_cumulative.then_some(parsed.usage)
+        {
+            let reconciled = metrics::reconcile_cumulative(total, baseline, resume_id.is_some());
+            parsed.usage = reconciled.per_turn;
+            if reconciled.unknown {
+                usage_warning = Some(
+                    "Per-turn usage is unknown for this turn: this session predates usage \
+                     tracking, so its running total cannot be split into a per-turn cost. \
+                     Recording resumes from the next turn."
+                        .to_string(),
+                );
+            }
+            reconciled.baseline
+        } else {
+            // Not a cumulative reporter (Claude reports per turn): nothing to difference and
+            // no baseline to keep.
+            None
+        };
 
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
@@ -974,8 +998,23 @@ impl Job {
         // produced a usable review reports that rather than looking untroubled. Second
         // because it is about how the review was collected, not about what was reviewed.
         warnings.extend(std::mem::take(&mut parsed.warnings));
-        let resumable = match &parsed.session_id {
+        if let Some(w) = usage_warning {
+            warnings.push(w);
+        }
+        // A resumed turn that did not echo its id is still the same thread, so record it
+        // under the id we resumed with. Skipping the record -- as this used to -- kept the
+        // mapping but never advanced the baseline, so the next turn subtracted against a
+        // stale total and double-counted this one.
+        let record_under = parsed.session_id.as_deref().or(resume_id);
+        let resumable = match record_under {
             Some(session_id) => {
+                if parsed.session_id.is_none() {
+                    eprintln!(
+                        "cross-review: warning: the reviewer reported no session id on a resumed \
+                         turn; recording under the resumed id for session '{}'",
+                        self.session
+                    );
+                }
                 match self.sessions.record_turn(
                     &self.session,
                     session::TurnFacts {
@@ -984,7 +1023,7 @@ impl Job {
                         model: &self.cfg.model,
                         effort: &self.cfg.effort,
                         cwd: &self.cfg.cwd.to_string_lossy(),
-                        cumulative_usage: reported_cumulative,
+                        cumulative_usage: baseline_to_persist,
                     },
                 ) {
                     Ok(_) => true,
@@ -1000,17 +1039,6 @@ impl Job {
                         false
                     }
                 }
-            }
-            // On a resumed turn the stored mapping is still valid even if this turn did
-            // not report an id, so the session remains resumable. Only a *new* review
-            // with no id leaves nothing to resume.
-            None if resume_id.is_some() => {
-                eprintln!(
-                    "cross-review: warning: the reviewer reported no session id on a resumed \
-                     turn; keeping the existing mapping for session '{}'",
-                    self.session
-                );
-                true
             }
             None => {
                 eprintln!(
