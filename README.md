@@ -105,8 +105,9 @@ the single source of truth. There is no config file of our own to drift out of s
 
 Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 
-> Pin models by full id. `--model opus` resolves to an older model — verified: it
-> reported `claude-opus-4-8`, not Opus 5.
+> Pin models by full id, not an alias. `--model opus` resolves to whatever the provider
+> currently maps that alias to and can move as releases ship — verified once as
+> `claude-opus-4-8`. Pinning the exact id keeps the reviewer fixed to the one you chose.
 
 ## The change under review is fetched for you
 

@@ -31,9 +31,10 @@ impl ReviewerKind {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            // Pinned by full id on purpose. Bare aliases like `opus` drift to whatever the
-            // newest model is as releases ship, so writing the exact id keeps each reviewer
-            // fixed to the one chosen here rather than moving out from under us.
+            // Pinned by full id on purpose. Bare aliases like `opus` can change resolution
+            // as releases ship (verified once: `--model opus` reported claude-opus-4-8), so
+            // writing the exact id keeps each reviewer fixed to the one chosen here rather
+            // than moving out from under us.
             Self::Claude => "claude-opus-4-8",
             Self::Codex => "gpt-5.6-luna",
         }
