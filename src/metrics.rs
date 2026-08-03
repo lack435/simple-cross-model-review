@@ -1389,9 +1389,11 @@ mod tests {
         file.write_all(b"{\"ts_unix\":170000").expect("torn write");
         drop(file);
 
-        // Asserted against the production path. The test-only `read()` skips malformed
-        // lines silently, so asserting a clean report through it described behaviour
-        // production does not have -- the test agreed with itself and with nothing else.
+        // Asserted against the production path. This once went through the test-only
+        // `read()`, which then classified malformed lines differently, so the assertion
+        // described behaviour production did not have. The two agree now -- see
+        // `the_test_reader_classifies_exactly_as_production_does` -- but the production
+        // path is still what a claim about production should be checked against.
         let (summary, report) = log.summarise();
         assert_eq!(summary.turns, 1, "the intact record was lost");
         assert_eq!(report.malformed, 1, "the torn line was not counted");

@@ -319,9 +319,10 @@ the local logs, and does not even create the directory it reads from.
 
 The log is unbounded on purpose. Its value is the comparison over time, and a rotation that
 dropped the oldest records would quietly break exactly that — so reports stream it rather
-than loading it. The per-session ranking is capped so that summarising really does stay
-bounded; turns past the cap still count toward every total and the report says how many
-lost their own row. Delete it
+than loading it: the number of records makes no difference to how much is held in memory,
+though the list of log files in the directory does. The per-session ranking is capped for
+the same reason; turns past the cap still count toward every total and the report says how
+many lost their own row. Delete it
 yourself when you no longer want the history; `--no-metrics` turns the recording off.
 
 Records carry a schema version. One written by a different version is skipped and counted
