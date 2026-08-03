@@ -310,8 +310,11 @@ Three columns earn their place:
 
 Each machine writes `usage-<machine>.jsonl`, and the reader takes every `usage*.jsonl` in
 the state directory. Rolling several machines up together is therefore a matter of copying
-their logs into one directory and pointing `--state-dir` at it — the names do not collide,
-so nothing is overwritten. Nothing is uploaded and no CLI is launched: `--usage` only reads
+their logs into one directory and pointing `--state-dir` at it. The machine name in the
+filename is a convenience, not a guarantee: two machines sharing a hostname — or both
+falling back to `usage-unknown.jsonl` when the environment does not supply one — produce
+the same filename, and copying one over the other loses data. Check for a name clash
+before copying, and rename if you find one. Nothing is uploaded and no CLI is launched: `--usage` only reads
 the local logs, and does not even create the directory it reads from.
 
 The log is unbounded on purpose. Its value is the comparison over time, and a rotation that

@@ -387,7 +387,7 @@ impl MetricsLog {
                         match serde_json::from_str::<Record>(line) {
                             Ok(r) if r.v == RECORD_VERSION => records.push(r),
                             Ok(_) => report.unsupported_version += 1,
-                            Err(_) => {}
+                            Err(_) => report.malformed += 1,
                         }
                     }
                 }
@@ -776,10 +776,6 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     }
 
     let usage = &summary.usage;
-    let field = |v: Option<u64>| match v {
-        Some(n) => thousands(n),
-        None => "not reported".to_string(),
-    };
     // Each component is qualified in its own right, not just the sum. `add` yields a
     // `Some` as soon as one row reports a figure, so a rollup mixing Claude and Codex
     // turns prints a cache-write number that omits the Codex turns entirely -- and a
@@ -793,6 +789,14 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
             "at least "
         }
     };
+    // "at least" is a claim about a number. A field the CLI never reported has no number
+    // to bound, so hedging it produces "at least not reported" -- which is neither the
+    // lower bound it looks like nor the "not reported" the README documents.
+    let figure = |v: Option<u64>, complete: bool| match v {
+        None => "not reported".to_string(),
+        Some(n) if complete && !partial => thousands(n),
+        Some(n) => format!("at least {}", thousands(n)),
+    };
     out.push_str(&format!(
         "turns:         {}{} ({} failed, {} re-run after an expired session)\n",
         summary.turns,
@@ -803,20 +807,16 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         summary.retried
     ));
     out.push_str(&format!(
-        "input tokens:  {}{} total = {}{} cache-write + {}{} cache-read + {}{} fresh\n",
+        "input tokens:  {}{} total = {} cache-write + {} cache-read + {} fresh\n",
         qualify(summary.input_complete()),
         thousands(usage.billable_input()),
-        qualify(summary.cache_write_complete),
-        field(usage.cache_creation_tokens),
-        qualify(summary.cache_read_complete),
-        field(usage.cache_read_tokens),
-        qualify(summary.fresh_complete),
-        field(usage.input_tokens),
+        figure(usage.cache_creation_tokens, summary.cache_write_complete),
+        figure(usage.cache_read_tokens, summary.cache_read_complete),
+        figure(usage.input_tokens, summary.fresh_complete),
     ));
     out.push_str(&format!(
-        "output tokens: {}{}\n",
-        qualify(summary.output_complete),
-        field(usage.output_tokens),
+        "output tokens: {}\n",
+        figure(usage.output_tokens, summary.output_complete),
     ));
     // Averages divide by the turns that actually reported, not by every turn. Dividing a
     // partial sum by the full turn count silently understates the rate, and the count of
@@ -862,13 +862,15 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     }
     for s in summary.by_session.iter().take(10) {
         out.push_str(&format!(
-            "  {}: {} turn(s), {}{} in, {}{} out",
+            "  {}: {} turn(s), {}{} in, {} out",
             s.session,
             s.turns,
             if s.input_complete { "" } else { "at least " },
             thousands(s.usage.billable_input()),
-            if s.output_complete { "" } else { "at least " },
-            field(s.usage.output_tokens),
+            // Same rule as the totals: hedge a number, never an absent value. The
+            // per-session row was not in the reported line list but had the identical
+            // defect, which is what a class of bug looks like rather than an instance.
+            figure(s.usage.output_tokens, s.output_complete),
         ));
         if let Some(cost) = s.usage.cost_usd {
             // Same rule as every other figure: a cost summed over a session where only
@@ -1089,6 +1091,51 @@ mod tests {
         assert!(line.contains("+ 320,000 cache-read"), "{line}");
         assert!(line.contains("+ 60 fresh"), "{line}");
         assert!(!line.contains("at least 320,000"), "{line}");
+    }
+
+    #[test]
+    fn an_absent_figure_is_never_hedged_as_if_it_were_a_number() {
+        // "at least" bounds a number. A field the CLI never reported has no number to
+        // bound, and "at least not reported" is neither a lower bound nor the
+        // "not reported" the README documents. Introduced while qualifying components.
+        let codex = Usage {
+            input_tokens: Some(50),
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: Some(120_000),
+            ..Usage::default()
+        };
+        let summary = summarise(&[record("s", 1, None, codex)]);
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        assert!(!text.contains("at least not reported"), "{text}");
+        assert!(text.contains("not reported cache-write"), "{text}");
+        assert!(text.contains("output tokens: not reported"), "{text}");
+    }
+
+    #[test]
+    fn the_test_reader_classifies_exactly_as_production_does() {
+        // It diverged twice: once on NotFound, once on malformed lines. A helper that
+        // classifies differently lets a test assert behaviour the real reader lacks.
+        let dir = temp_dir("cross-review-metrics-parity");
+        let log = MetricsLog::new(&dir, true);
+        log.record(&record("s", 1, None, usage(1, 2, 3)));
+        let mut file = OpenOptions::new().append(true).open(log.path()).unwrap();
+        file.write_all(
+            b"{not json
+",
+        )
+        .unwrap();
+        drop(file);
+
+        let (records, via_read) = log.read();
+        let (summary, via_summarise) = log.summarise();
+        assert_eq!(records.len(), summary.turns);
+        assert_eq!(via_read.malformed, via_summarise.malformed, "malformed");
+        assert_eq!(
+            via_read.problem_count, via_summarise.problem_count,
+            "problems"
+        );
+        assert_eq!(via_read.malformed, 1);
     }
 
     #[test]
