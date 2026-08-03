@@ -287,9 +287,9 @@ cross-review.exe --reviewer claude --usage
 turns:         5 (0 failed, 0 re-run after an expired session)
 input tokens:  2,320,250 total = 1,470,000 cache-write + 850,000 cache-read + 250 fresh
 output tokens: 97,000
-model calls:   43 (8.6 per turn)
+model calls:   43 over 5 turn(s) (8.6 per reporting turn)
 wall time:     75m total (15m per turn)
-reported cost: $14.07 ($2.81 per turn)
+reported cost: $14.07 over 5 turn(s) ($2.81 per reporting turn)
 
 resumed turns by gap since the previous turn:
      2  5m to 1h (past the 5m lifetime, inside the 1h one)

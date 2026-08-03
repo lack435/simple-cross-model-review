@@ -50,6 +50,12 @@ pub const RECORD_VERSION: u32 = 1;
 /// Far above any plausible real use: a session per pull request for years still fits.
 pub const MAX_RANKED_SESSIONS: usize = 1000;
 
+/// How many distinct read failures are quoted in a report. Beyond this they are counted
+/// only: the point of the list is to show what kind of thing went wrong, and a directory
+/// full of unreadable files would otherwise put an unbounded string list in memory to say
+/// the same thing a thousand times.
+pub const MAX_REPORTED_PROBLEMS: usize = 10;
+
 /// What the reviewer CLI reported about its own token usage.
 ///
 /// Every field is an `Option` because "the CLI did not report this" and "the CLI reported
@@ -315,9 +321,7 @@ impl MetricsLog {
             Ok(paths) => paths,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                report
-                    .problems
-                    .push(format!("cannot list {}: {e}", self.dir.display()));
+                report.problem(format!("cannot list {}: {e}", self.dir.display()));
                 Vec::new()
             }
         };
@@ -328,15 +332,13 @@ impl MetricsLog {
                 // Absent is the ordinary state before the first review.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    report.problems.push(format!("{}: {e}", path.display()));
+                    report.problem(format!("{}: {e}", path.display()));
                     continue;
                 }
             };
             for line in BufReader::new(file).lines() {
                 let Ok(line) = line else {
-                    report
-                        .problems
-                        .push(format!("{}: stopped partway through", path.display()));
+                    report.problem(format!("{}: stopped partway through", path.display()));
                     break;
                 };
                 if line.trim().is_empty() {
@@ -367,7 +369,7 @@ impl MetricsLog {
         let paths = match self.logs() {
             Ok(paths) => paths,
             Err(e) => {
-                report.problems.push(format!("{e}"));
+                report.problem(format!("{e}"));
                 Vec::new()
             }
         };
@@ -383,7 +385,7 @@ impl MetricsLog {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => report.problems.push(format!("{}: {e}", path.display())),
+                Err(e) => report.problem(format!("{}: {e}", path.display())),
             }
         }
         records.sort_by_key(|r| r.ts_unix);
@@ -394,9 +396,11 @@ impl MetricsLog {
 /// What went wrong, or was deliberately left out, while reading the logs.
 #[derive(Default)]
 pub struct ReadReport {
-    /// Files that could not be read at all, the directory that could not be listed, or a
-    /// file whose read stopped partway.
+    /// A sample of the read failures, capped at `MAX_REPORTED_PROBLEMS`. Use
+    /// `problem_count` for how many there really were.
     pub problems: Vec<String>,
+    /// Every read failure, counted whether or not it was quoted above.
+    pub problem_count: usize,
     /// Records written by a schema version this build cannot interpret, skipped rather
     /// than misread. Not necessarily *older*: a newer version is equally unreadable here.
     pub unsupported_version: usize,
@@ -411,8 +415,16 @@ pub struct ReadReport {
 
 impl ReadReport {
     /// Nothing was missed, so the figures describe everything on disk.
+    /// Record a failure, keeping the quoted list bounded.
+    pub fn problem(&mut self, message: String) {
+        self.problem_count += 1;
+        if self.problems.len() < MAX_REPORTED_PROBLEMS {
+            self.problems.push(message);
+        }
+    }
+
     pub fn is_clean(&self) -> bool {
-        self.problems.is_empty()
+        self.problem_count == 0
             && self.unsupported_version == 0
             && self.malformed == 0
             && self.unranked_turns == 0
@@ -423,7 +435,7 @@ impl ReadReport {
     /// Distinct from `is_clean`: a capped session ranking omits *rows* but still counts
     /// those turns in the totals, so it does not make the totals partial.
     pub fn totals_are_partial(&self) -> bool {
-        !self.problems.is_empty() || self.unsupported_version > 0 || self.malformed > 0
+        self.problem_count > 0 || self.unsupported_version > 0 || self.malformed > 0
     }
 }
 
@@ -481,9 +493,43 @@ pub struct SessionRollup {
     pub usage: Usage,
     pub input_complete: bool,
     pub output_complete: bool,
+    /// Whether every turn in this session reported a cost. Tracked for the same reason
+    /// as the two above, and missed when they were added: a session printing `$3.50` as
+    /// exact while only some of its turns reported a figure is the same false precision
+    /// in the one place the pattern had not been extended to.
+    pub cost_complete: bool,
 }
 
-/// Running totals, so a summary never requires holding the whole history in memory.
+/// Per-session running totals. A named struct rather than a widening tuple -- the fourth
+/// coverage flag is what made the tuple unreadable, and unreadable is how the third one
+/// came to be missing.
+struct SessionAcc {
+    turns: usize,
+    usage: Usage,
+    input_complete: bool,
+    output_complete: bool,
+    cost_complete: bool,
+}
+
+impl SessionAcc {
+    fn new() -> Self {
+        Self {
+            turns: 0,
+            usage: Usage::default(),
+            input_complete: true,
+            output_complete: true,
+            cost_complete: true,
+        }
+    }
+}
+
+/// Running totals, so summarising never requires holding the record history in memory.
+///
+/// Deliberately not described as "fixed-size", which this has twice been claimed to be
+/// and twice not been. What is true and verified is the part that matters: the number of
+/// records makes no difference to how much is held. The per-session ranking is capped and
+/// the diagnostics list is capped; the list of log *files* is not, being bounded by what
+/// is in the directory rather than by anything a caller controls.
 #[derive(Default)]
 pub struct Accumulator {
     turns: usize,
@@ -497,7 +543,7 @@ pub struct Accumulator {
     input_complete: bool,
     output_complete: bool,
     gap_buckets: BTreeMap<&'static str, usize>,
-    per_session: BTreeMap<String, (usize, Usage, bool, bool)>,
+    per_session: BTreeMap<String, SessionAcc>,
     unranked_turns: usize,
     started: bool,
 }
@@ -553,18 +599,23 @@ impl Accumulator {
         // already updated, so a turn beyond the cap is still counted -- it only loses its
         // own row, and the report says how many sessions that happened to.
         let room = self.per_session.len() < MAX_RANKED_SESSIONS;
+        let cost_ok = record.usage.cost_usd.is_some();
         match self.per_session.get_mut(&record.session) {
             Some(entry) => {
-                entry.0 += 1;
-                accumulate(&mut entry.1, &record.usage);
-                entry.2 &= input_ok;
-                entry.3 &= output_ok;
+                entry.turns += 1;
+                accumulate(&mut entry.usage, &record.usage);
+                entry.input_complete &= input_ok;
+                entry.output_complete &= output_ok;
+                entry.cost_complete &= cost_ok;
             }
             None if room => {
-                let mut usage = Usage::default();
-                accumulate(&mut usage, &record.usage);
-                self.per_session
-                    .insert(record.session.clone(), (1, usage, input_ok, output_ok));
+                let mut entry = SessionAcc::new();
+                entry.turns = 1;
+                accumulate(&mut entry.usage, &record.usage);
+                entry.input_complete = input_ok;
+                entry.output_complete = output_ok;
+                entry.cost_complete = cost_ok;
+                self.per_session.insert(record.session.clone(), entry);
             }
             // A counter, not a set of names: a set of caller-chosen names is exactly the
             // unbounded growth the cap exists to prevent.
@@ -582,12 +633,13 @@ impl Accumulator {
         let mut by_session: Vec<SessionRollup> = self
             .per_session
             .into_iter()
-            .map(|(session, (turns, usage, input, output))| SessionRollup {
+            .map(|(session, acc)| SessionRollup {
                 session,
-                turns,
-                usage,
-                input_complete: input,
-                output_complete: output,
+                turns: acc.turns,
+                usage: acc.usage,
+                input_complete: acc.input_complete,
+                output_complete: acc.output_complete,
+                cost_complete: acc.cost_complete,
             })
             .collect();
         by_session.sort_by_key(|s| std::cmp::Reverse(s.usage.billable_input()));
@@ -641,6 +693,14 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     out.push_str(&format!("usage log:     {}\n", dir.display()));
     for problem in &report.problems {
         out.push_str(&format!("               UNREADABLE: {problem}\n"));
+    }
+    // The quoted list is a sample; the count is the fact. Showing ten failures and
+    // stopping would understate a directory where everything is unreadable.
+    if report.problem_count > report.problems.len() {
+        out.push_str(&format!(
+            "               UNREADABLE: and {} more not listed\n",
+            report.problem_count - report.problems.len()
+        ));
     }
     // Named rather than dropped quietly: these records exist, and excluding them without
     // saying so would understate the history the report claims to cover.
@@ -757,7 +817,17 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         }
     }
 
-    out.push_str("\nheaviest sessions:\n");
+    // Only claim "heaviest" when the ranking actually saw everything. Past the cap it is
+    // the heaviest of the first N sessions encountered, and the true heaviest may have no
+    // row at all -- so the heading stops making a claim the data cannot support.
+    if report.unranked_turns > 0 {
+        out.push_str(&format!(
+            "\nheaviest of the first {MAX_RANKED_SESSIONS} sessions seen (others were \
+             counted in the totals but not ranked, so the real heaviest may be absent):\n"
+        ));
+    } else {
+        out.push_str("\nheaviest sessions:\n");
+    }
     for s in summary.by_session.iter().take(10) {
         out.push_str(&format!(
             "  {}: {} turn(s), {}{} in, {}{} out",
@@ -769,7 +839,12 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
             field(s.usage.output_tokens),
         ));
         if let Some(cost) = s.usage.cost_usd {
-            out.push_str(&format!(", ${cost:.2}"));
+            // Same rule as every other figure: a cost summed over a session where only
+            // some turns reported one is a floor, not the session's cost.
+            out.push_str(&format!(
+                ", {}${cost:.2}",
+                if s.cost_complete { "" } else { "at least " }
+            ));
         }
         out.push('\n');
     }
@@ -1194,9 +1269,83 @@ mod tests {
         file.write_all(b"{\"ts_unix\":170000").expect("torn write");
         drop(file);
 
-        let (read, report) = log.read();
-        assert_eq!(read.len(), 1, "the intact record was lost");
-        assert!(report.is_clean(), "a torn line is not an unreadable file");
+        // Asserted against the production path. The test-only `read()` skips malformed
+        // lines silently, so asserting a clean report through it described behaviour
+        // production does not have -- the test agreed with itself and with nothing else.
+        let (summary, report) = log.summarise();
+        assert_eq!(summary.turns, 1, "the intact record was lost");
+        assert_eq!(report.malformed, 1, "the torn line was not counted");
+        assert!(
+            report.problems.is_empty(),
+            "a torn line is a skipped record, not an unreadable file"
+        );
+        // It is still a record that exists and was not counted, so the totals are floors.
+        assert!(report.totals_are_partial());
+        let text = render_summary(&summary, &dir, &report);
+        assert!(text.contains("1 record(s) that did not parse"), "{text}");
+    }
+
+    #[test]
+    fn a_session_cost_summed_over_partly_reporting_turns_is_shown_as_a_floor() {
+        // The third place this distinction had to be made, and the one it was missed in:
+        // per-session rows tracked input and output coverage but printed cost as exact.
+        let with_cost = usage(10, 20, 5);
+        let without = Usage {
+            cost_usd: None,
+            ..with_cost
+        };
+        let summary = summarise(&[
+            record("partly", 1, None, with_cost),
+            record("partly", 2, None, without),
+            record("fully", 1, None, with_cost),
+        ]);
+        let by: BTreeMap<&str, &SessionRollup> = summary
+            .by_session
+            .iter()
+            .map(|s| (s.session.as_str(), s))
+            .collect();
+        assert!(!by["partly"].cost_complete);
+        assert!(by["fully"].cost_complete);
+
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        let partly = text.lines().find(|l| l.contains("partly:")).unwrap();
+        let fully = text.lines().find(|l| l.contains("fully:")).unwrap();
+        assert!(partly.contains("at least $"), "{partly}");
+        assert!(!fully.contains("at least $"), "{fully}");
+    }
+
+    #[test]
+    fn the_report_stops_quoting_read_failures_but_keeps_counting_them() {
+        // The quoted list exists to show what kind of thing went wrong. A directory full
+        // of unreadable files would otherwise hold an unbounded string list to say the
+        // same thing a thousand times.
+        let mut report = ReadReport::default();
+        for n in 0..MAX_REPORTED_PROBLEMS + 7 {
+            report.problem(format!("file-{n}.jsonl: denied"));
+        }
+        assert_eq!(report.problems.len(), MAX_REPORTED_PROBLEMS);
+        assert_eq!(report.problem_count, MAX_REPORTED_PROBLEMS + 7);
+        assert!(!report.is_clean());
+
+        let text = render_summary(&summarise(&[]), Path::new("C:\\s"), &report);
+        assert!(text.contains("and 7 more not listed"), "{text}");
+    }
+
+    #[test]
+    fn a_capped_ranking_stops_calling_itself_the_heaviest() {
+        // Past the cap the ranking covers the first N sessions seen, so the genuinely
+        // heaviest one may have no row at all. The heading must not claim otherwise.
+        let summary = summarise(&[record("s", 1, None, usage(1, 1, 1))]);
+        let capped = ReadReport {
+            unranked_turns: 3,
+            ..ReadReport::default()
+        };
+        let text = render_summary(&summary, Path::new("C:\\s"), &capped);
+        assert!(text.contains("the real heaviest may be absent"), "{text}");
+        assert!(!text.contains("\nheaviest sessions:"), "{text}");
+
+        let uncapped = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        assert!(uncapped.contains("\nheaviest sessions:"), "{uncapped}");
     }
 
     #[test]
