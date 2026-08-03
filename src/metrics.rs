@@ -307,8 +307,10 @@ impl MetricsLog {
     ///
     /// Streamed rather than collected. The log is unbounded by decision -- its value is
     /// the comparison over time -- but keeping all of the history does not require
-    /// holding all of it in memory at once, and `status` runs this on every call. The
-    /// aggregate is fixed-size no matter how long the history gets.
+    /// holding all of it in memory at once, and `status` runs this on every call. What is
+    /// verified is narrower than "fixed-size", which this has twice been claimed to be
+    /// and twice not been: the number of *records* makes no difference to how much is
+    /// held. The list of log files does, being bounded by what is in the directory.
     ///
     /// Failures are returned rather than swallowed: an unreadable log is not an empty
     /// one, and reporting "no turns recorded yet" over a permissions error would answer
@@ -368,6 +370,11 @@ impl MetricsLog {
         let mut report = ReadReport::default();
         let paths = match self.logs() {
             Ok(paths) => paths,
+            // Classified exactly as production does: an absent directory is the ordinary
+            // pre-first-review state, not a problem. A helper that classifies differently
+            // lets a future test assert behaviour the real reader does not have -- which
+            // is how the torn-line test came to pass against nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
                 report.problem(format!("{e}"));
                 Vec::new()
@@ -480,11 +487,27 @@ pub struct Summary {
     /// as one row reports a figure, so a total built from a reporting turn and a
     /// non-reporting one presents itself as complete when it is only a floor -- which is
     /// what a rollup mixing Claude and Codex turns produces.
-    pub input_complete: bool,
+    /// Coverage per component, not just for the input figure as a whole.
+    ///
+    /// Each component is itself a number a reader will take at face value: a rollup can
+    /// print "at least 820,100 total" and then "500,000 cache-write" beside it, where the
+    /// second omits a Codex turn's unreported cache writes and reads as measured. The
+    /// qualifier has to reach the parts, not only the sum.
+    pub cache_write_complete: bool,
+    pub cache_read_complete: bool,
+    pub fresh_complete: bool,
     pub output_complete: bool,
     /// Turns that resumed a session, bucketed by how long the session sat idle first.
     pub gap_buckets: BTreeMap<&'static str, usize>,
     pub by_session: Vec<SessionRollup>,
+}
+
+impl Summary {
+    /// Every component of the input figure reported by every turn. Derived rather than
+    /// tracked separately, so it cannot drift from the parts it summarises.
+    pub fn input_complete(&self) -> bool {
+        self.cache_write_complete && self.cache_read_complete && self.fresh_complete
+    }
 }
 
 pub struct SessionRollup {
@@ -540,7 +563,9 @@ pub struct Accumulator {
     api_calls_turns: usize,
     cost_turns: usize,
     wall_secs: u64,
-    input_complete: bool,
+    cache_write_complete: bool,
+    cache_read_complete: bool,
+    fresh_complete: bool,
     output_complete: bool,
     gap_buckets: BTreeMap<&'static str, usize>,
     per_session: BTreeMap<String, SessionAcc>,
@@ -562,7 +587,9 @@ impl Accumulator {
     pub fn push(&mut self, record: &Record) {
         if !self.started {
             self.started = true;
-            self.input_complete = true;
+            self.cache_write_complete = true;
+            self.cache_read_complete = true;
+            self.fresh_complete = true;
             self.output_complete = true;
         }
         self.turns += 1;
@@ -573,7 +600,9 @@ impl Accumulator {
         // exact when it is a floor.
         let input_ok = record.usage.input_complete();
         let output_ok = record.usage.output_tokens.is_some();
-        self.input_complete &= input_ok;
+        self.cache_write_complete &= record.usage.cache_creation_tokens.is_some();
+        self.cache_read_complete &= record.usage.cache_read_tokens.is_some();
+        self.fresh_complete &= record.usage.input_tokens.is_some();
         self.output_complete &= output_ok;
 
         if let Some(calls) = record.usage.api_calls {
@@ -653,7 +682,9 @@ impl Accumulator {
             api_calls: self.api_calls,
             api_calls_turns: self.api_calls_turns,
             cost_turns: self.cost_turns,
-            input_complete: self.input_complete,
+            cache_write_complete: self.cache_write_complete,
+            cache_read_complete: self.cache_read_complete,
+            fresh_complete: self.fresh_complete,
             output_complete: self.output_complete,
             gap_buckets: self.gap_buckets,
             by_session,
@@ -749,41 +780,42 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         Some(n) => thousands(n),
         None => "not reported".to_string(),
     };
+    // Each component is qualified in its own right, not just the sum. `add` yields a
+    // `Some` as soon as one row reports a figure, so a rollup mixing Claude and Codex
+    // turns prints a cache-write number that omits the Codex turns entirely -- and a
+    // reader takes "500,000 cache-write" at face value however the total above it is
+    // labelled. The qualifier has to reach the parts.
+    let partial = report.totals_are_partial();
+    let qualify = |complete: bool| {
+        if complete && !partial {
+            ""
+        } else {
+            "at least "
+        }
+    };
     out.push_str(&format!(
         "turns:         {}{} ({} failed, {} re-run after an expired session)\n",
         summary.turns,
         // "1 readable" rather than "1" when something on disk could not be counted: the
         // turn count is as much a lower bound as the token figures are.
-        if report.totals_are_partial() {
-            " readable"
-        } else {
-            ""
-        },
+        if partial { " readable" } else { "" },
         summary.failed,
         summary.retried
     ));
     out.push_str(&format!(
-        "input tokens:  {}{} total = {} cache-write + {} cache-read + {} fresh\n",
-        // The summary's own answer, not the sum's: `add` yields a `Some` as soon as one
-        // row reports a figure, so a total built from a reporting turn and a
-        // non-reporting one would otherwise present itself as complete.
-        if summary.input_complete && !report.totals_are_partial() {
-            ""
-        } else {
-            "at least "
-        },
+        "input tokens:  {}{} total = {}{} cache-write + {}{} cache-read + {}{} fresh\n",
+        qualify(summary.input_complete()),
         thousands(usage.billable_input()),
+        qualify(summary.cache_write_complete),
         field(usage.cache_creation_tokens),
+        qualify(summary.cache_read_complete),
         field(usage.cache_read_tokens),
+        qualify(summary.fresh_complete),
         field(usage.input_tokens),
     ));
     out.push_str(&format!(
         "output tokens: {}{}\n",
-        if summary.output_complete && !report.totals_are_partial() {
-            ""
-        } else {
-            "at least "
-        },
+        qualify(summary.output_complete),
         field(usage.output_tokens),
     ));
     // Averages divide by the turns that actually reported, not by every turn. Dividing a
@@ -994,7 +1026,7 @@ mod tests {
         ]);
 
         assert!(
-            !summary.input_complete,
+            !summary.input_complete(),
             "a total built from a turn that never reported cache-write is a floor"
         );
         // Assert on the totals line specifically. Matching "at least" anywhere in the
@@ -1016,6 +1048,47 @@ mod tests {
             .collect();
         assert!(by["claude-side"], "a fully reported session is not a floor");
         assert!(!by["codex-side"]);
+    }
+
+    #[test]
+    fn a_mixed_reviewer_rollup_qualifies_each_component_not_only_the_total() {
+        // The fourth instance of this class, and the one that survived three rounds of
+        // fixing the others: the headline said "at least", and then the breakdown beside
+        // it printed "500,000 cache-write" — a figure that omits every Codex turn's
+        // unreported cache writes and which a reader takes at face value regardless of
+        // how the line above is labelled.
+        let claude = usage(500_000, 200_000, 9_000);
+        let codex = Usage {
+            input_tokens: Some(50),
+            output_tokens: Some(9_000),
+            cache_creation_tokens: None,
+            cache_read_tokens: Some(120_000),
+            ..Usage::default()
+        };
+        let summary = summarise(&[
+            record("claude-side", 1, None, claude),
+            record("codex-side", 1, None, codex),
+        ]);
+
+        // Only cache-write is short; the other two components were reported by both.
+        assert!(!summary.cache_write_complete);
+        assert!(summary.cache_read_complete);
+        assert!(summary.fresh_complete);
+        assert!(!summary.input_complete());
+
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("input tokens:"))
+            .expect("a totals line");
+        assert!(
+            line.contains("at least 500,000 cache-write"),
+            "the unreported component still reads as measured: {line}"
+        );
+        // And the components that *were* fully reported are not needlessly hedged.
+        assert!(line.contains("+ 320,000 cache-read"), "{line}");
+        assert!(line.contains("+ 60 fresh"), "{line}");
+        assert!(!line.contains("at least 320,000"), "{line}");
     }
 
     #[test]
@@ -1159,7 +1232,7 @@ mod tests {
             record("s", 1, None, usage(100, 200, 50)),
             record("s", 2, None, Usage::default()),
         ]);
-        assert!(!summary.input_complete);
+        assert!(!summary.input_complete());
         assert!(!summary.output_complete);
         let totals = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
         let line = totals
