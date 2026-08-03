@@ -46,7 +46,8 @@ pub struct Parsed {
     /// What the CLI reported about the tokens this turn consumed. Both CLIs report it and
     /// we used to discard it, which left the cost of a review invisible to the tool that
     /// caused it. Defaulted rather than optional: a CLI that stops reporting usage should
-    /// degrade to zeroes in the log, not to a failed review.
+    /// degrade to unreported usage in the log -- every `Usage` field stays `None` and
+    /// serialises as absent, never as an asserted zero -- not to a failed review.
     pub usage: crate::metrics::Usage,
     /// Whether `usage` counts the whole reviewer conversation rather than this turn.
     ///

@@ -959,10 +959,12 @@ impl Job {
         //
         // The baseline is passed in, not read from the job, so the expired-session retry --
         // a brand new thread -- gets `None` and never differences against a dead thread.
-        // `baseline_to_persist` is what the next turn will subtract against, and it is
-        // recorded only when this reading actually carried a running total. The whole
-        // reconciliation is a pure function so its every branch can be tested without a
-        // live reviewer -- see `metrics::reconcile_cumulative`.
+        // `baseline_to_persist` is what the next turn will subtract against: when a baseline
+        // already exists it is always carried forward (an empty reading keeps the old one
+        // rather than erasing it), and only in the no-baseline case is one persisted solely
+        // when this reading actually carried a running total. The whole reconciliation is a
+        // pure function so its every branch can be tested without a live reviewer -- see
+        // `metrics::reconcile_cumulative`.
         let mut usage_warning: Option<String> = None;
         let baseline_to_persist = if let Some(total) =
             parsed.usage_is_cumulative.then_some(parsed.usage)
@@ -973,7 +975,8 @@ impl Job {
                 usage_warning = Some(
                     "Per-turn usage is unknown for this turn: this session predates usage \
                      tracking, so its running total cannot be split into a per-turn cost. \
-                     Recording resumes from the next turn."
+                     Recording resumes once a later turn reports a running total to measure \
+                     against."
                         .to_string(),
                 );
             }

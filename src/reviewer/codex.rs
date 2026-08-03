@@ -183,6 +183,15 @@ impl Reviewer for CodexReviewer {
                     .to_string(),
             );
         }
+        if events.input_inconsistent {
+            warnings.push(
+                "The reviewer's own usage report was inconsistent -- it counted more cached \
+                 input than total input -- so the uncached (fresh) input for this run is left \
+                 unreported rather than shown as a measured zero. The token totals below may \
+                 therefore understate the input."
+                    .to_string(),
+            );
+        }
 
         Ok(Parsed {
             text,
@@ -208,6 +217,10 @@ struct Events {
     /// so the figure means the same thing as Claude's `num_turns`: model calls billed
     /// inside this one review turn.
     turns_seen: u64,
+    /// Set when a reading counted more cached input than total input -- a violation of the
+    /// subset relationship Codex documents. Surfaced as a warning so the unreported fresh
+    /// input is explained rather than read as a silent gap.
+    input_inconsistent: bool,
 }
 
 /// Read `codex exec --json` output. The stream is JSONL, but the CLI also emits
@@ -274,7 +287,18 @@ fn parse_events(stdout: &str) -> Events {
                     let cached = field("cached_input_tokens");
                     events.usage.cache_read_tokens = cached;
                     events.usage.input_tokens = match (total_in, cached) {
-                        (Some(total), Some(cached)) => Some(total.saturating_sub(cached)),
+                        // Codex documents cached as a subset of the input total, so this
+                        // subtraction should never underflow. If it ever does, the fresh
+                        // remainder is *unknowable*, not zero: `checked_sub` leaves it
+                        // unreported rather than asserting a measured `Some(0)` beside
+                        // Claude's real figures -- the same rule the cumulative delta keeps.
+                        (Some(total), Some(cached)) => match total.checked_sub(cached) {
+                            Some(fresh) => Some(fresh),
+                            None => {
+                                events.input_inconsistent = true;
+                                None
+                            }
+                        },
                         (total, None) => total,
                         (None, _) => None,
                     };
@@ -360,6 +384,24 @@ mod tests {
         // unreported rather than being guessed at -- a zero here would be an assertion,
         // and it sits directly beside Claude's measured figure.
         assert_eq!(events.usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn a_cached_count_above_the_total_leaves_fresh_input_unreported() {
+        // Codex documents cached input as a subset of the total, so cached > total should be
+        // impossible. If it ever happens, the fresh remainder is unknowable, not zero: it is
+        // left unreported (and flagged) rather than clamped to a measured-looking Some(0).
+        let stream = r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":5}}"#;
+        let events = parse_events(stream);
+        assert_eq!(events.usage.cache_read_tokens, Some(150));
+        assert_eq!(
+            events.usage.input_tokens, None,
+            "an impossible subset is unknowable, not a measured zero"
+        );
+        assert!(
+            events.input_inconsistent,
+            "the inconsistency is flagged so it can be surfaced as a warning"
+        );
     }
 
     #[test]

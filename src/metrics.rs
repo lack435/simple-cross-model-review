@@ -112,6 +112,17 @@ impl Usage {
             && self.cache_read_tokens.is_some()
     }
 
+    /// Was not one of the three input components reported? Then `billable_input` is `0` only
+    /// because there was nothing to add, and must render as `not reported` -- not as a
+    /// lower-bounded `at least 0`, which would claim a measured floor that does not exist.
+    /// This is the same not-reported-versus-zero contract the counters keep, applied to
+    /// their sum.
+    pub fn input_unreported(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+            && self.cache_read_tokens.is_none()
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -137,13 +148,12 @@ impl Usage {
             None => "not reported".to_string(),
         };
         let mut out = format!(
-            "{}{} in ({} cache-write, {} cache-read, {} fresh), {} out",
-            if self.input_complete() {
-                ""
-            } else {
-                "at least "
-            },
-            thousands(self.billable_input()),
+            "{} in ({} cache-write, {} cache-read, {} fresh), {} out",
+            input_display(
+                self.billable_input(),
+                self.input_unreported(),
+                self.input_complete()
+            ),
             field(self.cache_creation_tokens),
             field(self.cache_read_tokens),
             field(self.input_tokens),
@@ -250,7 +260,8 @@ pub struct Reconciled {
 /// - A thread whose baseline predates usage tracking has no baseline because it was never
 ///   recorded, and its running total is *every* turn's cost, not this one's. Reporting it
 ///   would be an overcount dressed as a measurement -- so the turn is left unreported and
-///   the total is kept only to seed the next turn.
+///   the total is kept only to seed a baseline. Measurement resumes on the first later turn
+///   that reports a running total to difference against, which need not be the very next one.
 ///
 /// The expired-session retry relies on the first case: it is a fresh, non-resumed thread
 /// handed `None`, so its total is correctly taken as turn one's cost rather than differenced
@@ -905,13 +916,6 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     // reader takes "500,000 cache-write" at face value however the total above it is
     // labelled. The qualifier has to reach the parts.
     let partial = report.totals_are_partial();
-    let qualify = |complete: bool| {
-        if complete && !partial {
-            ""
-        } else {
-            "at least "
-        }
-    };
     // "at least" is a claim about a number. A field the CLI never reported has no number
     // to bound, so hedging it produces "at least not reported" -- which is neither the
     // lower bound it looks like nor the "not reported" the README documents.
@@ -930,9 +934,12 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         summary.retried
     ));
     out.push_str(&format!(
-        "input tokens:  {}{} total = {} cache-write + {} cache-read + {} fresh\n",
-        qualify(summary.input_complete()),
-        thousands(usage.billable_input()),
+        "input tokens:  {} total = {} cache-write + {} cache-read + {} fresh\n",
+        input_display(
+            usage.billable_input(),
+            usage.input_unreported(),
+            summary.input_complete() && !partial,
+        ),
         figure(usage.cache_creation_tokens, summary.cache_write_complete),
         figure(usage.cache_read_tokens, summary.cache_read_complete),
         figure(usage.input_tokens, summary.fresh_complete),
@@ -985,11 +992,14 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     }
     for s in summary.by_session.iter().take(10) {
         out.push_str(&format!(
-            "  {}: {} turn(s), {}{} in, {} out",
+            "  {}: {} turn(s), {} in, {} out",
             s.session,
             s.turns,
-            if s.input_complete { "" } else { "at least " },
-            thousands(s.usage.billable_input()),
+            input_display(
+                s.usage.billable_input(),
+                s.usage.input_unreported(),
+                s.input_complete,
+            ),
             // Same rule as the totals: hedge a number, never an absent value. The
             // per-session row was not in the reported line list but had the identical
             // defect, which is what a class of bug looks like rather than an instance.
@@ -1006,6 +1016,23 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         out.push('\n');
     }
     out
+}
+
+/// Render a billable-input sum under the not-reported / lower-bound / exact contract, so
+/// every input line -- the per-turn summary, the rollup total, and the per-session row --
+/// makes the same three-way distinction from one place.
+///
+/// `unreported` (no component reported at all) has to be tested before `complete`, because a
+/// wholly-absent figure is `0` for want of anything to add and is neither a bound nor a
+/// measurement -- "at least 0" would assert a floor that was never reported.
+fn input_display(billable: u64, unreported: bool, complete: bool) -> String {
+    if unreported {
+        "not reported".to_string()
+    } else if complete {
+        thousands(billable)
+    } else {
+        format!("at least {}", thousands(billable))
+    }
 }
 
 /// "N turns", or "N of M turns" when only some of them reported the figure. Spelling out
