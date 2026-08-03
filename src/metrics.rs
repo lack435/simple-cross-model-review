@@ -1081,7 +1081,7 @@ mod tests {
             resumed: turn > 1,
             gap_secs: gap,
             reviewer: "claude".into(),
-            model: "claude-opus-5".into(),
+            model: "claude-opus-4-8".into(),
             effort: "medium".into(),
             prompt_bytes: 1000,
             diff_bytes: 500,

@@ -1,6 +1,6 @@
 # Codex, reviewed by Claude
 
-The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 5.
+The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 4.8.
 
 ## Setup
 
@@ -18,7 +18,7 @@ The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 5.
    ```toml
    [mcp_servers.cross_review]
    command = "tools/cross-review.exe"
-   args = ["--reviewer", "claude", "--model", "claude-opus-5", "--effort", "high"]
+   args = ["--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium"]
    startup_timeout_sec = 30
    tool_timeout_sec = 400
    ```
@@ -70,8 +70,8 @@ Add `--bin` with its full path:
 ```toml
 args = [
   "--reviewer", "claude",
-  "--model", "claude-opus-5",
-  "--effort", "high",
+  "--model", "claude-opus-4-8",
+  "--effort", "medium",
   "--bin", "C:\\Users\\you\\.local\\bin\\claude.exe",
 ]
 ```
@@ -86,5 +86,5 @@ vendored the executable.
 
 ## Effort levels
 
-Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`. `high` is the default here.
+Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`. `medium` is the default here.
 Raising it costs more and takes longer.

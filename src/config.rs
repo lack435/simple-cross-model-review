@@ -31,17 +31,19 @@ impl ReviewerKind {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            // Pinned by full id on purpose: the `opus` alias resolves to an older
-            // model (verified: `--model opus` reported claude-opus-4-8).
-            Self::Claude => "claude-opus-5",
-            Self::Codex => "gpt-5.6-terra",
+            // Pinned by full id on purpose. Bare aliases like `opus` can change resolution
+            // as releases ship (verified once: `--model opus` reported claude-opus-4-8), so
+            // writing the exact id keeps each reviewer fixed to the one chosen here rather
+            // than moving out from under us.
+            Self::Claude => "claude-opus-4-8",
+            Self::Codex => "gpt-5.6-luna",
         }
     }
 
     pub fn default_effort(self) -> &'static str {
         match self {
-            Self::Claude => "high",
-            Self::Codex => "xhigh",
+            Self::Claude => "medium",
+            Self::Codex => "max",
         }
     }
 
@@ -541,10 +543,10 @@ REQUIRED:
 
 OPTIONS:
   --model <id>                Reviewer model. Pin the full id, not an alias.
-                              default: claude -> claude-opus-5, codex -> gpt-5.6-terra
+                              default: claude -> claude-opus-4-8, codex -> gpt-5.6-luna
   --effort <level>            Reasoning effort.
-                              claude: low|medium|high|xhigh|max          (default high)
-                              codex:  low|medium|high|xhigh|max|ultra    (default xhigh)
+                              claude: low|medium|high|xhigh|max          (default medium)
+                              codex:  low|medium|high|xhigh|max|ultra    (default max)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
   --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800.
@@ -621,12 +623,12 @@ mod tests {
     #[test]
     fn defaults_are_pinned_per_reviewer() {
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert_eq!(claude.model, "claude-opus-5");
-        assert_eq!(claude.effort, "high");
+        assert_eq!(claude.model, "claude-opus-4-8");
+        assert_eq!(claude.effort, "medium");
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert_eq!(codex.model, "gpt-5.6-terra");
-        assert_eq!(codex.effort, "xhigh");
+        assert_eq!(codex.model, "gpt-5.6-luna");
+        assert_eq!(codex.effort, "max");
     }
 
     #[test]

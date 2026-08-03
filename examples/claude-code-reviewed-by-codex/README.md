@@ -58,14 +58,14 @@ Add `--bin` with its full path:
 ```json
 "args": [
   "--reviewer", "codex",
-  "--model", "gpt-5.6-terra",
-  "--effort", "xhigh",
+  "--model", "gpt-5.6-luna",
+  "--effort", "max",
   "--bin", "C:\\Users\\you\\AppData\\Roaming\\npm\\codex.cmd"
 ]
 ```
 
 ## Effort levels
 
-Codex accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. `xhigh` is the
-default here. Raising it costs more and takes longer; `ultra` and `max` are worth it
-only for genuinely hard review questions.
+Codex accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. `max` is the
+default here. Lowering it is cheaper and faster; `ultra`, the only level above it, is
+worth the extra cost only for genuinely hard review questions.

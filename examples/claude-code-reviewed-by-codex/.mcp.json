@@ -4,8 +4,8 @@
       "command": "tools\\cross-review.exe",
       "args": [
         "--reviewer", "codex",
-        "--model", "gpt-5.6-terra",
-        "--effort", "xhigh"
+        "--model", "gpt-5.6-luna",
+        "--effort", "max"
       ],
       "timeout": 600000
     }

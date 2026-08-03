@@ -340,8 +340,8 @@ mod tests {
                 TurnFacts {
                     reviewer: "codex",
                     cli_session_id: cli_id,
-                    model: "gpt-5.6-terra",
-                    effort: "xhigh",
+                    model: "gpt-5.6-luna",
+                    effort: "max",
                     cwd: "C:\\repo",
                     cumulative_usage: None,
                 },
@@ -397,8 +397,8 @@ mod tests {
         let facts = |usage| TurnFacts {
             reviewer: "codex",
             cli_session_id: "thread-1",
-            model: "gpt-5.6-terra",
-            effort: "xhigh",
+            model: "gpt-5.6-luna",
+            effort: "max",
             cwd: "C:\\repo",
             cumulative_usage: Some(usage),
         };
