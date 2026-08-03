@@ -16,6 +16,7 @@ mod config;
 mod errors;
 mod git;
 mod mcp;
+mod metrics;
 mod prompt;
 mod registry;
 mod reviewer;
@@ -43,7 +44,11 @@ fn main() {
     }
 
     let doctor = args.iter().any(|a| a == "--doctor");
-    let args: Vec<String> = args.into_iter().filter(|a| a != "--doctor").collect();
+    let usage_report = args.iter().any(|a| a == "--usage");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--doctor" && a != "--usage")
+        .collect();
 
     let cfg = match Config::from_args(&args) {
         Ok(cfg) => cfg,
@@ -53,6 +58,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if usage_report {
+        // Ahead of the state-directory creation below, so this really is read-only: the
+        // README promises `--usage` only reads the local log, and creating a directory
+        // to report on would contradict that -- most visibly when it is pointed at a
+        // path collected from other machines. No CLI is launched and nothing is billed.
+        print!("{}", App::new(cfg).usage_report());
+        return;
+    }
 
     if let Err(e) = std::fs::create_dir_all(&cfg.state_dir) {
         // Not fatal: reviews still work, only resuming across restarts is lost.

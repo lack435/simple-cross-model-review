@@ -43,6 +43,21 @@ pub struct Parsed {
     pub denials: Vec<String>,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
+    /// What the CLI reported about the tokens this turn consumed. Both CLIs report it and
+    /// we used to discard it, which left the cost of a review invisible to the tool that
+    /// caused it. Defaulted rather than optional: a CLI that stops reporting usage should
+    /// degrade to unreported usage in the log -- every `Usage` field stays `None` and
+    /// serialises as absent, never as an asserted zero -- not to a failed review.
+    pub usage: crate::metrics::Usage,
+    /// Whether `usage` counts the whole reviewer conversation rather than this turn.
+    ///
+    /// The two CLIs differ and the difference is invisible in the numbers, which is how
+    /// a thread total came to be recorded as a turn's cost: Claude reports per turn,
+    /// Codex reports the thread's running total on every `turn.completed`. Stated by the
+    /// adapter rather than inferred by the caller, because inferring it is exactly what
+    /// went wrong -- a cumulative figure looks like a plausible per-turn one right up
+    /// until you compare two turns.
+    pub usage_is_cumulative: bool,
 }
 
 pub struct Invocation {

@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::Config;
 use crate::errors::{self, Failure};
+use crate::metrics::Usage;
 
 /// Tools removed outright rather than merely denied, so the model has no write
 /// affordance to attempt in the first place.
@@ -213,7 +214,36 @@ impl Reviewer for ClaudeReviewer {
             session_id,
             denials: collect_denials(&parsed),
             warnings,
+            usage: collect_usage(&parsed),
+            // Claude's result document describes the turn that just ran, not the
+            // conversation. Verified by the fields themselves: `num_turns` is this
+            // invocation's model-call count, and a resumed turn does not inherit the
+            // previous one's totals.
+            usage_is_cumulative: false,
         })
+    }
+}
+
+/// Pull the turn's token accounting out of the result document.
+///
+/// `num_turns` is the field that explains the bill: it is the number of model calls the
+/// reviewer made inside this one review turn, and every one of them re-sent the whole
+/// conversation so far. A turn that reads as "one review" is routinely ten calls over a
+/// context that grows with each of them.
+fn collect_usage(parsed: &Value) -> Usage {
+    let u = parsed.get("usage");
+    // Absent stays absent. A field this CLI stopped reporting must read as unknown in the
+    // log, not as a measured zero -- the log is read by someone asking where their tokens
+    // went, and a confident zero is the worst available answer.
+    let field = |name: &str| -> Option<u64> { u.and_then(|u| u.get(name)).and_then(Value::as_u64) };
+    Usage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_creation_tokens: field("cache_creation_input_tokens"),
+        cache_read_tokens: field("cache_read_input_tokens"),
+        cost_usd: parsed.get("total_cost_usd").and_then(Value::as_f64),
+        api_calls: parsed.get("num_turns").and_then(Value::as_u64),
+        api_duration_ms: parsed.get("duration_api_ms").and_then(Value::as_u64),
     }
 }
 
@@ -342,6 +372,43 @@ mod tests {
             Some("3d759777-4801-4e26-b6c5-4fbdb70adbbf")
         );
         assert!(parsed.denials.is_empty());
+    }
+
+    #[test]
+    fn usage_is_taken_from_the_result_document() {
+        // These fields were parsed and thrown away, which is why a review's cost was
+        // invisible to the tool that caused it.
+        let json = r#"{"is_error":false,"result":"ok","session_id":"s","num_turns":11,
+            "duration_api_ms":412000,"total_cost_usd":3.87,
+            "usage":{"input_tokens":142,"output_tokens":9021,
+                     "cache_creation_input_tokens":648000,"cache_read_input_tokens":5170000}}"#;
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &outcome(json, true), None)
+            .expect("parse");
+
+        assert_eq!(parsed.usage.input_tokens, Some(142));
+        assert_eq!(parsed.usage.output_tokens, Some(9_021));
+        assert_eq!(parsed.usage.cache_creation_tokens, Some(648_000));
+        assert_eq!(parsed.usage.cache_read_tokens, Some(5_170_000));
+        assert_eq!(parsed.usage.cost_usd, Some(3.87));
+        assert_eq!(parsed.usage.api_calls, Some(11));
+        assert_eq!(parsed.usage.api_duration_ms, Some(412_000));
+
+        // The figure that actually explains the bill: `input_tokens` on its own is the
+        // uncached remainder, and reporting only that reads as a nearly free turn.
+        assert_eq!(parsed.usage.billable_input(), 142 + 648_000 + 5_170_000);
+    }
+
+    #[test]
+    fn a_result_with_no_usage_block_is_still_a_valid_review() {
+        // A CLI that changes its reporting must cost us the accounting, not the review.
+        // Escaped rather than raw: the value contains `"##`, which closes an `r#"`.
+        let json = "{\"is_error\":false,\"result\":\"## Verdict\\nAPPROVE\",\"session_id\":\"s\"}";
+        let parsed = ClaudeReviewer
+            .parse(&cfg(), &outcome(json, true), None)
+            .expect("parse");
+        assert_eq!(parsed.text, "## Verdict\nAPPROVE");
+        assert!(parsed.usage.is_empty());
     }
 
     #[test]

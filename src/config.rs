@@ -193,6 +193,15 @@ pub struct Config {
     /// so excluding it is defensible on its own terms; pass the conventions that matter
     /// in `instructions` instead.
     pub isolate_reviewer: bool,
+    /// Append a line to `usage-<machine>.jsonl` in the state directory for every
+    /// finished turn. Named for the machine so several machines' logs can share one
+    /// directory; the reader takes every `usage*.jsonl` it finds there.
+    ///
+    /// On by default. The data is entirely local -- token counts the reviewer CLI already
+    /// reported, plus sizes and timings this server already knows -- and without it the
+    /// cost of a review is invisible to the tool that caused it. `--no-metrics` turns it
+    /// off for anyone who would rather the server wrote one less file.
+    pub metrics: bool,
     /// What the server captures and hands the reviewer as "the change".
     ///
     /// Defaults to `auto`, which supplies a working-tree diff only when the reviewer has
@@ -218,6 +227,7 @@ impl Config {
         let mut preamble_file: Option<PathBuf> = None;
         let mut no_preamble = false;
         let mut isolate_reviewer = true;
+        let mut metrics = true;
         let mut diff = DiffMode::Auto;
 
         let mut i = 0;
@@ -268,6 +278,7 @@ impl Config {
                 // The original name only spoke of MCP; kept working because it is in
                 // published example configs.
                 "--allow-reviewer-config" | "--allow-reviewer-mcp" => isolate_reviewer = false,
+                "--no-metrics" => metrics = false,
                 other => return Err(format!("unknown argument '{other}' (try --help)")),
             }
             i += 1;
@@ -329,6 +340,7 @@ impl Config {
             preamble,
             no_preamble,
             isolate_reviewer,
+            metrics,
             diff,
         })
     }
@@ -577,9 +589,17 @@ OPTIONS:
                               with no tool call and so no permission check. Only pass
                               this for repositories you already trust.
                               (--allow-reviewer-mcp is an accepted older name.)
+  --no-metrics                Stop recording per-turn token usage to
+                              usage-<machine>.jsonl in the state directory. On by
+                              default; the data is local and is what makes "where did
+                              the usage go?" answerable.
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
+  --usage                     Print the recorded per-turn usage summary, then exit.
+                              Reads every usage*.jsonl in the state directory, so
+                              point --state-dir at a copied-together directory to roll
+                              up several machines at once.
   --help, -h                  Show this help.
   --version, -V               Show the version.
 "#;

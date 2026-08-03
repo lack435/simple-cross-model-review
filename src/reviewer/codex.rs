@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::Config;
 use crate::errors::{self, Failure};
+use crate::metrics::Usage;
 
 pub struct CodexReviewer;
 
@@ -182,21 +183,44 @@ impl Reviewer for CodexReviewer {
                     .to_string(),
             );
         }
+        if events.input_inconsistent {
+            warnings.push(
+                "The reviewer's own usage report was inconsistent -- it counted more cached \
+                 input than total input -- so the uncached (fresh) input for this run is left \
+                 unreported rather than shown as a measured zero. The token totals below may \
+                 therefore understate the input."
+                    .to_string(),
+            );
+        }
 
         Ok(Parsed {
             text,
             session_id: events.thread_id,
             denials: Vec::new(),
             warnings,
+            usage: Usage {
+                api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
+                ..events.usage
+            },
+            usage_is_cumulative: true,
         })
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq)]
 struct Events {
     thread_id: Option<String>,
     last_message: Option<String>,
     errors: Vec<String>,
+    usage: Usage,
+    /// How many `turn.completed` events carried usage. Reported as the model-call count
+    /// so the figure means the same thing as Claude's `num_turns`: model calls billed
+    /// inside this one review turn.
+    turns_seen: u64,
+    /// Set when a reading counted more cached input than total input -- a violation of the
+    /// subset relationship Codex documents. Surfaced as a warning so the unreported fresh
+    /// input is explained rather than read as a silent gap.
+    input_inconsistent: bool,
 }
 
 /// Read `codex exec --json` output. The stream is JSONL, but the CLI also emits
@@ -235,6 +259,59 @@ fn parse_events(stdout: &str) -> Events {
                     }
                 }
             }
+            // Last-wins, and these are the *thread's* running totals rather than this
+            // turn's. Verified against `codex exec --json`: two trivial turns on one
+            // thread reported output_tokens 5 then 10, where the second turn's reply was
+            // a single word. The values match `total_token_usage` in Codex's own rollout
+            // log, whose per-turn `last_token_usage` this stream never emits -- so the
+            // per-turn figure has to be a delta, taken by the caller. See
+            // `Parsed::usage_is_cumulative`.
+            //
+            // An earlier version summed these, with a comment arguing that keeping only
+            // the last would under-report the run. The opposite is true: the last value
+            // *is* the run, and adding them multiplies it.
+            "turn.completed" => {
+                if let Some(usage) = value.get("usage") {
+                    let field =
+                        |name: &str| -> Option<u64> { usage.get(name).and_then(Value::as_u64) };
+                    events.turns_seen += 1;
+
+                    // Converted to the convention `Usage` documents, which is Anthropic's:
+                    // `input_tokens` there is the *uncached remainder*, with cache reads
+                    // counted beside it, so the three input figures sum to the prompt.
+                    // Codex follows OpenAI's opposite convention -- `cached_input_tokens`
+                    // is a subset of `input_tokens`, verified as 9,984 of 13,133 on a
+                    // fresh thread -- so passing it through unchanged made
+                    // `billable_input()` count the cached portion twice.
+                    let total_in = field("input_tokens");
+                    let cached = field("cached_input_tokens");
+                    events.usage.cache_read_tokens = cached;
+                    // Both derived last-wins, together, from this event: usage is the
+                    // thread's running total and only the latest one is kept, so the
+                    // inconsistency flag must track the same event -- accumulating it would
+                    // leave a stale warning on a stream whose final reading is valid.
+                    let (fresh, inconsistent) = match (total_in, cached) {
+                        // Codex documents cached as a subset of the input total, so this
+                        // subtraction should never underflow. If it ever does, the fresh
+                        // remainder is *unknowable*, not zero: `checked_sub` leaves it
+                        // unreported rather than asserting a measured `Some(0)` beside
+                        // Claude's real figures -- the same rule the cumulative delta keeps.
+                        (Some(total), Some(cached)) => match total.checked_sub(cached) {
+                            Some(fresh) => (Some(fresh), false),
+                            None => (None, true),
+                        },
+                        (total, None) => (total, false),
+                        (None, _) => (None, false),
+                    };
+                    events.usage.input_tokens = fresh;
+                    events.input_inconsistent = inconsistent;
+                    events.usage.output_tokens = field("output_tokens");
+                    // `cache_creation_tokens` is deliberately never set. Codex reports
+                    // cached input but does not distinguish writes from reads, and this
+                    // figure sits directly beside Claude's measured one -- so it stays
+                    // unreported rather than becoming an asserted zero.
+                }
+            }
             "error" | "turn.failed" | "thread.error" => {
                 let message = value
                     .get("message")
@@ -267,6 +344,110 @@ mod tests {
 {"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"## Verdict\nREQUEST CHANGES"}}
 {"type":"turn.completed","usage":{"input_tokens":14124,"output_tokens":5}}"###;
+
+    #[test]
+    fn usage_is_read_from_the_event_stream() {
+        let events = parse_events(REAL_STREAM);
+        assert_eq!(events.usage.input_tokens, Some(14_124));
+        assert_eq!(events.usage.output_tokens, Some(5));
+        assert_eq!(events.turns_seen, 1);
+    }
+
+    #[test]
+    fn cumulative_usage_is_taken_last_wins_and_converted_to_our_convention() {
+        // Real values, captured from `codex exec --json`: two one-word turns on a single
+        // thread. The second reply was the word "two", yet reports output_tokens 10 --
+        // because these are the *thread's* running totals, not the turn's.
+        //
+        // An earlier version summed them, arguing that keeping only the last would
+        // under-report the run. That is backwards, and it is how a thread total came to
+        // be recorded as one turn's cost.
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":13133,"cached_input_tokens":9984,"output_tokens":5,"reasoning_output_tokens":0}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":26285,"cached_input_tokens":22016,"output_tokens":10,"reasoning_output_tokens":0}}"#,
+        );
+        let events = parse_events(stream);
+
+        // Last wins, not the sum: 26,285 rather than 39,418.
+        assert_eq!(events.usage.output_tokens, Some(10));
+        // And converted out of OpenAI's convention, where `cached_input_tokens` is a
+        // subset of `input_tokens`, into the one `Usage` documents, where the fields are
+        // disjoint and sum to the prompt. Passing it through unchanged made
+        // `billable_input()` count the cached portion twice.
+        assert_eq!(events.usage.cache_read_tokens, Some(22_016));
+        assert_eq!(events.usage.input_tokens, Some(26_285 - 22_016));
+        assert_eq!(
+            events.usage.billable_input(),
+            26_285,
+            "the converted fields must still sum to what Codex reported"
+        );
+        assert_eq!(events.turns_seen, 2);
+        // Codex does not distinguish cache writes from reads, so that field stays
+        // unreported rather than being guessed at -- a zero here would be an assertion,
+        // and it sits directly beside Claude's measured figure.
+        assert_eq!(events.usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn a_cached_count_above_the_total_leaves_fresh_input_unreported() {
+        // Codex documents cached input as a subset of the total, so cached > total should be
+        // impossible. If it ever happens, the fresh remainder is unknowable, not zero: it is
+        // left unreported (and flagged) rather than clamped to a measured-looking Some(0).
+        let stream = r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":5}}"#;
+        let events = parse_events(stream);
+        assert_eq!(events.usage.cache_read_tokens, Some(150));
+        assert_eq!(
+            events.usage.input_tokens, None,
+            "an impossible subset is unknowable, not a measured zero"
+        );
+        assert!(
+            events.input_inconsistent,
+            "the inconsistency is flagged so it can be surfaced as a warning"
+        );
+    }
+
+    #[test]
+    fn a_later_valid_reading_clears_an_earlier_inconsistency() {
+        // Usage is last-wins, so the inconsistency flag must be too: an early bad event
+        // followed by a valid one leaves valid final numbers, and warning about omitted
+        // input then would be stale.
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":5}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":26285,"cached_input_tokens":22016,"output_tokens":10}}"#,
+        );
+        let events = parse_events(stream);
+        assert_eq!(events.usage.input_tokens, Some(26_285 - 22_016));
+        assert!(
+            !events.input_inconsistent,
+            "the final reading is valid, so no stale warning"
+        );
+    }
+
+    #[test]
+    fn a_codex_turn_declares_its_usage_cumulative_and_a_claude_turn_does_not() {
+        // The two CLIs differ and the difference is invisible in the numbers, so the
+        // adapter states it rather than leaving the caller to infer -- inferring it is
+        // what produced eight rounds of inflated figures.
+        let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
+        let parsed = CodexReviewer
+            .parse(&cfg(), &outcome(stream, true), None)
+            .expect("parse");
+        assert!(parsed.usage_is_cumulative);
+    }
+
+    #[test]
+    fn a_stream_with_no_usage_reports_none_rather_than_zero_calls() {
+        // `api_calls: Some(0)` would read as "this turn made no model calls", which is
+        // a claim; `None` is the honest "the CLI did not say".
+        let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
+        let parsed = CodexReviewer
+            .parse(&cfg(), &outcome(stream, true), None)
+            .expect("parse");
+        assert!(parsed.usage.is_empty());
+        assert_eq!(parsed.usage.api_calls, None);
+    }
 
     fn cfg() -> Config {
         Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config")

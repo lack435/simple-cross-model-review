@@ -11,6 +11,7 @@ use crate::cancel::RequestCancel;
 use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
 use crate::git;
+use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{
     IdState, Outcome, Phase, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
@@ -52,6 +53,7 @@ pub struct App {
     reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
+    metrics: Arc<MetricsLog>,
     /// Successful preflights are cached for the process lifetime; failures are not, so
     /// a user who runs `codex login` can retry without restarting the agent session.
     preflight: Mutex<Option<Preflight>>,
@@ -60,14 +62,22 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
+        let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
         let reviewer = reviewer::for_kind(cfg.reviewer);
         Self {
             cfg: Arc::new(cfg),
             reviewer: Arc::from(reviewer),
             registry: Arc::new(Registry::new()),
             sessions: Arc::new(sessions),
+            metrics: Arc::new(metrics),
             preflight: Mutex::new(None),
         }
+    }
+
+    /// The recorded usage history, for the `--usage` report.
+    pub fn usage_report(&self) -> String {
+        let (summary, report) = self.metrics.summarise();
+        metrics::render_summary(&summary, self.metrics.dir(), &report)
     }
 
     pub fn cfg(&self) -> &Config {
@@ -179,12 +189,18 @@ impl App {
             reviewer: Arc::clone(&self.reviewer),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
+            metrics: Arc::clone(&self.metrics),
             bin: ready.bin,
             id: id.clone(),
             session: session.clone(),
             instructions,
             context_paths,
             turn,
+            // Read here, while the lease is held and before this turn overwrites it, so
+            // the recorded gap is the interval the reviewer's prompt cache actually saw.
+            // Taking it after the review would measure zero.
+            gap_secs: metrics::gap_since(prior.as_ref().map(|record| record.updated_unix)),
+            prior_cumulative: prior.as_ref().and_then(|record| record.cumulative_usage),
             cancel,
             _lease: Some(lease),
         };
@@ -403,6 +419,14 @@ impl App {
             snapshot.elapsed.as_secs(),
         ));
 
+        // Stated on every completed review rather than kept in the log alone. A review
+        // turn is many model calls over a conversation that grows with each turn, and an
+        // agent that cannot see what a turn cost has no way to notice that its tenth
+        // follow-up costs several times what its first did.
+        if !snapshot.usage.is_empty() {
+            out.push_str(&format!("usage:     {}\n\n", snapshot.usage.summary()));
+        }
+
         for warning in &snapshot.warnings {
             out.push_str(&format!("WARNING: {warning}\n\n"));
         }
@@ -494,6 +518,18 @@ impl App {
             self.sessions.path().display()
         ));
 
+        if self.metrics.enabled() {
+            let (summary, report) = self.metrics.summarise();
+            out.push('\n');
+            out.push_str(&metrics::render_summary(
+                &summary,
+                self.metrics.dir(),
+                &report,
+            ));
+        } else {
+            out.push_str("usage log:     off (--no-metrics)\n");
+        }
+
         let sessions = self.sessions.list();
         out.push_str("\nsaved review sessions:\n");
         if sessions.is_empty() {
@@ -563,16 +599,71 @@ struct Job {
     reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
+    metrics: Arc<MetricsLog>,
     bin: PathBuf,
     id: String,
     session: String,
     instructions: String,
     context_paths: Vec<String>,
     turn: u32,
+    /// How long this session sat idle before this turn, when it had a previous one.
+    gap_secs: Option<u64>,
+    /// The cumulative usage this session's reviewer last reported, for adapters that
+    /// report cumulatively. Subtracting it is the only way to recover a per-turn figure
+    /// from Codex, whose event stream carries the thread total and nothing else.
+    prior_cumulative: Option<crate::metrics::Usage>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
     _lease: Option<ExclusiveLock>,
+}
+
+/// What the attempt that produced the outcome actually did.
+///
+/// Separate from the `Job`'s own fields because the two can disagree: the expired-session
+/// retry runs turn 1 of a brand new conversation regardless of which turn the caller
+/// asked for. Recording the caller's numbers there would file a fresh turn as a resumed
+/// one, carrying a cache gap it never had -- and that comparison is the reason the usage
+/// log exists at all.
+#[derive(Clone, Copy)]
+struct AttemptFacts {
+    turn: u32,
+    resumed: bool,
+    gap_secs: Option<u64>,
+    prompt_bytes: usize,
+    /// An earlier attempt was billed and thrown away. Its usage is not recoverable -- the
+    /// CLI reports usage on the run we abandoned -- so the figures alongside this are an
+    /// undercount, and say so.
+    retried: bool,
+}
+
+impl AttemptFacts {
+    /// What the caller's turn looks like before anything goes wrong.
+    fn first(turn: u32, resumed: bool, gap_secs: Option<u64>) -> Self {
+        Self {
+            turn,
+            resumed,
+            gap_secs,
+            prompt_bytes: 0,
+            retried: false,
+        }
+    }
+
+    /// What the expired-session retry looks like.
+    ///
+    /// Turn 1 of a conversation that did not exist a moment ago: not resumed, and with no
+    /// gap, because there is no earlier turn whose cache it could have reused. A pure
+    /// function so the branch is testable without a live reviewer CLI -- it is otherwise
+    /// reachable only by making a real CLI fail in a specific way.
+    fn after_expired_session() -> Self {
+        Self {
+            turn: 1,
+            resumed: false,
+            gap_secs: None,
+            prompt_bytes: 0,
+            retried: true,
+        }
+    }
 }
 
 /// Records a failure if the worker thread unwinds before finishing.
@@ -597,6 +688,7 @@ impl Drop for FinishGuard<'_> {
 
 impl Job {
     fn run(self, resume_id: Option<String>) {
+        let started = std::time::Instant::now();
         let mut guard = FinishGuard {
             registry: &self.registry,
             id: &self.id,
@@ -617,11 +709,19 @@ impl Job {
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
+        // What the surviving attempt actually did, as opposed to what the caller asked
+        // for. The retry below starts a brand new reviewer conversation, and filing that
+        // under the old turn number would record a fresh turn as a resumed one -- exactly
+        // the distinction the usage log exists to draw.
+        let mut facts = AttemptFacts::first(self.turn, resume_id.is_some(), self.gap_secs);
+
         let outcome = match self.attempt(
             resume_id.as_deref(),
             self.turn,
+            self.prior_cumulative,
             change.as_deref(),
             &capture_warnings,
+            &mut facts.prompt_bytes,
         ) {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -635,8 +735,24 @@ impl Job {
                          reviewer session",
                         self.session
                     );
+                    // The retry is a different conversation, so the record describes that
+                    // one: turn 1, not resumed, and no cache gap, because there is no
+                    // prior turn its cache could have been warm from. `retried` is what
+                    // says a discarded attempt was also billed.
+                    facts = AttemptFacts::after_expired_session();
                     self.registry.set_phase(&self.id, Phase::Launching);
-                    match self.attempt(None, 1, change.as_deref(), &capture_warnings) {
+                    // No baseline: the retry is a brand new reviewer thread, so subtracting
+                    // the expired thread's running total from it would record this turn as a
+                    // cross-thread delta -- near zero when the fresh total is smaller, junk
+                    // when it is larger.
+                    match self.attempt(
+                        None,
+                        1,
+                        None,
+                        change.as_deref(),
+                        &capture_warnings,
+                        &mut facts.prompt_bytes,
+                    ) {
                         Ok(mut outcome) => {
                             if let Some(review) = outcome.review.take() {
                                 outcome.review = Some(format!(
@@ -653,18 +769,105 @@ impl Job {
                 }
             }
         };
+        // Everything telemetry needs, taken before the outcome moves into the registry.
+        let usage = outcome.usage;
+        let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
+
+        // Deliver the review first, and disarm before any accounting runs. Recording used
+        // to happen here, while the guard was still armed: `eprintln!` panics if stderr
+        // has closed, which would have replaced a completed, fully-parsed review with
+        // WORKER_PANICKED and lost it outright. Telemetry must never be able to cost the
+        // caller the review it is describing -- and it need not hold up the response for
+        // a lock, either.
         self.registry.finish(&self.id, outcome);
-        // Disarmed only once a terminal state is recorded, so the guard covers every
-        // path that could unwind before this point.
         guard.armed = false;
+
+        self.record_usage(usage, failure_code, capture.change.as_ref(), started, facts);
+    }
+
+    /// Append this turn to the usage log, and say the same thing on stderr.
+    ///
+    /// Both, because they answer different questions. The log is what you aggregate
+    /// across sessions and machines after the fact; the stderr line is what a user
+    /// watching a review happen can see without going and finding the file.
+    ///
+    /// Best effort by construction: it runs after the review has been handed over, so
+    /// nothing it does can affect the result.
+    fn record_usage(
+        &self,
+        usage: crate::metrics::Usage,
+        failure_code: Option<String>,
+        change: Option<&git::Change>,
+        started: std::time::Instant,
+        facts: AttemptFacts,
+    ) {
+        let status = if failure_code.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+
+        // The rendered diff is what actually went into the prompt, so that is what is
+        // measured -- not the raw `git diff` output, which is a different size.
+        let diff_bytes = change.map(|c| c.diff.text.len()).unwrap_or(0);
+        let diff_truncated = change.map(|c| c.diff.truncated).unwrap_or(false);
+
+        eprintln!(
+            "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}{}",
+            self.cfg.reviewer.as_str(),
+            facts.turn,
+            self.session,
+            status,
+            started.elapsed().as_secs(),
+            match facts.gap_secs {
+                Some(gap) => format!(
+                    " after a {} idle gap",
+                    fmt_elapsed(Duration::from_secs(gap))
+                ),
+                None => String::new(),
+            },
+            if usage.is_empty() {
+                "no usage reported by the CLI".to_string()
+            } else {
+                usage.summary()
+            },
+            if facts.retried {
+                " (an earlier attempt was billed and discarded: the reviewer session had expired)"
+            } else {
+                ""
+            },
+        );
+
+        self.metrics.record(&metrics::Record {
+            v: metrics::RECORD_VERSION,
+            ts_unix: now_unix(),
+            review_id: self.id.clone(),
+            session: self.session.clone(),
+            turn: facts.turn,
+            resumed: facts.resumed,
+            gap_secs: facts.gap_secs,
+            reviewer: self.cfg.reviewer.as_str().to_string(),
+            model: self.cfg.model.clone(),
+            effort: self.cfg.effort.clone(),
+            prompt_bytes: facts.prompt_bytes,
+            diff_bytes,
+            diff_truncated,
+            usage,
+            wall_secs: started.elapsed().as_secs(),
+            retried: facts.retried,
+            status: status.to_string(),
+            failure_code,
+        });
     }
 
     fn attempt(
         &self,
         resume_id: Option<&str>,
         turn: u32,
+        baseline: Option<crate::metrics::Usage>,
         change: Option<&str>,
         capture_warnings: &[String],
+        prompt_bytes: &mut usize,
     ) -> Result<Outcome, Failure> {
         let preamble = if self.cfg.no_preamble {
             None
@@ -695,6 +898,9 @@ impl Job {
             capabilities,
             change,
         });
+        // Reported back through the out-parameter so it survives the error paths below:
+        // a failed turn still sent a prompt, and its size is part of explaining the cost.
+        *prompt_bytes = text.len();
 
         let invocation = self
             .reviewer
@@ -746,6 +952,41 @@ impl Job {
 
         let mut parsed = result?;
 
+        // A cumulative reporter gives the thread's running total, so this turn's cost is
+        // the difference from the last one. Without this the first turn looks right and
+        // every later one is inflated by everything before it -- which is exactly what
+        // happened, and it is invisible in a single figure.
+        //
+        // The baseline is passed in, not read from the job, so the expired-session retry --
+        // a brand new thread -- gets `None` and never differences against a dead thread.
+        // `baseline_to_persist` is what the next turn will subtract against: when a baseline
+        // already exists it is always carried forward (an empty reading keeps the old one
+        // rather than erasing it), and only in the no-baseline case is one persisted solely
+        // when this reading actually carried a running total. The whole reconciliation is a
+        // pure function so its every branch can be tested without a live reviewer -- see
+        // `metrics::reconcile_cumulative`.
+        let mut usage_warning: Option<String> = None;
+        let baseline_to_persist = if let Some(total) =
+            parsed.usage_is_cumulative.then_some(parsed.usage)
+        {
+            let reconciled = metrics::reconcile_cumulative(total, baseline, resume_id.is_some());
+            parsed.usage = reconciled.per_turn;
+            if reconciled.unknown {
+                usage_warning = Some(
+                    "Per-turn usage is unknown for this turn: this session predates usage \
+                     tracking, so its running total cannot be split into a per-turn cost. \
+                     Recording resumes once a later turn reports a running total to measure \
+                     against."
+                        .to_string(),
+                );
+            }
+            reconciled.baseline
+        } else {
+            // Not a cumulative reporter (Claude reports per turn): nothing to difference and
+            // no baseline to keep.
+            None
+        };
+
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
         // Resumability is tracked rather than assumed: the completed response invites a
@@ -760,15 +1001,33 @@ impl Job {
         // produced a usable review reports that rather than looking untroubled. Second
         // because it is about how the review was collected, not about what was reviewed.
         warnings.extend(std::mem::take(&mut parsed.warnings));
-        let resumable = match &parsed.session_id {
+        if let Some(w) = usage_warning {
+            warnings.push(w);
+        }
+        // A resumed turn that did not echo its id is still the same thread, so record it
+        // under the id we resumed with. Skipping the record -- as this used to -- kept the
+        // mapping but never advanced the baseline, so the next turn subtracted against a
+        // stale total and double-counted this one.
+        let record_under = parsed.session_id.as_deref().or(resume_id);
+        let resumable = match record_under {
             Some(session_id) => {
+                if parsed.session_id.is_none() {
+                    eprintln!(
+                        "cross-review: warning: the reviewer reported no session id on a resumed \
+                         turn; recording under the resumed id for session '{}'",
+                        self.session
+                    );
+                }
                 match self.sessions.record_turn(
                     &self.session,
-                    self.cfg.reviewer.as_str(),
-                    session_id,
-                    &self.cfg.model,
-                    &self.cfg.effort,
-                    &self.cfg.cwd.to_string_lossy(),
+                    session::TurnFacts {
+                        reviewer: self.cfg.reviewer.as_str(),
+                        cli_session_id: session_id,
+                        model: &self.cfg.model,
+                        effort: &self.cfg.effort,
+                        cwd: &self.cfg.cwd.to_string_lossy(),
+                        cumulative_usage: baseline_to_persist,
+                    },
                 ) {
                     Ok(_) => true,
                     Err(e) => {
@@ -783,17 +1042,6 @@ impl Job {
                         false
                     }
                 }
-            }
-            // On a resumed turn the stored mapping is still valid even if this turn did
-            // not report an id, so the session remains resumable. Only a *new* review
-            // with no id leaves nothing to resume.
-            None if resume_id.is_some() => {
-                eprintln!(
-                    "cross-review: warning: the reviewer reported no session id on a resumed \
-                     turn; keeping the existing mapping for session '{}'",
-                    self.session
-                );
-                true
             }
             None => {
                 eprintln!(
@@ -817,6 +1065,7 @@ impl Job {
             denials: parsed.denials,
             warnings,
             resumable,
+            usage: parsed.usage,
         })
     }
 }
@@ -936,6 +1185,33 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_retry_after_an_expired_session_is_recorded_as_the_fresh_turn_it_is() {
+        // The retry runs turn 1 of a conversation that did not exist a moment ago. An
+        // earlier version kept the caller's turn number, `resumed: true`, and the old
+        // session's gap, filing a fresh turn as a resumed one -- corrupting exactly the
+        // comparison the usage log exists to support. Extracted into a pure function so
+        // the branch is reachable in a test: otherwise it needs a live CLI failing in one
+        // specific way.
+        let first = AttemptFacts::first(7, true, Some(900));
+        assert_eq!(first.turn, 7);
+        assert!(first.resumed);
+        assert_eq!(first.gap_secs, Some(900));
+        assert!(!first.retried);
+
+        let retry = AttemptFacts::after_expired_session();
+        assert_eq!(retry.turn, 1, "the retry is turn 1 of a new conversation");
+        assert!(!retry.resumed);
+        assert_eq!(
+            retry.gap_secs, None,
+            "there is no earlier turn whose cache this one could have reused"
+        );
+        assert!(
+            retry.retried,
+            "the discarded attempt was billed and the figures undercount it"
+        );
+    }
 
     #[test]
     fn string_arg_treats_blank_as_absent() {
