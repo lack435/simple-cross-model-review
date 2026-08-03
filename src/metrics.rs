@@ -1263,6 +1263,46 @@ mod tests {
     }
 
     #[test]
+    fn a_wholly_unreported_input_reads_not_reported_not_at_least_zero() {
+        // When not one input component was reported, `billable_input` sums to 0 for want of
+        // anything to add. Rendering that as "at least 0" would assert a floor that was
+        // never measured; it must read "not reported" in all three places the figure
+        // appears -- the per-turn summary, the rollup total, and the per-session row.
+        let no_input = Usage {
+            output_tokens: Some(5_000),
+            ..Usage::default()
+        };
+        assert!(no_input.input_unreported());
+
+        // Per turn.
+        let per_turn = no_input.summary();
+        assert!(
+            per_turn.starts_with("not reported in"),
+            "per-turn: {per_turn}"
+        );
+        assert!(!per_turn.contains("at least 0"), "per-turn: {per_turn}");
+
+        // Rollup total and per-session row.
+        let summary = summarise(&[record("only-output", 1, None, no_input)]);
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        let totals = text
+            .lines()
+            .find(|l| l.starts_with("input tokens:"))
+            .expect("a totals line");
+        assert!(totals.contains("not reported total"), "totals: {totals}");
+        assert!(!totals.contains("at least 0"), "totals: {totals}");
+        let session = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("only-output:"))
+            .expect("a per-session row");
+        assert!(
+            session.contains("not reported in"),
+            "per-session: {session}"
+        );
+        assert!(!session.contains("at least 0"), "per-session: {session}");
+    }
+
+    #[test]
     fn the_test_reader_classifies_exactly_as_production_does() {
         // It diverged twice: once on NotFound, once on malformed lines. A helper that
         // classifies differently lets a test assert behaviour the real reader lacks.

@@ -286,22 +286,25 @@ fn parse_events(stdout: &str) -> Events {
                     let total_in = field("input_tokens");
                     let cached = field("cached_input_tokens");
                     events.usage.cache_read_tokens = cached;
-                    events.usage.input_tokens = match (total_in, cached) {
+                    // Both derived last-wins, together, from this event: usage is the
+                    // thread's running total and only the latest one is kept, so the
+                    // inconsistency flag must track the same event -- accumulating it would
+                    // leave a stale warning on a stream whose final reading is valid.
+                    let (fresh, inconsistent) = match (total_in, cached) {
                         // Codex documents cached as a subset of the input total, so this
                         // subtraction should never underflow. If it ever does, the fresh
                         // remainder is *unknowable*, not zero: `checked_sub` leaves it
                         // unreported rather than asserting a measured `Some(0)` beside
                         // Claude's real figures -- the same rule the cumulative delta keeps.
                         (Some(total), Some(cached)) => match total.checked_sub(cached) {
-                            Some(fresh) => Some(fresh),
-                            None => {
-                                events.input_inconsistent = true;
-                                None
-                            }
+                            Some(fresh) => (Some(fresh), false),
+                            None => (None, true),
                         },
-                        (total, None) => total,
-                        (None, _) => None,
+                        (total, None) => (total, false),
+                        (None, _) => (None, false),
                     };
+                    events.usage.input_tokens = fresh;
+                    events.input_inconsistent = inconsistent;
                     events.usage.output_tokens = field("output_tokens");
                     // `cache_creation_tokens` is deliberately never set. Codex reports
                     // cached input but does not distinguish writes from reads, and this
@@ -401,6 +404,24 @@ mod tests {
         assert!(
             events.input_inconsistent,
             "the inconsistency is flagged so it can be surfaced as a warning"
+        );
+    }
+
+    #[test]
+    fn a_later_valid_reading_clears_an_earlier_inconsistency() {
+        // Usage is last-wins, so the inconsistency flag must be too: an early bad event
+        // followed by a valid one leaves valid final numbers, and warning about omitted
+        // input then would be stale.
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":150,"output_tokens":5}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":26285,"cached_input_tokens":22016,"output_tokens":10}}"#,
+        );
+        let events = parse_events(stream);
+        assert_eq!(events.usage.input_tokens, Some(26_285 - 22_016));
+        assert!(
+            !events.input_inconsistent,
+            "the final reading is valid, so no stale warning"
         );
     }
 
