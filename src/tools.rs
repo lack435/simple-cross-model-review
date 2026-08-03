@@ -1,7 +1,7 @@
 //! The four tools, and the state they share.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,9 +76,9 @@ impl App {
 
     /// The recorded usage history, for the `--usage` report.
     pub fn usage_report(&self) -> String {
-        let records = self.metrics.read();
+        let (records, problems) = self.metrics.read();
         let summary = metrics::summarise(&records);
-        metrics::render_summary(&summary, self.metrics.path())
+        metrics::render_summary(&summary, self.metrics.dir(), &problems)
     }
 
     pub fn cfg(&self) -> &Config {
@@ -201,7 +201,6 @@ impl App {
             // the recorded gap is the interval the reviewer's prompt cache actually saw.
             // Taking it after the review would measure zero.
             gap_secs: metrics::gap_since(prior.as_ref().map(|record| record.updated_unix)),
-            prompt_bytes: AtomicUsize::new(0),
             cancel,
             _lease: Some(lease),
         };
@@ -519,12 +518,13 @@ impl App {
             self.sessions.path().display()
         ));
 
-        let records = self.metrics.read();
         if self.metrics.enabled() {
+            let (records, problems) = self.metrics.read();
             out.push('\n');
             out.push_str(&metrics::render_summary(
                 &metrics::summarise(&records),
-                self.metrics.path(),
+                self.metrics.dir(),
+                &problems,
             ));
         } else {
             out.push_str("usage log:     off (--no-metrics)\n");
@@ -608,14 +608,29 @@ struct Job {
     turn: u32,
     /// How long this session sat idle before this turn, when it had a previous one.
     gap_secs: Option<u64>,
-    /// Size of the prompt `attempt` last built, for the usage log. An atomic because
-    /// `attempt` takes `&self` and can run twice; the retry's prompt is the one that
-    /// was actually reviewed.
-    prompt_bytes: AtomicUsize,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
     _lease: Option<ExclusiveLock>,
+}
+
+/// What the attempt that produced the outcome actually did.
+///
+/// Separate from the `Job`'s own fields because the two can disagree: the expired-session
+/// retry runs turn 1 of a brand new conversation regardless of which turn the caller
+/// asked for. Recording the caller's numbers there would file a fresh turn as a resumed
+/// one, carrying a cache gap it never had -- and that comparison is the reason the usage
+/// log exists at all.
+#[derive(Clone, Copy)]
+struct AttemptFacts {
+    turn: u32,
+    resumed: bool,
+    gap_secs: Option<u64>,
+    prompt_bytes: usize,
+    /// An earlier attempt was billed and thrown away. Its usage is not recoverable -- the
+    /// CLI reports usage on the run we abandoned -- so the figures alongside this are an
+    /// undercount, and say so.
+    retried: bool,
 }
 
 /// Records a failure if the worker thread unwinds before finishing.
@@ -661,12 +676,24 @@ impl Job {
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
-        let mut retried = false;
+        // What the surviving attempt actually did, as opposed to what the caller asked
+        // for. The retry below starts a brand new reviewer conversation, and filing that
+        // under the old turn number would record a fresh turn as a resumed one -- exactly
+        // the distinction the usage log exists to draw.
+        let mut facts = AttemptFacts {
+            turn: self.turn,
+            resumed: resume_id.is_some(),
+            gap_secs: self.gap_secs,
+            prompt_bytes: 0,
+            retried: false,
+        };
+
         let outcome = match self.attempt(
             resume_id.as_deref(),
             self.turn,
             change.as_deref(),
             &capture_warnings,
+            &mut facts.prompt_bytes,
         ) {
             Ok(outcome) => outcome,
             Err(failure) => {
@@ -680,11 +707,25 @@ impl Job {
                          reviewer session",
                         self.session
                     );
-                    // Recorded because it doubles the turn: the dead-session attempt was
-                    // billed too, and only the second attempt's usage is reported back.
-                    retried = true;
+                    // The retry is a different conversation, so the record describes that
+                    // one: turn 1, not resumed, and no cache gap, because there is no
+                    // prior turn its cache could have been warm from. `retried` is what
+                    // says a discarded attempt was also billed.
+                    facts = AttemptFacts {
+                        turn: 1,
+                        resumed: false,
+                        gap_secs: None,
+                        prompt_bytes: 0,
+                        retried: true,
+                    };
                     self.registry.set_phase(&self.id, Phase::Launching);
-                    match self.attempt(None, 1, change.as_deref(), &capture_warnings) {
+                    match self.attempt(
+                        None,
+                        1,
+                        change.as_deref(),
+                        &capture_warnings,
+                        &mut facts.prompt_bytes,
+                    ) {
                         Ok(mut outcome) => {
                             if let Some(review) = outcome.review.take() {
                                 outcome.review = Some(format!(
@@ -701,11 +742,20 @@ impl Job {
                 }
             }
         };
-        self.record_usage(&outcome, capture.change.as_ref(), started, retried);
+        // Everything telemetry needs, taken before the outcome moves into the registry.
+        let usage = outcome.usage;
+        let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
+
+        // Deliver the review first, and disarm before any accounting runs. Recording used
+        // to happen here, while the guard was still armed: `eprintln!` panics if stderr
+        // has closed, which would have replaced a completed, fully-parsed review with
+        // WORKER_PANICKED and lost it outright. Telemetry must never be able to cost the
+        // caller the review it is describing -- and it need not hold up the response for
+        // a lock, either.
         self.registry.finish(&self.id, outcome);
-        // Disarmed only once a terminal state is recorded, so the guard covers every
-        // path that could unwind before this point.
         guard.armed = false;
+
+        self.record_usage(usage, failure_code, capture.change.as_ref(), started, facts);
     }
 
     /// Append this turn to the usage log, and say the same thing on stderr.
@@ -713,15 +763,17 @@ impl Job {
     /// Both, because they answer different questions. The log is what you aggregate
     /// across sessions and machines after the fact; the stderr line is what a user
     /// watching a review happen can see without going and finding the file.
+    ///
+    /// Best effort by construction: it runs after the review has been handed over, so
+    /// nothing it does can affect the result.
     fn record_usage(
         &self,
-        outcome: &Outcome,
+        usage: crate::metrics::Usage,
+        failure_code: Option<String>,
         change: Option<&git::Change>,
         started: std::time::Instant,
-        retried: bool,
+        facts: AttemptFacts,
     ) {
-        let usage = outcome.usage;
-        let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
         let status = if failure_code.is_some() {
             "failed"
         } else {
@@ -736,11 +788,11 @@ impl Job {
         eprintln!(
             "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}{}",
             self.cfg.reviewer.as_str(),
-            self.turn,
+            facts.turn,
             self.session,
             status,
             started.elapsed().as_secs(),
-            match self.gap_secs {
+            match facts.gap_secs {
                 Some(gap) => format!(
                     " after a {} idle gap",
                     fmt_elapsed(Duration::from_secs(gap))
@@ -752,8 +804,8 @@ impl Job {
             } else {
                 usage.summary()
             },
-            if retried {
-                " (ran twice: the earlier reviewer session had expired)"
+            if facts.retried {
+                " (an earlier attempt was billed and discarded: the reviewer session had expired)"
             } else {
                 ""
             },
@@ -763,29 +815,21 @@ impl Job {
             ts_unix: now_unix(),
             review_id: self.id.clone(),
             session: self.session.clone(),
-            turn: self.turn,
-            resumed: self.turn > 1,
-            gap_secs: self.gap_secs,
+            turn: facts.turn,
+            resumed: facts.resumed,
+            gap_secs: facts.gap_secs,
             reviewer: self.cfg.reviewer.as_str().to_string(),
             model: self.cfg.model.clone(),
             effort: self.cfg.effort.clone(),
-            prompt_bytes: self.last_prompt_bytes(),
+            prompt_bytes: facts.prompt_bytes,
             diff_bytes,
             diff_truncated,
             usage,
             wall_secs: started.elapsed().as_secs(),
-            retried,
+            retried: facts.retried,
             status: status.to_string(),
             failure_code,
         });
-    }
-
-    /// Size of the prompt this turn sent, recorded by `attempt`.
-    ///
-    /// Read back from the job rather than threaded through the return value because the
-    /// retry path produces two prompts and the one that mattered is the last one built.
-    fn last_prompt_bytes(&self) -> usize {
-        self.prompt_bytes.load(Ordering::Relaxed)
     }
 
     fn attempt(
@@ -794,6 +838,7 @@ impl Job {
         turn: u32,
         change: Option<&str>,
         capture_warnings: &[String],
+        prompt_bytes: &mut usize,
     ) -> Result<Outcome, Failure> {
         let preamble = if self.cfg.no_preamble {
             None
@@ -824,7 +869,9 @@ impl Job {
             capabilities,
             change,
         });
-        self.prompt_bytes.store(text.len(), Ordering::Relaxed);
+        // Reported back through the out-parameter so it survives the error paths below:
+        // a failed turn still sent a prompt, and its size is part of explaining the cost.
+        *prompt_bytes = text.len();
 
         let invocation = self
             .reviewer

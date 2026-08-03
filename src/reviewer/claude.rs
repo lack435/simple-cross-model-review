@@ -227,11 +227,10 @@ impl Reviewer for ClaudeReviewer {
 /// context that grows with each of them.
 fn collect_usage(parsed: &Value) -> Usage {
     let u = parsed.get("usage");
-    let field = |name: &str| -> u64 {
-        u.and_then(|u| u.get(name))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
+    // Absent stays absent. A field this CLI stopped reporting must read as unknown in the
+    // log, not as a measured zero -- the log is read by someone asking where their tokens
+    // went, and a confident zero is the worst available answer.
+    let field = |name: &str| -> Option<u64> { u.and_then(|u| u.get(name)).and_then(Value::as_u64) };
     Usage {
         input_tokens: field("input_tokens"),
         output_tokens: field("output_tokens"),
@@ -382,10 +381,10 @@ mod tests {
             .parse(&cfg(), &outcome(json, true), None)
             .expect("parse");
 
-        assert_eq!(parsed.usage.input_tokens, 142);
-        assert_eq!(parsed.usage.output_tokens, 9_021);
-        assert_eq!(parsed.usage.cache_creation_tokens, 648_000);
-        assert_eq!(parsed.usage.cache_read_tokens, 5_170_000);
+        assert_eq!(parsed.usage.input_tokens, Some(142));
+        assert_eq!(parsed.usage.output_tokens, Some(9_021));
+        assert_eq!(parsed.usage.cache_creation_tokens, Some(648_000));
+        assert_eq!(parsed.usage.cache_read_tokens, Some(5_170_000));
         assert_eq!(parsed.usage.cost_usd, Some(3.87));
         assert_eq!(parsed.usage.api_calls, Some(11));
         assert_eq!(parsed.usage.api_duration_ms, Some(412_000));

@@ -59,6 +59,15 @@ fn main() {
         }
     };
 
+    if usage_report {
+        // Ahead of the state-directory creation below, so this really is read-only: the
+        // README promises `--usage` only reads the local log, and creating a directory
+        // to report on would contradict that -- most visibly when it is pointed at a
+        // path collected from other machines. No CLI is launched and nothing is billed.
+        print!("{}", App::new(cfg).usage_report());
+        return;
+    }
+
     if let Err(e) = std::fs::create_dir_all(&cfg.state_dir) {
         // Not fatal: reviews still work, only resuming across restarts is lost.
         eprintln!(
@@ -68,13 +77,6 @@ fn main() {
     }
 
     let app = Arc::new(App::new(cfg));
-
-    if usage_report {
-        // Reads only the local log -- no CLI is launched and nothing is billed, so this
-        // is safe to run against a state directory collected from several machines.
-        print!("{}", app.usage_report());
-        return;
-    }
 
     if doctor {
         // Human-facing preflight, so a misconfiguration can be found without

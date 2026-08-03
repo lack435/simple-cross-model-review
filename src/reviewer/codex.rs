@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::Config;
 use crate::errors::{self, Failure};
-use crate::metrics::Usage;
+use crate::metrics::{add, Usage};
 
 pub struct CodexReviewer;
 
@@ -250,17 +250,19 @@ fn parse_events(stdout: &str) -> Events {
             // was really billed, and keeping only the last would under-report the run.
             "turn.completed" => {
                 if let Some(usage) = value.get("usage") {
-                    let field = |name: &str| -> u64 {
-                        usage.get(name).and_then(Value::as_u64).unwrap_or(0)
-                    };
+                    let field =
+                        |name: &str| -> Option<u64> { usage.get(name).and_then(Value::as_u64) };
                     events.turns_seen += 1;
-                    // Codex reports cached input but does not distinguish cache writes
-                    // from reads, so only the read side is populated here. Left at zero
-                    // rather than guessed: an invented cache-write figure would be
-                    // compared against Claude's real one.
-                    events.usage.input_tokens += field("input_tokens");
-                    events.usage.output_tokens += field("output_tokens");
-                    events.usage.cache_read_tokens += field("cached_input_tokens");
+                    events.usage.input_tokens =
+                        add(events.usage.input_tokens, field("input_tokens"));
+                    events.usage.output_tokens =
+                        add(events.usage.output_tokens, field("output_tokens"));
+                    events.usage.cache_read_tokens =
+                        add(events.usage.cache_read_tokens, field("cached_input_tokens"));
+                    // `cache_creation_tokens` is deliberately never set. Codex reports
+                    // cached input but does not distinguish writes from reads, and this
+                    // figure sits directly beside Claude's measured one -- so it stays
+                    // unreported rather than becoming an asserted zero.
                 }
             }
             "error" | "turn.failed" | "thread.error" => {
@@ -299,8 +301,8 @@ mod tests {
     #[test]
     fn usage_is_read_from_the_event_stream() {
         let events = parse_events(REAL_STREAM);
-        assert_eq!(events.usage.input_tokens, 14_124);
-        assert_eq!(events.usage.output_tokens, 5);
+        assert_eq!(events.usage.input_tokens, Some(14_124));
+        assert_eq!(events.usage.output_tokens, Some(5));
         assert_eq!(events.turns_seen, 1);
     }
 
@@ -314,13 +316,14 @@ mod tests {
             r#"{"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":1800}}"#,
         );
         let events = parse_events(stream);
-        assert_eq!(events.usage.input_tokens, 300);
-        assert_eq!(events.usage.output_tokens, 30);
-        assert_eq!(events.usage.cache_read_tokens, 2_700);
+        assert_eq!(events.usage.input_tokens, Some(300));
+        assert_eq!(events.usage.output_tokens, Some(30));
+        assert_eq!(events.usage.cache_read_tokens, Some(2_700));
         assert_eq!(events.turns_seen, 2);
-        // Codex does not distinguish cache writes from reads, so that field stays zero
-        // rather than being guessed at -- it sits beside Claude's real figure.
-        assert_eq!(events.usage.cache_creation_tokens, 0);
+        // Codex does not distinguish cache writes from reads, so that field stays
+        // unreported rather than being guessed at -- a zero here would be an assertion,
+        // and it sits directly beside Claude's measured figure.
+        assert_eq!(events.usage.cache_creation_tokens, None);
     }
 
     #[test]

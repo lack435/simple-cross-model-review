@@ -308,11 +308,20 @@ Three columns earn their place:
   key or cloud provider — because the server cannot see which is in force.
 - **Model calls per turn.** The multiplier between "one review" and what it actually cost.
 
-The state directory is per project, so rolling several machines up together is a matter of
-copying their `usage.jsonl` files into one directory and pointing `--state-dir` at it.
-Nothing is uploaded and no CLI is launched: `--usage` only reads the local log.
+Each machine writes `usage-<machine>.jsonl`, and the reader takes every `usage*.jsonl` in
+the state directory. Rolling several machines up together is therefore a matter of copying
+their logs into one directory and pointing `--state-dir` at it — the names do not collide,
+so nothing is overwritten. Nothing is uploaded and no CLI is launched: `--usage` only reads
+the local logs, and does not even create the directory it reads from.
 
-`--no-metrics` turns the recording off.
+The log is unbounded on purpose. Its value is the comparison over time, and a rotation that
+dropped the oldest records would quietly break exactly that. Delete it yourself when you no
+longer want the history; `--no-metrics` turns the recording off.
+
+Unreported figures stay unreported rather than becoming zeroes — Codex publishes no
+cache-write count, so that column reads `not reported` for Codex turns and the input total
+is shown as a floor. A zero there would be an assertion sitting next to Claude's measured
+value.
 
 ## What the reviewer can and cannot do
 
