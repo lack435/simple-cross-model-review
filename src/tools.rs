@@ -76,9 +76,8 @@ impl App {
 
     /// The recorded usage history, for the `--usage` report.
     pub fn usage_report(&self) -> String {
-        let (records, problems) = self.metrics.read();
-        let summary = metrics::summarise(&records);
-        metrics::render_summary(&summary, self.metrics.dir(), &problems)
+        let (summary, report) = self.metrics.summarise();
+        metrics::render_summary(&summary, self.metrics.dir(), &report)
     }
 
     pub fn cfg(&self) -> &Config {
@@ -519,12 +518,12 @@ impl App {
         ));
 
         if self.metrics.enabled() {
-            let (records, problems) = self.metrics.read();
+            let (summary, report) = self.metrics.summarise();
             out.push('\n');
             out.push_str(&metrics::render_summary(
-                &metrics::summarise(&records),
+                &summary,
                 self.metrics.dir(),
-                &problems,
+                &report,
             ));
         } else {
             out.push_str("usage log:     off (--no-metrics)\n");
@@ -633,6 +632,35 @@ struct AttemptFacts {
     retried: bool,
 }
 
+impl AttemptFacts {
+    /// What the caller's turn looks like before anything goes wrong.
+    fn first(turn: u32, resumed: bool, gap_secs: Option<u64>) -> Self {
+        Self {
+            turn,
+            resumed,
+            gap_secs,
+            prompt_bytes: 0,
+            retried: false,
+        }
+    }
+
+    /// What the expired-session retry looks like.
+    ///
+    /// Turn 1 of a conversation that did not exist a moment ago: not resumed, and with no
+    /// gap, because there is no earlier turn whose cache it could have reused. A pure
+    /// function so the branch is testable without a live reviewer CLI -- it is otherwise
+    /// reachable only by making a real CLI fail in a specific way.
+    fn after_expired_session() -> Self {
+        Self {
+            turn: 1,
+            resumed: false,
+            gap_secs: None,
+            prompt_bytes: 0,
+            retried: true,
+        }
+    }
+}
+
 /// Records a failure if the worker thread unwinds before finishing.
 ///
 /// Without this, a panic would leave the review `Running` for the life of the server:
@@ -680,13 +708,7 @@ impl Job {
         // for. The retry below starts a brand new reviewer conversation, and filing that
         // under the old turn number would record a fresh turn as a resumed one -- exactly
         // the distinction the usage log exists to draw.
-        let mut facts = AttemptFacts {
-            turn: self.turn,
-            resumed: resume_id.is_some(),
-            gap_secs: self.gap_secs,
-            prompt_bytes: 0,
-            retried: false,
-        };
+        let mut facts = AttemptFacts::first(self.turn, resume_id.is_some(), self.gap_secs);
 
         let outcome = match self.attempt(
             resume_id.as_deref(),
@@ -711,13 +733,7 @@ impl Job {
                     // one: turn 1, not resumed, and no cache gap, because there is no
                     // prior turn its cache could have been warm from. `retried` is what
                     // says a discarded attempt was also billed.
-                    facts = AttemptFacts {
-                        turn: 1,
-                        resumed: false,
-                        gap_secs: None,
-                        prompt_bytes: 0,
-                        retried: true,
-                    };
+                    facts = AttemptFacts::after_expired_session();
                     self.registry.set_phase(&self.id, Phase::Launching);
                     match self.attempt(
                         None,
@@ -812,6 +828,7 @@ impl Job {
         );
 
         self.metrics.record(&metrics::Record {
+            v: metrics::RECORD_VERSION,
             ts_unix: now_unix(),
             review_id: self.id.clone(),
             session: self.session.clone(),
@@ -1114,6 +1131,33 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_retry_after_an_expired_session_is_recorded_as_the_fresh_turn_it_is() {
+        // The retry runs turn 1 of a conversation that did not exist a moment ago. An
+        // earlier version kept the caller's turn number, `resumed: true`, and the old
+        // session's gap, filing a fresh turn as a resumed one -- corrupting exactly the
+        // comparison the usage log exists to support. Extracted into a pure function so
+        // the branch is reachable in a test: otherwise it needs a live CLI failing in one
+        // specific way.
+        let first = AttemptFacts::first(7, true, Some(900));
+        assert_eq!(first.turn, 7);
+        assert!(first.resumed);
+        assert_eq!(first.gap_secs, Some(900));
+        assert!(!first.retried);
+
+        let retry = AttemptFacts::after_expired_session();
+        assert_eq!(retry.turn, 1, "the retry is turn 1 of a new conversation");
+        assert!(!retry.resumed);
+        assert_eq!(
+            retry.gap_secs, None,
+            "there is no earlier turn whose cache this one could have reused"
+        );
+        assert!(
+            retry.retried,
+            "the discarded attempt was billed and the figures undercount it"
+        );
+    }
 
     #[test]
     fn string_arg_treats_blank_as_absent() {

@@ -315,13 +315,20 @@ so nothing is overwritten. Nothing is uploaded and no CLI is launched: `--usage`
 the local logs, and does not even create the directory it reads from.
 
 The log is unbounded on purpose. Its value is the comparison over time, and a rotation that
-dropped the oldest records would quietly break exactly that. Delete it yourself when you no
-longer want the history; `--no-metrics` turns the recording off.
+dropped the oldest records would quietly break exactly that — so reports stream it rather
+than loading it, and the summary stays fixed-size however long the history gets. Delete it
+yourself when you no longer want the history; `--no-metrics` turns the recording off.
+
+Records carry a schema version. One written by a different version is skipped and counted
+rather than guessed at, and the report says how many were left out — reading an older
+record would turn figures that were never reported into asserted zeroes.
 
 Unreported figures stay unreported rather than becoming zeroes — Codex publishes no
-cache-write count, so that column reads `not reported` for Codex turns and the input total
-is shown as a floor. A zero there would be an assertion sitting next to Claude's measured
-value.
+cache-write count, so that column reads `not reported` for Codex turns and any total drawing
+on one is shown as a floor (`at least ...`). A zero there would be an assertion sitting next
+to Claude's measured value. Averages divide by the turns that actually reported the figure,
+and name that denominator, so a rollup mixing the two reviewers cannot read as though every
+turn had been measured.
 
 ## What the reviewer can and cannot do
 

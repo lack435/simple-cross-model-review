@@ -16,8 +16,8 @@
 //! comparison over time that the whole file exists to support.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -29,6 +29,15 @@ use crate::session::{now_unix, ExclusiveLock};
 /// session-store wait: this is an append nobody is blocked on, and it is taken after the
 /// review has already been delivered.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Schema version stamped on every record.
+///
+/// Records from another version are counted and skipped, never guessed at. Version 0 --
+/// an absent field -- is the pre-`Option` format, which serialised unreported figures as
+/// numeric zeroes; reading one now would turn Codex's unknown cache-write count into an
+/// asserted `Some(0)`, which is precisely the falsehood this format exists to avoid.
+/// Skipping is the honest reading, and the count is surfaced so it is never silent.
+pub const RECORD_VERSION: u32 = 1;
 
 /// What the reviewer CLI reported about its own token usage.
 ///
@@ -132,6 +141,9 @@ pub fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// One finished review turn.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
+    /// Schema version; see `RECORD_VERSION`. Absent means the pre-`Option` format.
+    #[serde(default)]
+    pub v: u32,
     pub ts_unix: u64,
     pub review_id: String,
     pub session: String,
@@ -253,10 +265,12 @@ impl MetricsLog {
     /// README describes depends on it: files arrive named for the machine that wrote
     /// them. The legacy unsuffixed `usage.jsonl` is matched too, so a log written before
     /// the rename is not silently ignored.
-    fn logs(&self) -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
-        };
+    fn logs(&self) -> std::io::Result<Vec<PathBuf>> {
+        // A directory we cannot enumerate is not an empty directory. Reporting
+        // "no turns recorded yet" over an access-denied error would answer a usage
+        // question with a confident falsehood -- the same bug as at the file level,
+        // one layer up.
+        let entries = std::fs::read_dir(&self.dir)?;
         let mut found: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -266,35 +280,113 @@ impl MetricsLog {
             })
             .collect();
         found.sort();
-        found
+        Ok(found)
     }
 
-    /// Read every record back, from this machine's log and any others copied alongside.
+    /// Fold every readable record into a summary, one line at a time.
     ///
-    /// Returns the records and a list of files that could not be read. An unreadable log
-    /// is *not* the same as an empty one -- reporting "no turns recorded yet" over a
-    /// permissions error would answer a usage question with a confident falsehood -- so
-    /// the caller is handed the failures and expected to show them.
-    pub fn read(&self) -> (Vec<Record>, Vec<String>) {
+    /// Streamed rather than collected. The log is unbounded by decision -- its value is
+    /// the comparison over time -- but keeping all of the history does not require
+    /// holding all of it in memory at once, and `status` runs this on every call. The
+    /// aggregate is fixed-size no matter how long the history gets.
+    ///
+    /// Failures are returned rather than swallowed: an unreadable log is not an empty
+    /// one, and reporting "no turns recorded yet" over a permissions error would answer
+    /// a usage question with a confident falsehood.
+    pub fn summarise(&self) -> (Summary, ReadReport) {
+        let mut acc = Accumulator::default();
+        let mut report = ReadReport::default();
+
+        let paths = match self.logs() {
+            Ok(paths) => paths,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                report
+                    .problems
+                    .push(format!("cannot list {}: {e}", self.dir.display()));
+                Vec::new()
+            }
+        };
+
+        for path in paths {
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                // Absent is the ordinary state before the first review.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    report.problems.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    report
+                        .problems
+                        .push(format!("{}: stopped partway through", path.display()));
+                    break;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Record>(&line) {
+                    Ok(record) if record.v == RECORD_VERSION => acc.push(&record),
+                    // A record we cannot interpret correctly is skipped, not guessed at.
+                    // Counted so the omission is visible rather than silent.
+                    Ok(_) => report.outdated += 1,
+                    // A killed process can leave a half-written final line. Losing that
+                    // one record is acceptable; losing the rest is not.
+                    Err(_) => {}
+                }
+            }
+        }
+        (acc.finish(), report)
+    }
+
+    /// Every readable record, for tests that need to inspect them individually. The
+    /// production path streams instead; see `summarise`.
+    #[cfg(test)]
+    pub fn read(&self) -> (Vec<Record>, ReadReport) {
         let mut records = Vec::new();
-        let mut problems = Vec::new();
-        for path in self.logs() {
+        let mut report = ReadReport::default();
+        let paths = match self.logs() {
+            Ok(paths) => paths,
+            Err(e) => {
+                report.problems.push(format!("{e}"));
+                Vec::new()
+            }
+        };
+        for path in paths {
             match std::fs::read_to_string(&path) {
-                Ok(text) => records.extend(
-                    text.lines()
-                        .filter(|line| !line.trim().is_empty())
-                        // A killed process can leave a half-written final line. Losing
-                        // that one record is acceptable; losing the rest is not.
-                        .filter_map(|line| serde_json::from_str::<Record>(line).ok()),
-                ),
-                // Absent is the ordinary state before the first review, and says nothing
-                // worth reporting. Anything else is a real failure to surface.
+                Ok(text) => {
+                    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                        match serde_json::from_str::<Record>(line) {
+                            Ok(r) if r.v == RECORD_VERSION => records.push(r),
+                            Ok(_) => report.outdated += 1,
+                            Err(_) => {}
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => problems.push(format!("{}: {e}", path.display())),
+                Err(e) => report.problems.push(format!("{}: {e}", path.display())),
             }
         }
         records.sort_by_key(|r| r.ts_unix);
-        (records, problems)
+        (records, report)
+    }
+}
+
+/// What went wrong, or was deliberately left out, while reading the logs.
+#[derive(Default)]
+pub struct ReadReport {
+    /// Files that could not be read at all, or the directory that could not be listed.
+    pub problems: Vec<String>,
+    /// Records written by another schema version, skipped rather than misread.
+    pub outdated: usize,
+}
+
+impl ReadReport {
+    pub fn is_clean(&self) -> bool {
+        self.problems.is_empty() && self.outdated == 0
     }
 }
 
@@ -323,87 +415,154 @@ pub struct Summary {
     pub failed: usize,
     pub retried: usize,
     pub usage: Usage,
-    pub api_calls: u64,
     pub wall_secs: u64,
-    /// Did every turn in this set report every input component?
+    /// Model calls, and how many turns actually reported a count.
     ///
-    /// Not the same as `usage.input_complete()` on the total. Summing one turn that
-    /// reported a cache-write figure with one that did not yields a `Some`, which then
-    /// looks like a complete total when it is only a floor -- so completeness is tracked
-    /// across the rows rather than read off the sum. Mixing Claude and Codex turns in one
-    /// rollup does exactly this.
+    /// Both, because the average is otherwise wrong: dividing calls that only some turns
+    /// reported by *every* turn understates the rate. Averages are taken over the turns
+    /// that reported, and the report says how many that was.
+    pub api_calls: u64,
+    pub api_calls_turns: usize,
+    /// Turns that reported a cost, for the same reason.
+    pub cost_turns: usize,
+    /// Whether every turn reported every component of each figure.
+    ///
+    /// Tracked across rows rather than read off the sums. `add` yields a `Some` as soon
+    /// as one row reports a figure, so a total built from a reporting turn and a
+    /// non-reporting one presents itself as complete when it is only a floor -- which is
+    /// what a rollup mixing Claude and Codex turns produces.
     pub input_complete: bool,
+    pub output_complete: bool,
     /// Turns that resumed a session, bucketed by how long the session sat idle first.
     pub gap_buckets: BTreeMap<&'static str, usize>,
-    /// Session name, turns, totals, and whether those totals are complete.
-    pub by_session: Vec<(String, usize, Usage, bool)>,
+    pub by_session: Vec<SessionRollup>,
 }
 
-pub fn summarise(records: &[Record]) -> Summary {
-    let mut total = Usage::default();
-    let mut api_calls = 0u64;
-    let mut wall_secs = 0u64;
-    let mut failed = 0usize;
-    let mut retried = 0usize;
-    let mut gap_buckets: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut per_session: BTreeMap<String, (usize, Usage, bool)> = BTreeMap::new();
-    let mut input_complete = true;
+pub struct SessionRollup {
+    pub session: String,
+    pub turns: usize,
+    pub usage: Usage,
+    pub input_complete: bool,
+    pub output_complete: bool,
+}
 
-    let accumulate = |into: &mut Usage, u: &Usage| {
-        into.input_tokens = add(into.input_tokens, u.input_tokens);
-        into.output_tokens = add(into.output_tokens, u.output_tokens);
-        into.cache_creation_tokens = add(into.cache_creation_tokens, u.cache_creation_tokens);
-        into.cache_read_tokens = add(into.cache_read_tokens, u.cache_read_tokens);
-        if let Some(cost) = u.cost_usd {
-            into.cost_usd = Some(into.cost_usd.unwrap_or(0.0) + cost);
+/// Running totals, so a summary never requires holding the whole history in memory.
+#[derive(Default)]
+pub struct Accumulator {
+    turns: usize,
+    failed: usize,
+    retried: usize,
+    total: Usage,
+    api_calls: u64,
+    api_calls_turns: usize,
+    cost_turns: usize,
+    wall_secs: u64,
+    input_complete: bool,
+    output_complete: bool,
+    gap_buckets: BTreeMap<&'static str, usize>,
+    per_session: BTreeMap<String, (usize, Usage, bool, bool)>,
+    started: bool,
+}
+
+fn accumulate(into: &mut Usage, u: &Usage) {
+    into.input_tokens = add(into.input_tokens, u.input_tokens);
+    into.output_tokens = add(into.output_tokens, u.output_tokens);
+    into.cache_creation_tokens = add(into.cache_creation_tokens, u.cache_creation_tokens);
+    into.cache_read_tokens = add(into.cache_read_tokens, u.cache_read_tokens);
+    if let Some(cost) = u.cost_usd {
+        into.cost_usd = Some(into.cost_usd.unwrap_or(0.0) + cost);
+    }
+}
+
+impl Accumulator {
+    pub fn push(&mut self, record: &Record) {
+        if !self.started {
+            self.started = true;
+            self.input_complete = true;
+            self.output_complete = true;
         }
-    };
+        self.turns += 1;
+        accumulate(&mut self.total, &record.usage);
 
-    for record in records {
-        accumulate(&mut total, &record.usage);
-        // A turn that reported nothing at all is not evidence of an incomplete total --
-        // it contributed nothing to sum. A turn that reported some components but not
-        // others is exactly what makes the total a floor.
-        let complete = record.usage.is_empty() || record.usage.input_complete();
-        input_complete &= complete;
-        api_calls += record.usage.api_calls.unwrap_or(0);
-        wall_secs += record.wall_secs;
+        // A turn that reported nothing still consumed tokens -- we simply do not know how
+        // many. Treating it as complete, as an earlier version did, presents the total as
+        // exact when it is a floor.
+        let input_ok = record.usage.input_complete();
+        let output_ok = record.usage.output_tokens.is_some();
+        self.input_complete &= input_ok;
+        self.output_complete &= output_ok;
+
+        if let Some(calls) = record.usage.api_calls {
+            self.api_calls += calls;
+            self.api_calls_turns += 1;
+        }
+        if record.usage.cost_usd.is_some() {
+            self.cost_turns += 1;
+        }
+        self.wall_secs += record.wall_secs;
         if record.status == "failed" {
-            failed += 1;
+            self.failed += 1;
         }
         if record.retried {
-            retried += 1;
+            self.retried += 1;
         }
         if let Some(gap) = record.gap_secs {
-            *gap_buckets.entry(gap_bucket(gap)).or_insert(0) += 1;
+            *self.gap_buckets.entry(gap_bucket(gap)).or_insert(0) += 1;
         }
-        let entry =
-            per_session
-                .entry(record.session.clone())
-                .or_insert((0, Usage::default(), true));
+
+        let entry = self.per_session.entry(record.session.clone()).or_insert((
+            0,
+            Usage::default(),
+            true,
+            true,
+        ));
         entry.0 += 1;
         accumulate(&mut entry.1, &record.usage);
-        entry.2 &= complete;
+        entry.2 &= input_ok;
+        entry.3 &= output_ok;
     }
 
-    // Heaviest first: the question this answers is which session spent the budget.
-    let mut by_session: Vec<(String, usize, Usage, bool)> = per_session
-        .into_iter()
-        .map(|(name, (turns, usage, complete))| (name, turns, usage, complete))
-        .collect();
-    by_session.sort_by_key(|(_, _, usage, _)| std::cmp::Reverse(usage.billable_input()));
+    pub fn finish(self) -> Summary {
+        // Heaviest first: the question this answers is which session spent the budget.
+        let mut by_session: Vec<SessionRollup> = self
+            .per_session
+            .into_iter()
+            .map(|(session, (turns, usage, input, output))| SessionRollup {
+                session,
+                turns,
+                usage,
+                input_complete: input,
+                output_complete: output,
+            })
+            .collect();
+        by_session.sort_by_key(|s| std::cmp::Reverse(s.usage.billable_input()));
 
-    Summary {
-        turns: records.len(),
-        failed,
-        retried,
-        usage: total,
-        api_calls,
-        wall_secs,
-        input_complete,
-        gap_buckets,
-        by_session,
+        Summary {
+            turns: self.turns,
+            failed: self.failed,
+            retried: self.retried,
+            usage: self.total,
+            wall_secs: self.wall_secs,
+            api_calls: self.api_calls,
+            api_calls_turns: self.api_calls_turns,
+            cost_turns: self.cost_turns,
+            input_complete: self.input_complete,
+            output_complete: self.output_complete,
+            gap_buckets: self.gap_buckets,
+            by_session,
+        }
     }
+}
+
+/// Summarise a slice of records, for tests that construct them directly. Production
+/// streams instead and never holds the history in memory; see `MetricsLog::summarise`.
+#[cfg(test)]
+pub fn summarise(records: &[Record]) -> Summary {
+    let mut acc = Accumulator::default();
+    for record in records {
+        acc.push(record);
+    }
+    acc.finish()
 }
 
 /// Buckets sit on the two documented prompt-cache lifetimes rather than round numbers.
@@ -422,14 +581,23 @@ fn gap_bucket(secs: u64) -> &'static str {
     }
 }
 
-pub fn render_summary(summary: &Summary, dir: &Path, problems: &[String]) -> String {
+pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> String {
     let mut out = String::new();
     out.push_str(&format!("usage log:     {}\n", dir.display()));
-    for problem in problems {
+    for problem in &report.problems {
         out.push_str(&format!("               UNREADABLE: {problem}\n"));
     }
+    if report.outdated > 0 {
+        // Named rather than dropped quietly: these records exist, and excluding them
+        // without saying so would understate the history the report claims to cover.
+        out.push_str(&format!(
+            "               SKIPPED: {} record(s) from an older schema, whose figures \
+             cannot be read back correctly\n",
+            report.outdated
+        ));
+    }
     if summary.turns == 0 {
-        out.push_str(if problems.is_empty() {
+        out.push_str(if report.is_clean() {
             "               (no turns recorded yet)\n"
         } else {
             "               (no turns readable -- see above; this is not the same as none)\n"
@@ -461,12 +629,24 @@ pub fn render_summary(summary: &Summary, dir: &Path, problems: &[String]) -> Str
         field(usage.cache_read_tokens),
         field(usage.input_tokens),
     ));
-    out.push_str(&format!("output tokens: {}\n", field(usage.output_tokens)));
-    if summary.api_calls > 0 {
+    out.push_str(&format!(
+        "output tokens: {}{}\n",
+        if summary.output_complete {
+            ""
+        } else {
+            "at least "
+        },
+        field(usage.output_tokens),
+    ));
+    // Averages divide by the turns that actually reported, not by every turn. Dividing a
+    // partial sum by the full turn count silently understates the rate, and the count of
+    // reporting turns is shown so the denominator is never a guess.
+    if summary.api_calls_turns > 0 {
         out.push_str(&format!(
-            "model calls:   {} ({:.1} per turn)\n",
+            "model calls:   {} over {} ({:.1} per reporting turn)\n",
             summary.api_calls,
-            summary.api_calls as f64 / summary.turns as f64
+            reporting(summary.api_calls_turns, summary.turns),
+            summary.api_calls as f64 / summary.api_calls_turns as f64,
         ));
     }
     out.push_str(&format!(
@@ -476,8 +656,9 @@ pub fn render_summary(summary: &Summary, dir: &Path, problems: &[String]) -> Str
     ));
     if let Some(cost) = usage.cost_usd {
         out.push_str(&format!(
-            "reported cost: ${cost:.2} (${:.2} per turn)\n",
-            cost / summary.turns as f64
+            "reported cost: ${cost:.2} over {} (${:.2} per reporting turn)\n",
+            reporting(summary.cost_turns, summary.turns),
+            cost / summary.cost_turns.max(1) as f64,
         ));
     }
 
@@ -489,19 +670,33 @@ pub fn render_summary(summary: &Summary, dir: &Path, problems: &[String]) -> Str
     }
 
     out.push_str("\nheaviest sessions:\n");
-    for (name, turns, usage, complete) in summary.by_session.iter().take(10) {
+    for s in summary.by_session.iter().take(10) {
         out.push_str(&format!(
-            "  {name}: {turns} turn(s), {}{} in, {} out",
-            if *complete { "" } else { "at least " },
-            thousands(usage.billable_input()),
-            field(usage.output_tokens),
+            "  {}: {} turn(s), {}{} in, {}{} out",
+            s.session,
+            s.turns,
+            if s.input_complete { "" } else { "at least " },
+            thousands(s.usage.billable_input()),
+            if s.output_complete { "" } else { "at least " },
+            field(s.usage.output_tokens),
         ));
-        if let Some(cost) = usage.cost_usd {
+        if let Some(cost) = s.usage.cost_usd {
             out.push_str(&format!(", ${cost:.2}"));
         }
         out.push('\n');
     }
     out
+}
+
+/// "N turns", or "N of M turns" when only some of them reported the figure. Spelling out
+/// the denominator keeps an average over a partial set from reading like an average over
+/// the whole one.
+fn reporting(reported: usize, total: usize) -> String {
+    if reported == total {
+        format!("{total} turn(s)")
+    } else {
+        format!("{reported} of {total} turn(s) that reported it")
+    }
 }
 
 /// Group separators, because these numbers are routinely eight digits and a wall of
@@ -531,6 +726,7 @@ mod tests {
 
     fn record(session: &str, turn: u32, gap: Option<u64>, usage: Usage) -> Record {
         Record {
+            v: RECORD_VERSION,
             ts_unix: 1_700_000_000 + turn as u64,
             review_id: format!("rv-1-{turn}"),
             session: session.to_string(),
@@ -608,7 +804,10 @@ mod tests {
         let summary = summarise(&[record("s", 1, None, codex), record("s", 2, None, codex)]);
         assert_eq!(summary.usage.cache_creation_tokens, None);
         assert_eq!(summary.usage.input_tokens, Some(200));
-        assert!(render_summary(&summary, Path::new("C:\\s"), &[]).contains("not reported"));
+        assert!(
+            render_summary(&summary, Path::new("C:\\s"), &ReadReport::default())
+                .contains("not reported")
+        );
     }
 
     #[test]
@@ -638,7 +837,7 @@ mod tests {
         // Assert on the totals line specifically. Matching "at least" anywhere in the
         // report passes on the per-session row below and would not have caught the
         // totals line still reading off the sum -- which is exactly what it was doing.
-        let text = render_summary(&summary, Path::new("C:\\s"), &[]);
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
         let totals = text
             .lines()
             .find(|l| l.starts_with("input tokens:"))
@@ -650,7 +849,7 @@ mod tests {
         let by: BTreeMap<&str, bool> = summary
             .by_session
             .iter()
-            .map(|(name, _, _, complete)| (name.as_str(), *complete))
+            .map(|s| (s.session.as_str(), s.input_complete))
             .collect();
         assert!(by["claude-side"], "a fully reported session is not a floor");
         assert!(!by["codex-side"]);
@@ -663,8 +862,8 @@ mod tests {
         log.record(&record("default", 1, None, usage(100, 200, 50)));
         log.record(&record("default", 2, Some(600), usage(300, 400, 60)));
 
-        let (read, problems) = log.read();
-        assert!(problems.is_empty());
+        let (read, report) = log.read();
+        assert!(report.is_clean());
         assert_eq!(read.len(), 2);
         assert_eq!(read[1].turn, 2);
         assert_eq!(read[1].gap_secs, Some(600));
@@ -702,6 +901,112 @@ mod tests {
     }
 
     #[test]
+    fn a_record_from_the_old_schema_is_skipped_and_counted_not_misread() {
+        // A literal pre-`Option` record, as the first version of this module actually
+        // wrote them: unreported figures serialised as numeric zeroes. Deserialising that
+        // into `Option<u64>` yields `Some(0)` -- Codex's unknown cache-write count
+        // becoming an asserted zero, which is exactly the falsehood the format change
+        // removed. Written by hand rather than round-tripped through `Record`, because a
+        // current record saved under an old name would not exercise this at all.
+        let dir = temp_dir("cross-review-metrics-legacy");
+        let log = MetricsLog::new(&dir, true);
+        let legacy = r#"{"ts_unix":1785400000,"review_id":"rv-1-1","session":"old",
+            "turn":1,"resumed":false,"reviewer":"codex","model":"gpt-5.6-terra",
+            "effort":"xhigh","prompt_bytes":1,"diff_bytes":1,"diff_truncated":false,
+            "usage":{"input_tokens":10,"output_tokens":20,"cache_creation_tokens":0,
+            "cache_read_tokens":30},"wall_secs":1,"status":"completed"}"#
+            .replace('\n', "")
+            .replace("            ", "");
+        std::fs::write(dir.join("usage.jsonl"), format!("{legacy}\n")).unwrap();
+
+        let (summary, report) = log.summarise();
+        assert_eq!(
+            summary.turns, 0,
+            "an unreadable-by-design record was counted"
+        );
+        assert_eq!(report.outdated, 1);
+        assert!(report.problems.is_empty(), "not a read failure, a skip");
+
+        // And the skip is stated. Silently excluding records would understate the
+        // history the report claims to cover.
+        let text = render_summary(&summary, &dir, &report);
+        assert!(text.contains("SKIPPED: 1 record(s)"), "{text}");
+        assert!(!text.contains("no turns recorded yet"), "{text}");
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_not_an_empty_history() {
+        // One layer up from the per-file case: `read_dir` failing used to yield an empty
+        // vector, so an access-denied state directory reported "no turns recorded yet".
+        let dir = temp_dir("cross-review-metrics-nodir");
+        let missing = dir.join("nested").join("deeper");
+        let log = MetricsLog::new(&missing, true);
+
+        // A path that does not exist is genuinely an empty history, and must stay quiet.
+        let (summary, report) = log.summarise();
+        assert_eq!(summary.turns, 0);
+        assert!(report.is_clean(), "{:?}", report.problems);
+
+        // A path that exists but is a *file* cannot be enumerated, and must not be
+        // reported as empty.
+        let as_file = dir.join("afile");
+        std::fs::write(&as_file, b"x").unwrap();
+        let (summary, report) = MetricsLog::new(&as_file, true).summarise();
+        assert_eq!(summary.turns, 0);
+        assert!(!report.is_clean(), "a listing failure was swallowed");
+        assert!(render_summary(&summary, &as_file, &report).contains("UNREADABLE"));
+    }
+
+    #[test]
+    fn averages_divide_by_the_turns_that_reported_not_by_every_turn() {
+        // Dividing a partial sum by the full turn count understates the rate, and reads
+        // as though every turn had been measured.
+        let reported = Usage {
+            api_calls: Some(10),
+            cost_usd: Some(4.0),
+            ..usage(1, 1, 1)
+        };
+        let silent = Usage {
+            api_calls: None,
+            cost_usd: None,
+            ..usage(1, 1, 1)
+        };
+        let summary = summarise(&[
+            record("s", 1, None, reported),
+            record("s", 2, None, silent),
+            record("s", 3, None, silent),
+        ]);
+        assert_eq!(summary.api_calls, 10);
+        assert_eq!(summary.api_calls_turns, 1);
+        assert_eq!(summary.cost_turns, 1);
+
+        let text = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        // 10 calls over the one turn that reported them, not 3.3 over all three.
+        assert!(text.contains("10.0 per reporting turn"), "{text}");
+        assert!(text.contains("$4.00 per reporting turn"), "{text}");
+        assert!(text.contains("1 of 3 turn(s) that reported it"), "{text}");
+    }
+
+    #[test]
+    fn a_turn_that_reported_no_usage_makes_the_total_a_floor() {
+        // An earlier version treated a wholly unreported turn as complete, reasoning that
+        // it contributed nothing to the sum. It contributed nothing *known*: the turn
+        // still consumed tokens, so the total is a floor.
+        let summary = summarise(&[
+            record("s", 1, None, usage(100, 200, 50)),
+            record("s", 2, None, Usage::default()),
+        ]);
+        assert!(!summary.input_complete);
+        assert!(!summary.output_complete);
+        let totals = render_summary(&summary, Path::new("C:\\s"), &ReadReport::default());
+        let line = totals
+            .lines()
+            .find(|l| l.starts_with("input tokens:"))
+            .unwrap();
+        assert!(line.contains("at least "), "{line}");
+    }
+
+    #[test]
     fn a_disabled_log_writes_nothing() {
         let dir = temp_dir("cross-review-metrics-disabled");
         let log = MetricsLog::new(&dir, false);
@@ -724,9 +1029,9 @@ mod tests {
         file.write_all(b"{\"ts_unix\":170000").expect("torn write");
         drop(file);
 
-        let (read, problems) = log.read();
+        let (read, report) = log.read();
         assert_eq!(read.len(), 1, "the intact record was lost");
-        assert!(problems.is_empty(), "a torn line is not an unreadable file");
+        assert!(report.is_clean(), "a torn line is not an unreadable file");
     }
 
     #[test]
@@ -740,10 +1045,10 @@ mod tests {
         // something other than NotFound on every platform.
         std::fs::create_dir_all(dir.join("usage-BROKEN.jsonl")).expect("mkdir");
 
-        let (read, problems) = log.read();
+        let (read, report) = log.read();
         assert!(read.is_empty());
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        let text = render_summary(&summarise(&read), &dir, &problems);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        let text = render_summary(&summarise(&read), &dir, &report);
         assert!(text.contains("UNREADABLE"), "{text}");
         assert!(!text.contains("no turns recorded yet"), "{text}");
     }
@@ -763,8 +1068,8 @@ mod tests {
         assert_eq!(summary.api_calls, 24);
         // Ranked by what the model actually read, so the session that spent the budget is
         // the one at the top.
-        assert_eq!(summary.by_session[0].0, "heavy");
-        assert_eq!(summary.by_session[0].1, 2);
+        assert_eq!(summary.by_session[0].session, "heavy");
+        assert_eq!(summary.by_session[0].turns, 2);
     }
 
     #[test]
@@ -807,7 +1112,7 @@ mod tests {
     #[test]
     fn a_summary_of_nothing_says_so_rather_than_printing_zeroes() {
         let summary = summarise(&[]);
-        let text = render_summary(&summary, Path::new("C:\\state"), &[]);
+        let text = render_summary(&summary, Path::new("C:\\state"), &ReadReport::default());
         assert!(text.contains("no turns recorded yet"), "{text}");
         assert!(!text.contains("input tokens"), "{text}");
     }
