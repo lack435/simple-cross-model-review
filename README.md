@@ -329,6 +329,14 @@ Records carry a schema version. One written by a different version is skipped an
 rather than guessed at, and the report says how many were left out — reading an older
 record would turn figures that were never reported into asserted zeroes.
 
+The two reviewer CLIs count differently, and the server normalises rather than assuming.
+Claude reports per turn, with `input_tokens` meaning the *uncached remainder* so the three
+input figures sum to the prompt. Codex reports the whole thread's running total on every
+turn, with `cached_input_tokens` as a *subset* of `input_tokens` — so its figures are
+converted to Claude's convention and differenced against the previous turn before being
+recorded. Both were verified against `codex exec --json`, not assumed; getting them wrong
+inflated this project's own recorded usage by about elevenfold.
+
 Unreported figures stay unreported rather than becoming zeroes — Codex publishes no
 cache-write count, so that column reads `not reported` for Codex turns and any total drawing
 on one is shown as a floor (`at least ...`). A zero there would be an assertion sitting next

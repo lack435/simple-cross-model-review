@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::Config;
 use crate::errors::{self, Failure};
-use crate::metrics::{add, Usage};
+use crate::metrics::Usage;
 
 pub struct CodexReviewer;
 
@@ -193,6 +193,7 @@ impl Reviewer for CodexReviewer {
                 api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
                 ..events.usage
             },
+            usage_is_cumulative: true,
         })
     }
 }
@@ -245,20 +246,39 @@ fn parse_events(stdout: &str) -> Events {
                     }
                 }
             }
-            // Summed rather than last-wins: a single `codex exec` normally reports one
-            // completed turn, but if it reports several they are each real usage that
-            // was really billed, and keeping only the last would under-report the run.
+            // Last-wins, and these are the *thread's* running totals rather than this
+            // turn's. Verified against `codex exec --json`: two trivial turns on one
+            // thread reported output_tokens 5 then 10, where the second turn's reply was
+            // a single word. The values match `total_token_usage` in Codex's own rollout
+            // log, whose per-turn `last_token_usage` this stream never emits -- so the
+            // per-turn figure has to be a delta, taken by the caller. See
+            // `Parsed::usage_is_cumulative`.
+            //
+            // An earlier version summed these, with a comment arguing that keeping only
+            // the last would under-report the run. The opposite is true: the last value
+            // *is* the run, and adding them multiplies it.
             "turn.completed" => {
                 if let Some(usage) = value.get("usage") {
                     let field =
                         |name: &str| -> Option<u64> { usage.get(name).and_then(Value::as_u64) };
                     events.turns_seen += 1;
-                    events.usage.input_tokens =
-                        add(events.usage.input_tokens, field("input_tokens"));
-                    events.usage.output_tokens =
-                        add(events.usage.output_tokens, field("output_tokens"));
-                    events.usage.cache_read_tokens =
-                        add(events.usage.cache_read_tokens, field("cached_input_tokens"));
+
+                    // Converted to the convention `Usage` documents, which is Anthropic's:
+                    // `input_tokens` there is the *uncached remainder*, with cache reads
+                    // counted beside it, so the three input figures sum to the prompt.
+                    // Codex follows OpenAI's opposite convention -- `cached_input_tokens`
+                    // is a subset of `input_tokens`, verified as 9,984 of 13,133 on a
+                    // fresh thread -- so passing it through unchanged made
+                    // `billable_input()` count the cached portion twice.
+                    let total_in = field("input_tokens");
+                    let cached = field("cached_input_tokens");
+                    events.usage.cache_read_tokens = cached;
+                    events.usage.input_tokens = match (total_in, cached) {
+                        (Some(total), Some(cached)) => Some(total.saturating_sub(cached)),
+                        (total, None) => total,
+                        (None, _) => None,
+                    };
+                    events.usage.output_tokens = field("output_tokens");
                     // `cache_creation_tokens` is deliberately never set. Codex reports
                     // cached input but does not distinguish writes from reads, and this
                     // figure sits directly beside Claude's measured one -- so it stays
@@ -307,23 +327,51 @@ mod tests {
     }
 
     #[test]
-    fn usage_is_summed_across_completed_turns_not_overwritten() {
-        // One `codex exec` normally reports a single completed turn, but if it reports
-        // several they were each billed -- keeping only the last would under-report.
+    fn cumulative_usage_is_taken_last_wins_and_converted_to_our_convention() {
+        // Real values, captured from `codex exec --json`: two one-word turns on a single
+        // thread. The second reply was the word "two", yet reports output_tokens 10 --
+        // because these are the *thread's* running totals, not the turn's.
+        //
+        // An earlier version summed them, arguing that keeping only the last would
+        // under-report the run. That is backwards, and it is how a thread total came to
+        // be recorded as one turn's cost.
         let stream = concat!(
-            r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":900}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":13133,"cached_input_tokens":9984,"output_tokens":5,"reasoning_output_tokens":0}}"#,
             "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":1800}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":26285,"cached_input_tokens":22016,"output_tokens":10,"reasoning_output_tokens":0}}"#,
         );
         let events = parse_events(stream);
-        assert_eq!(events.usage.input_tokens, Some(300));
-        assert_eq!(events.usage.output_tokens, Some(30));
-        assert_eq!(events.usage.cache_read_tokens, Some(2_700));
+
+        // Last wins, not the sum: 26,285 rather than 39,418.
+        assert_eq!(events.usage.output_tokens, Some(10));
+        // And converted out of OpenAI's convention, where `cached_input_tokens` is a
+        // subset of `input_tokens`, into the one `Usage` documents, where the fields are
+        // disjoint and sum to the prompt. Passing it through unchanged made
+        // `billable_input()` count the cached portion twice.
+        assert_eq!(events.usage.cache_read_tokens, Some(22_016));
+        assert_eq!(events.usage.input_tokens, Some(26_285 - 22_016));
+        assert_eq!(
+            events.usage.billable_input(),
+            26_285,
+            "the converted fields must still sum to what Codex reported"
+        );
         assert_eq!(events.turns_seen, 2);
         // Codex does not distinguish cache writes from reads, so that field stays
         // unreported rather than being guessed at -- a zero here would be an assertion,
         // and it sits directly beside Claude's measured figure.
         assert_eq!(events.usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn a_codex_turn_declares_its_usage_cumulative_and_a_claude_turn_does_not() {
+        // The two CLIs differ and the difference is invisible in the numbers, so the
+        // adapter states it rather than leaving the caller to infer -- inferring it is
+        // what produced eight rounds of inflated figures.
+        let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
+        let parsed = CodexReviewer
+            .parse(&cfg(), &outcome(stream, true), None)
+            .expect("parse");
+        assert!(parsed.usage_is_cumulative);
     }
 
     #[test]

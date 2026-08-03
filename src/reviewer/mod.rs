@@ -48,6 +48,15 @@ pub struct Parsed {
     /// caused it. Defaulted rather than optional: a CLI that stops reporting usage should
     /// degrade to zeroes in the log, not to a failed review.
     pub usage: crate::metrics::Usage,
+    /// Whether `usage` counts the whole reviewer conversation rather than this turn.
+    ///
+    /// The two CLIs differ and the difference is invisible in the numbers, which is how
+    /// a thread total came to be recorded as a turn's cost: Claude reports per turn,
+    /// Codex reports the thread's running total on every `turn.completed`. Stated by the
+    /// adapter rather than inferred by the caller, because inferring it is exactly what
+    /// went wrong -- a cumulative figure looks like a plausible per-turn one right up
+    /// until you compare two turns.
+    pub usage_is_cumulative: bool,
 }
 
 pub struct Invocation {

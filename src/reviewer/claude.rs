@@ -215,6 +215,11 @@ impl Reviewer for ClaudeReviewer {
             denials: collect_denials(&parsed),
             warnings,
             usage: collect_usage(&parsed),
+            // Claude's result document describes the turn that just ran, not the
+            // conversation. Verified by the fields themselves: `num_turns` is this
+            // invocation's model-call count, and a resumed turn does not inherit the
+            // previous one's totals.
+            usage_is_cumulative: false,
         })
     }
 }

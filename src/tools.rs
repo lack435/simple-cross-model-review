@@ -200,6 +200,7 @@ impl App {
             // the recorded gap is the interval the reviewer's prompt cache actually saw.
             // Taking it after the review would measure zero.
             gap_secs: metrics::gap_since(prior.as_ref().map(|record| record.updated_unix)),
+            prior_cumulative: prior.as_ref().and_then(|record| record.cumulative_usage),
             cancel,
             _lease: Some(lease),
         };
@@ -607,6 +608,10 @@ struct Job {
     turn: u32,
     /// How long this session sat idle before this turn, when it had a previous one.
     gap_secs: Option<u64>,
+    /// The cumulative usage this session's reviewer last reported, for adapters that
+    /// report cumulatively. Subtracting it is the only way to recover a per-turn figure
+    /// from Codex, whose event stream carries the thread total and nothing else.
+    prior_cumulative: Option<crate::metrics::Usage>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -940,6 +945,21 @@ impl Job {
 
         let mut parsed = result?;
 
+        // A cumulative reporter gives the thread's running total, so this turn's cost is
+        // the difference from the last one. Without this the first turn looks right and
+        // every later one is inflated by everything before it -- which is exactly what
+        // happened, and it is invisible in a single figure.
+        let reported_cumulative = parsed.usage_is_cumulative.then_some(parsed.usage);
+        if let Some(total) = reported_cumulative {
+            parsed.usage = match self.prior_cumulative {
+                Some(prior) => metrics::subtract(total, prior),
+                // First turn on this session, or a session recorded before the cumulative
+                // was tracked: the running total is this turn's cost, or the best
+                // available floor for it.
+                None => total,
+            };
+        }
+
         // Only record the session once we have a real review in hand, so a failed
         // turn never leaves a session pointing at a conversation that went nowhere.
         // Resumability is tracked rather than assumed: the completed response invites a
@@ -958,11 +978,14 @@ impl Job {
             Some(session_id) => {
                 match self.sessions.record_turn(
                     &self.session,
-                    self.cfg.reviewer.as_str(),
-                    session_id,
-                    &self.cfg.model,
-                    &self.cfg.effort,
-                    &self.cfg.cwd.to_string_lossy(),
+                    session::TurnFacts {
+                        reviewer: self.cfg.reviewer.as_str(),
+                        cli_session_id: session_id,
+                        model: &self.cfg.model,
+                        effort: &self.cfg.effort,
+                        cwd: &self.cfg.cwd.to_string_lossy(),
+                        cumulative_usage: reported_cumulative,
+                    },
                 ) {
                     Ok(_) => true,
                     Err(e) => {

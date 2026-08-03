@@ -34,6 +34,30 @@ pub struct SessionRecord {
     pub turns: u32,
     pub created_unix: u64,
     pub updated_unix: u64,
+    /// The last cumulative usage this session's reviewer reported, when it reports
+    /// cumulatively at all.
+    ///
+    /// Codex reports the whole thread's running total on every turn, and the per-turn
+    /// figure is nowhere in its event stream -- so the only way to get one is to subtract
+    /// the previous total, which means remembering it. Absent for Claude, which reports
+    /// per turn already, and absent on a session recorded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_usage: Option<crate::metrics::Usage>,
+}
+
+/// What a completed turn contributes to its session's record.
+///
+/// A struct rather than a parameter list: six of these in a row, five of them `&str`,
+/// is a call site where two arguments can be transposed without the compiler noticing.
+pub struct TurnFacts<'a> {
+    pub reviewer: &'a str,
+    /// The reviewer CLI's own session identifier for this conversation.
+    pub cli_session_id: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub cwd: &'a str,
+    /// The running total this turn reported, for reviewers that report cumulatively.
+    pub cumulative_usage: Option<crate::metrics::Usage>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -78,15 +102,15 @@ impl SessionStore {
     }
 
     /// Record the result of a completed turn, creating the session on first use.
-    pub fn record_turn(
-        &self,
-        name: &str,
-        reviewer: &str,
-        cli_session_id: &str,
-        model: &str,
-        effort: &str,
-        cwd: &str,
-    ) -> io::Result<SessionRecord> {
+    pub fn record_turn(&self, name: &str, turn: TurnFacts) -> io::Result<SessionRecord> {
+        let TurnFacts {
+            reviewer,
+            cli_session_id,
+            model,
+            effort,
+            cwd,
+            cumulative_usage,
+        } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
         // process reading between the two would write back a snapshot missing this turn.
@@ -106,6 +130,7 @@ impl SessionStore {
                 model: model.to_string(),
                 effort: effort.to_string(),
                 cwd: cwd.to_string(),
+                cumulative_usage,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -117,6 +142,7 @@ impl SessionStore {
                 turns: 1,
                 created_unix: now,
                 updated_unix: now,
+                cumulative_usage,
             },
         };
 
@@ -309,7 +335,17 @@ mod tests {
 
     fn record(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {
         store
-            .record_turn(name, "codex", cli_id, "gpt-5.6-terra", "xhigh", "C:\\repo")
+            .record_turn(
+                name,
+                TurnFacts {
+                    reviewer: "codex",
+                    cli_session_id: cli_id,
+                    model: "gpt-5.6-terra",
+                    effort: "xhigh",
+                    cwd: "C:\\repo",
+                    cumulative_usage: None,
+                },
+            )
             .expect("record turn")
     }
 

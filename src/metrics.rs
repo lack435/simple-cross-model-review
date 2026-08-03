@@ -155,6 +155,36 @@ pub fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// This turn's usage, from two cumulative readings of a thread that reports totals.
+///
+/// Saturating throughout. A later total below an earlier one should be impossible, but if
+/// a CLI ever resets or reorders its counters, a wrapped `u64` would record a turn that
+/// cost eighteen quintillion tokens -- a number wrong enough to discredit the whole log,
+/// where a zero is merely uninformative.
+pub fn subtract(total: Usage, prior: Usage) -> Usage {
+    let sub = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_sub(b)),
+        // Nothing to subtract, so the newer reading stands as reported.
+        (a, None) => a,
+        (None, _) => None,
+    };
+    Usage {
+        input_tokens: sub(total.input_tokens, prior.input_tokens),
+        output_tokens: sub(total.output_tokens, prior.output_tokens),
+        cache_creation_tokens: sub(total.cache_creation_tokens, prior.cache_creation_tokens),
+        cache_read_tokens: sub(total.cache_read_tokens, prior.cache_read_tokens),
+        cost_usd: match (total.cost_usd, prior.cost_usd) {
+            (Some(a), Some(b)) => Some((a - b).max(0.0)),
+            (a, None) => a,
+            (None, _) => None,
+        },
+        // Not cumulative in the same sense: the call count and API duration describe the
+        // invocation that just ran, so they pass through untouched.
+        api_calls: total.api_calls,
+        api_duration_ms: total.api_duration_ms,
+    }
+}
+
 /// One finished review turn.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
@@ -1136,6 +1166,84 @@ mod tests {
             "problems"
         );
         assert_eq!(via_read.malformed, 1);
+    }
+
+    #[test]
+    fn a_turn_of_a_cumulative_reporter_is_the_difference_from_the_last_one() {
+        // Real readings from `codex exec --json`, converted to our convention. Codex
+        // reports the thread's running total on every turn, so turn two's cost is the
+        // difference -- recording the total as the turn is what made an eight-round
+        // review report eleven million input tokens for its final, nineteen-second turn.
+        let turn1 = Usage {
+            input_tokens: Some(13_133 - 9_984),
+            cache_read_tokens: Some(9_984),
+            output_tokens: Some(5),
+            ..Usage::default()
+        };
+        let turn2_total = Usage {
+            input_tokens: Some(26_285 - 22_016),
+            cache_read_tokens: Some(22_016),
+            output_tokens: Some(10),
+            api_calls: Some(1),
+            ..Usage::default()
+        };
+
+        let turn2 = subtract(turn2_total, turn1);
+        assert_eq!(
+            turn2.output_tokens,
+            Some(5),
+            "the second reply was one word"
+        );
+        assert_eq!(turn2.cache_read_tokens, Some(22_016 - 9_984));
+        assert_eq!(
+            turn2.input_tokens,
+            Some((26_285 - 22_016) - (13_133 - 9_984))
+        );
+        // The call count describes the invocation that just ran, not the thread, so it
+        // is not differenced.
+        assert_eq!(turn2.api_calls, Some(1));
+    }
+
+    #[test]
+    fn a_counter_that_goes_backwards_yields_zero_rather_than_wrapping() {
+        // Should be impossible. If a CLI ever resets or reorders its counters, a wrapped
+        // `u64` would record a turn costing eighteen quintillion tokens -- wrong enough
+        // to discredit the whole log, where a zero is merely uninformative.
+        let smaller = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(1),
+            cache_read_tokens: Some(5),
+            cost_usd: Some(1.0),
+            ..Usage::default()
+        };
+        let larger = Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(100),
+            cache_read_tokens: Some(500),
+            cost_usd: Some(9.0),
+            ..Usage::default()
+        };
+        let backwards = subtract(smaller, larger);
+        assert_eq!(backwards.input_tokens, Some(0));
+        assert_eq!(backwards.output_tokens, Some(0));
+        assert_eq!(backwards.cache_read_tokens, Some(0));
+        assert_eq!(backwards.cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn subtracting_from_an_unreported_prior_leaves_the_reading_as_reported() {
+        // The first turn of a session, or one recorded before the cumulative was tracked:
+        // there is nothing to subtract, and inventing a zero baseline would be a guess.
+        let total = Usage {
+            input_tokens: Some(4_269),
+            cache_read_tokens: Some(22_016),
+            output_tokens: None,
+            ..Usage::default()
+        };
+        let out = subtract(total, Usage::default());
+        assert_eq!(out.input_tokens, Some(4_269));
+        assert_eq!(out.cache_read_tokens, Some(22_016));
+        assert_eq!(out.output_tokens, None, "absent stays absent");
     }
 
     #[test]
