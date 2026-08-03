@@ -98,7 +98,9 @@ the single source of truth. There is no config file of our own to drift out of s
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
 --allow-reviewer-config     Let the reviewer load project and user configuration.
+--no-metrics                Stop recording per-turn token usage. On by default.
 --doctor                    Check CLI and auth from a terminal, then exit.
+--usage                     Print the recorded usage summary, then exit.
 ```
 
 Defaults are `claude-opus-5` at `high` and `gpt-5.6-terra` at `xhigh`.
@@ -264,6 +266,53 @@ cross_model_review(session: "auth-refactor", instructions: "Addressed findings 1
 
 The name-to-session mapping is stored on disk, so a review survives an MCP server
 restart. Pass `fresh: true` when earlier findings would only mislead.
+
+### Resuming is not free, and the cost is now visible
+
+A resumed turn re-sends the whole conversation, so turn six of a session costs more than
+turn one did — and a "turn" is not one model call. The reviewer runs an agentic loop, and
+every iteration of that loop re-reads everything accumulated so far. Measured on this
+project's own reviews: around nine model calls per turn, with the context those calls read
+growing from ~190k tokens on turn one to ~970k by turn six.
+
+Both CLIs report their token usage and the server used to discard it. It is now recorded,
+one JSON object per finished turn, in `usage.jsonl` in the state directory — and
+summarised on every completed review, in `cross_model_review_status`, and by `--usage`:
+
+```
+cross-review.exe --reviewer claude --usage
+```
+
+```
+turns:         5 (0 failed, 0 re-run after an expired session)
+input tokens:  2,320,250 total = 1,470,000 cache-write + 850,000 cache-read + 250 fresh
+output tokens: 97,000
+model calls:   43 (8.6 per turn)
+wall time:     75m total (15m per turn)
+reported cost: $14.07 ($2.81 per turn)
+
+resumed turns by gap since the previous turn:
+     2  5m to 1h (past the 5m lifetime, inside the 1h one)
+     1  under 5m (inside either lifetime)
+```
+
+Three columns earn their place:
+
+- **Cache-write against cache-read.** Cache reads are billed at a fraction of the input
+  rate; cache writes are billed *above* it. A large cache-write figure is the expensive
+  kind of traffic, and it is what a total spend number hides.
+- **The gap since the previous turn.** Only interpretable next to the cache split, which
+  is why they sit together: a turn that re-read its history cheaply and one that paid to
+  write the whole conversation back are indistinguishable in a cost total. The buckets sit
+  on both documented cache lifetimes — an hour on a subscription, five minutes on an API
+  key or cloud provider — because the server cannot see which is in force.
+- **Model calls per turn.** The multiplier between "one review" and what it actually cost.
+
+The state directory is per project, so rolling several machines up together is a matter of
+copying their `usage.jsonl` files into one directory and pointing `--state-dir` at it.
+Nothing is uploaded and no CLI is launched: `--usage` only reads the local log.
+
+`--no-metrics` turns the recording off.
 
 ## What the reviewer can and cannot do
 

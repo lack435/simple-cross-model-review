@@ -1,7 +1,7 @@
 //! The four tools, and the state they share.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,6 +11,7 @@ use crate::cancel::RequestCancel;
 use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
 use crate::git;
+use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{
     IdState, Outcome, Phase, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
@@ -52,6 +53,7 @@ pub struct App {
     reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
+    metrics: Arc<MetricsLog>,
     /// Successful preflights are cached for the process lifetime; failures are not, so
     /// a user who runs `codex login` can retry without restarting the agent session.
     preflight: Mutex<Option<Preflight>>,
@@ -60,14 +62,23 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
+        let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
         let reviewer = reviewer::for_kind(cfg.reviewer);
         Self {
             cfg: Arc::new(cfg),
             reviewer: Arc::from(reviewer),
             registry: Arc::new(Registry::new()),
             sessions: Arc::new(sessions),
+            metrics: Arc::new(metrics),
             preflight: Mutex::new(None),
         }
+    }
+
+    /// The recorded usage history, for the `--usage` report.
+    pub fn usage_report(&self) -> String {
+        let records = self.metrics.read();
+        let summary = metrics::summarise(&records);
+        metrics::render_summary(&summary, self.metrics.path())
     }
 
     pub fn cfg(&self) -> &Config {
@@ -179,12 +190,18 @@ impl App {
             reviewer: Arc::clone(&self.reviewer),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
+            metrics: Arc::clone(&self.metrics),
             bin: ready.bin,
             id: id.clone(),
             session: session.clone(),
             instructions,
             context_paths,
             turn,
+            // Read here, while the lease is held and before this turn overwrites it, so
+            // the recorded gap is the interval the reviewer's prompt cache actually saw.
+            // Taking it after the review would measure zero.
+            gap_secs: metrics::gap_since(prior.as_ref().map(|record| record.updated_unix)),
+            prompt_bytes: AtomicUsize::new(0),
             cancel,
             _lease: Some(lease),
         };
@@ -403,6 +420,14 @@ impl App {
             snapshot.elapsed.as_secs(),
         ));
 
+        // Stated on every completed review rather than kept in the log alone. A review
+        // turn is many model calls over a conversation that grows with each turn, and an
+        // agent that cannot see what a turn cost has no way to notice that its tenth
+        // follow-up costs several times what its first did.
+        if !snapshot.usage.is_empty() {
+            out.push_str(&format!("usage:     {}\n\n", snapshot.usage.summary()));
+        }
+
         for warning in &snapshot.warnings {
             out.push_str(&format!("WARNING: {warning}\n\n"));
         }
@@ -494,6 +519,17 @@ impl App {
             self.sessions.path().display()
         ));
 
+        let records = self.metrics.read();
+        if self.metrics.enabled() {
+            out.push('\n');
+            out.push_str(&metrics::render_summary(
+                &metrics::summarise(&records),
+                self.metrics.path(),
+            ));
+        } else {
+            out.push_str("usage log:     off (--no-metrics)\n");
+        }
+
         let sessions = self.sessions.list();
         out.push_str("\nsaved review sessions:\n");
         if sessions.is_empty() {
@@ -563,12 +599,19 @@ struct Job {
     reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
+    metrics: Arc<MetricsLog>,
     bin: PathBuf,
     id: String,
     session: String,
     instructions: String,
     context_paths: Vec<String>,
     turn: u32,
+    /// How long this session sat idle before this turn, when it had a previous one.
+    gap_secs: Option<u64>,
+    /// Size of the prompt `attempt` last built, for the usage log. An atomic because
+    /// `attempt` takes `&self` and can run twice; the retry's prompt is the one that
+    /// was actually reviewed.
+    prompt_bytes: AtomicUsize,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -597,6 +640,7 @@ impl Drop for FinishGuard<'_> {
 
 impl Job {
     fn run(self, resume_id: Option<String>) {
+        let started = std::time::Instant::now();
         let mut guard = FinishGuard {
             registry: &self.registry,
             id: &self.id,
@@ -617,6 +661,7 @@ impl Job {
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
+        let mut retried = false;
         let outcome = match self.attempt(
             resume_id.as_deref(),
             self.turn,
@@ -635,6 +680,9 @@ impl Job {
                          reviewer session",
                         self.session
                     );
+                    // Recorded because it doubles the turn: the dead-session attempt was
+                    // billed too, and only the second attempt's usage is reported back.
+                    retried = true;
                     self.registry.set_phase(&self.id, Phase::Launching);
                     match self.attempt(None, 1, change.as_deref(), &capture_warnings) {
                         Ok(mut outcome) => {
@@ -653,10 +701,91 @@ impl Job {
                 }
             }
         };
+        self.record_usage(&outcome, capture.change.as_ref(), started, retried);
         self.registry.finish(&self.id, outcome);
         // Disarmed only once a terminal state is recorded, so the guard covers every
         // path that could unwind before this point.
         guard.armed = false;
+    }
+
+    /// Append this turn to the usage log, and say the same thing on stderr.
+    ///
+    /// Both, because they answer different questions. The log is what you aggregate
+    /// across sessions and machines after the fact; the stderr line is what a user
+    /// watching a review happen can see without going and finding the file.
+    fn record_usage(
+        &self,
+        outcome: &Outcome,
+        change: Option<&git::Change>,
+        started: std::time::Instant,
+        retried: bool,
+    ) {
+        let usage = outcome.usage;
+        let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
+        let status = if failure_code.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+
+        // The rendered diff is what actually went into the prompt, so that is what is
+        // measured -- not the raw `git diff` output, which is a different size.
+        let diff_bytes = change.map(|c| c.diff.text.len()).unwrap_or(0);
+        let diff_truncated = change.map(|c| c.diff.truncated).unwrap_or(false);
+
+        eprintln!(
+            "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}{}",
+            self.cfg.reviewer.as_str(),
+            self.turn,
+            self.session,
+            status,
+            started.elapsed().as_secs(),
+            match self.gap_secs {
+                Some(gap) => format!(
+                    " after a {} idle gap",
+                    fmt_elapsed(Duration::from_secs(gap))
+                ),
+                None => String::new(),
+            },
+            if usage.is_empty() {
+                "no usage reported by the CLI".to_string()
+            } else {
+                usage.summary()
+            },
+            if retried {
+                " (ran twice: the earlier reviewer session had expired)"
+            } else {
+                ""
+            },
+        );
+
+        self.metrics.record(&metrics::Record {
+            ts_unix: now_unix(),
+            review_id: self.id.clone(),
+            session: self.session.clone(),
+            turn: self.turn,
+            resumed: self.turn > 1,
+            gap_secs: self.gap_secs,
+            reviewer: self.cfg.reviewer.as_str().to_string(),
+            model: self.cfg.model.clone(),
+            effort: self.cfg.effort.clone(),
+            prompt_bytes: self.last_prompt_bytes(),
+            diff_bytes,
+            diff_truncated,
+            usage,
+            wall_secs: started.elapsed().as_secs(),
+            retried,
+            status: status.to_string(),
+            failure_code,
+        });
+    }
+
+    /// Size of the prompt this turn sent, recorded by `attempt`.
+    ///
+    /// Read back from the job rather than threaded through the return value because the
+    /// retry path produces two prompts and the one that mattered is the last one built.
+    fn last_prompt_bytes(&self) -> usize {
+        self.prompt_bytes.load(Ordering::Relaxed)
     }
 
     fn attempt(
@@ -695,6 +824,7 @@ impl Job {
             capabilities,
             change,
         });
+        self.prompt_bytes.store(text.len(), Ordering::Relaxed);
 
         let invocation = self
             .reviewer
@@ -817,6 +947,7 @@ impl Job {
             denials: parsed.denials,
             warnings,
             resumable,
+            usage: parsed.usage,
         })
     }
 }

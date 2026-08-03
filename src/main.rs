@@ -16,6 +16,7 @@ mod config;
 mod errors;
 mod git;
 mod mcp;
+mod metrics;
 mod prompt;
 mod registry;
 mod reviewer;
@@ -43,7 +44,11 @@ fn main() {
     }
 
     let doctor = args.iter().any(|a| a == "--doctor");
-    let args: Vec<String> = args.into_iter().filter(|a| a != "--doctor").collect();
+    let usage_report = args.iter().any(|a| a == "--usage");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--doctor" && a != "--usage")
+        .collect();
 
     let cfg = match Config::from_args(&args) {
         Ok(cfg) => cfg,
@@ -63,6 +68,13 @@ fn main() {
     }
 
     let app = Arc::new(App::new(cfg));
+
+    if usage_report {
+        // Reads only the local log -- no CLI is launched and nothing is billed, so this
+        // is safe to run against a state directory collected from several machines.
+        print!("{}", app.usage_report());
+        return;
+    }
 
     if doctor {
         // Human-facing preflight, so a misconfiguration can be found without

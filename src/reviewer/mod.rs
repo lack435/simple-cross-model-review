@@ -43,6 +43,11 @@ pub struct Parsed {
     pub denials: Vec<String>,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
+    /// What the CLI reported about the tokens this turn consumed. Both CLIs report it and
+    /// we used to discard it, which left the cost of a review invisible to the tool that
+    /// caused it. Defaulted rather than optional: a CLI that stops reporting usage should
+    /// degrade to zeroes in the log, not to a failed review.
+    pub usage: crate::metrics::Usage,
 }
 
 pub struct Invocation {

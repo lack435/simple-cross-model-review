@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::errors::Failure;
+use crate::metrics::Usage;
 
 /// Finished reviews kept per session. A review holds its full text for the life of the
 /// process, so a long agent session doing many reviews accumulated all of them.
@@ -117,6 +118,9 @@ pub struct Review {
     /// of activity, not a completion estimate: Claude commonly emits nothing until the
     /// final response, while Codex emits a JSONL event stream as it works.
     pub output_bytes: usize,
+    /// What the turn cost, once it has finished. Zero while it is running: the CLIs
+    /// report usage on completion, so there is nothing honest to show before then.
+    pub usage: Usage,
     pub cancel: Arc<AtomicBool>,
     /// Order in which this process finished the review, or 0 while it is still running.
     /// Assigned under the registry lock; see `State::finishes`.
@@ -137,6 +141,8 @@ pub struct Outcome {
     pub denials: Vec<String>,
     pub warnings: Vec<String>,
     pub resumable: bool,
+    /// What this turn cost, as the reviewer CLI reported it.
+    pub usage: Usage,
 }
 
 impl Outcome {
@@ -147,6 +153,7 @@ impl Outcome {
             denials: Vec::new(),
             warnings: Vec::new(),
             resumable: false,
+            usage: Usage::default(),
         }
     }
 
@@ -158,6 +165,7 @@ impl Outcome {
             denials: Vec::new(),
             warnings: Vec::new(),
             resumable: true,
+            usage: Usage::default(),
         }
     }
 }
@@ -305,6 +313,7 @@ impl Registry {
                 phase_started: now,
                 last_activity: now,
                 output_bytes: 0,
+                usage: Usage::default(),
                 cancel: Arc::clone(&cancel),
                 finish_seq: 0,
             },
@@ -372,6 +381,7 @@ impl Registry {
                 review.denials = outcome.denials;
                 review.warnings = outcome.warnings;
                 review.resumable = outcome.resumable;
+                review.usage = outcome.usage;
                 match outcome.failure {
                     Some(failure) => {
                         review.status = Status::Failed;
@@ -544,6 +554,7 @@ pub struct Snapshot {
     pub phase_elapsed: Duration,
     pub activity_age: Duration,
     pub output_bytes: usize,
+    pub usage: Usage,
     /// The server had begun shutting down when this was taken. A `Running` snapshot with
     /// this set means the wait was cut short, not that the caller's budget ran out — and
     /// that no later call can collect the review, because the process is exiting.
@@ -568,6 +579,7 @@ impl Snapshot {
             phase_elapsed: review.phase_started.elapsed(),
             activity_age: review.last_activity.elapsed(),
             output_bytes: review.output_bytes,
+            usage: review.usage,
             shutting_down,
         }
     }

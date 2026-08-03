@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::Config;
 use crate::errors::{self, Failure};
+use crate::metrics::Usage;
 
 pub struct CodexReviewer;
 
@@ -188,15 +189,24 @@ impl Reviewer for CodexReviewer {
             session_id: events.thread_id,
             denials: Vec::new(),
             warnings,
+            usage: Usage {
+                api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
+                ..events.usage
+            },
         })
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq)]
 struct Events {
     thread_id: Option<String>,
     last_message: Option<String>,
     errors: Vec<String>,
+    usage: Usage,
+    /// How many `turn.completed` events carried usage. Reported as the model-call count
+    /// so the figure means the same thing as Claude's `num_turns`: model calls billed
+    /// inside this one review turn.
+    turns_seen: u64,
 }
 
 /// Read `codex exec --json` output. The stream is JSONL, but the CLI also emits
@@ -235,6 +245,24 @@ fn parse_events(stdout: &str) -> Events {
                     }
                 }
             }
+            // Summed rather than last-wins: a single `codex exec` normally reports one
+            // completed turn, but if it reports several they are each real usage that
+            // was really billed, and keeping only the last would under-report the run.
+            "turn.completed" => {
+                if let Some(usage) = value.get("usage") {
+                    let field = |name: &str| -> u64 {
+                        usage.get(name).and_then(Value::as_u64).unwrap_or(0)
+                    };
+                    events.turns_seen += 1;
+                    // Codex reports cached input but does not distinguish cache writes
+                    // from reads, so only the read side is populated here. Left at zero
+                    // rather than guessed: an invented cache-write figure would be
+                    // compared against Claude's real one.
+                    events.usage.input_tokens += field("input_tokens");
+                    events.usage.output_tokens += field("output_tokens");
+                    events.usage.cache_read_tokens += field("cached_input_tokens");
+                }
+            }
             "error" | "turn.failed" | "thread.error" => {
                 let message = value
                     .get("message")
@@ -267,6 +295,45 @@ mod tests {
 {"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"## Verdict\nREQUEST CHANGES"}}
 {"type":"turn.completed","usage":{"input_tokens":14124,"output_tokens":5}}"###;
+
+    #[test]
+    fn usage_is_read_from_the_event_stream() {
+        let events = parse_events(REAL_STREAM);
+        assert_eq!(events.usage.input_tokens, 14_124);
+        assert_eq!(events.usage.output_tokens, 5);
+        assert_eq!(events.turns_seen, 1);
+    }
+
+    #[test]
+    fn usage_is_summed_across_completed_turns_not_overwritten() {
+        // One `codex exec` normally reports a single completed turn, but if it reports
+        // several they were each billed -- keeping only the last would under-report.
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":900}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":1800}}"#,
+        );
+        let events = parse_events(stream);
+        assert_eq!(events.usage.input_tokens, 300);
+        assert_eq!(events.usage.output_tokens, 30);
+        assert_eq!(events.usage.cache_read_tokens, 2_700);
+        assert_eq!(events.turns_seen, 2);
+        // Codex does not distinguish cache writes from reads, so that field stays zero
+        // rather than being guessed at -- it sits beside Claude's real figure.
+        assert_eq!(events.usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn a_stream_with_no_usage_reports_none_rather_than_zero_calls() {
+        // `api_calls: Some(0)` would read as "this turn made no model calls", which is
+        // a claim; `None` is the honest "the CLI did not say".
+        let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
+        let parsed = CodexReviewer
+            .parse(&cfg(), &outcome(stream, true), None)
+            .expect("parse");
+        assert!(parsed.usage.is_empty());
+        assert_eq!(parsed.usage.api_calls, None);
+    }
 
     fn cfg() -> Config {
         Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config")
