@@ -276,7 +276,7 @@ project's own reviews: around nine model calls per turn, with the context those 
 growing from ~190k tokens on turn one to ~970k by turn six.
 
 Both CLIs report their token usage and the server used to discard it. It is now recorded,
-one JSON object per finished turn, in `usage.jsonl` in the state directory — and
+one JSON object per finished turn, in `usage-<machine>.jsonl` in the state directory — and
 summarised on every completed review, in `cross_model_review_status`, and by `--usage`:
 
 ```
@@ -316,7 +316,9 @@ the local logs, and does not even create the directory it reads from.
 
 The log is unbounded on purpose. Its value is the comparison over time, and a rotation that
 dropped the oldest records would quietly break exactly that — so reports stream it rather
-than loading it, and the summary stays fixed-size however long the history gets. Delete it
+than loading it. The per-session ranking is capped so that summarising really does stay
+bounded; turns past the cap still count toward every total and the report says how many
+lost their own row. Delete it
 yourself when you no longer want the history; `--no-metrics` turns the recording off.
 
 Records carry a schema version. One written by a different version is skipped and counted

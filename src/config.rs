@@ -193,7 +193,9 @@ pub struct Config {
     /// so excluding it is defensible on its own terms; pass the conventions that matter
     /// in `instructions` instead.
     pub isolate_reviewer: bool,
-    /// Append a line to `usage.jsonl` in the state directory for every finished turn.
+    /// Append a line to `usage-<machine>.jsonl` in the state directory for every
+    /// finished turn. Named for the machine so several machines' logs can share one
+    /// directory; the reader takes every `usage*.jsonl` it finds there.
     ///
     /// On by default. The data is entirely local -- token counts the reviewer CLI already
     /// reported, plus sizes and timings this server already knows -- and without it the
@@ -587,16 +589,17 @@ OPTIONS:
                               with no tool call and so no permission check. Only pass
                               this for repositories you already trust.
                               (--allow-reviewer-mcp is an accepted older name.)
-  --no-metrics                Stop recording per-turn token usage to usage.jsonl in
-                              the state directory. On by default; the data is local
-                              and is what makes "where did the usage go?" answerable.
+  --no-metrics                Stop recording per-turn token usage to
+                              usage-<machine>.jsonl in the state directory. On by
+                              default; the data is local and is what makes "where did
+                              the usage go?" answerable.
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
   --usage                     Print the recorded per-turn usage summary, then exit.
-                              Reads usage.jsonl from the state directory, so point
-                              --state-dir at a copied-together directory to roll up
-                              several machines at once.
+                              Reads every usage*.jsonl in the state directory, so
+                              point --state-dir at a copied-together directory to roll
+                              up several machines at once.
   --help, -h                  Show this help.
   --version, -V               Show the version.
 "#;

@@ -39,6 +39,17 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// Skipping is the honest reading, and the count is surfaced so it is never silent.
 pub const RECORD_VERSION: u32 = 1;
 
+/// How many distinct sessions the per-session ranking will track.
+///
+/// Session names are chosen by the calling agent, so the number of distinct ones is
+/// caller-controlled and unbounded. Without a cap the accumulator grows with the history
+/// it is meant to summarise in constant space -- the earlier claim that it was fixed-size
+/// was simply false. Every turn is still counted in the totals once the cap is reached;
+/// only the individual rows stop being tracked, and the report says how many.
+///
+/// Far above any plausible real use: a session per pull request for years still fits.
+pub const MAX_RANKED_SESSIONS: usize = 1000;
+
 /// What the reviewer CLI reported about its own token usage.
 ///
 /// Every field is an `Option` because "the CLI did not report this" and "the CLI reported
@@ -270,9 +281,12 @@ impl MetricsLog {
         // "no turns recorded yet" over an access-denied error would answer a usage
         // question with a confident falsehood -- the same bug as at the file level,
         // one layer up.
-        let entries = std::fs::read_dir(&self.dir)?;
+        // Each entry is fallible in its own right, and `filter_map(Result::ok)` dropped
+        // those failures on the floor -- an unreadable entry would have vanished from the
+        // listing as though the log it names did not exist.
+        let entries = std::fs::read_dir(&self.dir)?.collect::<std::io::Result<Vec<_>>>()?;
         let mut found: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.file_name().unwrap_or_default().to_string_lossy();
@@ -332,13 +346,15 @@ impl MetricsLog {
                     Ok(record) if record.v == RECORD_VERSION => acc.push(&record),
                     // A record we cannot interpret correctly is skipped, not guessed at.
                     // Counted so the omission is visible rather than silent.
-                    Ok(_) => report.outdated += 1,
-                    // A killed process can leave a half-written final line. Losing that
-                    // one record is acceptable; losing the rest is not.
-                    Err(_) => {}
+                    Ok(_) => report.unsupported_version += 1,
+                    // A killed process leaves a half-written final line, which is the
+                    // ordinary cause. Counted anyway: losing one record is routine, and a
+                    // file full of them is not, and silence cannot tell the two apart.
+                    Err(_) => report.malformed += 1,
                 }
             }
         }
+        report.unranked_turns = acc.unranked_turns();
         (acc.finish(), report)
     }
 
@@ -361,7 +377,7 @@ impl MetricsLog {
                     for line in text.lines().filter(|l| !l.trim().is_empty()) {
                         match serde_json::from_str::<Record>(line) {
                             Ok(r) if r.v == RECORD_VERSION => records.push(r),
-                            Ok(_) => report.outdated += 1,
+                            Ok(_) => report.unsupported_version += 1,
                             Err(_) => {}
                         }
                     }
@@ -378,15 +394,36 @@ impl MetricsLog {
 /// What went wrong, or was deliberately left out, while reading the logs.
 #[derive(Default)]
 pub struct ReadReport {
-    /// Files that could not be read at all, or the directory that could not be listed.
+    /// Files that could not be read at all, the directory that could not be listed, or a
+    /// file whose read stopped partway.
     pub problems: Vec<String>,
-    /// Records written by another schema version, skipped rather than misread.
-    pub outdated: usize,
+    /// Records written by a schema version this build cannot interpret, skipped rather
+    /// than misread. Not necessarily *older*: a newer version is equally unreadable here.
+    pub unsupported_version: usize,
+    /// Records that did not parse at all. A killed process leaves a half-written final
+    /// line, which is the ordinary cause -- but counted rather than passed over in
+    /// silence, because a file full of them is a different situation entirely.
+    pub malformed: usize,
+    /// Turns belonging to sessions beyond the ranking cap. Counted in every total; only
+    /// their individual rows are missing. See `MAX_RANKED_SESSIONS`.
+    pub unranked_turns: usize,
 }
 
 impl ReadReport {
+    /// Nothing was missed, so the figures describe everything on disk.
     pub fn is_clean(&self) -> bool {
-        self.problems.is_empty() && self.outdated == 0
+        self.problems.is_empty()
+            && self.unsupported_version == 0
+            && self.malformed == 0
+            && self.unranked_turns == 0
+    }
+
+    /// Some record that exists was not counted, so every total is a lower bound.
+    ///
+    /// Distinct from `is_clean`: a capped session ranking omits *rows* but still counts
+    /// those turns in the totals, so it does not make the totals partial.
+    pub fn totals_are_partial(&self) -> bool {
+        !self.problems.is_empty() || self.unsupported_version > 0 || self.malformed > 0
     }
 }
 
@@ -461,6 +498,7 @@ pub struct Accumulator {
     output_complete: bool,
     gap_buckets: BTreeMap<&'static str, usize>,
     per_session: BTreeMap<String, (usize, Usage, bool, bool)>,
+    unranked_turns: usize,
     started: bool,
 }
 
@@ -510,16 +548,33 @@ impl Accumulator {
             *self.gap_buckets.entry(gap_bucket(gap)).or_insert(0) += 1;
         }
 
-        let entry = self.per_session.entry(record.session.clone()).or_insert((
-            0,
-            Usage::default(),
-            true,
-            true,
-        ));
-        entry.0 += 1;
-        accumulate(&mut entry.1, &record.usage);
-        entry.2 &= input_ok;
-        entry.3 &= output_ok;
+        // Bounded. Session names are caller-chosen, so an unbounded map grows with the
+        // history it is supposed to summarise in constant space. The totals above are
+        // already updated, so a turn beyond the cap is still counted -- it only loses its
+        // own row, and the report says how many sessions that happened to.
+        let room = self.per_session.len() < MAX_RANKED_SESSIONS;
+        match self.per_session.get_mut(&record.session) {
+            Some(entry) => {
+                entry.0 += 1;
+                accumulate(&mut entry.1, &record.usage);
+                entry.2 &= input_ok;
+                entry.3 &= output_ok;
+            }
+            None if room => {
+                let mut usage = Usage::default();
+                accumulate(&mut usage, &record.usage);
+                self.per_session
+                    .insert(record.session.clone(), (1, usage, input_ok, output_ok));
+            }
+            // A counter, not a set of names: a set of caller-chosen names is exactly the
+            // unbounded growth the cap exists to prevent.
+            None => self.unranked_turns += 1,
+        }
+    }
+
+    /// Turns whose session was beyond the ranking cap. See `MAX_RANKED_SESSIONS`.
+    pub fn unranked_turns(&self) -> usize {
+        self.unranked_turns
     }
 
     pub fn finish(self) -> Summary {
@@ -587,14 +642,38 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     for problem in &report.problems {
         out.push_str(&format!("               UNREADABLE: {problem}\n"));
     }
-    if report.outdated > 0 {
-        // Named rather than dropped quietly: these records exist, and excluding them
-        // without saying so would understate the history the report claims to cover.
+    // Named rather than dropped quietly: these records exist, and excluding them without
+    // saying so would understate the history the report claims to cover.
+    if report.unsupported_version > 0 {
+        // Not "older": a record from a *newer* build is equally unreadable here, and
+        // calling it old would send someone looking in the wrong direction.
         out.push_str(&format!(
-            "               SKIPPED: {} record(s) from an older schema, whose figures \
-             cannot be read back correctly\n",
-            report.outdated
+            "               SKIPPED: {} record(s) written by an unsupported schema \
+             version\n",
+            report.unsupported_version
         ));
+    }
+    if report.malformed > 0 {
+        out.push_str(&format!(
+            "               SKIPPED: {} record(s) that did not parse (a killed process \
+             leaves one; many means something else)\n",
+            report.malformed
+        ));
+    }
+    if report.unranked_turns > 0 {
+        out.push_str(&format!(
+            "               NOTE: {} turn(s) are counted in the totals but have no \
+             session row (past the {MAX_RANKED_SESSIONS}-session ranking cap)\n",
+            report.unranked_turns
+        ));
+    }
+    // Everything below describes only what could be read, so say so before the numbers
+    // rather than after them.
+    if report.totals_are_partial() {
+        out.push_str(
+            "               Figures below cover readable records only and are lower \
+             bounds.\n",
+        );
     }
     if summary.turns == 0 {
         out.push_str(if report.is_clean() {
@@ -611,15 +690,24 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
         None => "not reported".to_string(),
     };
     out.push_str(&format!(
-        "turns:         {} ({} failed, {} re-run after an expired session)\n",
-        summary.turns, summary.failed, summary.retried
+        "turns:         {}{} ({} failed, {} re-run after an expired session)\n",
+        summary.turns,
+        // "1 readable" rather than "1" when something on disk could not be counted: the
+        // turn count is as much a lower bound as the token figures are.
+        if report.totals_are_partial() {
+            " readable"
+        } else {
+            ""
+        },
+        summary.failed,
+        summary.retried
     ));
     out.push_str(&format!(
         "input tokens:  {}{} total = {} cache-write + {} cache-read + {} fresh\n",
         // The summary's own answer, not the sum's: `add` yields a `Some` as soon as one
         // row reports a figure, so a total built from a reporting turn and a
         // non-reporting one would otherwise present itself as complete.
-        if summary.input_complete {
+        if summary.input_complete && !report.totals_are_partial() {
             ""
         } else {
             "at least "
@@ -631,7 +719,7 @@ pub fn render_summary(summary: &Summary, dir: &Path, report: &ReadReport) -> Str
     ));
     out.push_str(&format!(
         "output tokens: {}{}\n",
-        if summary.output_complete {
+        if summary.output_complete && !report.totals_are_partial() {
             ""
         } else {
             "at least "
@@ -924,7 +1012,7 @@ mod tests {
             summary.turns, 0,
             "an unreadable-by-design record was counted"
         );
-        assert_eq!(report.outdated, 1);
+        assert_eq!(report.unsupported_version, 1);
         assert!(report.problems.is_empty(), "not a read failure, a skip");
 
         // And the skip is stated. Silently excluding records would understate the
@@ -1004,6 +1092,83 @@ mod tests {
             .find(|l| l.starts_with("input tokens:"))
             .unwrap();
         assert!(line.contains("at least "), "{line}");
+    }
+
+    #[test]
+    fn the_session_ranking_is_bounded_and_says_what_it_left_out() {
+        // Session names come from the calling agent, so an unbounded map grows with the
+        // history it is supposed to summarise in constant space. An earlier version
+        // claimed to be fixed-size while doing exactly that.
+        let mut acc = Accumulator::default();
+        let over = MAX_RANKED_SESSIONS + 25;
+        for n in 0..over {
+            acc.push(&record(&format!("session-{n}"), 1, None, usage(10, 20, 5)));
+        }
+        assert_eq!(acc.unranked_turns(), 25);
+        let summary = acc.finish();
+
+        // Bounded rows...
+        assert_eq!(summary.by_session.len(), MAX_RANKED_SESSIONS);
+        // ...but every turn still counted in the totals, which is the point: the cap
+        // costs detail, not accuracy.
+        assert_eq!(summary.turns, over);
+        assert_eq!(
+            summary.usage.cache_creation_tokens,
+            Some(10 * over as u64),
+            "a turn past the cap was dropped from the totals, not just the ranking"
+        );
+
+        let report = ReadReport {
+            unranked_turns: 25,
+            ..ReadReport::default()
+        };
+        let text = render_summary(&summary, Path::new("C:\\s"), &report);
+        assert!(
+            text.contains("25 turn(s) are counted in the totals"),
+            "{text}"
+        );
+        // A capped ranking omits rows, not records, so the totals are not lower bounds.
+        assert!(!report.totals_are_partial());
+        assert!(!text.contains("lower bounds"), "{text}");
+    }
+
+    #[test]
+    fn a_partial_read_marks_every_figure_below_it_as_a_lower_bound() {
+        // Surfacing UNREADABLE above a set of exact-looking totals is only half an
+        // answer: whatever was skipped is unknown, so the figures are floors.
+        let summary = summarise(&[record("s", 1, None, usage(100, 200, 50))]);
+        let report = ReadReport {
+            problems: vec!["usage-B.jsonl: denied".into()],
+            malformed: 2,
+            ..ReadReport::default()
+        };
+        assert!(report.totals_are_partial());
+
+        let text = render_summary(&summary, Path::new("C:\\s"), &report);
+        assert!(text.contains("UNREADABLE"), "{text}");
+        assert!(text.contains("2 record(s) that did not parse"), "{text}");
+        assert!(text.contains("lower bounds"), "{text}");
+        // The totals themselves, not just the preamble, have to carry it.
+        for prefix in ["turns:", "input tokens:", "output tokens:"] {
+            let line = text.lines().find(|l| l.starts_with(prefix)).unwrap();
+            assert!(
+                line.contains("readable") || line.contains("at least "),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_from_a_future_version_is_not_called_older() {
+        // Any version but ours is unreadable here; calling a newer record "older" sends
+        // someone looking in the wrong direction.
+        let report = ReadReport {
+            unsupported_version: 1,
+            ..ReadReport::default()
+        };
+        let text = render_summary(&summarise(&[]), Path::new("C:\\s"), &report);
+        assert!(text.contains("unsupported schema version"), "{text}");
+        assert!(!text.to_lowercase().contains("older schema"), "{text}");
     }
 
     #[test]
