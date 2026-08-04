@@ -508,8 +508,10 @@ pub fn classify(
     // Checked here rather than in each adapter, because a reviewer CLI can report an
     // expired session on a path where its structured output never arrives. Claude reports
     // it on stderr with stdout empty, so the JSON never parses and the adapter's own check
-    // was unreachable -- which meant the automatic retry into a fresh session could never
-    // fire, despite a test that appeared to cover it.
+    // was unreachable. Classifying it here is what lets an expired resume surface cleanly as
+    // SESSION_NOT_FOUND, which the caller acts on by retrying with fresh=true. (It once drove
+    // an automatic retry into a fresh session; that retry was removed, but the classification
+    // is still what makes the failure legible.)
     if has(&[
         "no conversation found",
         "session not found",

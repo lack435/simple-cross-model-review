@@ -687,9 +687,8 @@ impl Job {
             armed: true,
         };
 
-        // Captured once, before either attempt: the retry below re-runs the same review
-        // in a new reviewer session, so re-running git for it would only spend time and
-        // risk showing the two turns different trees.
+        // Captured once, before the attempt runs, so the reviewer's prompt and the usage
+        // metrics below describe the same diff.
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
@@ -918,8 +917,9 @@ impl Job {
         // every later one is inflated by everything before it -- which is exactly what
         // happened, and it is invisible in a single figure.
         //
-        // The baseline is passed in, not read from the job, so the expired-session retry --
-        // a brand new thread -- gets `None` and never differences against a dead thread.
+        // The baseline is passed in as a parameter rather than read from the job, so a fresh
+        // (non-resumed) turn gets `None` and never differences its total against another
+        // thread's, keeping this reconciliation a pure function of its inputs.
         // `baseline_to_persist` is what the next turn will subtract against: when a baseline
         // already exists it is always carried forward (an empty reading keeps the old one
         // rather than erasing it), and only in the no-baseline case is one persisted solely
@@ -1087,8 +1087,9 @@ fn resume_block(cfg: &Config, record: &session::SessionRecord, now: u64) -> Opti
         if idle > cfg.resume_max_idle.as_secs() {
             return Some(format!(
                 "it was last used {} ago, past the configured {} resume window \
-                 (--session-max-idle-seconds); the reviewer's prompt cache will have expired, \
-                 so resuming re-reads the whole conversation for no saving.",
+                 (--session-max-idle-seconds); by then the reviewer's prompt cache may no \
+                 longer be warm and its context may have drifted, so resuming risks paying to \
+                 re-read the whole conversation.",
                 fmt_age(idle),
                 fmt_elapsed(cfg.resume_max_idle)
             ));

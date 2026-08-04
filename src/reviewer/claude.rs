@@ -534,8 +534,8 @@ mod tests {
         // Fixture taken from the real thing: `claude -p --resume <bogus-uuid>` exits 1 with
         // the message on stderr and stdout completely empty. The previous fixture put it in
         // a `result` field of valid JSON, which the CLI never does -- so it exercised a
-        // branch that could not be reached in practice, and the automatic retry into a
-        // fresh session had in fact never worked.
+        // branch that could not be reached in practice. Getting this classification right is
+        // what lets an expired resume surface as SESSION_NOT_FOUND at all.
         let out = RunOutcome {
             stdout: String::new(),
             stderr: "No conversation found with session ID: \

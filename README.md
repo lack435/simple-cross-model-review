@@ -88,6 +88,12 @@ the single source of truth. There is no config file of our own to drift out of s
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
 --timeout-seconds <n>       Per-turn budget. Default 1800.
+--session-max-turns <n>     Refuse to resume a review session past this many turns; the
+                            caller starts fresh (fresh=true) or uses a new session name.
+                            Default 10. 0 disables.
+--session-max-idle-seconds <n>
+                            Refuse to resume a review session idle longer than this many
+                            seconds. Default 3300 (55m). 0 disables.
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.

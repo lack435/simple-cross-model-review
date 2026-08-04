@@ -283,11 +283,13 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 300;
 
-/// Refuse to resume a review session idle longer than this. By then the reviewer's prompt
-/// cache has almost certainly expired, so a resume pays to re-read the whole conversation
-/// for no cache saving -- and the further a session is from its last turn, the more likely
-/// its context has drifted from the work in front of it. The caller is told to start fresh
-/// rather than silently handed an expensive, stale resume. Zero disables the check.
+/// Refuse to resume a review session idle longer than this. Past this window the reviewer's
+/// prompt cache may no longer be warm -- its lifetime depends on how the CLI is
+/// authenticated (an hour on a subscription, five minutes on an API key), which this server
+/// cannot see -- so a resume risks paying to re-read the whole conversation, and the further
+/// a session is from its last turn the more its context may have drifted from the work in
+/// front of it. The default sits just under the one-hour lifetime. The caller is told to
+/// start fresh rather than silently handed the stale resume. Zero disables the check.
 pub const DEFAULT_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
 
 /// Refuse to resume a review session that has already run this many turns. Every turn
@@ -823,10 +825,11 @@ OPTIONS:
                               Default: 10.
   --session-max-idle-seconds <n>
                               Refuse to resume a review session idle longer than this many
-                              seconds. By then the reviewer's prompt cache has expired, so a
-                              resume re-reads the whole conversation for no saving. The
-                              caller is told to start fresh rather than silently handed the
-                              stale resume. 0 disables. Default: 3300 (55 minutes).
+                              seconds. Past it the reviewer's prompt cache may no longer be
+                              warm and its context may have drifted, so a resume risks
+                              re-reading the whole conversation. The caller is told to start
+                              fresh rather than silently handed the stale resume. 0 disables.
+                              Default: 3300 (55 minutes, just under the 1h cache lifetime).
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
