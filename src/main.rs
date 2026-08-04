@@ -14,7 +14,6 @@ compile_error!(
 mod cancel;
 mod config;
 mod errors;
-mod git;
 mod mcp;
 mod metrics;
 mod prompt;
@@ -24,6 +23,7 @@ mod session;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod vcs;
 mod winjob;
 
 use std::sync::Arc;
