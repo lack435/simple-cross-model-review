@@ -10,7 +10,6 @@ use serde_json::Value;
 use crate::cancel::RequestCancel;
 use crate::config::{Config, MAX_WAIT_SECS};
 use crate::errors::{self, Failure};
-use crate::git;
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
 use crate::registry::{
@@ -19,6 +18,7 @@ use crate::registry::{
 };
 use crate::reviewer::{self, Reviewer};
 use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
+use crate::vcs;
 
 /// How long to wait for another server process to release a named session.
 const SESSION_LEASE_WAIT: Duration = Duration::from_secs(3);
@@ -701,11 +701,11 @@ impl Job {
         if self.cfg.supplies_diff() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
-        let capture = git::capture(&self.cfg, &self.cancel);
+        let capture = vcs::capture(&self.cfg, &self.cancel);
         let change = capture
             .change
             .as_ref()
-            .map(|change| git::render(change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
+            .map(|change| vcs::render(change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -797,7 +797,7 @@ impl Job {
         &self,
         usage: crate::metrics::Usage,
         failure_code: Option<String>,
-        change: Option<&git::Change>,
+        change: Option<&vcs::Change>,
         started: std::time::Instant,
         facts: AttemptFacts,
     ) {

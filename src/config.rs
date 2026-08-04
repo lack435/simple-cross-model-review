@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::git::DiffMode;
+use crate::vcs::DiffMode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReviewerKind {
