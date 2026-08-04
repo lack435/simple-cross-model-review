@@ -103,9 +103,6 @@ the single source of truth. There is no config file of our own to drift out of s
 --diff <spec>               git only. What to capture as "the change".
                             auto|none|staged|HEAD|<rev>. Default auto: supply a diff only
                             when the reviewer has no shell to fetch one itself.
---change <n[,n...]>         Perforce only. The changelist numbers to review, e.g.
-                            43650,43651. Numeric only — no default and no "default"
-                            changelist; with no --change nothing is captured. Max 20.
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -268,12 +265,37 @@ Notes on the edges, because they are where this would otherwise mislead:
 ### Perforce
 
 `--vcs perforce` (or `auto` in a workspace with no `.git`) captures an **explicit list of
-changelists** — `--change 43650,43651`. There is deliberately no default and no "all
-opened": Perforce workspaces are large and a reconcile of one is slow, so the change is
-always the changelists you name. With no `--change`, nothing is captured and the caller is
-warned. `p4` is resolved from PATH and run in the working root, so `P4CONFIG`/`P4CLIENT`
-resolve the client; the resolved client and root are printed in the reviewer's prompt so a
-wrong one is visible.
+changelists**, named **per call** in the `cross_model_review` `change` argument —
+`"change": "43650"`, `"43650,43651"`, or `["43650","43651"]`. There is deliberately no
+default and no "all opened": Perforce workspaces are large and a reconcile of one is slow,
+so the change is always the changelists you name. `change` is **required** for a Perforce
+review — a call without it is refused, not silently turned into a review of the current
+tree — and it is named per call rather than baked into the server entry precisely because
+the changelist under review moves from one review to the next. A review session binds to
+its changelist *set* on first use; a resume that names a different set is refused (use
+`fresh: true` to switch), while the pending contents are re-captured every turn because a
+pending changelist mutates.
+
+**Client and charset are derived, not assumed.** `p4` is resolved from PATH and run in the
+working root. If `P4CONFIG`/`P4CLIENT` already resolve a client whose root contains the
+working root, it is used as-is; otherwise the client is derived the way the Perforce MCP
+does — `p4 info` for the host and user, then `p4 clients -u`, keeping the clients whose
+`Host` matches this machine (an empty `Host` is a wildcard) and whose `Root` is an ancestor
+of the working root, longest root winning and a tie refused. Every capture command then runs
+bound to that client with a global `-c <client>` (in the global slot, so it does not collide
+with a subcommand's own `-c`, e.g. `opened -c <changelist>`) and `-C utf8` — the `-C utf8`
+is mandatory, not hygiene: the server is unicode-mode and the machine charset is `auto`,
+which corrupts `unicode`-filetype files. The resolved client and root are printed in the
+reviewer's prompt so a wrong one is visible.
+
+> **Known limitation — `AltRoots` and `Root: null`.** Derivation ranks on the *primary*
+> `Root` reported by `p4 clients`, so a client whose effective root on this host comes from
+> an `AltRoots` entry (or a `Root: null` workspace) is not matched. Usually that just fails
+> to find a client — a loud error pointing you at `P4CLIENT`/`P4CONFIG`, whose `p4 info`
+> path *does* resolve the effective (AltRoot) root and is checked first. The one case it does
+> not cover is two of the user's clients whose effective roots overlap at the working root
+> (one via a primary root, one via an AltRoot): derivation would pick the primary-root one
+> and could pick the wrong workspace. Set `P4CLIENT`/`P4CONFIG` explicitly in that setup.
 
 Per changelist the reviewer is shown a **basis banner**, the changelist description (fenced
 as evidence, never as instructions), a diff, a listing of the affected files with their
@@ -281,8 +303,15 @@ depot and working-root-relative paths, and the contents of files opened for add:
 
 | Changelist | Basis | Diff | New-file contents |
 | --- | --- | --- | --- |
-| pending | **workspace** — the diff (`p4 diff -du` of opened edits) compares the workspace to the depot, so it matches the files you can read | opened edits | files opened for add, read from disk |
+| pending, unshelved | **workspace** — the diff (`p4 diff -du` of opened edits) compares the workspace to the depot, so it matches the files you can read | opened edits | files opened for add, read from disk |
+| pending, shelved *(opt-in)* | **shelved** — `p4 describe -S -du`, the server-side shelf, which need not match the tree; requires `include_shelved: true` | the shelved files, filtered per file | (none) |
 | submitted | **server revision** — `p4 describe -du`; the live tree may be a *different* revision, and the reviewer is told so | the whole changelist, filtered per file | (none) |
+
+**Shelved content is opt-in.** A pending changelist with nothing open in this workspace (it
+is shelved, or belongs to another client) is reported as incomplete by default, because
+shelved files are often work-in-progress checkpoints rather than the change to review. Pass
+`include_shelved: true` to pull the shelf with `p4 describe -S -du` instead — which also
+makes a teammate's shelved changelist reviewable, since the shelf is server-side.
 
 Two things are stated plainly rather than glossed, because getting them wrong would let the
 reviewer trust the wrong tree:
@@ -291,16 +320,23 @@ reviewer trust the wrong tree:
   but says nothing about files edited without `p4 edit` (not detected — reconcile is too
   slow to run), files opened in *other* changelists, or any other workspace change. Any
   changelist can also be **incomplete** — permission-limited, an out-of-root file dropped,
-  truncated output, a foreign/shelved pending changelist with nothing open here. Each is
-  labelled per changelist, and the requested / captured / skipped changelists are listed in
-  the prompt, not only in the caller's warnings.
+  truncated output, or a pending changelist with nothing open here and `include_shelved` off.
+  Each is labelled per changelist, and the requested / captured / skipped changelists are
+  listed in the prompt, not only in the caller's warnings.
 - **Read confinement differs by basis.** A Perforce client view can map depot files to disk
   outside the working root, so out-of-root content is dropped — the capture never contains
-  what the reviewer's own `Read(./**)` scope could not. For a *pending* changelist that is
-  process-level: paths are filtered *before* any file is read. For a *submitted* one it is
-  prompt-level only — `p4 describe -du` returns the whole changelist server-side, so
-  out-of-root bytes reach this process and are dropped before rendering, not before being
-  read. The guarantee there is "not shown to the reviewer", not "not read by the server".
+  what the reviewer's own `Read(./**)` scope could not. For a *pending* (unshelved)
+  changelist that is process-level: paths are filtered *before* any file is read. For a
+  *submitted* or *shelved* one it is prompt-level only — `p4 describe` returns the whole
+  changelist server-side, so out-of-root bytes reach this process and are dropped before
+  rendering, not before being read. The guarantee there is "not shown to the reviewer", not
+  "not read by the server".
+- **The reviewer is told the truth about its own reach.** The server-side capture is the
+  source of truth because the reviewer usually *cannot* fetch a Perforce change itself: `p4`
+  needs to reach the server, which a read-only Codex sandbox denies (and the reviewer's own
+  `p4` would be client-less here anyway). So the "you can inspect the history yourself"
+  prose is gated — it is shown only when the sandbox grants network — and otherwise the
+  reviewer is told to rely on the captured change. git history is local, so it is unaffected.
 
 The Perforce threat surface is **narrower** than git's, and the README says so rather than
 claiming parity: there is no committed-config execution analog. `p4 diff -du` forces p4's

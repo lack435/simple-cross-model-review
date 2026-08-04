@@ -125,6 +125,43 @@ impl App {
         let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
         let context_paths = string_array_arg(args, "context_paths");
 
+        // Perforce changelists are named per call, and validated here -- before the preflight
+        // and the session lease -- so a malformed or backend-mismatched request costs nothing.
+        // A git server rejects the Perforce-only inputs by presence (any non-null value)
+        // rather than silently ignoring them, so a git caller gets the pointed "wrong backend"
+        // message instead of a downstream parse error or a no-op. A JSON null is "unset", so
+        // it is treated as absent, here and in the strict parse below.
+        if self.cfg.vcs == crate::config::Vcs::Git {
+            let present = |key: &str| args.get(key).is_some_and(|v| !v.is_null());
+            if present("change") || present("include_shelved") {
+                return Err(errors::bad_request(
+                    "'change' and 'include_shelved' name Perforce inputs, but this working root \
+                     is git. Omit them -- the git diff to review is configured on the server \
+                     (see --diff).",
+                ));
+            }
+        }
+
+        let changes = parse_change_arg(args)?;
+        // Parsed strictly rather than coerced: a non-boolean silently becoming `false` would
+        // drop a caller's intent to review a shelf without any error.
+        let include_shelved = match args.get("include_shelved") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(errors::bad_request(
+                    "'include_shelved' must be true or false.",
+                ))
+            }
+        };
+        if self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
+            return Err(errors::bad_request(
+                "'change' is required for a Perforce review: name the changelist number(s) to \
+                 review, for example \"43650\" or [\"43650\",\"43651\"].",
+            ));
+        }
+        let changes_canonical = crate::changeset::canonical(&changes);
+
         let ready = self.ensure_ready()?;
 
         // The lease comes first, before the session record is read. Reading first would
@@ -150,7 +187,7 @@ impl App {
         // chooses to start fresh (fresh=true, or a new session name) rather than being
         // silently handed a review with no memory of the work it asked to continue.
         if let Some(record) = &prior {
-            if let Some(reason) = resume_block(&self.cfg, record, now_unix()) {
+            if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
                 return Err(errors::session_not_resumable(&session, reason));
             }
         }
@@ -199,6 +236,8 @@ impl App {
             session: session.clone(),
             instructions,
             context_paths,
+            changes: changes.clone(),
+            include_shelved,
             turn,
             // Read here, while the lease is held and before this turn overwrites it, so
             // the recorded gap is the interval the reviewer's prompt cache actually saw.
@@ -236,6 +275,21 @@ impl App {
             }
         ));
         out.push_str(&format!("reviewer:  {}\n", self.cfg.describe_reviewer()));
+        if !changes.is_empty() {
+            out.push_str(&format!(
+                "changelists: {}{}\n",
+                changes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if include_shelved {
+                    " (including shelved snapshots)"
+                } else {
+                    ""
+                }
+            ));
+        }
         out.push_str(&format!("budget:    {}\n\n", fmt_elapsed(self.cfg.timeout)));
         out.push_str(&format!(
             "Collect it with cross_model_review_result using review_id \"{id}\". That call waits \
@@ -621,6 +675,10 @@ struct Job {
     session: String,
     instructions: String,
     context_paths: Vec<String>,
+    /// The Perforce changelists this review captures, in request order. Empty for git.
+    changes: Vec<u64>,
+    /// Whether to pull shelved content for a pending changelist with nothing open.
+    include_shelved: bool,
     turn: u32,
     /// How long this session sat idle before this turn, when it had a previous one.
     gap_secs: Option<u64>,
@@ -692,7 +750,7 @@ impl Job {
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
-        let capture = vcs::capture(&self.cfg, &self.cancel);
+        let capture = vcs::capture(&self.cfg, &self.changes, self.include_shelved, &self.cancel);
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
         let change = capture.change.as_ref().map(|c| c.rendered.clone());
@@ -848,6 +906,18 @@ impl Job {
         } else {
             Some(capabilities.as_str())
         };
+        // On a resumed Perforce turn the captured change is a fresh snapshot of a changelist
+        // whose pending contents can move between turns; say so, so the reviewer does not read
+        // a legitimate change as a contradiction of its earlier findings.
+        let resumed_capture_note = (resume_id.is_some()
+            && self.cfg.vcs == crate::config::Vcs::Perforce
+            && change.is_some())
+        .then_some(
+            "Note: the \"Change under review\" above is a freshly captured snapshot of the \
+             changelist(s). A pending changelist's contents can move between turns, so it may \
+             differ from what you reviewed on the previous turn -- review what is shown here, and \
+             do not treat a difference from your earlier reading as a contradiction.",
+        );
         let text = prompt::build(&PromptParts {
             instructions: &self.instructions,
             context_paths: &self.context_paths,
@@ -857,6 +927,7 @@ impl Job {
             preamble,
             capabilities,
             change,
+            resumed_capture_note,
         });
         // Reported back through the out-parameter so it survives the error paths below:
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
@@ -988,6 +1059,10 @@ impl Job {
                         effort: &self.cfg.effort,
                         cwd: &self.cfg.cwd.to_string_lossy(),
                         cumulative_usage: baseline_to_persist,
+                        // Bind the session to the changelist set (Perforce only), canonicalised
+                        // so a re-review naming the same changelists in another order resumes.
+                        changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                            .then(|| crate::changeset::canonical(&self.changes)),
                     },
                 ) {
                     Ok(_) => true,
@@ -1043,7 +1118,12 @@ impl Job {
 /// Every branch refuses rather than silently starting a new session. A resume that quietly
 /// became a fresh review is the one outcome this tool must not produce: the caller asked
 /// for continuity and would act on the answer as though it had it.
-fn resume_block(cfg: &Config, record: &session::SessionRecord, now: u64) -> Option<String> {
+fn resume_block(
+    cfg: &Config,
+    record: &session::SessionRecord,
+    requested_changes: &[u64],
+    now: u64,
+) -> Option<String> {
     // Identity first: a session belongs to the reviewer, model and working root that
     // created it. A configuration that now points elsewhere cannot resume that conversation
     // at all, so the honest answer is to start over -- explicitly, so the caller learns the
@@ -1070,6 +1150,25 @@ fn resume_block(cfg: &Config, record: &session::SessionRecord, now: u64) -> Opti
             "it was created against working root '{}', but this server is now working in '{}'.",
             record.cwd, cwd
         ));
+    }
+
+    // A Perforce session follows one changelist set. A resume that names a different set is
+    // continuing different work, so refuse rather than silently re-reviewing it with the old
+    // findings in context. `requested_changes` is canonical (sorted, deduped) and so is the
+    // stored binding, so the comparison is order-insensitive. `None` on the record is a git
+    // session or one recorded before this binding existed -- treated as unbound.
+    if cfg.vcs == crate::config::Vcs::Perforce {
+        if let Some(bound) = &record.changes {
+            if bound != requested_changes {
+                return Some(format!(
+                    "it is bound to changelist(s) {}, but this call names {}. A review session \
+                     follows one changelist set; start a fresh review (fresh: true) to review a \
+                     different set, or use a new session name.",
+                    join_changes(bound),
+                    join_changes(requested_changes),
+                ));
+            }
+        }
     }
 
     // Then staleness. Turns before idle: when a session is both long and old, "it ran too
@@ -1120,6 +1219,55 @@ fn string_arg(args: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Parse the `change` request argument into validated changelist numbers.
+///
+/// Accepts the same comma-separated string form the removed `--change` flag took (`"43650"`
+/// or `"43650,43651"`) and an array of strings/numbers, so a caller can pass either shape.
+/// Both funnel through [`crate::changeset::parse_change_tokens`], so the dedupe, cap and
+/// numeric validation are single-sourced. An absent argument yields an empty list; the
+/// backend-specific requirement is enforced by the caller.
+fn parse_change_arg(args: &Value) -> Result<Vec<u64>, Failure> {
+    match args.get("change") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => crate::changeset::parse_changes(s).map_err(errors::bad_request),
+        Some(Value::Array(items)) => {
+            // An array element may be a JSON string or number, and a string element may itself
+            // carry a comma; collect owned tokens, then split so the two forms are identical.
+            let mut toks: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(s) => toks.push(s.clone()),
+                    Value::Number(n) if n.is_u64() => toks.push(n.to_string()),
+                    _ => {
+                        return Err(errors::bad_request(
+                            "each entry in 'change' must be a changelist number (a string like \
+                             \"43650\" or a non-negative integer).",
+                        ))
+                    }
+                }
+            }
+            crate::changeset::parse_change_tokens(toks.iter().flat_map(|t| t.split(',')))
+                .map_err(errors::bad_request)
+        }
+        Some(_) => Err(errors::bad_request(
+            "'change' must be a changelist number string (\"43650\" or \"43650,43651\") or an \
+             array of changelist numbers.",
+        )),
+    }
+}
+
+/// Render a changelist list for a message, or "none" when empty.
+fn join_changes(changes: &[u64]) -> String {
+    if changes.is_empty() {
+        return "none".to_string();
+    }
+    changes
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn string_array_arg(args: &Value, key: &str) -> Vec<String> {
@@ -1226,6 +1374,7 @@ mod tests {
             created_unix: 0,
             updated_unix,
             cumulative_usage: None,
+            changes: None,
         }
     }
 
@@ -1234,7 +1383,7 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
-        assert!(resume_block(&cfg, &ok, now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], now).is_none());
     }
 
     #[test]
@@ -1245,11 +1394,17 @@ mod tests {
         assert!(resume_block(
             &cfg,
             &record_matching(&cfg, cfg.resume_max_turns - 1, now),
+            &[],
             now
         )
         .is_none());
-        let reason = resume_block(&cfg, &record_matching(&cfg, cfg.resume_max_turns, now), now)
-            .expect("at the cap it is refused");
+        let reason = resume_block(
+            &cfg,
+            &record_matching(&cfg, cfg.resume_max_turns, now),
+            &[],
+            now,
+        )
+        .expect("at the cap it is refused");
         assert!(reason.contains("turn"), "{reason}");
         assert!(reason.contains("--session-max-turns"), "{reason}");
     }
@@ -1260,8 +1415,8 @@ mod tests {
         let now = 1_000_000;
         let idle = cfg.resume_max_idle.as_secs();
         // Exactly at the window still resumes; one second past it does not.
-        assert!(resume_block(&cfg, &record_matching(&cfg, 1, now - idle), now).is_none());
-        let reason = resume_block(&cfg, &record_matching(&cfg, 1, now - idle - 1), now)
+        assert!(resume_block(&cfg, &record_matching(&cfg, 1, now - idle), &[], now).is_none());
+        let reason = resume_block(&cfg, &record_matching(&cfg, 1, now - idle - 1), &[], now)
             .expect("past the window it is refused");
         assert!(reason.contains("resume window"), "{reason}");
         assert!(reason.contains("--session-max-idle-seconds"), "{reason}");
@@ -1276,26 +1431,26 @@ mod tests {
 
         let mut wrong_reviewer = record_matching(&cfg, 1, now);
         wrong_reviewer.reviewer = "claude".to_string();
-        assert!(resume_block(&cfg, &wrong_reviewer, now)
+        assert!(resume_block(&cfg, &wrong_reviewer, &[], now)
             .expect("refused")
             .contains("reviewer"));
 
         let mut wrong_model = record_matching(&cfg, 1, now);
         wrong_model.model = "gpt-5.6-sol".to_string();
-        assert!(resume_block(&cfg, &wrong_model, now)
+        assert!(resume_block(&cfg, &wrong_model, &[], now)
             .expect("refused")
             .contains("model"));
 
         let mut wrong_cwd = record_matching(&cfg, 1, now);
         wrong_cwd.cwd = "C:\\somewhere\\else".to_string();
-        assert!(resume_block(&cfg, &wrong_cwd, now)
+        assert!(resume_block(&cfg, &wrong_cwd, &[], now)
             .expect("refused")
             .contains("working root"));
 
         // A case-only difference in the working root is the same root on Windows.
         let mut cased = record_matching(&cfg, 1, now);
         cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
-        assert!(resume_block(&cfg, &cased, now).is_none());
+        assert!(resume_block(&cfg, &cased, &[], now).is_none());
     }
 
     #[test]
@@ -1312,7 +1467,161 @@ mod tests {
         .expect("config");
         let now = 1_000_000;
         let ancient_and_long = record_matching(&cfg, 999, 0);
-        assert!(resume_block(&cfg, &ancient_and_long, now).is_none());
+        assert!(resume_block(&cfg, &ancient_and_long, &[], now).is_none());
+    }
+
+    #[test]
+    fn change_arg_accepts_string_comma_and_array_forms() {
+        // All three shapes normalise to the same deduped list through the shared core.
+        assert_eq!(
+            parse_change_arg(&json!({"change": "43650"})).unwrap(),
+            vec![43650]
+        );
+        assert_eq!(
+            parse_change_arg(&json!({"change": "43650,43651"})).unwrap(),
+            vec![43650, 43651]
+        );
+        assert_eq!(
+            parse_change_arg(&json!({"change": ["43650", "43651"]})).unwrap(),
+            vec![43650, 43651]
+        );
+        // JSON numbers are accepted, and an array element may itself carry a comma.
+        assert_eq!(
+            parse_change_arg(&json!({"change": [43650, "43651,43650"]})).unwrap(),
+            vec![43650, 43651]
+        );
+        // Absent means empty; the backend requirement is enforced by the caller.
+        assert!(parse_change_arg(&json!({})).unwrap().is_empty());
+    }
+
+    #[test]
+    fn change_arg_rejects_malformed_input_as_agent_correctable() {
+        for bad in [
+            json!({"change": "default"}),
+            json!({"change": "-3"}),
+            json!({"change": "0"}),
+            json!({"change": ["43650", "nope"]}),
+            json!({"change": [43650.5]}),
+            json!({"change": 43650}), // a bare number, not a string or array
+            json!({"change": true}),
+        ] {
+            let err = parse_change_arg(&bad).unwrap_err();
+            assert_eq!(err.code, "BAD_REQUEST", "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_perforce_review_requires_change_and_git_refuses_it() {
+        // Perforce with no `change`: a request error, not a silent review of the tree.
+        let p4 = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "perforce".into(),
+            ])
+            .expect("cfg"),
+        );
+        let err = p4
+            .start_review(&json!({"instructions": "look"}), &RequestCancel::new())
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("'change' is required"),
+            "{}",
+            err.summary
+        );
+
+        // git handed a `change`: rejected with a message pointing back at git.
+        let git = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "git".into(),
+            ])
+            .expect("cfg"),
+        );
+        let err = git
+            .start_review(
+                &json!({"instructions": "look", "change": "43650"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("this working root is git"),
+            "{}",
+            err.summary
+        );
+    }
+
+    #[test]
+    fn include_shelved_is_parsed_strictly_and_rejected_under_git() {
+        let p4 = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "perforce".into(),
+            ])
+            .expect("cfg"),
+        );
+        // A non-boolean include_shelved is a request error, not a silent false.
+        let err = p4
+            .start_review(
+                &json!({"instructions": "x", "change": "43650", "include_shelved": "yes"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains("include_shelved"), "{}", err.summary);
+
+        // Under git it is a Perforce-only input and is refused rather than silently ignored.
+        let git = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "git".into(),
+            ])
+            .expect("cfg"),
+        );
+        let err = git
+            .start_review(
+                &json!({"instructions": "x", "include_shelved": true}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains("Perforce inputs"), "{}", err.summary);
+    }
+
+    #[test]
+    fn a_perforce_session_is_bound_to_its_changelist_set() {
+        // A record created under Perforce, bound to a changelist set.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--vcs".into(),
+            "perforce".into(),
+        ])
+        .expect("cfg");
+        let now = 1_000_000;
+        let mut record = record_matching(&cfg, 1, now);
+        record.changes = Some(vec![43650, 43651]);
+
+        // Same set (any order, canonicalised by the caller) resumes.
+        assert!(resume_block(&cfg, &record, &[43650, 43651], now).is_none());
+        // A different set is refused, naming both sets and the escape hatch.
+        let reason = resume_block(&cfg, &record, &[43650], now).expect("refused");
+        assert!(reason.contains("43650, 43651"), "{reason}");
+        assert!(reason.contains("fresh: true"), "{reason}");
+
+        // A record with no binding (legacy or git) is treated as unbound and resumes.
+        let mut unbound = record.clone();
+        unbound.changes = None;
+        assert!(resume_block(&cfg, &unbound, &[99999], now).is_none());
     }
 
     #[test]

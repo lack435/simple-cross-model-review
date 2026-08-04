@@ -12,6 +12,7 @@ compile_error!(
 );
 
 mod cancel;
+mod changeset;
 mod config;
 mod errors;
 mod mcp;

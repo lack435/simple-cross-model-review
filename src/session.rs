@@ -43,6 +43,16 @@ pub struct SessionRecord {
     /// per turn already, and absent on a session recorded before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cumulative_usage: Option<crate::metrics::Usage>,
+    /// The Perforce changelist set this session is bound to, canonicalised (sorted, deduped).
+    ///
+    /// A review session follows one changelist set: a resume that names a different set is
+    /// refused rather than silently continuing against work the reviewer never saw. `None` is
+    /// a git session (no binding) or a session recorded before this field existed, both of
+    /// which the resume check treats as unbound. The pending changelists' *contents* may move
+    /// between turns -- that is expected in a re-review and is handled by re-capturing, not by
+    /// this field, which is identity only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<u64>>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -58,6 +68,8 @@ pub struct TurnFacts<'a> {
     pub cwd: &'a str,
     /// The running total this turn reported, for reviewers that report cumulatively.
     pub cumulative_usage: Option<crate::metrics::Usage>,
+    /// The canonical Perforce changelist set this session is bound to, or `None` for git.
+    pub changes: Option<Vec<u64>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -110,6 +122,7 @@ impl SessionStore {
             effort,
             cwd,
             cumulative_usage,
+            changes,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -120,7 +133,10 @@ impl SessionStore {
         let now = now_unix();
 
         let record = match store.sessions.get(name) {
-            // Same underlying session: another turn on it.
+            // Same underlying session: another turn on it. The changelist binding is
+            // invariant across turns (a mismatched resume is refused before we get here), so
+            // carrying this turn's value forward keeps it while tolerating a `None` from a
+            // git turn without erasing an existing binding.
             Some(existing) if existing.cli_session_id == cli_session_id => SessionRecord {
                 turns: existing.turns.saturating_add(1),
                 created_unix: existing.created_unix,
@@ -131,6 +147,7 @@ impl SessionStore {
                 effort: effort.to_string(),
                 cwd: cwd.to_string(),
                 cumulative_usage,
+                changes: changes.or(existing.changes.clone()),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -143,6 +160,7 @@ impl SessionStore {
                 created_unix: now,
                 updated_unix: now,
                 cumulative_usage,
+                changes,
             },
         };
 
@@ -344,6 +362,7 @@ mod tests {
                     effort: "max",
                     cwd: "C:\\repo",
                     cumulative_usage: None,
+                    changes: None,
                 },
             )
             .expect("record turn")
@@ -401,6 +420,7 @@ mod tests {
             effort: "max",
             cwd: "C:\\repo",
             cumulative_usage: Some(usage),
+            changes: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -419,6 +439,28 @@ mod tests {
             Some(turn_two),
             "the baseline advances to the latest running total"
         );
+    }
+
+    #[test]
+    fn a_changelist_binding_persists_and_survives_a_none_turn() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |changes| TurnFacts {
+            reviewer: "codex",
+            cli_session_id: "thread-1",
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes,
+        };
+        store
+            .record_turn("p4", facts(Some(vec![43650, 43651])))
+            .expect("turn 1");
+        assert_eq!(store.get("p4").unwrap().changes, Some(vec![43650, 43651]));
+        // A later turn that carried no binding must not erase the one already stored.
+        store.record_turn("p4", facts(None)).expect("turn 2");
+        assert_eq!(store.get("p4").unwrap().changes, Some(vec![43650, 43651]));
     }
 
     #[test]
