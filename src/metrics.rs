@@ -263,9 +263,12 @@ pub struct Reconciled {
 ///   the total is kept only to seed a baseline. Measurement resumes on the first later turn
 ///   that reports a running total to difference against, which need not be the very next one.
 ///
-/// The expired-session retry relies on the first case: it is a fresh, non-resumed thread
-/// handed `None`, so its total is correctly taken as turn one's cost rather than differenced
-/// against the dead thread it replaced.
+/// The expired-session auto-retry once relied on the first case -- it was a fresh,
+/// non-resumed thread handed `None`, so its total was taken as turn one's cost rather than
+/// differenced against the dead thread it replaced. That retry has since been removed (an
+/// expired resume now surfaces `SESSION_NOT_FOUND` instead of starting a fresh conversation),
+/// so this is reached only by genuine turns today; the two no-baseline arms above still hold
+/// on their own terms.
 pub fn reconcile_cumulative(total: Usage, baseline: Option<Usage>, resumed: bool) -> Reconciled {
     match baseline {
         // Fold the reading onto the baseline rather than replacing it, so a turn that
@@ -300,10 +303,10 @@ pub struct Record {
     pub session: String,
     /// The turn number of the reviewer conversation this record describes.
     ///
-    /// On the expired-session retry path this is the *new* conversation's turn number,
-    /// not the one the caller asked for. A retry starts a brand new reviewer session, so
-    /// recording the old number would file a fresh turn under a resumed one and corrupt
-    /// exactly the comparison this log exists to support. See `retried`.
+    /// In records written before the expired-session auto-retry was removed, this could be
+    /// the *new* conversation's turn number after a resume target expired mid-turn -- the
+    /// retry started a brand new reviewer session, and `retried` marks those. New records
+    /// never retry, so this is simply the turn the caller ran.
     pub turn: u32,
     pub resumed: bool,
     /// Seconds since the previous turn on this session, when this turn resumed one.
@@ -311,8 +314,8 @@ pub struct Record {
     /// Only interpretable next to the cache split, which is why they sit together: a turn
     /// that re-read its history cheaply and one that paid to write the whole conversation
     /// back are indistinguishable in a cost total. Absent on a turn that resumed nothing,
-    /// including a retry that fell back to a fresh conversation -- there is no prior turn
-    /// for its cache to have been warm from.
+    /// including a genuine first turn -- there is no prior turn for its cache to have been
+    /// warm from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_secs: Option<u64>,
     pub reviewer: String,
@@ -330,10 +333,13 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Usage::is_empty")]
     pub usage: Usage,
     pub wall_secs: u64,
-    /// An earlier attempt on this turn hit an expired reviewer session and was thrown
-    /// away, so a first attempt was billed whose usage the CLI never reported back to us.
-    /// The figures in `usage` cover the surviving attempt only, and are therefore an
-    /// undercount for this turn.
+    /// Legacy: set only on records written before the expired-session auto-retry was
+    /// removed. On those, an earlier attempt on this turn hit an expired reviewer session
+    /// and was thrown away, so a first attempt was billed whose usage the CLI never reported
+    /// back -- the figures in `usage` covered the surviving attempt only and undercounted
+    /// the turn. New records always write `false` (an expired resume now fails with
+    /// `SESSION_NOT_FOUND` rather than retrying); the field stays so those older records
+    /// still read and report correctly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retried: bool,
     /// `completed` or `failed`. Owned rather than `&'static str` so a record can be read
@@ -1482,8 +1488,7 @@ mod tests {
     #[test]
     fn reconcile_first_turn_takes_the_running_total_as_this_turns_cost() {
         // No baseline and not a resume: nothing preceded this thread, so the running total
-        // is exactly this turn's cost. This is also the expired-session retry's path -- a
-        // fresh, non-resumed thread handed `None`.
+        // is exactly this turn's cost -- the path every genuine first turn takes.
         let total = Usage {
             input_tokens: Some(190_000),
             cost_usd: Some(2.81),

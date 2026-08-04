@@ -88,9 +88,13 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   reviewer reports what is resolved, what is still open, and what regressed. That request
   must carry every finding you dismissed and the evidence for dismissing it: a dismissal the
   reviewer never sees is not a dismissal, it is a bypass. Only use `fresh: true` when the
-  earlier findings would mislead. If the response reports that the session had expired and
-  was replaced with a fresh one, the reviewer remembers nothing — re-supply the earlier
-  findings and your dismissals yourself.
+  earlier findings would mislead. A re-review call can be refused rather than resumed: the
+  server returns `SESSION_NOT_RESUMABLE` when the session is past its turn or idle limit
+  (`--session-max-turns`, `--session-max-idle-seconds`) or no longer matches the reviewer,
+  model and working root that created it, and `SESSION_NOT_FOUND` when the reviewer session
+  expired out from under the resume. In every one of those cases the reviewer remembers
+  nothing, so retry with `fresh: true` and re-supply the earlier findings and your
+  dismissals yourself — nothing is carried over for you.
 - Never approve, merge, or tell the user a PR is ready to merge without that review having
   run and its findings either resolved or disputed with concrete evidence the reviewer has
   seen and answered.

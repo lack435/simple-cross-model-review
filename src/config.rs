@@ -283,6 +283,20 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 pub const DEFAULT_WAIT_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 300;
 
+/// Refuse to resume a review session idle longer than this. Past this window the reviewer's
+/// prompt cache may no longer be warm -- its lifetime depends on how the CLI is
+/// authenticated (an hour on a subscription, five minutes on an API key), which this server
+/// cannot see -- so a resume risks paying to re-read the whole conversation, and the further
+/// a session is from its last turn the more its context may have drifted from the work in
+/// front of it. The default sits just under the one-hour lifetime. The caller is told to
+/// start fresh rather than silently handed the stale resume. Zero disables the check.
+pub const DEFAULT_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
+
+/// Refuse to resume a review session that has already run this many turns. Every turn
+/// re-processes the whole conversation so far, so a long-running session is both expensive
+/// and prone to losing the thread. Zero disables the check.
+pub const DEFAULT_RESUME_MAX_TURNS: u32 = 10;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub reviewer: ReviewerKind,
@@ -294,6 +308,13 @@ pub struct Config {
     /// the project root when a harness launches us from `.mcp.json`.
     pub cwd: PathBuf,
     pub timeout: Duration,
+    /// Refuse to resume a session idle longer than this. Zero disables the check. See
+    /// `DEFAULT_RESUME_MAX_IDLE_SECS`. A tripped session is refused with
+    /// SESSION_NOT_RESUMABLE, not silently restarted, so the caller decides to start fresh.
+    pub resume_max_idle: Duration,
+    /// Refuse to resume a session that has already run this many turns. Zero disables the
+    /// check. See `DEFAULT_RESUME_MAX_TURNS`.
+    pub resume_max_turns: u32,
     pub state_dir: PathBuf,
     /// Codex sandbox policy.
     pub sandbox: String,
@@ -352,6 +373,8 @@ impl Config {
         let mut bin: Option<PathBuf> = None;
         let mut cwd: Option<PathBuf> = None;
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
+        let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
+        let mut resume_max_turns = DEFAULT_RESUME_MAX_TURNS;
         let mut state_dir: Option<PathBuf> = None;
         let mut sandbox = "read-only".to_string();
         let mut allowed_tools: Option<String> = None;
@@ -404,6 +427,20 @@ impl Config {
                     if timeout_secs == 0 {
                         return Err("--timeout-seconds must be greater than 0".into());
                     }
+                }
+                "--session-max-turns" => {
+                    let v = take("--session-max-turns")?;
+                    resume_max_turns = v.parse().map_err(|_| {
+                        format!("--session-max-turns must be an integer (0 disables), got '{v}'")
+                    })?;
+                }
+                "--session-max-idle-seconds" => {
+                    let v = take("--session-max-idle-seconds")?;
+                    resume_max_idle_secs = v.parse().map_err(|_| {
+                        format!(
+                            "--session-max-idle-seconds must be an integer (0 disables), got '{v}'"
+                        )
+                    })?;
                 }
                 "--state-dir" => state_dir = Some(PathBuf::from(take("--state-dir")?)),
                 "--sandbox" => sandbox = take("--sandbox")?,
@@ -522,6 +559,8 @@ impl Config {
             state_dir,
             cwd,
             timeout: Duration::from_secs(timeout_secs),
+            resume_max_idle: Duration::from_secs(resume_max_idle_secs),
+            resume_max_turns,
             sandbox,
             allowed_tools,
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
@@ -779,6 +818,18 @@ OPTIONS:
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
   --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800.
+  --session-max-turns <n>     Refuse to resume a review session once it has run this many
+                              turns; the caller must start fresh (fresh=true) or use a new
+                              session name. Each turn re-processes the whole conversation, so
+                              a long session grows expensive and prone to drift. 0 disables.
+                              Default: 10.
+  --session-max-idle-seconds <n>
+                              Refuse to resume a review session idle longer than this many
+                              seconds. Past it the reviewer's prompt cache may no longer be
+                              warm and its context may have drifted, so a resume risks
+                              re-reading the whole conversation. The caller is told to start
+                              fresh rather than silently handed the stale resume. 0 disables.
+                              Default: 3300 (55 minutes, just under the 1h cache lifetime).
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
@@ -937,6 +988,54 @@ mod tests {
         let err = Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "0"]))
             .unwrap_err();
         assert!(err.contains("greater than 0"));
+    }
+
+    #[test]
+    fn resume_limits_default_override_and_disable() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.resume_max_turns, DEFAULT_RESUME_MAX_TURNS);
+        assert_eq!(cfg.resume_max_idle.as_secs(), DEFAULT_RESUME_MAX_IDLE_SECS);
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--session-max-turns",
+            "3",
+            "--session-max-idle-seconds",
+            "120",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.resume_max_turns, 3);
+        assert_eq!(cfg.resume_max_idle.as_secs(), 120);
+
+        // Zero on either disables that check rather than being rejected.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--session-max-turns",
+            "0",
+            "--session-max-idle-seconds",
+            "0",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.resume_max_turns, 0);
+        assert!(cfg.resume_max_idle.is_zero());
+
+        // A non-integer is a configuration mistake, not a value to guess at.
+        assert!(Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--session-max-turns",
+            "lots"
+        ]))
+        .is_err());
+        assert!(Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--session-max-idle-seconds",
+            "soon"
+        ]))
+        .is_err());
     }
 
     #[test]

@@ -144,12 +144,16 @@ impl App {
         } else {
             self.sessions.get(&session)
         };
-        let prior = prior.filter(|record| {
-            // A session belongs to the reviewer that created it. If the project's
-            // configuration now points at a different CLI or model, start over rather
-            // than trying to resume someone else's conversation.
-            record.reviewer == self.cfg.reviewer.as_str() && record.model == self.cfg.model
-        });
+
+        // A stored session that exists but must not be resumed is refused here, while the
+        // lease is held and before anything is spawned or billed, so the caller explicitly
+        // chooses to start fresh (fresh=true, or a new session name) rather than being
+        // silently handed a review with no memory of the work it asked to continue.
+        if let Some(record) = &prior {
+            if let Some(reason) = resume_block(&self.cfg, record, now_unix()) {
+                return Err(errors::session_not_resumable(&session, reason));
+            }
+        }
 
         let (resume_id, turn, resumed) = match &prior {
             Some(record) => (
@@ -506,6 +510,18 @@ impl App {
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
         out.push_str(&format!("turn timeout:  {}s\n", self.cfg.timeout.as_secs()));
         out.push_str(&format!(
+            "resume limits: {}, {} (a session past either is refused, not silently restarted)\n",
+            match self.cfg.resume_max_turns {
+                0 => "no turn cap".to_string(),
+                n => format!("max {n} turns"),
+            },
+            if self.cfg.resume_max_idle.is_zero() {
+                "no idle cap".to_string()
+            } else {
+                format!("idle up to {}", fmt_elapsed(self.cfg.resume_max_idle))
+            },
+        ));
+        out.push_str(&format!(
             "isolation:     {}\n",
             if self.cfg.isolate_reviewer {
                 "on (reviewer loads no project hooks, settings, plugins or MCP servers)"
@@ -618,50 +634,26 @@ struct Job {
     _lease: Option<ExclusiveLock>,
 }
 
-/// What the attempt that produced the outcome actually did.
+/// What the attempt that produced the outcome actually did, gathered for the usage record.
 ///
-/// Separate from the `Job`'s own fields because the two can disagree: the expired-session
-/// retry runs turn 1 of a brand new conversation regardless of which turn the caller
-/// asked for. Recording the caller's numbers there would file a fresh turn as a resumed
-/// one, carrying a cache gap it never had -- and that comparison is the reason the usage
-/// log exists at all.
+/// `prompt_bytes` is filled in by `attempt` through an out-parameter, so it survives the
+/// error paths there: a failed turn still sent a prompt, and its size is part of explaining
+/// the cost.
 #[derive(Clone, Copy)]
 struct AttemptFacts {
     turn: u32,
     resumed: bool,
     gap_secs: Option<u64>,
     prompt_bytes: usize,
-    /// An earlier attempt was billed and thrown away. Its usage is not recoverable -- the
-    /// CLI reports usage on the run we abandoned -- so the figures alongside this are an
-    /// undercount, and say so.
-    retried: bool,
 }
 
 impl AttemptFacts {
-    /// What the caller's turn looks like before anything goes wrong.
-    fn first(turn: u32, resumed: bool, gap_secs: Option<u64>) -> Self {
+    fn new(turn: u32, resumed: bool, gap_secs: Option<u64>) -> Self {
         Self {
             turn,
             resumed,
             gap_secs,
             prompt_bytes: 0,
-            retried: false,
-        }
-    }
-
-    /// What the expired-session retry looks like.
-    ///
-    /// Turn 1 of a conversation that did not exist a moment ago: not resumed, and with no
-    /// gap, because there is no earlier turn whose cache it could have reused. A pure
-    /// function so the branch is testable without a live reviewer CLI -- it is otherwise
-    /// reachable only by making a real CLI fail in a specific way.
-    fn after_expired_session() -> Self {
-        Self {
-            turn: 1,
-            resumed: false,
-            gap_secs: None,
-            prompt_bytes: 0,
-            retried: true,
         }
     }
 }
@@ -695,9 +687,8 @@ impl Job {
             armed: true,
         };
 
-        // Captured once, before either attempt: the retry below re-runs the same review
-        // in a new reviewer session, so re-running git for it would only spend time and
-        // risk showing the two turns different trees.
+        // Captured once, before the attempt runs, so the reviewer's prompt and the usage
+        // metrics below describe the same diff.
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
@@ -708,11 +699,8 @@ impl Job {
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
-        // What the surviving attempt actually did, as opposed to what the caller asked
-        // for. The retry below starts a brand new reviewer conversation, and filing that
-        // under the old turn number would record a fresh turn as a resumed one -- exactly
-        // the distinction the usage log exists to draw.
-        let mut facts = AttemptFacts::first(self.turn, resume_id.is_some(), self.gap_secs);
+        // What this attempt did, for the usage record.
+        let mut facts = AttemptFacts::new(self.turn, resume_id.is_some(), self.gap_secs);
 
         let outcome = match self.attempt(
             resume_id.as_deref(),
@@ -724,48 +712,22 @@ impl Job {
         ) {
             Ok(outcome) => outcome,
             Err(failure) => {
-                // A resume target that has expired is recoverable: drop the stale
-                // mapping and review the work in a brand new session instead of
-                // handing the caller a dead end.
+                // A resume target the reviewer no longer has is a dead mapping: drop it so a
+                // follow-up call is not billed for the same doomed resume. The failure is
+                // then reported rather than silently retried into a fresh conversation --
+                // the caller is told the session expired and decides whether to start over
+                // (fresh=true), the same explicit contract the pre-flight resume checks use.
+                // Its remediation already says exactly that.
                 if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
                     self.sessions.forget(&self.session).ok();
                     eprintln!(
-                        "cross-review: session '{}' could not be resumed; starting a fresh \
-                         reviewer session",
+                        "cross-review: session '{}' could not be resumed (the reviewer no \
+                         longer has it); reporting SESSION_NOT_FOUND rather than silently \
+                         starting a fresh session",
                         self.session
                     );
-                    // The retry is a different conversation, so the record describes that
-                    // one: turn 1, not resumed, and no cache gap, because there is no
-                    // prior turn its cache could have been warm from. `retried` is what
-                    // says a discarded attempt was also billed.
-                    facts = AttemptFacts::after_expired_session();
-                    self.registry.set_phase(&self.id, Phase::Launching);
-                    // No baseline: the retry is a brand new reviewer thread, so subtracting
-                    // the expired thread's running total from it would record this turn as a
-                    // cross-thread delta -- near zero when the fresh total is smaller, junk
-                    // when it is larger.
-                    match self.attempt(
-                        None,
-                        1,
-                        None,
-                        change.as_deref(),
-                        &capture_warnings,
-                        &mut facts.prompt_bytes,
-                    ) {
-                        Ok(mut outcome) => {
-                            if let Some(review) = outcome.review.take() {
-                                outcome.review = Some(format!(
-                                    "NOTE: the previous review session had expired, so this is a \
-                                     fresh review with no memory of earlier turns.\n\n{review}"
-                                ));
-                            }
-                            outcome
-                        }
-                        Err(failure) => Outcome::failed(failure),
-                    }
-                } else {
-                    Outcome::failed(failure)
                 }
+                Outcome::failed(failure)
             }
         };
         // Everything telemetry needs, taken before the outcome moves into the registry.
@@ -812,7 +774,7 @@ impl Job {
         let diff_truncated = change.map(|c| c.diff_truncated).unwrap_or(false);
 
         eprintln!(
-            "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}{}",
+            "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}",
             self.cfg.reviewer.as_str(),
             facts.turn,
             self.session,
@@ -829,11 +791,6 @@ impl Job {
                 "no usage reported by the CLI".to_string()
             } else {
                 usage.summary()
-            },
-            if facts.retried {
-                " (an earlier attempt was billed and discarded: the reviewer session had expired)"
-            } else {
-                ""
             },
         );
 
@@ -853,7 +810,11 @@ impl Job {
             diff_truncated,
             usage,
             wall_secs: started.elapsed().as_secs(),
-            retried: facts.retried,
+            // Turns are no longer auto-retried after an expired session -- the failure is
+            // surfaced instead -- so a freshly written record is never a retry. The field
+            // stays in the schema so the reader can still report `retried: true` from
+            // records written before that change.
+            retried: false,
             status: status.to_string(),
             failure_code,
         });
@@ -956,8 +917,9 @@ impl Job {
         // every later one is inflated by everything before it -- which is exactly what
         // happened, and it is invisible in a single figure.
         //
-        // The baseline is passed in, not read from the job, so the expired-session retry --
-        // a brand new thread -- gets `None` and never differences against a dead thread.
+        // The baseline is passed in as a parameter rather than read from the job, so a fresh
+        // (non-resumed) turn gets `None` and never differences its total against another
+        // thread's, keeping this reconciliation a pure function of its inputs.
         // `baseline_to_persist` is what the next turn will subtract against: when a baseline
         // already exists it is always carried forward (an empty reading keeps the old one
         // rather than erasing it), and only in the no-baseline case is one persisted solely
@@ -1073,6 +1035,69 @@ impl Job {
 // Argument helpers
 // ---------------------------------------------------------------------------
 
+/// Why a stored session must not be resumed, phrased for the calling agent, or `None` when
+/// it may be. Checked while the session lease is held and before any reviewer is spawned,
+/// so a refusal costs nothing. `fresh: true` never reaches here -- it looks up no prior --
+/// so it is always the escape hatch.
+///
+/// Every branch refuses rather than silently starting a new session. A resume that quietly
+/// became a fresh review is the one outcome this tool must not produce: the caller asked
+/// for continuity and would act on the answer as though it had it.
+fn resume_block(cfg: &Config, record: &session::SessionRecord, now: u64) -> Option<String> {
+    // Identity first: a session belongs to the reviewer, model and working root that
+    // created it. A configuration that now points elsewhere cannot resume that conversation
+    // at all, so the honest answer is to start over -- explicitly, so the caller learns the
+    // earlier context is gone rather than inheriting it silently.
+    if record.reviewer != cfg.reviewer.as_str() {
+        return Some(format!(
+            "it was created by reviewer '{}', but this server is now configured for '{}', and \
+             a conversation cannot move between reviewers.",
+            record.reviewer,
+            cfg.reviewer.as_str()
+        ));
+    }
+    if record.model != cfg.model {
+        return Some(format!(
+            "it was created with model '{}', but this server is now configured for '{}'.",
+            record.model, cfg.model
+        ));
+    }
+    let cwd = cfg.cwd.to_string_lossy();
+    // Windows paths are case-insensitive, and the state directory is already keyed
+    // case-insensitively, so a case-only difference here is the same root, not a new one.
+    if !record.cwd.eq_ignore_ascii_case(&cwd) {
+        return Some(format!(
+            "it was created against working root '{}', but this server is now working in '{}'.",
+            record.cwd, cwd
+        ));
+    }
+
+    // Then staleness. Turns before idle: when a session is both long and old, "it ran too
+    // many turns" is the more specific thing to say.
+    if cfg.resume_max_turns > 0 && record.turns >= cfg.resume_max_turns {
+        return Some(format!(
+            "it has already run {} turn(s), reaching the configured limit of {} \
+             (--session-max-turns); each turn re-processes the whole conversation so far, so a \
+             longer session grows expensive and prone to drift.",
+            record.turns, cfg.resume_max_turns
+        ));
+    }
+    if !cfg.resume_max_idle.is_zero() {
+        let idle = now.saturating_sub(record.updated_unix);
+        if idle > cfg.resume_max_idle.as_secs() {
+            return Some(format!(
+                "it was last used {} ago, past the configured {} resume window \
+                 (--session-max-idle-seconds); by then the reviewer's prompt cache may no \
+                 longer be warm and its context may have drifted, so resuming risks paying to \
+                 re-read the whole conversation.",
+                fmt_age(idle),
+                fmt_elapsed(cfg.resume_max_idle)
+            ));
+        }
+    }
+    None
+}
+
 /// What to tell a caller holding the id of a review that has been evicted.
 ///
 /// Names both caps, not just the per-session one. Either can be the reason, and a caller
@@ -1185,31 +1210,109 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn a_retry_after_an_expired_session_is_recorded_as_the_fresh_turn_it_is() {
-        // The retry runs turn 1 of a conversation that did not exist a moment ago. An
-        // earlier version kept the caller's turn number, `resumed: true`, and the old
-        // session's gap, filing a fresh turn as a resumed one -- corrupting exactly the
-        // comparison the usage log exists to support. Extracted into a pure function so
-        // the branch is reachable in a test: otherwise it needs a live CLI failing in one
-        // specific way.
-        let first = AttemptFacts::first(7, true, Some(900));
-        assert_eq!(first.turn, 7);
-        assert!(first.resumed);
-        assert_eq!(first.gap_secs, Some(900));
-        assert!(!first.retried);
+    /// A session record identical to what `cfg` would create, aged and lengthened to order.
+    fn record_matching(
+        cfg: &Config,
+        turns: u32,
+        updated_unix: u64,
+    ) -> crate::session::SessionRecord {
+        crate::session::SessionRecord {
+            reviewer: cfg.reviewer.as_str().to_string(),
+            cli_session_id: "sid-1".to_string(),
+            model: cfg.model.clone(),
+            effort: cfg.effort.clone(),
+            cwd: cfg.cwd.to_string_lossy().to_string(),
+            turns,
+            created_unix: 0,
+            updated_unix,
+            cumulative_usage: None,
+        }
+    }
 
-        let retry = AttemptFacts::after_expired_session();
-        assert_eq!(retry.turn, 1, "the retry is turn 1 of a new conversation");
-        assert!(!retry.resumed);
-        assert_eq!(
-            retry.gap_secs, None,
-            "there is no earlier turn whose cache this one could have reused"
-        );
-        assert!(
-            retry.retried,
-            "the discarded attempt was billed and the figures undercount it"
-        );
+    #[test]
+    fn a_fresh_short_matching_session_resumes() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+        let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
+        assert!(resume_block(&cfg, &ok, now).is_none());
+    }
+
+    #[test]
+    fn reaching_the_turn_limit_refuses_resume() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+        // One below the cap still resumes; the cap itself does not.
+        assert!(resume_block(
+            &cfg,
+            &record_matching(&cfg, cfg.resume_max_turns - 1, now),
+            now
+        )
+        .is_none());
+        let reason = resume_block(&cfg, &record_matching(&cfg, cfg.resume_max_turns, now), now)
+            .expect("at the cap it is refused");
+        assert!(reason.contains("turn"), "{reason}");
+        assert!(reason.contains("--session-max-turns"), "{reason}");
+    }
+
+    #[test]
+    fn passing_the_idle_window_refuses_resume() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+        let idle = cfg.resume_max_idle.as_secs();
+        // Exactly at the window still resumes; one second past it does not.
+        assert!(resume_block(&cfg, &record_matching(&cfg, 1, now - idle), now).is_none());
+        let reason = resume_block(&cfg, &record_matching(&cfg, 1, now - idle - 1), now)
+            .expect("past the window it is refused");
+        assert!(reason.contains("resume window"), "{reason}");
+        assert!(reason.contains("--session-max-idle-seconds"), "{reason}");
+    }
+
+    #[test]
+    fn identity_mismatch_refuses_rather_than_silently_starting_fresh() {
+        // reviewer, model and working root each pin the session. A configuration that now
+        // points elsewhere is told so explicitly rather than being handed a fresh review.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+
+        let mut wrong_reviewer = record_matching(&cfg, 1, now);
+        wrong_reviewer.reviewer = "claude".to_string();
+        assert!(resume_block(&cfg, &wrong_reviewer, now)
+            .expect("refused")
+            .contains("reviewer"));
+
+        let mut wrong_model = record_matching(&cfg, 1, now);
+        wrong_model.model = "gpt-5.6-sol".to_string();
+        assert!(resume_block(&cfg, &wrong_model, now)
+            .expect("refused")
+            .contains("model"));
+
+        let mut wrong_cwd = record_matching(&cfg, 1, now);
+        wrong_cwd.cwd = "C:\\somewhere\\else".to_string();
+        assert!(resume_block(&cfg, &wrong_cwd, now)
+            .expect("refused")
+            .contains("working root"));
+
+        // A case-only difference in the working root is the same root on Windows.
+        let mut cased = record_matching(&cfg, 1, now);
+        cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
+        assert!(resume_block(&cfg, &cased, now).is_none());
+    }
+
+    #[test]
+    fn zero_disables_the_staleness_checks() {
+        // A session that is both ancient and very long still resumes when both caps are off.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--session-max-turns".into(),
+            "0".into(),
+            "--session-max-idle-seconds".into(),
+            "0".into(),
+        ])
+        .expect("config");
+        let now = 1_000_000;
+        let ancient_and_long = record_matching(&cfg, 999, 0);
+        assert!(resume_block(&cfg, &ancient_and_long, now).is_none());
     }
 
     #[test]
