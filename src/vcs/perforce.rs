@@ -191,12 +191,14 @@ impl Budget {
         }
     }
 
-    /// Take up to `self.diff_remaining` bytes of diff text, recording truncation.
-    fn take_diff(&mut self, text: String) -> String {
+    /// Take up to `self.diff_remaining` bytes of diff text, reporting whether *this* take was
+    /// cut short so the caller can mark the affected changelist incomplete and say so in the
+    /// prompt -- a caller-only warning would leave the reviewer reading a partial diff blind.
+    fn take_diff(&mut self, text: String) -> (String, bool) {
         let section = truncate(text, self.diff_remaining);
         self.diff_remaining -= section.text.len();
         self.diff_truncated |= section.truncated;
-        section.text
+        (section.text, section.truncated)
     }
 }
 
@@ -223,6 +225,9 @@ struct Segment {
     listing: String,
     /// The unified diff text (already drawn from the global budget).
     diff: String,
+    /// Whether this changelist's diff was cut short by the combined-diff budget, so the
+    /// render says so where the diff is shown, not only in the caller's warnings.
+    diff_truncated: bool,
     /// Contents of files opened for add.
     added: Vec<AddedFile>,
     /// Per-file omission notes (out-of-root, binary, unreadable, unmapped, ...).
@@ -256,7 +261,7 @@ impl<'a> P4<'a> {
         let description = cap_desc(&meta.description);
 
         if meta.submitted {
-            self.submitted_segment(cl, info, &meta, description, budget)
+            self.submitted_segment(cl, &meta, description, budget)
         } else {
             self.pending_segment(cl, info, &meta, description, budget)
         }
@@ -266,11 +271,32 @@ impl<'a> P4<'a> {
     fn submitted_segment(
         &self,
         cl: u64,
-        info: &Info,
         meta: &DescribeMeta,
         description: String,
         budget: &mut Budget,
     ) -> CaptureOne {
+        // A submitted changelist always has affected files; an empty ledger means the metadata
+        // was restricted (`p4 describe` redacts a change the user cannot see, e.g. `desc no
+        // permission` with no files). Render it as incomplete rather than as an empty change.
+        if meta.files.is_empty() {
+            return CaptureOne::Segment(Segment {
+                change: cl,
+                basis: DiffBasis::ServerRevision,
+                complete: false,
+                incomplete_reason: Some(
+                    "this submitted changelist returned no accessible file list (it is likely \
+                     restricted), so no diff is available"
+                        .to_string(),
+                ),
+                description,
+                listing: String::new(),
+                diff: String::new(),
+                diff_truncated: false,
+                added: Vec::new(),
+                omissions: Vec::new(),
+            });
+        }
+
         let (raw, output_truncated) = match self.run(&["describe", "-du", &cl.to_string()], "") {
             Some(out) if out.success => (out.stdout, out.stdout_truncated),
             Some(out) if out.cancelled => return CaptureOne::Cancelled,
@@ -285,12 +311,24 @@ impl<'a> P4<'a> {
 
         let sections = parse_describe_diff(&raw);
         // Map every affected file's local location so out-of-root sections can be dropped.
-        let wheres = self.where_of(sections.iter().map(|s| s.depot.as_str()));
+        let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
 
         let mut listing = String::new();
         let mut diff = String::new();
         let mut omissions = Vec::new();
         let mut complete = true;
+        let mut diff_truncated = false;
+
+        // The `describe -s` ledger or the `where` mapping being cut off means files may be
+        // missing or misjudged as out-of-root; either way the changelist is not fully shown.
+        if meta.truncated || where_truncated {
+            complete = false;
+            omissions.push(
+                "The changelist metadata hit the output size cap, so its file list may be \
+                 incomplete."
+                    .to_string(),
+            );
+        }
 
         // The indexed file list from `describe -s` is the completeness ledger: every one of
         // these must be accounted for, present as a diff section or explicitly labelled.
@@ -300,7 +338,7 @@ impl<'a> P4<'a> {
         for file in &meta.files {
             let local = wheres.get(file.depot.as_str());
             let in_root = match local {
-                Some(WhereResult::Mapped(path)) => within_root(path, self.cwd, info),
+                Some(WhereResult::Mapped(path)) => within_root(path, self.cwd),
                 _ => false,
             };
             let local_label = match local {
@@ -326,11 +364,15 @@ impl<'a> P4<'a> {
 
             match section_by_depot.get(file.depot.as_str()) {
                 Some(section) if !section.body.trim().is_empty() => {
-                    let piece = budget.take_diff(format!(
+                    let (piece, cut) = budget.take_diff(format!(
                         "==== {} ({}) ====\n{}\n",
                         file.depot, file.action, section.body
                     ));
                     diff.push_str(&piece);
+                    if cut {
+                        diff_truncated = true;
+                        complete = false;
+                    }
                 }
                 _ => {
                     // No textual hunk: binary, empty, or a pure add/delete describe records
@@ -378,6 +420,7 @@ impl<'a> P4<'a> {
             description,
             listing,
             diff,
+            diff_truncated,
             added: Vec::new(),
             omissions,
         })
@@ -414,12 +457,13 @@ impl<'a> P4<'a> {
                 description,
                 listing,
                 diff: String::new(),
+                diff_truncated: false,
                 added: Vec::new(),
                 omissions: Vec::new(),
             });
         }
 
-        let opened = match self.opened(cl) {
+        let (opened, opened_truncated) = match self.opened(cl) {
             Some(Ok(opened)) => opened,
             Some(Err(reason)) => return CaptureOne::Skipped(reason),
             None => return CaptureOne::Cancelled,
@@ -444,6 +488,7 @@ impl<'a> P4<'a> {
                 description,
                 listing,
                 diff: String::new(),
+                diff_truncated: false,
                 added: Vec::new(),
                 omissions: Vec::new(),
             });
@@ -451,13 +496,25 @@ impl<'a> P4<'a> {
 
         // Map every opened file to its local path, so both diff and add-reads can be confined
         // to the working root before any bytes are read.
-        let wheres = self.where_of(opened.iter().map(|f| f.depot.as_str()));
+        let (wheres, where_truncated) = self.where_of(opened.iter().map(|f| f.depot.as_str()));
 
         let mut listing = String::new();
         let mut omissions = Vec::new();
         let mut edit_targets: Vec<String> = Vec::new();
         let mut adds: Vec<(String, PathBuf)> = Vec::new(); // (depot, local)
         let mut complete = true;
+        let mut diff_truncated = false;
+
+        // A truncated opened-file listing or where mapping means files may be missing or
+        // wrongly judged out-of-root; the changelist is not fully shown either way.
+        if opened_truncated || where_truncated {
+            complete = false;
+            omissions.push(
+                "The opened-file listing hit the output size cap, so some opened files may not \
+                 be shown."
+                    .to_string(),
+            );
+        }
 
         for file in &opened {
             let local = match wheres.get(file.depot.as_str()) {
@@ -466,7 +523,7 @@ impl<'a> P4<'a> {
             };
             let in_root = local
                 .as_ref()
-                .map(|p| within_root(p, self.cwd, info))
+                .map(|p| within_root(p, self.cwd))
                 .unwrap_or(false);
             let local_label = local
                 .as_ref()
@@ -493,7 +550,18 @@ impl<'a> P4<'a> {
             match ActionKind::of(&file.action) {
                 ActionKind::Edit => edit_targets.push(file.depot.clone()),
                 ActionKind::Add => adds.push((file.depot.clone(), local)),
-                ActionKind::Delete => { /* listing only; no content */ }
+                ActionKind::Delete => {
+                    // `p4 diff` skips deletes, so unlike a git diff the removed content is not
+                    // shown -- only the fact of the deletion, in the listing. Say so and mark
+                    // the changelist incomplete: a reviewer must not read a delete-only
+                    // changelist as fully covered.
+                    complete = false;
+                    omissions.push(format!(
+                        "`{}` is deleted; the removed content is not shown (p4 does not diff \
+                         deletes).",
+                        safe_label(&file.depot)
+                    ));
+                }
                 ActionKind::Other => {
                     complete = false;
                     omissions.push(format!(
@@ -520,7 +588,12 @@ impl<'a> P4<'a> {
                                 .to_string(),
                         );
                     }
-                    diff = budget.take_diff(out.stdout);
+                    let (text, cut) = budget.take_diff(out.stdout);
+                    diff = text;
+                    if cut {
+                        diff_truncated = true;
+                        complete = false;
+                    }
                 }
                 Some(out) if out.cancelled => return CaptureOne::Cancelled,
                 Some(out) => {
@@ -608,6 +681,7 @@ impl<'a> P4<'a> {
             description,
             listing,
             diff,
+            diff_truncated,
             added,
             omissions,
         })
@@ -695,6 +769,13 @@ fn render(
         } else {
             out.push_str("#### Diff\n\n");
             push_fenced(&mut out, "diff", &seg.diff);
+            if seg.diff_truncated {
+                out.push_str(
+                    "\n**The diff above was truncated at the combined size cap**, so it is not \
+                     the whole change. Judge only what you can see, and say under \"What I could \
+                     not check\" that the rest was not shown.\n",
+                );
+            }
             out.push('\n');
         }
 
@@ -847,7 +928,10 @@ impl<'a> P4<'a> {
             )));
         }
         match parse_describe_ztag(&out.stdout) {
-            Some(meta) => Some(Ok(meta)),
+            Some(mut meta) => {
+                meta.truncated = out.stdout_truncated;
+                Some(Ok(meta))
+            }
             None => Some(Err(format!(
                 "`p4 describe -s {cl}` returned no usable metadata (restricted or unknown \
                  changelist)"
@@ -855,7 +939,8 @@ impl<'a> P4<'a> {
         }
     }
 
-    fn opened(&self, cl: u64) -> Option<Result<Vec<OpenedFile>, String>> {
+    /// Files opened for a changelist, plus whether the listing was cut off at the size cap.
+    fn opened(&self, cl: u64) -> Option<Result<(Vec<OpenedFile>, bool), String>> {
         let out = self.run(&["-ztag", "opened", "-c", &cl.to_string()], "")?;
         if out.cancelled {
             return None;
@@ -864,27 +949,34 @@ impl<'a> P4<'a> {
             // "not opened on this client" is a normal, non-fatal answer -> empty.
             let diag = out.diagnostics();
             if diag.contains("not opened") || diag.trim().is_empty() {
-                return Some(Ok(Vec::new()));
+                return Some(Ok((Vec::new(), false)));
             }
             return Some(Err(format!(
                 "`p4 opened -c {cl}` failed: {}",
                 first_line(&diag)
             )));
         }
-        Some(Ok(parse_opened_ztag(&out.stdout)))
+        Some(Ok((parse_opened_ztag(&out.stdout), out.stdout_truncated)))
     }
 
     /// Map depot paths to local paths via `p4 where`, fed on stdin so there is no
     /// command-line length limit and no risk of an empty argument broadening the command.
-    fn where_of<'b>(&self, depots: impl Iterator<Item = &'b str>) -> BTreeMap<String, WhereResult> {
+    ///
+    /// Returns the effective map and whether the output was truncated. A truncated `where`
+    /// simply omits some mappings, which the callers already treat as unmapped (out of the
+    /// working root), so the flag is a belt-and-suspenders signal rather than the only one.
+    fn where_of<'b>(
+        &self,
+        depots: impl Iterator<Item = &'b str>,
+    ) -> (BTreeMap<String, WhereResult>, bool) {
         let paths: Vec<&str> = depots.collect();
         if paths.is_empty() {
-            return BTreeMap::new();
+            return (BTreeMap::new(), false);
         }
         let stdin = paths.join("\n") + "\n";
         match self.run(&["-ztag", "-x", "-", "where"], &stdin) {
-            Some(out) if out.success => parse_where_ztag(&out.stdout),
-            _ => BTreeMap::new(),
+            Some(out) if out.success => (parse_where_ztag(&out.stdout), out.stdout_truncated),
+            _ => (BTreeMap::new(), false),
         }
     }
 }
@@ -917,6 +1009,9 @@ struct DescribeMeta {
     client: String,
     description: String,
     files: Vec<AffectedFile>,
+    /// Whether the `p4 describe -s` output was cut off at the runner's size cap, so the file
+    /// ledger may be short and the changelist must be treated as incomplete.
+    truncated: bool,
 }
 
 struct AffectedFile {
@@ -1084,6 +1179,7 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
         client,
         description,
         files,
+        truncated: false,
     })
 }
 
@@ -1131,31 +1227,64 @@ fn strip_rev(spec: &str) -> &str {
     }
 }
 
-/// Whether an opened file's type marks it binary, independent of NUL sniffing.
+/// Whether an opened file's Perforce type marks it binary, independent of NUL sniffing.
+///
+/// Classified by *base* type (the part before any `+modifiers`), because a binary file must
+/// never be read and rendered as lossy UTF-8. The NUL sniff in the caller is a backstop for a
+/// file typed as text that is not; this catches the ones the type already declares -- including
+/// the legacy combined spellings (`ubinary`, `xbinary`, `uxbinary`, `tempobj`) that do not
+/// start with "binary", plus `utf16`, which is full of NUL bytes.
 fn is_binary_type(depot: &str, opened: &[OpenedFile]) -> bool {
     opened
         .iter()
         .find(|f| f.depot == depot)
-        .map(|f| f.ptype.starts_with("binary") || f.ptype.contains("binary+"))
+        .map(|f| base_type_is_binary(&f.ptype))
         .unwrap_or(false)
 }
 
-/// Whether a resolved local path is inside the working root.
+fn base_type_is_binary(ptype: &str) -> bool {
+    let base = ptype.split('+').next().unwrap_or(ptype).trim();
+    matches!(
+        base,
+        "binary"
+            | "ubinary"
+            | "xbinary"
+            | "uxbinary"
+            | "tempobj"
+            | "xtempobj"
+            | "resource"
+            | "apple"
+            | "utf16"
+    )
+}
+
+/// Whether a resolved local path is inside the **working root** (`cwd`).
 ///
-/// Existing files are canonicalised (resolving symlinks/junctions) before the check; a path
-/// that does not exist -- a deleted file, or a `where` mapping for a file not on disk -- gets
-/// a lexical check so it is not dropped merely because it cannot be canonicalised.
-fn within_root(path: &Path, cwd: &Path, info: &Info) -> bool {
+/// Confined to `cwd`, not the client root: the reviewer's own reads are scoped to `cwd`, so
+/// a file the client view maps elsewhere -- which `p4 where` will still report a mapping for,
+/// even when nothing is on disk -- must be dropped. Existing files are canonicalised (resolving
+/// symlinks/junctions) before the check. A path with nothing on disk to resolve -- a deleted
+/// file, or a mapping for a file not present -- gets a lexical check so it is not dropped
+/// merely for being absent, and that check fails closed: a `..` component could escape a
+/// prefix test, so any such path is treated as outside.
+fn within_root(path: &Path, cwd: &Path) -> bool {
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if let Ok(resolved) = path.canonicalize() {
         return reviewer::is_within(&resolved, &root);
     }
-    // Lexical containment for a path with nothing on disk to resolve. Both the working root
-    // and the client root are accepted anchors, since the client root is where the view maps.
-    lexically_within(path, cwd) || lexically_within(path, Path::new(&info.root))
+    lexically_within(path, cwd)
 }
 
 fn lexically_within(path: &Path, root: &Path) -> bool {
+    // Fail closed on any parent-dir component: a lexical prefix test cannot see through `..`,
+    // so `cwd\..\sibling` would spuriously pass. Canonicalisation handles it for real files;
+    // for an absent path there is nothing to resolve, so refuse it.
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
     let p = path.to_string_lossy().to_lowercase().replace('/', "\\");
     let mut r = root.to_string_lossy().to_lowercase().replace('/', "\\");
     if !r.ends_with('\\') {
@@ -1373,6 +1502,35 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn base_type_covers_binary_aliases_and_modifiers() {
+        // The legacy combined spellings do not start with "binary", so a prefix check would
+        // miss them and read a `.uasset` as lossy text.
+        for t in [
+            "binary", "binary+l", "ubinary", "xbinary", "uxbinary", "tempobj", "xtempobj",
+            "resource", "apple", "utf16", "binary+w",
+        ] {
+            assert!(base_type_is_binary(t), "{t} should be binary");
+        }
+        for t in ["text", "text+w", "unicode", "utf8", "symlink", "ktext"] {
+            assert!(!base_type_is_binary(t), "{t} should not be binary");
+        }
+    }
+
+    #[test]
+    fn containment_is_cwd_only_and_fails_closed_on_parent_dir() {
+        let cwd = Path::new("C:\\dev\\main\\UE");
+        // A nonexistent path outside cwd is rejected, even if it is under a broader client
+        // root -- the reviewer's reads are scoped to cwd, so ours are too.
+        assert!(!within_root(Path::new("C:\\dev\\main\\Other\\x.txt"), cwd));
+        assert!(within_root(Path::new("C:\\dev\\main\\UE\\gone.txt"), cwd));
+        // A `..` component cannot be seen through by a lexical prefix test, so it fails closed.
+        assert!(!lexically_within(
+            Path::new("C:\\dev\\main\\UE\\..\\Other\\x"),
+            cwd
+        ));
+    }
+
+    #[test]
     fn lexical_containment_keeps_deleted_files_and_rejects_siblings() {
         let root = Path::new("C:\\dev\\main\\UE");
         // A file with nothing on disk still counts as inside by its lexical path.
@@ -1409,6 +1567,7 @@ Change 5 by u@c on 2026/01/01\n\n\
             description: "Add the feature\nwith detail".into(),
             listing: "edit         //depot/a  (a)\nadd          //depot/b  (b)\n".into(),
             diff: "@@ -1 +1 @@\n-a\n+b\n".into(),
+            diff_truncated: false,
             added: vec![AddedFile {
                 depot: "//depot/b".into(),
                 local: "b".into(),
