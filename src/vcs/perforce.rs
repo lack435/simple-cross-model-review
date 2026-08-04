@@ -285,7 +285,7 @@ impl<'a> P4<'a> {
                 complete: false,
                 incomplete_reason: Some(
                     "this submitted changelist returned no accessible file list (it is likely \
-                     restricted), so no diff is available"
+                     restricted, or its metadata was truncated), so no diff is available"
                         .to_string(),
                 ),
                 description,
@@ -293,7 +293,7 @@ impl<'a> P4<'a> {
                 diff: String::new(),
                 diff_truncated: false,
                 added: Vec::new(),
-                omissions: Vec::new(),
+                omissions: truncation_notes(meta.truncated, false, false),
             });
         }
 
@@ -321,21 +321,9 @@ impl<'a> P4<'a> {
 
         // Each source of truncation is reported separately, so the note names the command that
         // was cut rather than conflating them.
-        if meta.truncated {
+        for note in truncation_notes(meta.truncated, false, where_truncated) {
             complete = false;
-            omissions.push(
-                "`p4 describe` metadata hit the output size cap, so the changelist's file list \
-                 may be incomplete."
-                    .to_string(),
-            );
-        }
-        if where_truncated {
-            complete = false;
-            omissions.push(
-                "`p4 where` output hit the output size cap, so some files may be missing their \
-                 local mapping and treated as out of the working root."
-                    .to_string(),
-            );
+            omissions.push(note);
         }
 
         // The indexed file list from `describe -s` is the completeness ledger: every one of
@@ -467,7 +455,7 @@ impl<'a> P4<'a> {
                 diff: String::new(),
                 diff_truncated: false,
                 added: Vec::new(),
-                omissions: Vec::new(),
+                omissions: truncation_notes(meta.truncated, false, false),
             });
         }
 
@@ -490,7 +478,8 @@ impl<'a> P4<'a> {
                 complete: false,
                 incomplete_reason: Some(
                     "no files are currently open for this changelist in this workspace (they may \
-                     be shelved or reverted), so no workspace diff is available"
+                     be shelved or reverted, or `p4 opened` was truncated), so no workspace diff \
+                     is available"
                         .to_string(),
                 ),
                 description,
@@ -498,7 +487,7 @@ impl<'a> P4<'a> {
                 diff: String::new(),
                 diff_truncated: false,
                 added: Vec::new(),
-                omissions: Vec::new(),
+                omissions: truncation_notes(meta.truncated, opened_truncated, false),
             });
         }
 
@@ -516,29 +505,9 @@ impl<'a> P4<'a> {
         // Truncation of any of the three metadata commands means files may be missing or
         // wrongly judged out-of-root; each is reported separately so the note names the
         // command that was cut.
-        if meta.truncated {
+        for note in truncation_notes(meta.truncated, opened_truncated, where_truncated) {
             complete = false;
-            omissions.push(
-                "`p4 describe` metadata hit the output size cap, so the changelist's file list \
-                 or description may be incomplete."
-                    .to_string(),
-            );
-        }
-        if opened_truncated {
-            complete = false;
-            omissions.push(
-                "`p4 opened` output hit the output size cap, so some opened files may not be \
-                 shown."
-                    .to_string(),
-            );
-        }
-        if where_truncated {
-            complete = false;
-            omissions.push(
-                "`p4 where` output hit the output size cap, so some files may be missing their \
-                 local mapping and treated as out of the working root."
-                    .to_string(),
-            );
+            omissions.push(note);
         }
 
         for file in &opened {
@@ -1350,6 +1319,37 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
+/// Omission notes for whichever metadata commands were cut off at the output size cap.
+///
+/// Single-sourced so every path -- the normal capture and the early returns that bail out on
+/// a restricted, foreign or empty changelist -- reports truncation the same way. Without it an
+/// early return would tell the reviewer "restricted" or "nothing is open" when the real reason
+/// the file list came back empty is that `p4`'s own output was truncated before it.
+fn truncation_notes(meta: bool, opened: bool, wher: bool) -> Vec<String> {
+    let mut notes = Vec::new();
+    if meta {
+        notes.push(
+            "`p4 describe` metadata hit the output size cap, so the changelist's file list or \
+             description may be incomplete."
+                .to_string(),
+        );
+    }
+    if opened {
+        notes.push(
+            "`p4 opened` output hit the output size cap, so some opened files may not be shown."
+                .to_string(),
+        );
+    }
+    if wher {
+        notes.push(
+            "`p4 where` output hit the output size cap, so some files may be missing their local \
+             mapping and treated as out of the working root."
+                .to_string(),
+        );
+    }
+    notes
+}
+
 // -- low-level tagged-output helpers --
 
 /// Split `... key value` on the first space after the key.
@@ -1585,6 +1585,20 @@ Change 5 by u@c on 2026/01/01\n\n\
             root
         ));
         assert!(!lexically_within(Path::new("C:\\dev\\other\\x"), root));
+    }
+
+    #[test]
+    fn truncation_notes_name_each_cut_command_separately() {
+        assert!(truncation_notes(false, false, false).is_empty());
+        let all = truncation_notes(true, true, true);
+        assert_eq!(all.len(), 3);
+        assert!(all[0].contains("p4 describe"));
+        assert!(all[1].contains("p4 opened"));
+        assert!(all[2].contains("p4 where"));
+        // Only the flagged source is named -- no conflation.
+        let only_where = truncation_notes(false, false, true);
+        assert_eq!(only_where.len(), 1);
+        assert!(only_where[0].contains("p4 where"));
     }
 
     #[test]
