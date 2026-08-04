@@ -697,7 +697,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     };
 
-    vec![
+    let mut tools = vec![
         json!({
             "name": "cross_model_review",
             "description": format!(
@@ -819,7 +819,49 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-    ]
+    ];
+
+    // The Perforce backend names its changelists per call, so those inputs exist only for a
+    // Perforce-configured server. A git server never advertises them, and rejects them if
+    // passed (additionalProperties is false), so a caller cannot silently misuse them.
+    if cfg.vcs == crate::config::Vcs::Perforce {
+        if let Some(props) = tools[0]["inputSchema"]["properties"].as_object_mut() {
+            props.insert(
+                "change".to_string(),
+                json!({
+                    "type": ["string", "array"],
+                    "items": {"type": ["string", "integer"]},
+                    "description":
+                        "Required. The Perforce changelist number(s) to review: a single number \
+                         (\"43650\"), a comma-separated string (\"43650,43651\"), or an array \
+                         ([\"43650\",\"43651\"]). Submitted and pending changelists are both \
+                         supported; the server captures each and hands the reviewer the diff, \
+                         file list, added-file contents and description. A review session is \
+                         bound to its changelist set -- reuse the same set to re-review, or pass \
+                         fresh:true to switch to a different one."
+                }),
+            );
+            props.insert(
+                "include_shelved".to_string(),
+                json!({
+                    "type": "boolean",
+                    "description":
+                        "Optional, default false. When a pending changelist has nothing open in \
+                         this workspace (it is shelved, or belongs to another client), pull its \
+                         shelved snapshot with `p4 describe -S` instead of reporting no diff. Off \
+                         by default because shelved files are often work-in-progress checkpoints \
+                         rather than the change to review."
+                }),
+            );
+        }
+        // `change` is required for a Perforce review (start_review refuses a call without it),
+        // so the schema says so too rather than describing it as required in prose alone.
+        if let Some(required) = tools[0]["inputSchema"]["required"].as_array_mut() {
+            required.push(json!("change"));
+        }
+    }
+
+    tools
 }
 
 #[cfg(test)]
@@ -880,6 +922,42 @@ mod tests {
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert!(!tool["description"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn perforce_server_exposes_change_inputs_and_git_does_not() {
+        // The default app resolves to git (this repo has a .git entry): no changelist inputs.
+        let git = handle_sync(&app(), "tools/list", &Value::Null, &json!(9));
+        let git_props = &git["result"]["tools"][0]["inputSchema"]["properties"];
+        assert!(git_props.get("change").is_none(), "{git_props}");
+        assert!(git_props.get("include_shelved").is_none(), "{git_props}");
+
+        // A Perforce-configured server advertises both, and still forbids anything else.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--vcs".into(),
+            "perforce".into(),
+        ])
+        .expect("cfg");
+        let p4app = Arc::new(App::new(cfg));
+        let p4 = handle_sync(&p4app, "tools/list", &Value::Null, &json!(9));
+        let review = &p4["result"]["tools"][0]["inputSchema"];
+        assert!(review["properties"].get("change").is_some(), "{review}");
+        assert!(
+            review["properties"].get("include_shelved").is_some(),
+            "{review}"
+        );
+        assert_eq!(review["additionalProperties"], false);
+        // instructions is always required; a Perforce server also requires `change`.
+        let required = review["required"].as_array().expect("required array");
+        assert!(required.iter().any(|v| v == "instructions"), "{review}");
+        assert!(required.iter().any(|v| v == "change"), "{review}");
+        // Array entries may be strings or integers, matching what start_review accepts.
+        assert_eq!(
+            review["properties"]["change"]["items"]["type"],
+            json!(["string", "integer"])
+        );
     }
 
     #[test]

@@ -48,6 +48,11 @@ pub struct PromptParts<'a> {
     /// fetch it itself. Rendered on every turn, not just the first: a follow-up review
     /// exists precisely because the working tree moved on since the last one.
     pub change: Option<&'a str>,
+    /// A note rendered only on a resumed turn, after the change. Used to tell a Perforce
+    /// reviewer that the captured change is a fresh snapshot of a changelist whose contents
+    /// may have moved since the previous turn, so it does not read a legitimate change as a
+    /// contradiction of its earlier findings.
+    pub resumed_capture_note: Option<&'a str>,
 }
 
 pub fn build(parts: &PromptParts) -> String {
@@ -91,6 +96,15 @@ pub fn build(parts: &PromptParts) -> String {
         out.push('\n');
     }
 
+    // Only on a resumed turn, and after the change it refers to.
+    if parts.resumed {
+        if let Some(note) = parts.resumed_capture_note {
+            out.push('\n');
+            out.push_str(note.trim());
+            out.push('\n');
+        }
+    }
+
     if !parts.resumed {
         out.push_str(&format!(
             "\n## Working directory\n\n{}\n",
@@ -126,6 +140,7 @@ mod tests {
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: None,
             change: None,
+            resumed_capture_note: None,
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -148,6 +163,7 @@ mod tests {
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: None,
             change: None,
+            resumed_capture_note: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -191,6 +207,7 @@ mod tests {
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: Some("You have no shell."),
             change: None,
+            resumed_capture_note: None,
         });
         assert!(first.contains("## Your access"));
         assert!(first.contains("You have no shell."));
@@ -205,6 +222,7 @@ mod tests {
             preamble: Some(DEFAULT_PREAMBLE),
             capabilities: Some("You have no shell."),
             change: None,
+            resumed_capture_note: None,
         });
         assert!(!resumed.contains("## Your access"));
     }
@@ -221,6 +239,7 @@ mod tests {
             preamble: None,
             capabilities: None,
             change: None,
+            resumed_capture_note: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
@@ -242,6 +261,7 @@ mod tests {
                 preamble: Some(DEFAULT_PREAMBLE),
                 capabilities: None,
                 change: Some("## Change under review\n\n+ added a line\n"),
+                resumed_capture_note: None,
             });
             assert!(text.contains("## Change under review"), "resumed={resumed}");
             assert!(text.contains("+ added a line"), "resumed={resumed}");
@@ -262,10 +282,37 @@ mod tests {
             preamble: None,
             capabilities: None,
             change: Some("## Change under review\n\n+ y\n"),
+            resumed_capture_note: None,
         });
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
         assert!(change_at < guidance_at, "{text}");
+    }
+
+    #[test]
+    fn the_resumed_capture_note_renders_only_on_a_resume_after_the_change() {
+        let (cwd, paths) = fixtures();
+        let note = "Note: freshly captured snapshot.";
+        let parts = |resumed| PromptParts {
+            instructions: "x",
+            context_paths: &paths,
+            cwd: &cwd,
+            turn: if resumed { 2 } else { 1 },
+            resumed,
+            preamble: None,
+            capabilities: None,
+            change: Some("## Change under review\n\n+ y\n"),
+            resumed_capture_note: Some(note),
+        };
+        // First turn: suppressed even when supplied -- there is no prior snapshot to differ
+        // from.
+        assert!(!build(&parts(false)).contains(note));
+        // Resumed turn: rendered, after the change and before the follow-up instruction.
+        let text = build(&parts(true));
+        let change_at = text.find("## Change under review").expect("change");
+        let note_at = text.find(note).expect("note");
+        let guidance_at = text.find("follow-up turn").expect("guidance");
+        assert!(change_at < note_at && note_at < guidance_at, "{text}");
     }
 
     #[test]
@@ -279,6 +326,7 @@ mod tests {
             preamble: None,
             capabilities: None,
             change: None,
+            resumed_capture_note: None,
         });
         assert!(!text.contains("flagged"));
     }

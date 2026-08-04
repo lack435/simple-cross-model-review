@@ -26,10 +26,19 @@ pub use shared::{Capture, CapturedChange};
 /// The dispatch is an exhaustive match on [`Vcs`] rather than a trait object: there are two
 /// backends, both "shell out to a local CLI on Windows and parse text", and neither is
 /// extended from outside. A new backend has to state its arm here rather than opt itself in.
-pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
+///
+/// `changes` and `include_shelved` are the Perforce backend's per-call inputs -- the
+/// changelist numbers to capture, and whether to pull shelved content. The git backend is
+/// driven entirely by `cfg` and ignores both.
+pub fn capture(
+    cfg: &Config,
+    changes: &[u64],
+    include_shelved: bool,
+    cancel: &AtomicBool,
+) -> Capture {
     match cfg.vcs {
         Vcs::Git => git_capture(cfg, cancel),
-        Vcs::Perforce => perforce::capture(cfg, cancel),
+        Vcs::Perforce => perforce::capture(cfg, changes, include_shelved, cancel),
     }
 }
 

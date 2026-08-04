@@ -2,7 +2,7 @@
 //!
 //! Where the git backend captures a working-tree or range diff, this one captures an
 //! explicit list of **changelists** -- there is no "all opened" and no default, by design
-//! (see [`crate::config::parse_changes`]). It runs `p4` over the client rooted at the
+//! (see [`crate::changeset::parse_change_tokens`]). It runs `p4` over the client rooted at the
 //! working directory and hands the reviewer, per changelist: a diff, a listing of the
 //! opened or affected files, the contents of files opened for add, and the changelist
 //! description.
@@ -49,22 +49,25 @@ use crate::reviewer::{self, RunOutcome};
 const MAX_DESC_BYTES: usize = 8_000;
 
 /// Capture the named changelists.
-pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
-    // No changelists configured: fail closed loudly rather than silently reviewing the tree.
-    // Ordered before the supplies-nothing short-circuit so the warning is actually reached.
-    if cfg.changes.is_empty() {
+pub fn capture(
+    cfg: &Config,
+    changes: &[u64],
+    include_shelved: bool,
+    cancel: &AtomicBool,
+) -> Capture {
+    // No changelists: fail closed loudly rather than silently reviewing the tree. In normal
+    // operation tools.rs rejects an empty `change` before a job is ever created, so reaching
+    // here is a direct or test call -- the fail-closed warning is the same either way.
+    if changes.is_empty() {
         return Capture::warn(
-            "The Perforce backend was selected but no --change was configured, so no changelist \
-             was captured and the reviewer was given nothing. It reviewed the current state of \
-             the code instead. Pass --change <n>[,<n>...] to review specific changelists."
+            "The Perforce backend was given no changelist to capture, so the reviewer was given \
+             nothing and reviewed the current state of the code instead. Name the changelist(s) \
+             to review in the `change` argument of cross_model_review."
                 .to_string(),
         );
     }
-    if !cfg.supplies_change() {
-        return Capture::default();
-    }
 
-    let Some(p4) = P4::new(&cfg.cwd, cancel) else {
+    let Some(mut p4) = P4::new(&cfg.cwd, cancel) else {
         return Capture::warn(
             "p4 is not on PATH, so the change under review could not be captured and the \
              reviewer was given no diff. It reviewed the current state of the code instead."
@@ -72,37 +75,31 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         );
     };
 
-    // Client check: without a resolved client the workspace paths mean nothing.
-    let info =
-        match p4.info() {
-            Some(info) if info.has_client() => info,
-            Some(_) => {
-                return Capture::warn(format!(
-                "{} is not inside a resolved Perforce workspace (no client root), so the change \
-                 under review could not be captured and the reviewer was given no diff. Check \
-                 that P4CLIENT / P4CONFIG resolve a client here. It reviewed the current state \
-                 of the code instead.",
-                cfg.cwd.display()
+    // Resolve the client the workspace paths are relative to, and bind every subsequent
+    // command to it with `-c`. Without this, `p4` here is client-less (this tree sets no
+    // P4CLIENT), so `p4 info` reports *unknown* and every workspace command is meaningless.
+    let info = match resolve_workspace(&p4, &cfg.cwd) {
+        Ok(info) => info,
+        Err(reason) => {
+            return Capture::warn(format!(
+                "{reason} So the change under review could not be captured and the reviewer was \
+                 given no diff; it reviewed the current state of the code instead."
             ))
-            }
-            None => return Capture::warn(
-                "p4 could not be run to identify the workspace, so the change under review was \
-                 not captured and the reviewer was given no diff. It reviewed the current state \
-                 of the code instead."
-                    .to_string(),
-            ),
-        };
+        }
+    };
+    // Every command from here runs as this client (global `-c`, injected in `run`).
+    p4.client = Some(info.client.clone());
 
     let mut budget = Budget::new();
     let mut segments = Vec::new();
     let mut captured = Vec::new();
     let mut skipped = Vec::new();
 
-    for &cl in &cfg.changes {
+    for &cl in changes {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Capture::default();
         }
-        match p4.changelist(cl, &info, &mut budget) {
+        match p4.changelist(cl, &info, include_shelved, &mut budget) {
             CaptureOne::Segment(seg) => {
                 captured.push(cl);
                 segments.push(seg);
@@ -125,7 +122,7 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
         ));
     }
 
-    let rendered = render(cfg, &info, &cfg.changes, &captured, &skipped, &segments);
+    let rendered = render(cfg, &info, changes, &captured, &skipped, &segments);
     let diff_bytes = segments.iter().map(|s| s.diff.len()).sum();
     let diff_truncated = budget.diff_truncated;
 
@@ -142,7 +139,7 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
             "The captured change was incomplete: {} of {} requested changelist(s) were not \
              captured and are not in the review: {reasons}.",
             skipped.len(),
-            cfg.changes.len()
+            changes.len()
         ));
     }
     if diff_truncated {
@@ -240,6 +237,8 @@ enum DiffBasis {
     Workspace,
     /// Submitted: the diff is a server revision the live tree may differ from.
     ServerRevision,
+    /// A pending changelist's shelved snapshot, from `p4 describe -S` (opt-in).
+    Shelved,
 }
 
 struct AddedFile {
@@ -251,7 +250,13 @@ struct AddedFile {
 
 impl<'a> P4<'a> {
     /// Capture one changelist, staged atomically.
-    fn changelist(&self, cl: u64, info: &Info, budget: &mut Budget) -> CaptureOne {
+    fn changelist(
+        &self,
+        cl: u64,
+        info: &Info,
+        include_shelved: bool,
+        budget: &mut Budget,
+    ) -> CaptureOne {
         let meta = match self.describe_meta(cl) {
             Some(Ok(meta)) => meta,
             Some(Err(reason)) => return CaptureOne::Skipped(reason),
@@ -263,7 +268,7 @@ impl<'a> P4<'a> {
         if meta.submitted {
             self.submitted_segment(cl, &meta, description, budget)
         } else {
-            self.pending_segment(cl, info, &meta, description, budget)
+            self.pending_segment(cl, info, &meta, description, include_shelved, budget)
         }
     }
 
@@ -429,12 +434,17 @@ impl<'a> P4<'a> {
         info: &Info,
         meta: &DescribeMeta,
         description: String,
+        include_shelved: bool,
         budget: &mut Budget,
     ) -> CaptureOne {
-        // Foreign / shelved guard: a pending changelist whose recorded client is not the one
-        // we are in has no current-workspace files to diff. Do not fabricate a Workspace
-        // segment; render it as incomplete with what the metadata gives.
+        // Foreign guard: a pending changelist whose recorded client is not the one we are in
+        // has no current-workspace files to diff. Its shelved snapshot is still readable
+        // server-side, so when shelved review is opted in, capture that; otherwise render it
+        // as incomplete with what the metadata gives.
         if !meta.client.is_empty() && meta.client != info.client {
+            if include_shelved {
+                return self.shelved_segment(cl, description, budget);
+            }
             let listing = meta
                 .files
                 .iter()
@@ -446,7 +456,8 @@ impl<'a> P4<'a> {
                 complete: false,
                 incomplete_reason: Some(format!(
                     "this pending changelist belongs to client `{}`, not the active client `{}`, \
-                     so its files are not open in this workspace and no diff is available",
+                     so its files are not open in this workspace and no diff is available. If it \
+                     is shelved, pass include_shelved:true to review the shelved snapshot",
                     safe_label(&meta.client),
                     safe_label(&info.client)
                 )),
@@ -466,7 +477,12 @@ impl<'a> P4<'a> {
         };
 
         if opened.is_empty() {
-            // Nothing open here though the changelist lists files: shelved or reverted.
+            // Nothing open here though the changelist lists files: shelved or reverted. The
+            // shelved snapshot is reviewable when opted in; otherwise say so and point at the
+            // flag rather than silently handing over no diff.
+            if include_shelved {
+                return self.shelved_segment(cl, description, budget);
+            }
             let listing = meta
                 .files
                 .iter()
@@ -479,7 +495,8 @@ impl<'a> P4<'a> {
                 incomplete_reason: Some(
                     "no files are currently open for this changelist in this workspace (they may \
                      be shelved or reverted, or `p4 opened` was truncated), so no workspace diff \
-                     is available"
+                     is available. If it is shelved, pass include_shelved:true to review the \
+                     shelved snapshot"
                         .to_string(),
                 ),
                 description,
@@ -680,6 +697,128 @@ impl<'a> P4<'a> {
             omissions,
         })
     }
+
+    /// A pending changelist's shelved snapshot, opted into with `include_shelved`.
+    ///
+    /// Unlike the workspace diff, the shelf is server-side: `p4 describe -S -du` returns it
+    /// whole regardless of which client owns the changelist, so a teammate's shelf is
+    /// reviewable too. The depot paths are still confined to the working root -- via the
+    /// active client's `p4 where` -- so the capture never contains bytes the reviewer itself
+    /// could not read. The diff sections are their own ledger here: `describe -s` metadata
+    /// describes the opened files, which for a shelved-and-reverted changelist need not match
+    /// the shelf, so this trusts `describe -S`'s own output rather than cross-checking it.
+    fn shelved_segment(&self, cl: u64, description: String, budget: &mut Budget) -> CaptureOne {
+        let (raw, output_truncated) = match self
+            .run(&["describe", "-S", "-du", &cl.to_string()], "")
+        {
+            Some(out) if out.success => (out.stdout, out.stdout_truncated),
+            Some(out) if out.cancelled => return CaptureOne::Cancelled,
+            Some(out) => {
+                return CaptureOne::Skipped(format!(
+                    "`p4 describe -S -du {cl}` failed: {}",
+                    first_line(&out.diagnostics())
+                ))
+            }
+            None => {
+                return CaptureOne::Skipped(format!("`p4 describe -S -du {cl}` could not be run"))
+            }
+        };
+
+        let sections = parse_describe_diff(&raw);
+        if sections.is_empty() {
+            return CaptureOne::Skipped(format!(
+                "changelist {cl} has no shelved files to review (nothing is shelved, or the shelf \
+                 is not accessible)"
+            ));
+        }
+
+        let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
+
+        let mut listing = String::new();
+        let mut diff = String::new();
+        let mut omissions = Vec::new();
+        let mut complete = true;
+        let mut diff_truncated = false;
+
+        for note in truncation_notes(false, false, where_truncated) {
+            complete = false;
+            omissions.push(note);
+        }
+
+        for section in &sections {
+            let local = wheres.get(section.depot.as_str());
+            let in_root =
+                matches!(local, Some(WhereResult::Mapped(path)) if within_root(path, self.cwd));
+            let local_label = match local {
+                Some(WhereResult::Mapped(path)) if within_root(path, self.cwd) => {
+                    root_relative(path, self.cwd)
+                }
+                _ => String::from("(unmapped or out of root)"),
+            };
+            listing.push_str(&format!(
+                "{}  ({})\n",
+                safe_label(&section.depot),
+                safe_label(&local_label)
+            ));
+
+            if !in_root {
+                complete = false;
+                omissions.push(format!(
+                    "`{}` was not included: it maps outside the working root (or is unmapped in \
+                     this client).",
+                    safe_label(&section.depot)
+                ));
+                continue;
+            }
+
+            if section.body.trim().is_empty() {
+                // A shelved binary or content-free file: describe records the header with no
+                // hunk. Labelled, never dropped silently.
+                complete = false;
+                omissions.push(format!(
+                    "`{}` has no textual diff in the shelf (binary or content-free).",
+                    safe_label(&section.depot)
+                ));
+                continue;
+            }
+
+            let (piece, cut) = budget.take_diff(format!(
+                "==== {} (shelved) ====\n{}\n",
+                section.depot, section.body
+            ));
+            diff.push_str(&piece);
+            if cut {
+                diff_truncated = true;
+                complete = false;
+            }
+        }
+
+        if output_truncated {
+            complete = false;
+            omissions.push(
+                "`p4 describe -S` output hit the size cap, so some of the shelf was not read."
+                    .to_string(),
+            );
+        }
+
+        let incomplete_reason = (!complete).then(|| {
+            "some shelved files are out of the working root, binary, or otherwise not shown"
+                .to_string()
+        });
+
+        CaptureOne::Segment(Segment {
+            change: cl,
+            basis: DiffBasis::Shelved,
+            complete,
+            incomplete_reason,
+            description,
+            listing,
+            diff,
+            diff_truncated,
+            added: Vec::new(),
+            omissions,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +843,12 @@ fn render(
         safe_label(&info.client),
         safe_label(&info.root)
     );
-    let mut out = evidence_preamble(&command, &cfg.cwd, cfg.reviewer_has_shell(), "p4");
+    let mut out = evidence_preamble(
+        &command,
+        &cfg.cwd,
+        cfg.reviewer_can_self_serve_change(),
+        "p4",
+    );
 
     // Requested / captured / skipped -- visible to the reviewer, not only the caller.
     out.push_str("### Changelists requested, captured and skipped\n\n");
@@ -723,6 +867,7 @@ fn render(
         let basis = match seg.basis {
             DiffBasis::Workspace => "pending, workspace diff",
             DiffBasis::ServerRevision => "submitted, server revision",
+            DiffBasis::Shelved => "pending, shelved snapshot",
         };
         out.push_str(&format!("### Changelist {} ({basis})\n\n", seg.change));
 
@@ -741,6 +886,14 @@ fn render(
                     "This diff is the submitted server revision. The working tree you can read \
                      may be a **different** revision -- do not treat a mismatch between a file \
                      you read and this diff as a defect in the change; attribute it to the tree.\n\n",
+                );
+            }
+            DiffBasis::Shelved => {
+                out.push_str(
+                    "This diff is the changelist's **shelved** snapshot from the server, not the \
+                     workspace. The working tree you can read may not match it -- shelved content \
+                     is not necessarily what is on disk -- so judge the shelf as shown and do not \
+                     treat a mismatch with a file you read as a defect in the change.\n\n",
                 );
             }
         }
@@ -855,6 +1008,10 @@ struct P4<'a> {
     cwd: &'a Path,
     cancel: &'a AtomicBool,
     deadline: Instant,
+    /// The client every command runs as, injected as a global `-c <client>`. `None` until
+    /// the workspace is resolved -- `p4 info` and `p4 clients` run client-less to derive it,
+    /// and everything after runs bound to it.
+    client: Option<String>,
 }
 
 impl<'a> P4<'a> {
@@ -871,6 +1028,7 @@ impl<'a> P4<'a> {
             cwd,
             cancel,
             deadline: Instant::now() + CAPTURE_BUDGET,
+            client: None,
         })
     }
 
@@ -893,8 +1051,16 @@ impl<'a> P4<'a> {
             return None;
         }
         let mut command = Command::new(&self.bin);
+        // Global options first, before the subcommand in `args`. The client override is the
+        // global `-c <client>`; it sits in the global slot so it does not collide with a
+        // subcommand's own `-c` (e.g. `opened -c <changelist>`), which p4 parses after the
+        // command. `-C utf8` is mandatory, not hygiene: the server is unicode-mode and the
+        // machine charset is `auto`, which corrupts `unicode`-filetype files.
+        command.args(["-C", "utf8"]);
+        if let Some(client) = &self.client {
+            command.args(["-c", client]);
+        }
         command
-            .args(["-C", "utf8"])
             .args(args)
             .current_dir(self.cwd)
             .env_remove("P4DIFF")
@@ -916,6 +1082,19 @@ impl<'a> P4<'a> {
             return None;
         }
         Some(parse_info(&out.stdout))
+    }
+
+    /// The user's client workspaces, for deriving the client when the ambient one does not
+    /// cover the working root, plus whether the listing was cut off at the size cap. `None`
+    /// means the command could not be run or failed; an empty vec means it ran and the user
+    /// owns no clients. Truncation is surfaced rather than swallowed: a cut-off list can drop
+    /// a deeper workspace and make the resolver pick a shallower, wrong one.
+    fn clients(&self, user: &str) -> Option<(Vec<ClientSpec>, bool)> {
+        let out = self.run(&["-ztag", "clients", "-u", user], "")?;
+        if !out.success {
+            return None;
+        }
+        Some((parse_clients_ztag(&out.stdout), out.stdout_truncated))
     }
 
     /// `p4 describe -s` metadata: status, owning client, description, and the file ledger.
@@ -990,13 +1169,137 @@ impl<'a> P4<'a> {
 struct Info {
     client: String,
     root: String,
-    #[allow(dead_code)]
     user: String,
+    /// This machine's Perforce host name, from `p4 info`'s `clientHost`. Used to match
+    /// host-locked client specs when deriving the client.
+    host: String,
 }
 
 impl Info {
     fn has_client(&self) -> bool {
         !self.client.is_empty() && !self.root.is_empty()
+    }
+}
+
+/// One `p4 clients` workspace: enough to derive the client for a working root.
+#[derive(Clone)]
+struct ClientSpec {
+    client: String,
+    root: String,
+    /// The client's `Host` restriction, empty when the client is not host-locked (usable
+    /// from any machine).
+    host: String,
+}
+
+/// Resolve the Perforce client the working root belongs to, and the workspace facts the rest
+/// of the capture needs.
+///
+/// Prefers an ambient client -- a correctly-configured `P4CLIENT` / `P4CONFIG` whose root
+/// already contains the working root -- so a deliberately-set client is never overridden.
+/// Otherwise derives it the way `perforce_mcp.py::resolve_client` does: over `p4 clients -u`,
+/// keep the clients whose `Host` matches this machine (an empty `Host` is a wildcard, usable
+/// anywhere) and whose `Root` is an ancestor of the working root, and take the longest such
+/// root so a nested workspace beats an outer one. A tie between two equally-deep roots is
+/// refused rather than guessed.
+fn resolve_workspace(p4: &P4, cwd: &Path) -> Result<Info, String> {
+    let info = p4
+        .info()
+        .ok_or_else(|| "p4 could not be run to identify the workspace.".to_string())?;
+
+    // Ambient client that already covers the working root: use it as-is.
+    if info.has_client() && lexically_within(cwd, Path::new(&info.root)) {
+        return Ok(info);
+    }
+
+    if info.user.is_empty() {
+        return Err(format!(
+            "{} is not inside a resolved Perforce workspace and `p4 info` reported no user name, \
+             so no client could be derived for it (check that p4 is logged in).",
+            cwd.display()
+        ));
+    }
+
+    let (clients, truncated) = p4.clients(&info.user).ok_or_else(|| {
+        format!(
+            "`p4 clients -u {}` could not be run, so the client for {} could not be derived.",
+            info.user,
+            cwd.display()
+        )
+    })?;
+    // A truncated list can hide a deeper workspace, so ranking it would risk choosing a
+    // shallower, wrong client. Fail closed and point at the ambient escape hatch.
+    if truncated {
+        return Err(format!(
+            "`p4 clients -u {}` output was cut off at the size cap, so the client for {} cannot \
+             be derived reliably (a deeper workspace could be missing). Set P4CLIENT / P4CONFIG \
+             to the intended client.",
+            info.user,
+            cwd.display()
+        ));
+    }
+
+    match select_client(&clients, cwd, &info.host) {
+        ClientChoice::One(spec) => Ok(Info {
+            client: spec.client,
+            root: spec.root,
+            user: info.user,
+            host: info.host,
+        }),
+        ClientChoice::None => Err(format!(
+            "no Perforce client for {} on host '{}' (user {}): none of the user's clients has a \
+             (primary) root that contains the working root. Set P4CLIENT / P4CONFIG to the \
+             intended client -- that also covers a client whose real root is an AltRoot or a \
+             `Root: null` workspace, which derivation from `p4 clients` does not inspect -- or \
+             point the server's --cwd into the intended workspace.",
+            cwd.display(),
+            info.host,
+            info.user
+        )),
+        ClientChoice::Ambiguous => Err(format!(
+            "the Perforce client for {} is ambiguous: two of the user's clients share the same \
+             deepest root that contains it, so which one owns this workspace cannot be decided \
+             automatically.",
+            cwd.display()
+        )),
+    }
+}
+
+/// The outcome of matching a working root against the user's client workspaces.
+enum ClientChoice {
+    One(ClientSpec),
+    None,
+    Ambiguous,
+}
+
+/// Pick the client whose root best contains `cwd`: host-matched (empty host is a wildcard),
+/// root an ancestor of `cwd`, longest such root wins, an exact-length tie is ambiguous.
+///
+/// Pure so the host/longest-root/wildcard/tie logic is testable without a live `p4`.
+fn select_client(clients: &[ClientSpec], cwd: &Path, host: &str) -> ClientChoice {
+    let mut best: Option<ClientSpec> = None;
+    let mut best_len = 0usize;
+    let mut tied = false;
+    for spec in clients {
+        // Empty Host is a wildcard: a client not locked to a host is usable on this machine.
+        if !spec.host.is_empty() && !spec.host.eq_ignore_ascii_case(host) {
+            continue;
+        }
+        if spec.root.is_empty() || !lexically_within(cwd, Path::new(&spec.root)) {
+            continue;
+        }
+        let len = spec.root.len();
+        if best.is_none() || len > best_len {
+            best = Some(spec.clone());
+            best_len = len;
+            tied = false;
+        } else if len == best_len {
+            tied = true;
+        }
+    }
+    match best {
+        None => ClientChoice::None,
+        Some(_) if tied => ClientChoice::Ambiguous,
+        Some(spec) => ClientChoice::One(spec),
     }
 }
 
@@ -1066,15 +1369,41 @@ fn parse_info(raw: &str) -> Info {
     let mut client = String::new();
     let mut root = String::new();
     let mut user = String::new();
+    let mut host = String::new();
     for (k, v) in tag_lines(&text) {
         match k {
             "clientName" if v != "*unknown*" => client = v.to_string(),
             "clientRoot" => root = v.to_string(),
             "userName" => user = v.to_string(),
+            "clientHost" => host = v.to_string(),
             _ => {}
         }
     }
-    Info { client, root, user }
+    Info {
+        client,
+        root,
+        user,
+        host,
+    }
+}
+
+/// Parse `p4 -ztag clients -u <user>` into the workspaces the resolver ranks.
+///
+/// Field names follow p4's tagged spelling: `client` (lowercase), `Root`, `Host`. A record
+/// without a client name is skipped; a missing `Root`/`Host` becomes empty, which the
+/// resolver treats as "does not match" and "wildcard host" respectively.
+fn parse_clients_ztag(raw: &str) -> Vec<ClientSpec> {
+    records(&normalize(raw))
+        .into_iter()
+        .filter_map(|rec| {
+            let client = rec.get("client")?.clone();
+            Some(ClientSpec {
+                client,
+                root: rec.get("Root").cloned().unwrap_or_default(),
+                host: rec.get("Host").cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Parse `p4 -ztag opened` (blank-line-separated records, single-line fields).
@@ -1396,16 +1725,114 @@ mod tests {
     #[test]
     fn info_parses_client_root_and_ignores_unknown_client() {
         let info = parse_info(
-            "... userName dwellman\n... clientName dwellman_W680\n... clientRoot C:\\dev\\main\\UE\n",
+            "... userName dwellman\n... clientName dwellman_W680\n... clientRoot C:\\dev\\main\\UE\n\
+             ... clientHost W680\n",
         );
         assert_eq!(info.client, "dwellman_W680");
         assert_eq!(info.root, "C:\\dev\\main\\UE");
         assert_eq!(info.user, "dwellman");
+        assert_eq!(info.host, "W680");
         assert!(info.has_client());
 
         // An unresolved client reports the sentinel and no root -> not a workspace.
         let unknown = parse_info("... clientName *unknown*\n");
         assert!(!unknown.has_client());
+    }
+
+    #[test]
+    fn clients_parse_client_root_and_host() {
+        let raw = "\
+... client dwellman_main\n... Owner dwellman\n... Host W680\n... Root C:\\dev\\main\\UE\n\n\
+... client hostless\n... Root C:\\dev\\other\n\n\
+... Owner nobody\n... Root C:\\nope\n";
+        let clients = parse_clients_ztag(raw);
+        // The record with no `client` field is skipped, not defaulted.
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client, "dwellman_main");
+        assert_eq!(clients[0].root, "C:\\dev\\main\\UE");
+        assert_eq!(clients[0].host, "W680");
+        // A client with no Host line is host-unlocked (empty), a wildcard downstream.
+        assert_eq!(clients[1].client, "hostless");
+        assert!(clients[1].host.is_empty());
+    }
+
+    fn spec(client: &str, root: &str, host: &str) -> ClientSpec {
+        ClientSpec {
+            client: client.into(),
+            root: root.into(),
+            host: host.into(),
+        }
+    }
+
+    #[test]
+    fn select_client_takes_the_host_matched_longest_root() {
+        let clients = vec![
+            spec("outer", "C:\\dev\\main\\UE", "W680"),
+            spec("nested", "C:\\dev\\main\\UE\\Bobcat", "W680"),
+            spec("otherbox", "C:\\dev\\main\\UE", "OTHERBOX"),
+        ];
+        // Under the outer root but not the nested one -> outer wins.
+        assert!(matches!(
+            select_client(&clients, Path::new("C:\\dev\\main\\UE\\Foo"), "W680"),
+            ClientChoice::One(c) if c.client == "outer"
+        ));
+        // Under the nested root -> the deeper client wins.
+        assert!(matches!(
+            select_client(&clients, Path::new("C:\\dev\\main\\UE\\Bobcat\\Sub"), "W680"),
+            ClientChoice::One(c) if c.client == "nested"
+        ));
+    }
+
+    #[test]
+    fn select_client_treats_empty_host_as_wildcard_and_excludes_a_mismatch() {
+        let clients = vec![
+            spec("locked", "C:\\ws", "OTHERBOX"),
+            spec("anywhere", "C:\\ws", ""),
+        ];
+        // The host-unlocked client is usable on this machine; the locked one is not.
+        assert!(matches!(
+            select_client(&clients, Path::new("C:\\ws\\sub"), "W680"),
+            ClientChoice::One(c) if c.client == "anywhere"
+        ));
+        // With only the host-locked client, nothing matches on this host -- it is not a
+        // fallback that gets used anyway, which was the empty-Host bug.
+        assert!(matches!(
+            select_client(
+                &[spec("locked", "C:\\ws", "OTHERBOX")],
+                Path::new("C:\\ws\\sub"),
+                "W680"
+            ),
+            ClientChoice::None
+        ));
+    }
+
+    #[test]
+    fn select_client_refuses_a_tie_and_reports_none_when_nothing_contains_the_root() {
+        // Two clients share the deepest containing root: ambiguous, not a coin toss.
+        let tie = vec![spec("a", "C:\\ws", ""), spec("b", "C:\\ws", "")];
+        assert!(matches!(
+            select_client(&tie, Path::new("C:\\ws\\x"), "W680"),
+            ClientChoice::Ambiguous
+        ));
+        // A longer root later in the list still breaks what would have been a tie.
+        let broken = vec![
+            spec("a", "C:\\ws", ""),
+            spec("b", "C:\\ws", ""),
+            spec("deep", "C:\\ws\\x", ""),
+        ];
+        assert!(matches!(
+            select_client(&broken, Path::new("C:\\ws\\x\\y"), "W680"),
+            ClientChoice::One(c) if c.client == "deep"
+        ));
+        // No client root contains the working root.
+        assert!(matches!(
+            select_client(
+                &[spec("elsewhere", "C:\\other", "")],
+                Path::new("C:\\ws\\x"),
+                "W680"
+            ),
+            ClientChoice::None
+        ));
     }
 
     #[test]
@@ -1635,14 +2062,13 @@ Change 5 by u@c on 2026/01/01\n\n\
             "claude".into(),
             "--vcs".into(),
             "perforce".into(),
-            "--change".into(),
-            "43650".into(),
         ])
         .expect("config");
         let info = Info {
             client: "dwellman_W680".into(),
             root: "C:\\dev\\main\\UE".into(),
             user: "dwellman".into(),
+            host: "W680".into(),
         };
         let captured: Vec<u64> = segments.iter().map(|s| s.change).collect();
         render(&cfg, &info, &[43650, 43651], &captured, skipped, segments)
@@ -1684,6 +2110,15 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn render_shows_the_shelved_basis_with_its_own_caveat() {
+        let text = render_fixture(&[segment_fixture(DiffBasis::Shelved, true)], &[]);
+        assert!(text.contains("pending, shelved snapshot"), "{text}");
+        assert!(text.contains("shelved** snapshot"), "{text}");
+        // Not described as a workspace diff -- the shelf need not match the tree.
+        assert!(!text.contains("workspace against the depot"), "{text}");
+    }
+
+    #[test]
     fn render_surfaces_incomplete_segments_and_skipped_changelists_to_the_reviewer() {
         let text = render_fixture(
             &[segment_fixture(DiffBasis::Workspace, false)],
@@ -1709,39 +2144,47 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     /// End-to-end against a real Perforce server. Opt-in and strictly read-only: it runs only
-    /// when `CROSS_REVIEW_P4_TEST_CL` and `CROSS_REVIEW_P4_TEST_CWD` are set (plus a resolvable
-    /// client via the ambient P4CLIENT / P4CONFIG), and never with a client it discovered for
-    /// itself. It exists to turn the Perforce output-format assumptions into checked
-    /// preconditions before the parsers are trusted.
+    /// when `CROSS_REVIEW_P4_TEST_CL` and `CROSS_REVIEW_P4_TEST_CWD` are set. The client is now
+    /// resolved by the capture itself (ambient-or-derived), which is exactly the path that
+    /// unblocked a pending unshelved changelist, so this asserts the diff came back non-empty
+    /// rather than merely that a header was rendered -- a client-less capture would render the
+    /// header and an empty diff, which is the original silent failure.
     #[test]
     fn live_capture_against_a_real_changelist() {
-        let (Ok(cl), Ok(cwd)) = (
+        let (Ok(cl_raw), Ok(cwd)) = (
             std::env::var("CROSS_REVIEW_P4_TEST_CL"),
             std::env::var("CROSS_REVIEW_P4_TEST_CWD"),
         ) else {
             eprintln!("skipping live Perforce test: set CROSS_REVIEW_P4_TEST_CL and _CWD to run");
             return;
         };
+        let changes =
+            crate::changeset::parse_changes(&cl_raw).expect("valid CROSS_REVIEW_P4_TEST_CL");
+        let include_shelved = std::env::var("CROSS_REVIEW_P4_TEST_SHELVED").is_ok();
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
             "--vcs".into(),
             "perforce".into(),
-            "--change".into(),
-            cl.clone(),
             "--cwd".into(),
             cwd,
         ])
         .expect("config");
         let cancel = AtomicBool::new(false);
-        let cap = capture(&cfg, &cancel);
+        let cap = capture(&cfg, &changes, include_shelved, &cancel);
         for w in &cap.warnings {
             eprintln!("live warning: {w}");
         }
         if let Some(change) = &cap.change {
             eprintln!("----- rendered capture -----\n{}", change.rendered);
-            assert!(change.rendered.contains(&format!("Changelist {cl}")));
+            assert!(change
+                .rendered
+                .contains(&format!("Changelist {}", changes[0])));
             assert!(change.rendered.contains("Change under review"));
+            assert!(
+                change.diff_bytes > 0,
+                "the captured diff was empty -- client resolution or capture branch is wrong"
+            );
         } else {
             panic!("live capture produced no change; warnings above");
         }
