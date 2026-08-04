@@ -3,36 +3,68 @@
 //! The server hands the reviewer "the change" as evidence -- a diff, a listing of what
 //! changed, and the contents of files a diff cannot cover -- so a shell-less reviewer does
 //! not have to be handed one by the caller. Which version-control system produced that
-//! change is a backend detail: [`git`] runs git over a work tree, and (added later) a
-//! Perforce backend runs `p4` over a client.
+//! change is a backend detail: [`git`] runs git over a work tree, [`perforce`] runs `p4`
+//! over a client.
 //!
-//! This module is the seam. [`capture`] and [`render`] are what the rest of the server
-//! calls; the git-specific machinery lives in [`git`]. Genuinely VCS-neutral primitives --
-//! truncation, capped reads, fenced rendering, path sanitisation, the omission bookkeeping
-//! -- are hoisted here so a second backend can reuse them without depending on the git one.
+//! This module is the seam. [`capture`] is what the rest of the server calls; each backend
+//! renders its own [`CapturedChange`]. The VCS-neutral primitives every backend shares --
+//! truncation, capped reads, fenced rendering, path sanitisation, omission bookkeeping --
+//! live in [`shared`], single-sourced so a second backend cannot fork the security logic.
 
 pub mod git;
+pub mod perforce;
+mod shared;
 
-// The git backend is currently the only one, so the dispatcher forwards to it verbatim.
-// A `Vcs` selector and a Perforce arm are added alongside the Perforce backend; keeping the
-// call sites on `vcs::capture` / `vcs::render` / `vcs::Change` now means that change does
-// not have to reach back out into `tools.rs` and `config.rs` again.
-pub use git::{capture, render, Change, DiffMode};
+use std::sync::atomic::AtomicBool;
+
+use crate::config::{Config, Vcs};
+pub use git::DiffMode;
+pub use shared::{Capture, CapturedChange};
+
+/// Capture the change under review, using whichever backend the configuration selected.
+///
+/// The dispatch is an exhaustive match on [`Vcs`] rather than a trait object: there are two
+/// backends, both "shell out to a local CLI on Windows and parse text", and neither is
+/// extended from outside. A new backend has to state its arm here rather than opt itself in.
+pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
+    match cfg.vcs {
+        Vcs::Git => git_capture(cfg, cancel),
+        Vcs::Perforce => perforce::capture(cfg, cancel),
+    }
+}
+
+/// Adapt the git backend's internal `Change` into the unified [`CapturedChange`].
+///
+/// The git backend keeps its own richly-typed `Change` (tree-relation flags, untracked
+/// files) and its own `render`, because those are git's semantics; the rest of the server
+/// only ever wants the rendered string plus the two figures the usage log records.
+fn git_capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
+    let captured = git::capture(cfg, cancel);
+    let change = captured.change.map(|change| CapturedChange {
+        diff_bytes: change.diff.text.len(),
+        diff_truncated: change.diff.truncated,
+        rendered: git::render(&change, &cfg.cwd, cfg.reviewer_has_shell()),
+    });
+    Capture {
+        change,
+        warnings: captured.warnings,
+    }
+}
 
 #[cfg(test)]
 mod golden_tests {
-    use super::git::{render, Change, Section};
+    use super::git::{render, Change};
+    use super::shared::{NewFile, Section};
     use std::path::Path;
 
     /// A rendered-prompt snapshot that must survive refactoring.
     ///
     /// `render` is what the reviewer actually reads, and every word of it was chosen with a
-    /// reason recorded in the source. This module is about to move shared primitives out of
-    /// the git backend, and "the tests still pass" does not prove the *rendered bytes* did
-    /// not shift -- a stray space or reordered section would pass every structural assertion
-    /// and still change what the reviewer sees. So this pins the whole string, for a fixture
-    /// that exercises the diff, the dirty-tree warning, the status listing, an untracked
-    /// file, an omission note and a gap note at once.
+    /// reason recorded in the source. Moving shared primitives out of the git backend must
+    /// not shift the *rendered bytes* -- a stray space or reordered section would pass every
+    /// structural assertion and still change what the reviewer sees. So this pins the whole
+    /// string, for a fixture that exercises the diff, the dirty-tree warning, the status
+    /// listing, an untracked file, an omission note and a gap note at once.
     fn full_fixture() -> Change {
         Change {
             command: "git diff HEAD".into(),
@@ -47,7 +79,7 @@ mod golden_tests {
                 text: " M x\n?? new.txt\n".into(),
                 truncated: false,
             },
-            untracked: vec![super::git::UntrackedFile {
+            untracked: vec![NewFile {
                 path: "new.txt".into(),
                 body: Section {
                     text: "brand new\n".into(),

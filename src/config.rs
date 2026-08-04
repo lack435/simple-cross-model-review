@@ -71,6 +71,128 @@ impl ReviewerKind {
     }
 }
 
+/// Which version-control system produced the change under review.
+///
+/// Selected by `--vcs`, defaulting to `auto`. `auto` is resolved once, at startup, by a
+/// filesystem-only check (see `detect_vcs`): it never runs `p4` -- or any process -- to
+/// decide, so an ordinary git repository behaves exactly as it did before Perforce existed
+/// and never touches a Perforce server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Vcs {
+    Git,
+    Perforce,
+}
+
+impl Vcs {
+    /// The CLI this backend drives. Used in reviewer- and caller-facing prose so a message
+    /// never says "git" to a Perforce user or the reverse.
+    pub fn cli(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Perforce => "p4",
+        }
+    }
+
+    /// Human name of the system, for prose that reads better than the bare CLI name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Perforce => "Perforce",
+        }
+    }
+
+    /// The read-only history commands a shelled reviewer can run for itself, named so the
+    /// reviewer prompt points it at the right tool rather than at git's.
+    pub fn read_commands_phrase(self) -> &'static str {
+        match self {
+            Self::Git => "`git diff`, `git log` and `git show`",
+            Self::Perforce => "`p4 describe`, `p4 opened` and `p4 diff`",
+        }
+    }
+
+    /// Parse a `--vcs` value. `auto` returns `None` -- it is resolved from the filesystem
+    /// after the working root is known, not here.
+    fn parse_arg(s: &str) -> Result<Option<Self>, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(None),
+            "git" => Ok(Some(Self::Git)),
+            "perforce" | "p4" => Ok(Some(Self::Perforce)),
+            other => Err(format!(
+                "unknown --vcs '{other}' (expected 'auto', 'git' or 'perforce')"
+            )),
+        }
+    }
+}
+
+/// The most changelists `--change` will accept.
+///
+/// A comma-separated list is otherwise unbounded, and each changelist spends part of the
+/// shared 60-second capture budget and adds to the prompt. The cap fails closed at parse
+/// time rather than silently processing a prefix and labelling it as the whole request.
+pub const MAX_CHANGELISTS: usize = 20;
+
+/// Parse `--change`: a comma-separated list of numeric changelists.
+///
+/// Numeric only, and deliberately strict -- "never a default, never the `default`
+/// changelist, never all-opened" is the whole contract, so anything that is not a positive
+/// integer is rejected rather than guessed at. Duplicates are dropped (a repeated changelist
+/// would be captured twice), preserving first-seen order.
+fn parse_changes(s: &str) -> Result<Vec<u64>, String> {
+    let mut out: Vec<u64> = Vec::new();
+    for raw in s.split(',') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            return Err(format!(
+                "--change '{s}' has an empty entry; give a comma-separated list of changelist \
+                 numbers such as '43650,43651'"
+            ));
+        }
+        // A leading '-' would both be a negative number and, if it ever reached `p4`, read
+        // as an option. Reject it here, as `--diff` does for git.
+        if !tok.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "--change entry '{tok}' is not a changelist number. Give numeric changelists \
+                 only (no 'default', no ranges): e.g. '43650,43651'."
+            ));
+        }
+        let n: u64 = tok
+            .parse()
+            .map_err(|_| format!("--change entry '{tok}' is out of range for a changelist"))?;
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    if out.is_empty() {
+        return Err("--change requires at least one changelist number".into());
+    }
+    if out.len() > MAX_CHANGELISTS {
+        return Err(format!(
+            "--change lists {} changelists, more than the maximum of {MAX_CHANGELISTS}. \
+             Review them in smaller batches.",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolve `--vcs auto` from the filesystem alone.
+///
+/// git wins if a `.git` entry -- file *or* directory, since worktrees and submodules use a
+/// `.git` file -- exists at the working root or any ancestor. Only then, with no git marker
+/// anywhere above, is the root treated as Perforce. This never spawns a process: deciding
+/// the backend must not itself hit a Perforce server, and a git repository must resolve
+/// without any Perforce involvement at all.
+fn detect_vcs(cwd: &Path) -> Vcs {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return Vcs::Git;
+        }
+        dir = d.parent();
+    }
+    Vcs::Perforce
+}
+
 /// Built-in tools the Claude reviewer may use at all. Omitting Write, Edit and Bash
 /// here removes them from the session entirely, so the model has nothing to attempt.
 ///
@@ -211,7 +333,15 @@ pub struct Config {
     /// reviews *of a change*, and without this the caller of a shell-less reviewer had to
     /// paste the diff into `instructions` -- spending its own context on it, missing
     /// untracked files, and getting a confident review of the current tree when it forgot.
+    ///
+    /// Meaningful only when `vcs == Git`; the Perforce backend is driven by `changes`.
     pub diff: DiffMode,
+    /// Which VCS the capture backend drives, resolved from `--vcs` (default `auto`).
+    pub vcs: Vcs,
+    /// The changelists the Perforce backend captures, from `--change`. Empty means none
+    /// were configured -- there is deliberately no default, so an empty list captures
+    /// nothing. Meaningful only when `vcs == Perforce`.
+    pub changes: Vec<u64>,
 }
 
 impl Config {
@@ -230,7 +360,12 @@ impl Config {
         let mut no_preamble = false;
         let mut isolate_reviewer = true;
         let mut metrics = true;
-        let mut diff = DiffMode::Auto;
+        // `--diff` and `--change` are parsed *after* the loop, because how a `--diff` value
+        // is interpreted (and whether `--change` is even legal) depends on `--vcs`, which
+        // may appear later on the command line. Kept raw until the backend is known.
+        let mut diff_raw: Option<String> = None;
+        let mut changes_raw: Option<String> = None;
+        let mut vcs_arg: Option<Vcs> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -274,7 +409,9 @@ impl Config {
                 "--sandbox" => sandbox = take("--sandbox")?,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
                 "--tools" => tools = Some(take("--tools")?),
-                "--diff" => diff = DiffMode::parse(&take("--diff")?)?,
+                "--diff" => diff_raw = Some(take("--diff")?),
+                "--vcs" => vcs_arg = Vcs::parse_arg(&take("--vcs")?)?,
+                "--change" | "--changelist" => changes_raw = Some(take("--change")?),
                 "--preamble-file" => preamble_file = Some(PathBuf::from(take("--preamble-file")?)),
                 "--no-preamble" => no_preamble = true,
                 // The original name only spoke of MCP; kept working because it is in
@@ -297,6 +434,55 @@ impl Config {
                 .map_err(|e| format!("cannot determine current directory: {e}"))?,
         };
         let cwd = normalize_dir(cwd);
+
+        // `--vcs auto` (or unset) resolves from the filesystem now that `cwd` is known. This
+        // is the only place a backend is chosen, and it spawns nothing.
+        let vcs = vcs_arg.unwrap_or_else(|| detect_vcs(&cwd));
+
+        // `--diff` and `--change` are backend-specific, and passing one to the wrong backend
+        // is a configuration mistake worth failing on rather than silently ignoring: a
+        // `--change` under git would capture nothing while looking configured, and a `--diff`
+        // under Perforce likewise. Each backend consults only its own field.
+        let (diff, changes) = match vcs {
+            Vcs::Git => {
+                if changes_raw.is_some() {
+                    return Err(
+                        "--change applies to Perforce; the working root resolved to git. \
+                         Use --diff for a git range, or pass --vcs perforce."
+                            .into(),
+                    );
+                }
+                let diff = match diff_raw {
+                    Some(s) => DiffMode::parse(&s)?,
+                    None => DiffMode::Auto,
+                };
+                (diff, Vec::new())
+            }
+            Vcs::Perforce => {
+                if diff_raw.is_some() {
+                    return Err(
+                        "--diff applies to git; the working root resolved to Perforce. \
+                         Use --change to name the changelists to review, or pass --vcs git."
+                            .into(),
+                    );
+                }
+                let changes = match changes_raw {
+                    Some(s) => parse_changes(&s)?,
+                    None => Vec::new(),
+                };
+                if changes.is_empty() {
+                    // Not fatal -- the capture reports it as a warning at review time so the
+                    // caller sees it -- but say it at startup too, because a Perforce backend
+                    // with no changelists captures nothing and reviews the current tree.
+                    eprintln!(
+                        "cross-review: warning: --vcs perforce with no --change, so no \
+                         changelist is captured; the reviewer will review the current tree. \
+                         Pass --change <n>[,<n>...] to review specific changelists."
+                    );
+                }
+                (DiffMode::Auto, changes)
+            }
+        };
 
         let effort = effort.unwrap_or_else(|| reviewer.default_effort().to_string());
         if !reviewer.known_efforts().contains(&effort.as_str()) {
@@ -344,6 +530,8 @@ impl Config {
             isolate_reviewer,
             metrics,
             diff,
+            vcs,
+            changes,
         })
     }
 
@@ -379,19 +567,58 @@ impl Config {
         }
     }
 
-    /// Whether this configuration intends to hand the reviewer a diff.
+    /// Whether this configuration intends to hand the reviewer a change.
     ///
-    /// Intent only: whether one actually arrives depends on the working root being a git
-    /// repository, which is a runtime question. `auto` supplies a diff exactly when the
-    /// reviewer cannot fetch one itself, so a reviewer with a shell is left to do its own
-    /// looking rather than being handed a stale snapshot alongside live access.
-    pub fn supplies_diff(&self) -> bool {
-        // Matched exhaustively: a new mode should have to state its answer here rather
-        // than opt itself in by falling through a wildcard.
-        match self.diff {
-            DiffMode::None => false,
-            DiffMode::Auto => !self.reviewer_has_shell(),
-            DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
+    /// Intent only: whether one actually arrives depends on the working root really being a
+    /// repository of that kind, which is a runtime question. For git, `auto` supplies a diff
+    /// exactly when the reviewer cannot fetch one itself, so a shelled reviewer is left to do
+    /// its own looking rather than handed a stale snapshot alongside live access. For
+    /// Perforce there is no `auto`: an explicit `--change` always supplies (the changelists
+    /// are the whole intent), and no `--change` supplies nothing.
+    pub fn supplies_change(&self) -> bool {
+        // Each backend matches exhaustively: a new mode or backend states its answer here
+        // rather than opting itself in by falling through a wildcard.
+        match self.vcs {
+            Vcs::Git => match self.diff {
+                DiffMode::None => false,
+                DiffMode::Auto => !self.reviewer_has_shell(),
+                DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
+            },
+            Vcs::Perforce => !self.changes.is_empty(),
+        }
+    }
+
+    /// What the *caller* is told the capture will contain, per backend.
+    ///
+    /// The tool description needs the shape of the capture so the calling agent knows what to
+    /// put in `instructions`. Git derives it from the `--diff` mode; Perforce from the
+    /// changelist list. Kept here, next to `supplies_change`, so a backend cannot advertise a
+    /// capture it does not perform.
+    pub fn capture_caller_summary(&self) -> (String, String) {
+        match self.vcs {
+            Vcs::Git => {
+                let (captures, caveat) = self.diff.caller_summary();
+                (captures, caveat.to_string())
+            }
+            Vcs::Perforce => {
+                let list = self
+                    .changes
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(
+                        "changelist(s) {list}: for each, its diff, a listing of the opened or \
+                         affected files, the contents of files opened for add, and the \
+                         changelist description"
+                    ),
+                    "Note that only the named changelists are covered; files edited without \
+                     `p4 edit`, and work in other changelists, are not shown, and a submitted \
+                     changelist's diff is a server revision that the live tree may differ from."
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -403,18 +630,19 @@ impl Config {
     /// and a reviewer with no shell cannot compute a diff at all -- so it needs telling
     /// to say that plainly instead of guessing at what changed.
     ///
-    /// `diff_supplied` is the *runtime* answer, not `supplies_diff()`: a configured diff
-    /// that could not be captured (no git, not a repository) must not be announced, or the
+    /// `diff_supplied` is the *runtime* answer, not `supplies_change()`: a configured change
+    /// that could not be captured (no git/p4, not a repository) must not be announced, or the
     /// reviewer goes looking below for a section that is not there.
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
         let mut out = String::new();
         match self.reviewer {
             ReviewerKind::Codex => {
-                out.push_str(
+                out.push_str(&format!(
                     "You can read any file in this project and run read-only shell commands, \
-                     including `git diff`, `git log`, `git show` and ripgrep, so you can inspect \
-                     the change history yourself. Writes are blocked by the sandbox.",
-                );
+                     including {} and ripgrep, so you can inspect the change history yourself. \
+                     Writes are blocked by the sandbox.",
+                    self.vcs.read_commands_phrase(),
+                ));
             }
             ReviewerKind::Claude if self.reviewer_has_shell() => {
                 // Not "read-only", unlike the Codex arm above. That one is a sandbox
@@ -432,13 +660,14 @@ impl Config {
                 );
             }
             ReviewerKind::Claude => {
-                out.push_str(
+                out.push_str(&format!(
                     "You can read and search files in this project, and nothing else: Read, Grep \
                      and Glob, scoped to this directory tree.\n\n\
-                     You have no shell. You cannot run `git`, so you cannot obtain the commit \
-                     history yourself, and you cannot reconstruct it from the `.git` directory \
-                     with the tools you have.",
-                );
+                     You have no shell. You cannot run `{}`, so you cannot obtain the change \
+                     history yourself, and you cannot reconstruct it from the version-control \
+                     metadata with the tools you have.",
+                    self.vcs.cli(),
+                ));
             }
         }
 
@@ -561,7 +790,19 @@ OPTIONS:
                               handed a tool it can never call.
   --allow-tools <list>        Claude permission rules. Default: Read/Grep/Glob scoped
                               to the working root, so reads cannot leave the project.
-  --diff <spec>               What to capture and hand the reviewer as "the change".
+  --vcs <auto|git|perforce>   Which version control the capture backend drives.
+                              auto    git if a .git entry exists at or above the working
+                                      root, else Perforce. Filesystem-only: never runs p4
+                                      to decide. (default)
+                              git     git backend, configured by --diff.
+                              perforce  Perforce backend, configured by --change.
+  --change <n[,n...]>         Perforce only: the changelist numbers to review, e.g.
+                              43650,43651. Numeric only -- there is deliberately no
+                              default and no 'default' changelist; with no --change the
+                              Perforce backend captures nothing. At most 20 changelists.
+                              Rejected under --vcs git (use --diff there).
+  --diff <spec>               git only: what to capture and hand the reviewer as "the
+                              change". Rejected under --vcs perforce (use --change there).
                               auto    supply a working-tree diff only when the reviewer
                                       has no usable shell to fetch one itself -- i.e.
                                       Claude without Bash both enabled and allow-listed.
@@ -819,7 +1060,7 @@ mod tests {
         .expect("config");
         assert!(!listed_only.reviewer_has_shell());
         assert!(
-            listed_only.supplies_diff(),
+            listed_only.supplies_change(),
             "and the diff must be supplied, since it has no usable shell"
         );
 
@@ -947,10 +1188,10 @@ mod tests {
     fn auto_supplies_a_diff_only_to_a_reviewer_that_cannot_fetch_one() {
         // The whole asymmetry this closes: Codex can run git diff itself, Claude cannot.
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert!(claude.supplies_diff());
+        assert!(claude.supplies_change());
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert!(!codex.supplies_diff());
+        assert!(!codex.supplies_change());
 
         // And a Claude reviewer given Bash back -- in the session *and* permitted, since
         // either alone leaves it unable to run anything -- can fetch its own.
@@ -963,7 +1204,7 @@ mod tests {
             "Read Grep Glob Bash(git diff:*)",
         ]))
         .expect("config");
-        assert!(!with_bash.supplies_diff());
+        assert!(!with_bash.supplies_change());
     }
 
     #[test]
@@ -972,11 +1213,11 @@ mod tests {
         // wants a specific range must get it even when the reviewer has a shell.
         let off =
             Config::from_args(&args(&["--reviewer", "claude", "--diff", "none"])).expect("config");
-        assert!(!off.supplies_diff());
+        assert!(!off.supplies_change());
 
         let ranged = Config::from_args(&args(&["--reviewer", "codex", "--diff", "main...HEAD"]))
             .expect("config");
-        assert!(ranged.supplies_diff());
+        assert!(ranged.supplies_change());
         assert_eq!(ranged.diff, DiffMode::Rev("main...HEAD".into()));
     }
 
@@ -1105,5 +1346,170 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--effort", "hyper"]))
             .expect("unusual effort should warn, not fail");
         assert_eq!(cfg.effort, "hyper");
+    }
+
+    #[test]
+    fn vcs_flag_parses_and_auto_detects_from_the_filesystem() {
+        // Explicit values.
+        let git = Config::from_args(&args(&["--reviewer", "codex", "--vcs", "git"])).expect("cfg");
+        assert_eq!(git.vcs, Vcs::Git);
+        for p4 in ["perforce", "p4"] {
+            let cfg = Config::from_args(&args(&["--reviewer", "codex", "--vcs", p4])).expect("cfg");
+            assert_eq!(cfg.vcs, Vcs::Perforce, "{p4}");
+        }
+        let err = Config::from_args(&args(&["--reviewer", "codex", "--vcs", "svn"])).unwrap_err();
+        assert!(err.contains("--vcs"), "{err}");
+
+        // auto: a directory with a `.git` entry is git, without one is Perforce -- and the
+        // detection is filesystem-only, so it does not need a live server.
+        let with_git = crate::testutil::temp_dir("cross-review-vcs-git");
+        std::fs::create_dir(with_git.join(".git")).expect("mkdir .git");
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--cwd",
+            &with_git.to_string_lossy(),
+        ]))
+        .expect("cfg");
+        assert_eq!(cfg.vcs, Vcs::Git);
+
+        let without_git = crate::testutil::temp_dir("cross-review-vcs-p4");
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--cwd",
+            &without_git.to_string_lossy(),
+        ]))
+        .expect("cfg");
+        assert_eq!(cfg.vcs, Vcs::Perforce);
+    }
+
+    #[test]
+    fn change_list_parses_dedupes_and_rejects_non_numeric() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "perforce",
+            "--change",
+            "43650, 43651 ,43650",
+        ]))
+        .expect("cfg");
+        // Trimmed, and the duplicate dropped, first-seen order preserved.
+        assert_eq!(cfg.changes, vec![43650, 43651]);
+
+        for bad in ["default", "-3", "43650,", "12a", "", "1.2"] {
+            let err = Config::from_args(&args(&[
+                "--reviewer",
+                "codex",
+                "--vcs",
+                "perforce",
+                "--change",
+                bad,
+            ]))
+            .unwrap_err();
+            assert!(!err.is_empty(), "'{bad}' should be rejected");
+        }
+
+        // Over the cap fails closed rather than silently truncating.
+        let many = (1..=MAX_CHANGELISTS as u64 + 1)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "perforce",
+            "--change",
+            &many,
+        ]))
+        .unwrap_err();
+        assert!(err.contains("maximum"), "{err}");
+    }
+
+    #[test]
+    fn backend_specific_flags_are_rejected_for_the_wrong_backend() {
+        // --change under git, and --diff under Perforce, are configuration mistakes.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "git",
+            "--change",
+            "1",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--change"), "{err}");
+
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "perforce",
+            "--diff",
+            "HEAD",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--diff"), "{err}");
+    }
+
+    #[test]
+    fn perforce_supplies_a_change_only_when_changelists_are_named() {
+        let with = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--vcs",
+            "perforce",
+            "--change",
+            "43650",
+        ]))
+        .expect("cfg");
+        assert!(with.supplies_change());
+
+        // No --change: not fatal, but supplies nothing (the capture warns at review time).
+        let without =
+            Config::from_args(&args(&["--reviewer", "claude", "--vcs", "perforce"])).expect("cfg");
+        assert!(without.changes.is_empty());
+        assert!(!without.supplies_change());
+    }
+
+    #[test]
+    fn perforce_capabilities_and_summary_name_p4_not_git() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--vcs",
+            "perforce",
+            "--change",
+            "43650,43651",
+        ]))
+        .expect("cfg");
+
+        // The shell-less Claude reviewer is told it cannot run p4, not git.
+        let caps = cfg.reviewer_capabilities(false);
+        assert!(caps.contains("cannot run `p4`"), "{caps}");
+        assert!(!caps.contains("`git`"), "{caps}");
+
+        // The caller summary names the actual changelists.
+        let (captures, caveat) = cfg.capture_caller_summary();
+        assert!(captures.contains("43650, 43651"), "{captures}");
+        assert!(caveat.contains("p4 edit"), "{caveat}");
+    }
+
+    #[test]
+    fn codex_capabilities_name_the_active_vcs_read_commands() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "perforce",
+            "--change",
+            "1",
+        ]))
+        .expect("cfg");
+        let caps = cfg.reviewer_capabilities(false);
+        assert!(caps.contains("p4 describe"), "{caps}");
+        assert!(!caps.contains("git diff"), "{caps}");
     }
 }

@@ -91,9 +91,15 @@ the single source of truth. There is no config file of our own to drift out of s
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.
---diff <spec>               What to capture as "the change". auto|none|staged|HEAD|<rev>.
-                            Default auto: supply a diff only when the reviewer has no
-                            shell to fetch one itself.
+--vcs <auto|git|perforce>   Which version control the capture backend drives. Default
+                            auto: git if a .git entry is at/above the working root, else
+                            Perforce. Filesystem-only — it never runs p4 to decide.
+--diff <spec>               git only. What to capture as "the change".
+                            auto|none|staged|HEAD|<rev>. Default auto: supply a diff only
+                            when the reviewer has no shell to fetch one itself.
+--change <n[,n...]>         Perforce only. The changelist numbers to review, e.g.
+                            43650,43651. Numeric only — no default and no "default"
+                            changelist; with no --change nothing is captured. Max 20.
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -119,9 +125,11 @@ and, when it is forgotten, getting back a confident review of the current tree r
 of the change.
 
 So the server fetches it. It is already a process on your machine with a known working
-root, so running `git` here costs the calling agent nothing:
+root, so running `git` (or `p4`) here costs the calling agent nothing. Which one it runs is
+[`--vcs`](#perforce), `auto` by default; the table below is the **git** backend, and the
+Perforce backend is described [below](#perforce).
 
-| `--diff` | What the reviewer is shown |
+| `--diff` (git) | What the reviewer is shown |
 | --- | --- |
 | `auto` *(default)* | `git diff HEAD` + `git status --porcelain` + untracked file contents — **only when the reviewer has no usable shell** |
 | `none` | nothing; supply your own in `instructions` |
@@ -250,6 +258,54 @@ Notes on the edges, because they are where this would otherwise mislead:
   and nowhere else. That is a policy judgement rather than a claim about the code: those
   files were all reached by the listing, so the reviewer has their shape, and keeping them
   out of the warnings is what makes a warning mean the capture itself was short.
+
+### Perforce
+
+`--vcs perforce` (or `auto` in a workspace with no `.git`) captures an **explicit list of
+changelists** — `--change 43650,43651`. There is deliberately no default and no "all
+opened": Perforce workspaces are large and a reconcile of one is slow, so the change is
+always the changelists you name. With no `--change`, nothing is captured and the caller is
+warned. `p4` is resolved from PATH and run in the working root, so `P4CONFIG`/`P4CLIENT`
+resolve the client; the resolved client and root are printed in the reviewer's prompt so a
+wrong one is visible.
+
+Per changelist the reviewer is shown a **basis banner**, the changelist description (fenced
+as evidence, never as instructions), a diff, a listing of the affected files with their
+depot and working-root-relative paths, and the contents of files opened for add:
+
+| Changelist | Basis | Diff | New-file contents |
+| --- | --- | --- | --- |
+| pending | **workspace** — the diff (`p4 diff -du` of opened edits) compares the workspace to the depot, so it matches the files you can read | opened edits | files opened for add, read from disk |
+| submitted | **server revision** — `p4 describe -du`; the live tree may be a *different* revision, and the reviewer is told so | the whole changelist, filtered per file | (none) |
+
+Two things are stated plainly rather than glossed, because getting them wrong would let the
+reviewer trust the wrong tree:
+
+- **Completeness is separate from basis.** A pending diff matches the files you can read,
+  but says nothing about files edited without `p4 edit` (not detected — reconcile is too
+  slow to run), files opened in *other* changelists, or any other workspace change. Any
+  changelist can also be **incomplete** — permission-limited, an out-of-root file dropped,
+  truncated output, a foreign/shelved pending changelist with nothing open here. Each is
+  labelled per changelist, and the requested / captured / skipped changelists are listed in
+  the prompt, not only in the caller's warnings.
+- **Read confinement differs by basis.** A Perforce client view can map depot files to disk
+  outside the working root, so out-of-root content is dropped — the capture never contains
+  what the reviewer's own `Read(./**)` scope could not. For a *pending* changelist that is
+  process-level: paths are filtered *before* any file is read. For a *submitted* one it is
+  prompt-level only — `p4 describe -du` returns the whole changelist server-side, so
+  out-of-root bytes reach this process and are dropped before rendering, not before being
+  read. The guarantee there is "not shown to the reviewer", not "not read by the server".
+
+The Perforce threat surface is **narrower** than git's, and the README says so rather than
+claiming parity: there is no committed-config execution analog. `p4 diff -du` forces p4's
+internal diff, so `P4DIFF` (the external-diff variable, Perforce's `diff.external`) is not
+consulted, and `P4MERGE`/`P4DIFFHTML`/`P4EDITOR` are removed from the child's environment as
+defence in depth; no `p4 resolve`/`merge`/`print` is ever run. That is not general config
+isolation — a `P4CONFIG` file in a parent directory still governs which server and client
+`p4` talks to, which is unavoidable because it is how the client resolves at all. Every
+filespec handed back to `p4` comes from `p4`'s own canonical output, so nothing is
+constructed from a literal name and there is nothing to escape; the only external input is
+the changelist *numbers*, validated numeric.
 
 ## Re-reviewing after you act on feedback
 

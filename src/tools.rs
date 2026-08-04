@@ -698,14 +698,13 @@ impl Job {
         // Captured once, before either attempt: the retry below re-runs the same review
         // in a new reviewer session, so re-running git for it would only spend time and
         // risk showing the two turns different trees.
-        if self.cfg.supplies_diff() {
+        if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         let capture = vcs::capture(&self.cfg, &self.cancel);
-        let change = capture
-            .change
-            .as_ref()
-            .map(|change| vcs::render(change, &self.cfg.cwd, self.cfg.reviewer_has_shell()));
+        // The backend has already rendered the change into the prompt string; clone it out
+        // so `capture.change` stays available for the usage metrics below.
+        let change = capture.change.as_ref().map(|c| c.rendered.clone());
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -797,7 +796,7 @@ impl Job {
         &self,
         usage: crate::metrics::Usage,
         failure_code: Option<String>,
-        change: Option<&vcs::Change>,
+        change: Option<&vcs::CapturedChange>,
         started: std::time::Instant,
         facts: AttemptFacts,
     ) {
@@ -809,8 +808,8 @@ impl Job {
 
         // The rendered diff is what actually went into the prompt, so that is what is
         // measured -- not the raw `git diff` output, which is a different size.
-        let diff_bytes = change.map(|c| c.diff.text.len()).unwrap_or(0);
-        let diff_truncated = change.map(|c| c.diff.truncated).unwrap_or(false);
+        let diff_bytes = change.map(|c| c.diff_bytes).unwrap_or(0);
+        let diff_truncated = change.map(|c| c.diff_truncated).unwrap_or(false);
 
         eprintln!(
             "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}{}",

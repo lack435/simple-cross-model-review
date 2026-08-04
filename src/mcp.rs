@@ -623,7 +623,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // reviewer with no shell cannot obtain a diff, and a description that implied
     // otherwise invited requests like "review the branch diff" that silently could not be
     // carried out -- with no permission denial to surface, since the tool is absent.
-    // `supplies_diff` is asked first because the two are not exclusive: `--diff HEAD` with
+    // `supplies_change` is asked first because the two are not exclusive: `--diff HEAD` with
     // a shelled reviewer captures *and* hands over a change, which the shell branch would
     // have described as "inspect the change history itself" while a diff sat in the prompt.
     // Said once, and only as strongly as the mechanism behind it. Codex's shell runs under a
@@ -642,26 +642,26 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     };
 
-    let access = if cfg.reviewer_has_shell() && !cfg.supplies_diff() {
+    let read_commands = cfg.vcs.read_commands_phrase();
+    let cli = cfg.vcs.cli();
+    let access = if cfg.reviewer_has_shell() && !cfg.supplies_change() {
         format!(
             "The reviewer can read and search files in this repository. {shell_clause}, so it \
-             can run `git diff` and `git log` and inspect the change history itself. You do \
-             not need to paste code. Describe what changed and what you want scrutinised."
+             can run {read_commands} and inspect the change history itself. You do not need to \
+             paste code. Describe what changed and what you want scrutinised."
         )
-    } else if cfg.supplies_diff() {
+    } else if cfg.supplies_change() {
         // Worth stating positively. The caller pastes a diff because it believes it has
         // to; left to infer, it will keep spending its own context on one this server
         // already fetched.
-        // Qualified rather than flat: `supplies_diff` is the configured intent, and
-        // whether a diff actually arrives depends on the working root being a git
-        // repository, which is only known at capture time. The reviewer is told the
+        // Qualified rather than flat: `supplies_change` is the configured intent, and
+        // whether a change actually arrives depends on the working root being a repository
+        // of that kind, which is only known at capture time. The reviewer is told the
         // runtime answer; the caller can only be told the intent, so it must not be
         // promised more than that.
-        // What is captured is what `--diff` selects, so the description asks the mode
-        // rather than restating one of them: under `--diff staged` or a range this text
-        // otherwise promised a working-tree capture with untracked files that those modes
-        // deliberately exclude.
-        let (captures, caveat) = cfg.diff.caller_summary();
+        // What is captured is what the backend's spec selects, so the description asks
+        // `capture_caller_summary` rather than restating one of them.
+        let (captures, caveat) = cfg.capture_caller_summary();
         // The shell clause is the one part that cannot be stated unconditionally here: a
         // capture is configured for both kinds of reviewer, but only one of them lacks a
         // shell, and telling the caller a shelled reviewer has none would be a plain lie.
@@ -672,19 +672,21 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         };
         format!(
             "The reviewer can read and search files in this repository, so you do not need to \
-             paste whole files. {shell}: when the working root is a git repository, this server \
-             captures {captures}, and hands them to the reviewer with your request. Do not paste \
-             a diff into 'instructions' -- describe the intent of the change and what you want \
-             scrutinised instead. {caveat}"
+             paste whole files. {shell}: when the working root is a {vcs} repository, this \
+             server captures {captures}, and hands them to the reviewer with your request. Do \
+             not paste a diff into 'instructions' -- describe the intent of the change and what \
+             you want scrutinised instead. {caveat}",
+            vcs = cfg.vcs.name(),
         )
     } else {
-        "The reviewer can read and search files in this repository, so you do not need to \
-         paste whole files. It has NO shell, so it cannot run `git` and cannot obtain a \
-         diff. If the review depends on what changed rather than on the current state of \
-         the code, include the diff or a precise description of the change in \
-         'instructions' -- otherwise the reviewer can only judge the code as it now \
-         stands, and will say so."
-            .to_string()
+        format!(
+            "The reviewer can read and search files in this repository, so you do not need to \
+             paste whole files. It has NO shell, so it cannot run `{cli}` and cannot obtain a \
+             diff. If the review depends on what changed rather than on the current state of \
+             the code, include the diff or a precise description of the change in \
+             'instructions' -- otherwise the reviewer can only judge the code as it now \
+             stands, and will say so."
+        )
     };
     let caller_hint = match cfg.reviewer {
         crate::config::ReviewerKind::Claude => {
