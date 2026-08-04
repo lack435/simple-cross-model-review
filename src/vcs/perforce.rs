@@ -319,13 +319,21 @@ impl<'a> P4<'a> {
         let mut complete = true;
         let mut diff_truncated = false;
 
-        // The `describe -s` ledger or the `where` mapping being cut off means files may be
-        // missing or misjudged as out-of-root; either way the changelist is not fully shown.
-        if meta.truncated || where_truncated {
+        // Each source of truncation is reported separately, so the note names the command that
+        // was cut rather than conflating them.
+        if meta.truncated {
             complete = false;
             omissions.push(
-                "The changelist metadata hit the output size cap, so its file list may be \
-                 incomplete."
+                "`p4 describe` metadata hit the output size cap, so the changelist's file list \
+                 may be incomplete."
+                    .to_string(),
+            );
+        }
+        if where_truncated {
+            complete = false;
+            omissions.push(
+                "`p4 where` output hit the output size cap, so some files may be missing their \
+                 local mapping and treated as out of the working root."
                     .to_string(),
             );
         }
@@ -505,13 +513,30 @@ impl<'a> P4<'a> {
         let mut complete = true;
         let mut diff_truncated = false;
 
-        // A truncated opened-file listing or where mapping means files may be missing or
-        // wrongly judged out-of-root; the changelist is not fully shown either way.
-        if opened_truncated || where_truncated {
+        // Truncation of any of the three metadata commands means files may be missing or
+        // wrongly judged out-of-root; each is reported separately so the note names the
+        // command that was cut.
+        if meta.truncated {
             complete = false;
             omissions.push(
-                "The opened-file listing hit the output size cap, so some opened files may not \
-                 be shown."
+                "`p4 describe` metadata hit the output size cap, so the changelist's file list \
+                 or description may be incomplete."
+                    .to_string(),
+            );
+        }
+        if opened_truncated {
+            complete = false;
+            omissions.push(
+                "`p4 opened` output hit the output size cap, so some opened files may not be \
+                 shown."
+                    .to_string(),
+            );
+        }
+        if where_truncated {
+            complete = false;
+            omissions.push(
+                "`p4 where` output hit the output size cap, so some files may be missing their \
+                 local mapping and treated as out of the working root."
                     .to_string(),
             );
         }
@@ -765,7 +790,19 @@ fn render(
         out.push('\n');
 
         if seg.diff.trim().is_empty() {
-            out.push_str("#### Diff\n\n(no textual diff was captured for this changelist.)\n\n");
+            out.push_str("#### Diff\n\n");
+            if seg.diff_truncated {
+                // Empty because the combined cap was already exhausted by earlier changelists,
+                // not because there was nothing to show -- say which, or the reviewer reads
+                // "no diff" as "no change".
+                out.push_str(
+                    "(no diff shown: the combined diff size cap was reached before this \
+                     changelist, so its diff was omitted. Say under \"What I could not check\" \
+                     that you were not shown it.)\n\n",
+                );
+            } else {
+                out.push_str("(no textual diff was captured for this changelist.)\n\n");
+            }
         } else {
             out.push_str("#### Diff\n\n");
             push_fenced(&mut out, "diff", &seg.diff);
@@ -1608,6 +1645,21 @@ Change 5 by u@c on 2026/01/01\n\n\
         // No git vocabulary leaks into a Perforce capture.
         assert!(!text.contains("git status"), "{text}");
         assert!(!text.contains("Untracked files"), "{text}");
+    }
+
+    #[test]
+    fn render_explains_an_empty_diff_that_was_truncated_by_the_budget() {
+        // A later changelist that got zero remaining diff budget has an empty diff *because*
+        // of the cap, not because there was no change -- the render must say which.
+        let mut seg = segment_fixture(DiffBasis::Workspace, false);
+        seg.diff = String::new();
+        seg.diff_truncated = true;
+        let text = render_fixture(&[seg], &[]);
+        assert!(
+            text.contains("combined diff size cap was reached before"),
+            "{text}"
+        );
+        assert!(!text.contains("no textual diff was captured"), "{text}");
     }
 
     #[test]
