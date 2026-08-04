@@ -583,15 +583,20 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `CANCELLED`, `SERVER_SHUTTING_DOWN`,
-`INTERNAL_ERROR`. Bad tool arguments
-get a plain correction instead, since that is the agent's own mistake and not something to
-escalate,
-and so does a tool call the server could not start a thread for -- neither says anything
-about the reviewer's state.
+`OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `CANCELLED`,
+`SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad tool arguments, a session already busy, and a
+session refused as not resumable get a plain correction instead, since each is the agent's
+own call to make and not something to escalate; so does a tool call the server could not
+start a thread for -- neither says anything about the reviewer's state.
 
-An expired reviewer session is handled rather than escalated: the stale mapping is
-dropped, the review runs in a fresh session, and the response says so.
+A stale session is refused rather than silently restarted. Before a review is resumed the
+server checks that the named session still matches this reviewer, model and working root and
+is within the configured turn and idle limits (`--session-max-turns`,
+`--session-max-idle-seconds`); a session that fails any check returns `SESSION_NOT_RESUMABLE`
+so the caller decides to start fresh (`fresh=true`) rather than being handed a review with no
+memory of the work it asked to continue. A reviewer session that has expired out from under a
+resume mid-run is the same story a step later: the stale mapping is dropped and
+`SESSION_NOT_FOUND` is reported, again pointing the caller at `fresh=true`.
 
 Preflight runs before any model call, so a misconfigured machine fails in seconds
 instead of after a minute of billed work.

@@ -311,6 +311,30 @@ pub fn session_not_found(session: &str, id: &str) -> Failure {
     )
 }
 
+/// A stored session exists but policy forbids resuming it: it is too old, has run too many
+/// turns, or its reviewer, model or working root no longer matches this server.
+///
+/// Deliberately refused rather than silently restarted. The calling agent asked for
+/// continuity -- the same reviewer, still holding its earlier findings -- and would act on
+/// the answer as though it had that. Silently handing it a fresh review with no memory is
+/// the one way this tool can mislead without anything appearing to go wrong, so the caller
+/// is made to choose. Agent-correctable: it just starts fresh, so it gets a plain
+/// correction, not the stop-and-tell-the-user contract.
+pub fn session_not_resumable(session: &str, reason: String) -> Failure {
+    Failure {
+        code: "SESSION_NOT_RESUMABLE",
+        summary: format!("Review session '{session}' exists but cannot be resumed: {reason}"),
+        remediation: format!(
+            "This is a deliberate guard against resuming a stale review conversation, not a \
+             setup problem. To review now, call cross_model_review again with fresh=true -- \
+             that starts a new session under the name '{session}' with no memory of earlier \
+             turns -- or use a different session name. Carry any earlier findings that still \
+             matter into the new instructions, since the reviewer will not remember them."
+        ),
+        detail: None,
+    }
+}
+
 /// Bad tool arguments. This is the calling agent's mistake, not a setup problem, so it
 /// gets a plain correction instead of the stop-and-tell-the-user contract.
 pub fn bad_request(summary: impl Into<String>) -> Failure {
@@ -436,7 +460,10 @@ impl Failure {
     /// True when the failure is the agent's own fault and it should just retry
     /// differently, rather than stopping to involve the user.
     pub fn is_agent_correctable(&self) -> bool {
-        matches!(self.code, "BAD_REQUEST" | "SESSION_BUSY")
+        matches!(
+            self.code,
+            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE"
+        )
     }
 
     /// Agent-correctable failures skip the stop-and-escalate ceremony.
