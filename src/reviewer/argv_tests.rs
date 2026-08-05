@@ -307,12 +307,14 @@ fn codex_argv_isolates_user_configuration_and_exec_policy_by_default() {
     }
 
     let permissive = config(&["codex", "--allow-reviewer-config"]);
-    let args = argv(&CodexReviewer, &permissive, None);
-    assert!(
-        !args.iter().any(|a| a == "--ignore-user-config"),
-        "{args:?}"
-    );
-    assert!(!args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
+    for resume in [None, Some("sess")] {
+        let args = argv(&CodexReviewer, &permissive, resume);
+        assert!(
+            !args.iter().any(|a| a == "--ignore-user-config"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
+    }
 }
 
 #[test]
