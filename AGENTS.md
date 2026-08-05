@@ -167,8 +167,9 @@ shipping a stale binary.
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **The reviewer's isolation and read-only posture are security boundaries.** The tool
-  policy, `--safe-mode` / `--ignore-user-config`, the path-scoped `Read(./**)` grants, and
-  the job-object process reaping all exist for reasons documented in the README with
-  verified evidence. Do not relax any of them without saying plainly what boundary moves.
+  policy, `--safe-mode` / `--ignore-user-config` / `--ignore-rules`, the path-scoped
+  `Read(./**)` grants, and the job-object process reaping all exist for reasons documented
+  in the README with verified evidence. Do not relax any of them without saying plainly
+  what boundary moves.
 - **Claim only what was verified.** The README distinguishes "verified" from "assumed"
   deliberately. Keep that discipline in code comments and in what you tell the user.

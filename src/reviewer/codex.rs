@@ -91,6 +91,13 @@ impl Reviewer for CodexReviewer {
             // the user config entirely. Auth still resolves from CODEX_HOME, and model,
             // effort and sandbox are all passed explicitly above.
             cmd.arg("--ignore-user-config");
+            // Exec-policy rules are loaded separately from config.toml. Leaving the user's
+            // default.rules active makes ordinary read commands fail closed in a
+            // non-interactive `codex exec` (there is nobody to approve them), even though
+            // the OS read-only sandbox would safely deny writes. A reviewer then retries
+            // reconnaissance commands until its turn times out. Ignore those user/project
+            // rules for the isolated child; the explicit sandbox remains the write boundary.
+            cmd.arg("--ignore-rules");
         }
         cmd.arg("-o").arg(&last_message_file);
 

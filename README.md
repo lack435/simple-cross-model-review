@@ -462,6 +462,14 @@ not trust:
   the review text, which is returned to the caller verbatim. If you are reviewing a
   repository you do not trust, prefer the Claude direction.
 
+  The child also runs with `--ignore-rules` when configuration isolation is enabled. Codex
+  loads exec-policy `.rules` files separately from `config.toml`; on a non-interactive
+  `codex exec` those rules can reject ordinary read commands because there is no approval
+  prompt to answer. Ignoring them prevents a reviewer from retrying blocked reconnaissance
+  until its turn expires. This does not grant writes: the explicit Windows read-only sandbox
+  remains the boundary. `--allow-reviewer-config` opts out of both isolation flags, so a
+  trusted repository can deliberately retain its normal Codex policy.
+
   **The write boundary is the OS's.** This was previously hedged as "the CLI's, unless you
   have checked further", because only the refusal had been observed and not what refused
   it. It has now been checked, against Codex 0.145.0 on Windows 11. `codex sandbox` runs a
@@ -570,8 +578,11 @@ So the reviewer runs configuration-isolated by default:
   normally. (`--bare` would also do it but redefines authentication as API-key-only,
   breaking subscription sign-in.) Verified end to end: with a hostile project committing
   the hook above, the review completed normally and the hook did **not** run.
-- **Codex reviewer** — `--ignore-user-config`. Codex project hooks additionally require
-  persisted trust, and we never pass `--dangerously-bypass-hook-trust`.
+- **Codex reviewer** — `--ignore-user-config` and `--ignore-rules`. Codex project hooks
+  additionally require persisted trust, and we never pass `--dangerously-bypass-hook-trust`.
+  The two flags are separate: the first prevents project/user settings and MCP servers from
+  being loaded, while the second prevents user/project exec-policy rules from turning normal
+  read commands into non-interactive refusals. The OS sandbox is still passed explicitly.
 
 Isolation also stops a reviewer that has cross-review registered from recursing into it,
 which matters because `codex exec` does start configured MCP servers (verified with a
