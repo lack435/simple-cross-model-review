@@ -44,6 +44,11 @@ pub struct Parsed {
     /// Total number of tool calls the CLI reported as denied. `denials` is a bounded list
     /// of examples for the caller, so this count must not be inferred from its length.
     pub denial_count: usize,
+    /// Whether `denial_count` is a lower bound rather than the exact total. Set when the
+    /// count was recovered from output that hit the collection cap, so later refusals were
+    /// discarded: presenting the retained count as exact would understate it silently. The
+    /// flag travels with `denial_count` so the render can say "at least N".
+    pub denial_count_is_floor: bool,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
     /// What the CLI reported about the tokens this turn consumed. Both CLIs report it and
@@ -578,6 +583,8 @@ pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
                     reviewer,
                     cfg.timeout.as_secs(),
                     policy_denials,
+                    // A capped stderr dropped later refusals, so the count is a floor.
+                    out.stderr_truncated,
                     out.diagnostics(),
                 );
             }
@@ -752,5 +759,21 @@ mod drain_tests {
             .remediation
             .contains("non-interactive command-policy refusals"));
         assert!(failure.detail.unwrap_or_default().contains("git grep foo"));
+
+        // With a capped stderr the two counted refusals are only the ones that survived, so
+        // the summary must report the count as a floor rather than as the exact total.
+        let capped = RunOutcome {
+            stderr_truncated: true,
+            ..out
+        };
+        let failure = failure_for(&cfg, &capped);
+        assert_eq!(failure.code, "TIMEOUT");
+        assert!(
+            failure
+                .summary
+                .contains("refused at least 2 shell command(s)"),
+            "{}",
+            failure.summary
+        );
     }
 }

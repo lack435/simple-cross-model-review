@@ -494,10 +494,16 @@ impl App {
             // fallback preserves honest output for snapshots created by older in-memory
             // callers that did not populate the count.
             let denial_count = snapshot.denial_count.max(snapshot.denials.len());
+            // When the count was recovered from capped output, later refusals were dropped,
+            // so it is a lower bound -- say so rather than presenting it as the exact total.
+            let count_phrase = if snapshot.denial_count_is_floor {
+                format!("at least {denial_count}")
+            } else {
+                denial_count.to_string()
+            };
             out.push_str(&format!(
-                "Note: the reviewer tried {} command(s) it was not permitted to run, so parts of \
-                 its analysis may rest on less evidence than usual:\n",
-                denial_count
+                "Note: the reviewer tried {count_phrase} command(s) it was not permitted to run, \
+                 so parts of its analysis may rest on less evidence than usual:\n",
             ));
             for denial in snapshot.denials.iter().take(10) {
                 out.push_str(&format!("  - {denial}\n"));
@@ -1104,6 +1110,7 @@ impl Job {
             failure: None,
             denials: parsed.denials,
             denial_count: parsed.denial_count,
+            denial_count_is_floor: parsed.denial_count_is_floor,
             warnings,
             resumable,
             usage: parsed.usage,

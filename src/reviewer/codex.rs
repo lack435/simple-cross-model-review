@@ -201,6 +201,10 @@ impl Reviewer for CodexReviewer {
             session_id: events.thread_id,
             denials,
             denial_count,
+            // The router writes these to stderr, so a capped stderr drops the later ones and
+            // the retained count is only a floor. This is the sole path that can produce a
+            // truncated stream and still return a review, so it is the only one that sets it.
+            denial_count_is_floor: out.stderr_truncated,
             warnings,
             usage: Usage {
                 api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
@@ -612,6 +616,30 @@ ordinary diagnostic
         let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
         assert_eq!(parsed.denial_count, 1);
         assert_eq!(parsed.denials, vec!["git ls-files"]);
+    }
+
+    #[test]
+    fn a_capped_stderr_marks_the_denial_count_as_a_lower_bound() {
+        // The router writes refusals to stderr, so once stderr hits the collection cap the
+        // later ones are gone and the retained count understates the truth. It must be
+        // reported as a floor rather than as the exact total.
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = "router: error=`git grep foo` rejected: blocked by policy".to_string();
+
+        let intact = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(intact.denial_count, 1);
+        assert!(
+            !intact.denial_count_is_floor,
+            "an untruncated stderr is exact"
+        );
+
+        out.stderr_truncated = true;
+        let capped = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(capped.denial_count, 1);
+        assert!(
+            capped.denial_count_is_floor,
+            "a capped stderr dropped later refusals, so the count is a floor"
+        );
     }
 
     #[test]

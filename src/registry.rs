@@ -102,6 +102,9 @@ pub struct Review {
     pub denials: Vec<String>,
     /// Total number of denied commands. `denials` is only a bounded set of examples.
     pub denial_count: usize,
+    /// Whether `denial_count` is a lower bound (the source output was capped). Reported as
+    /// "at least N" so a count thinned by truncation is not presented as the exact total.
+    pub denial_count_is_floor: bool,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
     /// Whether a follow-up call on this session name will actually reach the same
@@ -143,6 +146,8 @@ pub struct Outcome {
     pub denials: Vec<String>,
     /// Total number of denied commands. `denials` is only a bounded set of examples.
     pub denial_count: usize,
+    /// Whether `denial_count` is a lower bound (the source output was capped).
+    pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
@@ -156,6 +161,7 @@ impl Outcome {
             failure: Some(failure),
             denials: Vec::new(),
             denial_count: 0,
+            denial_count_is_floor: false,
             warnings: Vec::new(),
             resumable: false,
             usage: Usage::default(),
@@ -169,6 +175,7 @@ impl Outcome {
             failure: None,
             denials: Vec::new(),
             denial_count: 0,
+            denial_count_is_floor: false,
             warnings: Vec::new(),
             resumable: true,
             usage: Usage::default(),
@@ -312,6 +319,7 @@ impl Registry {
                 failure: None,
                 denials: Vec::new(),
                 denial_count: 0,
+                denial_count_is_floor: false,
                 warnings: Vec::new(),
                 resumable: false,
                 started: now,
@@ -387,6 +395,7 @@ impl Registry {
                 review.finish_seq = finish_seq;
                 review.denials = outcome.denials;
                 review.denial_count = outcome.denial_count;
+                review.denial_count_is_floor = outcome.denial_count_is_floor;
                 review.warnings = outcome.warnings;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
@@ -557,6 +566,8 @@ pub struct Snapshot {
     pub denials: Vec<String>,
     /// Total number of denied commands. `denials` is only a bounded set of examples.
     pub denial_count: usize,
+    /// Whether `denial_count` is a lower bound (the source output was capped).
+    pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
     pub resumable: bool,
     pub elapsed: Duration,
@@ -583,6 +594,7 @@ impl Snapshot {
             failure: review.failure.clone(),
             denials: review.denials.clone(),
             denial_count: review.denial_count,
+            denial_count_is_floor: review.denial_count_is_floor,
             warnings: review.warnings.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
@@ -1081,12 +1093,16 @@ mod tests {
             Outcome {
                 denials: vec!["git grep example".into()],
                 denial_count: 101,
+                denial_count_is_floor: true,
                 ..Outcome::completed("ok")
             },
         );
         let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
         assert_eq!(snapshot.denial_count, 101);
         assert_eq!(snapshot.denials, vec!["git grep example"]);
+        // The floor flag must travel with the count, or the render presents a truncated
+        // total as exact.
+        assert!(snapshot.denial_count_is_floor);
     }
 
     #[test]

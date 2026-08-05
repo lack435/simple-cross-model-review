@@ -220,6 +220,10 @@ impl Reviewer for ClaudeReviewer {
             session_id,
             denials,
             denial_count,
+            // Claude's denials come from the final result document. If stdout hit the cap the
+            // document does not parse and this returns OUTPUT_TRUNCATED above, so a count that
+            // reaches here counted the whole document -- it is never a floor.
+            denial_count_is_floor: false,
             warnings,
             usage: collect_usage(&parsed),
             // Claude's result document describes the turn that just ran, not the

@@ -214,13 +214,21 @@ pub fn timed_out_after_policy_denials(
     reviewer: &str,
     secs: u64,
     count: usize,
+    count_is_floor: bool,
     detail: impl Into<String>,
 ) -> Failure {
+    // A capped stderr drops later refusals, so the retained count is a lower bound; say
+    // "at least N" rather than assert an exact total the collection could not have seen.
+    let count_phrase = if count_is_floor {
+        format!("at least {count}")
+    } else {
+        count.to_string()
+    };
     Failure::new(
         "TIMEOUT",
         format!(
-            "The '{reviewer}' reviewer timed out after its CLI refused {count} shell command(s) \
-             by policy."
+            "The '{reviewer}' reviewer timed out after its CLI refused {count_phrase} shell \
+             command(s) by policy."
         ),
         format!(
             "The cross-model review was cancelled after {secs} seconds. The reviewer encountered \
