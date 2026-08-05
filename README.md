@@ -462,6 +462,12 @@ not trust:
   the review text, which is returned to the caller verbatim. If you are reviewing a
   repository you do not trust, prefer the Claude direction.
 
+  The shell is not an unrestricted non-interactive command runner. Codex may refuse a command
+  form that needs approval, even when the operation is read-only. The reviewer is told to
+  prefer direct read commands and to treat a policy refusal as final rather than retrying
+  variants or composing a larger pipeline; it must report the resulting gap under "What I
+  could not check". A completed review also surfaces the commands that were refused.
+
   **The write boundary is the OS's.** This was previously hedged as "the CLI's, unless you
   have checked further", because only the refusal had been observed and not what refused
   it. It has now been checked, against Codex 0.145.0 on Windows 11. `codex sandbox` runs a
@@ -630,6 +636,11 @@ Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVA
 session refused as not resumable get a plain correction instead, since each is the agent's
 own call to make and not something to escalate; so does a tool call the server could not
 start a thread for -- neither says anything about the reviewer's state.
+
+When a Codex timeout includes repeated command-policy refusals, it remains `TIMEOUT` but the
+message names the refusal count and advises against simply raising the budget. Successful
+Codex reviews surface refused commands as a note, so a review that completed after missing
+evidence is not presented as fully checked.
 
 A stale session is refused rather than silently restarted. Before a review is resumed the
 server checks that the named session still matches this reviewer, model and working root and

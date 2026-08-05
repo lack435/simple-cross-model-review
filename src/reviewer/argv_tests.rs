@@ -303,11 +303,13 @@ fn codex_argv_isolates_user_configuration_by_default() {
     }
 
     let permissive = config(&["codex", "--allow-reviewer-config"]);
-    let args = argv(&CodexReviewer, &permissive, None);
-    assert!(
-        !args.iter().any(|a| a == "--ignore-user-config"),
-        "{args:?}"
-    );
+    for resume in [None, Some("sess")] {
+        let args = argv(&CodexReviewer, &permissive, resume);
+        assert!(
+            !args.iter().any(|a| a == "--ignore-user-config"),
+            "{args:?}"
+        );
+    }
 }
 
 #[test]

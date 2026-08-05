@@ -193,10 +193,18 @@ impl Reviewer for CodexReviewer {
             );
         }
 
+        let denial_count = policy_denial_count(&out.stderr);
+        let denials = collect_denials(&out.stderr);
+
         Ok(Parsed {
             text,
             session_id: events.thread_id,
-            denials: Vec::new(),
+            denials,
+            denial_count,
+            // The router writes these to stderr, so a capped stderr drops the later ones and
+            // the retained count is only a floor. This is the sole path that can produce a
+            // truncated stream and still return a review, so it is the only one that sets it.
+            denial_count_is_floor: out.stderr_truncated,
             warnings,
             usage: Usage {
                 api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
@@ -332,6 +340,46 @@ fn parse_events(stdout: &str) -> Events {
     }
 
     events
+}
+
+const POLICY_DENIAL_MARKER: &str = "rejected: blocked by policy";
+
+/// Count shell commands the Codex router refused before execution. This is separate from
+/// the JSON event parser because the router writes these diagnostics to stderr, not to the
+/// `--json` stream. The count is used to make a timeout self-diagnosing rather than looking
+/// like an unexplained stalled model.
+pub(crate) fn policy_denial_count(stderr: &str) -> usize {
+    stderr.lines().filter(|line| is_policy_denial(line)).count()
+}
+
+fn is_policy_denial(line: &str) -> bool {
+    line.to_ascii_lowercase().contains(POLICY_DENIAL_MARKER)
+}
+
+/// Render the refused command, keeping the useful part of Codex's router diagnostic while
+/// avoiding a repeated timestamp/prefix and bounding one denial's contribution to the MCP
+/// response. The full stderr remains in a timeout failure's diagnostic detail.
+fn collect_denials(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| is_policy_denial(line))
+        .take(100)
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let command = lower.find("error=`").and_then(|start| {
+                let start = start + "error=`".len();
+                lower[start..]
+                    .find("` rejected: blocked by policy")
+                    .and_then(|end| line.get(start..start + end))
+            });
+            let command = command.unwrap_or_else(|| line.trim());
+            let mut command = command.trim().to_string();
+            if command.chars().count() > 1000 {
+                command = command.chars().take(1000).collect::<String>() + "...";
+            }
+            command
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -539,6 +587,72 @@ mod tests {
             Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn successful_run_surfaces_commands_refused_by_the_cli_policy() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = r###"2026-08-05T15:32:49Z ERROR codex_core::tools::router: error=`"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "git grep -n CursorCert"` rejected: blocked by policy
+ordinary diagnostic
+"###
+        .to_string();
+
+        assert_eq!(policy_denial_count(&out.stderr), 1);
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 1);
+        assert_eq!(
+            parsed.denials,
+            vec![
+                r###""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "git grep -n CursorCert""###
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_denial_examples_parse_markers_without_relying_on_case() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = "router: ERROR=`git ls-files` REJECTED: BLOCKED BY POLICY".to_string();
+
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 1);
+        assert_eq!(parsed.denials, vec!["git ls-files"]);
+    }
+
+    #[test]
+    fn a_capped_stderr_marks_the_denial_count_as_a_lower_bound() {
+        // The router writes refusals to stderr, so once stderr hits the collection cap the
+        // later ones are gone and the retained count understates the truth. It must be
+        // reported as a floor rather than as the exact total.
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = "router: error=`git grep foo` rejected: blocked by policy".to_string();
+
+        let intact = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(intact.denial_count, 1);
+        assert!(
+            !intact.denial_count_is_floor,
+            "an untruncated stderr is exact"
+        );
+
+        out.stderr_truncated = true;
+        let capped = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(capped.denial_count, 1);
+        assert!(
+            capped.denial_count_is_floor,
+            "a capped stderr dropped later refusals, so the count is a floor"
+        );
+    }
+
+    #[test]
+    fn policy_denial_count_is_not_limited_by_the_example_cap() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = (0..101)
+            .map(|n| format!("router: error=`git grep {n}` rejected: blocked by policy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 101);
+        assert_eq!(parsed.denials.len(), 100);
     }
 
     #[test]

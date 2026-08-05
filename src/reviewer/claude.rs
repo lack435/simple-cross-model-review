@@ -209,10 +209,21 @@ impl Reviewer for ClaudeReviewer {
             );
         }
 
+        let denials = collect_denials(&parsed);
+        let denial_count = parsed
+            .get("permission_denials")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+
         Ok(Parsed {
             text,
             session_id,
-            denials: collect_denials(&parsed),
+            denials,
+            denial_count,
+            // Claude's denials come from the final result document. If stdout hit the cap the
+            // document does not parse and this returns OUTPUT_TRUNCATED above, so a count that
+            // reaches here counted the whole document -- it is never a floor.
+            denial_count_is_floor: false,
             warnings,
             usage: collect_usage(&parsed),
             // Claude's result document describes the turn that just ran, not the
@@ -254,6 +265,7 @@ fn collect_denials(parsed: &Value) -> Vec<String> {
         return Vec::new();
     };
     list.iter()
+        .take(100)
         .map(|entry| {
             let tool = entry
                 .get("tool_name")
@@ -419,6 +431,7 @@ mod tests {
             .parse(&cfg(), &outcome(json, true), None)
             .expect("parse");
         assert_eq!(parsed.denials, vec!["Bash: echo pwned > EVIL.txt"]);
+        assert_eq!(parsed.denial_count, 1);
     }
 
     #[test]

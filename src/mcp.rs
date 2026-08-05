@@ -635,7 +635,9 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // to the project, and no way to confine them was found (`README.md`), so this clause must
     // not grow into one that suggests otherwise.
     let shell_clause = match cfg.reviewer {
-        crate::config::ReviewerKind::Codex => "It has a read-only shell",
+        crate::config::ReviewerKind::Codex => {
+            "It has a read-only shell; its non-interactive command policy may refuse some forms"
+        }
         crate::config::ReviewerKind::Claude => {
             "It has a shell, because one was enabled explicitly -- its allow-list is a soft \
              boundary rather than a read-only guarantee"

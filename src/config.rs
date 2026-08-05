@@ -617,9 +617,18 @@ impl Config {
         match self.reviewer {
             ReviewerKind::Codex if self.reviewer_can_self_serve_change() => {
                 out.push_str(&format!(
-                    "You can read any file in this project and run read-only shell commands, \
-                     including {} and ripgrep, so you can inspect the change history yourself. \
-                     Writes are blocked by the sandbox.",
+                    "You can read any file in this project and inspect the change history \
+                     yourself, but only through simple, single read commands: {}, ripgrep \
+                     (`rg`), and `Get-Content`/`cat`. Run ONE command per call and keep it \
+                     simple -- do not chain commands with `;`, do not pipe them together, and do \
+                     not use `git grep` or `git ls-files`. The non-interactive CLI refuses \
+                     chained, piped, and non-allowed forms, and a refusal is final. If a command \
+                     is refused, do not repeat it or a near-variant: reach for a simpler allowed \
+                     command that gets the same thing -- `rg PATTERN` in place of `git grep`, \
+                     reading a specific file in place of listing -- and carry on reviewing with \
+                     what works. Do not abandon the review because one command was refused; note \
+                     something under \"What I could not check\" only when no allowed command can \
+                     get it. Writes are blocked by the sandbox.",
                     self.vcs.read_commands_phrase(),
                 ));
             }
@@ -627,15 +636,22 @@ impl Config {
                 // Reached for Perforce under a sandbox that denies network: `p4` needs to
                 // reach the server, so telling the reviewer it can inspect the changelist
                 // itself would be false (verified: p4 came back policy-blocked). It still has
-                // a read-only shell for the working tree and ripgrep.
+                // a shell for direct reads of the working tree and ripgrep.
                 // Whether to rely on a captured change is decided by the diff_supplied tail
                 // below, not asserted here: capture can fail (no client, p4 absent), and a
                 // flat "rely on the change below" would point at a section that is not there.
                 out.push_str(&format!(
-                    "You can read any file in this project and run read-only shell commands, \
-                     including ripgrep. Writes are blocked by the sandbox. Running `{}` needs to \
-                     reach the {} server, which this sandbox's network policy denies, so you \
-                     cannot inspect the changelist yourself.",
+                     "You can read any file in this project through simple, single read commands: \
+                     ripgrep (`rg`) and `Get-Content`/`cat`. Run ONE command per call and keep it \
+                     simple -- do not chain commands with `;`, do not pipe them together, and do \
+                     not use `git grep` or `git ls-files`. The non-interactive CLI refuses \
+                     chained, piped, and non-allowed forms, and a refusal is final. If a command \
+                     is refused, do not repeat it or a near-variant: reach for a simpler allowed \
+                     command that gets the same thing -- `rg PATTERN` in place of `git grep`, \
+                     reading a specific file in place of listing -- and carry on with what works, \
+                     rather than abandoning the review. Writes are blocked by the sandbox. Running \
+                     `{}` needs to reach the {} server, which this sandbox's network policy denies, \
+                     so you cannot inspect the changelist yourself.",
                     self.vcs.cli(),
                     self.vcs.name(),
                 ));
@@ -1194,9 +1210,14 @@ mod tests {
         let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
-        // Codex's shell has its writes denied by the OS sandbox, so it may be called
-        // read-only. That says nothing about reads, which are not confined to the project.
-        assert!(text.contains("read-only shell"), "{text}");
+        // Codex's shell has its writes denied by the OS sandbox, but the CLI may still
+        // refuse a command form in non-interactive mode. A small model at low effort batched
+        // its whole reconnaissance into one compound command, had it refused wholesale, and
+        // gave up -- so the guidance steers it to one simple command at a time and to fall
+        // back rather than abandon the review.
+        assert!(text.contains("ONE command per call"), "{text}");
+        assert!(text.contains("a refusal is final"), "{text}");
+        assert!(text.contains("carry on reviewing with"), "{text}");
     }
 
     /// The prompt the reviewer itself reads must not claim a boundary the mechanism does

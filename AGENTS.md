@@ -23,8 +23,9 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   not write the diff.
 - **Getting the diff in front of the reviewer depends on which direction you are calling.**
   The Codex reviewer has a read-only shell, so give it the branch and base and let it run
-  `git diff` itself. The Claude reviewer still has no shell, but no longer needs one: the
-  server captures the change and hands it over with the request. Do not paste a diff into
+  `git diff` itself. Its non-interactive command policy may refuse other shell forms; a
+  refusal is final, so do not retry variants. The Claude reviewer still has no shell, but no
+  longer needs one: the server captures the change and hands it over with the request. Do not paste a diff into
   `instructions` in either direction — describe the intent and what you want scrutinised,
   and let the reviewer or the server fetch the code.
 - **For the Claude direction, the gate reviews what is committed.** What gets captured is
@@ -167,8 +168,9 @@ shipping a stale binary.
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **The reviewer's isolation and read-only posture are security boundaries.** The tool
-  policy, `--safe-mode` / `--ignore-user-config`, the path-scoped `Read(./**)` grants, and
-  the job-object process reaping all exist for reasons documented in the README with
-  verified evidence. Do not relax any of them without saying plainly what boundary moves.
+  policy, `--safe-mode` / `--ignore-user-config`, the path-scoped
+  `Read(./**)` grants, and the job-object process reaping all exist for reasons documented
+  in the README with verified evidence. Do not relax any of them without saying plainly
+  what boundary moves.
 - **Claim only what was verified.** The README distinguishes "verified" from "assumed"
   deliberately. Keep that discipline in code comments and in what you tell the user.
