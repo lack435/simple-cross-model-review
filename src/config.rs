@@ -617,9 +617,12 @@ impl Config {
         match self.reviewer {
             ReviewerKind::Codex if self.reviewer_can_self_serve_change() => {
                 out.push_str(&format!(
-                    "You can read any file in this project and run read-only shell commands, \
-                     including {} and ripgrep, so you can inspect the change history yourself. \
-                     Writes are blocked by the sandbox.",
+                    "You can read any file in this project and use the shell for direct read \
+                     commands, including {}, ripgrep, and `Get-Content`/`cat`, so you can inspect \
+                     the change history yourself. The non-interactive CLI may refuse other shell \
+                     forms; prefer these direct forms over `git grep`, `git ls-files`, or composed \
+                     PowerShell pipelines. A refusal is final, so do not retry variants or compose \
+                     a more elaborate command. Writes are blocked by the sandbox.",
                     self.vcs.read_commands_phrase(),
                 ));
             }
@@ -627,15 +630,18 @@ impl Config {
                 // Reached for Perforce under a sandbox that denies network: `p4` needs to
                 // reach the server, so telling the reviewer it can inspect the changelist
                 // itself would be false (verified: p4 came back policy-blocked). It still has
-                // a read-only shell for the working tree and ripgrep.
+                // a shell for direct reads of the working tree and ripgrep.
                 // Whether to rely on a captured change is decided by the diff_supplied tail
                 // below, not asserted here: capture can fail (no client, p4 absent), and a
                 // flat "rely on the change below" would point at a section that is not there.
                 out.push_str(&format!(
-                    "You can read any file in this project and run read-only shell commands, \
-                     including ripgrep. Writes are blocked by the sandbox. Running `{}` needs to \
-                     reach the {} server, which this sandbox's network policy denies, so you \
-                     cannot inspect the changelist yourself.",
+                     "You can read any file in this project and use the shell for direct read \
+                     commands, including ripgrep and `Get-Content`/`cat`. The non-interactive CLI \
+                     may refuse other shell forms; prefer these direct forms over `git grep`, \
+                     `git ls-files`, or composed PowerShell pipelines. A refusal is final, so do not \
+                     retry variants or compose a more elaborate command. Writes are blocked by the \
+                     sandbox. Running `{}` needs to reach the {} server, which this sandbox's network \
+                     policy denies, so you cannot inspect the changelist yourself.",
                     self.vcs.cli(),
                     self.vcs.name(),
                 ));
@@ -1194,9 +1200,11 @@ mod tests {
         let text = codex.reviewer_capabilities(false);
         assert!(text.contains("git diff"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
-        // Codex's shell has its writes denied by the OS sandbox, so it may be called
-        // read-only. That says nothing about reads, which are not confined to the project.
-        assert!(text.contains("read-only shell"), "{text}");
+        // Codex's shell has its writes denied by the OS sandbox, but the CLI may still
+        // refuse a command form in non-interactive mode. The reviewer is told not to thrash
+        // when that happens.
+        assert!(text.contains("direct read commands"), "{text}");
+        assert!(text.contains("refusal is final"), "{text}");
     }
 
     /// The prompt the reviewer itself reads must not claim a boundary the mechanism does

@@ -2,7 +2,7 @@
 //!
 //! Every security property this tool claims lives in `invocation()`: `--safe-mode`,
 //! `--tools`, the scoped `--allowed-tools` rules, `--permission-mode dontAsk`,
-//! `-s read-only`, `--ignore-user-config`, `--ignore-rules`. Those were previously covered only
+//! `-s read-only`, `--ignore-user-config`. Those were previously covered only
 //! indirectly -- tests asserted the `Config` fields, but nothing asserted the fields
 //! reached the CLI, so deleting `cmd.arg("--safe-mode")` left the suite green.
 //!
@@ -293,17 +293,13 @@ fn codex_resume_passes_the_session_id_positionally() {
 }
 
 #[test]
-fn codex_argv_isolates_user_configuration_and_exec_policy_by_default() {
+fn codex_argv_isolates_user_configuration_by_default() {
     let cfg = config(&["codex"]);
     for resume in [None, Some("sess")] {
         let args = argv(&CodexReviewer, &cfg, resume);
         // codex exec does start configured MCP servers, so without this a reviewer with
         // cross-review registered could recurse into it.
         assert!(args.iter().any(|a| a == "--ignore-user-config"), "{args:?}");
-        // Exec-policy rules are a separate load path. If the caller's default.rules remains
-        // active, non-interactive read commands are rejected before the read-only OS sandbox
-        // gets a chance to run them, and the reviewer can burn its turn retrying them.
-        assert!(args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
     }
 
     let permissive = config(&["codex", "--allow-reviewer-config"]);
@@ -313,7 +309,6 @@ fn codex_argv_isolates_user_configuration_and_exec_policy_by_default() {
             !args.iter().any(|a| a == "--ignore-user-config"),
             "{args:?}"
         );
-        assert!(!args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
     }
 }
 

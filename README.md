@@ -462,13 +462,11 @@ not trust:
   the review text, which is returned to the caller verbatim. If you are reviewing a
   repository you do not trust, prefer the Claude direction.
 
-  The child also runs with `--ignore-rules` when configuration isolation is enabled. Codex
-  loads exec-policy `.rules` files separately from `config.toml`; on a non-interactive
-  `codex exec` those rules can reject ordinary read commands because there is no approval
-  prompt to answer. Ignoring them prevents a reviewer from retrying blocked reconnaissance
-  until its turn expires. This does not grant writes: the explicit Windows read-only sandbox
-  remains the boundary. `--allow-reviewer-config` opts out of both isolation flags, so a
-  trusted repository can deliberately retain its normal Codex policy.
+  The shell is not an unrestricted non-interactive command runner. Codex may refuse a command
+  form that needs approval, even when the operation is read-only. The reviewer is told to
+  prefer direct read commands and to treat a policy refusal as final rather than retrying
+  variants or composing a larger pipeline; it must report the resulting gap under "What I
+  could not check". A completed review also surfaces the commands that were refused.
 
   **The write boundary is the OS's.** This was previously hedged as "the CLI's, unless you
   have checked further", because only the refusal had been observed and not what refused
@@ -578,11 +576,8 @@ So the reviewer runs configuration-isolated by default:
   normally. (`--bare` would also do it but redefines authentication as API-key-only,
   breaking subscription sign-in.) Verified end to end: with a hostile project committing
   the hook above, the review completed normally and the hook did **not** run.
-- **Codex reviewer** — `--ignore-user-config` and `--ignore-rules`. Codex project hooks
-  additionally require persisted trust, and we never pass `--dangerously-bypass-hook-trust`.
-  The two flags are separate: the first prevents project/user settings and MCP servers from
-  being loaded, while the second prevents user/project exec-policy rules from turning normal
-  read commands into non-interactive refusals. The OS sandbox is still passed explicitly.
+- **Codex reviewer** — `--ignore-user-config`. Codex project hooks additionally require
+  persisted trust, and we never pass `--dangerously-bypass-hook-trust`.
 
 Isolation also stops a reviewer that has cross-review registered from recursing into it,
 which matters because `codex exec` does start configured MCP servers (verified with a
@@ -641,6 +636,11 @@ Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVA
 session refused as not resumable get a plain correction instead, since each is the agent's
 own call to make and not something to escalate; so does a tool call the server could not
 start a thread for -- neither says anything about the reviewer's state.
+
+When a Codex timeout includes repeated command-policy refusals, it remains `TIMEOUT` but the
+message names the refusal count and advises against simply raising the budget. Successful
+Codex reviews surface refused commands as a note, so a review that completed after missing
+evidence is not presented as fully checked.
 
 A stale session is refused rather than silently restarted. Before a review is resumed the
 server checks that the named session still matches this reviewer, model and working root and

@@ -91,13 +91,6 @@ impl Reviewer for CodexReviewer {
             // the user config entirely. Auth still resolves from CODEX_HOME, and model,
             // effort and sandbox are all passed explicitly above.
             cmd.arg("--ignore-user-config");
-            // Exec-policy rules are loaded separately from config.toml. Leaving the user's
-            // default.rules active makes ordinary read commands fail closed in a
-            // non-interactive `codex exec` (there is nobody to approve them), even though
-            // the OS read-only sandbox would safely deny writes. A reviewer then retries
-            // reconnaissance commands until its turn times out. Ignore those user/project
-            // rules for the isolated child; the explicit sandbox remains the write boundary.
-            cmd.arg("--ignore-rules");
         }
         cmd.arg("-o").arg(&last_message_file);
 
@@ -203,7 +196,7 @@ impl Reviewer for CodexReviewer {
         Ok(Parsed {
             text,
             session_id: events.thread_id,
-            denials: Vec::new(),
+            denials: collect_denials(&out.stderr),
             warnings,
             usage: Usage {
                 api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
@@ -339,6 +332,47 @@ fn parse_events(stdout: &str) -> Events {
     }
 
     events
+}
+
+const POLICY_DENIAL_MARKER: &str = "rejected: blocked by policy";
+
+/// Count shell commands the Codex router refused before execution. This is separate from
+/// the JSON event parser because the router writes these diagnostics to stderr, not to the
+/// `--json` stream. The count is used to make a timeout self-diagnosing rather than looking
+/// like an unexplained stalled model.
+pub(crate) fn policy_denial_count(stderr: &str) -> usize {
+    stderr.lines().filter(|line| is_policy_denial(line)).count()
+}
+
+fn is_policy_denial(line: &str) -> bool {
+    line.to_ascii_lowercase().contains(POLICY_DENIAL_MARKER)
+}
+
+/// Render the refused command, keeping the useful part of Codex's router diagnostic while
+/// avoiding a repeated timestamp/prefix and bounding one denial's contribution to the MCP
+/// response. The full stderr remains in a timeout failure's diagnostic detail.
+fn collect_denials(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| is_policy_denial(line))
+        .take(100)
+        .map(|line| {
+            let command = line
+                .find("error=`")
+                .and_then(|start| {
+                    let start = start + "error=`".len();
+                    line[start..]
+                        .find("` rejected: blocked by policy")
+                        .map(|end| &line[start..start + end])
+                })
+                .unwrap_or_else(|| line.trim());
+            let mut command = command.trim().to_string();
+            if command.chars().count() > 1000 {
+                command = command.chars().take(1000).collect::<String>() + "...";
+            }
+            command
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -546,6 +580,24 @@ mod tests {
             Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn successful_run_surfaces_commands_refused_by_the_cli_policy() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = r###"2026-08-05T15:32:49Z ERROR codex_core::tools::router: error=`"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "git grep -n CursorCert"` rejected: blocked by policy
+ordinary diagnostic
+"###
+        .to_string();
+
+        assert_eq!(policy_denial_count(&out.stderr), 1);
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(
+            parsed.denials,
+            vec![
+                r###""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "git grep -n CursorCert""###
+            ]
+        );
     }
 
     #[test]

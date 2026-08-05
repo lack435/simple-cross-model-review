@@ -207,6 +207,32 @@ pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failur
     .with_detail(detail)
 }
 
+/// A timeout accompanied by Codex command-policy refusals needs different guidance from a
+/// generic slow model. Raising the budget only gives the reviewer more time to retry commands
+/// that the non-interactive CLI will never approve.
+pub fn timed_out_after_policy_denials(
+    reviewer: &str,
+    secs: u64,
+    count: usize,
+    detail: impl Into<String>,
+) -> Failure {
+    Failure::new(
+        "TIMEOUT",
+        format!(
+            "The '{reviewer}' reviewer timed out after its CLI refused {count} shell command(s) \
+             by policy."
+        ),
+        format!(
+            "The cross-model review was cancelled after {secs} seconds. The reviewer encountered \
+             non-interactive command-policy refusals, so increasing the timeout is unlikely to \
+             help. Use the direct read commands the reviewer was told to prefer, configure a \
+             narrowly scoped allow rule for commands you trust, or use the other reviewer \
+             direction. The review has NOT been performed."
+        ),
+    )
+    .with_detail(detail)
+}
+
 pub fn cancelled() -> Failure {
     Failure::new(
         "CANCELLED",

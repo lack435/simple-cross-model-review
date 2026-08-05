@@ -568,6 +568,17 @@ pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
         return errors::cancelled();
     }
     if out.timed_out {
+        if cfg.reviewer == ReviewerKind::Codex {
+            let policy_denials = codex::policy_denial_count(&out.stderr);
+            if policy_denials > 0 {
+                return errors::timed_out_after_policy_denials(
+                    reviewer,
+                    cfg.timeout.as_secs(),
+                    policy_denials,
+                    out.diagnostics(),
+                );
+            }
+        }
         return errors::timed_out(reviewer, cfg.timeout.as_secs(), out.diagnostics());
     }
     errors::classify(
@@ -710,5 +721,33 @@ mod drain_tests {
             ..out
         };
         assert!(truncation_failure(&cfg, &intact).is_none());
+    }
+
+    #[test]
+    fn a_codex_timeout_with_policy_denials_explains_the_likely_stall() {
+        let cfg =
+            Config::from_args(&["--reviewer".to_string(), "codex".to_string()]).expect("config");
+        let out = RunOutcome {
+            stdout: String::new(),
+            stderr: concat!(
+                "ERROR codex_core::tools::router: error=`git grep foo` rejected: blocked by policy\n",
+                "ERROR codex_core::tools::router: error=`git ls-files` rejected: blocked by policy\n",
+            )
+            .to_string(),
+            exit: None,
+            success: false,
+            timed_out: true,
+            cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+
+        let failure = failure_for(&cfg, &out);
+        assert_eq!(failure.code, "TIMEOUT");
+        assert!(failure.summary.contains("refused 2 shell command(s)"));
+        assert!(failure
+            .remediation
+            .contains("non-interactive command-policy refusals"));
+        assert!(failure.detail.unwrap_or_default().contains("git grep foo"));
     }
 }
