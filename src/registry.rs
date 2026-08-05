@@ -100,6 +100,8 @@ pub struct Review {
     /// Read-only commands the reviewer attempted but was not permitted to run. Surfaced
     /// so the caller can tell a thin review from a blocked one.
     pub denials: Vec<String>,
+    /// Total number of denied commands. `denials` is only a bounded set of examples.
+    pub denial_count: usize,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
     /// Whether a follow-up call on this session name will actually reach the same
@@ -139,6 +141,8 @@ pub struct Outcome {
     pub review: Option<String>,
     pub failure: Option<Failure>,
     pub denials: Vec<String>,
+    /// Total number of denied commands. `denials` is only a bounded set of examples.
+    pub denial_count: usize,
     pub warnings: Vec<String>,
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
@@ -151,6 +155,7 @@ impl Outcome {
             review: None,
             failure: Some(failure),
             denials: Vec::new(),
+            denial_count: 0,
             warnings: Vec::new(),
             resumable: false,
             usage: Usage::default(),
@@ -163,6 +168,7 @@ impl Outcome {
             review: Some(review.to_string()),
             failure: None,
             denials: Vec::new(),
+            denial_count: 0,
             warnings: Vec::new(),
             resumable: true,
             usage: Usage::default(),
@@ -305,6 +311,7 @@ impl Registry {
                 review: None,
                 failure: None,
                 denials: Vec::new(),
+                denial_count: 0,
                 warnings: Vec::new(),
                 resumable: false,
                 started: now,
@@ -379,6 +386,7 @@ impl Registry {
                 review.finished = Some(Instant::now());
                 review.finish_seq = finish_seq;
                 review.denials = outcome.denials;
+                review.denial_count = outcome.denial_count;
                 review.warnings = outcome.warnings;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
@@ -547,6 +555,8 @@ pub struct Snapshot {
     pub review: Option<String>,
     pub failure: Option<Failure>,
     pub denials: Vec<String>,
+    /// Total number of denied commands. `denials` is only a bounded set of examples.
+    pub denial_count: usize,
     pub warnings: Vec<String>,
     pub resumable: bool,
     pub elapsed: Duration,
@@ -572,6 +582,7 @@ impl Snapshot {
             review: review.review.clone(),
             failure: review.failure.clone(),
             denials: review.denials.clone(),
+            denial_count: review.denial_count,
             warnings: review.warnings.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
@@ -1059,6 +1070,23 @@ mod tests {
         );
         // A review that could not be persisted must not be advertised as resumable.
         assert!(!snapshot.resumable);
+    }
+
+    #[test]
+    fn denial_count_survives_to_the_snapshot_separately_from_examples() {
+        let registry = Registry::new();
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        registry.finish(
+            &id,
+            Outcome {
+                denials: vec!["git grep example".into()],
+                denial_count: 101,
+                ..Outcome::completed("ok")
+            },
+        );
+        let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
+        assert_eq!(snapshot.denial_count, 101);
+        assert_eq!(snapshot.denials, vec!["git grep example"]);
     }
 
     #[test]

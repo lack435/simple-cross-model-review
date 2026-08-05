@@ -41,6 +41,9 @@ pub struct Parsed {
     pub session_id: Option<String>,
     /// Tool calls the reviewer was not permitted to make.
     pub denials: Vec<String>,
+    /// Total number of tool calls the CLI reported as denied. `denials` is a bounded list
+    /// of examples for the caller, so this count must not be inferred from its length.
+    pub denial_count: usize,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
     /// What the CLI reported about the tokens this turn consumed. Both CLIs report it and

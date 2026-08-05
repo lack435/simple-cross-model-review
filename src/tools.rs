@@ -489,11 +489,15 @@ impl App {
             out.push_str(&format!("WARNING: {warning}\n\n"));
         }
 
-        if !snapshot.denials.is_empty() {
+        if snapshot.denial_count > 0 || !snapshot.denials.is_empty() {
+            // Keep the exact total separate from the bounded examples shown below. The
+            // fallback preserves honest output for snapshots created by older in-memory
+            // callers that did not populate the count.
+            let denial_count = snapshot.denial_count.max(snapshot.denials.len());
             out.push_str(&format!(
                 "Note: the reviewer tried {} command(s) it was not permitted to run, so parts of \
                  its analysis may rest on less evidence than usual:\n",
-                snapshot.denials.len()
+                denial_count
             ));
             for denial in snapshot.denials.iter().take(10) {
                 out.push_str(&format!("  - {denial}\n"));
@@ -1099,6 +1103,7 @@ impl Job {
             review: Some(parsed.text),
             failure: None,
             denials: parsed.denials,
+            denial_count: parsed.denial_count,
             warnings,
             resumable,
             usage: parsed.usage,

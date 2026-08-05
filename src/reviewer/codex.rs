@@ -193,10 +193,14 @@ impl Reviewer for CodexReviewer {
             );
         }
 
+        let denial_count = policy_denial_count(&out.stderr);
+        let denials = collect_denials(&out.stderr);
+
         Ok(Parsed {
             text,
             session_id: events.thread_id,
-            denials: collect_denials(&out.stderr),
+            denials,
+            denial_count,
             warnings,
             usage: Usage {
                 api_calls: (events.turns_seen > 0).then_some(events.turns_seen),
@@ -357,15 +361,14 @@ fn collect_denials(stderr: &str) -> Vec<String> {
         .filter(|line| is_policy_denial(line))
         .take(100)
         .map(|line| {
-            let command = line
-                .find("error=`")
-                .and_then(|start| {
-                    let start = start + "error=`".len();
-                    line[start..]
-                        .find("` rejected: blocked by policy")
-                        .map(|end| &line[start..start + end])
-                })
-                .unwrap_or_else(|| line.trim());
+            let lower = line.to_ascii_lowercase();
+            let command = lower.find("error=`").and_then(|start| {
+                let start = start + "error=`".len();
+                lower[start..]
+                    .find("` rejected: blocked by policy")
+                    .and_then(|end| line.get(start..start + end))
+            });
+            let command = command.unwrap_or_else(|| line.trim());
             let mut command = command.trim().to_string();
             if command.chars().count() > 1000 {
                 command = command.chars().take(1000).collect::<String>() + "...";
@@ -592,12 +595,36 @@ ordinary diagnostic
 
         assert_eq!(policy_denial_count(&out.stderr), 1);
         let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 1);
         assert_eq!(
             parsed.denials,
             vec![
                 r###""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "git grep -n CursorCert""###
             ]
         );
+    }
+
+    #[test]
+    fn policy_denial_examples_parse_markers_without_relying_on_case() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = "router: ERROR=`git ls-files` REJECTED: BLOCKED BY POLICY".to_string();
+
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 1);
+        assert_eq!(parsed.denials, vec!["git ls-files"]);
+    }
+
+    #[test]
+    fn policy_denial_count_is_not_limited_by_the_example_cap() {
+        let mut out = outcome(REAL_STREAM, true);
+        out.stderr = (0..101)
+            .map(|n| format!("router: error=`git grep {n}` rejected: blocked by policy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        assert_eq!(parsed.denial_count, 101);
+        assert_eq!(parsed.denials.len(), 100);
     }
 
     #[test]
