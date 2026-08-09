@@ -3301,4 +3301,76 @@ Change 5 by u@c on 2026/01/01\n\n\
             panic!("live capture produced no change; warnings above");
         }
     }
+
+    /// End-to-end resume delta against a real workspace: capture the same changelist twice, the
+    /// second time with the first turn's baseline. Nothing changes in between, so every elidable
+    /// file must collapse to a placeholder and the second render must be dramatically smaller.
+    /// Opt-in via the same env vars as the capture test. Proves the delta on real `p4` output.
+    #[test]
+    fn live_resume_delta_collapses_unchanged_files() {
+        let (Ok(cl_raw), Ok(cwd)) = (
+            std::env::var("CROSS_REVIEW_P4_TEST_CL"),
+            std::env::var("CROSS_REVIEW_P4_TEST_CWD"),
+        ) else {
+            eprintln!("skipping live resume-delta test: set CROSS_REVIEW_P4_TEST_CL and _CWD");
+            return;
+        };
+        let changes =
+            crate::changeset::parse_changes(&cl_raw).expect("valid CROSS_REVIEW_P4_TEST_CL");
+        let include_shelved = std::env::var("CROSS_REVIEW_P4_TEST_SHELVED").is_ok();
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--vcs".into(),
+            "perforce".into(),
+            "--cwd".into(),
+            cwd,
+        ])
+        .expect("config");
+        let cancel = AtomicBool::new(false);
+
+        // Turn 1: a full capture, which produces the baseline the next turn deltas against.
+        let cap1 = capture(&cfg, &changes, include_shelved, None, &cancel);
+        let r1 = cap1.change.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
+        let baseline = cap1.perforce_baseline.clone().expect("turn 1 baseline");
+        let identity = cap1.capture_identity.clone().expect("turn 1 identity");
+        if !matches!(baseline, baseline::PerforceBaseline::Full { .. }) {
+            eprintln!(
+                "SKIP delta assertion: turn 1 recorded Disabled (a per-file omission made the \
+                 capture incomplete, so it will not elide by design). turn 1 = {r1} bytes"
+            );
+            return;
+        }
+
+        // Turn 2: resume with that baseline. Nothing changed, so every elidable file collapses.
+        let resume = PerforceResume {
+            baseline: &baseline,
+            identity: Some(&identity),
+            include_shelved: Some(include_shelved),
+        };
+        let cap2 = capture(&cfg, &changes, include_shelved, Some(resume), &cancel);
+        let rendered2 = cap2
+            .change
+            .as_ref()
+            .expect("turn 2 change")
+            .rendered
+            .clone();
+        let r2 = rendered2.len();
+        eprintln!(
+            "resume delta: turn 1 = {r1} bytes, turn 2 = {r2} bytes ({}% of turn 1)",
+            r2 * 100 / r1.max(1)
+        );
+        assert!(
+            rendered2.contains("follow-up review"),
+            "turn 2 must carry the follow-up framing"
+        );
+        assert!(
+            rendered2.contains("unchanged since your previous turn"),
+            "turn 2 must collapse unchanged files to placeholders"
+        );
+        assert!(
+            r2 < r1 / 2,
+            "an all-unchanged delta must be far smaller than the full capture: {r1} -> {r2}"
+        );
+    }
 }
