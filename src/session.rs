@@ -53,6 +53,17 @@ pub struct SessionRecord {
     /// this field, which is identity only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<u64>>,
+    /// The git commit (`HEAD`) this session's last turn captured, when the backend is git and
+    /// HEAD could be resolved.
+    ///
+    /// The next turn reviews only what changed since it (`<head_sha>..HEAD`) instead of the
+    /// whole configured range, so the reviewer -- which already holds the earlier full diff in
+    /// its resumed conversation -- is not re-sent a near-duplicate every turn. Advanced to the
+    /// latest captured HEAD on every turn, unlike `changes`, which is an invariant binding.
+    /// `None` for a Perforce session, a session recorded before this field existed, or a turn
+    /// where HEAD could not be resolved (no commits yet, detached, git unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -70,6 +81,9 @@ pub struct TurnFacts<'a> {
     pub cumulative_usage: Option<crate::metrics::Usage>,
     /// The canonical Perforce changelist set this session is bound to, or `None` for git.
     pub changes: Option<Vec<u64>>,
+    /// The git HEAD this turn captured, so the next turn can review only what changed since
+    /// it. `None` for Perforce or when HEAD could not be resolved.
+    pub head_sha: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -123,6 +137,7 @@ impl SessionStore {
             cwd,
             cumulative_usage,
             changes,
+            head_sha,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -148,6 +163,10 @@ impl SessionStore {
                 cwd: cwd.to_string(),
                 cumulative_usage,
                 changes: changes.or(existing.changes.clone()),
+                // Advance to this turn's HEAD so the next resume deltas against the latest
+                // reviewed commit. A turn that could not resolve HEAD keeps the prior value
+                // rather than erasing it: an older ancestor still yields a valid delta.
+                head_sha: head_sha.or(existing.head_sha.clone()),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -161,6 +180,7 @@ impl SessionStore {
                 updated_unix: now,
                 cumulative_usage,
                 changes,
+                head_sha,
             },
         };
 
@@ -363,6 +383,7 @@ mod tests {
                     cwd: "C:\\repo",
                     cumulative_usage: None,
                     changes: None,
+                    head_sha: None,
                 },
             )
             .expect("record turn")
@@ -421,6 +442,7 @@ mod tests {
             cwd: "C:\\repo",
             cumulative_usage: Some(usage),
             changes: None,
+            head_sha: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -442,6 +464,34 @@ mod tests {
     }
 
     #[test]
+    fn a_head_sha_advances_each_turn_but_survives_a_turn_that_could_not_resolve_it() {
+        // The next resume deltas against the latest reviewed commit, so this must advance --
+        // unlike the changelist binding, which is invariant. But a transient failure to
+        // resolve HEAD must not erase the baseline, or that turn would silently force the
+        // following one back to a full capture.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |head: Option<&str>| TurnFacts {
+            reviewer: "claude",
+            cli_session_id: "sid-1",
+            model: "claude-opus-4-8",
+            effort: "medium",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: head.map(str::to_string),
+        };
+        store.record_turn("g", facts(Some("aaa1"))).expect("turn 1");
+        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("aaa1"));
+        // A later turn advances it.
+        store.record_turn("g", facts(Some("bbb2"))).expect("turn 2");
+        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("bbb2"));
+        // A turn that could not resolve HEAD keeps the prior value rather than erasing it.
+        store.record_turn("g", facts(None)).expect("turn 3");
+        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("bbb2"));
+    }
+
+    #[test]
     fn a_changelist_binding_persists_and_survives_a_none_turn() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
@@ -453,6 +503,7 @@ mod tests {
             cwd: "C:\\repo",
             cumulative_usage: None,
             changes,
+            head_sha: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))

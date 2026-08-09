@@ -310,6 +310,21 @@ pub struct Config {
     pub diff: DiffMode,
     /// Which VCS the capture backend drives, resolved from `--vcs` (default `auto`).
     pub vcs: Vcs,
+    /// On a resumed git turn whose `--diff` is a committed range, capture only the commits
+    /// added since the previous turn (`<prior-HEAD>..HEAD`) rather than the whole range again.
+    ///
+    /// A re-review resumes the reviewer's own conversation, so the earlier full diff is still
+    /// in its context; re-sending the whole range every turn just pays to re-cache a
+    /// near-duplicate, and for the Claude reviewer that cache write is billed at a premium, so
+    /// the per-turn cost climbs even when nothing but the fixes changed. Reviewing only the
+    /// delta collapses that. Guarded by an ancestry check: if the branch was rewritten
+    /// (rebase, amend, force-push) so the prior commit is no longer an ancestor of HEAD, the
+    /// full range is captured instead, because `<prior>..HEAD` would then be meaningless.
+    ///
+    /// Git only. The Perforce backend re-captures a changelist's current contents each turn by
+    /// design (a pending changelist mutates in place, so there is no prior revision to delta
+    /// against), and is unaffected by this flag. `--no-incremental-resume` turns it off.
+    pub resume_incremental_diff: bool,
 }
 
 impl Config {
@@ -330,6 +345,7 @@ impl Config {
         let mut no_preamble = false;
         let mut isolate_reviewer = true;
         let mut metrics = true;
+        let mut resume_incremental_diff = true;
         // `--diff` is parsed *after* the loop, because how its value is interpreted (and
         // whether it is even legal) depends on `--vcs`, which may appear later on the command
         // line. Kept raw until the backend is known.
@@ -400,6 +416,7 @@ impl Config {
                 // published example configs.
                 "--allow-reviewer-config" | "--allow-reviewer-mcp" => isolate_reviewer = false,
                 "--no-metrics" => metrics = false,
+                "--no-incremental-resume" => resume_incremental_diff = false,
                 other => return Err(format!("unknown argument '{other}' (try --help)")),
             }
             i += 1;
@@ -492,6 +509,7 @@ impl Config {
             metrics,
             diff,
             vcs,
+            resume_incremental_diff,
         })
     }
 
@@ -848,6 +866,16 @@ OPTIONS:
                               A capture that was configured and could not be produced is
                               reported to the caller with the review, not skipped in
                               silence. Not affected by --no-preamble; use --diff none.
+  --no-incremental-resume     git only: on a resumed turn whose --diff is a committed
+                              range (e.g. main...HEAD), capture the WHOLE range again
+                              instead of only the commits added since the previous turn.
+                              The incremental capture is the default: a re-review resumes
+                              the reviewer's own conversation, so the earlier full diff is
+                              still in its context, and re-sending the whole range every
+                              turn pays to re-cache a near-duplicate -- billed at a
+                              premium for the Claude reviewer. A rewritten branch (rebase,
+                              amend, force-push) falls back to the full range on its own,
+                              so this flag is only for forcing that everywhere.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration
@@ -962,6 +990,19 @@ mod tests {
         let err = Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "0"]))
             .unwrap_err();
         assert!(err.contains("greater than 0"));
+    }
+
+    #[test]
+    fn incremental_resume_is_on_by_default_and_can_be_turned_off() {
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert!(
+            cfg.resume_incremental_diff,
+            "incremental resume is the default"
+        );
+
+        let cfg = Config::from_args(&args(&["--reviewer", "claude", "--no-incremental-resume"]))
+            .expect("config");
+        assert!(!cfg.resume_incremental_diff);
     }
 
     #[test]

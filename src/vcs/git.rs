@@ -343,6 +343,11 @@ pub struct Change {
     /// had no untracked files -- it has no shell to go and check. That is exactly the
     /// silent shortfall this module refuses to produce anywhere else, so it is stated.
     pub notes: Vec<String>,
+    /// Set on a resumed turn when this diff is only the commits added since the previous one
+    /// (`<incremental_from>..HEAD`) rather than the whole configured range. Carries the prior
+    /// commit so the render can name it and tell the reviewer the earlier full diff is still
+    /// in its resumed context. `None` for a full capture.
+    pub incremental_from: Option<String>,
 }
 
 /// The result of trying to capture the change: what was captured, and what the *caller*
@@ -359,6 +364,10 @@ pub struct Change {
 pub struct Capture {
     pub change: Option<Change>,
     pub warnings: Vec<String>,
+    /// The `HEAD` this capture was taken at, when it could be resolved. Recorded on the
+    /// session so the next turn can review only what changed since it. Present even when
+    /// `change` is `None` or empty: an empty diff at a known HEAD still advances the baseline.
+    pub head_sha: Option<String>,
 }
 
 impl Capture {
@@ -366,6 +375,7 @@ impl Capture {
         Self {
             change: None,
             warnings: vec![warning],
+            head_sha: None,
         }
     }
 }
@@ -378,11 +388,10 @@ impl Capture {
 ///
 /// An *empty* diff is not `None`. A clean tree is a fact the reviewer needs: told nothing,
 /// it reviews the current code and calls that a review of the change.
-pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
+pub fn capture(cfg: &Config, prior_head: Option<&str>, cancel: &AtomicBool) -> Capture {
     if !cfg.supplies_change() {
         return Capture::default();
     }
-    let mode = &cfg.diff;
     let Some(git) = Git::new(&cfg.cwd, cancel) else {
         return Capture::warn(
             "git is not on PATH, so the change under review could not be captured and the \
@@ -410,6 +419,25 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
             )
         }
     }
+
+    // Resolve HEAD once: it is both the baseline the next turn will delta against and, on
+    // this turn, half of the delta range. A repository with no commits yet, a detached HEAD,
+    // or a failed git call yields None -- nothing is stored and the full configured range is
+    // captured.
+    let head_sha = git.rev_parse_head();
+
+    // On a resumed turn whose configured mode is a committed range, review only the commits
+    // added since the previously reviewed one. The earlier full diff is still in the
+    // reviewer's resumed conversation, so re-sending the whole range just re-caches a
+    // near-duplicate every turn. `incremental_base` is the prior commit when that applies and
+    // `None` otherwise (first turn, working-tree mode, disabled, or a branch rewritten so the
+    // prior commit is no longer an ancestor of HEAD -- see `incremental_base`).
+    let incremental_base = incremental_base(cfg, prior_head, head_sha.as_deref(), &git);
+    let effective = match &incremental_base {
+        Some(base) => DiffMode::Rev(format!("{base}..HEAD")),
+        None => cfg.diff.clone(),
+    };
+    let mode = &effective;
 
     let mut diff_args = vec!["diff"];
     diff_args.extend(mode.diff_args());
@@ -513,9 +541,49 @@ pub fn capture(cfg: &Config, cancel: &AtomicBool) -> Capture {
             untracked,
             untracked_omitted: omissions.notes,
             notes,
+            incremental_from: incremental_base,
         }),
         warnings,
+        head_sha,
     }
+}
+
+/// The commit a resumed turn should review changes *since*, or `None` for a full capture.
+///
+/// Returns the prior turn's HEAD only when reviewing just `<prior>..HEAD` is both wanted and
+/// safe: the feature is enabled, this is a resume with a stored prior commit, the current
+/// HEAD is known, the configured mode is a committed range (a working-tree or staged diff
+/// carries uncommitted work a commit delta would silently drop), and the prior commit is an
+/// ancestor of the current one. That last check is what makes a rewritten branch -- rebased,
+/// amended, force-pushed -- fall back to the full range instead of a meaningless
+/// `<orphaned-commit>..HEAD`. `git merge-base --is-ancestor X X` is true, so a resume with no
+/// new commits yields an (empty) delta, which the render reports as "nothing new since your
+/// last turn" rather than as an empty change.
+fn incremental_base(
+    cfg: &Config,
+    prior_head: Option<&str>,
+    head_sha: Option<&str>,
+    git: &Git,
+) -> Option<String> {
+    if !cfg.resume_incremental_diff {
+        return None;
+    }
+    let prior = prior_head.filter(|s| is_object_name(s))?;
+    let head = head_sha.filter(|s| is_object_name(s))?;
+    // Committed range only: `compares_against_working_tree()` is true for auto/HEAD/staged and
+    // for a bare revision, all of which include uncommitted work that `<prior>..HEAD` omits.
+    if !matches!(cfg.diff, DiffMode::Rev(_)) || cfg.diff.compares_against_working_tree() {
+        return None;
+    }
+    git.is_ancestor(prior, head).then(|| prior.to_string())
+}
+
+/// Whether a string is safe to pass to git as a commit name: a non-empty hex object id. Both
+/// endpoints of the ancestry check and the delta range come from `git rev-parse` or our own
+/// session store, but validating here means a stray value can never be read by git as an
+/// option (a leading `-`) or a pathspec.
+fn is_object_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// One warning about a *capture-level* shortfall, phrased the one way.
@@ -550,24 +618,51 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
          following it.\n\n",
     );
 
+    // A resumed turn that shows only the delta must say so up front, or the reviewer reads a
+    // handful of commits as the entire change and reports everything else as missing. The
+    // earlier full diff is still in its resumed context, so this is framed as "on top of what
+    // you already saw", not as a fresh, smaller change.
+    if change.incremental_from.is_some() {
+        out.push_str(&format!(
+            "**This is a follow-up review, and the diff below is only what changed since your \
+             previous turn** -- the commits added since then (`{}`). You reviewed the earlier \
+             state earlier in this same session and that conversation is still in your \
+             context, so the whole change is what you were shown before *plus* what is below. \
+             Re-check your earlier findings against these new commits rather than treating \
+             this as the entire change.\n\n",
+            change.command
+        ));
+    }
+
     out.push_str(&format!("### {}\n\n", change.command));
     if change.diff.text.trim().is_empty() {
-        out.push_str("(empty -- this command found no differences.");
-        if change.working_tree_only {
-            // Without this, the commonest flow of all -- "I committed my branch, review
-            // it" -- makes the reviewer confidently report that there was no change,
-            // which is the same failure this feature exists to remove, pointing the other
-            // way.
+        if change.incremental_from.is_some() {
+            // An empty delta is not an empty change: it means no commits were added since the
+            // last turn. Saying "no differences" here would read as "there is nothing to
+            // review", when the reviewer already reviewed the change on an earlier turn.
             out.push_str(
-                " Note that it covers **uncommitted** work only, and for a staged diff, \
-                 only work that has been staged: if the change you were asked to review \
-                 has already been committed, or was never staged, it will not appear here.",
+                "(empty -- there are no new commits since your previous turn, so nothing has \
+                 changed since your last review. Say so plainly, rather than re-reviewing the \
+                 change from scratch or reporting that there was no change at all.)\n\n",
+            );
+        } else {
+            out.push_str("(empty -- this command found no differences.");
+            if change.working_tree_only {
+                // Without this, the commonest flow of all -- "I committed my branch, review
+                // it" -- makes the reviewer confidently report that there was no change,
+                // which is the same failure this feature exists to remove, pointing the other
+                // way.
+                out.push_str(
+                    " Note that it covers **uncommitted** work only, and for a staged diff, \
+                     only work that has been staged: if the change you were asked to review \
+                     has already been committed, or was never staged, it will not appear here.",
+                );
+            }
+            out.push_str(
+                " Say plainly what you were and were not shown, rather than reviewing the \
+                 current state of the code as though it were the change.)\n\n",
             );
         }
-        out.push_str(
-            " Say plainly what you were and were not shown, rather than reviewing the \
-             current state of the code as though it were the change.)\n\n",
-        );
     } else {
         push_fenced(&mut out, "diff", &change.diff.text);
         if change.diff.truncated {
@@ -760,6 +855,33 @@ impl<'a> Git<'a> {
     fn is_work_tree(&self) -> Option<bool> {
         let out = self.run(&["rev-parse", "--is-inside-work-tree"])?;
         Some(out.success && out.stdout.trim() == "true")
+    }
+
+    /// The current commit, or `None` when there is not one to name (an unborn HEAD on a fresh
+    /// repository, a detached or unreadable HEAD, or git not completing). The output is
+    /// validated as an object id rather than trusted: a surprise like an echoed `HEAD` must
+    /// not become a commit name later handed back to git.
+    fn rev_parse_head(&self) -> Option<String> {
+        let out = self.run(&["rev-parse", "HEAD"])?;
+        if !out.success {
+            return None;
+        }
+        let sha = out.stdout.trim();
+        is_object_name(sha).then(|| sha.to_string())
+    }
+
+    /// Whether `ancestor` is an ancestor of `descendant` (a commit is its own ancestor).
+    ///
+    /// `git merge-base --is-ancestor` exits 0 for yes, 1 for no, and 128 for an error such as
+    /// an unknown commit -- which is exactly what a rewritten, garbage-collected prior commit
+    /// looks like. Only exit 0 is "yes"; every other outcome, error included, is "no", so the
+    /// caller falls back to the full range rather than trusting a delta against a commit git
+    /// can no longer place.
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+        match self.run(&["merge-base", "--is-ancestor", ancestor, descendant]) {
+            Some(out) => out.success,
+            None => false,
+        }
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
@@ -1060,6 +1182,7 @@ mod tests {
             untracked: Vec::new(),
             untracked_omitted: Vec::new(),
             notes: Vec::new(),
+            incremental_from: None,
         }
     }
 
@@ -1276,6 +1399,7 @@ mod tests {
             }],
             untracked_omitted: vec!["`blob.bin` is binary".into()],
             notes: Vec::new(),
+            incremental_from: None,
         };
         let text = render(&change, Path::new("C:\\repo"), false);
         assert!(text.contains("diff above was truncated"), "{text}");
@@ -1343,7 +1467,7 @@ mod tests {
         let Some(dir) = repo_with_untracked_budget_spent(spent) else {
             return;
         };
-        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
             .change
             .expect("a change");
         let big = change
@@ -1358,7 +1482,7 @@ mod tests {
         let Some(dir) = repo_with_untracked_budget_spent(spent + 5_000) else {
             return;
         };
-        let change = capture(&config_for(&dir, DiffMode::Head), &idle())
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
             .change
             .expect("a change");
         let big = change
@@ -1424,7 +1548,7 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).change.expect("a change");
+        let change = capture(&cfg, None, &idle()).change.expect("a change");
 
         assert!(
             change.diff.text.contains("-original"),
@@ -1462,7 +1586,7 @@ mod tests {
         };
         // `--diff staged` against a tree with nothing staged.
         let cfg = config_for(&dir, DiffMode::Staged);
-        let change = capture(&cfg, &idle()).change.expect("a change");
+        let change = capture(&cfg, None, &idle()).change.expect("a change");
         assert!(change.diff.text.trim().is_empty(), "{}", change.diff.text);
         // Untracked files do not belong with a staged diff.
         assert!(change.untracked.is_empty());
@@ -1479,7 +1603,7 @@ mod tests {
             return;
         };
         let cfg = config_for(&dir, DiffMode::Rev("no-such-branch".into()));
-        let capture = capture(&cfg, &idle());
+        let capture = capture(&cfg, None, &idle());
         assert!(capture.change.is_none());
 
         // Reported to the *caller*, not only to stderr. The review still runs, so nothing
@@ -1496,7 +1620,7 @@ mod tests {
     fn a_directory_that_is_not_a_repository_warns_the_caller() {
         let dir = temp_dir();
         let cfg = config_for(&dir, DiffMode::Head);
-        let capture = capture(&cfg, &idle());
+        let capture = capture(&cfg, None, &idle());
         assert!(capture.change.is_none());
         assert_eq!(capture.warnings.len(), 1, "{:?}", capture.warnings);
         assert!(capture.warnings[0].contains("not inside a git work tree"));
@@ -1514,9 +1638,13 @@ mod tests {
         };
         // `repo_with_a_change` leaves tracked.txt modified but uncommitted, and HEAD is the
         // only commit, so both specs below have the same commit-to-commit content: none.
-        let bare = capture(&config_for(&dir, DiffMode::Rev("HEAD".into())), &idle())
-            .change
-            .expect("a change");
+        let bare = capture(
+            &config_for(&dir, DiffMode::Rev("HEAD".into())),
+            None,
+            &idle(),
+        )
+        .change
+        .expect("a change");
         assert!(
             bare.diff.text.contains("modified"),
             "a bare revision should carry the uncommitted edit: {}",
@@ -1530,6 +1658,7 @@ mod tests {
 
         let ranged = capture(
             &config_for(&dir, DiffMode::Rev("HEAD..HEAD".into())),
+            None,
             &idle(),
         )
         .change
@@ -1553,13 +1682,13 @@ mod tests {
         let Some(dir) = repo_with_a_change() else {
             return;
         };
-        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+        assert!(capture(&config_for(&dir, DiffMode::None), None, &idle())
             .warnings
             .is_empty());
 
         let mut cfg = config_for(&dir, DiffMode::Auto);
         cfg.tools = "Read,Grep,Glob,Bash".to_string();
-        assert!(capture(&cfg, &idle()).warnings.is_empty());
+        assert!(capture(&cfg, None, &idle()).warnings.is_empty());
     }
 
     #[test]
@@ -1567,7 +1696,7 @@ mod tests {
         let Some(dir) = repo_with_a_change() else {
             return;
         };
-        assert!(capture(&config_for(&dir, DiffMode::None), &idle())
+        assert!(capture(&config_for(&dir, DiffMode::None), None, &idle())
             .change
             .is_none());
 
@@ -1576,7 +1705,7 @@ mod tests {
         let mut cfg = config_for(&dir, DiffMode::Auto);
         cfg.tools = "Read,Grep,Glob,Bash".to_string();
         cfg.allowed_tools = vec!["Read Grep Glob Bash(git diff:*)".to_string()];
-        assert!(capture(&cfg, &idle()).change.is_none());
+        assert!(capture(&cfg, None, &idle()).change.is_none());
     }
 
     #[test]
@@ -1608,7 +1737,7 @@ mod tests {
         }
 
         let cfg = config_for(&dir, DiffMode::Head);
-        let change = capture(&cfg, &idle()).change.expect("a change");
+        let change = capture(&cfg, None, &idle()).change.expect("a change");
 
         for file in &change.untracked {
             assert!(
@@ -1643,7 +1772,7 @@ mod tests {
             std::fs::write(dir.join(format!("blob-{i:04}.bin")), [0u8, 1, 2]).expect("write");
         }
 
-        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let captured = capture(&config_for(&dir, DiffMode::Head), None, &idle());
         let change = captured.change.as_ref().expect("a change");
 
         assert!(
@@ -1677,7 +1806,7 @@ mod tests {
         };
         std::fs::write(dir.join("blob.bin"), [0u8, 1, 2]).expect("write");
 
-        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let captured = capture(&config_for(&dir, DiffMode::Head), None, &idle());
         let change = captured.change.as_ref().expect("a change");
 
         // The reviewer is told, because it is reading the prompt and can open the file.
@@ -1701,7 +1830,7 @@ mod tests {
             return;
         };
 
-        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let captured = capture(&config_for(&dir, DiffMode::Head), None, &idle());
         let change = captured.change.as_ref().expect("a change");
 
         // The budget is gone before the last file, so it is skipped rather than truncated.
@@ -1748,7 +1877,7 @@ mod tests {
             std::fs::write(dir.join(format!("{name}{i:06}")), "x").expect("write");
         }
 
-        let captured = capture(&config_for(&dir, DiffMode::Head), &idle());
+        let captured = capture(&config_for(&dir, DiffMode::Head), None, &idle());
         let change = captured.change.as_ref().expect("a change");
         assert!(
             change.diff.truncated,
@@ -1773,6 +1902,208 @@ mod tests {
                 .any(|w| w.contains("`git status` listing was cut short")),
             "{:?}",
             captured.warnings
+        );
+    }
+
+    #[test]
+    fn object_names_are_hex_and_bounded() {
+        assert!(is_object_name("abc123"));
+        assert!(is_object_name(&"a".repeat(40)));
+        assert!(is_object_name(&"a".repeat(64)));
+        assert!(!is_object_name(""), "empty is not a commit name");
+        assert!(
+            !is_object_name(&"a".repeat(65)),
+            "longer than any object id"
+        );
+        // The reason this is validated at all: a value that reaches git as a commit name
+        // must not be read as an option or a pathspec.
+        assert!(!is_object_name("--output=x"));
+        assert!(!is_object_name("HEAD"));
+        assert!(!is_object_name("abc..def"));
+    }
+
+    #[test]
+    fn an_incremental_capture_tells_the_reviewer_it_is_only_the_delta() {
+        let change = Change {
+            command: "git diff abc123..HEAD".into(),
+            working_tree_only: false,
+            diff: Section {
+                text: "+new line".into(),
+                truncated: false,
+            },
+            incremental_from: Some("abc123".into()),
+            ..change_fixture()
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        // Framed as a delta on top of the earlier review, not as a fresh, smaller change.
+        assert!(text.contains("only what changed since your"), "{text}");
+        assert!(text.contains("still in your"), "{text}");
+        assert!(text.contains("git diff abc123..HEAD"), "{text}");
+        // The diff itself is still shown.
+        assert!(text.contains("+new line"), "{text}");
+
+        // A full capture carries none of that framing.
+        let full = render(&change_fixture(), Path::new("C:\\repo"), false);
+        assert!(!full.contains("only what changed since your"), "{full}");
+    }
+
+    #[test]
+    fn an_empty_delta_reads_as_no_new_commits_not_as_no_change() {
+        // A resume with nothing new is not an empty change: the reviewer already reviewed the
+        // change on an earlier turn, so "no differences" would read as "nothing to review".
+        let change = Change {
+            command: "git diff abc123..HEAD".into(),
+            working_tree_only: false,
+            diff: Section::empty(),
+            incremental_from: Some("abc123".into()),
+            ..change_fixture()
+        };
+        let text = render(&change, Path::new("C:\\repo"), false);
+        assert!(
+            text.contains("no new commits since your previous turn"),
+            "{text}"
+        );
+        assert!(!text.contains("found no differences"), "{text}");
+    }
+
+    /// Build a repository with a committed base and one feature commit on top, returning the
+    /// directory, the base sha, and the feature-commit sha. `None` when git is unavailable.
+    fn repo_with_committed_history() -> Option<(TempDir, String, String)> {
+        let dir = repo_with_a_change()?;
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel)?;
+        let run = |args: &[&str]| git.run(args).map(|o| o.success).unwrap_or(false);
+        // Commit whatever the base fixture left uncommitted, so there is committed history to
+        // range over rather than a working-tree diff.
+        if !run(&["add", "-A"]) || !run(&["commit", "--quiet", "-m", "base"]) {
+            return None;
+        }
+        let base = git.rev_parse_head()?;
+        std::fs::write(dir.join("feature1.txt"), "one\n").ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "--quiet", "-m", "feature1"]);
+        let head1 = git.rev_parse_head()?;
+        Some((dir, base, head1))
+    }
+
+    #[test]
+    fn a_resumed_range_review_captures_only_the_commits_added_since_the_prior_head() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+
+        // Turn 1: no prior head, so the whole range, and the baseline it hands back is HEAD.
+        let cap1 = capture(&cfg, None, &cancel);
+        assert_eq!(cap1.head_sha.as_deref(), Some(head1.as_str()));
+        let change1 = cap1.change.expect("a change");
+        assert!(change1.incremental_from.is_none());
+        assert!(
+            change1.diff.text.contains("feature1"),
+            "{}",
+            change1.diff.text
+        );
+
+        // A second commit lands.
+        let git = Git::new(&dir, &cancel).expect("git");
+        std::fs::write(dir.join("feature2.txt"), "two\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "-m", "feature2"])
+                .expect("commit")
+                .success
+        );
+        let head2 = git.rev_parse_head().expect("head2");
+
+        // Turn 2: resume with turn 1's HEAD -> only feature2, never feature1 again.
+        let cap2 = capture(&cfg, Some(&head1), &cancel);
+        assert_eq!(cap2.head_sha.as_deref(), Some(head2.as_str()));
+        let change2 = cap2.change.expect("a change");
+        assert_eq!(change2.incremental_from.as_deref(), Some(head1.as_str()));
+        assert!(
+            change2.diff.text.contains("feature2"),
+            "{}",
+            change2.diff.text
+        );
+        assert!(
+            !change2.diff.text.contains("feature1.txt"),
+            "the delta must not re-show the earlier commit: {}",
+            change2.diff.text
+        );
+    }
+
+    #[test]
+    fn a_resume_with_no_new_commits_yields_an_empty_delta() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        // HEAD has not moved since it was captured, so `head1..HEAD` is empty -- which is the
+        // correct answer, and the render says "no new commits" rather than "no change".
+        let cap = capture(&cfg, Some(&head1), &cancel);
+        let change = cap.change.expect("a change");
+        assert_eq!(change.incremental_from.as_deref(), Some(head1.as_str()));
+        assert!(change.diff.text.trim().is_empty(), "{}", change.diff.text);
+    }
+
+    #[test]
+    fn a_rewritten_branch_falls_back_to_the_full_range() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+        // Amend the feature commit: the new HEAD shares the base as parent but is not a
+        // descendant of head1, so head1..HEAD would be meaningless.
+        std::fs::write(dir.join("feature1.txt"), "one, revised\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "--amend", "-m", "feature1 amended"])
+                .expect("amend")
+                .success
+        );
+        let amended = git.rev_parse_head().expect("amended");
+        assert_ne!(amended, head1);
+
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let cap = capture(&cfg, Some(&head1), &cancel);
+        let change = cap.change.expect("a change");
+        assert!(
+            change.incremental_from.is_none(),
+            "a rewritten branch must fall back to the full range, not delta against an \
+             orphaned commit"
+        );
+        // The baseline still advances to the current HEAD for the next turn.
+        assert_eq!(cap.head_sha.as_deref(), Some(amended.as_str()));
+    }
+
+    #[test]
+    fn a_working_tree_mode_never_deltas_even_on_resume() {
+        // A commit delta would drop uncommitted work, which is exactly what a working-tree
+        // diff exists to show, so the delta must not apply to HEAD/auto/staged/bare-rev modes.
+        let Some((dir, _base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Head);
+        let cap = capture(&cfg, Some(&head1), &cancel);
+        assert!(cap.change.expect("a change").incremental_from.is_none());
+    }
+
+    #[test]
+    fn no_incremental_resume_forces_the_full_range() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let mut cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        cfg.resume_incremental_diff = false;
+        let cap = capture(&cfg, Some(&head1), &cancel);
+        assert!(
+            cap.change.expect("a change").incremental_from.is_none(),
+            "--no-incremental-resume must capture the whole range"
         );
     }
 }

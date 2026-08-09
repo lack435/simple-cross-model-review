@@ -66,6 +66,14 @@ pub struct CapturedChange {
 pub struct Capture {
     pub change: Option<CapturedChange>,
     pub warnings: Vec<String>,
+    /// The git `HEAD` this capture was taken at, when the backend is git and HEAD resolved.
+    ///
+    /// Stored on the session so the next turn can review only `<head_sha>..HEAD`. Carried on
+    /// the top-level result rather than on `CapturedChange` because it is capture metadata,
+    /// not part of the change shown to the reviewer, and it exists even when `change` is
+    /// `None` (an empty or failed capture at a known HEAD still advances the baseline).
+    /// Always `None` for Perforce.
+    pub head_sha: Option<String>,
 }
 
 impl Capture {
@@ -73,6 +81,7 @@ impl Capture {
         Self {
             change: None,
             warnings: vec![warning],
+            head_sha: None,
         }
     }
 }

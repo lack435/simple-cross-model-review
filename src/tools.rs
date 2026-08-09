@@ -244,6 +244,9 @@ impl App {
             // Taking it after the review would measure zero.
             gap_secs: metrics::gap_since(prior.as_ref().map(|record| record.updated_unix)),
             prior_cumulative: prior.as_ref().and_then(|record| record.cumulative_usage),
+            // Only carried on a genuine resume: `prior` is `None` for a fresh review
+            // (fresh=true or a new session name), so the first turn always captures in full.
+            prior_head: prior.as_ref().and_then(|record| record.head_sha.clone()),
             cancel,
             _lease: Some(lease),
         };
@@ -696,10 +699,23 @@ struct Job {
     /// report cumulatively. Subtracting it is the only way to recover a per-turn figure
     /// from Codex, whose event stream carries the thread total and nothing else.
     prior_cumulative: Option<crate::metrics::Usage>,
+    /// The git HEAD the previous turn of this session captured, for the incremental-resume
+    /// delta. `None` on a fresh review, a Perforce session, or a prior turn that could not
+    /// resolve HEAD. Only ever consulted on a resumed git turn.
+    prior_head: Option<String>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
     _lease: Option<ExclusiveLock>,
+}
+
+/// The capture's outputs that `attempt` threads onward: the rendered change goes into the
+/// prompt, and the captured HEAD goes into the session record so the next resume can review
+/// only what changed since it. Bundled so the two travel together rather than as a pair of
+/// loose `Option<&str>` arguments that could be transposed.
+struct CaptureOutputs<'a> {
+    change: Option<&'a str>,
+    head_sha: Option<&'a str>,
 }
 
 /// What the attempt that produced the outcome actually did, gathered for the usage record.
@@ -760,10 +776,19 @@ impl Job {
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
-        let capture = vcs::capture(&self.cfg, &self.changes, self.include_shelved, &self.cancel);
+        let capture = vcs::capture(
+            &self.cfg,
+            &self.changes,
+            self.include_shelved,
+            self.prior_head.as_deref(),
+            &self.cancel,
+        );
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
         let change = capture.change.as_ref().map(|c| c.rendered.clone());
+        // The HEAD this turn captured, recorded on the session so the next turn deltas against
+        // it. Git-only; `None` for Perforce or an unresolved HEAD.
+        let head_sha = capture.head_sha.clone();
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -774,7 +799,10 @@ impl Job {
             resume_id.as_deref(),
             self.turn,
             self.prior_cumulative,
-            change.as_deref(),
+            CaptureOutputs {
+                change: change.as_deref(),
+                head_sha: head_sha.as_deref(),
+            },
             &capture_warnings,
             &mut facts.prompt_bytes,
         ) {
@@ -893,10 +921,11 @@ impl Job {
         resume_id: Option<&str>,
         turn: u32,
         baseline: Option<crate::metrics::Usage>,
-        change: Option<&str>,
+        captured: CaptureOutputs<'_>,
         capture_warnings: &[String],
         prompt_bytes: &mut usize,
     ) -> Result<Outcome, Failure> {
+        let CaptureOutputs { change, head_sha } = captured;
         let preamble = if self.cfg.no_preamble {
             None
         } else {
@@ -1073,6 +1102,9 @@ impl Job {
                         // so a re-review naming the same changelists in another order resumes.
                         changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
                             .then(|| crate::changeset::canonical(&self.changes)),
+                        // The HEAD this turn captured, so the next resume reviews only what
+                        // changed since it. `None` for Perforce or an unresolved HEAD.
+                        head_sha: head_sha.map(str::to_string),
                     },
                 ) {
                     Ok(_) => true,
@@ -1387,6 +1419,7 @@ mod tests {
             updated_unix,
             cumulative_usage: None,
             changes: None,
+            head_sha: None,
         }
     }
 
