@@ -162,9 +162,14 @@ impl SessionStore {
         // The baseline is a (head, base) pair the next turn deltas from, so it advances as a
         // unit: a turn that produced a complete pair replaces it; any incomplete one (a
         // truncated capture, an unresolved HEAD, a Perforce turn) retains the prior pair intact
-        // rather than storing a half of one. Computed against whatever this session already
-        // holds -- an existing record or, for a new session, nothing.
-        let prior = store.sessions.get(name);
+        // rather than storing a half of one. The prior pair is only inherited from the *same*
+        // conversation -- a fresh or rebound reviewer session (a different `cli_session_id`
+        // under this name) never saw the old diff, so an incomplete first turn there must store
+        // nothing rather than a baseline the new reviewer cannot resume against.
+        let prior = store
+            .sessions
+            .get(name)
+            .filter(|p| p.cli_session_id == cli_session_id);
         let (head_sha, base_sha) = match (&head_sha, &base_sha) {
             (Some(_), Some(_)) => (head_sha, base_sha),
             _ => (
@@ -536,6 +541,41 @@ mod tests {
             "head retained, not ccc3"
         );
         assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+    }
+
+    #[test]
+    fn a_rebound_session_does_not_inherit_the_prior_conversations_baseline() {
+        // A fresh review under an existing name is a different conversation. An incomplete
+        // first turn there -- a truncated capture, say -- must not resume against the old
+        // reviewer's baseline, which the new reviewer never saw. The prior pair is inherited
+        // only within the same `cli_session_id`.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |cli: &'static str, head: Option<&str>, base: Option<&str>| TurnFacts {
+            reviewer: "claude",
+            cli_session_id: cli,
+            model: "claude-opus-4-8",
+            effort: "medium",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: head.map(str::to_string),
+            base_sha: base.map(str::to_string),
+        };
+        // The old conversation establishes a complete baseline.
+        store
+            .record_turn("s", facts("old", Some("h1"), Some("b1")))
+            .expect("old turn");
+        // Rebound to a new conversation whose first turn is incomplete (e.g. truncated).
+        let rec = store
+            .record_turn("s", facts("new", Some("h2"), None))
+            .expect("rebound turn");
+        assert_eq!(rec.turns, 1, "a rebound restarts the turn count");
+        assert_eq!(rec.cli_session_id, "new");
+        assert!(
+            rec.head_sha.is_none() && rec.base_sha.is_none(),
+            "an incomplete first turn of a new conversation must not inherit the old baseline"
+        );
     }
 
     #[test]

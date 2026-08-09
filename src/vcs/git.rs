@@ -480,9 +480,16 @@ pub fn capture(
     // `None` otherwise -- see it for every condition that has to hold.
     let incremental_base =
         incremental_base(cfg, resume, head_sha.as_deref(), base_sha.as_deref(), &git);
-    let effective = match &incremental_base {
-        Some(prior) => DiffMode::Rev(format!("{prior}..HEAD")),
-        None => cfg.diff.clone(),
+    // Pin the capture to the HEAD resolved above. A literal `HEAD` in the diff is re-resolved
+    // by git when it runs, so a commit landing mid-capture would make the stored baseline name
+    // a commit that was never diffed. Using the resolved sha makes the diff, the stored head,
+    // and the base one commit. The delta is a two-dot `<prior>..<head>`; a full HEAD-anchored
+    // range has its right endpoint pinned; every other mode keeps its configured spelling and
+    // never becomes a baseline anyway.
+    let effective = match (&incremental_base, head_sha.as_deref()) {
+        (Some(prior), Some(head)) => DiffMode::Rev(format!("{prior}..{head}")),
+        (_, Some(head)) => pin_to_head(&cfg.diff, head).unwrap_or_else(|| cfg.diff.clone()),
+        (_, None) => cfg.diff.clone(),
     };
     let mode = &effective;
 
@@ -635,13 +642,39 @@ fn effective_base(git: &Git, diff: &DiffMode, head: Option<&str>) -> Option<Stri
     if right != "HEAD" {
         return None;
     }
+    // Resolve the left endpoint to a validated object id first. That is the two-dot base
+    // directly, and for three-dot it makes both `merge-base` arguments plain hex, so that call
+    // needs no `--end-of-options` -- an option `git rev-parse` documents but `git merge-base`
+    // does not, and older git would reject, which would silently disable the delta for the
+    // production `main...HEAD` mode.
+    let left_sha = git.rev_parse(left)?;
     if three_dot {
         // The three-dot base is the merge-base with HEAD, so a HEAD we could not resolve
         // leaves it unknowable rather than guessed.
-        git.merge_base(left, head?)
+        git.merge_base(&left_sha, head?)
     } else {
-        git.rev_parse(left)
+        Some(left_sha)
     }
+}
+
+/// Rewrite a HEAD-anchored range's right endpoint to a resolved commit id.
+///
+/// HEAD is read once at the start of a capture, but a literal `HEAD` in the diff is resolved
+/// again by git when the diff runs -- so a commit landing between the two would make the stored
+/// baseline name a commit that was never diffed. Pinning the right endpoint to the sha we
+/// already resolved makes the diff, the stored head, and the base one consistent commit.
+/// `None` for anything that is not a range ending at HEAD: there is nothing to pin, and such
+/// modes never become a baseline.
+fn pin_to_head(diff: &DiffMode, head: &str) -> Option<DiffMode> {
+    let DiffMode::Rev(spec) = diff else {
+        return None;
+    };
+    let (left, right, three_dot) = range_endpoints(spec)?;
+    if right != "HEAD" {
+        return None;
+    }
+    let op = if three_dot { "..." } else { ".." };
+    Some(DiffMode::Rev(format!("{left}{op}{head}")))
 }
 
 /// The commit a resumed turn should review changes *since*, or `None` for a full capture.
@@ -1010,10 +1043,13 @@ impl<'a> Git<'a> {
         is_object_name(sha).then(|| sha.to_string())
     }
 
-    /// The merge-base of two revisions -- the commit `a...b` diffs against -- or `None` when
-    /// there is none or git failed.
+    /// The merge-base of two commits -- the commit `a...b` diffs against -- or `None` when
+    /// there is none or git failed. Both arguments are already-resolved object ids (see
+    /// `effective_base`), so no `--end-of-options` is needed to keep them from being read as
+    /// options -- which matters because `git merge-base` does not document that flag.
     fn merge_base(&self, a: &str, b: &str) -> Option<String> {
-        let out = self.run(&["merge-base", "--end-of-options", a, b])?;
+        debug_assert!(is_object_name(a) && is_object_name(b));
+        let out = self.run(&["merge-base", a, b])?;
         if !out.success {
             return None;
         }
@@ -2150,6 +2186,14 @@ mod tests {
             "{}",
             change1.diff.text
         );
+        // The range was pinned to the resolved HEAD, so the command names that commit rather
+        // than a literal HEAD a concurrent commit could move out from under it.
+        assert!(
+            change1.command.contains(head1.as_str()),
+            "{}",
+            change1.command
+        );
+        assert!(!change1.command.contains("HEAD"), "{}", change1.command);
 
         // A second commit lands.
         let git = Git::new(&dir, &cancel).expect("git");
@@ -2176,6 +2220,50 @@ mod tests {
             !change2.diff.text.contains("feature1.txt"),
             "the delta must not re-show the earlier commit: {}",
             change2.diff.text
+        );
+    }
+
+    #[test]
+    fn a_three_dot_range_resolves_its_base_to_the_merge_base() {
+        // The production `main...HEAD` shape: the base is merge-base(main, HEAD), not `main`.
+        // This exercises the `rev-parse` + `merge-base` path and proves it works (the flag
+        // scare notwithstanding), and that the diff excludes commits only on the diverged side.
+        let Some((dir, base, f1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+        // A commit on top of `base` that is not on f1's history: the diverged "main".
+        assert!(
+            git.run(&["checkout", "--quiet", &base])
+                .expect("co")
+                .success
+        );
+        std::fs::write(dir.join("mainside.txt"), "m\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "-m", "mainside"])
+                .expect("commit")
+                .success
+        );
+        let m1 = git.rev_parse_head().expect("m1");
+        assert!(git.run(&["checkout", "--quiet", &f1]).expect("co").success);
+
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{m1}...HEAD")));
+        let cap = capture(&cfg, None, &cancel);
+        // merge-base(m1, f1) is `base`, which is what a three-dot range diffs against.
+        assert_eq!(cap.base_sha.as_deref(), Some(base.as_str()));
+        assert_eq!(cap.head_sha.as_deref(), Some(f1.as_str()));
+        let change = cap.change.expect("a change");
+        assert!(
+            change.diff.text.contains("feature1"),
+            "the branch's own change is shown: {}",
+            change.diff.text
+        );
+        assert!(
+            !change.diff.text.contains("mainside"),
+            "the diverged main-side commit is not: {}",
+            change.diff.text
         );
     }
 
@@ -2328,6 +2416,24 @@ mod tests {
             cap.change.expect("a change").incremental_from.is_none(),
             "--no-incremental-resume must capture the whole range"
         );
+    }
+
+    #[test]
+    fn pin_to_head_rewrites_only_a_head_anchored_range() {
+        assert_eq!(
+            pin_to_head(&DiffMode::Rev("main...HEAD".into()), "abc123"),
+            Some(DiffMode::Rev("main...abc123".into()))
+        );
+        assert_eq!(
+            pin_to_head(&DiffMode::Rev("main..HEAD".into()), "abc123"),
+            Some(DiffMode::Rev("main..abc123".into()))
+        );
+        // A fixed window or a keyword mode has nothing to pin -- it never becomes a baseline.
+        assert_eq!(
+            pin_to_head(&DiffMode::Rev("HEAD~3..HEAD~1".into()), "abc123"),
+            None
+        );
+        assert_eq!(pin_to_head(&DiffMode::Head, "abc123"), None);
     }
 
     #[test]
