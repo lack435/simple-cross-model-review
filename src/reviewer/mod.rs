@@ -317,6 +317,13 @@ impl RunOutcome {
         self.stdout_truncated || self.stderr_truncated
     }
 
+    /// Whether stdout cannot be trusted as a complete, byte-faithful document: it hit the size
+    /// cap, ended before it was fully drained, or did not decode cleanly. A consumer that parses
+    /// stdout as authoritative evidence (the Perforce capture) must not trust it when this is set.
+    pub fn stdout_untrustworthy(&self) -> bool {
+        self.stdout_truncated || self.stdout_incomplete || self.stdout_lossy
+    }
+
     /// stderr first: that is where CLIs put the reason they failed.
     pub fn diagnostics(&self) -> String {
         let mut out = String::new();
@@ -596,8 +603,11 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
 pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     // Gated on stdout alone. A run whose stderr flooded but whose stdout is simply empty
     // failed for some other reason, and reporting it as truncation would tell the caller
-    // not to retry when retrying is exactly right.
-    out.stdout_truncated.then(|| {
+    // not to retry when retrying is exactly right. `stdout_incomplete` (a partial prefix from a
+    // pipe error or a drain-deadline expiry) is treated the same way: a review parsed from a
+    // truncated transcript is as unreliable as one from a capped one, and the Codex JSONL
+    // fallback would otherwise return an earlier agent message as the review.
+    (out.stdout_truncated || out.stdout_incomplete).then(|| {
         errors::output_truncated(
             cfg.reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),

@@ -217,8 +217,13 @@ pub fn capture(
     // `inventory` returns `None` if any complete unit could not be fingerprinted (fail-closed).
     let entries = capture_complete.then(|| inventory(&segments)).flatten();
     let over_caps = entries.as_ref().is_some_and(|entries| {
+        // The byte cap is measured against the *actual* serialized form the session store will
+        // write (pretty JSON), not an estimate, so the on-disk record cannot exceed it unnoticed.
         entries.len() > MAX_INVENTORY_ENTRIES
-            || entries.iter().map(inventory_entry_bytes).sum::<usize>() > MAX_INVENTORY_BYTES
+            || serde_json::to_string_pretty(entries)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX)
+                > MAX_INVENTORY_BYTES
     });
     if over_caps {
         warnings.push(
@@ -486,16 +491,6 @@ fn inventory(segments: &[Segment]) -> Option<Vec<baseline::InventoryEntry>> {
     Some(entries)
 }
 
-/// A conservative serialized size of one inventory entry, for the total-byte cap. Over-estimates
-/// rather than under: a fixed allowance covers the JSON field names, quoting, braces and the
-/// 64-char digest hex; the variable cost is the depot path and comparator. Erring high means the
-/// cap trips before the on-disk record actually gets that large.
-fn inventory_entry_bytes(entry: &baseline::InventoryEntry) -> usize {
-    // ~120 bytes of JSON scaffolding (keys `change`/`basis`/`kind`/`depot`/`comparator`/
-    // `fingerprint`/`len`/`sha256`, quotes, braces, commas) plus the 64-char digest.
-    120 + 64 + entry.depot.len() + entry.comparator.len()
-}
-
 /// Apply the resume delta to freshly-captured segments: collapse each unit that is
 /// byte-identical to what the reviewer was shown last turn, and note files that left the
 /// changelist or lost their diff.
@@ -575,13 +570,16 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
 fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
     let client_spec_digest = p4
         .run(&["client", "-o", &info.client], "")
-        // A truncated spec would hash only its prefix, so a change in an omitted View/Root/Options
-        // field past the cut would leave the digest unchanged and permit elision under a changed
-        // client (gate finding 4). Reject a truncated or lossy spec: the identity is then
-        // unconfirmed and elision is disabled.
-        .filter(|out| out.success && !out.stdout_lossy && !out.stdout_truncated)
+        // Any untrustworthy spec output -- capped, lossy, or a partial prefix -- would hash only
+        // part of the spec, so a change in an omitted View/Root/Options field could leave the
+        // digest unchanged and permit elision under a changed client. Reject it: the identity is
+        // then unconfirmed and elision is disabled (gate findings 4/2).
+        .filter(|out| out.success && !out.stdout_untrustworthy())
         .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
-        .map(|fp| fp.sha256);
+        .map(|fp| fp.sha256)
+        // If the workspace resolution itself came from untrustworthy `p4 info`/`clients` output,
+        // the server/client fields may be wrong too, so the whole identity is unconfirmed.
+        .filter(|_| info.trustworthy);
     baseline::CaptureIdentity {
         server: info.server.clone(),
         client: info.client.clone(),
@@ -771,7 +769,7 @@ impl<'a> P4<'a> {
 
         if output_truncated {
             omissions.push(
-                "`p4 describe` output hit the size cap, so some of this changelist was not read."
+                "`p4 describe` output hit the size cap or ended before it was fully read, so some of this changelist was not read."
                     .to_string(),
             );
         }
@@ -975,13 +973,15 @@ impl<'a> P4<'a> {
             local_by_depot.insert(file.depot.clone(), local_label);
 
             match ActionKind::of(&file.action) {
-                // A binary edit gets no useful text diff from `p4 diff -du` (it emits an empty or
-                // "files differ" section), which would otherwise be discarded silently, leaving the
-                // file in `present_depots` with no unit and no omission -- and so a false "restored
-                // to depot" note next turn (gate finding 2). Classify it up front and omit it.
-                ActionKind::Edit if is_binary_type(&file.depot, &opened) => {
+                // Only an edit with a known text type is sent to `p4 diff`. A binary edit -- or one
+                // whose type tag is missing (malformed `opened` output) -- gets no useful text diff
+                // (an empty or "files differ" section), which would otherwise be discarded
+                // silently, leaving the file in `present_depots` with no unit and no omission, and
+                // so a false "restored to depot" note next turn (gate finding 2). Omit it instead.
+                ActionKind::Edit if !is_diffable_text(&file.depot, &opened) => {
                     omissions.push(format!(
-                        "`{}` is a binary edit; p4 does not produce a text diff for it.",
+                        "`{}` is a binary edit or has no known text type; p4 does not produce a \
+                         text diff for it.",
                         safe_label(&file.depot)
                     ));
                 }
@@ -1033,6 +1033,17 @@ impl<'a> P4<'a> {
                         omissions.push(
                             "`p4 diff` output did not decode cleanly, so some edits may be \
                              misrepresented."
+                                .to_string(),
+                        );
+                    }
+                    if out.stdout_incomplete {
+                        // A partial prefix (pipe error or drain-deadline) may contain no non-empty
+                        // sections at all, in which case no unit would be built and the segment
+                        // would look vacuously complete. Push an omission so it is marked
+                        // incomplete regardless of what the prefix parsed to (gate finding).
+                        omissions.push(
+                            "`p4 diff` output ended before it was fully read, so some edits may be \
+                             missing from the diff."
                                 .to_string(),
                         );
                     }
@@ -1279,7 +1290,7 @@ impl<'a> P4<'a> {
 
         if output_truncated {
             omissions.push(
-                "`p4 describe -S` output hit the size cap, so some of the shelf was not read."
+                "`p4 describe -S` output hit the size cap or ended before it was fully read, so some of the shelf was not read."
                     .to_string(),
             );
         }
@@ -1650,7 +1661,11 @@ impl<'a> P4<'a> {
         if !out.success {
             return None;
         }
-        Some(parse_info(&out.stdout))
+        let mut info = parse_info(&out.stdout);
+        // Untrustworthy `p4 info` output could give a wrong server/client, so the capture identity
+        // built from it must not be trusted for elision.
+        info.trustworthy = !out.stdout_untrustworthy();
+        Some(info)
     }
 
     /// The user's client workspaces, for deriving the client when the ambient one does not
@@ -1663,7 +1678,9 @@ impl<'a> P4<'a> {
         if !out.success {
             return None;
         }
-        Some((parse_clients_ztag(&out.stdout), out.stdout_truncated))
+        // Any untrustworthy output (capped, lossy, or a partial prefix) can drop a deeper
+        // workspace and make the resolver pick a shallower, wrong client.
+        Some((parse_clients_ztag(&out.stdout), out.stdout_untrustworthy()))
     }
 
     /// `p4 describe -s` metadata: status, owning client, description, and the file ledger.
@@ -1755,6 +1772,11 @@ struct Info {
     /// The server address (`p4 info`'s `serverAddress`), part of the resume capture identity so
     /// a session pointed at a different server never elides against the wrong one.
     server: String,
+    /// Whether the `p4 info` / `p4 clients` output this was resolved from was trustworthy (not
+    /// capped, lossy, or a partial prefix). When false, the resolved client/server may be wrong,
+    /// so the capture identity is left unconfirmed and elision is disabled. Defaults true; the
+    /// resolvers lower it.
+    trustworthy: bool,
 }
 
 impl Info {
@@ -1827,6 +1849,9 @@ fn resolve_workspace(p4: &P4, cwd: &Path) -> Result<Info, String> {
             user: info.user,
             host: info.host,
             server: info.server,
+            // `clients` was already required trustworthy above (a cut list errors out), so the
+            // derived identity is only as trustworthy as the `p4 info` that seeded it.
+            trustworthy: info.trustworthy,
         }),
         ClientChoice::None => Err(format!(
             "no Perforce client for {} on host '{}' (user {}): none of the user's clients has a \
@@ -1976,6 +2001,9 @@ fn parse_info(raw: &str) -> Info {
         user,
         host,
         server,
+        // Parsing alone cannot know if the output was complete; `info()` lowers this from the
+        // run outcome. Default true so a direct parse (in tests) is trusted.
+        trustworthy: true,
     }
 }
 
@@ -2197,6 +2225,18 @@ fn is_binary_type(depot: &str, opened: &[OpenedFile]) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `p4 diff` can be trusted to produce a real text diff for this opened edit: the file
+/// has a known, non-binary Perforce type. A missing or empty type tag (a malformed `p4 opened`
+/// record) is treated as NOT diffable, so a binary edit whose type was dropped cannot be sent to
+/// `p4 diff`, emit an empty section, and slip through without an omission (gate finding).
+fn is_diffable_text(depot: &str, opened: &[OpenedFile]) -> bool {
+    opened
+        .iter()
+        .find(|f| f.depot == depot)
+        .map(|f| !f.ptype.trim().is_empty() && !base_type_is_binary(&f.ptype))
+        .unwrap_or(false)
+}
+
 fn base_type_is_binary(ptype: &str) -> bool {
     let base = ptype.split('+').next().unwrap_or(ptype).trim();
     matches!(
@@ -2281,21 +2321,21 @@ fn truncation_notes(meta: bool, opened: bool, wher: bool) -> Vec<String> {
     let mut notes = Vec::new();
     if meta {
         notes.push(
-            "`p4 describe` metadata hit the output size cap or did not decode cleanly, so the \
+            "`p4 describe` metadata hit the output size cap, did not decode cleanly, or ended before it was fully read, so the \
              changelist's file list or description may be incomplete."
                 .to_string(),
         );
     }
     if opened {
         notes.push(
-            "`p4 opened` output hit the output size cap or did not decode cleanly, so some opened \
+            "`p4 opened` output hit the output size cap, did not decode cleanly, or ended before it was fully read, so some opened \
              files may not be shown."
                 .to_string(),
         );
     }
     if wher {
         notes.push(
-            "`p4 where` output hit the output size cap or did not decode cleanly, so some files \
+            "`p4 where` output hit the output size cap, did not decode cleanly, or ended before it was fully read, so some files \
              may be missing their local mapping and treated as out of the working root."
                 .to_string(),
         );
@@ -2592,6 +2632,33 @@ Change 5 by u@c on 2026/01/01\n\n\
         ];
         assert!(is_binary_type("//d/a", &opened));
         assert!(!is_binary_type("//d/b", &opened));
+    }
+
+    #[test]
+    fn is_diffable_text_requires_a_known_non_binary_type() {
+        let opened = |ptype: &str| {
+            vec![OpenedFile {
+                depot: "//d/a".into(),
+                action: "edit".into(),
+                ptype: ptype.into(),
+            }]
+        };
+        assert!(is_diffable_text("//d/a", &opened("text")));
+        assert!(is_diffable_text("//d/a", &opened("unicode")));
+        assert!(
+            !is_diffable_text("//d/a", &opened("binary")),
+            "binary is not diffable"
+        );
+        // A missing/empty type tag (malformed opened record) is NOT diffable, so a binary edit
+        // with a dropped type cannot slip through as an empty diff.
+        assert!(
+            !is_diffable_text("//d/a", &opened("")),
+            "empty type is not diffable"
+        );
+        assert!(
+            !is_diffable_text("//d/unknown", &opened("text")),
+            "no record -> not diffable"
+        );
     }
 
     #[test]
@@ -2995,6 +3062,7 @@ Change 5 by u@c on 2026/01/01\n\n\
             user: "dwellman".into(),
             host: "W680".into(),
             server: "ssl:perforce:1666".into(),
+            trustworthy: true,
         };
         let captured: Vec<u64> = segments.iter().map(|s| s.change).collect();
         render(
@@ -3088,6 +3156,7 @@ Change 5 by u@c on 2026/01/01\n\n\
             user: "u".into(),
             host: "h".into(),
             server: "s".into(),
+            trustworthy: true,
         };
         let text = render(&cfg, &info, &[43650], &[43650], &[], &[seg], true);
         // The follow-up framing is present, and the collapsed unit shows a placeholder, not its

@@ -1193,24 +1193,35 @@ impl Job {
                         // delta is ancestry-checked and has no equivalent hazard.
                         if self.cfg.vcs == crate::config::Vcs::Perforce {
                             match self.sessions.forget(&self.session) {
-                                Ok(_) => warnings.push(format!(
+                                // Only `Ok(true)` -- a mapping was actually removed -- proves the
+                                // session was reset. `Ok(false)` means nothing was removed, which
+                                // includes the case where `read()` silently fell back to an empty
+                                // store on a transient read error, leaving the stale mapping on
+                                // disk. Treat that as uncertain, like an outright error.
+                                Ok(true) => warnings.push(format!(
                                     "This turn could not be saved to disk ({e}). To stop a later \
                                      review from collapsing files against a stale baseline, session \
                                      '{}' has been reset -- a follow-up call will start a fresh \
                                      review. The review below is unaffected.",
                                     self.session
                                 )),
-                                // Poisoning itself failed (the state store is unwritable), so the
-                                // stale mapping may survive. Say so plainly and tell the caller to
-                                // force a fresh review rather than trust a resume.
-                                Err(forget_err) => warnings.push(format!(
-                                    "This turn could not be saved to disk ({e}), and session '{}' \
-                                     could not be reset either ({forget_err}). A follow-up resume \
-                                     of this session could collapse files against a stale baseline \
-                                     -- pass fresh: true to review it safely. The review below is \
-                                     unaffected.",
-                                    self.session
-                                )),
+                                // Poisoning could not be confirmed (the store was unwritable, or a
+                                // read fell back to empty), so a stale mapping may survive. Say so
+                                // plainly and tell the caller to force a fresh review.
+                                other => {
+                                    let detail = match other {
+                                        Err(forget_err) => format!(" ({forget_err})"),
+                                        _ => String::new(),
+                                    };
+                                    warnings.push(format!(
+                                        "This turn could not be saved to disk ({e}), and session \
+                                         '{}' could not be reliably reset{detail}. A follow-up \
+                                         resume of this session could collapse files against a \
+                                         stale baseline -- pass fresh: true to review it safely. \
+                                         The review below is unaffected.",
+                                        self.session
+                                    ));
+                                }
                             }
                         } else {
                             warnings.push(format!(
@@ -1225,17 +1236,23 @@ impl Job {
                 }
             }
             None => {
-                eprintln!(
-                    "cross-review: warning: the reviewer did not report a session id, so review \
-                     session '{}' cannot be resumed",
-                    self.session
-                );
+                // No session id means this turn cannot be recorded, so a prior Perforce mapping
+                // (with its now-stale baseline) would otherwise survive and be resumed. Drop it,
+                // before the panic-prone diagnostics, so the next call starts fresh.
+                if self.cfg.vcs == crate::config::Vcs::Perforce {
+                    self.sessions.forget(&self.session).ok();
+                }
                 warnings.push(format!(
                     "The reviewer did not report a session id, so session '{}' cannot be resumed. \
                      The review below is still valid, but a follow-up call with this session name \
                      will start a fresh review with no memory of it.",
                     self.session
                 ));
+                eprintln!(
+                    "cross-review: warning: the reviewer did not report a session id, so review \
+                     session '{}' cannot be resumed",
+                    self.session
+                );
                 false
             }
         };
