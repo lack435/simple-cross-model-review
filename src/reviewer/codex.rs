@@ -511,6 +511,7 @@ mod tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
         }
     }
 
@@ -690,6 +691,7 @@ ordinary diagnostic
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
         }
     }
 

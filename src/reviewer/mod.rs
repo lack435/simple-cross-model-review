@@ -290,6 +290,11 @@ pub struct RunOutcome {
     /// review itself from stdout, so only this one makes a review unrecoverable.
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// stdout contained bytes that were not valid UTF-8 and were replaced during decoding,
+    /// so `stdout` is not a faithful copy of what the child produced. The Perforce resume
+    /// delta needs this: a fingerprint over lossily-decoded text cannot claim byte-identity
+    /// with the underlying file, so any evidence captured from such output is non-elidable.
+    pub stdout_lossy: bool,
 }
 
 /// Observable liveness from a reviewer child process.
@@ -459,6 +464,7 @@ pub fn run_observed(
     Ok(RunOutcome {
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
+        stdout_lossy: stdout.lossy,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -529,10 +535,12 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
     }
 }
 
-/// One pipe's output, and whether the cap threw any of it away.
+/// One pipe's output, whether the cap threw any of it away, and whether decoding it was
+/// lossy (non-UTF-8 bytes replaced).
 struct Collected {
     text: String,
     truncated: bool,
+    lossy: bool,
 }
 
 /// Take what a pipe has produced, waiting until EOF or `deadline`, whichever comes first.
@@ -544,9 +552,13 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
         std::thread::sleep(Duration::from_millis(25));
     }
     let buffer = drain.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    // Whether decoding replaced any byte: valid UTF-8 decodes losslessly, anything else does
+    // not. Recorded so a caller that needs byte-fidelity (the Perforce fingerprint) can tell.
+    let lossy = std::str::from_utf8(&buffer).is_err();
     Collected {
         text: String::from_utf8_lossy(&buffer).into_owned(),
         truncated: drain.truncated.load(Ordering::SeqCst),
+        lossy,
     }
 }
 
@@ -633,6 +645,17 @@ mod drain_tests {
         assert!(collected.truncated);
     }
 
+    #[test]
+    fn valid_utf8_is_not_flagged_lossy_but_invalid_bytes_are() {
+        // The Perforce fingerprint keys off this: text that decoded cleanly can be trusted as
+        // byte-faithful, text that needed replacement cannot.
+        assert!(!drained("clean utf-8 café".as_bytes().to_vec()).lossy);
+        // A lone 0xFF is not valid UTF-8, so decoding replaces it.
+        let lossy = drained(vec![b'o', b'k', 0xFF, b'!']);
+        assert!(lossy.lossy);
+        assert!(lossy.text.contains('\u{FFFD}'));
+    }
+
     /// A reader that records how many bytes were actually taken from it.
     struct Counting {
         remaining: usize,
@@ -693,6 +716,7 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: true,
             stderr_truncated: false,
+            stdout_lossy: false,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
@@ -721,6 +745,7 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: true,
             stderr_truncated: false,
+            stdout_lossy: false,
         };
         let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
@@ -750,6 +775,7 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
         };
 
         let failure = failure_for(&cfg, &out);
