@@ -273,6 +273,40 @@ impl DiffMode {
         matches!(self, Self::Auto | Self::Head | Self::Staged)
     }
 
+    /// A stable identity for this mode, stored on the session so a resume can tell whether the
+    /// server's `--diff` was reconfigured between turns. Two turns whose keys differ captured
+    /// different things, so the earlier HEAD is not a baseline the later diff can delta
+    /// against -- the caller falls back to a full capture instead. The keyword variants can
+    /// never collide with a `Rev`, because `parse` maps those spellings to the variants and
+    /// leaves `Rev` only the revisions.
+    pub fn spec_key(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::None => "none".to_string(),
+            Self::Staged => "staged".to_string(),
+            Self::Head => "HEAD".to_string(),
+            Self::Rev(rev) => rev.clone(),
+        }
+    }
+
+    /// Whether this is a two-endpoint range whose right endpoint is literally `HEAD`.
+    ///
+    /// The incremental resume rewrites the configured range to `<prior>..HEAD`, which is only
+    /// equivalent to the configured range when that range also *ends* at HEAD. A range like
+    /// `HEAD~3..HEAD~1` or `main...release` names a fixed window that does not move with HEAD,
+    /// so `<prior>..HEAD` would review something else entirely -- those must never delta. The
+    /// right endpoint is the text after the last range operator; `parse` has already refused
+    /// the ambiguous `:/…..` spellings and `is_two_endpoint` excludes dots inside `^{…}`, so a
+    /// mode that reaches here as a non-working-tree `Rev` is a genuine range with a `..`.
+    fn ends_at_head(&self) -> bool {
+        match self {
+            Self::Rev(rev) if !self.compares_against_working_tree() => rev
+                .rsplit_once("..")
+                .is_some_and(|(_, right)| right == "HEAD"),
+            _ => false,
+        }
+    }
+
     /// What the *caller* is told the capture contains, and what it therefore does not.
     ///
     /// The reviewer is shown the exact command line; the caller needs the shape of it, to
@@ -388,7 +422,11 @@ impl Capture {
 ///
 /// An *empty* diff is not `None`. A clean tree is a fact the reviewer needs: told nothing,
 /// it reviews the current code and calls that a review of the change.
-pub fn capture(cfg: &Config, prior_head: Option<&str>, cancel: &AtomicBool) -> Capture {
+pub fn capture(
+    cfg: &Config,
+    resume: Option<GitResumeBaseline<'_>>,
+    cancel: &AtomicBool,
+) -> Capture {
     if !cfg.supplies_change() {
         return Capture::default();
     }
@@ -426,13 +464,12 @@ pub fn capture(cfg: &Config, prior_head: Option<&str>, cancel: &AtomicBool) -> C
     // captured.
     let head_sha = git.rev_parse_head();
 
-    // On a resumed turn whose configured mode is a committed range, review only the commits
-    // added since the previously reviewed one. The earlier full diff is still in the
-    // reviewer's resumed conversation, so re-sending the whole range just re-caches a
+    // On a resumed turn whose configured mode is a committed range ending at HEAD, review
+    // only the commits added since the previously reviewed one. The earlier full diff is still
+    // in the reviewer's resumed conversation, so re-sending the whole range just re-caches a
     // near-duplicate every turn. `incremental_base` is the prior commit when that applies and
-    // `None` otherwise (first turn, working-tree mode, disabled, or a branch rewritten so the
-    // prior commit is no longer an ancestor of HEAD -- see `incremental_base`).
-    let incremental_base = incremental_base(cfg, prior_head, head_sha.as_deref(), &git);
+    // `None` otherwise -- see it for every condition that has to hold.
+    let incremental_base = incremental_base(cfg, resume, head_sha.as_deref(), &git);
     let effective = match &incremental_base {
         Some(base) => DiffMode::Rev(format!("{base}..HEAD")),
         None => cfg.diff.clone(),
@@ -548,33 +585,57 @@ pub fn capture(cfg: &Config, prior_head: Option<&str>, cancel: &AtomicBool) -> C
     }
 }
 
+/// The previous turn's capture, carried into this one so it can review only what changed
+/// since. Both halves are needed: `head` is the commit to delta from, and `diff_spec`
+/// identifies the `--diff` that produced it, so a turn whose server was reconfigured to a
+/// different range (or a working-tree mode) does not delta against a baseline that reviewed
+/// something else. Only ever consulted for git.
+#[derive(Clone, Copy)]
+pub struct GitResumeBaseline<'a> {
+    pub head: &'a str,
+    pub diff_spec: &'a str,
+}
+
 /// The commit a resumed turn should review changes *since*, or `None` for a full capture.
 ///
-/// Returns the prior turn's HEAD only when reviewing just `<prior>..HEAD` is both wanted and
-/// safe: the feature is enabled, this is a resume with a stored prior commit, the current
-/// HEAD is known, the configured mode is a committed range (a working-tree or staged diff
-/// carries uncommitted work a commit delta would silently drop), and the prior commit is an
-/// ancestor of the current one. That last check is what makes a rewritten branch -- rebased,
-/// amended, force-pushed -- fall back to the full range instead of a meaningless
-/// `<orphaned-commit>..HEAD`. `git merge-base --is-ancestor X X` is true, so a resume with no
-/// new commits yields an (empty) delta, which the render reports as "nothing new since your
-/// last turn" rather than as an empty change.
+/// Returns the prior turn's HEAD only when reviewing just `<prior>..HEAD` is both equivalent
+/// to the configured range and safe. Every condition has to hold:
+///
+/// - the feature is enabled;
+/// - this is a resume carrying the prior turn's baseline, and its HEAD is a valid object id;
+/// - the current HEAD is known;
+/// - the configured mode is a committed range **ending at HEAD** -- a working-tree or staged
+///   diff carries uncommitted work a commit delta would drop, and a range like `HEAD~3..HEAD~1`
+///   or `main...release` names a fixed window `<prior>..HEAD` would not reproduce;
+/// - the configured range is the **same** one the baseline was captured under, so a server
+///   reconfigured between turns re-captures in full rather than deltaing against a diff the
+///   reviewer never saw;
+/// - and the prior commit is an ancestor of the current one, which is what makes a rewritten
+///   branch (rebased, amended, force-pushed) fall back to the full range instead of a
+///   meaningless `<orphaned-commit>..HEAD`.
+///
+/// `git merge-base --is-ancestor X X` is true, so a resume with no new commits yields an
+/// (empty) delta, which the render reports as "no new commits" rather than as an empty change.
 fn incremental_base(
     cfg: &Config,
-    prior_head: Option<&str>,
+    resume: Option<GitResumeBaseline<'_>>,
     head_sha: Option<&str>,
     git: &Git,
 ) -> Option<String> {
     if !cfg.resume_incremental_diff {
         return None;
     }
-    let prior = prior_head.filter(|s| is_object_name(s))?;
-    let head = head_sha.filter(|s| is_object_name(s))?;
-    // Committed range only: `compares_against_working_tree()` is true for auto/HEAD/staged and
-    // for a bare revision, all of which include uncommitted work that `<prior>..HEAD` omits.
-    if !matches!(cfg.diff, DiffMode::Rev(_)) || cfg.diff.compares_against_working_tree() {
+    if !cfg.diff.ends_at_head() {
         return None;
     }
+    let resume = resume?;
+    // The baseline must have been captured under the same range, or `<prior>..HEAD` unions
+    // with a prior context that reviewed a different diff.
+    if resume.diff_spec != cfg.diff.spec_key() {
+        return None;
+    }
+    let prior = Some(resume.head).filter(|s| is_object_name(s))?;
+    let head = head_sha.filter(|s| is_object_name(s))?;
     git.is_ancestor(prior, head).then(|| prior.to_string())
 }
 
@@ -639,11 +700,16 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
         if change.incremental_from.is_some() {
             // An empty delta is not an empty change: it means no commits were added since the
             // last turn. Saying "no differences" here would read as "there is nothing to
-            // review", when the reviewer already reviewed the change on an earlier turn.
+            // review", when the reviewer already reviewed the change on an earlier turn. It is
+            // scoped to committed history: this range never shows uncommitted work, so the
+            // live tree may still have moved on -- flagged in the tree-divergence section
+            // below when it has -- and this must not claim the whole change is unchanged.
             out.push_str(
-                "(empty -- there are no new commits since your previous turn, so nothing has \
-                 changed since your last review. Say so plainly, rather than re-reviewing the \
-                 change from scratch or reporting that there was no change at all.)\n\n",
+                "(empty -- no new commits since your previous turn, so the committed change is \
+                 unchanged from your last review. This range covers committed history only; if \
+                 the working tree has uncommitted changes they are not shown here (and are \
+                 noted below if so). Say that no new commits were captured, rather than that \
+                 there was no change at all.)\n\n",
             );
         } else {
             out.push_str("(empty -- this command found no differences.");
@@ -1986,6 +2052,15 @@ mod tests {
         Some((dir, base, head1))
     }
 
+    /// A resume baseline captured under `cfg`'s current diff spec, i.e. the eligible case:
+    /// same range, so only the ends-at-HEAD and ancestry checks decide whether it deltas.
+    fn matching_baseline<'a>(head: &'a str, spec: &'a str) -> GitResumeBaseline<'a> {
+        GitResumeBaseline {
+            head,
+            diff_spec: spec,
+        }
+    }
+
     #[test]
     fn a_resumed_range_review_captures_only_the_commits_added_since_the_prior_head() {
         let Some((dir, base, head1)) = repo_with_committed_history() else {
@@ -1993,6 +2068,7 @@ mod tests {
         };
         let cancel = idle();
         let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let spec = cfg.diff.spec_key();
 
         // Turn 1: no prior head, so the whole range, and the baseline it hands back is HEAD.
         let cap1 = capture(&cfg, None, &cancel);
@@ -2017,7 +2093,7 @@ mod tests {
         let head2 = git.rev_parse_head().expect("head2");
 
         // Turn 2: resume with turn 1's HEAD -> only feature2, never feature1 again.
-        let cap2 = capture(&cfg, Some(&head1), &cancel);
+        let cap2 = capture(&cfg, Some(matching_baseline(&head1, &spec)), &cancel);
         assert_eq!(cap2.head_sha.as_deref(), Some(head2.as_str()));
         let change2 = cap2.change.expect("a change");
         assert_eq!(change2.incremental_from.as_deref(), Some(head1.as_str()));
@@ -2040,9 +2116,10 @@ mod tests {
         };
         let cancel = idle();
         let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let spec = cfg.diff.spec_key();
         // HEAD has not moved since it was captured, so `head1..HEAD` is empty -- which is the
         // correct answer, and the render says "no new commits" rather than "no change".
-        let cap = capture(&cfg, Some(&head1), &cancel);
+        let cap = capture(&cfg, Some(matching_baseline(&head1, &spec)), &cancel);
         let change = cap.change.expect("a change");
         assert_eq!(change.incremental_from.as_deref(), Some(head1.as_str()));
         assert!(change.diff.text.trim().is_empty(), "{}", change.diff.text);
@@ -2068,7 +2145,8 @@ mod tests {
         assert_ne!(amended, head1);
 
         let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
-        let cap = capture(&cfg, Some(&head1), &cancel);
+        let spec = cfg.diff.spec_key();
+        let cap = capture(&cfg, Some(matching_baseline(&head1, &spec)), &cancel);
         let change = cap.change.expect("a change");
         assert!(
             change.incremental_from.is_none(),
@@ -2088,8 +2166,48 @@ mod tests {
         };
         let cancel = idle();
         let cfg = config_for(&dir, DiffMode::Head);
-        let cap = capture(&cfg, Some(&head1), &cancel);
+        // Even a matching baseline must not delta here.
+        let cap = capture(&cfg, Some(matching_baseline(&head1, "HEAD")), &cancel);
         assert!(cap.change.expect("a change").incremental_from.is_none());
+    }
+
+    #[test]
+    fn a_range_that_does_not_end_at_head_never_deltas() {
+        // `<prior>..HEAD` only reproduces a range that itself ends at HEAD. A fixed window
+        // like `<base>..<sha>` names a change that does not move with HEAD, so it must always
+        // be captured in full even when the baseline matches and is an ancestor.
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..{head1}")));
+        let spec = cfg.diff.spec_key();
+        let cap = capture(&cfg, Some(matching_baseline(&base, &spec)), &cancel);
+        assert!(
+            cap.change.expect("a change").incremental_from.is_none(),
+            "a range not ending at HEAD must not be rewritten to <prior>..HEAD"
+        );
+    }
+
+    #[test]
+    fn a_reconfigured_diff_spec_falls_back_to_the_full_range() {
+        // The baseline was captured under a different `--diff`, so the reviewer's context
+        // holds a different range; deltaing against it would union with the wrong diff. Both
+        // specs end at HEAD, so only the spec-identity check catches this.
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let cap = capture(
+            &cfg,
+            Some(matching_baseline(&head1, "some-other-base...HEAD")),
+            &cancel,
+        );
+        assert!(
+            cap.change.expect("a change").incremental_from.is_none(),
+            "a baseline captured under a different range must not be deltaed against"
+        );
     }
 
     #[test]
@@ -2099,11 +2217,27 @@ mod tests {
         };
         let cancel = idle();
         let mut cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let spec = cfg.diff.spec_key();
         cfg.resume_incremental_diff = false;
-        let cap = capture(&cfg, Some(&head1), &cancel);
+        let cap = capture(&cfg, Some(matching_baseline(&head1, &spec)), &cancel);
         assert!(
             cap.change.expect("a change").incremental_from.is_none(),
             "--no-incremental-resume must capture the whole range"
         );
+    }
+
+    #[test]
+    fn ends_at_head_recognises_only_ranges_anchored_at_head() {
+        assert!(DiffMode::Rev("main...HEAD".into()).ends_at_head());
+        assert!(DiffMode::Rev("main..HEAD".into()).ends_at_head());
+        assert!(DiffMode::Rev("origin/main...HEAD".into()).ends_at_head());
+        // A fixed window, a different right endpoint, or a working-tree/keyword mode: none of
+        // these move with HEAD, so none may be rewritten to `<prior>..HEAD`.
+        assert!(!DiffMode::Rev("HEAD~3..HEAD~1".into()).ends_at_head());
+        assert!(!DiffMode::Rev("main...release".into()).ends_at_head());
+        assert!(!DiffMode::Rev("HEAD~3".into()).ends_at_head());
+        assert!(!DiffMode::Head.ends_at_head());
+        assert!(!DiffMode::Staged.ends_at_head());
+        assert!(!DiffMode::Auto.ends_at_head());
     }
 }

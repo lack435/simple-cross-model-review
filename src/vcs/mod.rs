@@ -18,7 +18,7 @@ mod shared;
 use std::sync::atomic::AtomicBool;
 
 use crate::config::{Config, Vcs};
-pub use git::DiffMode;
+pub use git::{DiffMode, GitResumeBaseline};
 pub use shared::{Capture, CapturedChange};
 
 /// Capture the change under review, using whichever backend the configuration selected.
@@ -34,12 +34,12 @@ pub fn capture(
     cfg: &Config,
     changes: &[u64],
     include_shelved: bool,
-    prior_head: Option<&str>,
+    resume: Option<GitResumeBaseline<'_>>,
     cancel: &AtomicBool,
 ) -> Capture {
     match cfg.vcs {
-        Vcs::Git => git_capture(cfg, prior_head, cancel),
-        // Perforce ignores `prior_head`: a pending changelist mutates in place, so there is no
+        Vcs::Git => git_capture(cfg, resume, cancel),
+        // Perforce ignores `resume`: a pending changelist mutates in place, so there is no
         // prior revision to delta against, and it re-captures the current contents each turn.
         Vcs::Perforce => perforce::capture(cfg, changes, include_shelved, cancel),
     }
@@ -50,8 +50,12 @@ pub fn capture(
 /// The git backend keeps its own richly-typed `Change` (tree-relation flags, untracked
 /// files) and its own `render`, because those are git's semantics; the rest of the server
 /// only ever wants the rendered string plus the two figures the usage log records.
-fn git_capture(cfg: &Config, prior_head: Option<&str>, cancel: &AtomicBool) -> Capture {
-    let captured = git::capture(cfg, prior_head, cancel);
+fn git_capture(
+    cfg: &Config,
+    resume: Option<GitResumeBaseline<'_>>,
+    cancel: &AtomicBool,
+) -> Capture {
+    let captured = git::capture(cfg, resume, cancel);
     let change = captured.change.map(|change| CapturedChange {
         diff_bytes: change.diff.text.len(),
         diff_truncated: change.diff.truncated,

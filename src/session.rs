@@ -64,6 +64,14 @@ pub struct SessionRecord {
     /// where HEAD could not be resolved (no commits yet, detached, git unavailable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
+    /// The `--diff` spec key `head_sha` was captured under, so a resume can tell whether the
+    /// server's diff configuration changed between turns. The next turn deltas against
+    /// `head_sha` only when its own spec matches this; otherwise the baseline reviewed a
+    /// different range (or a working-tree mode) and a full capture is taken instead. Paired
+    /// with `head_sha`, so it advances and is retained together with it. `None` for Perforce
+    /// or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_spec: Option<String>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -84,6 +92,9 @@ pub struct TurnFacts<'a> {
     /// The git HEAD this turn captured, so the next turn can review only what changed since
     /// it. `None` for Perforce or when HEAD could not be resolved.
     pub head_sha: Option<String>,
+    /// The `--diff` spec key `head_sha` was captured under, so a resume only deltas against it
+    /// when this turn's configuration matches. `None` for Perforce.
+    pub diff_spec: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -138,6 +149,7 @@ impl SessionStore {
             cumulative_usage,
             changes,
             head_sha,
+            diff_spec,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -165,8 +177,15 @@ impl SessionStore {
                 changes: changes.or(existing.changes.clone()),
                 // Advance to this turn's HEAD so the next resume deltas against the latest
                 // reviewed commit. A turn that could not resolve HEAD keeps the prior value
-                // rather than erasing it: an older ancestor still yields a valid delta.
-                head_sha: head_sha.or(existing.head_sha.clone()),
+                // rather than erasing it: an older ancestor still yields a valid delta. The
+                // spec advances and is retained with it, so the pair always describes one
+                // capture rather than a HEAD from one turn beside a spec from another.
+                head_sha: head_sha.clone().or(existing.head_sha.clone()),
+                diff_spec: if head_sha.is_some() {
+                    diff_spec
+                } else {
+                    existing.diff_spec.clone()
+                },
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -181,6 +200,7 @@ impl SessionStore {
                 cumulative_usage,
                 changes,
                 head_sha,
+                diff_spec,
             },
         };
 
@@ -384,6 +404,7 @@ mod tests {
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
+                    diff_spec: None,
                 },
             )
             .expect("record turn")
@@ -443,6 +464,7 @@ mod tests {
             cumulative_usage: Some(usage),
             changes: None,
             head_sha: None,
+            diff_spec: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -471,7 +493,7 @@ mod tests {
         // following one back to a full capture.
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
-        let facts = |head: Option<&str>| TurnFacts {
+        let facts = |head: Option<&str>, spec: Option<&str>| TurnFacts {
             reviewer: "claude",
             cli_session_id: "sid-1",
             model: "claude-opus-4-8",
@@ -480,15 +502,25 @@ mod tests {
             cumulative_usage: None,
             changes: None,
             head_sha: head.map(str::to_string),
+            diff_spec: spec.map(str::to_string),
         };
-        store.record_turn("g", facts(Some("aaa1"))).expect("turn 1");
-        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("aaa1"));
-        // A later turn advances it.
-        store.record_turn("g", facts(Some("bbb2"))).expect("turn 2");
+        store
+            .record_turn("g", facts(Some("aaa1"), Some("main...HEAD")))
+            .expect("turn 1");
+        let rec = store.get("g").unwrap();
+        assert_eq!(rec.head_sha.as_deref(), Some("aaa1"));
+        assert_eq!(rec.diff_spec.as_deref(), Some("main...HEAD"));
+        // A later turn advances the HEAD and its spec together.
+        store
+            .record_turn("g", facts(Some("bbb2"), Some("main...HEAD")))
+            .expect("turn 2");
         assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("bbb2"));
-        // A turn that could not resolve HEAD keeps the prior value rather than erasing it.
-        store.record_turn("g", facts(None)).expect("turn 3");
-        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("bbb2"));
+        // A turn that could not resolve HEAD keeps the prior pair rather than erasing it, and
+        // keeps them consistent -- the retained spec still describes the retained HEAD.
+        store.record_turn("g", facts(None, None)).expect("turn 3");
+        let rec = store.get("g").unwrap();
+        assert_eq!(rec.head_sha.as_deref(), Some("bbb2"));
+        assert_eq!(rec.diff_spec.as_deref(), Some("main...HEAD"));
     }
 
     #[test]
@@ -504,6 +536,7 @@ mod tests {
             cumulative_usage: None,
             changes,
             head_sha: None,
+            diff_spec: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
