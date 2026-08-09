@@ -1333,6 +1333,12 @@ struct AffectedFile {
 
 struct DiffSection {
     depot: String,
+    /// The `#rev`/`@rev` from the header (without the leading `#`/`@`), if present. This is the
+    /// per-file *comparator* the resume delta keys on: for a submitted file it is the changed
+    /// revision `#N` (immutable), for a pending edit or a shelved file the revision the diff was
+    /// taken against. `None` when the header carried no revision, which makes the unit
+    /// non-elidable rather than eliding against an unknown basis.
+    rev: Option<String>,
     body: String,
 }
 
@@ -1529,30 +1535,38 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
 fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
     let text = normalize(raw);
     let mut sections = Vec::new();
-    let mut current: Option<(String, String)> = None;
+    let mut current: Option<(String, Option<String>, String)> = None;
     for line in text.lines() {
-        if let Some(depot) = parse_diff_header(line) {
-            if let Some((d, b)) = current.take() {
-                sections.push(DiffSection { depot: d, body: b });
+        if let Some((depot, rev)) = parse_diff_header(line) {
+            if let Some((d, r, b)) = current.take() {
+                sections.push(DiffSection {
+                    depot: d,
+                    rev: r,
+                    body: b,
+                });
             }
-            current = Some((depot, String::new()));
-        } else if let Some((_, body)) = current.as_mut() {
+            current = Some((depot, rev, String::new()));
+        } else if let Some((_, _, body)) = current.as_mut() {
             body.push_str(line);
             body.push('\n');
         }
     }
-    if let Some((d, b)) = current.take() {
-        sections.push(DiffSection { depot: d, body: b });
+    if let Some((d, r, b)) = current.take() {
+        sections.push(DiffSection {
+            depot: d,
+            rev: r,
+            body: b,
+        });
     }
     sections
 }
 
-/// The depot path in a `==== ... ====` describe header, suffix- and tail-stripped.
-fn parse_diff_header(line: &str) -> Option<String> {
+/// The depot path and its `#rev`/`@rev` in a `==== ... ====` describe header, tail-stripped.
+fn parse_diff_header(line: &str) -> Option<(String, Option<String>)> {
     let inner = line.strip_prefix("==== ")?.strip_suffix(" ====")?;
     // inner is like `//depot/path#52 (binary+l)` or `//depot/path#5 - //client/path (text)`.
     let spec = inner.split_whitespace().next().unwrap_or(inner);
-    Some(strip_rev(spec).to_string())
+    Some((strip_rev(spec).to_string(), split_rev(spec)))
 }
 
 /// Strip a trailing `#rev` or `@rev` from a depot filespec. Depot paths from p4 are already
@@ -1563,6 +1577,11 @@ fn strip_rev(spec: &str) -> &str {
         Some(idx) => &spec[..idx],
         None => spec,
     }
+}
+
+/// The `#rev`/`@rev` suffix of a depot filespec, without the leading `#`/`@`, or `None`.
+fn split_rev(spec: &str) -> Option<String> {
+    spec.find(['#', '@']).map(|idx| spec[idx + 1..].to_string())
 }
 
 /// Whether an opened file's Perforce type marks it binary, independent of NUL sniffing.
@@ -1916,9 +1935,11 @@ Change 5 by u@c on 2026/01/01\n\n\
         let sections = parse_describe_diff(raw);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].depot, "//depot/text.rs");
+        assert_eq!(sections[0].rev.as_deref(), Some("3"));
         assert!(sections[0].body.contains("+b"));
         // A binary file gets a header with an empty body, not a dropped section.
         assert_eq!(sections[1].depot, "//depot/image.uasset");
+        assert_eq!(sections[1].rev.as_deref(), Some("52"));
         assert!(sections[1].body.trim().is_empty());
     }
 
@@ -1926,9 +1947,15 @@ Change 5 by u@c on 2026/01/01\n\n\
     fn diff_header_and_strip_rev_handle_revisions_and_encoded_names() {
         assert_eq!(
             parse_diff_header("==== //depot/a.rs#5 (text) ====").unwrap(),
-            "//depot/a.rs"
+            ("//depot/a.rs".to_string(), Some("5".to_string()))
         );
         assert_eq!(parse_diff_header("no header here"), None);
+        // The `@rev` form of the comparator is captured too.
+        assert_eq!(
+            split_rev("//depot/a@=99"),
+            Some("=99".to_string())
+        );
+        assert_eq!(split_rev("//depot/a"), None);
         assert_eq!(strip_rev("//depot/a#5"), "//depot/a");
         assert_eq!(strip_rev("//depot/a@=99"), "//depot/a");
         // A literal '#'/'@' in a name is %-encoded by p4, so an encoded path has no bare
