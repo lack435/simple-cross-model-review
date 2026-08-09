@@ -53,6 +53,25 @@ pub struct SessionRecord {
     /// this field, which is identity only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<u64>>,
+    /// The git commit (`HEAD`) this session's last turn captured, when the backend is git and
+    /// HEAD could be resolved.
+    ///
+    /// The next turn reviews only what changed since it (`<head_sha>..HEAD`) instead of the
+    /// whole configured range, so the reviewer -- which already holds the earlier full diff in
+    /// its resumed conversation -- is not re-sent a near-duplicate every turn. Advanced to the
+    /// latest captured HEAD on every turn, unlike `changes`, which is an invariant binding.
+    /// `None` for a Perforce session, a session recorded before this field existed, or a turn
+    /// where HEAD could not be resolved (no commits yet, detached, git unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// The resolved effective base of the range `head_sha` was captured under. The next turn
+    /// deltas against `head_sha` only when its own range resolves to this same base; otherwise
+    /// the base ref moved (or the mode changed) and a full capture is taken instead. Paired
+    /// with `head_sha`: the two advance together on a complete capture and are retained
+    /// together otherwise, so a `head` never sits beside a `base` from a different turn. `None`
+    /// for Perforce or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -70,6 +89,12 @@ pub struct TurnFacts<'a> {
     pub cumulative_usage: Option<crate::metrics::Usage>,
     /// The canonical Perforce changelist set this session is bound to, or `None` for git.
     pub changes: Option<Vec<u64>>,
+    /// The git HEAD this turn captured, so the next turn can review only what changed since
+    /// it, and the resolved effective base of the range it was captured under. Both `None`
+    /// together for Perforce, an unresolved HEAD, or a truncated capture; a resume only deltas
+    /// when it has both.
+    pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -123,6 +148,8 @@ impl SessionStore {
             cwd,
             cumulative_usage,
             changes,
+            head_sha,
+            base_sha,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -131,6 +158,25 @@ impl SessionStore {
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
         let mut store = self.read();
         let now = now_unix();
+
+        // The baseline is a (head, base) pair the next turn deltas from, so it advances as a
+        // unit: a turn that produced a complete pair replaces it; any incomplete one (a
+        // truncated capture, an unresolved HEAD, a Perforce turn) retains the prior pair intact
+        // rather than storing a half of one. The prior pair is only inherited from the *same*
+        // conversation -- a fresh or rebound reviewer session (a different `cli_session_id`
+        // under this name) never saw the old diff, so an incomplete first turn there must store
+        // nothing rather than a baseline the new reviewer cannot resume against.
+        let prior = store
+            .sessions
+            .get(name)
+            .filter(|p| p.cli_session_id == cli_session_id);
+        let (head_sha, base_sha) = match (&head_sha, &base_sha) {
+            (Some(_), Some(_)) => (head_sha, base_sha),
+            _ => (
+                prior.and_then(|p| p.head_sha.clone()),
+                prior.and_then(|p| p.base_sha.clone()),
+            ),
+        };
 
         let record = match store.sessions.get(name) {
             // Same underlying session: another turn on it. The changelist binding is
@@ -148,6 +194,10 @@ impl SessionStore {
                 cwd: cwd.to_string(),
                 cumulative_usage,
                 changes: changes.or(existing.changes.clone()),
+                // The (head, base) baseline was already resolved above as a unit -- this turn's
+                // complete pair, or the prior one retained -- so it is stored as-is here.
+                head_sha,
+                base_sha,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -161,6 +211,8 @@ impl SessionStore {
                 updated_unix: now,
                 cumulative_usage,
                 changes,
+                head_sha,
+                base_sha,
             },
         };
 
@@ -363,6 +415,8 @@ mod tests {
                     cwd: "C:\\repo",
                     cumulative_usage: None,
                     changes: None,
+                    head_sha: None,
+                    base_sha: None,
                 },
             )
             .expect("record turn")
@@ -421,6 +475,8 @@ mod tests {
             cwd: "C:\\repo",
             cumulative_usage: Some(usage),
             changes: None,
+            head_sha: None,
+            base_sha: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -442,6 +498,87 @@ mod tests {
     }
 
     #[test]
+    fn the_baseline_pair_advances_together_and_survives_an_incomplete_turn_intact() {
+        // The next resume deltas from a (head, base) pair, so it advances as a unit: a complete
+        // turn replaces it, an incomplete one (a truncated capture, an unresolved HEAD, a
+        // Perforce turn -- all arriving as a `None` half) retains the prior pair rather than
+        // erasing it or storing a head beside a base from a different turn.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |head: Option<&str>, base: Option<&str>| TurnFacts {
+            reviewer: "claude",
+            cli_session_id: "sid-1",
+            model: "claude-opus-4-8",
+            effort: "medium",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: head.map(str::to_string),
+            base_sha: base.map(str::to_string),
+        };
+        store
+            .record_turn("g", facts(Some("aaa1"), Some("base0")))
+            .expect("turn 1");
+        let rec = store.get("g").unwrap();
+        assert_eq!(rec.head_sha.as_deref(), Some("aaa1"));
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+        // A later complete turn advances both halves together.
+        store
+            .record_turn("g", facts(Some("bbb2"), Some("base0")))
+            .expect("turn 2");
+        let rec = store.get("g").unwrap();
+        assert_eq!(rec.head_sha.as_deref(), Some("bbb2"));
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+        // An incomplete turn (here a resolved HEAD but no base -- a partial pair) must not
+        // store half a baseline: the prior complete pair is retained intact.
+        store
+            .record_turn("g", facts(Some("ccc3"), None))
+            .expect("turn 3");
+        let rec = store.get("g").unwrap();
+        assert_eq!(
+            rec.head_sha.as_deref(),
+            Some("bbb2"),
+            "head retained, not ccc3"
+        );
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+    }
+
+    #[test]
+    fn a_rebound_session_does_not_inherit_the_prior_conversations_baseline() {
+        // A fresh review under an existing name is a different conversation. An incomplete
+        // first turn there -- a truncated capture, say -- must not resume against the old
+        // reviewer's baseline, which the new reviewer never saw. The prior pair is inherited
+        // only within the same `cli_session_id`.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |cli: &'static str, head: Option<&str>, base: Option<&str>| TurnFacts {
+            reviewer: "claude",
+            cli_session_id: cli,
+            model: "claude-opus-4-8",
+            effort: "medium",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: head.map(str::to_string),
+            base_sha: base.map(str::to_string),
+        };
+        // The old conversation establishes a complete baseline.
+        store
+            .record_turn("s", facts("old", Some("h1"), Some("b1")))
+            .expect("old turn");
+        // Rebound to a new conversation whose first turn is incomplete (e.g. truncated).
+        let rec = store
+            .record_turn("s", facts("new", Some("h2"), None))
+            .expect("rebound turn");
+        assert_eq!(rec.turns, 1, "a rebound restarts the turn count");
+        assert_eq!(rec.cli_session_id, "new");
+        assert!(
+            rec.head_sha.is_none() && rec.base_sha.is_none(),
+            "an incomplete first turn of a new conversation must not inherit the old baseline"
+        );
+    }
+
+    #[test]
     fn a_changelist_binding_persists_and_survives_a_none_turn() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
@@ -453,6 +590,8 @@ mod tests {
             cwd: "C:\\repo",
             cumulative_usage: None,
             changes,
+            head_sha: None,
+            base_sha: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))

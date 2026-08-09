@@ -156,6 +156,9 @@ pub fn capture(
             diff_truncated,
         }),
         warnings,
+        // Perforce has no git HEAD; the incremental-resume baseline is git-only.
+        head_sha: None,
+        base_sha: None,
     }
 }
 
