@@ -247,7 +247,7 @@ impl App {
             // Only carried on a genuine resume: `prior` is `None` for a fresh review
             // (fresh=true or a new session name), so the first turn always captures in full.
             prior_head: prior.as_ref().and_then(|record| record.head_sha.clone()),
-            prior_diff_spec: prior.as_ref().and_then(|record| record.diff_spec.clone()),
+            prior_base: prior.as_ref().and_then(|record| record.base_sha.clone()),
             cancel,
             _lease: Some(lease),
         };
@@ -705,7 +705,7 @@ struct Job {
     /// Perforce session, or a prior turn that could not resolve HEAD; the delta needs both, so
     /// a resume only reviews the delta when each is present and the spec still matches.
     prior_head: Option<String>,
-    prior_diff_spec: Option<String>,
+    prior_base: Option<String>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -713,12 +713,13 @@ struct Job {
 }
 
 /// The capture's outputs that `attempt` threads onward: the rendered change goes into the
-/// prompt, and the captured HEAD goes into the session record so the next resume can review
-/// only what changed since it. Bundled so the two travel together rather than as a pair of
+/// prompt, and the captured (HEAD, base) baseline goes into the session record so the next
+/// resume can review only what changed since it. Bundled so they travel together rather than as
 /// loose `Option<&str>` arguments that could be transposed.
 struct CaptureOutputs<'a> {
     change: Option<&'a str>,
     head_sha: Option<&'a str>,
+    base_sha: Option<&'a str>,
 }
 
 /// What the attempt that produced the outcome actually did, gathered for the usage record.
@@ -781,9 +782,9 @@ impl Job {
         }
         // The prior turn's baseline for the incremental-resume delta, assembled only when both
         // halves are present. The git backend decides from there whether the delta is safe
-        // (matching spec, ancestry); Perforce ignores it.
-        let resume_baseline = match (self.prior_head.as_deref(), self.prior_diff_spec.as_deref()) {
-            (Some(head), Some(diff_spec)) => Some(vcs::GitResumeBaseline { head, diff_spec }),
+        // (matching base, ancestry); Perforce ignores it.
+        let resume_baseline = match (self.prior_head.as_deref(), self.prior_base.as_deref()) {
+            (Some(head), Some(base)) => Some(vcs::GitResumeBaseline { head, base }),
             _ => None,
         };
         let capture = vcs::capture(
@@ -796,9 +797,11 @@ impl Job {
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
         let change = capture.change.as_ref().map(|c| c.rendered.clone());
-        // The HEAD this turn captured, recorded on the session so the next turn deltas against
-        // it. Git-only; `None` for Perforce or an unresolved HEAD.
+        // The (HEAD, base) baseline this turn captured, recorded on the session so the next
+        // turn can delta against it. Git-only; both `None` for Perforce, an unresolved HEAD, or
+        // a truncated capture.
         let head_sha = capture.head_sha.clone();
+        let base_sha = capture.base_sha.clone();
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -812,6 +815,7 @@ impl Job {
             CaptureOutputs {
                 change: change.as_deref(),
                 head_sha: head_sha.as_deref(),
+                base_sha: base_sha.as_deref(),
             },
             &capture_warnings,
             &mut facts.prompt_bytes,
@@ -935,7 +939,11 @@ impl Job {
         capture_warnings: &[String],
         prompt_bytes: &mut usize,
     ) -> Result<Outcome, Failure> {
-        let CaptureOutputs { change, head_sha } = captured;
+        let CaptureOutputs {
+            change,
+            head_sha,
+            base_sha,
+        } = captured;
         let preamble = if self.cfg.no_preamble {
             None
         } else {
@@ -1112,14 +1120,13 @@ impl Job {
                         // so a re-review naming the same changelists in another order resumes.
                         changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
                             .then(|| crate::changeset::canonical(&self.changes)),
-                        // The HEAD this turn captured, so the next resume reviews only what
-                        // changed since it, and the configured `--diff` it was captured under,
-                        // so that next turn only deltas when its own configuration still
-                        // matches. `None` for Perforce or an unresolved HEAD; the record pairs
-                        // them, keeping the spec only for a turn that resolved a HEAD.
+                        // The (HEAD, base) baseline this turn captured, so the next resume
+                        // reviews only what changed since it -- and only when its own range
+                        // still resolves to the same base. Both come from the capture, which
+                        // leaves them `None` (together) for Perforce, an unresolved HEAD, or a
+                        // truncated diff; the record then advances or retains them as a pair.
                         head_sha: head_sha.map(str::to_string),
-                        diff_spec: (self.cfg.vcs == crate::config::Vcs::Git)
-                            .then(|| self.cfg.diff.spec_key()),
+                        base_sha: base_sha.map(str::to_string),
                     },
                 ) {
                     Ok(_) => true,
@@ -1435,7 +1442,7 @@ mod tests {
             cumulative_usage: None,
             changes: None,
             head_sha: None,
-            diff_spec: None,
+            base_sha: None,
         }
     }
 

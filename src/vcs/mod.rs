@@ -65,6 +65,7 @@ fn git_capture(
         change,
         warnings: captured.warnings,
         head_sha: captured.head_sha,
+        base_sha: captured.base_sha,
     }
 }
 

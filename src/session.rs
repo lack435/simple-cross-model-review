@@ -64,14 +64,14 @@ pub struct SessionRecord {
     /// where HEAD could not be resolved (no commits yet, detached, git unavailable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
-    /// The `--diff` spec key `head_sha` was captured under, so a resume can tell whether the
-    /// server's diff configuration changed between turns. The next turn deltas against
-    /// `head_sha` only when its own spec matches this; otherwise the baseline reviewed a
-    /// different range (or a working-tree mode) and a full capture is taken instead. Paired
-    /// with `head_sha`, so it advances and is retained together with it. `None` for Perforce
-    /// or a record predating this field.
+    /// The resolved effective base of the range `head_sha` was captured under. The next turn
+    /// deltas against `head_sha` only when its own range resolves to this same base; otherwise
+    /// the base ref moved (or the mode changed) and a full capture is taken instead. Paired
+    /// with `head_sha`: the two advance together on a complete capture and are retained
+    /// together otherwise, so a `head` never sits beside a `base` from a different turn. `None`
+    /// for Perforce or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff_spec: Option<String>,
+    pub base_sha: Option<String>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -90,11 +90,11 @@ pub struct TurnFacts<'a> {
     /// The canonical Perforce changelist set this session is bound to, or `None` for git.
     pub changes: Option<Vec<u64>>,
     /// The git HEAD this turn captured, so the next turn can review only what changed since
-    /// it. `None` for Perforce or when HEAD could not be resolved.
+    /// it, and the resolved effective base of the range it was captured under. Both `None`
+    /// together for Perforce, an unresolved HEAD, or a truncated capture; a resume only deltas
+    /// when it has both.
     pub head_sha: Option<String>,
-    /// The `--diff` spec key `head_sha` was captured under, so a resume only deltas against it
-    /// when this turn's configuration matches. `None` for Perforce.
-    pub diff_spec: Option<String>,
+    pub base_sha: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -149,7 +149,7 @@ impl SessionStore {
             cumulative_usage,
             changes,
             head_sha,
-            diff_spec,
+            base_sha,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -158,6 +158,20 @@ impl SessionStore {
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
         let mut store = self.read();
         let now = now_unix();
+
+        // The baseline is a (head, base) pair the next turn deltas from, so it advances as a
+        // unit: a turn that produced a complete pair replaces it; any incomplete one (a
+        // truncated capture, an unresolved HEAD, a Perforce turn) retains the prior pair intact
+        // rather than storing a half of one. Computed against whatever this session already
+        // holds -- an existing record or, for a new session, nothing.
+        let prior = store.sessions.get(name);
+        let (head_sha, base_sha) = match (&head_sha, &base_sha) {
+            (Some(_), Some(_)) => (head_sha, base_sha),
+            _ => (
+                prior.and_then(|p| p.head_sha.clone()),
+                prior.and_then(|p| p.base_sha.clone()),
+            ),
+        };
 
         let record = match store.sessions.get(name) {
             // Same underlying session: another turn on it. The changelist binding is
@@ -175,17 +189,10 @@ impl SessionStore {
                 cwd: cwd.to_string(),
                 cumulative_usage,
                 changes: changes.or(existing.changes.clone()),
-                // Advance to this turn's HEAD so the next resume deltas against the latest
-                // reviewed commit. A turn that could not resolve HEAD keeps the prior value
-                // rather than erasing it: an older ancestor still yields a valid delta. The
-                // spec advances and is retained with it, so the pair always describes one
-                // capture rather than a HEAD from one turn beside a spec from another.
-                head_sha: head_sha.clone().or(existing.head_sha.clone()),
-                diff_spec: if head_sha.is_some() {
-                    diff_spec
-                } else {
-                    existing.diff_spec.clone()
-                },
+                // The (head, base) baseline was already resolved above as a unit -- this turn's
+                // complete pair, or the prior one retained -- so it is stored as-is here.
+                head_sha,
+                base_sha,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -200,7 +207,7 @@ impl SessionStore {
                 cumulative_usage,
                 changes,
                 head_sha,
-                diff_spec,
+                base_sha,
             },
         };
 
@@ -404,7 +411,7 @@ mod tests {
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
-                    diff_spec: None,
+                    base_sha: None,
                 },
             )
             .expect("record turn")
@@ -464,7 +471,7 @@ mod tests {
             cumulative_usage: Some(usage),
             changes: None,
             head_sha: None,
-            diff_spec: None,
+            base_sha: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -486,14 +493,14 @@ mod tests {
     }
 
     #[test]
-    fn a_head_sha_advances_each_turn_but_survives_a_turn_that_could_not_resolve_it() {
-        // The next resume deltas against the latest reviewed commit, so this must advance --
-        // unlike the changelist binding, which is invariant. But a transient failure to
-        // resolve HEAD must not erase the baseline, or that turn would silently force the
-        // following one back to a full capture.
+    fn the_baseline_pair_advances_together_and_survives_an_incomplete_turn_intact() {
+        // The next resume deltas from a (head, base) pair, so it advances as a unit: a complete
+        // turn replaces it, an incomplete one (a truncated capture, an unresolved HEAD, a
+        // Perforce turn -- all arriving as a `None` half) retains the prior pair rather than
+        // erasing it or storing a head beside a base from a different turn.
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
-        let facts = |head: Option<&str>, spec: Option<&str>| TurnFacts {
+        let facts = |head: Option<&str>, base: Option<&str>| TurnFacts {
             reviewer: "claude",
             cli_session_id: "sid-1",
             model: "claude-opus-4-8",
@@ -502,25 +509,33 @@ mod tests {
             cumulative_usage: None,
             changes: None,
             head_sha: head.map(str::to_string),
-            diff_spec: spec.map(str::to_string),
+            base_sha: base.map(str::to_string),
         };
         store
-            .record_turn("g", facts(Some("aaa1"), Some("main...HEAD")))
+            .record_turn("g", facts(Some("aaa1"), Some("base0")))
             .expect("turn 1");
         let rec = store.get("g").unwrap();
         assert_eq!(rec.head_sha.as_deref(), Some("aaa1"));
-        assert_eq!(rec.diff_spec.as_deref(), Some("main...HEAD"));
-        // A later turn advances the HEAD and its spec together.
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+        // A later complete turn advances both halves together.
         store
-            .record_turn("g", facts(Some("bbb2"), Some("main...HEAD")))
+            .record_turn("g", facts(Some("bbb2"), Some("base0")))
             .expect("turn 2");
-        assert_eq!(store.get("g").unwrap().head_sha.as_deref(), Some("bbb2"));
-        // A turn that could not resolve HEAD keeps the prior pair rather than erasing it, and
-        // keeps them consistent -- the retained spec still describes the retained HEAD.
-        store.record_turn("g", facts(None, None)).expect("turn 3");
         let rec = store.get("g").unwrap();
         assert_eq!(rec.head_sha.as_deref(), Some("bbb2"));
-        assert_eq!(rec.diff_spec.as_deref(), Some("main...HEAD"));
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
+        // An incomplete turn (here a resolved HEAD but no base -- a partial pair) must not
+        // store half a baseline: the prior complete pair is retained intact.
+        store
+            .record_turn("g", facts(Some("ccc3"), None))
+            .expect("turn 3");
+        let rec = store.get("g").unwrap();
+        assert_eq!(
+            rec.head_sha.as_deref(),
+            Some("bbb2"),
+            "head retained, not ccc3"
+        );
+        assert_eq!(rec.base_sha.as_deref(), Some("base0"));
     }
 
     #[test]
@@ -536,7 +551,7 @@ mod tests {
             cumulative_usage: None,
             changes,
             head_sha: None,
-            diff_spec: None,
+            base_sha: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
