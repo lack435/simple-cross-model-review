@@ -2288,7 +2288,9 @@ fn is_text_base_type(ptype: &str) -> bool {
     let base = ptype.split('+').next().unwrap_or(ptype).trim();
     matches!(
         base,
-        "text" | "xtext" | "ktext" | "kxtext" | "ltext" | "unicode" | "utf8"
+        // `ctext`/`cxtext` are compressed-storage text -- the content is still text and diffs
+        // cleanly, so they belong here alongside the executable/keyword legacy spellings.
+        "text" | "xtext" | "ktext" | "kxtext" | "ltext" | "ctext" | "cxtext" | "unicode" | "utf8"
     )
 }
 
@@ -2735,7 +2737,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         // Known text base types diff cleanly, including the legacy combined spellings and any
         // `+modifiers`.
         for t in [
-            "text", "text+w", "text+k", "xtext", "ktext", "kxtext", "ltext", "unicode", "utf8",
+            "text", "text+w", "text+k", "xtext", "ktext", "kxtext", "ltext", "ctext", "cxtext",
+            "unicode", "utf8",
         ] {
             assert!(is_text_base_type(t), "{t} should be diffable text");
         }
