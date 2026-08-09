@@ -1,8 +1,32 @@
 # Perforce resume delta — design
 
-Status: **proposal, not yet implemented.** This document is the plan under review; nothing
-in the code implements it yet. It has been through four rounds of cross-model review (see
-[Review history](#review-history)).
+Status: **implemented** (see [Implementation status](#implementation-status)). This document
+was the plan; it went through five rounds of cross-model review (see
+[Review history](#review-history)) before implementation.
+
+## Implementation status
+
+The engine is built and lives in `src/digest.rs`, `src/vcs/baseline.rs`, `src/vcs/perforce.rs`,
+`src/session.rs`, `src/vcs/mod.rs`, `src/reviewer/mod.rs`, `src/config.rs` and `src/tools.rs`.
+Everything above is implemented as specified, with two deliberate **conservatisms** that are
+safe (they only ever *disable* elision, never elide wrongly) and are candidate follow-ups:
+
+- **`Full` is gated on whole-segment completeness.** A changelist records a `Full` baseline
+  only when every segment is `complete` — no per-file omission at all. So a changelist that
+  contains an out-of-root, binary, or deleted file (a per-file omission) records `Disabled` and
+  will not elide next turn, even though its *other* files are perfectly elidable. The design's
+  finer "complete inventory vs complete unit" split (invariant 4) would let those files collapse;
+  the implementation takes the stricter line for now. This is the main saving left on the table
+  for mixed changelists.
+- **The authoritative shelf ledger (`describe -s -S`, invariant 4) is not yet added.** The
+  shelved path still derives its file set from the `-du` diff sections. Because any shelved
+  omission or truncation forces `Disabled` under the conservatism above, this cannot cause an
+  incorrect elision — a shelf only elides when it captured cleanly — but the cross-check is a
+  planned hardening.
+
+Not yet done: the live `smoke.ps1` round trip against a real Perforce server (needs a server;
+the gated `live_capture_against_a_real_changelist` unit test covers the capture path when
+`CROSS_REVIEW_P4_TEST_*` are set), and the cross-review merge gate on the implementation diff.
 
 ## Problem
 
