@@ -720,6 +720,11 @@ struct CaptureOutputs<'a> {
     change: Option<&'a str>,
     head_sha: Option<&'a str>,
     base_sha: Option<&'a str>,
+    /// The Perforce capture identity and resume-delta baseline this turn produced, recorded on
+    /// the session so the next resume knows what capture it may collapse against. Both `None`
+    /// for git.
+    capture_identity: Option<&'a crate::vcs::baseline::CaptureIdentity>,
+    perforce_baseline: Option<&'a crate::vcs::baseline::PerforceBaseline>,
 }
 
 /// What the attempt that produced the outcome actually did, gathered for the usage record.
@@ -802,6 +807,10 @@ impl Job {
         // a truncated capture.
         let head_sha = capture.head_sha.clone();
         let base_sha = capture.base_sha.clone();
+        // The Perforce capture identity and resume-delta baseline this turn produced. Both
+        // `None` for git; recorded on the session so the next resume can collapse against them.
+        let capture_identity = capture.capture_identity.clone();
+        let perforce_baseline = capture.perforce_baseline.clone();
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -816,6 +825,8 @@ impl Job {
                 change: change.as_deref(),
                 head_sha: head_sha.as_deref(),
                 base_sha: base_sha.as_deref(),
+                capture_identity: capture_identity.as_ref(),
+                perforce_baseline: perforce_baseline.as_ref(),
             },
             &capture_warnings,
             &mut facts.prompt_bytes,
@@ -943,6 +954,8 @@ impl Job {
             change,
             head_sha,
             base_sha,
+            capture_identity,
+            perforce_baseline,
         } = captured;
         let preamble = if self.cfg.no_preamble {
             None
@@ -1128,14 +1141,13 @@ impl Job {
                         head_sha: head_sha.map(str::to_string),
                         base_sha: base_sha.map(str::to_string),
                         // The Perforce resume-delta binding and baseline. `backend` and the
-                        // shelved flag are known from config; the capture identity and the
-                        // per-file baseline come from the Perforce capture, which does not
-                        // produce them yet, so they are `None` (no elision) for now.
+                        // shelved flag are known from config; the capture identity and per-file
+                        // baseline come from the capture (both `None` for git).
                         backend: Some(self.cfg.vcs.backend_id()),
                         include_shelved: (self.cfg.vcs == crate::config::Vcs::Perforce)
                             .then_some(self.include_shelved),
-                        capture_identity: None,
-                        perforce_baseline: None,
+                        capture_identity: capture_identity.cloned(),
+                        perforce_baseline: perforce_baseline.cloned(),
                     },
                 ) {
                     Ok(_) => true,

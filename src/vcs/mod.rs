@@ -67,6 +67,9 @@ fn git_capture(
         warnings: captured.warnings,
         head_sha: captured.head_sha,
         base_sha: captured.base_sha,
+        // The Perforce delta baseline and capture identity are git-irrelevant.
+        capture_identity: None,
+        perforce_baseline: None,
     }
 }
 

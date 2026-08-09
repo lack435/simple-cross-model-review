@@ -43,6 +43,7 @@ use super::shared::{
     MAX_UNTRACKED_FILES, MAX_UNTRACKED_TOTAL_BYTES,
 };
 use crate::config::Config;
+use crate::digest::Fingerprint;
 use crate::reviewer::{self, RunOutcome};
 
 /// Cap on a single changelist description put in the prompt. Descriptions are
@@ -90,6 +91,11 @@ pub fn capture(
     };
     // Every command from here runs as this client (global `-c`, injected in `run`).
     p4.client = Some(info.client.clone());
+
+    // The capture identity binds the resume delta: the server, client, charset and client-spec
+    // digest this turn ran under. Resolved once, up front, so it describes the same client every
+    // command below uses.
+    let identity = resolve_capture_identity(&p4, &info);
 
     let mut budget = Budget::new();
     let mut segments = Vec::new();
@@ -155,6 +161,23 @@ pub fn capture(
         ));
     }
 
+    // This turn's baseline for the *next* resume. Conservatively `Full` only when the whole
+    // capture is trustworthy: the client spec was confirmed, no changelist was skipped, and
+    // every segment is complete (so its file list is whole and every unit was fully shown). Any
+    // shortfall records `Disabled`, so the next turn re-captures in full rather than eliding
+    // against a set that might be missing files or hunks.
+    let capture_complete = identity.client_spec_digest.is_some()
+        && skipped.is_empty()
+        && segments.iter().all(|s| s.complete);
+    let perforce_baseline = Some(if capture_complete {
+        baseline::PerforceBaseline::Full {
+            schema: baseline::INVENTORY_SCHEMA,
+            entries: inventory(&segments),
+        }
+    } else {
+        baseline::PerforceBaseline::Disabled
+    });
+
     Capture {
         change: Some(CapturedChange {
             rendered,
@@ -162,9 +185,11 @@ pub fn capture(
             diff_truncated,
         }),
         warnings,
-        // Perforce has no git HEAD; the incremental-resume baseline is git-only.
+        // Perforce has no git HEAD; the git incremental-resume baseline is git-only.
         head_sha: None,
         base_sha: None,
+        capture_identity: Some(identity),
+        perforce_baseline,
     }
 }
 
@@ -316,6 +341,91 @@ impl Unit {
             body,
             complete,
         }
+    }
+}
+
+/// The stable tag for a basis in a fingerprint input. Explicit strings, not `Debug`, so the
+/// persisted fingerprint does not change if the enum's `Debug` spelling ever does.
+fn basis_tag(basis: baseline::Basis) -> &'static str {
+    match basis {
+        baseline::Basis::Workspace => "workspace",
+        baseline::Basis::Shelved => "shelved",
+        baseline::Basis::Submitted => "submitted",
+    }
+}
+
+fn kind_tag(kind: baseline::UnitKind) -> &'static str {
+    match kind {
+        baseline::UnitKind::TextDiff => "text-diff",
+        baseline::UnitKind::AddBody => "add-body",
+        baseline::UnitKind::Note => "note",
+    }
+}
+
+/// The collision-resistant fingerprint of a unit's evidence, over a domain-separated canonical
+/// input: the identity fields (so two units cannot collide across files, bases, kinds or
+/// comparators) followed by the exact shown body. `None` when the digest is unavailable, which
+/// the caller treats as non-elidable.
+fn unit_fingerprint(change: u64, basis: baseline::Basis, unit: &Unit) -> Option<Fingerprint> {
+    let mut input = Vec::new();
+    input.extend_from_slice(
+        format!(
+            "cross-review/pf-unit/v{}\n{change}\n{}\n{}\n{}\n{}\n",
+            baseline::INVENTORY_SCHEMA,
+            basis_tag(basis),
+            kind_tag(unit.kind),
+            unit.depot,
+            unit.comparator,
+        )
+        .as_bytes(),
+    );
+    input.extend_from_slice(unit.body.as_bytes());
+    Fingerprint::of(&input)
+}
+
+/// This turn's inventory: one entry per fully-shown elidable unit, carrying the fingerprint the
+/// next turn compares against. Only complete units are included; a unit whose digest could not
+/// be produced is left out (its absence next turn simply means "not elidable"). Built only when
+/// the capture is complete enough to store a `Full` baseline, so every unit here is complete.
+fn inventory(segments: &[Segment]) -> Vec<baseline::InventoryEntry> {
+    let mut entries = Vec::new();
+    for seg in segments {
+        let basis = seg.basis.persisted();
+        for unit in &seg.units {
+            if !unit.complete {
+                continue;
+            }
+            let Some(fingerprint) = unit_fingerprint(seg.change, basis, unit) else {
+                continue;
+            };
+            entries.push(baseline::InventoryEntry {
+                change: seg.change,
+                basis,
+                kind: unit.kind,
+                depot: unit.depot.clone(),
+                comparator: unit.comparator.clone(),
+                fingerprint: Some(fingerprint),
+            });
+        }
+    }
+    entries
+}
+
+/// Resolve the capture identity a resume binds to: the server, client, charset, and a digest of
+/// the canonical client spec (which folds in the view, root and `AltRoots`). The spec digest is
+/// `None` when `p4 client -o` fails or decodes lossily, which makes the identity unconfirmed and
+/// disables elision rather than eliding under a mapping we could not verify.
+fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
+    let client_spec_digest = p4
+        .run(&["client", "-o", &info.client], "")
+        .filter(|out| out.success && !out.stdout_lossy)
+        .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
+        .map(|fp| fp.sha256);
+    baseline::CaptureIdentity {
+        server: info.server.clone(),
+        client: info.client.clone(),
+        charset: std::env::var("P4CHARSET").unwrap_or_default(),
+        client_spec_digest,
     }
 }
 
@@ -1303,6 +1413,9 @@ struct Info {
     /// This machine's Perforce host name, from `p4 info`'s `clientHost`. Used to match
     /// host-locked client specs when deriving the client.
     host: String,
+    /// The server address (`p4 info`'s `serverAddress`), part of the resume capture identity so
+    /// a session pointed at a different server never elides against the wrong one.
+    server: String,
 }
 
 impl Info {
@@ -1374,6 +1487,7 @@ fn resolve_workspace(p4: &P4, cwd: &Path) -> Result<Info, String> {
             root: spec.root,
             user: info.user,
             host: info.host,
+            server: info.server,
         }),
         ClientChoice::None => Err(format!(
             "no Perforce client for {} on host '{}' (user {}): none of the user's clients has a \
@@ -1506,12 +1620,14 @@ fn parse_info(raw: &str) -> Info {
     let mut root = String::new();
     let mut user = String::new();
     let mut host = String::new();
+    let mut server = String::new();
     for (k, v) in tag_lines(&text) {
         match k {
             "clientName" if v != "*unknown*" => client = v.to_string(),
             "clientRoot" => root = v.to_string(),
             "userName" => user = v.to_string(),
             "clientHost" => host = v.to_string(),
+            "serverAddress" => server = v.to_string(),
             _ => {}
         }
     }
@@ -1520,6 +1636,7 @@ fn parse_info(raw: &str) -> Info {
         root,
         user,
         host,
+        server,
     }
 }
 
@@ -2183,6 +2300,96 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn unit_fingerprint_is_deterministic_and_identity_sensitive() {
+        let base = Unit::text_diff(
+            "//depot/a".into(),
+            Some("3".into()),
+            "a".into(),
+            "hunk".into(),
+            true,
+        );
+        let fp = |c: u64, b: baseline::Basis, u: &Unit| unit_fingerprint(c, b, u);
+        // Same inputs -> same fingerprint; that is what makes an unchanged unit collapse.
+        assert_eq!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(1, baseline::Basis::Workspace, &base)
+        );
+        // Every identity field moves it: change, basis, depot, comparator, body.
+        assert_ne!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(2, baseline::Basis::Workspace, &base)
+        );
+        assert_ne!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(1, baseline::Basis::Submitted, &base)
+        );
+        let other_rev = Unit::text_diff(
+            "//depot/a".into(),
+            Some("4".into()),
+            "a".into(),
+            "hunk".into(),
+            true,
+        );
+        assert_ne!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(1, baseline::Basis::Workspace, &other_rev)
+        );
+        let other_body = Unit::text_diff(
+            "//depot/a".into(),
+            Some("3".into()),
+            "a".into(),
+            "HUNK".into(),
+            true,
+        );
+        assert_ne!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(1, baseline::Basis::Workspace, &other_body)
+        );
+        // An add body with the same text is a different unit from a diff with that text.
+        let add = Unit::add_body("//depot/a".into(), "a".into(), "hunk".into(), true);
+        assert_ne!(
+            fp(1, baseline::Basis::Workspace, &base),
+            fp(1, baseline::Basis::Workspace, &add)
+        );
+    }
+
+    #[test]
+    fn inventory_includes_only_complete_units_with_fingerprints() {
+        let seg = Segment {
+            change: 42,
+            basis: DiffBasis::Workspace,
+            complete: true,
+            incomplete_reason: None,
+            description: String::new(),
+            listing: String::new(),
+            units: vec![
+                Unit::text_diff(
+                    "//depot/a".into(),
+                    Some("3".into()),
+                    "a".into(),
+                    "x".into(),
+                    true,
+                ),
+                // An incomplete unit (budget-cut) must not enter the inventory.
+                Unit::text_diff(
+                    "//depot/b".into(),
+                    Some("2".into()),
+                    "b".into(),
+                    "y".into(),
+                    false,
+                ),
+            ],
+            present_depots: vec!["//depot/a".into(), "//depot/b".into()],
+            diff_truncated: false,
+            omissions: Vec::new(),
+        };
+        let inv = inventory(&[seg]);
+        assert_eq!(inv.len(), 1, "only the complete unit is fingerprinted");
+        assert_eq!(inv[0].depot, "//depot/a");
+        assert!(inv[0].fingerprint.is_some());
+    }
+
+    #[test]
     fn description_is_capped() {
         let long = "x".repeat(MAX_DESC_BYTES + 500);
         let capped = cap_desc(&long);
@@ -2227,6 +2434,7 @@ Change 5 by u@c on 2026/01/01\n\n\
             root: "C:\\dev\\main\\UE".into(),
             user: "dwellman".into(),
             host: "W680".into(),
+            server: "ssl:perforce:1666".into(),
         };
         let captured: Vec<u64> = segments.iter().map(|s| s.change).collect();
         render(&cfg, &info, &[43650, 43651], &captured, skipped, segments)
