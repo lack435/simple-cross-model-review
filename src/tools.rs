@@ -248,6 +248,13 @@ impl App {
             // (fresh=true or a new session name), so the first turn always captures in full.
             prior_head: prior.as_ref().and_then(|record| record.head_sha.clone()),
             prior_base: prior.as_ref().and_then(|record| record.base_sha.clone()),
+            prior_perforce_baseline: prior
+                .as_ref()
+                .and_then(|record| record.perforce_baseline.clone()),
+            prior_capture_identity: prior
+                .as_ref()
+                .and_then(|record| record.capture_identity.clone()),
+            prior_include_shelved: prior.as_ref().and_then(|record| record.include_shelved),
             cancel,
             _lease: Some(lease),
         };
@@ -706,6 +713,12 @@ struct Job {
     /// a resume only reviews the delta when each is present and the spec still matches.
     prior_head: Option<String>,
     prior_base: Option<String>,
+    /// The previous Perforce turn's resume-delta baseline, capture identity and shelved-capture
+    /// mode, for collapsing unchanged files. All `None` on a fresh review or a git session; the
+    /// delta needs the baseline and the identity, and only collapses when the mode still matches.
+    prior_perforce_baseline: Option<crate::vcs::baseline::PerforceBaseline>,
+    prior_capture_identity: Option<crate::vcs::baseline::CaptureIdentity>,
+    prior_include_shelved: Option<bool>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -785,18 +798,33 @@ impl Job {
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
-        // The prior turn's baseline for the incremental-resume delta, assembled only when both
-        // halves are present. The git backend decides from there whether the delta is safe
-        // (matching base, ancestry); Perforce ignores it.
-        let resume_baseline = match (self.prior_head.as_deref(), self.prior_base.as_deref()) {
-            (Some(head), Some(base)) => Some(vcs::GitResumeBaseline { head, base }),
-            _ => None,
+        // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
+        // needs both HEAD and base; Perforce needs its stored inventory. The backend decides from
+        // there whether the delta is safe (git: matching base and ancestry; Perforce: matching
+        // identity, mode and per-file fingerprint). A git session never carries a Perforce
+        // baseline and vice versa, so at most one arm is `Some`.
+        let resume = match self.cfg.vcs {
+            crate::config::Vcs::Git => {
+                match (self.prior_head.as_deref(), self.prior_base.as_deref()) {
+                    (Some(head), Some(base)) => {
+                        Some(vcs::Resume::Git(vcs::GitResumeBaseline { head, base }))
+                    }
+                    _ => None,
+                }
+            }
+            crate::config::Vcs::Perforce => self.prior_perforce_baseline.as_ref().map(|baseline| {
+                vcs::Resume::Perforce(vcs::perforce::PerforceResume {
+                    baseline,
+                    identity: self.prior_capture_identity.as_ref(),
+                    include_shelved: self.prior_include_shelved,
+                })
+            }),
         };
         let capture = vcs::capture(
             &self.cfg,
             &self.changes,
             self.include_shelved,
-            resume_baseline,
+            resume,
             &self.cancel,
         );
         // The backend has already rendered the change into the prompt string; clone it out
@@ -1155,11 +1183,29 @@ impl Job {
                         // The review itself succeeded; losing resumability is worth a
                         // warning but not worth discarding the review.
                         eprintln!("cross-review: warning: could not save session state: {e}");
-                        warnings.push(format!(
-                            "This turn could not be saved to disk ({e}), so session '{}' may not \
-                             resume correctly. The review below is unaffected.",
-                            self.session
-                        ));
+                        // Fail-closed for Perforce: the review was delivered, but the persisted
+                        // record is still the *prior* turn's, so its stored inventory is now stale
+                        // relative to what the reviewer just saw. A later resume that collapsed
+                        // files against it would hide this turn's changes -- so poison the session
+                        // by dropping the mapping, forcing the next call to start fresh rather than
+                        // resume a superseded baseline. Git's delta is ancestry-checked and has no
+                        // equivalent hazard.
+                        if self.cfg.vcs == crate::config::Vcs::Perforce {
+                            self.sessions.forget(&self.session).ok();
+                            warnings.push(format!(
+                                "This turn could not be saved to disk ({e}). To stop a later \
+                                 review from collapsing files against a stale baseline, session \
+                                 '{}' has been reset -- a follow-up call will start a fresh \
+                                 review. The review below is unaffected.",
+                                self.session
+                            ));
+                        } else {
+                            warnings.push(format!(
+                                "This turn could not be saved to disk ({e}), so session '{}' may \
+                                 not resume correctly. The review below is unaffected.",
+                                self.session
+                            ));
+                        }
                         false
                     }
                 }
@@ -1237,6 +1283,22 @@ fn resume_block(
             "it was created against working root '{}', but this server is now working in '{}'.",
             record.cwd, cwd
         ));
+    }
+
+    // A session belongs to the capture backend that created it. A git record must never satisfy
+    // the Perforce binding logic (a git record carries no `changes`, which would otherwise read
+    // as "unbound"), nor a Perforce record be resumed under git. `None` is a record written
+    // before the backend field existed -- treated as unknown and allowed, since the other
+    // identity checks still gate it.
+    if let Some(backend) = &record.backend {
+        if backend != cfg.vcs.backend_id() {
+            return Some(format!(
+                "it was created by the {} backend, but this server is now configured for {}, and \
+                 a session cannot move between capture backends.",
+                backend,
+                cfg.vcs.backend_id()
+            ));
+        }
     }
 
     // A Perforce session follows one changelist set. A resume that names a different set is
@@ -1544,6 +1606,33 @@ mod tests {
         let mut cased = record_matching(&cfg, 1, now);
         cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
         assert!(resume_block(&cfg, &cased, &[], now).is_none());
+    }
+
+    #[test]
+    fn a_session_cannot_be_resumed_under_a_different_backend() {
+        // A git record must never satisfy the Perforce binding logic (it carries no `changes`,
+        // which would otherwise read as "unbound"), and vice versa.
+        let git = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("git cfg");
+        let p4 = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--vcs".into(),
+            "perforce".into(),
+        ])
+        .expect("p4 cfg");
+        let now = 1_000_000;
+
+        let mut git_record = record_matching(&git, 1, now);
+        git_record.backend = Some("git".into());
+        assert!(resume_block(&p4, &git_record, &[42], now)
+            .expect("refused")
+            .contains("backend"));
+
+        let mut p4_record = record_matching(&p4, 1, now);
+        p4_record.backend = Some("perforce".into());
+        assert!(resume_block(&git, &p4_record, &[], now)
+            .expect("refused")
+            .contains("backend"));
     }
 
     #[test]

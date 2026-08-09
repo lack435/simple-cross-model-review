@@ -35,15 +35,35 @@ pub fn capture(
     cfg: &Config,
     changes: &[u64],
     include_shelved: bool,
-    resume: Option<GitResumeBaseline<'_>>,
+    resume: Option<Resume<'_>>,
     cancel: &AtomicBool,
 ) -> Capture {
     match cfg.vcs {
-        Vcs::Git => git_capture(cfg, resume, cancel),
-        // Perforce ignores `resume`: a pending changelist mutates in place, so there is no
-        // prior revision to delta against, and it re-captures the current contents each turn.
-        Vcs::Perforce => perforce::capture(cfg, changes, include_shelved, cancel),
+        // Each backend consumes only its own resume shape; the other variant (or `None`) means a
+        // full capture. A mismatched variant cannot arrive -- `tools.rs` builds the resume from
+        // the same backend it is about to capture with -- but is treated as "no resume" anyway.
+        Vcs::Git => {
+            let git = match resume {
+                Some(Resume::Git(g)) => Some(g),
+                _ => None,
+            };
+            git_capture(cfg, git, cancel)
+        }
+        Vcs::Perforce => {
+            let pf = match resume {
+                Some(Resume::Perforce(p)) => Some(p),
+                _ => None,
+            };
+            perforce::capture(cfg, changes, include_shelved, pf, cancel)
+        }
     }
+}
+
+/// The prior turn's baseline, tagged by backend. Assembled by `tools.rs` from the session record
+/// and handed to [`capture`], which routes each variant to the backend that understands it.
+pub enum Resume<'a> {
+    Git(GitResumeBaseline<'a>),
+    Perforce(perforce::PerforceResume<'a>),
 }
 
 /// Adapt the git backend's internal `Change` into the unified [`CapturedChange`].
