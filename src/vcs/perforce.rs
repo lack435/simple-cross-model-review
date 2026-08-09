@@ -36,6 +36,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use super::baseline;
 use super::shared::{
     evidence_preamble, push_fenced, read_cap, read_capped, safe_label, truncate, Capture,
     CapturedChange, Omissions, CAPTURE_BUDGET, MAX_DIFF_BYTES, MAX_UNTRACKED_EXAMINED,
@@ -123,7 +124,12 @@ pub fn capture(
     }
 
     let rendered = render(cfg, &info, changes, &captured, &skipped, &segments);
-    let diff_bytes = segments.iter().map(|s| s.diff.len()).sum();
+    let diff_bytes = segments
+        .iter()
+        .flat_map(|s| &s.units)
+        .filter(|u| u.kind == baseline::UnitKind::TextDiff)
+        .map(|u| u.body.len())
+        .sum();
     let diff_truncated = budget.diff_truncated;
 
     // Skipped changelists are a bound on the evidence the caller is reading, so they are
@@ -223,13 +229,18 @@ struct Segment {
     description: String,
     /// The affected-file listing (`action  depotFile  (local)` lines).
     listing: String,
-    /// The unified diff text (already drawn from the global budget).
-    diff: String,
+    /// The addressable evidence units -- one per file with a textual diff or an added-file
+    /// body. These are what the resume delta fingerprints, collapses and re-renders; on a full
+    /// capture the renderer simply shows them all.
+    units: Vec<Unit>,
+    /// Every depot path this changelist touched this turn, whatever became of its evidence
+    /// (diffed, binary, deleted, out-of-root). Not rendered; used by the delta to tell a file
+    /// that left the changelist ("removed") from one that is still present but no longer has a
+    /// diff ("restored to its depot revision").
+    present_depots: Vec<String>,
     /// Whether this changelist's diff was cut short by the combined-diff budget, so the
     /// render says so where the diff is shown, not only in the caller's warnings.
     diff_truncated: bool,
-    /// Contents of files opened for add.
-    added: Vec<AddedFile>,
     /// Per-file omission notes (out-of-root, binary, unreadable, unmapped, ...).
     omissions: Vec<String>,
 }
@@ -244,11 +255,68 @@ enum DiffBasis {
     Shelved,
 }
 
-struct AddedFile {
+impl DiffBasis {
+    /// The persisted [`baseline::Basis`] this maps to (the resume delta does not distinguish a
+    /// pending workspace diff from a foreign pending changelist's listing; both are `Workspace`).
+    fn persisted(self) -> baseline::Basis {
+        match self {
+            DiffBasis::Workspace => baseline::Basis::Workspace,
+            DiffBasis::ServerRevision => baseline::Basis::Submitted,
+            DiffBasis::Shelved => baseline::Basis::Shelved,
+        }
+    }
+}
+
+/// One addressable piece of a changelist's evidence: a file's textual diff hunk, or a pending
+/// added file's body. The unit the resume delta fingerprints, collapses and re-renders.
+struct Unit {
     depot: String,
+    kind: baseline::UnitKind,
+    /// The comparator the evidence was taken against: a depot revision for a diff, or the
+    /// [`baseline::NO_DEPOT_BASE`] sentinel for an add. Part of the unit's identity and folded
+    /// into its fingerprint, so a base-revision change alone breaks a match.
+    comparator: String,
+    /// A working-root-relative label for the unit's heading, or the depot path when unmapped.
     local: String,
+    /// The exact body shown to the reviewer -- a diff hunk, or an added file's contents --
+    /// rendered inside a fence. Fingerprinted together with the identity fields.
     body: String,
-    truncated: bool,
+    /// Whether the body was shown completely: not cut by the diff budget, not from truncated
+    /// command output, not lossy-decoded. Only a complete unit may seed or match an elision
+    /// baseline; an incomplete one is always re-shown.
+    complete: bool,
+}
+
+impl Unit {
+    /// A text-diff unit for `depot` at comparator `rev`, holding the hunk `body`.
+    fn text_diff(
+        depot: String,
+        rev: Option<String>,
+        local: String,
+        body: String,
+        complete: bool,
+    ) -> Self {
+        Self {
+            depot,
+            kind: baseline::UnitKind::TextDiff,
+            comparator: rev.unwrap_or_default(),
+            local,
+            body,
+            complete,
+        }
+    }
+
+    /// An added-file body unit, whose comparator is the no-depot-base sentinel.
+    fn add_body(depot: String, local: String, body: String, complete: bool) -> Self {
+        Self {
+            depot,
+            kind: baseline::UnitKind::AddBody,
+            comparator: baseline::NO_DEPOT_BASE.to_string(),
+            local,
+            body,
+            complete,
+        }
+    }
 }
 
 impl<'a> P4<'a> {
@@ -298,9 +366,9 @@ impl<'a> P4<'a> {
                 ),
                 description,
                 listing: String::new(),
-                diff: String::new(),
+                units: Vec::new(),
+                present_depots: Vec::new(),
                 diff_truncated: false,
-                added: Vec::new(),
                 omissions: truncation_notes(meta.truncated, false, false),
             });
         }
@@ -322,7 +390,8 @@ impl<'a> P4<'a> {
         let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
 
         let mut listing = String::new();
-        let mut diff = String::new();
+        let mut units = Vec::new();
+        let mut present_depots = Vec::new();
         let mut omissions = Vec::new();
         let mut complete = true;
         let mut diff_truncated = false;
@@ -340,6 +409,7 @@ impl<'a> P4<'a> {
             sections.iter().map(|s| (s.depot.as_str(), s)).collect();
 
         for file in &meta.files {
+            present_depots.push(file.depot.clone());
             let local = wheres.get(file.depot.as_str());
             let in_root = match local {
                 Some(WhereResult::Mapped(path)) => within_root(path, self.cwd),
@@ -368,15 +438,20 @@ impl<'a> P4<'a> {
 
             match section_by_depot.get(file.depot.as_str()) {
                 Some(section) if !section.body.trim().is_empty() => {
-                    let (piece, cut) = budget.take_diff(format!(
-                        "==== {} ({}) ====\n{}\n",
-                        file.depot, file.action, section.body
-                    ));
-                    diff.push_str(&piece);
+                    // The submitted diff's `#N` is the changed revision -- immutable, so it
+                    // fully identifies this unit for a resume.
+                    let (hunk, cut) = budget.take_diff(section.body.clone());
                     if cut {
                         diff_truncated = true;
                         complete = false;
                     }
+                    units.push(Unit::text_diff(
+                        file.depot.clone(),
+                        section.rev.clone(),
+                        local_label,
+                        hunk,
+                        !cut,
+                    ));
                 }
                 _ => {
                     // No textual hunk: binary, empty, or a pure add/delete describe records
@@ -423,9 +498,9 @@ impl<'a> P4<'a> {
             incomplete_reason,
             description,
             listing,
-            diff,
+            units,
+            present_depots,
             diff_truncated,
-            added: Vec::new(),
             omissions,
         })
     }
@@ -466,9 +541,9 @@ impl<'a> P4<'a> {
                 )),
                 description,
                 listing,
-                diff: String::new(),
+                units: Vec::new(),
+                present_depots: meta.files.iter().map(|f| f.depot.clone()).collect(),
                 diff_truncated: false,
-                added: Vec::new(),
                 omissions: truncation_notes(meta.truncated, false, false),
             });
         }
@@ -504,9 +579,9 @@ impl<'a> P4<'a> {
                 ),
                 description,
                 listing,
-                diff: String::new(),
+                units: Vec::new(),
+                present_depots: meta.files.iter().map(|f| f.depot.clone()).collect(),
                 diff_truncated: false,
-                added: Vec::new(),
                 omissions: truncation_notes(meta.truncated, opened_truncated, false),
             });
         }
@@ -517,7 +592,11 @@ impl<'a> P4<'a> {
 
         let mut listing = String::new();
         let mut omissions = Vec::new();
+        let mut units = Vec::new();
+        let mut present_depots = Vec::new();
         let mut edit_targets: Vec<String> = Vec::new();
+        // depot -> working-root-relative label, so a diff section can be given its local heading.
+        let mut local_by_depot: BTreeMap<String, String> = BTreeMap::new();
         let mut adds: Vec<(String, PathBuf)> = Vec::new(); // (depot, local)
         let mut complete = true;
         let mut diff_truncated = false;
@@ -531,6 +610,7 @@ impl<'a> P4<'a> {
         }
 
         for file in &opened {
+            present_depots.push(file.depot.clone());
             let local = match wheres.get(file.depot.as_str()) {
                 Some(WhereResult::Mapped(path)) => Some(path.clone()),
                 _ => None,
@@ -560,6 +640,7 @@ impl<'a> P4<'a> {
                 continue;
             }
             let local = local.expect("in_root implies a mapped local path");
+            local_by_depot.insert(file.depot.clone(), local_label);
 
             match ActionKind::of(&file.action) {
                 ActionKind::Edit => edit_targets.push(file.depot.clone()),
@@ -588,12 +669,16 @@ impl<'a> P4<'a> {
         }
 
         // Diff the editable opens. Never with an empty target list -- an omitted filespec
-        // would broaden `p4 diff` to every open file in the client.
-        let mut diff = String::new();
+        // would broaden `p4 diff` to every open file in the client. The unified output is split
+        // per file so each becomes its own elidable unit; the header carries the revision the
+        // workspace was diffed against, which is the unit's comparator.
         if !edit_targets.is_empty() {
             let stdin = edit_targets.join("\n") + "\n";
             match self.run(&["-x", "-", "diff", "-du"], &stdin) {
                 Some(out) if out.success => {
+                    // A cut here truncates the final section, so every unit built from this
+                    // output is marked incomplete (non-elidable) rather than trusting a prefix.
+                    let output_cut = out.stdout_truncated || out.stdout_lossy;
                     if out.stdout_truncated {
                         complete = false;
                         omissions.push(
@@ -602,11 +687,26 @@ impl<'a> P4<'a> {
                                 .to_string(),
                         );
                     }
-                    let (text, cut) = budget.take_diff(out.stdout);
-                    diff = text;
-                    if cut {
-                        diff_truncated = true;
-                        complete = false;
+                    for section in parse_describe_diff(&out.stdout) {
+                        if section.body.trim().is_empty() {
+                            continue;
+                        }
+                        let (hunk, cut) = budget.take_diff(section.body.clone());
+                        if cut {
+                            diff_truncated = true;
+                            complete = false;
+                        }
+                        let local = local_by_depot
+                            .get(&section.depot)
+                            .cloned()
+                            .unwrap_or_else(|| section.depot.clone());
+                        units.push(Unit::text_diff(
+                            section.depot,
+                            section.rev,
+                            local,
+                            hunk,
+                            !cut && !output_cut,
+                        ));
                     }
                 }
                 Some(out) if out.cancelled => return CaptureOne::Cancelled,
@@ -626,8 +726,8 @@ impl<'a> P4<'a> {
         }
 
         // Read opened-for-add contents from disk, confined to the working root, drawing from
-        // the shared budgets.
-        let mut added = Vec::new();
+        // the shared budgets. Each becomes an `AddBody` unit whose comparator is the
+        // no-depot-base sentinel.
         let mut cl_omissions = Omissions::new("added-file content", "opened-for-add file");
         for (depot, local) in adds {
             if budget.files_examined >= MAX_UNTRACKED_EXAMINED
@@ -665,15 +765,19 @@ impl<'a> P4<'a> {
                 cl_omissions.push(format!("`{}` is binary", safe_label(&depot)));
                 continue;
             }
+            // Whether the read decoded losslessly decides whether the body can be a byte-faithful
+            // elision baseline: a body that needed replacement is shown but never collapsed.
+            let lossy = std::str::from_utf8(&bytes).is_err();
             let section = truncate(String::from_utf8_lossy(&bytes).into_owned(), cap);
             budget.added_remaining -= section.text.len();
             budget.files_included += 1;
-            added.push(AddedFile {
+            let over_cap = section.truncated || over_cap;
+            units.push(Unit::add_body(
                 depot,
-                local: root_relative(&local, self.cwd),
-                truncated: section.truncated || over_cap,
-                body: section.text,
-            });
+                root_relative(&local, self.cwd),
+                section.text,
+                !over_cap && !lossy,
+            ));
         }
         let report = cl_omissions.finish();
         omissions.extend(report.notes);
@@ -694,9 +798,9 @@ impl<'a> P4<'a> {
             incomplete_reason,
             description,
             listing,
-            diff,
+            units,
+            present_depots,
             diff_truncated,
-            added,
             omissions,
         })
     }
@@ -711,10 +815,10 @@ impl<'a> P4<'a> {
     /// describes the opened files, which for a shelved-and-reverted changelist need not match
     /// the shelf, so this trusts `describe -S`'s own output rather than cross-checking it.
     fn shelved_segment(&self, cl: u64, description: String, budget: &mut Budget) -> CaptureOne {
-        let (raw, output_truncated) = match self
+        let (raw, output_truncated, output_lossy) = match self
             .run(&["describe", "-S", "-du", &cl.to_string()], "")
         {
-            Some(out) if out.success => (out.stdout, out.stdout_truncated),
+            Some(out) if out.success => (out.stdout, out.stdout_truncated, out.stdout_lossy),
             Some(out) if out.cancelled => return CaptureOne::Cancelled,
             Some(out) => {
                 return CaptureOne::Skipped(format!(
@@ -738,7 +842,8 @@ impl<'a> P4<'a> {
         let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
 
         let mut listing = String::new();
-        let mut diff = String::new();
+        let mut units = Vec::new();
+        let mut present_depots = Vec::new();
         let mut omissions = Vec::new();
         let mut complete = true;
         let mut diff_truncated = false;
@@ -749,6 +854,7 @@ impl<'a> P4<'a> {
         }
 
         for section in &sections {
+            present_depots.push(section.depot.clone());
             let local = wheres.get(section.depot.as_str());
             let in_root =
                 matches!(local, Some(WhereResult::Mapped(path)) if within_root(path, self.cwd));
@@ -785,15 +891,18 @@ impl<'a> P4<'a> {
                 continue;
             }
 
-            let (piece, cut) = budget.take_diff(format!(
-                "==== {} (shelved) ====\n{}\n",
-                section.depot, section.body
-            ));
-            diff.push_str(&piece);
+            let (hunk, cut) = budget.take_diff(section.body.clone());
             if cut {
                 diff_truncated = true;
                 complete = false;
             }
+            units.push(Unit::text_diff(
+                section.depot.clone(),
+                section.rev.clone(),
+                local_label,
+                hunk,
+                !cut && !output_truncated && !output_lossy,
+            ));
         }
 
         if output_truncated {
@@ -816,9 +925,9 @@ impl<'a> P4<'a> {
             incomplete_reason,
             description,
             listing,
-            diff,
+            units,
+            present_depots,
             diff_truncated,
-            added: Vec::new(),
             omissions,
         })
     }
@@ -914,8 +1023,16 @@ fn render(
         push_fenced(&mut out, "", &seg.description);
         out.push('\n');
 
-        if seg.diff.trim().is_empty() {
-            out.push_str("#### Diff\n\n");
+        // The diff block is the concatenation of every text-diff unit, each under its own depot
+        // header. Building it from units (rather than one pre-joined string) is what lets a
+        // resumed turn replace an unchanged unit's hunk with a one-line placeholder.
+        let diff_units: Vec<&Unit> = seg
+            .units
+            .iter()
+            .filter(|u| u.kind == baseline::UnitKind::TextDiff)
+            .collect();
+        out.push_str("#### Diff\n\n");
+        if diff_units.is_empty() {
             if seg.diff_truncated {
                 // Empty because the combined cap was already exhausted by earlier changelists,
                 // not because there was nothing to show -- say which, or the reviewer reads
@@ -929,8 +1046,13 @@ fn render(
                 out.push_str("(no textual diff was captured for this changelist.)\n\n");
             }
         } else {
-            out.push_str("#### Diff\n\n");
-            push_fenced(&mut out, "diff", &seg.diff);
+            let mut body = String::new();
+            for unit in &diff_units {
+                body.push_str(&format!("==== {} ====\n", safe_label(&unit.depot)));
+                body.push_str(unit.body.trim_end_matches('\n'));
+                body.push('\n');
+            }
+            push_fenced(&mut out, "diff", body.trim_end_matches('\n'));
             if seg.diff_truncated {
                 out.push_str(
                     "\n**The diff above was truncated at the combined size cap**, so it is not \
@@ -948,20 +1070,25 @@ fn render(
             out.push('\n');
         }
 
-        if !seg.added.is_empty() {
+        let add_units: Vec<&Unit> = seg
+            .units
+            .iter()
+            .filter(|u| u.kind == baseline::UnitKind::AddBody)
+            .collect();
+        if !add_units.is_empty() {
             out.push_str("#### Files opened for add\n\n");
             out.push_str(
                 "These are not in the diff, because they have no depot revision yet. Their \
                  contents follow.\n\n",
             );
-            for file in &seg.added {
+            for unit in &add_units {
                 out.push_str(&format!(
                     "##### {}  (depot: {})\n\n",
-                    safe_label(&file.local),
-                    safe_label(&file.depot)
+                    safe_label(&unit.local),
+                    safe_label(&unit.depot)
                 ));
-                push_fenced(&mut out, "", &file.body);
-                if file.truncated {
+                push_fenced(&mut out, "", &unit.body);
+                if !unit.complete {
                     out.push_str("\n(truncated -- this file exceeded the size cap.)\n");
                 }
                 out.push('\n');
@@ -2071,14 +2198,18 @@ Change 5 by u@c on 2026/01/01\n\n\
             incomplete_reason: (!complete).then(|| "a file was out of root".to_string()),
             description: "Add the feature\nwith detail".into(),
             listing: "edit         //depot/a  (a)\nadd          //depot/b  (b)\n".into(),
-            diff: "@@ -1 +1 @@\n-a\n+b\n".into(),
+            units: vec![
+                Unit::text_diff(
+                    "//depot/a".into(),
+                    Some("3".into()),
+                    "a".into(),
+                    "@@ -1 +1 @@\n-a\n+b\n".into(),
+                    true,
+                ),
+                Unit::add_body("//depot/b".into(), "b".into(), "new file body".into(), true),
+            ],
+            present_depots: vec!["//depot/a".into(), "//depot/b".into()],
             diff_truncated: false,
-            added: vec![AddedFile {
-                depot: "//depot/b".into(),
-                local: "b".into(),
-                body: "new file body".into(),
-                truncated: false,
-            }],
             omissions: vec!["`//depot/c` maps outside the working root".into()],
         }
     }
@@ -2119,7 +2250,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         // A later changelist that got zero remaining diff budget has an empty diff *because*
         // of the cap, not because there was no change -- the render must say which.
         let mut seg = segment_fixture(DiffBasis::Workspace, false);
-        seg.diff = String::new();
+        // No text-diff units, but the budget was exhausted before this changelist.
+        seg.units.retain(|u| u.kind != baseline::UnitKind::TextDiff);
         seg.diff_truncated = true;
         let text = render_fixture(&[seg], &[]);
         assert!(
