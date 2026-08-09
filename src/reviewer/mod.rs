@@ -295,6 +295,11 @@ pub struct RunOutcome {
     /// delta needs this: a fingerprint over lossily-decoded text cannot claim byte-identity
     /// with the underlying file, so any evidence captured from such output is non-elidable.
     pub stdout_lossy: bool,
+    /// The stdout stream ended before it was fully drained -- a pipe read error, or the collect
+    /// deadline expiring -- so `stdout` may be a partial prefix even though the process exited
+    /// cleanly. The Perforce capture treats this like truncation: an incomplete list or diff must
+    /// not be parsed as a whole and seed an elision baseline.
+    pub stdout_incomplete: bool,
 }
 
 /// Observable liveness from a reviewer child process.
@@ -465,6 +470,7 @@ pub fn run_observed(
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
         stdout_lossy: stdout.lossy,
+        stdout_incomplete: stdout.incomplete,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -480,6 +486,10 @@ struct Drain {
     buffer: Arc<Mutex<Vec<u8>>>,
     done: Arc<AtomicBool>,
     truncated: Arc<AtomicBool>,
+    /// The reader broke on a pipe read *error* rather than a clean EOF, so the output may be cut
+    /// mid-stream. Distinct from `truncated` (the deliberate size cap): a consumer that needs a
+    /// complete stream (the Perforce capture) must treat this as untrustworthy.
+    errored: Arc<AtomicBool>,
 }
 
 impl Drain {
@@ -502,15 +512,23 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
+    let errored = Arc::new(AtomicBool::new(false));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
+    let writer_errored = Arc::clone(&errored);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    // A read error means the stream ended abnormally: record it so a consumer
+                    // that needs a complete stream does not parse a partial prefix as whole.
+                    writer_errored.store(true, Ordering::SeqCst);
+                    break;
+                }
                 Ok(n) => {
                     let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
                     let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
@@ -532,15 +550,17 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
         buffer,
         done,
         truncated,
+        errored,
     }
 }
 
-/// One pipe's output, whether the cap threw any of it away, and whether decoding it was
-/// lossy (non-UTF-8 bytes replaced).
+/// One pipe's output, whether the cap threw any of it away, whether decoding was lossy, and
+/// whether the stream ended before it was fully drained (a read error or the collect deadline).
 struct Collected {
     text: String,
     truncated: bool,
     lossy: bool,
+    incomplete: bool,
 }
 
 /// Take what a pipe has produced, waiting until EOF or `deadline`, whichever comes first.
@@ -551,6 +571,10 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
     while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
+    // The stream is incomplete if the reader hit a pipe error, or if we gave up waiting before it
+    // reached EOF -- either way the buffer may be a partial prefix, which a byte-fidelity consumer
+    // (the Perforce capture) must not parse as a whole document.
+    let incomplete = drain.errored.load(Ordering::SeqCst) || !drain.done.load(Ordering::SeqCst);
     let buffer = drain.buffer.lock().unwrap_or_else(|e| e.into_inner());
     // Whether decoding replaced any byte: valid UTF-8 decodes losslessly, anything else does
     // not. Recorded so a caller that needs byte-fidelity (the Perforce fingerprint) can tell.
@@ -559,6 +583,7 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
         text: String::from_utf8_lossy(&buffer).into_owned(),
         truncated: drain.truncated.load(Ordering::SeqCst),
         lossy,
+        incomplete,
     }
 }
 
@@ -717,6 +742,7 @@ mod drain_tests {
             stdout_truncated: true,
             stderr_truncated: false,
             stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
@@ -746,6 +772,7 @@ mod drain_tests {
             stdout_truncated: true,
             stderr_truncated: false,
             stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
@@ -776,6 +803,7 @@ mod drain_tests {
             stdout_truncated: false,
             stderr_truncated: false,
             stdout_lossy: false,
+            stdout_incomplete: false,
         };
 
         let failure = failure_for(&cfg, &out);
