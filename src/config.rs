@@ -310,20 +310,26 @@ pub struct Config {
     pub diff: DiffMode,
     /// Which VCS the capture backend drives, resolved from `--vcs` (default `auto`).
     pub vcs: Vcs,
-    /// On a resumed git turn whose `--diff` is a committed range, capture only the commits
-    /// added since the previous turn (`<prior-HEAD>..HEAD`) rather than the whole range again.
+    /// On a resumed turn, send the reviewer only what changed since its previous turn rather
+    /// than the whole captured change again.
     ///
-    /// A re-review resumes the reviewer's own conversation, so the earlier full diff is still
-    /// in its context; re-sending the whole range every turn just pays to re-cache a
-    /// near-duplicate, and for the Claude reviewer that cache write is billed at a premium, so
-    /// the per-turn cost climbs even when nothing but the fixes changed. Reviewing only the
-    /// delta collapses that. Guarded by an ancestry check: if the branch was rewritten
-    /// (rebase, amend, force-push) so the prior commit is no longer an ancestor of HEAD, the
-    /// full range is captured instead, because `<prior>..HEAD` would then be meaningless.
+    /// A re-review resumes the reviewer's own conversation, so the earlier full change is still
+    /// in its context; re-sending it every turn just pays to re-cache a near-duplicate, and for
+    /// the Claude reviewer that cache write is billed at a premium, so the per-turn cost climbs
+    /// even when nothing but the fixes changed. Reviewing only the delta collapses that.
     ///
-    /// Git only. The Perforce backend re-captures a changelist's current contents each turn by
-    /// design (a pending changelist mutates in place, so there is no prior revision to delta
-    /// against), and is unaffected by this flag. `--no-incremental-resume` turns it off.
+    /// Backend-agnostic: one switch governs incremental resume for whichever backend is active.
+    /// The two backends realise it differently, because their change objects differ:
+    ///
+    /// - **Git** captures only the commits added since the previous turn (`<prior-HEAD>..HEAD`),
+    ///   guarded by an ancestry check: a rewritten branch (rebase, amend, force-push) whose
+    ///   prior commit is no longer an ancestor of HEAD falls back to the full range.
+    /// - **Perforce** re-captures the changelist(s) each turn (a pending changelist mutates in
+    ///   place, so there is no prior revision to delta against) and collapses files that are
+    ///   byte-identical to what the reviewer was already shown, guarded by a per-file
+    ///   fingerprint. See `docs/perforce-resume-delta.md`.
+    ///
+    /// `--no-incremental-resume` turns it off for both.
     pub resume_incremental_diff: bool,
 }
 
@@ -866,16 +872,16 @@ OPTIONS:
                               A capture that was configured and could not be produced is
                               reported to the caller with the review, not skipped in
                               silence. Not affected by --no-preamble; use --diff none.
-  --no-incremental-resume     git only: on a resumed turn whose --diff is a committed
-                              range (e.g. main...HEAD), capture the WHOLE range again
-                              instead of only the commits added since the previous turn.
-                              The incremental capture is the default: a re-review resumes
-                              the reviewer's own conversation, so the earlier full diff is
-                              still in its context, and re-sending the whole range every
-                              turn pays to re-cache a near-duplicate -- billed at a
-                              premium for the Claude reviewer. A rewritten branch (rebase,
-                              amend, force-push) falls back to the full range on its own,
-                              so this flag is only for forcing that everywhere.
+  --no-incremental-resume     on a resumed turn, send the WHOLE captured change again
+                              instead of only what changed since the reviewer's previous
+                              turn. The incremental default resumes the reviewer's own
+                              conversation, so the earlier change is still in its context,
+                              and re-sending it every turn pays to re-cache a near-duplicate
+                              -- billed at a premium for the Claude reviewer. Both backends
+                              honour it: git sends only the commits added since the prior
+                              turn (a rewritten branch falls back to the full range on its
+                              own); Perforce collapses files byte-identical to what the
+                              reviewer was already shown. This flag forces full capture.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration
