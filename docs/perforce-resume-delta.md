@@ -1,7 +1,7 @@
 # Perforce resume delta — design
 
 Status: **proposal, not yet implemented.** This document is the plan under review; nothing
-in the code implements it yet. It has been through three rounds of cross-model review (see
+in the code implements it yet. It has been through four rounds of cross-model review (see
 [Review history](#review-history)).
 
 ## Problem
@@ -85,7 +85,11 @@ Each entry carries: state (`present/elidable` with fingerprint, `present/no-diff
 revision the diff was taken against; see invariant 2). The comparator ID is also folded into
 the hashed canonical input, so a base-revision change alone busts the fingerprint even when
 the rendered body is identical (R3-F1). A missing or ambiguous comparator ID makes the unit
-non-elidable.
+non-elidable — **except** a `pending-add-body`, which has no depot base by definition and
+carries the explicit sentinel comparator `NoDepotBase` (also folded into the hash). Without
+that sentinel the "missing comparator → non-elidable" rule would make every pending add body
+non-elidable and forfeit one of the primary wins (R4-F1); with it, an unchanged pending add
+body elides and a changed one does not.
 
 ### The persisted state is an inventory, not just fingerprints
 
@@ -122,6 +126,13 @@ underlying file identity. So any unit whose content **required lossy decoding is
 non-elidable** (R3-F6); storing an additional raw-byte digest is the alternative if that
 proves too conservative in practice.
 
+This is only enforceable with a plumbing change: `RunOutcome` retains a decoded `String` and
+the runner calls `from_utf8_lossy` without recording whether any replacement occurred
+(`src/reviewer/mod.rs:282`, `:548`), so the backend cannot currently tell valid UTF-8 from
+lossy output (R4-F2). The runner must either preserve raw stdout or expose a `stdout_lossy`
+flag, propagated to each affected evidence unit. Until it does, the fail-closed fallback is
+to disable elision for any command output that could have been lossy-decoded.
+
 ### 2. Comparator identity is defined per basis and persisted
 
 Each basis has its own comparator identity; where it cannot be established from the captured
@@ -136,6 +147,10 @@ evidence the unit is non-elidable (R2-F2, R3-F1):
   for edit, and `p4 have` can move after a sync even for an open file, so a byte-identical
   workspace can yield a different diff. The comparator revision is taken from the **same** diff
   evidence, never a separate `p4 have`; if not recoverable there, the unit is non-elidable.
+- **Pending add body** — has no depot base, so its comparator is the sentinel `NoDepotBase`
+  (R4-F1). It is a real comparator, not a "missing" one, so the add body remains elidable; the
+  sentinel is in the hashed input so a `pending-add-body` can never key-collide with a
+  `text-diff` for the same path.
 
 The comparator ID lives in each elidable entry **and** in the hashed input (invariant 1), so
 neither a dropped `#N` on reconstruction nor a silent base move can elide a changed diff.
@@ -195,9 +210,16 @@ The session binds only `changes` today (`src/session.rs:46`), checked pre-captur
   (`src/vcs/perforce.rs:78`), so `resume_block` cannot see it (R3-F2). Two acceptable shapes:
   a lightweight Perforce **identity preflight** (resolve client) before `resume_block`, so a
   mismatch refuses consistently with the `changes` check; or — v1's minimum — the backend
-  **validates client + `include_shelved` before it consults the prior inventory** and, on
-  mismatch, takes a full capture with elision disabled. Either way the inventory is never
-  consulted until identity is confirmed.
+  **validates the capture identity + `include_shelved` before it consults the prior
+  inventory** and, on mismatch, takes a full capture with elision disabled. Either way the
+  inventory is never consulted until identity is confirmed.
+
+  **Capture identity** is not the client *name* alone: a changed `P4CONFIG`/`P4PORT` server,
+  client view, root/`AltRoots`, or charset can remap paths and content while the name stays
+  the same (R4-F4). Define it as a canonical effective identity over at least
+  `(server P4PORT, client spec/view, client root and AltRoots, charset)`, resolved from the
+  same `p4 info`/`p4 client` the capture already runs (`src/vcs/perforce.rs:1013`, `:1043`,
+  `:1173`), and store that canonical form in the binding.
 
 ### 6. The baseline is the last *persisted* successfully-parsed turn
 
@@ -213,9 +235,28 @@ But a parsed turn whose **state-write itself fails** is *not* safe (R3-F4): the 
 delivered even when `record_turn` fails (`src/tools.rs:1110`, `:1136`), so the reviewer has
 advanced while the persisted inventory has not — a later turn could elide against a superseded
 baseline and hide a transition. So a `record_turn` failure for a Perforce session carrying a
-baseline **poisons the session**: forget/remove the mapping (as `SESSION_NOT_FOUND` already
-does) so the next call cannot resume the stale inventory and must go `fresh`. The baseline is
-thus the last *persisted* parsed turn, not merely the last parsed one.
+baseline **poisons the session** so the next call cannot resume the stale inventory and must
+go `fresh`. The baseline is thus the last *persisted* parsed turn, not merely the last parsed
+one.
+
+Poisoning must be **fail-closed**, which the existing `forget` is not: the `SESSION_NOT_FOUND`
+path `.ok()`s its `forget` error (`src/tools.rs:831`), so if the state file is unavailable the
+stale mapping survives and a later call can still resume against the superseded inventory
+(R4-F3). Two properties make it durable:
+
+- **Read-side enforcement.** A resume that cannot load and parse the session record, or finds
+  it flagged poisoned, disables elision (goes `fresh`) rather than trusting a partial read. A
+  failed write therefore cannot *produce* a trusted baseline on the next read.
+- **No torn state.** `record_turn` writes via atomic rename, so a failed write leaves the
+  wholly-consistent prior record — never a half-updated inventory.
+
+The residual case is a record that is intact but *stale* because a prior write was lost while
+the reviewer's conversation advanced (turn 2 delivered, its write failed, turn 3 resumes a
+turn-1 record). Because the lost write also failed to advance `turns`, the baseline carries the
+turn number it was captured at; a resume whose reviewer session is detectably ahead of that
+number disables elision. How reliably each reviewer CLI exposes its own turn/conversation
+position is an implementation-time verification item, and where it cannot be established the
+conservative default is again to disable elision.
 
 ## State model
 
@@ -255,6 +296,9 @@ the current `resumed_capture_note` in `tools.rs`.
 - **CNG digest helper** — a small `unsafe` FFI wrapper over `BCryptHashData` (SHA-256) with a
   runtime "digest unavailable → disable elision" path; VCS-neutral, beside the shared
   primitives.
+- **`src/reviewer/mod.rs`** — expose whether a command's stdout was lossy-decoded (a
+  `stdout_lossy` flag on `RunOutcome`, or preserved raw bytes), propagated to each evidence
+  unit so invariant 1 can classify lossy content non-elidable.
 - **`src/session.rs`** — the `Full(inventory)`/`Disabled` value, schema version, **backend
   identity**, and the extended binding (`include_shelved`, client identity) on
   `SessionRecord`/`TurnFacts`, `#[serde(default)]`; `resume_block` extended to reject
@@ -272,14 +316,18 @@ the current `resumed_capture_note` in `tools.rs`.
   changelists keyed distinctly (F1); every transition including *restored-to-depot/no-diff*,
   kind-change, and an **elided unit carried forward then returning changed** (R3-F5); per-basis
   comparator identity and a base-rev change with identical body → not elided (R3-F1/F2); binary
-  same-type edit → not elided (F2); lossy-decoded content → non-elidable (R3-F6); every
-  completeness source including `where`-failure, 8 MiB prefix truncation, and the
-  description/omission caps → non-elidable, "removed" suppressed on incomplete inventory
+  same-type edit → not elided (F2); an unchanged **pending add body elides** under the
+  `NoDepotBase` sentinel while a changed one does not (R4-F1); lossy-decoded content →
+  non-elidable, with the `RunOutcome` lossy flag actually propagating (R3-F6/R4-F2); a changed
+  **capture identity** (server/view/root/charset behind an unchanged client name) → not elided
+  (R4-F4); every completeness source including `where`-failure, 8 MiB prefix truncation, and
+  the description/omission caps → non-elidable, "removed" suppressed on incomplete inventory
   (F3/F4/R3-F3/R3-F7); shelved authoritative-ledger disagreement → incomplete (R3-F3);
   provisional hash discarded for a budget-truncated unit (R2-F4); `include_shelved`/client
   change → not elided (R2-F3/R3-F2); cross-backend record rejected (R3-F2); **`record_turn`
-  failure poisons the session** so the next turn goes fresh (R3-F4); digest-unavailable →
-  disabled (F4); schema/backend-version mismatch invalidates the map.
+  failure poisons the session** so the next turn goes fresh, **including when `forget` itself
+  fails** (read-side enforcement) (R3-F4/R4-F3); digest-unavailable → disabled (F4);
+  schema/backend-version mismatch invalidates the map.
 - **Golden render snapshots** for the resumed Perforce prompt: a mixed turn with collapsed,
   modified, added, removed, and restored-to-depot units.
 - **Live smoke** (`smoke.ps1 -Reviewer codex`) against a real pending changelist edited between
@@ -326,3 +374,10 @@ wall-clock too. Kept out of the first cut: the token win is fully delivered with
   unit's fingerprint; lossy-decoded content non-elidable; qualify framing to "all elidable
   units", add description/omission caps to completeness, and decide to widen
   `resume_incremental_diff` to backend-agnostic).
+- **Round 4:** R3-F1/F3/F5/F7 resolved, R3-F2 resolved, R3-F4/F6 partially open; no structural
+  objection to per-file coarse elision. REQUEST CHANGES, all accepted: `NoDepotBase` sentinel
+  comparator for pending add bodies so they stay elidable (R4-F1); a `RunOutcome` lossy flag,
+  since the runner currently hides whether `from_utf8_lossy` replaced anything (R4-F2);
+  fail-closed poisoning with read-side enforcement, since the existing `forget` `.ok()`s its
+  error (R4-F3); a concrete capture-identity definition (server/view/root/charset, not just the
+  client name) (R4-F4).
