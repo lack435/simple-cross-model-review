@@ -279,9 +279,11 @@ backend mismatch on read invalidates it to absent.
 ## Reviewer-facing rendering
 
 A framing note up front, mirroring git's follow-up preamble (`render` in `src/vcs/git.rs`):
-the reviewer saw the full changelist(s) earlier in this session, **all elidable files** are
-collapsed to one line, only what moved is shown in full, non-elidable evidence is still shown,
-and it should re-check its earlier findings. Then the per-file transition lines, including the
+the reviewer saw the **complete captured evidence** for the changelist(s) earlier in this
+session (not the full changelist — server-side added bodies are omitted and binary/deleted
+files are represented by notes), **all elidable files** are collapsed to one line, only what
+moved is shown in full, non-elidable evidence is still shown, and it should re-check its
+earlier findings. Then the per-file transition lines, including the
 explicit *removed*, *restored-to-depot*, and *shelf-no-longer-in-scope* notes. This replaces
 the current `resumed_capture_note` in `tools.rs`.
 
