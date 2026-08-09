@@ -599,8 +599,10 @@ impl<'a> P4<'a> {
             });
         }
 
-        let (raw, output_truncated) = match self.run(&["describe", "-du", &cl.to_string()], "") {
-            Some(out) if out.success => (out.stdout, out.stdout_truncated),
+        let (raw, output_truncated, output_lossy) = match self
+            .run(&["describe", "-du", &cl.to_string()], "")
+        {
+            Some(out) if out.success => (out.stdout, out.stdout_truncated, out.stdout_lossy),
             Some(out) if out.cancelled => return CaptureOne::Cancelled,
             Some(out) => {
                 return CaptureOne::Skipped(format!(
@@ -676,7 +678,9 @@ impl<'a> P4<'a> {
                         section.rev.clone(),
                         local_label,
                         hunk,
-                        !cut,
+                        // A lossily-decoded describe body is not byte-faithful, so it is shown but
+                        // never becomes an elision baseline.
+                        !cut && !output_lossy,
                     ));
                 }
                 _ => {
