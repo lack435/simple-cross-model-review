@@ -571,28 +571,48 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
     }
 }
 
+/// Whether a server/client identity field is a real value rather than empty, whitespace, or
+/// Perforce's `*unknown*` sentinel. A sentinel is the same across every unconfigured client, so
+/// treating it as an identity would let unrelated captures match.
+fn is_real_identity_field(value: &str) -> bool {
+    let v = value.trim();
+    !v.is_empty() && v != "*unknown*"
+}
+
+/// Whether `p4 client -o` output is structurally a client spec, not merely a successful-but-empty
+/// or malformed response. Requires the two mandatory spec fields (`Client:` and `Root:`), so an
+/// empty or truncated-to-comments response cannot hash to a stable "unchanged" digest.
+fn is_client_spec(raw: &str) -> bool {
+    let text = normalize(raw);
+    let has_field = |name: &str| {
+        text.lines()
+            .any(|line| line.trim_start().starts_with(name) && line.contains(name))
+    };
+    has_field("Client:") && has_field("Root:")
+}
+
 /// Resolve the capture identity a resume binds to: the server, client, charset, and a digest of
 /// the canonical client spec (which folds in the view, root and `AltRoots`). The spec digest is
 /// `None` when `p4 client -o` fails or decodes lossily, which makes the identity unconfirmed and
 /// disables elision rather than eliding under a mapping we could not verify.
 fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
-    let client_spec_digest = p4
-        .run(&["client", "-o", &info.client], "")
+    // Mandatory, non-sentinel identity fields. Beyond non-empty, a `*unknown*`/whitespace server
+    // or client is not a real identity, so it must not be confirmed: two such captures would
+    // otherwise match on the sentinel even against different real servers.
+    let fields_valid = info.trustworthy
+        && is_real_identity_field(&info.server)
+        && is_real_identity_field(&info.client);
+    let client_spec_digest = fields_valid
+        .then(|| p4.run(&["client", "-o", &info.client], ""))
+        .flatten()
         // Any untrustworthy spec output -- capped, lossy, or a partial prefix -- would hash only
         // part of the spec, so a change in an omitted View/Root/Options field could leave the
-        // digest unchanged and permit elision under a changed client. Reject it: the identity is
-        // then unconfirmed and elision is disabled (gate findings 4/2).
-        .filter(|out| out.success && !out.stdout_untrustworthy())
+        // digest unchanged and permit elision under a changed client (gate findings 4/2). The
+        // output must also *be* a real client spec: an empty or structurally invalid success would
+        // otherwise hash to a stable digest and read as "unchanged" (gate finding 3).
+        .filter(|out| out.success && !out.stdout_untrustworthy() && is_client_spec(&out.stdout))
         .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
-        .map(|fp| fp.sha256)
-        // If the workspace resolution itself came from untrustworthy `p4 info`/`clients` output,
-        // the server/client fields may be wrong too, so the whole identity is unconfirmed.
-        .filter(|_| info.trustworthy)
-        // Both mandatory identity fields must be present: an absent `serverAddress` (or client)
-        // would leave that field empty, and two captures against *different* unreported servers
-        // would then match on the empty string. A missing field means the identity cannot be
-        // confirmed, so elision is disabled.
-        .filter(|_| !info.server.is_empty() && !info.client.is_empty());
+        .map(|fp| fp.sha256);
     baseline::CaptureIdentity {
         server: info.server.clone(),
         client: info.client.clone(),
@@ -750,9 +770,11 @@ impl<'a> P4<'a> {
                         section.rev.clone(),
                         local_label,
                         hunk,
-                        // A lossily-decoded describe body is not byte-faithful, so it is shown but
-                        // never becomes an elision baseline.
-                        !cut && !output_lossy,
+                        // A budget cut, or a `describe` output that hit the size cap / ended early
+                        // / decoded lossily, means this body is not a byte-faithful whole -- so it
+                        // is shown but never collapsed or made an elision baseline. `output_truncated`
+                        // already folds in `stdout_incomplete` (gate finding 2).
+                        !cut && !output_truncated && !output_lossy,
                     ));
                 }
                 _ => {
@@ -1747,12 +1769,10 @@ impl<'a> P4<'a> {
                 first_line(&diag)
             )));
         }
-        // Lossy output folds into the truncation flag: a corrupted depot path would give a file a
-        // wrong identity, so treat undecodable `opened` output as an untrustworthy list.
-        Some(Ok((
-            parse_opened_ztag(&out.stdout),
-            out.stdout_truncated || out.stdout_lossy || out.stdout_incomplete,
-        )))
+        // A dropped record, or any untrustworthy stream (capped, lossy, incomplete), means the
+        // file list may be short an unknown file, so mark it untrustworthy.
+        let (files, dropped) = parse_opened_ztag(&out.stdout);
+        Some(Ok((files, dropped || out.stdout_untrustworthy())))
     }
 
     /// Map depot paths to local paths via `p4 where`, fed on stdin so there is no
@@ -2044,9 +2064,15 @@ fn parse_clients_ztag(raw: &str) -> Vec<ClientSpec> {
         .collect()
 }
 
-/// Parse `p4 -ztag opened` (blank-line-separated records, single-line fields).
-fn parse_opened_ztag(raw: &str) -> Vec<OpenedFile> {
-    records(&normalize(raw))
+/// Parse `p4 -ztag opened` (blank-line-separated records, single-line fields), plus whether any
+/// non-empty record had to be dropped for lacking a `depotFile`. A dropped record means the file
+/// list is short by an unknown file even though the output was not truncated, which would let a
+/// clean capture omit a file and then mis-report it as "removed" -- so the caller treats a drop
+/// as untrustworthy output (gate finding 4).
+fn parse_opened_ztag(raw: &str) -> (Vec<OpenedFile>, bool) {
+    let all = records(&normalize(raw));
+    let non_empty = all.iter().filter(|r| !r.is_empty()).count();
+    let files: Vec<OpenedFile> = all
         .into_iter()
         .filter_map(|rec| {
             let depot = rec.get("depotFile")?.clone();
@@ -2058,7 +2084,9 @@ fn parse_opened_ztag(raw: &str) -> Vec<OpenedFile> {
                 ptype,
             })
         })
-        .collect()
+        .collect();
+    let dropped = files.len() < non_empty;
+    (files, dropped)
 }
 
 /// Parse `p4 -ztag where` into an effective depot -> local map.
@@ -2509,11 +2537,20 @@ mod tests {
         let raw = "\
 ... depotFile //depot/a.txt\n... clientFile //cl/a.txt\n... action edit\n... type text\n\n\
 ... depotFile //depot/bin.uasset\n... clientFile //cl/bin.uasset\n... action add\n... type binary+l\n";
-        let opened = parse_opened_ztag(raw);
+        let (opened, dropped) = parse_opened_ztag(raw);
+        assert!(!dropped, "well-formed records are not dropped");
         assert_eq!(opened.len(), 2);
         assert_eq!(opened[0].depot, "//depot/a.txt");
         assert_eq!(opened[0].action, "edit");
         assert_eq!(opened[1].ptype, "binary+l");
+
+        // A record missing its depotFile is dropped, and the drop is reported so the caller can
+        // treat the (now short) file list as untrustworthy.
+        let malformed =
+            "... depotFile //depot/a\n... action edit\n\n... action edit\n... type text\n";
+        let (files, dropped) = parse_opened_ztag(malformed);
+        assert_eq!(files.len(), 1);
+        assert!(dropped, "a record without depotFile is a reported drop");
     }
 
     #[test]
@@ -2619,6 +2656,22 @@ Change 5 by u@c on 2026/01/01\n\n\
         // Anything unrecognised falls to Other, so it can never reach `p4 diff`.
         assert!(matches!(ActionKind::of("archive"), ActionKind::Other));
         assert!(matches!(ActionKind::of(""), ActionKind::Other));
+    }
+
+    #[test]
+    fn identity_validation_rejects_sentinels_and_non_specs() {
+        assert!(is_real_identity_field("ssl:perforce:1666"));
+        assert!(!is_real_identity_field(""));
+        assert!(!is_real_identity_field("   "));
+        assert!(!is_real_identity_field("*unknown*"));
+
+        // A real client spec has the mandatory Client: and Root: fields.
+        let spec = "# comment\n\nClient:\tws\n\nRoot:\tC:\\ws\n\nView:\n\t//depot/... //ws/...\n";
+        assert!(is_client_spec(spec));
+        // Empty or comments-only output is not a spec, so its digest must not be trusted.
+        assert!(!is_client_spec(""));
+        assert!(!is_client_spec("# just a comment header\n"));
+        assert!(!is_client_spec("Client:\tws\n"), "missing Root:");
     }
 
     #[test]

@@ -295,26 +295,35 @@ impl SessionStore {
     /// that could deliver a review without persisting its baseline, and cleared only once the turn
     /// is durably recorded. A crash, panic, or write failure in between therefore leaves it set,
     /// and [`is_pending`](Self::is_pending) tells the next resume to fall back to a full capture
-    /// rather than collapse against a baseline that never advanced. Best effort: if even this
-    /// small write fails there is nothing more the process can durably do.
-    pub fn mark_pending(&self, name: &str) {
+    /// rather than collapse against a baseline that never advanced.
+    ///
+    /// Returns an error if the marker could not be written: the caller must then refuse to produce
+    /// a resumable baseline this turn, since a later crash could not be detected.
+    pub fn mark_pending(&self, name: &str) -> io::Result<()> {
         let path = self.pending_marker(name);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, b"").ok();
+        std::fs::write(&path, b"")
     }
 
-    /// Clear the in-progress marker after a turn is durably recorded.
-    pub fn clear_pending(&self, name: &str) {
-        std::fs::remove_file(self.pending_marker(name)).ok();
+    /// Clear the in-progress marker after a turn is durably recorded. `Ok(())` on a successful
+    /// delete or an already-absent marker; `Err` if the delete failed and the marker may survive
+    /// (which would wrongly disable future elision, so the caller surfaces it).
+    pub fn clear_pending(&self, name: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.pending_marker(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Whether the previous turn of this session left an uncleared in-progress marker -- it
-    /// crashed, panicked, or failed to persist. Elision must be disabled until a clean turn
-    /// clears it.
+    /// crashed, panicked, or failed to persist. **Fail-closed:** an I/O error deciding this
+    /// returns `true`, so an unreadable marker state disables elision rather than risking a
+    /// collapse against a baseline that never advanced.
     pub fn is_pending(&self, name: &str) -> bool {
-        self.pending_marker(name).exists()
+        self.pending_marker(name).try_exists().unwrap_or(true)
     }
 
     pub fn forget(&self, name: &str) -> io::Result<bool> {
@@ -780,14 +789,16 @@ mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         assert!(!store.is_pending("p4"), "nothing pending initially");
-        store.mark_pending("p4");
+        store.mark_pending("p4").expect("mark");
         assert!(store.is_pending("p4"), "marked pending");
         // It survives a fresh store over the same directory (i.e. an MCP server restart).
         assert!(SessionStore::new(&dir).is_pending("p4"));
-        store.clear_pending("p4");
+        store.clear_pending("p4").expect("clear");
         assert!(!store.is_pending("p4"), "cleared");
+        // Clearing an already-absent marker is not an error.
+        store.clear_pending("p4").expect("clear absent is ok");
         // Distinct session names have distinct markers.
-        store.mark_pending("a");
+        store.mark_pending("a").expect("mark a");
         assert!(store.is_pending("a") && !store.is_pending("b"));
     }
 

@@ -805,10 +805,11 @@ impl Job {
         let prior_pending =
             self.cfg.vcs == crate::config::Vcs::Perforce && self.sessions.is_pending(&self.session);
         // Mark this Perforce turn in progress; cleared only once it is durably recorded, so a
-        // failure anywhere below leaves the marker set for the next resume to see.
-        if self.cfg.vcs == crate::config::Vcs::Perforce {
-            self.sessions.mark_pending(&self.session);
-        }
+        // failure anywhere below leaves the marker set for the next resume to see. If the marker
+        // cannot be written, a later crash could not be detected, so this turn must not produce a
+        // resumable baseline at all (forced to `Disabled` below).
+        let pending_marked = self.cfg.vcs == crate::config::Vcs::Perforce
+            && self.sessions.mark_pending(&self.session).is_ok();
 
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
         // needs both HEAD and base; Perforce needs its stored inventory. The backend decides from
@@ -853,7 +854,14 @@ impl Job {
         // The Perforce capture identity and resume-delta baseline this turn produced. Both
         // `None` for git; recorded on the session so the next resume can collapse against them.
         let capture_identity = capture.capture_identity.clone();
-        let perforce_baseline = capture.perforce_baseline.clone();
+        // If the in-progress marker could not be written, this turn cannot be made safely
+        // resumable (a later crash would be undetectable), so refuse to persist a `Full` baseline
+        // regardless of what the capture produced.
+        let perforce_baseline = if self.cfg.vcs == crate::config::Vcs::Perforce && !pending_marked {
+            Some(crate::vcs::baseline::PerforceBaseline::Disabled)
+        } else {
+            capture.perforce_baseline.clone()
+        };
         let capture_warnings = capture.warnings;
         self.registry.set_phase(&self.id, Phase::Launching);
 
@@ -1195,9 +1203,18 @@ impl Job {
                 ) {
                     Ok(_) => {
                         // Durably recorded: clear the in-progress marker so the next resume trusts
-                        // this turn's baseline. Only reached after `record_turn` returned `Ok`.
+                        // this turn's baseline. Only reached after `record_turn` returned `Ok`. If
+                        // the delete fails the marker may survive and wrongly disable the *next*
+                        // incremental review, so say so rather than letting it silently persist.
                         if self.cfg.vcs == crate::config::Vcs::Perforce {
-                            self.sessions.clear_pending(&self.session);
+                            if let Err(e) = self.sessions.clear_pending(&self.session) {
+                                warnings.push(format!(
+                                    "This turn was saved, but the session's in-progress marker \
+                                     could not be cleared ({e}); the next review of session '{}' \
+                                     may re-send the whole change instead of only what changed.",
+                                    self.session
+                                ));
+                            }
                         }
                         true
                     }
