@@ -798,6 +798,18 @@ impl Job {
         if self.cfg.supplies_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
+        // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
+        // marker -- it crashed, panicked, or failed to persist its baseline -- the persisted
+        // baseline may be stale relative to what the reviewer last saw, so do not collapse against
+        // it. Read this before marking the current turn pending.
+        let prior_pending =
+            self.cfg.vcs == crate::config::Vcs::Perforce && self.sessions.is_pending(&self.session);
+        // Mark this Perforce turn in progress; cleared only once it is durably recorded, so a
+        // failure anywhere below leaves the marker set for the next resume to see.
+        if self.cfg.vcs == crate::config::Vcs::Perforce {
+            self.sessions.mark_pending(&self.session);
+        }
+
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
         // needs both HEAD and base; Perforce needs its stored inventory. The backend decides from
         // there whether the delta is safe (git: matching base and ancestry; Perforce: matching
@@ -812,6 +824,9 @@ impl Job {
                     _ => None,
                 }
             }
+            // `prior_pending` forces a full capture: the prior turn did not cleanly persist, so its
+            // baseline cannot be trusted.
+            crate::config::Vcs::Perforce if prior_pending => None,
             crate::config::Vcs::Perforce => self.prior_perforce_baseline.as_ref().map(|baseline| {
                 vcs::Resume::Perforce(vcs::perforce::PerforceResume {
                     baseline,
@@ -1178,7 +1193,14 @@ impl Job {
                         perforce_baseline: perforce_baseline.cloned(),
                     },
                 ) {
-                    Ok(_) => true,
+                    Ok(_) => {
+                        // Durably recorded: clear the in-progress marker so the next resume trusts
+                        // this turn's baseline. Only reached after `record_turn` returned `Ok`.
+                        if self.cfg.vcs == crate::config::Vcs::Perforce {
+                            self.sessions.clear_pending(&self.session);
+                        }
+                        true
+                    }
                     Err(e) => {
                         // The review itself succeeded; losing resumability is worth a
                         // warning but not worth discarding the review.

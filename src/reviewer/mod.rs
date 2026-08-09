@@ -607,13 +607,22 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     // pipe error or a drain-deadline expiry) is treated the same way: a review parsed from a
     // truncated transcript is as unreliable as one from a capped one, and the Codex JSONL
     // fallback would otherwise return an earlier agent message as the review.
-    (out.stdout_truncated || out.stdout_incomplete).then(|| {
-        errors::output_truncated(
+    if out.stdout_truncated {
+        Some(errors::output_truncated(
             cfg.reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),
             out.diagnostics(),
-        )
-    })
+        ))
+    } else if out.stdout_incomplete {
+        // A partial prefix that did not hit the size cap: a distinct diagnostic, since the
+        // truncation message would wrongly claim the CLI exceeded the cap.
+        Some(errors::output_incomplete(
+            cfg.reviewer.as_str(),
+            out.diagnostics(),
+        ))
+    } else {
+        None
+    }
 }
 
 /// Turn a non-success run into the right `Failure`.

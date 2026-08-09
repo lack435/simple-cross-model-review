@@ -270,6 +270,53 @@ impl SessionStore {
         Ok(record)
     }
 
+    /// The path of a session's "turn in progress" marker. A sibling of the state file, keyed by
+    /// name the same way the session lock is, so it survives a crash independently of the JSON.
+    fn pending_marker(&self, name: &str) -> PathBuf {
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(48)
+            .collect();
+        dir.join(format!(
+            "session-{safe}-{:016x}.pending",
+            crate::config::fnv1a64(name)
+        ))
+    }
+
+    /// Mark a Perforce turn as in progress. The marker is written *before* the turn does anything
+    /// that could deliver a review without persisting its baseline, and cleared only once the turn
+    /// is durably recorded. A crash, panic, or write failure in between therefore leaves it set,
+    /// and [`is_pending`](Self::is_pending) tells the next resume to fall back to a full capture
+    /// rather than collapse against a baseline that never advanced. Best effort: if even this
+    /// small write fails there is nothing more the process can durably do.
+    pub fn mark_pending(&self, name: &str) {
+        let path = self.pending_marker(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, b"").ok();
+    }
+
+    /// Clear the in-progress marker after a turn is durably recorded.
+    pub fn clear_pending(&self, name: &str) {
+        std::fs::remove_file(self.pending_marker(name)).ok();
+    }
+
+    /// Whether the previous turn of this session left an uncleared in-progress marker -- it
+    /// crashed, panicked, or failed to persist. Elision must be disabled until a clean turn
+    /// clears it.
+    pub fn is_pending(&self, name: &str) -> bool {
+        self.pending_marker(name).exists()
+    }
+
     pub fn forget(&self, name: &str) -> io::Result<bool> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
@@ -724,6 +771,24 @@ mod tests {
         let rec = store.get("p4").unwrap();
         assert_eq!(rec.backend.as_deref(), Some("perforce"));
         assert_eq!(rec.include_shelved, Some(false));
+    }
+
+    #[test]
+    fn a_pending_marker_survives_and_is_cleared_only_deliberately() {
+        // The marker is the durable poison: set before a turn, cleared only when it is durably
+        // recorded, so a crash/failure in between leaves it set for the next resume to see.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        assert!(!store.is_pending("p4"), "nothing pending initially");
+        store.mark_pending("p4");
+        assert!(store.is_pending("p4"), "marked pending");
+        // It survives a fresh store over the same directory (i.e. an MCP server restart).
+        assert!(SessionStore::new(&dir).is_pending("p4"));
+        store.clear_pending("p4");
+        assert!(!store.is_pending("p4"), "cleared");
+        // Distinct session names have distinct markers.
+        store.mark_pending("a");
+        assert!(store.is_pending("a") && !store.is_pending("b"));
     }
 
     #[test]

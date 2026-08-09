@@ -215,12 +215,23 @@ pub fn capture(
         && skipped.is_empty()
         && segments.iter().all(|s| s.complete);
     // `inventory` returns `None` if any complete unit could not be fingerprinted (fail-closed).
-    let entries = capture_complete.then(|| inventory(&segments)).flatten();
-    let over_caps = entries.as_ref().is_some_and(|entries| {
-        // The byte cap is measured against the *actual* serialized form the session store will
-        // write (pretty JSON), not an estimate, so the on-disk record cannot exceed it unnoticed.
-        entries.len() > MAX_INVENTORY_ENTRIES
-            || serde_json::to_string_pretty(entries)
+    let full = capture_complete
+        .then(|| inventory(&segments))
+        .flatten()
+        .map(|entries| baseline::PerforceBaseline::Full {
+            schema: baseline::INVENTORY_SCHEMA,
+            entries,
+        });
+    // The byte cap is measured against the *actual* serialized `PerforceBaseline` the session
+    // store persists (pretty JSON, schema wrapper included), not an estimate of the entries
+    // alone, so the on-disk baseline cannot exceed it unnoticed.
+    let over_caps = full.as_ref().is_some_and(|full| {
+        let entry_count = match full {
+            baseline::PerforceBaseline::Full { entries, .. } => entries.len(),
+            baseline::PerforceBaseline::Disabled => 0,
+        };
+        entry_count > MAX_INVENTORY_ENTRIES
+            || serde_json::to_string_pretty(full)
                 .map(|s| s.len())
                 .unwrap_or(usize::MAX)
                 > MAX_INVENTORY_BYTES
@@ -232,11 +243,8 @@ pub fn capture(
                 .to_string(),
         );
     }
-    let perforce_baseline = Some(match entries {
-        Some(entries) if !over_caps => baseline::PerforceBaseline::Full {
-            schema: baseline::INVENTORY_SCHEMA,
-            entries,
-        },
+    let perforce_baseline = Some(match full {
+        Some(full) if !over_caps => full,
         _ => baseline::PerforceBaseline::Disabled,
     });
 
@@ -579,7 +587,12 @@ fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
         .map(|fp| fp.sha256)
         // If the workspace resolution itself came from untrustworthy `p4 info`/`clients` output,
         // the server/client fields may be wrong too, so the whole identity is unconfirmed.
-        .filter(|_| info.trustworthy);
+        .filter(|_| info.trustworthy)
+        // Both mandatory identity fields must be present: an absent `serverAddress` (or client)
+        // would leave that field empty, and two captures against *different* unreported servers
+        // would then match on the empty string. A missing field means the identity cannot be
+        // confirmed, so elision is disabled.
+        .filter(|_| !info.server.is_empty() && !info.client.is_empty());
     baseline::CaptureIdentity {
         server: info.server.clone(),
         client: info.client.clone(),
@@ -1102,9 +1115,14 @@ impl<'a> P4<'a> {
             budget.files_examined += 1;
             // The Perforce file type is authoritative and free, so a binary add is skipped
             // before it is read -- reading a multi-gigabyte `.uasset` to then discard it
-            // would be the memory spike the caps exist to avoid.
-            if is_binary_type(&depot, &opened) {
-                cl_omissions.push(format!("`{}` is binary", safe_label(&depot)));
+            // would be the memory spike the caps exist to avoid. An add whose type tag is
+            // missing/unknown is skipped for the same reason it is not diffed: unknown evidence is
+            // non-elidable, so it must not enter the inventory even if its bytes look like text.
+            if !is_diffable_text(&depot, &opened) {
+                cl_omissions.push(format!(
+                    "`{}` is binary or has no known text type",
+                    safe_label(&depot)
+                ));
                 continue;
             }
             if budget.added_remaining == 0 {
@@ -2210,25 +2228,12 @@ fn split_rev(spec: &str) -> Option<String> {
     Some(rev.to_string())
 }
 
-/// Whether an opened file's Perforce type marks it binary, independent of NUL sniffing.
-///
-/// Classified by *base* type (the part before any `+modifiers`), because a binary file must
-/// never be read and rendered as lossy UTF-8. The NUL sniff in the caller is a backstop for a
-/// file typed as text that is not; this catches the ones the type already declares -- including
-/// the legacy combined spellings (`ubinary`, `xbinary`, `uxbinary`, `tempobj`) that do not
-/// start with "binary", plus `utf16`, which is full of NUL bytes.
-fn is_binary_type(depot: &str, opened: &[OpenedFile]) -> bool {
-    opened
-        .iter()
-        .find(|f| f.depot == depot)
-        .map(|f| base_type_is_binary(&f.ptype))
-        .unwrap_or(false)
-}
-
 /// Whether `p4 diff` can be trusted to produce a real text diff for this opened edit: the file
-/// has a known, non-binary Perforce type. A missing or empty type tag (a malformed `p4 opened`
-/// record) is treated as NOT diffable, so a binary edit whose type was dropped cannot be sent to
-/// `p4 diff`, emit an empty section, and slip through without an omission (gate finding).
+/// has a known, non-binary Perforce type, classified by *base* type (the part before any
+/// `+modifiers`). A missing or empty type tag (a malformed `p4 opened` record) is treated as NOT
+/// diffable, so a binary edit whose type was dropped cannot be sent to `p4 diff`, emit an empty
+/// section, and slip through without an omission (gate finding). The legacy combined binary
+/// spellings (`ubinary`, `xbinary`, ...) and `utf16` are covered by [`base_type_is_binary`].
 fn is_diffable_text(depot: &str, opened: &[OpenedFile]) -> bool {
     opened
         .iter()
@@ -2614,24 +2619,6 @@ Change 5 by u@c on 2026/01/01\n\n\
         // Anything unrecognised falls to Other, so it can never reach `p4 diff`.
         assert!(matches!(ActionKind::of("archive"), ActionKind::Other));
         assert!(matches!(ActionKind::of(""), ActionKind::Other));
-    }
-
-    #[test]
-    fn binary_type_is_classified_from_the_type_field() {
-        let opened = vec![
-            OpenedFile {
-                depot: "//d/a".into(),
-                action: "add".into(),
-                ptype: "binary+l".into(),
-            },
-            OpenedFile {
-                depot: "//d/b".into(),
-                action: "add".into(),
-                ptype: "text".into(),
-            },
-        ];
-        assert!(is_binary_type("//d/a", &opened));
-        assert!(!is_binary_type("//d/b", &opened));
     }
 
     #[test]
