@@ -290,6 +290,16 @@ pub struct RunOutcome {
     /// review itself from stdout, so only this one makes a review unrecoverable.
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// stdout contained bytes that were not valid UTF-8 and were replaced during decoding,
+    /// so `stdout` is not a faithful copy of what the child produced. The Perforce resume
+    /// delta needs this: a fingerprint over lossily-decoded text cannot claim byte-identity
+    /// with the underlying file, so any evidence captured from such output is non-elidable.
+    pub stdout_lossy: bool,
+    /// The stdout stream ended before it was fully drained -- a pipe read error, or the collect
+    /// deadline expiring -- so `stdout` may be a partial prefix even though the process exited
+    /// cleanly. The Perforce capture treats this like truncation: an incomplete list or diff must
+    /// not be parsed as a whole and seed an elision baseline.
+    pub stdout_incomplete: bool,
 }
 
 /// Observable liveness from a reviewer child process.
@@ -305,6 +315,13 @@ impl RunOutcome {
     /// `stdout_truncated` instead -- a flooded stderr says nothing about the review.
     pub fn truncated(&self) -> bool {
         self.stdout_truncated || self.stderr_truncated
+    }
+
+    /// Whether stdout cannot be trusted as a complete, byte-faithful document: it hit the size
+    /// cap, ended before it was fully drained, or did not decode cleanly. A consumer that parses
+    /// stdout as authoritative evidence (the Perforce capture) must not trust it when this is set.
+    pub fn stdout_untrustworthy(&self) -> bool {
+        self.stdout_truncated || self.stdout_incomplete || self.stdout_lossy
     }
 
     /// stderr first: that is where CLIs put the reason they failed.
@@ -459,6 +476,8 @@ pub fn run_observed(
     Ok(RunOutcome {
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
+        stdout_lossy: stdout.lossy,
+        stdout_incomplete: stdout.incomplete,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -474,6 +493,10 @@ struct Drain {
     buffer: Arc<Mutex<Vec<u8>>>,
     done: Arc<AtomicBool>,
     truncated: Arc<AtomicBool>,
+    /// The reader broke on a pipe read *error* rather than a clean EOF, so the output may be cut
+    /// mid-stream. Distinct from `truncated` (the deliberate size cap): a consumer that needs a
+    /// complete stream (the Perforce capture) must treat this as untrustworthy.
+    errored: Arc<AtomicBool>,
 }
 
 impl Drain {
@@ -496,15 +519,23 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
+    let errored = Arc::new(AtomicBool::new(false));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
+    let writer_errored = Arc::clone(&errored);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    // A read error means the stream ended abnormally: record it so a consumer
+                    // that needs a complete stream does not parse a partial prefix as whole.
+                    writer_errored.store(true, Ordering::SeqCst);
+                    break;
+                }
                 Ok(n) => {
                     let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
                     let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
@@ -526,13 +557,17 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
         buffer,
         done,
         truncated,
+        errored,
     }
 }
 
-/// One pipe's output, and whether the cap threw any of it away.
+/// One pipe's output, whether the cap threw any of it away, whether decoding was lossy, and
+/// whether the stream ended before it was fully drained (a read error or the collect deadline).
 struct Collected {
     text: String,
     truncated: bool,
+    lossy: bool,
+    incomplete: bool,
 }
 
 /// Take what a pipe has produced, waiting until EOF or `deadline`, whichever comes first.
@@ -543,10 +578,19 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
     while !drain.done.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
+    // The stream is incomplete if the reader hit a pipe error, or if we gave up waiting before it
+    // reached EOF -- either way the buffer may be a partial prefix, which a byte-fidelity consumer
+    // (the Perforce capture) must not parse as a whole document.
+    let incomplete = drain.errored.load(Ordering::SeqCst) || !drain.done.load(Ordering::SeqCst);
     let buffer = drain.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    // Whether decoding replaced any byte: valid UTF-8 decodes losslessly, anything else does
+    // not. Recorded so a caller that needs byte-fidelity (the Perforce fingerprint) can tell.
+    let lossy = std::str::from_utf8(&buffer).is_err();
     Collected {
         text: String::from_utf8_lossy(&buffer).into_owned(),
         truncated: drain.truncated.load(Ordering::SeqCst),
+        lossy,
+        incomplete,
     }
 }
 
@@ -559,14 +603,26 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
 pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     // Gated on stdout alone. A run whose stderr flooded but whose stdout is simply empty
     // failed for some other reason, and reporting it as truncation would tell the caller
-    // not to retry when retrying is exactly right.
-    out.stdout_truncated.then(|| {
-        errors::output_truncated(
+    // not to retry when retrying is exactly right. `stdout_incomplete` (a partial prefix from a
+    // pipe error or a drain-deadline expiry) is treated the same way: a review parsed from a
+    // truncated transcript is as unreliable as one from a capped one, and the Codex JSONL
+    // fallback would otherwise return an earlier agent message as the review.
+    if out.stdout_truncated {
+        Some(errors::output_truncated(
             cfg.reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),
             out.diagnostics(),
-        )
-    })
+        ))
+    } else if out.stdout_incomplete {
+        // A partial prefix that did not hit the size cap: a distinct diagnostic, since the
+        // truncation message would wrongly claim the CLI exceeded the cap.
+        Some(errors::output_incomplete(
+            cfg.reviewer.as_str(),
+            out.diagnostics(),
+        ))
+    } else {
+        None
+    }
 }
 
 /// Turn a non-success run into the right `Failure`.
@@ -633,6 +689,17 @@ mod drain_tests {
         assert!(collected.truncated);
     }
 
+    #[test]
+    fn valid_utf8_is_not_flagged_lossy_but_invalid_bytes_are() {
+        // The Perforce fingerprint keys off this: text that decoded cleanly can be trusted as
+        // byte-faithful, text that needed replacement cannot.
+        assert!(!drained("clean utf-8 café".as_bytes().to_vec()).lossy);
+        // A lone 0xFF is not valid UTF-8, so decoding replaces it.
+        let lossy = drained(vec![b'o', b'k', 0xFF, b'!']);
+        assert!(lossy.lossy);
+        assert!(lossy.text.contains('\u{FFFD}'));
+    }
+
     /// A reader that records how many bytes were actually taken from it.
     struct Counting {
         remaining: usize,
@@ -693,6 +760,8 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: true,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
@@ -721,6 +790,8 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: true,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
@@ -750,6 +821,8 @@ mod drain_tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         };
 
         let failure = failure_for(&cfg, &out);

@@ -309,6 +309,8 @@ mod tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         }
     }
 
@@ -467,6 +469,8 @@ mod tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         }
     }
 
@@ -529,6 +533,8 @@ mod tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
@@ -560,6 +566,8 @@ mod tests {
             cancelled: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_lossy: false,
+            stdout_incomplete: false,
         };
         let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");

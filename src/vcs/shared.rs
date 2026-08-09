@@ -79,6 +79,12 @@ pub struct Capture {
     /// the next turn deltas only when its own base resolves to the same commit. Always `None`
     /// for Perforce, and `None` alongside a `None` head.
     pub base_sha: Option<String>,
+    /// The Perforce capture identity this turn ran under, recorded on the session so the next
+    /// turn only elides when its own identity matches. Always `None` for git.
+    pub capture_identity: Option<super::baseline::CaptureIdentity>,
+    /// The Perforce resume-delta baseline this turn produced (`Full` inventory or `Disabled`),
+    /// stored so the next turn knows what it may collapse against. Always `None` for git.
+    pub perforce_baseline: Option<super::baseline::PerforceBaseline>,
 }
 
 impl Capture {
@@ -88,6 +94,8 @@ impl Capture {
             warnings: vec![warning],
             head_sha: None,
             base_sha: None,
+            capture_identity: None,
+            perforce_baseline: None,
         }
     }
 }

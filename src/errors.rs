@@ -330,6 +330,26 @@ pub fn output_truncated(reviewer: &str, megabytes: usize, detail: impl Into<Stri
     .with_detail(detail)
 }
 
+/// stdout ended before it was fully read -- a pipe read error, or the drain deadline expiring --
+/// so the transcript is a partial prefix even though the process may have exited cleanly. Kept
+/// apart from `OUTPUT_TRUNCATED`, whose message asserts the CLI exceeded the size cap, which is
+/// not what happened here and can occur with a small transcript.
+pub fn output_incomplete(reviewer: &str, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "OUTPUT_INCOMPLETE",
+        format!(
+            "The '{reviewer}' CLI's output stream ended before it was fully read, so the review \
+             could not be recovered from the partial output."
+        ),
+        "The reviewer's output was cut off mid-stream (a pipe error or a drain timeout), so the \
+         transcript is incomplete and the result could not be parsed from what arrived. This is \
+         not a normal failure. Report it to the user rather than retrying blindly, and do not \
+         continue as if the review had passed."
+            .to_string(),
+    )
+    .with_detail(detail)
+}
+
 pub fn session_not_found(session: &str, id: &str) -> Failure {
     Failure::new(
         "SESSION_NOT_FOUND",
