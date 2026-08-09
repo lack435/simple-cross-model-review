@@ -101,6 +101,15 @@ impl Vcs {
         }
     }
 
+    /// A stable lowercase identity token persisted in the session record, so a resume cannot
+    /// cross backends. Kept distinct from `cli`/`name` because those are prose and may change.
+    pub fn backend_id(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Perforce => "perforce",
+        }
+    }
+
     /// The read-only history commands a shelled reviewer can run for itself, named so the
     /// reviewer prompt points it at the right tool rather than at git's.
     pub fn read_commands_phrase(self) -> &'static str {

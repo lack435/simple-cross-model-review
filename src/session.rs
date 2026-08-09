@@ -15,6 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::vcs::baseline::{CaptureIdentity, PerforceBaseline};
+
 /// Distinguishes temp files written by concurrent writers in this process.
 static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -72,6 +74,27 @@ pub struct SessionRecord {
     /// for Perforce or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
+    /// Which capture backend this session belongs to (`"git"` or `"perforce"`), so a resume
+    /// cannot cross backends: a git record must never satisfy the Perforce-only binding logic,
+    /// nor vice versa. `None` for a record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Whether the last Perforce turn was capturing shelved content. Part of the resume
+    /// binding: a session that showed a shelf and then omits it (or the reverse) must not
+    /// silently leave stale evidence in scope, so a change here refuses the incremental resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_shelved: Option<bool>,
+    /// The resolved Perforce capture identity (server, client, charset, client-spec digest) the
+    /// last turn ran under. A resume whose identity differs re-captures in full. `None` for git
+    /// or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_identity: Option<CaptureIdentity>,
+    /// The Perforce resume-delta baseline the next turn collapses against: the last *persisted*
+    /// turn's per-file inventory (`Full`) or `Disabled` when that turn was incomplete. Written
+    /// explicitly every Perforce turn -- never inherited from a prior turn -- so a stale
+    /// inventory can never be eluded against. `None` for git or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perforce_baseline: Option<PerforceBaseline>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -95,6 +118,14 @@ pub struct TurnFacts<'a> {
     /// when it has both.
     pub head_sha: Option<String>,
     pub base_sha: Option<String>,
+    /// The capture backend (`"git"`/`"perforce"`), the shelved-capture flag, the resolved
+    /// capture identity, and the Perforce delta baseline this turn produced. All `None` for a
+    /// git turn; a Perforce turn always supplies `backend`, `include_shelved`, `identity` and a
+    /// `perforce_baseline` (`Full` or `Disabled`).
+    pub backend: Option<&'a str>,
+    pub include_shelved: Option<bool>,
+    pub capture_identity: Option<CaptureIdentity>,
+    pub perforce_baseline: Option<PerforceBaseline>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -150,6 +181,10 @@ impl SessionStore {
             changes,
             head_sha,
             base_sha,
+            backend,
+            include_shelved,
+            capture_identity,
+            perforce_baseline,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -198,6 +233,16 @@ impl SessionStore {
                 // complete pair, or the prior one retained -- so it is stored as-is here.
                 head_sha,
                 base_sha,
+                // Backend, shelved flag and capture identity are the binding: stable across a
+                // session, so carry this turn's value while tolerating a `None` from a turn that
+                // did not supply one rather than erasing what is bound.
+                backend: backend.map(str::to_string).or(existing.backend.clone()),
+                include_shelved: include_shelved.or(existing.include_shelved),
+                capture_identity: capture_identity.or(existing.capture_identity.clone()),
+                // The delta baseline, unlike the binding, is *this* turn's alone: it reflects
+                // exactly what the reviewer was last shown, so it is stored directly and never
+                // inherited -- a stale inventory must never be eluded against.
+                perforce_baseline,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -213,6 +258,10 @@ impl SessionStore {
                 changes,
                 head_sha,
                 base_sha,
+                backend: backend.map(str::to_string),
+                include_shelved,
+                capture_identity,
+                perforce_baseline,
             },
         };
 
@@ -417,6 +466,10 @@ mod tests {
                     changes: None,
                     head_sha: None,
                     base_sha: None,
+                    backend: None,
+                    include_shelved: None,
+                    capture_identity: None,
+                    perforce_baseline: None,
                 },
             )
             .expect("record turn")
@@ -477,6 +530,10 @@ mod tests {
             changes: None,
             head_sha: None,
             base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -515,6 +572,10 @@ mod tests {
             changes: None,
             head_sha: head.map(str::to_string),
             base_sha: base.map(str::to_string),
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -561,6 +622,10 @@ mod tests {
             changes: None,
             head_sha: head.map(str::to_string),
             base_sha: base.map(str::to_string),
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
         };
         // The old conversation establishes a complete baseline.
         store
@@ -592,6 +657,10 @@ mod tests {
             changes,
             head_sha: None,
             base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -600,6 +669,61 @@ mod tests {
         // A later turn that carried no binding must not erase the one already stored.
         store.record_turn("p4", facts(None)).expect("turn 2");
         assert_eq!(store.get("p4").unwrap().changes, Some(vec![43650, 43651]));
+    }
+
+    #[test]
+    fn the_perforce_baseline_is_this_turns_value_and_is_never_inherited() {
+        // Unlike the (head, base) pair, the delta baseline reflects exactly what the reviewer
+        // was last shown, so every turn overwrites it: a `Full` inventory on one turn must not
+        // survive a later `Disabled` turn, or the next turn would elide against a stale set.
+        use crate::vcs::baseline::{
+            Basis, InventoryEntry, PerforceBaseline, UnitKind, INVENTORY_SCHEMA,
+        };
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |baseline: Option<PerforceBaseline>| TurnFacts {
+            reviewer: "codex",
+            cli_session_id: "thread-1",
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: "C:\\repo",
+            cumulative_usage: None,
+            changes: Some(vec![42]),
+            head_sha: None,
+            base_sha: None,
+            backend: Some("perforce"),
+            include_shelved: Some(false),
+            capture_identity: None,
+            perforce_baseline: baseline,
+        };
+        let full = PerforceBaseline::Full {
+            schema: INVENTORY_SCHEMA,
+            entries: vec![InventoryEntry {
+                change: 42,
+                basis: Basis::Workspace,
+                kind: UnitKind::TextDiff,
+                depot: "//depot/a".into(),
+                comparator: "3".into(),
+                fingerprint: crate::digest::Fingerprint::of(b"x"),
+            }],
+        };
+        store
+            .record_turn("p4", facts(Some(full.clone())))
+            .expect("turn 1");
+        assert_eq!(store.get("p4").unwrap().perforce_baseline, Some(full));
+        // A later incomplete turn records `Disabled` -- the prior `Full` must not linger.
+        store
+            .record_turn("p4", facts(Some(PerforceBaseline::Disabled)))
+            .expect("turn 2");
+        assert_eq!(
+            store.get("p4").unwrap().perforce_baseline,
+            Some(PerforceBaseline::Disabled),
+            "the baseline is overwritten every turn, never inherited"
+        );
+        // The binding (backend, include_shelved) persists across turns.
+        let rec = store.get("p4").unwrap();
+        assert_eq!(rec.backend.as_deref(), Some("perforce"));
+        assert_eq!(rec.include_shelved, Some(false));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! truncation, capped reads, fenced rendering, path sanitisation, omission bookkeeping --
 //! live in [`shared`], single-sourced so a second backend cannot fork the security logic.
 
+pub mod baseline;
 pub mod git;
 pub mod perforce;
 mod shared;

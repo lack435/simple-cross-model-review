@@ -1951,10 +1951,7 @@ Change 5 by u@c on 2026/01/01\n\n\
         );
         assert_eq!(parse_diff_header("no header here"), None);
         // The `@rev` form of the comparator is captured too.
-        assert_eq!(
-            split_rev("//depot/a@=99"),
-            Some("=99".to_string())
-        );
+        assert_eq!(split_rev("//depot/a@=99"), Some("=99".to_string()));
         assert_eq!(split_rev("//depot/a"), None);
         assert_eq!(strip_rev("//depot/a#5"), "//depot/a");
         assert_eq!(strip_rev("//depot/a@=99"), "//depot/a");

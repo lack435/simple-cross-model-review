@@ -1127,6 +1127,15 @@ impl Job {
                         // truncated diff; the record then advances or retains them as a pair.
                         head_sha: head_sha.map(str::to_string),
                         base_sha: base_sha.map(str::to_string),
+                        // The Perforce resume-delta binding and baseline. `backend` and the
+                        // shelved flag are known from config; the capture identity and the
+                        // per-file baseline come from the Perforce capture, which does not
+                        // produce them yet, so they are `None` (no elision) for now.
+                        backend: Some(self.cfg.vcs.backend_id()),
+                        include_shelved: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                            .then_some(self.include_shelved),
+                        capture_identity: None,
+                        perforce_baseline: None,
                     },
                 ) {
                     Ok(_) => true,
@@ -1443,6 +1452,10 @@ mod tests {
             changes: None,
             head_sha: None,
             base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
         }
     }
 
