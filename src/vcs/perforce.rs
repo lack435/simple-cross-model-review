@@ -532,13 +532,15 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
         if !seg.complete {
             continue;
         }
-        // The shelved basis has no authoritative file ledger yet (the `describe -s -S` cross-check
-        // is deferred): its file list comes from the `-du` diff sections alone, so a shelved file
-        // that became binary or empty produces no section and would be mis-reported as "removed".
-        // Until the ledger is added, shelved transitions are suppressed -- collapse is still safe
-        // (an absent unit cannot match a prior fingerprint), only the removed/restored notes are
-        // withheld (gate finding 5).
-        if seg.basis == DiffBasis::Shelved {
+        // Removed/restored transitions are only meaningful for a **pending** changelist, whose
+        // file set genuinely changes between turns. A *submitted* changelist is an immutable
+        // historical record -- its file list is fixed forever, so a file appearing "removed" could
+        // only ever be a capture artifact (e.g. sparse `describe` metadata), never a real change.
+        // A *shelved* changelist has no authoritative file ledger yet (the `describe -s -S`
+        // cross-check is deferred), so an absent section is ambiguous. Both therefore suppress
+        // transitions entirely; collapse stays safe in both, since an absent unit cannot match a
+        // prior fingerprint (gate findings 4/5).
+        if seg.basis != DiffBasis::Workspace {
             continue;
         }
         // One note per depot the prior turn showed that has no unit this turn. A depot still in
@@ -579,16 +581,22 @@ fn is_real_identity_field(value: &str) -> bool {
     !v.is_empty() && v != "*unknown*"
 }
 
-/// Whether `p4 client -o` output is structurally a client spec, not merely a successful-but-empty
-/// or malformed response. Requires the two mandatory spec fields (`Client:` and `Root:`), so an
-/// empty or truncated-to-comments response cannot hash to a stable "unchanged" digest.
-fn is_client_spec(raw: &str) -> bool {
+/// Whether `p4 client -o` output is a real client spec for `client`, not a successful-but-empty or
+/// malformed response. Requires the mandatory `Client:` and `Root:` fields to be present *with
+/// non-empty values*, and the `Client:` value to match the client we asked for -- so an empty
+/// `Client:\nRoot:\n`, or a spec for a different client, cannot hash to a stable "unchanged"
+/// digest (gate finding 3). `Root:` may legitimately be `null`, so only its presence and
+/// non-emptiness are checked.
+fn is_client_spec(raw: &str, client: &str) -> bool {
     let text = normalize(raw);
-    let has_field = |name: &str| {
-        text.lines()
-            .any(|line| line.trim_start().starts_with(name) && line.contains(name))
+    let field_value = |name: &str| -> Option<String> {
+        text.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?;
+            let value = rest.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
     };
-    has_field("Client:") && has_field("Root:")
+    field_value("Client:").as_deref() == Some(client) && field_value("Root:").is_some()
 }
 
 /// Resolve the capture identity a resume binds to: the server, client, charset, and a digest of
@@ -610,7 +618,9 @@ fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
         // digest unchanged and permit elision under a changed client (gate findings 4/2). The
         // output must also *be* a real client spec: an empty or structurally invalid success would
         // otherwise hash to a stable digest and read as "unchanged" (gate finding 3).
-        .filter(|out| out.success && !out.stdout_untrustworthy() && is_client_spec(&out.stdout))
+        .filter(|out| {
+            out.success && !out.stdout_untrustworthy() && is_client_spec(&out.stdout, &info.client)
+        })
         .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
         .map(|fp| fp.sha256);
     baseline::CaptureIdentity {
@@ -2256,33 +2266,29 @@ fn split_rev(spec: &str) -> Option<String> {
     Some(rev.to_string())
 }
 
-/// Whether `p4 diff` can be trusted to produce a real text diff for this opened edit: the file
-/// has a known, non-binary Perforce type, classified by *base* type (the part before any
-/// `+modifiers`). A missing or empty type tag (a malformed `p4 opened` record) is treated as NOT
-/// diffable, so a binary edit whose type was dropped cannot be sent to `p4 diff`, emit an empty
-/// section, and slip through without an omission (gate finding). The legacy combined binary
-/// spellings (`ubinary`, `xbinary`, ...) and `utf16` are covered by [`base_type_is_binary`].
+/// Whether `p4 diff` can be trusted to produce a real text diff for this opened file: it has a
+/// *known text* Perforce type, by an **allowlist** of base types (the part before any
+/// `+modifiers`). A denylist would let an unknown or newly-introduced binary type through --
+/// producing an empty diff section with no omission and slipping a binary file into the inventory
+/// (gate finding) -- so anything not explicitly text (including a missing/empty type tag) is
+/// treated as non-diffable and omitted.
 fn is_diffable_text(depot: &str, opened: &[OpenedFile]) -> bool {
     opened
         .iter()
         .find(|f| f.depot == depot)
-        .map(|f| !f.ptype.trim().is_empty() && !base_type_is_binary(&f.ptype))
+        .map(|f| is_text_base_type(&f.ptype))
         .unwrap_or(false)
 }
 
-fn base_type_is_binary(ptype: &str) -> bool {
+/// Whether a Perforce file type's base (before any `+modifiers`) is a known diffable text type.
+/// The legacy combined spellings (`xtext`, `ktext`, ...) are text with the executable/keyword
+/// modifiers folded into the base name, so they are listed explicitly. `utf16` is deliberately
+/// excluded: it is UTF-16 and full of NUL bytes, handled as binary.
+fn is_text_base_type(ptype: &str) -> bool {
     let base = ptype.split('+').next().unwrap_or(ptype).trim();
     matches!(
         base,
-        "binary"
-            | "ubinary"
-            | "xbinary"
-            | "uxbinary"
-            | "tempobj"
-            | "xtempobj"
-            | "resource"
-            | "apple"
-            | "utf16"
+        "text" | "xtext" | "ktext" | "kxtext" | "ltext" | "unicode" | "utf8"
     )
 }
 
@@ -2665,13 +2671,22 @@ Change 5 by u@c on 2026/01/01\n\n\
         assert!(!is_real_identity_field("   "));
         assert!(!is_real_identity_field("*unknown*"));
 
-        // A real client spec has the mandatory Client: and Root: fields.
+        // A real client spec has the mandatory Client: and Root: fields, with the Client value
+        // matching the client we asked for.
         let spec = "# comment\n\nClient:\tws\n\nRoot:\tC:\\ws\n\nView:\n\t//depot/... //ws/...\n";
-        assert!(is_client_spec(spec));
-        // Empty or comments-only output is not a spec, so its digest must not be trusted.
-        assert!(!is_client_spec(""));
-        assert!(!is_client_spec("# just a comment header\n"));
-        assert!(!is_client_spec("Client:\tws\n"), "missing Root:");
+        assert!(is_client_spec(spec, "ws"));
+        // A spec for a different client must not be trusted as this one's identity.
+        assert!(!is_client_spec(spec, "other"));
+        // Empty/comments-only output, or empty field values, are not a usable spec.
+        assert!(!is_client_spec("", "ws"));
+        assert!(!is_client_spec("# just a comment header\n", "ws"));
+        assert!(!is_client_spec("Client:\tws\n", "ws"), "missing Root:");
+        assert!(
+            !is_client_spec("Client:\nRoot:\n", "ws"),
+            "empty field values"
+        );
+        // Root: null is a legitimate Perforce root and is accepted (only presence is required).
+        assert!(is_client_spec("Client:\tws\nRoot:\tnull\n", "ws"));
     }
 
     #[test]
@@ -2716,17 +2731,30 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
-    fn base_type_covers_binary_aliases_and_modifiers() {
-        // The legacy combined spellings do not start with "binary", so a prefix check would
-        // miss them and read a `.uasset` as lossy text.
+    fn text_base_type_is_an_allowlist_with_modifiers_folded() {
+        // Known text base types diff cleanly, including the legacy combined spellings and any
+        // `+modifiers`.
         for t in [
-            "binary", "binary+l", "ubinary", "xbinary", "uxbinary", "tempobj", "xtempobj",
-            "resource", "apple", "utf16", "binary+w",
+            "text", "text+w", "text+k", "xtext", "ktext", "kxtext", "ltext", "unicode", "utf8",
         ] {
-            assert!(base_type_is_binary(t), "{t} should be binary");
+            assert!(is_text_base_type(t), "{t} should be diffable text");
         }
-        for t in ["text", "text+w", "unicode", "utf8", "symlink", "ktext"] {
-            assert!(!base_type_is_binary(t), "{t} should not be binary");
+        // Binary types, utf16 (NUL-laden), and -- crucially -- any unknown or empty type are NOT
+        // text, so an unknown binary type cannot slip through a denylist.
+        for t in [
+            "binary",
+            "binary+l",
+            "ubinary",
+            "uxbinary",
+            "tempobj",
+            "resource",
+            "apple",
+            "utf16",
+            "symlink",
+            "brandnewtype",
+            "",
+        ] {
+            assert!(!is_text_base_type(t), "{t} should not be diffable text");
         }
     }
 

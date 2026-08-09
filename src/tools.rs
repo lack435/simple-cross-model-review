@@ -825,9 +825,11 @@ impl Job {
                     _ => None,
                 }
             }
-            // `prior_pending` forces a full capture: the prior turn did not cleanly persist, so its
-            // baseline cannot be trusted.
-            crate::config::Vcs::Perforce if prior_pending => None,
+            // Force a full capture (no elision this turn) when either the prior turn did not
+            // cleanly persist (`prior_pending`) or this turn's in-progress marker could not be
+            // written (`!pending_marked`) -- in the latter case a later crash would be undetectable,
+            // so eliding against the prior baseline now is not safe either.
+            crate::config::Vcs::Perforce if prior_pending || !pending_marked => None,
             crate::config::Vcs::Perforce => self.prior_perforce_baseline.as_ref().map(|baseline| {
                 vcs::Resume::Perforce(vcs::perforce::PerforceResume {
                     baseline,
@@ -1277,16 +1279,31 @@ impl Job {
             None => {
                 // No session id means this turn cannot be recorded, so a prior Perforce mapping
                 // (with its now-stale baseline) would otherwise survive and be resumed. Drop it,
-                // before the panic-prone diagnostics, so the next call starts fresh.
-                if self.cfg.vcs == crate::config::Vcs::Perforce {
-                    self.sessions.forget(&self.session).ok();
+                // before the panic-prone diagnostics. Report honestly: only a confirmed removal
+                // (`Ok(true)`) means the mapping is gone; any other result may leave it, so the
+                // caller is told to force `fresh: true`. (The durable pending marker still blocks a
+                // stale-baseline collapse when it was written.)
+                let forgot = if self.cfg.vcs == crate::config::Vcs::Perforce {
+                    matches!(self.sessions.forget(&self.session), Ok(true))
+                } else {
+                    self.sessions.forget(&self.session).unwrap_or(false)
+                };
+                if forgot || self.cfg.vcs != crate::config::Vcs::Perforce {
+                    warnings.push(format!(
+                        "The reviewer did not report a session id, so session '{}' cannot be \
+                         resumed. The review below is still valid, but a follow-up call with this \
+                         session name will start a fresh review with no memory of it.",
+                        self.session
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "The reviewer did not report a session id, so session '{}' cannot be \
+                         resumed, and its stored mapping could not be reliably cleared. The review \
+                         below is valid; pass fresh: true on the next call to avoid resuming stale \
+                         state.",
+                        self.session
+                    ));
                 }
-                warnings.push(format!(
-                    "The reviewer did not report a session id, so session '{}' cannot be resumed. \
-                     The review below is still valid, but a follow-up call with this session name \
-                     will start a fresh review with no memory of it.",
-                    self.session
-                ));
                 eprintln!(
                     "cross-review: warning: the reviewer did not report a session id, so review \
                      session '{}' cannot be resumed",
