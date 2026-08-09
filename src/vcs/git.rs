@@ -480,16 +480,22 @@ pub fn capture(
     // `None` otherwise -- see it for every condition that has to hold.
     let incremental_base =
         incremental_base(cfg, resume, head_sha.as_deref(), base_sha.as_deref(), &git);
-    // Pin the capture to the HEAD resolved above. A literal `HEAD` in the diff is re-resolved
-    // by git when it runs, so a commit landing mid-capture would make the stored baseline name
-    // a commit that was never diffed. Using the resolved sha makes the diff, the stored head,
-    // and the base one commit. The delta is a two-dot `<prior>..<head>`; a full HEAD-anchored
-    // range has its right endpoint pinned; every other mode keeps its configured spelling and
-    // never becomes a baseline anyway.
-    let effective = match (&incremental_base, head_sha.as_deref()) {
-        (Some(prior), Some(head)) => DiffMode::Rev(format!("{prior}..{head}")),
-        (_, Some(head)) => pin_to_head(&cfg.diff, head).unwrap_or_else(|| cfg.diff.clone()),
-        (_, None) => cfg.diff.clone(),
+    // Pin the capture to concrete commits resolved above. A symbolic ref in the diff --
+    // `HEAD`, but also a left endpoint like `HEAD~3` or a branch such as `main` -- is
+    // re-resolved by git when the diff runs, so a commit landing mid-capture would make the
+    // stored baseline name a diff that was never shown. Both endpoints are pinned:
+    //
+    // - A full HEAD-anchored range becomes the two-dot `<base>..<head>`. That reproduces the
+    //   configured range exactly -- for a two-dot range `<base>` is the resolved left, and for
+    //   a three-dot one it is the merge-base, which is precisely what `left...HEAD` diffs
+    //   against -- with no ref left to move.
+    // - The delta is `<prior>..<head>`, both already commits.
+    // - Any other mode (working-tree, staged, a non-HEAD range, or an unresolved HEAD/base)
+    //   keeps its configured spelling and never becomes a baseline anyway.
+    let effective = match (&incremental_base, head_sha.as_deref(), base_sha.as_deref()) {
+        (Some(prior), Some(head), _) => DiffMode::Rev(format!("{prior}..{head}")),
+        (None, Some(head), Some(base)) => DiffMode::Rev(format!("{base}..{head}")),
+        _ => cfg.diff.clone(),
     };
     let mode = &effective;
 
@@ -655,26 +661,6 @@ fn effective_base(git: &Git, diff: &DiffMode, head: Option<&str>) -> Option<Stri
     } else {
         Some(left_sha)
     }
-}
-
-/// Rewrite a HEAD-anchored range's right endpoint to a resolved commit id.
-///
-/// HEAD is read once at the start of a capture, but a literal `HEAD` in the diff is resolved
-/// again by git when the diff runs -- so a commit landing between the two would make the stored
-/// baseline name a commit that was never diffed. Pinning the right endpoint to the sha we
-/// already resolved makes the diff, the stored head, and the base one consistent commit.
-/// `None` for anything that is not a range ending at HEAD: there is nothing to pin, and such
-/// modes never become a baseline.
-fn pin_to_head(diff: &DiffMode, head: &str) -> Option<DiffMode> {
-    let DiffMode::Rev(spec) = diff else {
-        return None;
-    };
-    let (left, right, three_dot) = range_endpoints(spec)?;
-    if right != "HEAD" {
-        return None;
-    }
-    let op = if three_dot { "..." } else { ".." };
-    Some(DiffMode::Rev(format!("{left}{op}{head}")))
 }
 
 /// The commit a resumed turn should review changes *since*, or `None` for a full capture.
@@ -2419,21 +2405,27 @@ mod tests {
     }
 
     #[test]
-    fn pin_to_head_rewrites_only_a_head_anchored_range() {
-        assert_eq!(
-            pin_to_head(&DiffMode::Rev("main...HEAD".into()), "abc123"),
-            Some(DiffMode::Rev("main...abc123".into()))
+    fn a_head_anchored_range_is_pinned_at_both_endpoints() {
+        // Neither a moving HEAD nor a moving left ref can change what the stored baseline names
+        // between resolution and the diff: both endpoints are resolved to concrete commits, so
+        // no symbolic ref survives into the command.
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        // A symbolic left endpoint (`HEAD~1`) resolves to `base` in this linear history.
+        let cfg = config_for(&dir, DiffMode::Rev("HEAD~1..HEAD".into()));
+        let cap = capture(&cfg, None, &cancel);
+        assert_eq!(cap.base_sha.as_deref(), Some(base.as_str()));
+        assert_eq!(cap.head_sha.as_deref(), Some(head1.as_str()));
+        let change = cap.change.expect("a change");
+        assert!(!change.command.contains("HEAD"), "{}", change.command);
+        assert!(change.command.contains(base.as_str()), "{}", change.command);
+        assert!(
+            change.command.contains(head1.as_str()),
+            "{}",
+            change.command
         );
-        assert_eq!(
-            pin_to_head(&DiffMode::Rev("main..HEAD".into()), "abc123"),
-            Some(DiffMode::Rev("main..abc123".into()))
-        );
-        // A fixed window or a keyword mode has nothing to pin -- it never becomes a baseline.
-        assert_eq!(
-            pin_to_head(&DiffMode::Rev("HEAD~3..HEAD~1".into()), "abc123"),
-            None
-        );
-        assert_eq!(pin_to_head(&DiffMode::Head, "abc123"), None);
     }
 
     #[test]
