@@ -50,6 +50,13 @@ use crate::reviewer::{self, RunOutcome};
 /// server-supplied evidence; a hostile one should not be able to spend the whole budget.
 const MAX_DESC_BYTES: usize = 8_000;
 
+/// Caps on the persisted resume inventory. Past either, the turn records `Disabled` rather than a
+/// `Full` baseline: a huge changelist is exactly where re-sending everything hurts, but a session
+/// record that large is itself a write-failure and load-cost risk, and correctness never depends
+/// on eliding (gate finding 6). Generous enough that ordinary changelists are unaffected.
+const MAX_INVENTORY_ENTRIES: usize = 5_000;
+const MAX_INVENTORY_BYTES: usize = 4_000_000;
+
 /// The prior turn's persisted state, handed to a resumed Perforce capture so it can collapse
 /// files byte-identical to what the reviewer already saw. Assembled by `tools.rs` from the
 /// session record; `None` on a fresh review.
@@ -207,13 +214,19 @@ pub fn capture(
     let capture_complete = identity.client_spec_digest.is_some()
         && skipped.is_empty()
         && segments.iter().all(|s| s.complete);
-    let perforce_baseline = Some(if capture_complete {
-        baseline::PerforceBaseline::Full {
+    let entries = capture_complete
+        .then(|| inventory(&segments))
+        .filter(|entries| {
+            // Past the caps, record `Disabled` rather than a giant session record.
+            entries.len() <= MAX_INVENTORY_ENTRIES
+                && entries.iter().map(inventory_entry_bytes).sum::<usize>() <= MAX_INVENTORY_BYTES
+        });
+    let perforce_baseline = Some(match entries {
+        Some(entries) => baseline::PerforceBaseline::Full {
             schema: baseline::INVENTORY_SCHEMA,
-            entries: inventory(&segments),
-        }
-    } else {
-        baseline::PerforceBaseline::Disabled
+            entries,
+        },
+        None => baseline::PerforceBaseline::Disabled,
     });
 
     Capture {
@@ -359,6 +372,10 @@ struct Unit {
 
 impl Unit {
     /// A text-diff unit for `depot` at comparator `rev`, holding the hunk `body`.
+    ///
+    /// A missing revision (a header we could not parse a `#N`/`@rev` from) makes the unit
+    /// **non-elidable**: without a comparator, an empty one could match another empty-comparator
+    /// unit on body alone and collapse despite the basis being unknown (gate finding 1).
     fn text_diff(
         depot: String,
         rev: Option<String>,
@@ -369,10 +386,10 @@ impl Unit {
         Self {
             depot,
             kind: baseline::UnitKind::TextDiff,
-            comparator: rev.unwrap_or_default(),
+            comparator: rev.clone().unwrap_or_default(),
             local,
             body,
-            complete,
+            complete: complete && rev.is_some(),
             collapsed: false,
         }
     }
@@ -463,6 +480,18 @@ fn inventory(segments: &[Segment]) -> Vec<baseline::InventoryEntry> {
     entries
 }
 
+/// A rough serialized size of one inventory entry, for the total-byte cap. The digest is a
+/// fixed-width hex string; the variable cost is the depot path and comparator.
+fn inventory_entry_bytes(entry: &baseline::InventoryEntry) -> usize {
+    64 + entry.depot.len()
+        + entry.comparator.len()
+        + entry
+            .fingerprint
+            .as_ref()
+            .map(|f| f.sha256.len())
+            .unwrap_or(0)
+}
+
 /// Apply the resume delta to freshly-captured segments: collapse each unit that is
 /// byte-identical to what the reviewer was shown last turn, and note files that left the
 /// changelist or lost their diff.
@@ -494,6 +523,15 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
         }
 
         if !seg.complete {
+            continue;
+        }
+        // The shelved basis has no authoritative file ledger yet (the `describe -s -S` cross-check
+        // is deferred): its file list comes from the `-du` diff sections alone, so a shelved file
+        // that became binary or empty produces no section and would be mis-reported as "removed".
+        // Until the ledger is added, shelved transitions are suppressed -- collapse is still safe
+        // (an absent unit cannot match a prior fingerprint), only the removed/restored notes are
+        // withheld (gate finding 5).
+        if seg.basis == DiffBasis::Shelved {
             continue;
         }
         // One note per depot the prior turn showed that has no unit this turn. A depot still in
@@ -533,7 +571,11 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
 fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
     let client_spec_digest = p4
         .run(&["client", "-o", &info.client], "")
-        .filter(|out| out.success && !out.stdout_lossy)
+        // A truncated spec would hash only its prefix, so a change in an omitted View/Root/Options
+        // field past the cut would leave the digest unchanged and permit elision under a changed
+        // client (gate finding 4). Reject a truncated or lossy spec: the identity is then
+        // unconfirmed and elision is disabled.
+        .filter(|out| out.success && !out.stdout_lossy && !out.stdout_truncated)
         .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
         .map(|fp| fp.sha256);
     baseline::CaptureIdentity {
@@ -709,13 +751,24 @@ impl<'a> P4<'a> {
         }
 
         if output_truncated {
-            complete = false;
             omissions.push(
                 "`p4 describe` output hit the size cap, so some of this changelist was not read."
                     .to_string(),
             );
         }
+        if output_lossy {
+            omissions.push(
+                "`p4 describe` output did not decode cleanly, so some of this changelist may be \
+                 misrepresented."
+                    .to_string(),
+            );
+        }
 
+        // Whole-segment completeness (gate findings 3/4): ANY per-file omission -- a binary or
+        // unreadable add, an out-of-root or deleted file, a lossy/truncated metadata list -- makes
+        // the segment incomplete, so it records `Disabled` and never seeds a `Full` inventory or a
+        // transition note against an unreliable file list.
+        let complete = complete && omissions.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some affected files are out of the working root, binary, or otherwise not shown"
                 .to_string()
@@ -913,10 +966,16 @@ impl<'a> P4<'a> {
                     // output is marked incomplete (non-elidable) rather than trusting a prefix.
                     let output_cut = out.stdout_truncated || out.stdout_lossy;
                     if out.stdout_truncated {
-                        complete = false;
                         omissions.push(
                             "`p4 diff` output hit the size cap; some edits may be missing from \
                              the diff."
+                                .to_string(),
+                        );
+                    }
+                    if out.stdout_lossy {
+                        omissions.push(
+                            "`p4 diff` output did not decode cleanly, so some edits may be \
+                             misrepresented."
                                 .to_string(),
                         );
                     }
@@ -1018,6 +1077,11 @@ impl<'a> P4<'a> {
             complete = false;
         }
 
+        // Whole-segment completeness (gate findings 3/4): ANY per-file omission -- a binary or
+        // unreadable add, an out-of-root or deleted file, a lossy/truncated metadata list -- makes
+        // the segment incomplete, so it records `Disabled` and never seeds a `Full` inventory or a
+        // transition note against an unreliable file list.
+        let complete = complete && omissions.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some opened files are out of the working root, binary, unread, or of an action not \
              diffed here"
@@ -1140,13 +1204,24 @@ impl<'a> P4<'a> {
         }
 
         if output_truncated {
-            complete = false;
             omissions.push(
                 "`p4 describe -S` output hit the size cap, so some of the shelf was not read."
                     .to_string(),
             );
         }
+        if output_lossy {
+            omissions.push(
+                "`p4 describe -S` output did not decode cleanly, so some of the shelf may be \
+                 misrepresented."
+                    .to_string(),
+            );
+        }
 
+        // Whole-segment completeness (gate findings 3/4): ANY per-file omission -- a binary or
+        // unreadable add, an out-of-root or deleted file, a lossy/truncated metadata list -- makes
+        // the segment incomplete, so it records `Disabled` and never seeds a `Full` inventory or a
+        // transition note against an unreliable file list.
+        let complete = complete && omissions.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some shelved files are out of the working root, binary, or otherwise not shown"
                 .to_string()
@@ -1518,7 +1593,9 @@ impl<'a> P4<'a> {
         }
         match parse_describe_ztag(&out.stdout) {
             Some(mut meta) => {
-                meta.truncated = out.stdout_truncated;
+                // Lossy output folds into `truncated`: both mean the file list cannot be trusted,
+                // and the caller uses this one flag to mark the changelist incomplete.
+                meta.truncated = out.stdout_truncated || out.stdout_lossy;
                 Some(Ok(meta))
             }
             None => Some(Err(format!(
@@ -1545,7 +1622,12 @@ impl<'a> P4<'a> {
                 first_line(&diag)
             )));
         }
-        Some(Ok((parse_opened_ztag(&out.stdout), out.stdout_truncated)))
+        // Lossy output folds into the truncation flag: a corrupted depot path would give a file a
+        // wrong identity, so treat undecodable `opened` output as an untrustworthy list.
+        Some(Ok((
+            parse_opened_ztag(&out.stdout),
+            out.stdout_truncated || out.stdout_lossy,
+        )))
     }
 
     /// Map depot paths to local paths via `p4 where`, fed on stdin so there is no
@@ -1564,7 +1646,10 @@ impl<'a> P4<'a> {
         }
         let stdin = paths.join("\n") + "\n";
         match self.run(&["-ztag", "-x", "-", "where"], &stdin) {
-            Some(out) if out.success => (parse_where_ztag(&out.stdout), out.stdout_truncated),
+            Some(out) if out.success => (
+                parse_where_ztag(&out.stdout),
+                out.stdout_truncated || out.stdout_lossy,
+            ),
             _ => (BTreeMap::new(), false),
         }
     }
@@ -2084,25 +2169,29 @@ fn first_line(text: &str) -> String {
 /// a restricted, foreign or empty changelist -- reports truncation the same way. Without it an
 /// early return would tell the reviewer "restricted" or "nothing is open" when the real reason
 /// the file list came back empty is that `p4`'s own output was truncated before it.
+/// Each flag means the command's output was untrustworthy -- cut off at the size cap, or
+/// containing bytes that did not decode cleanly. Either way the file list may be wrong, so the
+/// note marks the changelist incomplete (which forces a `Disabled` baseline).
 fn truncation_notes(meta: bool, opened: bool, wher: bool) -> Vec<String> {
     let mut notes = Vec::new();
     if meta {
         notes.push(
-            "`p4 describe` metadata hit the output size cap, so the changelist's file list or \
-             description may be incomplete."
+            "`p4 describe` metadata hit the output size cap or did not decode cleanly, so the \
+             changelist's file list or description may be incomplete."
                 .to_string(),
         );
     }
     if opened {
         notes.push(
-            "`p4 opened` output hit the output size cap, so some opened files may not be shown."
+            "`p4 opened` output hit the output size cap or did not decode cleanly, so some opened \
+             files may not be shown."
                 .to_string(),
         );
     }
     if wher {
         notes.push(
-            "`p4 where` output hit the output size cap, so some files may be missing their local \
-             mapping and treated as out of the working root."
+            "`p4 where` output hit the output size cap or did not decode cleanly, so some files \
+             may be missing their local mapping and treated as out of the working root."
                 .to_string(),
         );
     }
@@ -2514,6 +2603,70 @@ Change 5 by u@c on 2026/01/01\n\n\
         assert_ne!(
             fp(1, baseline::Basis::Workspace, &base),
             fp(1, baseline::Basis::Workspace, &add)
+        );
+    }
+
+    #[test]
+    fn a_text_unit_without_a_comparator_is_non_elidable() {
+        // A header we could not parse a revision from must never collapse: an empty comparator
+        // could otherwise match another empty-comparator unit on body alone.
+        let with = Unit::text_diff(
+            "//d/a".into(),
+            Some("3".into()),
+            "a".into(),
+            "b".into(),
+            true,
+        );
+        assert!(with.complete);
+        let without = Unit::text_diff("//d/a".into(), None, "a".into(), "b".into(), true);
+        assert!(!without.complete, "no comparator -> non-elidable");
+        // It is therefore excluded from the inventory.
+        let seg = Segment {
+            change: 1,
+            basis: DiffBasis::Workspace,
+            complete: true,
+            incomplete_reason: None,
+            description: String::new(),
+            listing: String::new(),
+            units: vec![without],
+            present_depots: vec!["//d/a".into()],
+            diff_truncated: false,
+            omissions: Vec::new(),
+            transitions: Vec::new(),
+        };
+        assert!(inventory(&[seg]).is_empty());
+    }
+
+    #[test]
+    fn apply_elision_suppresses_transitions_for_the_shelved_basis() {
+        // The shelved file list is not authoritative yet, so a file absent this turn cannot be
+        // safely called "removed". Collapse still works; only the transition notes are withheld.
+        let mut seg = Segment {
+            change: 9,
+            basis: DiffBasis::Shelved,
+            complete: true,
+            incomplete_reason: None,
+            description: String::new(),
+            listing: String::new(),
+            units: Vec::new(),
+            present_depots: Vec::new(),
+            diff_truncated: false,
+            omissions: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let prior = vec![baseline::InventoryEntry {
+            change: 9,
+            basis: baseline::Basis::Shelved,
+            kind: baseline::UnitKind::TextDiff,
+            depot: "//d/gone".into(),
+            comparator: "2".into(),
+            fingerprint: Fingerprint::of(b"x"),
+        }];
+        apply_elision(std::slice::from_mut(&mut seg), &prior);
+        assert!(
+            seg.transitions.is_empty(),
+            "shelved transitions are suppressed: {:?}",
+            seg.transitions
         );
     }
 

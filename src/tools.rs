@@ -1182,23 +1182,36 @@ impl Job {
                     Err(e) => {
                         // The review itself succeeded; losing resumability is worth a
                         // warning but not worth discarding the review.
-                        eprintln!("cross-review: warning: could not save session state: {e}");
-                        // Fail-closed for Perforce: the review was delivered, but the persisted
-                        // record is still the *prior* turn's, so its stored inventory is now stale
-                        // relative to what the reviewer just saw. A later resume that collapsed
-                        // files against it would hide this turn's changes -- so poison the session
-                        // by dropping the mapping, forcing the next call to start fresh rather than
-                        // resume a superseded baseline. Git's delta is ancestry-checked and has no
-                        // equivalent hazard.
+                        //
+                        // Fail-closed for Perforce: the write left the persisted record at the
+                        // *prior* turn, so its stored inventory is now stale relative to what the
+                        // reviewer just saw. A later resume that collapsed files against it would
+                        // hide this turn's changes -- so poison the session by dropping the
+                        // mapping, forcing the next call to start fresh. Do this *before* the
+                        // diagnostics `eprintln!`, which can panic if stderr has closed (see the
+                        // FinishGuard note above), so a lost stderr cannot skip the cleanup. Git's
+                        // delta is ancestry-checked and has no equivalent hazard.
                         if self.cfg.vcs == crate::config::Vcs::Perforce {
-                            self.sessions.forget(&self.session).ok();
-                            warnings.push(format!(
-                                "This turn could not be saved to disk ({e}). To stop a later \
-                                 review from collapsing files against a stale baseline, session \
-                                 '{}' has been reset -- a follow-up call will start a fresh \
-                                 review. The review below is unaffected.",
-                                self.session
-                            ));
+                            match self.sessions.forget(&self.session) {
+                                Ok(_) => warnings.push(format!(
+                                    "This turn could not be saved to disk ({e}). To stop a later \
+                                     review from collapsing files against a stale baseline, session \
+                                     '{}' has been reset -- a follow-up call will start a fresh \
+                                     review. The review below is unaffected.",
+                                    self.session
+                                )),
+                                // Poisoning itself failed (the state store is unwritable), so the
+                                // stale mapping may survive. Say so plainly and tell the caller to
+                                // force a fresh review rather than trust a resume.
+                                Err(forget_err) => warnings.push(format!(
+                                    "This turn could not be saved to disk ({e}), and session '{}' \
+                                     could not be reset either ({forget_err}). A follow-up resume \
+                                     of this session could collapse files against a stale baseline \
+                                     -- pass fresh: true to review it safely. The review below is \
+                                     unaffected.",
+                                    self.session
+                                )),
+                            }
                         } else {
                             warnings.push(format!(
                                 "This turn could not be saved to disk ({e}), so session '{}' may \
@@ -1206,6 +1219,7 @@ impl Job {
                                 self.session
                             ));
                         }
+                        eprintln!("cross-review: warning: could not save session state: {e}");
                         false
                     }
                 }

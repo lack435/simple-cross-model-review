@@ -21,8 +21,10 @@ safe (they only ever *disable* elision, never elide wrongly) and are candidate f
 - **The authoritative shelf ledger (`describe -s -S`, invariant 4) is not yet added.** The
   shelved path still derives its file set from the `-du` diff sections. Because any shelved
   omission or truncation forces `Disabled` under the conservatism above, this cannot cause an
-  incorrect elision — a shelf only elides when it captured cleanly — but the cross-check is a
-  planned hardening.
+  incorrect *collapse* — a shelf only elides when it captured cleanly. And because the shelved
+  file list is not authoritative, the resume delta **suppresses removed/restored transition
+  notes for the shelved basis entirely**, so it cannot mislabel a file either. Adding the
+  ledger (which would re-enable shelved transitions) is a planned hardening.
 
 Not yet done: the live `smoke.ps1` round trip against a real Perforce server (needs a server;
 the gated `live_capture_against_a_real_changelist` unit test covers the capture path when
