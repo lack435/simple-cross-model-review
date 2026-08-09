@@ -1,30 +1,33 @@
 # Perforce resume delta — design
 
-Status: **implemented** (see [Implementation status](#implementation-status)). This document
-was the plan; it went through five rounds of cross-model review (see
-[Review history](#review-history)) before implementation.
+Status: **implemented and merge-gate approved** (see [Implementation status](#implementation-status)).
+This document was the plan; it went through five rounds of cross-model review (see
+[Review history](#review-history)) before implementation, and the implementation itself went
+through eight rounds of this repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max)
+ending in APPROVE — "no remaining fail-open elision path."
 
 ## Implementation status
 
 The engine is built and lives in `src/digest.rs`, `src/vcs/baseline.rs`, `src/vcs/perforce.rs`,
-`src/session.rs`, `src/vcs/mod.rs`, `src/reviewer/mod.rs`, `src/config.rs` and `src/tools.rs`.
-Everything above is implemented as specified, with two deliberate **conservatisms** that are
-safe (they only ever *disable* elision, never elide wrongly) and are candidate follow-ups:
+`src/session.rs`, `src/vcs/mod.rs`, `src/reviewer/mod.rs`, `src/config.rs`, `src/errors.rs` and
+`src/tools.rs`. It is fail-closed on every uncertain signal — any truncation, lossy or incomplete
+output, dropped record, unknown file type, unconfirmed capture identity, digest failure, or
+un-persistable turn records `Disabled` and re-captures in full rather than risk an incorrect
+collapse. Two deliberate **conservatisms** remain (both only ever *disable* elision, never elide
+wrongly) as candidate follow-ups:
 
 - **`Full` is gated on whole-segment completeness.** A changelist records a `Full` baseline
   only when every segment is `complete` — no per-file omission at all. So a changelist that
   contains an out-of-root, binary, or deleted file (a per-file omission) records `Disabled` and
   will not elide next turn, even though its *other* files are perfectly elidable. The design's
   finer "complete inventory vs complete unit" split (invariant 4) would let those files collapse;
-  the implementation takes the stricter line for now. This is the main saving left on the table
-  for mixed changelists.
-- **The authoritative shelf ledger (`describe -s -S`, invariant 4) is not yet added.** The
-  shelved path still derives its file set from the `-du` diff sections. Because any shelved
-  omission or truncation forces `Disabled` under the conservatism above, this cannot cause an
-  incorrect *collapse* — a shelf only elides when it captured cleanly. And because the shelved
-  file list is not authoritative, the resume delta **suppresses removed/restored transition
-  notes for the shelved basis entirely**, so it cannot mislabel a file either. Adding the
-  ledger (which would re-enable shelved transitions) is a planned hardening.
+  the implementation takes the stricter line. This is the main saving left on the table for mixed
+  changelists.
+- **The authoritative shelf ledger (`describe -s -S`, invariant 4) is not yet added,** and
+  removed/restored transition notes are emitted **only for the pending workspace basis** —
+  suppressed for submitted (immutable, so a "removed" file could only be a capture artifact) and
+  shelved (no authoritative ledger). Collapse stays safe for all three bases. Adding the ledger
+  would re-enable shelved transitions.
 
 Not yet done: the live `smoke.ps1` round trip against a real Perforce server (needs a server;
 the gated `live_capture_against_a_real_changelist` unit test covers the capture path when
