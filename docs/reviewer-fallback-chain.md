@@ -1,11 +1,12 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1–7.** This document is the plan. Per
-this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Rounds 1–7 each returned REQUEST
-CHANGES — seven findings, then six, five, six, six, two, and one, all accepted; the sections
-below fold each one in, and [Review history](#review-history) records where. It is the plan for
-[issue #48].
+Status: **plan approved by the merge gate — implementation in progress.** This document is the
+plan. Per this repository's own rule it went through the `cross-review` gate (Codex,
+gpt-5.6-luna, effort=max): rounds 1–7 each returned REQUEST CHANGES — seven findings, then six,
+five, six, six, two, and one, all accepted — and round 8 returned **APPROVE** ("the plan is
+implementation-ready"). The sections below fold every finding in, and
+[Review history](#review-history) records where. The implementation is a separate change that
+goes through its own cross-review rounds. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -1004,6 +1005,10 @@ now reflects.
   auth invocation *plus a bounded non-cancellable drain tail*, and by rewording the testing and
   blast-radius text to distinguish the cancellable running-child phase from the drain residual
   ([The fall-through, budget], [Testing]). No functional change.
+- **Round 8 (same session, turn 8) — APPROVE.** "The residual budget and cancellation behavior
+  is now described consistently, and the plan is implementation-ready." All earlier findings
+  confirmed resolved, no new regressions. This is the merge gate's approval of the plan;
+  implementation proceeds as a separate change through its own gate.
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
