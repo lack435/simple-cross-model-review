@@ -1,11 +1,14 @@
 # Incremental-resume disposition, surfaced to the caller — design
 
-Status: **plan approved by the cross-review gate — implementation pending.** This document was
-the plan; it went through eight rounds of this repository's own `cross-review` gate (Codex,
-gpt-5.6-luna, effort=max), ending in APPROVE — "internally consistent and ready to guide
-implementation." Filed against issue #41 ("Incremental re-review: send the reviewer only the
-delta since its last turn"), but deliberately *not* a re-implementation of it — see
-[What #41 already got](#what-41-already-got).
+Status: **implemented and merge-gate approved.** This document was the plan; it went through
+eight rounds of this repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max)
+ending in APPROVE, and the implementation then went through two rounds of the same gate ending
+in APPROVE — "all three round-1 findings are resolved, with no new correctness, security,
+interface, or resource regressions found." The engine lives in `src/vcs/disposition.rs`,
+`src/vcs/git.rs`, `src/vcs/perforce.rs`, `src/session.rs`, `src/tools.rs`, `src/registry.rs`,
+`src/metrics.rs`, `src/vcs/shared.rs` and `src/vcs/mod.rs`. Filed against issue #41 ("Incremental
+re-review: send the reviewer only the delta since its last turn"), but deliberately *not* a
+re-implementation of it — see [What #41 already got](#what-41-already-got).
 
 ## What #41 already got
 
