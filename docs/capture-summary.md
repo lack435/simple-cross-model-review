@@ -42,6 +42,10 @@ summary to the caller in every review response").
   replacement) is no longer described as a stream that "ended early"; the token parenthetical uses
   neutral "stream incomplete or lossy" and the warning names the precise cause. Changes tagged
   *(r5)* below.
+- *r6 → r7:* one gap. `untracked_files_floor` now fires on an **outright `git ls-files` failure**,
+  not only a short/lossy successful stream — the failure branch returns an empty `OmissionReport`,
+  so the earlier formula would have left a `0 untracked — partial` line unmarked. Folded into an
+  `ls_files_incomplete` (failed *or* short) condition. Changes tagged *(r6)* below.
 
 ## Problem: the caller cannot see what change the reviewer was given
 
@@ -156,10 +160,10 @@ pub enum CaptureSummary {
         /// out-of-root, unreadable) are not in it, by the rule-3 contract.
         untracked_files: usize,
         /// `untracked_files` may be lower than the true count of new files: the enumeration
-        /// short-streamed, its listing was cut at `MAX_UNTRACKED_EXAMINED`, or the total content
-        /// budget dropped whole files. Its own typed floor — NOT `complete`, since a diff/status
-        /// gap must not put "at least" on the untracked figure. False for deliberate per-file
-        /// exclusions, which do not undercount.
+        /// failed outright, short-streamed, had its listing cut at `MAX_UNTRACKED_EXAMINED`, or the
+        /// total content budget dropped whole files. Its own typed floor — NOT `complete`, since a
+        /// diff/status gap must not put "at least" on the untracked figure. False for deliberate
+        /// per-file exclusions, which do not undercount.
         untracked_files_floor: bool,
         /// The combined diff hit the byte cap. Drives the explicit `diff:` token — a precise,
         /// unambiguous fact that cannot contradict the `partial` verdict. See "the diff token".
@@ -318,15 +322,24 @@ is never an overstatement; when the relevant evidence was shortened, the render 
     `diff_incomplete = change.diff.truncated || diff.stdout_incomplete || diff.stdout_lossy`.
 - **`untracked_files`** is the count of new files whose content was included, carried alongside the
   diff and therefore *not* in the `+/-` counts. Reported separately (the review endorsed keeping it
-  separate). *(r3/r5)* It carries its own typed floor, `untracked_files_floor`,
-  set true when the count may understate the true number of new files:
-  `ls_files_stream_short || !omissions.capture_level.is_empty()`. That covers all three
-  capture-level shortfalls — a short/lossy `git ls-files` stream, the listing cut at
-  `MAX_UNTRACKED_EXAMINED`, and *(r5)* the total content budget reaching zero and dropping whole
-  later files (`content_cap_skipped`, `src/vcs/git.rs`) — and is **false** for the deliberate
-  per-file exclusion of a binary/out-of-root/unreadable file, which does not undercount by the
-  rule-3 contract. It is a separate bool precisely because `complete` cannot stand in: a truncated
-  `status` or `diff` must not add "at least" to the *untracked* figure.
+  separate). *(r3/r5/r6)* It carries its own typed floor, `untracked_files_floor`, set true when the
+  count may understate the true number of new files:
+  `ls_files_incomplete || !omissions.capture_level.is_empty()`, covering every capture-level
+  shortfall in the untracked set:
+  - *(r6)* `ls_files_incomplete` is true when the enumeration **failed outright** (`git ls-files`
+    did not complete — today the backend pushes a note and returns an *empty* `OmissionReport`, so
+    the failure would otherwise miss the floor) **or** returned success with
+    `stdout_truncated`/`stdout_incomplete`/`stdout_lossy`. The implementation surfaces this from
+    `untracked()`, which already sees both the failure branch and the `RunOutcome` flags rather than
+    discarding them into a bare note; it also feeds `complete` and its warning (the failure note
+    already does).
+  - `!omissions.capture_level.is_empty()` covers the listing cut at `MAX_UNTRACKED_EXAMINED` and
+    *(r5)* the total content budget reaching zero and dropping whole later files
+    (`content_cap_skipped`, `src/vcs/git.rs`).
+
+  It is **false** for the deliberate per-file exclusion of a binary/out-of-root/unreadable file,
+  which does not undercount by the rule-3 contract, and is a separate bool because `complete`
+  cannot stand in: a truncated `status` or `diff` must not add "at least" to the *untracked* figure.
 - **`diff_truncated`** (`change.diff.truncated`, the byte cap) drives the `diff:` token;
   **`diff_incomplete`** (above) drives the count floor and the baseline gate; **`complete`** as
   defined above. The two diff bools are carried separately on purpose: the token states a precise
@@ -559,6 +572,9 @@ a new injection surface.
     reached, whole later files dropped) sets `untracked_files_floor == true` (and `complete ==
     false`), while a diff-only shortfall leaves `untracked_files_floor == false` — the two floors
     are independent.
+  - *(r6)* An outright `git ls-files` failure while the diff succeeds sets
+    `untracked_files_floor == true` (and `complete == false`, with the enumeration-failure warning),
+    so a `0 untracked` count is never presented as exact when the enumeration never ran.
   - The invariant itself: for each partial case above, assert `Capture::warnings` is non-empty
     (the "see warnings below" pointer is never dangling).
 - *(r4)* **Resume-baseline gate regression tests** (git, `src/vcs/git.rs`): a first capture whose
