@@ -76,7 +76,8 @@ changing which range is captured.
 Before the value, the precondition, because the second review found the first draft computing
 a disposition in cases where the server sent nothing. **A disposition is emitted only when
 both** (a) the turn is a resume (`resume_id.is_some()`) **and** (b) the server actually sent a
-change (`capture.change.is_some()`). If either is false there is no line and no warning:
+change (`capture.change.is_some()`). If either is false there is no disposition line and no
+*disposition-specific* warning:
 
 - A **fresh** turn (turn 1, or a name rebound to a new reviewer session) has no prior turn to
   be incremental against. Internally this is the `Full` state; it is never rendered.
@@ -85,6 +86,13 @@ change (`capture.change.is_some()`). If either is false there is no line and no 
   capture that **failed or was cancelled** — cannot honestly carry a disposition about a diff
   the reviewer was never handed. Saying "full re-capture" there would violate the
   say-only-what-was-sent boundary as surely as an overclaiming `Incremental` line would.
+
+**This suppresses only the new disposition output — it must not touch the existing warnings.**
+A *failed* capture already produces `Capture::warn(...)` (`src/vcs/git.rs:441`, `:519`) and
+those warnings are forwarded to the caller as the fail-closed contract requires; the
+disposition gate adds nothing there and removes nothing. The rule is precisely: no disposition
+line, and no disposition *warning*, when `change` is absent — every capture, adapter, usage and
+persistence warning that flows today still flows.
 
 So the disposition is `Option`-typed and computed from `capture.change`, not alongside it.
 
@@ -111,19 +119,30 @@ Given a resumed turn that sent a change, the git backend decides:
    without a baseline is a fall-back, not a `Full`. It covers first-turn truncation followed
    by a resume (no baseline ever persisted). It does **not** cover truncation *after* an
    established baseline, because the session retains the prior complete pair
-   (`src/session.rs:208`) and that later turn stays `Incremental`.
-4. **`FellBackToFull { CurrentHeadUnavailable }`** — HEAD will not resolve now (unborn,
-   detached, git failed), so there is no right endpoint to delta to. Distinct from #3: a
-   complete prior baseline may still exist; what is missing is *this* turn's HEAD.
+   (`src/session.rs:208`) and that later turn stays `Incremental`. **When both this and #4
+   hold (no baseline *and* HEAD will not resolve), this wins** — the absence of a baseline is
+   the more fundamental block, and it needs no git call to decide.
+4. **`FellBackToFull { CurrentHeadUnavailable }`** — HEAD will not resolve now, so there is no
+   right endpoint to delta to. This is an **unborn HEAD** (a repository with no commits) or a
+   failed `git rev-parse HEAD` — **not** a detached HEAD, which `rev-parse` resolves to its
+   commit SHA and accepts (`src/vcs/git.rs:996`); the round-3 review corrected the first
+   draft's inclusion of "detached" here. Distinct from #3: a complete prior baseline may still
+   exist; what is missing is *this* turn's HEAD.
 5. **`FellBackToFull { CurrentBaseUnresolvable }`** — the configured range's left ref no longer
    resolves, or a three-dot merge-base cannot be computed. The base is unknown, so `BaseMoved`
    cannot even be evaluated — this is why it must be a *separate* reason decided *before* it.
-6. **`FellBackToFull { BaseMoved }`** — both the prior baseline's base and the current
-   effective base are usable **and differ** (`main` advanced, or `--diff` was repointed). Only
-   reachable once #5 has established the current base resolves.
-7. **`FellBackToFull { PriorBaselineInvalid }`** — the current base matches, but the stored
-   prior HEAD is not a usable object id (a corrupt or truncated record). Guards the ancestry
-   check's input.
+6. **`FellBackToFull { PriorBaselineInvalid }`** — the **stored** prior head *or* prior base is
+   not a syntactically usable object id (a corrupt or truncated session record). Decided here,
+   **before** `BaseMoved`, because the round-3 review found the first draft comparing
+   `resume.base` against the current base *before* validating it — a garbage stored base would
+   otherwise be reported as a moved base. Both stored fields are checked, not just the head.
+   Syntactic validation (`is_object_name`) needs no git call; this does **not** claim the
+   stored ids are still *reachable* objects (that would need a query and is not required — see
+   below).
+7. **`FellBackToFull { BaseMoved }`** — the stored base and the current effective base are both
+   present and valid (per #5 and #6) **and differ** (`main` advanced, or `--diff` was
+   repointed). This is a comparison of two object ids the server itself produced; it does not
+   assert either is still reachable, only that the recorded base is not the current one.
 8. **`FellBackToFull { AncestryUndecidable }`** — the ancestry check could not be *run* (git
    error/timeout): a *three-way* result, not the `false` that today's `is_ancestor` collapses
    error into. Reported as its own reason rather than mislabelled `BranchRewritten`.
@@ -137,9 +156,14 @@ Every `FellBackToFull { … }` reason warns (an eligible delta that stopped happ
 surprise); every `FullByDesign { … }` reason does not; `Incremental` does not. That mapping is
 now a property of the state, not a per-call judgement.
 
-The **Perforce** backend substitutes its own durability/identity reasons for #3–#9, decided in
-`tools.rs` before capture (see [finding 4](#perforce-durability-reasons)); #1, #2 and #10 apply
-unchanged.
+The **Perforce** backend substitutes its own durability/identity reasons for #3–#9, but they
+are **not** all decided in one place — the round-3 review corrected this. `#1`
+(`--no-incremental-resume`) and `#10` (`Incremental`) apply unchanged; **`#2` (`ModeNotDeltable`)
+does not apply at all**, because `--diff` is git-only and a Perforce review always intends to
+capture its named changelists (`src/config.rs:465`, `:581`). Where each Perforce reason is
+decided — split between `tools.rs` (the pre-capture marker guards) and `perforce::capture`
+(identity, shelved-mode, inventory usability, via `elision_active`) — is spelled out under
+[Perforce durability reasons](#perforce-durability-reasons).
 
 Making it an enum — not a prose sentence — is the point: machine-checkable by the calling
 agent, assertable in unit tests, greppable in the smoke test. The prose the caller reads is
@@ -169,8 +193,12 @@ them to preserve it. Concretely, three call sites lose information today:
   "git errored / timed out."** Labelling every `false` as `BranchRewritten` would be a factual
   claim the code cannot back. Return a three-way answer (yes / no / undecidable) so the
   no-case is `BranchRewritten` and the error-case is `AncestryUndecidable`.
-- **The prior HEAD is validated before the ancestry check**, so a corrupt/truncated stored id
-  is `PriorBaselineInvalid`, not fed to git.
+- **Both stored baseline fields (prior head *and* prior base) are validated before either is
+  used** — the base before the `BaseMoved` comparison, the head before the ancestry check — so
+  a corrupt/truncated stored id is `PriorBaselineInvalid` rather than silently miscompared or
+  fed to git. Today the code compares `resume.base` before validating the stored head
+  (`src/vcs/git.rs:700`, `:703`) and never validates the stored base; this reorders and
+  completes that.
 - **Fresh-vs-resumed is invisible to `vcs::capture`, which receives only `Option<Resume>`
   (`src/vcs/mod.rs:34-38`).** `None` there means *both* "a fresh turn" and "a resumed turn
   whose session held no baseline" — the backend cannot tell them apart, and it must not, since
@@ -179,12 +207,18 @@ them to preserve it. Concretely, three call sites lose information today:
   no-baseline reason are assigned in `tools.rs`**, which knows `resume_id` and whether a
   baseline was passed; the backend only reports the decisions that are its own (mode, base,
   ancestry).
-- **The Perforce durability reasons are decided in `tools.rs:805-833` *before* `capture`
-  runs** — see [below](#perforce-durability-reasons).
+- **The Perforce durability reasons are decided in *two* layers, not one:** the marker guards
+  in `tools.rs:805-833` before capture, and identity/mode/inventory inside `perforce::capture`
+  (`elision_active`). The round-3 review corrected the first draft's claim that they all live
+  in `tools.rs` — see [below](#perforce-durability-reasons).
 
 None of these add a git/p4 call for the *decision* (the ancestry and base-resolve commands
-already run); they change what the existing calls' outcomes are allowed to say. The one place
-a new query would be needed is an optional commit *count* — see below.
+already run); they change what the existing calls' outcomes are allowed to say, and add
+*syntactic* validation of the stored ids, which is free. Two things are explicitly **not**
+free and are called out where they arise: proving a stored id is still a *reachable* object
+(not required — `BaseMoved` only compares recorded-vs-current, and the ancestry command
+reports an unavailable prior head as `AncestryUndecidable`), and the optional commit *count*
+(a `rev-list --count`, see below).
 
 Then thread the disposition out through `Capture` (which already carries `head_sha` /
 `base_sha` — note that `CapturedChange` does **not**; the first draft misplaced this) to
@@ -192,22 +226,30 @@ Then thread the disposition out through `Capture` (which already carries `head_s
 
 #### Perforce durability reasons
 
-The Perforce full-capture cases are already *decided* in `tools.rs` (`:805-833`, `:862`), but
-the first draft's single `PriorTurnUnpersisted` conflated distinct ones. Separate them (or use
-one `DurabilityGuard` reason carrying structured detail), with a defined precedence when more
-than one holds:
+The Perforce full-capture reasons are **decided in two different places**, and the round-3
+review found the first draft wrongly attributing all of them to `tools.rs`. The split follows
+where each decision actually lives:
 
-- `PriorTurnPending` — the *previous* turn left an uncleared in-progress marker
-  (`is_pending`): it crashed or failed to persist, so its baseline may be stale.
-- `MarkerUnwritable` — *this* turn could not write its in-progress marker (`!pending_marked`),
-  so a later crash would be undetectable and the turn refuses to elide (and records
-  `Disabled`). A current durability failure, not evidence about the prior turn.
-- `PriorBaselineUnusable` — the prior turn persisted `PerforceBaseline::Disabled` or an
-  inventory that does not match this turn's identity/mode. Distinct from a missing marker.
+- **Decided in `tools.rs`, before capture** (`:805-833`) — the durable-marker guards, which is
+  why `tools.rs` forces `resume = None` in these cases:
+  - `PriorTurnPending` — the *previous* turn left an uncleared in-progress marker
+    (`is_pending`): it crashed or failed to persist, so its baseline may be stale.
+  - `MarkerUnwritable` — *this* turn could not write its in-progress marker (`!pending_marked`),
+    so a later crash would be undetectable and the turn refuses to elide (and records
+    `Disabled`). A current durability failure, not evidence about the prior turn.
+- **Decided inside `perforce::capture`, via `elision_active`** (`src/vcs/perforce.rs:149`) —
+  the identity, mode and inventory checks:
+  - `IdentityChanged` — the resolved capture identity differs from the baseline's.
+  - `ModeOrShelvedChanged` — the shelved-capture flag differs.
+  - `PriorBaselineUnusable` — **restricted** to a prior baseline that is `Disabled` or an
+    otherwise unusable inventory. The first draft let this overlap the two reasons above by
+    including identity/mode mismatches; those are their *own* reasons, so this one is now only
+    the "the stored inventory itself is not usable" case.
 
-Plus the identity/mode cases already named: `IdentityChanged`, `ModeOrShelvedChanged`. When
-several apply at once, precedence is: marker failures (they mean the durability guarantee is
-absent) before identity/mode mismatches before baseline-content mismatches.
+So the backend returns its identity/mode/inventory decision and `tools.rs` combines it with the
+pre-capture marker decision. Precedence when several hold: the marker guards win (they mean the
+durability guarantee is absent at all), then identity/mode mismatch, then an unusable
+inventory.
 
 ### What the detail can honestly say
 
@@ -316,10 +358,13 @@ nothing.
   - `BaseMoved` — base ref advanced to a different, *resolvable* commit.
   - `CurrentBaseUnresolvable` — the configured left ref no longer resolves; asserts it does
     **not** get mislabelled `BaseMoved`.
-  - `CurrentHeadUnavailable` — HEAD will not resolve; asserts a retained prior baseline is not
-    mislabelled `NoCompleteBaselineRetained`.
-  - `PriorBaselineInvalid` — a corrupt stored prior HEAD; asserts it never reaches the
-    ancestry command.
+  - `CurrentHeadUnavailable` — an **unborn** HEAD (no commits); asserts a retained prior
+    baseline is not mislabelled `NoCompleteBaselineRetained`. A separate test asserts a
+    **detached** (but committed) HEAD stays `Incremental` — `rev-parse HEAD` resolves it, so it
+    is *not* `CurrentHeadUnavailable` (round-3 finding 4).
+  - `PriorBaselineInvalid` — a corrupt stored prior **base** (asserting it is not miscompared
+    as `BaseMoved`) *and* a corrupt stored prior **head** (asserting it never reaches the
+    ancestry command). Both stored fields, per round-3 finding 2.
   - `FullByDesign { ModeNotDeltable }` — a working-tree (`--diff HEAD`) or non-HEAD range
     resume; asserts it emits the info line but **no** warning.
   - `FullByDesign { Disabled }` — `--no-incremental-resume`; same no-warning assertion.
@@ -328,9 +373,12 @@ nothing.
     baseline, which must still delta from the retained older complete `(head, base)` pair
     (`src/session.rs:208`, `src/tools.rs:821-825`) → **`Incremental`**, proving the reason is
     "no complete baseline retained," not "the last capture truncated."
-- **Unit, no-capture states (round-2 finding 3):** `--diff auto` with a shell-equipped
-  reviewer, `--diff none`, a cancelled capture, and a failed capture each emit **no**
-  disposition and **no** warning — the server sent no change, so it says nothing about one.
+- **Unit, no-capture states (round-2 finding 3, round-3 finding 1):** `--diff auto` with a
+  shell-equipped reviewer, `--diff none`, and a cancelled capture emit **no disposition line
+  and no disposition warning**. A **failed** capture likewise emits no *disposition* output —
+  but its existing `Capture::warn(...)` warning must still reach the caller unchanged; the test
+  asserts both (the disposition is absent *and* the pre-existing failure warning is preserved),
+  so the disposition gate cannot regress the fail-closed contract.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
   `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
 - **Unit, tools:** a resumed turn that sent a change emits the disposition line; a fresh turn
