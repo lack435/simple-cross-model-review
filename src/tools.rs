@@ -941,7 +941,7 @@ impl Job {
 
         // Captured once, before the attempt runs, so the reviewer's prompt and the usage
         // metrics below describe the same diff.
-        if self.cfg.supplies_change() {
+        if self.cfg.chain_needs_capture() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
@@ -1304,7 +1304,11 @@ impl Job {
         //
         // The capability text is told what was actually captured rather than what was
         // configured, so a diff that could not be produced is never announced.
-        let capabilities = self.cfg.reviewer_capabilities(change.is_some());
+        // Rendered for the *active* entry, so a mixed-family fallback is told the truth about its
+        // own shell/self-serve ability rather than the primary's.
+        let capabilities = self
+            .cfg
+            .reviewer_capabilities_of(self.spec.reviewer, change.is_some());
         let capabilities = if self.cfg.no_preamble {
             None
         } else {

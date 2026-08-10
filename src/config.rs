@@ -775,7 +775,13 @@ impl Config {
 
     /// True when the reviewer has any shell at all.
     pub fn reviewer_has_shell(&self) -> bool {
-        match self.primary().reviewer {
+        self.reviewer_has_shell_of(self.primary().reviewer)
+    }
+
+    /// `reviewer_has_shell`, evaluated for a specific chain entry rather than the primary. The
+    /// tool/allow-list inputs it consults are process-global, so only the reviewer kind varies.
+    pub fn reviewer_has_shell_of(&self, reviewer: ReviewerKind) -> bool {
+        match reviewer {
             // Codex runs under a sandbox policy rather than a tool allow-list, so its
             // shell is always present and always write-denied.
             ReviewerKind::Codex => true,
@@ -815,12 +821,20 @@ impl Config {
     /// always to supply -- whether a change actually arrives depends on the capture, which is
     /// the runtime question this caller-facing intent does not promise.
     pub fn supplies_change(&self) -> bool {
+        self.supplies_change_of(self.primary().reviewer)
+    }
+
+    /// `supplies_change`, evaluated for a specific chain entry rather than the primary.
+    ///
+    /// Under `--diff auto` the answer is per-reviewer (a shell-less entry needs the diff, a
+    /// shelled one does not), which is why `chain_needs_capture` folds it across every entry.
+    pub fn supplies_change_of(&self, reviewer: ReviewerKind) -> bool {
         // Each backend matches exhaustively: a new mode or backend states its answer here
         // rather than opting itself in by falling through a wildcard.
         match self.vcs {
             Vcs::Git => match self.diff {
                 DiffMode::None => false,
-                DiffMode::Auto => !self.reviewer_has_shell(),
+                DiffMode::Auto => !self.reviewer_has_shell_of(reviewer),
                 DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
             },
             // The `change` argument is required for a Perforce review (enforced in `tools.rs`
@@ -828,6 +842,19 @@ impl Config {
             // change.
             Vcs::Perforce => true,
         }
+    }
+
+    /// Whether the capture must be gathered at all, folded across the whole chain.
+    ///
+    /// The change is captured whenever *any* entry the walk might reach would need it — not
+    /// merely the primary — because a `Codex → Claude` chain must have the diff ready for the
+    /// shell-less Claude fallback even though the Codex primary would fetch its own. A shelled
+    /// entry handed the captured change is the harmless `--diff HEAD` case. See
+    /// `docs/reviewer-fallback-chain.md`.
+    pub fn chain_needs_capture(&self) -> bool {
+        self.reviewers
+            .iter()
+            .any(|spec| self.supplies_change_of(spec.reviewer))
     }
 
     /// Whether the reviewer can fetch the change/history itself with its own tools.
@@ -844,11 +871,19 @@ impl Config {
     /// does not), cannot be reliably inspected for it, and would be client-less here anyway.
     /// So p4 self-serve is promised to no Claude reviewer and only to a networked Codex one --
     /// erring toward "rely on the captured change", which is always the safe direction.
+    /// Primary-entry convenience used by the config tests; the run path uses the `_of` variant
+    /// with the active entry.
+    #[cfg(test)]
     pub fn reviewer_can_self_serve_change(&self) -> bool {
+        self.reviewer_can_self_serve_change_of(self.primary().reviewer)
+    }
+
+    /// `reviewer_can_self_serve_change`, evaluated for a specific chain entry.
+    pub fn reviewer_can_self_serve_change_of(&self, reviewer: ReviewerKind) -> bool {
         match self.vcs {
-            Vcs::Git => self.reviewer_has_shell(),
+            Vcs::Git => self.reviewer_has_shell_of(reviewer),
             Vcs::Perforce => {
-                matches!(self.primary().reviewer, ReviewerKind::Codex)
+                matches!(reviewer, ReviewerKind::Codex)
                     && self.sandbox.trim() == "danger-full-access"
             }
         }
@@ -890,10 +925,22 @@ impl Config {
     /// `diff_supplied` is the *runtime* answer, not `supplies_change()`: a configured change
     /// that could not be captured (no git/p4, not a repository) must not be announced, or the
     /// reviewer goes looking below for a section that is not there.
+    /// Primary-entry convenience used by the config tests; the run path uses the `_of` variant
+    /// with the active entry.
+    #[cfg(test)]
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
+        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied)
+    }
+
+    /// `reviewer_capabilities`, rendered for a specific chain entry.
+    ///
+    /// This is rendered per *active* entry at turn time, from the captured change, so a
+    /// mixed-family fallback is told the truth about *its* shell and self-serve ability — the
+    /// captured block itself is capability-neutral. See `docs/reviewer-fallback-chain.md`.
+    pub fn reviewer_capabilities_of(&self, reviewer: ReviewerKind, diff_supplied: bool) -> String {
         let mut out = String::new();
-        match self.primary().reviewer {
-            ReviewerKind::Codex if self.reviewer_can_self_serve_change() => {
+        match reviewer {
+            ReviewerKind::Codex if self.reviewer_can_self_serve_change_of(reviewer) => {
                 out.push_str(&format!(
                     "You can read any file in this project and inspect the change history \
                      yourself, but only through simple, single read commands: {}, ripgrep \
@@ -934,7 +981,7 @@ impl Config {
                     self.vcs.name(),
                 ));
             }
-            ReviewerKind::Claude if self.reviewer_has_shell() => {
+            ReviewerKind::Claude if self.reviewer_has_shell_of(reviewer) => {
                 // Not "read-only", unlike the Codex arm above. That one is a sandbox
                 // policy; this one is a prefix allow-list, which this file's own
                 // `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified,
@@ -968,7 +1015,7 @@ impl Config {
                  changed. If judging it needs history the section does not include, say so under \
                  \"What I could not check\".",
             );
-        } else if !self.reviewer_can_self_serve_change() {
+        } else if !self.reviewer_can_self_serve_change_of(reviewer) {
             // Not merely `!reviewer_has_shell()`: a Codex reviewer under a no-network sandbox
             // has a shell but still cannot reach Perforce, so with no captured change it is in
             // the same position as a shell-less reviewer and needs the same guidance.

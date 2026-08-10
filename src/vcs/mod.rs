@@ -86,7 +86,7 @@ fn git_capture(
     let change = captured.change.map(|change| CapturedChange {
         diff_bytes: change.diff.text.len(),
         diff_truncated: change.diff.truncated,
-        rendered: git::render(&change, &cfg.cwd, cfg.reviewer_has_shell()),
+        rendered: git::render(&change, &cfg.cwd),
     });
     Capture {
         change,

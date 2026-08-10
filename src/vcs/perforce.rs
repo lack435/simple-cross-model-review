@@ -1493,12 +1493,7 @@ fn render(
         safe_label(&info.client),
         safe_label(&info.root)
     );
-    let mut out = evidence_preamble(
-        &command,
-        &cfg.cwd,
-        cfg.reviewer_can_self_serve_change(),
-        "p4",
-    );
+    let mut out = evidence_preamble(&command, &cfg.cwd);
 
     // On a resumed turn that collapses unchanged files, say so up front, or the reviewer reads a
     // handful of diffs as the whole change and reports everything else as missing.
