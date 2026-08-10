@@ -73,10 +73,14 @@ does not vanish. For a **single** detached review it is bounded and mitigated:
 
 - **The budget caps the spend.** A detached review runs at most `--timeout-seconds` (default
   30 min) before the server stops it. It cannot bill unbounded.
-- **The session lease releases when the review finishes**, not when it is collected. A detached
-  review that runs to completion frees its session; a later `cross_model_review` on that session
-  is refused as `SESSION_BUSY` only while the review is genuinely still running — which is
-  correct, since you should not start a second review of a session mid-review anyway.
+- **The session lease releases when the worker finishes**, not when the review is collected.
+  Precisely: the lease is the `_lease` field on the `Job` (`src/tools.rs`, "dropping the job
+  releases the session"), so it is freed when the worker thread returns — which is just *after*
+  `Registry::finish` flips the terminal state and its post-finish accounting runs, not exactly at
+  `finish`. Either way it is bounded by the worker's own lifetime, not by whether a caller ever
+  collects. A later `cross_model_review` on that session is refused as `SESSION_BUSY` only while
+  the worker is genuinely still running — which is correct, since you should not start a second
+  review of a session mid-review anyway.
 - **Explicit cancellation still exists.** An agent that truly wants to stop the spend calls
   `cross_model_review_cancel`. The kill path is not removed; it is moved to the tool whose *job*
   is to kill, and off the tool whose job is to wait.
@@ -100,10 +104,12 @@ fresh session name each time and detaches every poll can accumulate arbitrarily 
 reviews at once. That is a real exposure this change introduces, and "bounded by the budget" is
 true only per review.
 
-So this PR adds an explicit **global cap on concurrently-running reviews** as the backstop:
+So this PR adds an explicit **per-process cap on concurrently-running reviews** as the backstop:
 
 - A new `--max-concurrent-reviews <n>` config knob (default a small figure — proposed **8** — that
-  no legitimate flow reaches; a serial dogfooding session runs one at a time).
+  no legitimate flow reaches; a serial dogfooding session runs one at a time). `0` disables the
+  check, consistent with the other limit knobs — but `0` is an explicit opt-out, **not** the
+  default: a finite backstop shipped by default is the point.
 - `Registry::try_start` gains a third refusal: alongside `Busy(existing)` and `ShuttingDown`, a
   `TooManyRunning { limit }` returned when the count of `Status::Running` reviews is already at the
   cap, mapped to a plain agent-facing error (`errors::too_many_running`) that tells the caller to
@@ -111,6 +117,18 @@ So this PR adds an explicit **global cap on concurrently-running reviews** as th
   since it is the agent's own call to make.
 - The check is inside `try_start`, under the same state lock that inserts the review, so two
   concurrent starts cannot both slip past a cap of *n* into *n+1*.
+- **It is a per-*process* cap, and the plan says so plainly rather than calling it "global."** `App`
+  holds one in-memory `Registry` per process (`src/tools.rs`, `src/registry.rs`), and the README
+  supports two server processes sharing one state directory. The cap lives in that in-memory
+  registry, so *N* server processes admit up to *N × limit* concurrent reviews; the cross-process
+  session lease bounds duplicate work on the *same* session name but does not coordinate a shared
+  running-count. A genuinely cross-process slot lease would need a crash-safe shared counter — the
+  same complexity the README notes was deliberately avoided for session state — and is
+  disproportionate to a backstop against a runaway *caller* (the trusted agent), which is a
+  per-process actor. The single-server case is the norm and is fully covered; the multi-server
+  multiplier is documented, not hidden.
+- Admission tests: the cap refuses at the limit, two concurrent starts cannot exceed it, and `0`
+  disables the check.
 
 What this deliberately does **not** bound: the count of persisted **session records**
 ([`session.rs`](../src/session.rs) `record_turn` writes one per distinct session name, uncapped
@@ -138,15 +156,39 @@ draft got wrong:
   `running` at the boundary. The cap has to account for the full path or it fails the very
   "one blocking call catches the result" property it exists to provide.
 - **Effective cap = `CAPTURE_BUDGET + cfg.timeout + FINALIZATION_GRACE`.** `FINALIZATION_GRACE` is
-  a single new named constant (proposed ~30s) covering output drain + transcript parse + session
-  persistence — the bounded tail after the reviewer clock stops. Computed with saturating
-  arithmetic so a pathological `--timeout-seconds` near `u64::MAX` cannot overflow. This is the
-  maximum wall-clock from review start to terminal state, so a single blocking call issued at or
-  after start reliably observes the terminal result (a completed review, or a `TIMEOUT` failure)
-  rather than a `running` snapshot.
+  a single new named constant (proposed ~30s) covering the tail after the reviewer clock stops:
+  the output-drain grace, transcript parse, and session persistence.
+- **Honest about what this is: a practical sizing, not a proven ceiling.** Two parts of the tail
+  are not themselves deadline-enforced in the code, so `max_wait()` is a generous cover for the
+  realistic lifecycle, not a mathematical upper bound on time-to-terminal-state:
+  - The Codex **final-message file read** is currently unbounded (`src/reviewer/codex.rs:138`,
+    `std::fs::read_to_string`). This PR **caps that read** at the existing 8 MiB stream cap, so the
+    one adversarially-controllable term becomes bounded and consistent with the pipe cap the README
+    already documents.
+  - **Session persistence has no wall-clock deadline** (`src/session.rs`), so a stalled disk write
+    could in principle push the terminal state past `max_wait()`. This PR does **not** add a
+    persistence timeout: the code deliberately treats session-mapping durability as load-bearing (a
+    session that cannot be persisted is reported as a warning and the response stops inviting a
+    resume), and a timeout there risks dropping a mapping that is mid-write. It is a small JSON
+    write of local state, not attacker-controlled latency, so it is left as documented residual.
+  - **Why the residual is acceptable here specifically:** because the whole design is now
+    non-destructive, a wait that expires one moment before the terminal state simply returns a
+    `running` snapshot and the caller polls once more — cheap, and it cannot lose the review. Under
+    the *old* destructive semantics that same boundary miss would have been fatal, which is exactly
+    why a proven ceiling would have mattered then and is only a nicety now. So the claim is
+    weakened to: **`max_wait()` catches the terminal state in one call in every realistic case, and
+    a boundary miss degrades to a single extra poll, never to lost work.** "One blocking call" is
+    the norm, not an asserted invariant.
 - **Derived, not a fixed 1800.** If an operator sets `--timeout-seconds 3600`, the cap tracks it.
   The cap follows the configured budget instead of a second hard-coded number that would silently
   disagree with it.
+- **`--timeout-seconds` gets a sane upper bound (fixes a latent overflow).** Today it accepts any
+  `u64` and several deadlines are computed as `Instant::now() + timeout` without checking
+  (`src/registry.rs:523`, `src/reviewer/mod.rs:424`), which panics on overflow. Deriving the wait
+  cap from `timeout` makes that latent bug easier to reach, so this PR rejects an out-of-range
+  `--timeout-seconds` at parse time (a defined maximum — proposed 24h — well above any real review)
+  rather than only saturating the cap sum, which would leave the `Instant + Duration` sites able to
+  panic. Saturating arithmetic on the cap computation stays as belt-and-braces.
 - **Default `wait_seconds` blocks to completion.** When `wait_seconds` is omitted, the call waits
   the full effective cap. The ergonomic no-argument path — `cross_model_review_result` with just a
   `review_id` — becomes the one blocking call the issue asks for. A caller that wants a quick "is
@@ -223,19 +265,35 @@ documents this and sets `shutdown` inside `State` before notifying for precisely
 Shutdown behaviour is unchanged: `begin_shutdown` already wakes parked waits, so a park up to the
 new (larger) cap is still released the instant stdin closes.
 
-### 3. The cap and the concurrency backstop (`src/config.rs`, `src/registry.rs`, `src/tools.rs`, `src/mcp.rs`, `src/errors.rs`)
+**What "returns promptly" does and does not cover.** `wake()` guarantees the parked `Registry::wait`
+returns. It does not guarantee the whole handler unwinds instantly: when a progress token was
+supplied, the handler then drops the `ProgressReporter`, which joins the progress thread
+(`src/mcp.rs:342`), and that thread can be mid-`send_progress` blocked on a stdout the client has
+stopped draining (`src/mcp.rs:324`). That join-on-a-blocked-stdout hazard already exists for **every**
+completed result call today — it is not introduced here — so this PR narrows the claim to "the wait
+is woken promptly" rather than "the handler returns promptly," notes the pre-existing progress-join
+caveat, and adds a progress-enabled cancellation test to pin the wake behaviour. Making the progress
+send itself time-bounded/interruptible is a separate, broader change to the stdout path and is out
+of scope.
+
+### 3. The cap, the concurrency backstop, and the finalization bound (`src/config.rs`, `src/registry.rs`, `src/reviewer/codex.rs`, `src/tools.rs`, `src/mcp.rs`, `src/errors.rs`)
 
 - `src/config.rs`: replace the fixed `MAX_WAIT_SECS = 300`. Introduce a derivation
   `Config::max_wait()` = `CAPTURE_BUDGET + timeout + FINALIZATION_GRACE`, saturating (see the cap
   section above for why all three terms are needed). `FINALIZATION_GRACE` is a new named constant.
   Keep `DEFAULT_WAIT_SECS`'s *meaning* as "block to completion" — i.e. an omitted `wait_seconds`
   resolves to `max_wait()`.
+- `src/config.rs`: validate `--timeout-seconds` against a defined maximum (proposed 24h) as well as
+  the existing `> 0` check, so the `Instant::now() + timeout` deadline sites cannot overflow.
 - `src/config.rs`: add `--max-concurrent-reviews <n>` (default 8), parsed like the other numeric
   flags, `0` disables the check (consistent with `--session-max-turns`/`--session-max-idle-seconds`).
 - `src/registry.rs`: `try_start` counts `Status::Running` reviews under the state lock and returns
   the new `StartRefused::TooManyRunning { limit }` when at the cap. `src/errors.rs`: a plain
   `too_many_running` correction (not an escalation code), telling the caller to collect or cancel an
   outstanding review. `src/tools.rs`/`src/mcp.rs`: map it on the start path next to `Busy`/`ShuttingDown`.
+- `src/reviewer/codex.rs`: cap the final-message file read at the existing 8 MiB stream cap instead
+  of an unbounded `read_to_string`, so the one adversarially-sized term in the finalization tail is
+  bounded and consistent with the pipe cap.
 - `src/tools.rs` `review_result`: `wait = args.wait_seconds.unwrap_or(max_wait()).min(max_wait())`.
 - `src/tools.rs` `render_start`: the "Use wait_seconds=300; if it returns status=running, call it
   again" guidance becomes "collect it with one call; it blocks until the review is done."
@@ -289,17 +347,30 @@ new (larger) cap is still released the instant stdin closes.
   (they re-park). Use the existing `parks`-counter barrier to force the cancellation into the
   window *between* the flag check and parking (the reviewer's finding-1 test), so a lost-wakeup
   regression fails the test rather than passing on timing luck.
-- `smoke.ps1` — **contract change, called out loudly.** Step 7 today cancels a `_result` poll and
-  asserts the review is `CANCELLED`. Under the new semantics a `_result` cancellation must leave the
-  review *alive*, so the assertion is split across **two independent reviews** — reusing one review
-  for both halves is nondeterministic, since the poll-cancellation review may finish naturally
-  before the explicit cancel and would then report `completed`, not `CANCELLED`:
-  1. **Review A** — start it, poll, cancel the poll → assert the poll is never answered (unchanged)
-     **and** a fresh collect returns the review still running *or* completed and collectible (i.e.
-     not `CANCELLED`, not gone). This proves poll-cancellation is non-destructive.
-  2. **Review B** — a separate review, still running → call `cross_model_review_cancel` explicitly →
-     assert it is now `CANCELLED` and the reviewer is dead. This is the "cancellation stops the
-     reviewer" assertion; it moves to the tool that actually owns killing.
+- **The authoritative cancellation contract moves to deterministic unit tests, not `smoke.ps1`.**
+  A real-model smoke run cannot *guarantee* a review is still mid-flight when the cancellation is
+  sent, so any assertion that depends on that timing is inherently flaky (Review A could finish
+  before the poll cancellation, letting the old destructive behaviour pass unnoticed; Review B could
+  finish before the explicit cancel, making `CANCELLED` flaky). So the load-bearing assertions live
+  where lifecycle is fully controlled — registry-level tests driving a scripted/fake reviewer:
+  - poll cancellation (`attach_wait` + `cancel()` → `Detach`) leaves the review `Running` and
+    collectible; the parked wait is woken (finding-1 barrier test);
+  - explicit `cross_model_review_cancel` drives the review to `Failed`/`CANCELLED`;
+  - start-call cancellation (`attach_owned` → `Kill`) finishes the review `CANCELLED`.
+- `smoke.ps1` — **contract change, called out loudly, but scoped to best-effort e2e liveness.** Step
+  7 today cancels a `_result` poll and asserts the review is `CANCELLED`; that assertion is wrong
+  under the new semantics. The rewrite cancels a real review ~2s after starting it — practically
+  certain to be mid-flight for a multi-minute review, the same timing the current step already
+  relies on — and asserts **tolerantly**:
+  1. **Review A** — poll, cancel the poll → assert the poll is never answered (unchanged) **and** a
+     fresh collect returns *running-or-completed-and-collectible* (i.e. **not** `CANCELLED`, not
+     gone). Then, so the smoke run does not leak a billing reviewer, explicitly
+     `cross_model_review_cancel` Review A if it is still running.
+  2. **Review B** — a separate review → `cross_model_review_cancel` ~2s in → assert `CANCELLED`.
+  The smoke test proves the wiring end to end; the *guarantee* is the unit tests. `README.md`'s
+  smoke summary (the "a cancellation that must leave the request unanswered and the reviewer dead"
+  line) is updated to describe the two-review split and that a poll cancellation now leaves the
+  reviewer alive.
 
 ## What #39 asks for that this does not do
 
@@ -353,3 +424,29 @@ the server can wake the agent on its own.
   preserves the existing response/kill race provided everything stays under one mutex; and the
   narrow protocol claim — that a stdio tools-only MCP server has no message to inject a finished
   result into an ended agent turn — is correct.
+
+- **Round 2** (same session) — REQUEST CHANGES. Round-1 #1 (wake race) and #5 (MCP deviation)
+  confirmed resolved; the ownership split and protocol claim reaffirmed sound. The new findings were
+  about over-claimed *hard guarantees*; all accepted, resolved mostly by weakening claims to the
+  honest *non-destructive-degradation* story plus two real hardenings:
+  1. *major* — `max_wait()` still is not a *proven* whole-lifecycle ceiling: the Codex final-message
+     file read is unbounded and persistence has no wall-clock deadline. Resolved by capping the
+     Codex read at 8 MiB, documenting persistence latency as accepted residual (a deadline there
+     risks session-mapping durability), and weakening the claim to "catches the terminal state in
+     every realistic case; a boundary miss is one cheap extra poll, never lost work" — acceptable
+     precisely because the design is now non-destructive.
+  2. *major* — `--max-concurrent-reviews` is per-*process*, not global (one `Registry` per process;
+     README supports two servers sharing a state dir). Resolved by calling it a per-process cap,
+     documenting the *N × limit* multiplier, and arguing a cross-process slot lease is
+     disproportionate to a runaway-caller backstop. Default stays finite (8); `0` is opt-out.
+  3. *minor* — the smoke split is still real-model-timing-dependent. Resolved by moving the
+     authoritative contract to deterministic registry unit tests; `smoke.ps1` becomes best-effort
+     e2e liveness with explicit Review-A cleanup, and the README smoke summary is updated.
+  4. *minor* — saturating the cap sum does not stop `Instant + timeout` overflow elsewhere. Resolved
+     by rejecting an out-of-range `--timeout-seconds` at parse (defined 24h max), fixing a latent
+     pre-existing panic the raised cap made easier to reach.
+  5. *minor* — `wake()` guarantees the *wait* wakes, but the handler can still linger on the
+     progress-thread join if the client stopped draining stdout. Resolved by narrowing the claim to
+     "the wait is woken promptly," noting the pre-existing progress-join caveat, and adding a
+     progress-enabled cancellation test; the lease-release-vs-`finish` distinction is now stated
+     precisely.
