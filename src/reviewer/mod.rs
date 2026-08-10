@@ -51,7 +51,7 @@ use crate::errors::{self, Failure};
 /// Three-state with an explicit `Unknown`: an absent, unparseable, unrecognised, stale, or
 /// identity-mismatched signal is `Unknown`, and `Unknown` never gates (fail-open). See
 /// `docs/usage-remaining-gate.md`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Headroom {
     /// No usable signal -- fail-open, always clears any minimum.
     Unknown,
@@ -70,7 +70,7 @@ pub enum Headroom {
 
 /// Claude's categorical usage status, normalized. Rank is explicit (`Exhausted < Warning <
 /// Ample`) rather than derived from declaration order, so a comparison cannot silently invert.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HeadroomLevel {
     Exhausted,
     Warning,
