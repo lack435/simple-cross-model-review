@@ -1,10 +1,11 @@
 # Capture summary, surfaced to the caller — design
 
-Status: **proposed.** This document is the plan. It is intended to go through this repository's
-own `cross-review` gate (Codex, gpt-5.6-luna, effort=max) before any code is written, the same
-way [`incremental-resume-disposition.md`](incremental-resume-disposition.md) did. Filed against
-issue [#46](https://github.com/lack435/simple-cross-model-review/issues/46) ("Surface a capture
-summary to the caller in every review response").
+Status: **approved for implementation.** This document is the plan. It went through this
+repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max) over seven rounds, ending
+in APPROVE — "the design is sound and complete enough to implement" — the same way
+[`incremental-resume-disposition.md`](incremental-resume-disposition.md) did before it. Filed
+against issue [#46](https://github.com/lack435/simple-cross-model-review/issues/46) ("Surface a
+capture summary to the caller in every review response").
 
 **Revision note.**
 
