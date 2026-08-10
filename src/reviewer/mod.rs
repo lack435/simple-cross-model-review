@@ -311,42 +311,6 @@ pub struct RunOutcome {
     pub stdout_incomplete: bool,
 }
 
-/// Why [`run_observed`] failed. The distinction is a durability boundary, not cosmetic: a `Spawn`
-/// failure means no child process was ever created, so a *resumed* reviewer conversation could not
-/// have advanced and the session's findings ledger is provably not stale. An `Observe` failure
-/// happened after the child was already running, so the reviewer may have advanced its conversation
-/// and the ledger must be treated as possibly stale.
-#[derive(Debug)]
-pub enum RunError {
-    /// `Command::spawn` failed — the child never started.
-    Spawn(std::io::Error),
-    /// The child started but observing it to completion failed (e.g. `try_wait`).
-    Observe(std::io::Error),
-}
-
-impl RunError {
-    /// True only when no child process was ever created, so nothing the reviewer persists could
-    /// have moved. Callers use this to decide whether a resumed session's findings write-ahead
-    /// marker can be safely cleared after a failure.
-    pub fn child_never_started(&self) -> bool {
-        matches!(self, RunError::Spawn(_))
-    }
-
-    fn into_io(self) -> std::io::Error {
-        match self {
-            RunError::Spawn(e) | RunError::Observe(e) => e,
-        }
-    }
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunError::Spawn(e) | RunError::Observe(e) => write!(f, "{e}"),
-        }
-    }
-}
-
 /// Observable liveness from a reviewer child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Activity {
@@ -407,9 +371,7 @@ pub fn run(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> std::io::Result<RunOutcome> {
-    // The status/liveness probes that use this wrapper do not need the spawn/observe distinction, so
-    // flatten it back to a plain `io::Error`.
-    run_observed(command, stdin_data, timeout, cancel, |_| {}).map_err(RunError::into_io)
+    run_observed(command, stdin_data, timeout, cancel, |_| {})
 }
 
 /// Run a reviewer child and periodically report that it was observed alive.
@@ -423,13 +385,13 @@ pub fn run_observed(
     timeout: Duration,
     cancel: &AtomicBool,
     mut on_activity: impl FnMut(Activity),
-) -> Result<RunOutcome, RunError> {
+) -> std::io::Result<RunOutcome> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child: Child = command.spawn().map_err(RunError::Spawn)?;
+    let mut child: Child = command.spawn()?;
 
     // Assign before the reviewer does any real work, so anything it spawns is inside the
     // job and dies with it. Without this, a helper that outlives its parent keeps our
@@ -474,7 +436,7 @@ pub fn run_observed(
     let mut next_activity = Instant::now();
 
     let status = loop {
-        match child.try_wait().map_err(RunError::Observe)? {
+        match child.try_wait()? {
             Some(status) => break Some(status),
             None => {
                 let now = Instant::now();
@@ -726,29 +688,6 @@ mod drain_tests {
         let collected = drained(b"a normal transcript".to_vec());
         assert_eq!(collected.text, "a normal transcript");
         assert!(!collected.truncated);
-    }
-
-    #[test]
-    fn a_failed_spawn_reports_child_never_started() {
-        // A command that cannot launch never creates a child, so `run_observed` returns
-        // `RunError::Spawn` and `child_never_started()` is true. That is the signal the worker uses
-        // to safely clear a resumed session's findings marker after a pre-launch failure: with no
-        // child, the reviewer conversation could not have advanced, so the ledger is not stale.
-        let cmd = std::process::Command::new("cross-review-no-such-binary-9c3f1a2b");
-        let result = run_observed(
-            cmd,
-            "",
-            Duration::from_secs(5),
-            &std::sync::atomic::AtomicBool::new(false),
-            |_| {},
-        );
-        match result {
-            Ok(_) => panic!("spawn of a missing binary must fail"),
-            Err(e) => {
-                assert!(e.child_never_started());
-                assert!(matches!(e, RunError::Spawn(_)));
-            }
-        }
     }
 
     #[test]

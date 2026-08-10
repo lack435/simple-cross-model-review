@@ -134,66 +134,6 @@ pub struct SessionRecord {
     /// binary. `None` on a legacy record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_bin: Option<String>,
-    /// The structured findings ledger for this session, stored as a raw JSON value rather than a
-    /// typed field on purpose: a single unreadable or incompatible ledger degrades only *this*
-    /// session (to [`LedgerLoad::Invalid`]) instead of failing the whole store parse, which is the
-    /// difference between a bad record and a corrupt store. `None` for a session with no ledger
-    /// yet, or a record written before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub findings_ledger: Option<serde_json::Value>,
-    /// A sticky terminal escalation state — currently only `"ledger_too_large"`. Once set, a resume
-    /// is refused (the session outgrew a single review conversation) until it is restarted `fresh`.
-    /// `None` for a healthy session or a record predating this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_reason: Option<String>,
-}
-
-/// The tri-state result of loading a session's findings ledger. A single record whose ledger is
-/// unreadable or at an incompatible version is `Invalid` — that session is refused a resume — while
-/// the store and other sessions stay usable (the difference from a corrupt *store*, [`StoreState`]).
-#[derive(Clone, Debug)]
-pub enum LedgerLoad {
-    /// No ledger has been attached to this session yet.
-    Absent,
-    /// A readable ledger at a compatible version.
-    Valid(crate::findings::Ledger),
-    /// A ledger value is present but could not be read as a compatible ledger.
-    Invalid,
-}
-
-impl SessionRecord {
-    /// Load this session's findings ledger, tri-state. `Invalid` is a durable poison: a resume of
-    /// such a session is refused before the model call (an unreadable ledger cannot be injected).
-    pub fn ledger_load(&self) -> LedgerLoad {
-        match &self.findings_ledger {
-            None => LedgerLoad::Absent,
-            Some(v) => match serde_json::from_value::<crate::findings::Ledger>(v.clone()) {
-                // Beyond deserializing at a compatible version, the ledger must be structurally
-                // sound — unique ids and a `next_seq` strictly greater than every existing id — or
-                // reconciliation could mint a colliding id. Fail-closed: anything else is `Invalid`.
-                Ok(l)
-                    if l.schema_version == crate::findings::SCHEMA_VERSION
-                        && l.is_structurally_valid() =>
-                {
-                    LedgerLoad::Valid(l)
-                }
-                _ => LedgerLoad::Invalid,
-            },
-        }
-    }
-}
-
-/// Whether the session *store* file parses. Distinct from a single bad ledger record: a corrupt
-/// store means every session is inaccessible, so all reviews are refused before the model call
-/// rather than silently starting a clean, convergeable conversation over unreadable state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreState {
-    /// No store file yet — genuinely empty, the normal first-run state.
-    Absent,
-    /// The store parses.
-    Valid,
-    /// The store file is present but did not parse. Refuse resume *and* fresh.
-    Corrupt,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -229,13 +169,6 @@ pub struct TurnFacts<'a> {
     /// can match this entry and detect PATH drift.
     pub raw_bin: RawBin,
     pub resolved_bin: String,
-    /// The reconciled findings ledger this turn produced, already serialized. Stored directly (the
-    /// new ledger already includes the prior findings) — never inherited from a prior turn. `None`
-    /// for a turn that produced no ledger.
-    pub findings_ledger: Option<serde_json::Value>,
-    /// The sticky terminal state this turn resolves to (`Some("ledger_too_large")` when the turn is
-    /// over budget), or `None`. Set on the record so a later resume is refused.
-    pub terminal_reason: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -269,24 +202,9 @@ impl SessionStore {
         self.path.with_extension("json.lock")
     }
 
-    /// Fetch a record, tolerant of a corrupt store (reads it as empty) — the single-record parallel
-    /// to [`list`](Self::list). The review path deliberately does **not** use this: it goes through
-    /// the fail-closed [`get_checked`](Self::get_checked) so a transient read error cannot masquerade
-    /// as "no record" and overwrite a real one. Retained as part of the documented accessor set and
-    /// exercised by the tests below; it currently has no production caller.
-    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<SessionRecord> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.read().sessions.get(name).cloned()
-    }
-
-    /// Like [`get`](Self::get), but fail-closed: a corrupt/unreadable store is an `Err`, not a
-    /// silent `Ok(None)`. The review path uses this so a transient read error after the preflight
-    /// `store_state` check cannot make the worker behave as if the session were absent (and then
-    /// overwrite the real record on `record_turn`). `Ok(None)` means genuinely absent.
-    pub fn get_checked(&self, name: &str) -> io::Result<Option<SessionRecord>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(self.read_or_corrupt()?.sessions.get(name).cloned())
     }
 
     pub fn list(&self) -> Vec<(String, SessionRecord)> {
@@ -312,15 +230,13 @@ impl SessionStore {
             perforce_baseline,
             raw_bin,
             resolved_bin,
-            findings_ledger,
-            terminal_reason,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
         // process reading between the two would write back a snapshot missing this turn.
         // A failure to lock is returned, not ignored, and reaches the caller as a warning.
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
-        let mut store = self.read_or_corrupt()?;
+        let mut store = self.read();
         let now = now_unix();
 
         // The baseline is a (head, base) pair the next turn deltas from, so it advances as a
@@ -374,11 +290,6 @@ impl SessionStore {
                 perforce_baseline,
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
-                // The findings ledger and terminal state are this turn's alone: the new ledger
-                // already includes the prior findings, and the terminal state is recomputed each
-                // turn (sticky terminal states are re-supplied by the caller from the prior record).
-                findings_ledger,
-                terminal_reason,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -400,8 +311,6 @@ impl SessionStore {
                 perforce_baseline,
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
-                findings_ledger,
-                terminal_reason,
             },
         };
 
@@ -410,13 +319,9 @@ impl SessionStore {
         Ok(record)
     }
 
-    /// The path of a session's in-progress marker with the given extension. A sibling of the state
-    /// file, keyed by name the same way the session lock is, so it survives a crash independently of
-    /// the JSON. Two distinct markers ride this: `.pending` (the Perforce resume-delta baseline) and
-    /// `.findings-pending` (the findings write-ahead) — kept separate so the findings resume-refusal
-    /// does not preempt the Perforce full-capture fallback, which are different responses to a
-    /// crashed turn.
-    fn marker_path(&self, name: &str, ext: &str) -> PathBuf {
+    /// The path of a session's "turn in progress" marker. A sibling of the state file, keyed by
+    /// name the same way the session lock is, so it survives a crash independently of the JSON.
+    fn pending_marker(&self, name: &str) -> PathBuf {
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         let safe: String = name
             .chars()
@@ -430,13 +335,9 @@ impl SessionStore {
             .take(48)
             .collect();
         dir.join(format!(
-            "session-{safe}-{:016x}.{ext}",
+            "session-{safe}-{:016x}.pending",
             crate::config::fnv1a64(name)
         ))
-    }
-
-    fn pending_marker(&self, name: &str) -> PathBuf {
-        self.marker_path(name, "pending")
     }
 
     /// Mark a Perforce turn as in progress. The marker is written *before* the turn does anything
@@ -479,94 +380,10 @@ impl SessionStore {
         }
     }
 
-    /// The findings write-ahead marker, distinct from the Perforce `.pending` baseline marker. It is
-    /// written before *every* reviewer turn and cleared only once the turn is durably recorded, so a
-    /// crash or persist failure leaves it set for the next resume to refuse — the ledger is then
-    /// stale relative to the reviewer's advanced conversation, and resuming could mint colliding ids.
-    /// Kept separate so refusing a findings resume never preempts the Perforce full-capture fallback.
-    pub fn mark_findings_pending(&self, name: &str) -> io::Result<()> {
-        let path = self.marker_path(name, "findings-pending");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, b"")
-    }
-
-    /// Clear the findings write-ahead marker after a turn is durably recorded. `Ok(())` on a
-    /// successful delete or an already-absent marker; `Err` if the delete failed (a surviving marker
-    /// over-refuses the next resume toward `fresh`, the safe direction, so the caller surfaces it).
-    pub fn clear_findings_pending(&self, name: &str) -> io::Result<()> {
-        match std::fs::remove_file(self.marker_path(name, "findings-pending")) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Whether the findings write-ahead marker is present. Fail-closed: an I/O error reading it
-    /// counts as `Unreadable` (treated as set), so an unreadable marker refuses the resume rather
-    /// than risking a resume on a possibly-stale ledger.
-    pub fn findings_marker_state(&self, name: &str) -> MarkerState {
-        match self.marker_path(name, "findings-pending").try_exists() {
-            Ok(true) => MarkerState::Present,
-            Ok(false) => MarkerState::Absent,
-            Err(_) => MarkerState::Unreadable,
-        }
-    }
-
-    /// Whether the store file parses, tri-state. Used to gate *every* review — resume and fresh
-    /// alike — when the store is `Corrupt`: a corrupt store is caught before the model call and is a
-    /// resume refusal, never a silent clean start over unreadable state (which could converge on
-    /// untracked history). A missing file is `Absent` (the normal first-run state), not corrupt.
-    pub fn store_state(&self) -> StoreState {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        match std::fs::read_to_string(&self.path) {
-            // Only a genuinely missing file is `Absent`. Any other read error (a permission or I/O
-            // failure) is fail-closed to `Corrupt` — better to refuse than to proceed as if empty
-            // and later overwrite whatever is really there.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => StoreState::Absent,
-            Err(_) => StoreState::Corrupt,
-            // An existing but empty/whitespace-only file is anomalous: `write` only ever produces a
-            // fully-serialized store via temp+rename, so a zero-byte `sessions.json` is corruption
-            // (e.g. an external truncation), not the normal first-run state — treat it as corrupt.
-            Ok(text) if text.trim().is_empty() => StoreState::Corrupt,
-            Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
-                Ok(_) => StoreState::Valid,
-                Err(_) => StoreState::Corrupt,
-            },
-        }
-    }
-
-    /// Set a session's sticky `terminal_reason` without advancing a turn — used by the
-    /// before-reviewer over-budget path, which runs no reviewer and records no turn but must make
-    /// the terminal state durable so the next resume is refused. Idempotent: writing the same
-    /// reason again is a no-op replace. Returns whether the named session existed.
-    pub fn set_terminal_reason(&self, name: &str, reason: &str) -> io::Result<bool> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
-        let mut store = self.read_or_corrupt()?;
-        match store.sessions.get_mut(name) {
-            Some(record) => {
-                record.terminal_reason = Some(reason.to_string());
-                self.write(&store)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// Remove a session mapping. One of the four documented store accessors
-    /// (`get`/`record_turn`/`forget`/`list`) that must be fail-closed on a corrupt store — it reads
-    /// through [`read_or_corrupt`](Self::read_or_corrupt), so it errors rather than silently treating
-    /// an unreadable store as empty. It currently has no production caller: failed-turn recovery
-    /// relies on the durable write-ahead markers (which refuse a resume) and preserves the prior
-    /// record and its findings ledger for a human-directed rebaseline, rather than deleting the
-    /// mapping. Retained as part of that accessor contract and exercised by the tests below.
-    #[allow(dead_code)]
     pub fn forget(&self, name: &str) -> io::Result<bool> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
-        let mut store = self.read_or_corrupt()?;
+        let mut store = self.read();
         let removed = store.sessions.remove(name).is_some();
         if removed {
             self.write(&store)?;
@@ -574,9 +391,8 @@ impl SessionStore {
         Ok(removed)
     }
 
-    /// A missing or corrupt store is treated as empty for *read* accessors (`get`/`list`): losing
-    /// the ability to resume is recoverable, and the review path is gated on [`store_state`] before
-    /// anything is spawned. **Mutators do not use this** — see [`read_or_corrupt`](Self::read_or_corrupt).
+    /// A missing or corrupt store is treated as empty rather than fatal: losing the
+    /// ability to resume is recoverable, refusing to start the server is not.
     fn read(&self) -> StoreFile {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -588,39 +404,6 @@ impl SessionStore {
                 StoreFile::default()
             }),
             Err(_) => StoreFile::default(),
-        }
-    }
-
-    /// The store for a *mutating* read-modify-write, tri-state. An absent file is `Ok(empty)` (the
-    /// normal first-run state), a valid file is `Ok(parsed)`, and a **present-but-unparseable file is
-    /// `Err`** — so `record_turn`/`forget`/`set_terminal_reason` refuse rather than overwrite a
-    /// corrupt store, which would destroy the evidence and could create a convergeable session over
-    /// history it cannot see. Recovery is an explicit operator action.
-    fn read_or_corrupt(&self) -> io::Result<StoreFile> {
-        match std::fs::read_to_string(&self.path) {
-            // Only a genuinely missing file is an empty store. Any other read error, or an existing
-            // empty/whitespace-only file (never produced by `write`), is fail-closed to an error, so
-            // a mutator refuses rather than overwriting whatever is really there.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(StoreFile::default()),
-            Err(e) => Err(e),
-            Ok(text) if text.trim().is_empty() => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{} is present but empty; refusing to overwrite it. Move it aside or point \
-                     --state-dir at a clean directory.",
-                    self.path.display()
-                ),
-            )),
-            Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} is corrupt (it did not parse: {e}); refusing to overwrite it. Move it \
-                         aside or point --state-dir at a clean directory.",
-                        self.path.display()
-                    ),
-                )
-            }),
         }
     }
 
@@ -799,8 +582,6 @@ mod tests {
                     perforce_baseline: None,
                     raw_bin: RawBin::PathSearch,
                     resolved_bin: String::new(),
-                    findings_ledger: None,
-                    terminal_reason: None,
                 },
             )
             .expect("record turn")
@@ -812,51 +593,6 @@ mod tests {
         let store = SessionStore::new(&dir);
         assert!(store.get("default").is_none());
         assert!(store.list().is_empty());
-    }
-
-    #[test]
-    fn store_state_distinguishes_absent_valid_and_corrupt() {
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir);
-        // No file yet -> Absent (the normal first-run state, not corrupt).
-        assert_eq!(store.store_state(), StoreState::Absent);
-        // After a turn the store parses -> Valid.
-        record(&store, "s", "thread-1");
-        assert_eq!(store.store_state(), StoreState::Valid);
-        // Corrupt the file -> Corrupt, so all reviews are refused before the model call.
-        std::fs::write(store.path(), b"{ not valid json").expect("write garbage");
-        assert_eq!(store.store_state(), StoreState::Corrupt);
-    }
-
-    #[test]
-    fn ledger_load_is_tri_state_per_record() {
-        use crate::findings::{Budget, LedgerCoverage};
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir);
-
-        // Absent: a record with no ledger.
-        let rec = record(&store, "s", "thread-1");
-        assert!(matches!(rec.ledger_load(), LedgerLoad::Absent));
-
-        // Valid: attach a real ledger produced by the pure module.
-        let ev = crate::findings::evaluate_turn(
-            "s",
-            1,
-            "rv-1-1",
-            "<<<CROSS_REVIEW_FINDINGS_IN:rv-1-1>>>\n{\"verdict\":\"approve\"}\n<<<CROSS_REVIEW_FINDINGS_IN_END:rv-1-1>>>",
-            None,
-            Budget::default(),
-        );
-        let mut rec = rec;
-        rec.findings_ledger = Some(serde_json::to_value(&ev.ledger).expect("serialize ledger"));
-        match rec.ledger_load() {
-            LedgerLoad::Valid(l) => assert_eq!(l.coverage, LedgerCoverage::WholeConversation),
-            other => panic!("expected valid ledger, got {other:?}"),
-        }
-
-        // Invalid: a ledger value that is not a compatible ledger.
-        rec.findings_ledger = Some(serde_json::json!({"schema_version": 999, "nonsense": true}));
-        assert!(matches!(rec.ledger_load(), LedgerLoad::Invalid));
     }
 
     #[test]
@@ -912,8 +648,6 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
-            findings_ledger: None,
-            terminal_reason: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -958,8 +692,6 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
-            findings_ledger: None,
-            terminal_reason: None,
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -1012,8 +744,6 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
-            findings_ledger: None,
-            terminal_reason: None,
         };
         // The old conversation establishes a complete baseline.
         store
@@ -1051,8 +781,6 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
-            findings_ledger: None,
-            terminal_reason: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -1089,8 +817,6 @@ mod tests {
             perforce_baseline: baseline,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
-            findings_ledger: None,
-            terminal_reason: None,
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,
@@ -1155,47 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn the_findings_marker_is_independent_of_the_perforce_pending_marker() {
-        // The findings write-ahead is a *separate* sidecar from the Perforce `.pending` baseline
-        // marker on purpose: a set `.pending` means "take a full re-capture and continue", while a
-        // set `.findings-pending` means "refuse the resume". Sharing one file would entangle those
-        // opposite recoveries, so the two must be fully independent — setting or clearing one must
-        // never move the other, and each must survive a restart on its own.
-        let dir = temp_dir();
-        let store = SessionStore::new(&dir);
-        assert_eq!(store.marker_state("s"), MarkerState::Absent);
-        assert_eq!(store.findings_marker_state("s"), MarkerState::Absent);
-
-        // Setting the findings marker leaves the Perforce marker untouched.
-        store.mark_findings_pending("s").expect("mark findings");
-        assert_eq!(store.findings_marker_state("s"), MarkerState::Present);
-        assert_eq!(
-            store.marker_state("s"),
-            MarkerState::Absent,
-            "a findings marker must not set the Perforce pending marker"
-        );
-
-        // Setting the Perforce marker too: both are now present and distinct.
-        store.mark_pending("s").expect("mark pending");
-        assert_eq!(store.marker_state("s"), MarkerState::Present);
-        assert_eq!(store.findings_marker_state("s"), MarkerState::Present);
-
-        // Both survive a restart (a fresh store over the same directory).
-        let restarted = SessionStore::new(&dir);
-        assert_eq!(restarted.marker_state("s"), MarkerState::Present);
-        assert_eq!(restarted.findings_marker_state("s"), MarkerState::Present);
-
-        // Clearing one leaves the other set.
-        store.clear_findings_pending("s").expect("clear findings");
-        assert_eq!(store.findings_marker_state("s"), MarkerState::Absent);
-        assert_eq!(
-            store.marker_state("s"),
-            MarkerState::Present,
-            "clearing the findings marker must not clear the Perforce pending marker"
-        );
-    }
-
-    #[test]
     fn rebinding_a_name_to_a_new_reviewer_session_restarts_the_count() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
@@ -1244,44 +929,15 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_store_reads_empty_but_is_never_overwritten() {
-        // Read accessors stay best-effort empty (the review path is gated on `store_state` before
-        // anything is spawned), but a mutator must NOT overwrite a corrupt store: that would destroy
-        // the evidence and could create a convergeable session over history it cannot see. Recovery
-        // is an explicit operator action, so `record_turn` refuses instead.
+    fn a_corrupt_store_is_treated_as_empty_rather_than_fatal() {
+        // Losing the ability to resume is recoverable; refusing to start is not.
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         std::fs::write(store.path(), "{ this is not json").expect("write garbage");
-        assert_eq!(store.store_state(), StoreState::Corrupt);
         assert!(store.get("default").is_none());
-        // record_turn refuses rather than clobbering the corrupt file.
-        let err = store
-            .record_turn(
-                "default",
-                TurnFacts {
-                    reviewer: "codex",
-                    cli_session_id: "thread-1",
-                    model: "m",
-                    effort: "max",
-                    cwd: "C:\\repo",
-                    cumulative_usage: None,
-                    changes: None,
-                    head_sha: None,
-                    base_sha: None,
-                    backend: None,
-                    include_shelved: None,
-                    capture_identity: None,
-                    perforce_baseline: None,
-                    raw_bin: RawBin::PathSearch,
-                    resolved_bin: String::new(),
-                    findings_ledger: None,
-                    terminal_reason: None,
-                },
-            )
-            .expect_err("record_turn must refuse a corrupt store");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        // The corrupt file is left untouched for recovery.
-        assert_eq!(store.store_state(), StoreState::Corrupt);
+        // And it recovers on the next write.
+        record(&store, "default", "thread-1");
+        assert_eq!(store.get("default").unwrap().cli_session_id, "thread-1");
     }
 
     #[test]

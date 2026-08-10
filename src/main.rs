@@ -16,7 +16,6 @@ mod changeset;
 mod config;
 mod digest;
 mod errors;
-mod findings;
 mod mcp;
 mod metrics;
 mod prompt;

@@ -557,19 +557,9 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // `cross_model_review_result` is handled on its own: it carries the machine-readable envelope
-    // as `structuredContent` (MCP 2025-06-18) alongside the `_OUT` block already in the text.
-    // `review_result_both` resolves the target and waits *once*, then renders both channels from the
-    // same final snapshot, so they can never describe different reviews or different states.
-    if name == "cross_model_review_result" {
-        return match app.review_result_both(&args, request) {
-            Ok((text, structured)) => text_result_with_structured(text, structured),
-            Err(failure) => text_result(failure.render_for_agent(), true),
-        };
-    }
-
     let outcome = match name {
         "cross_model_review" => app.start_review(&args, request),
+        "cross_model_review_result" => app.review_result(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
         other => {
@@ -606,19 +596,6 @@ fn handler_thread_unavailable_response(id: &Value, tool: &str, error: &std::io::
 
 fn text_result(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
-}
-
-/// A successful tool result carrying the text channel plus, when present, the `structuredContent`
-/// sibling (MCP 2025-06-18). A client that ignores `structuredContent` is unaffected — the same
-/// envelope is in the text `_OUT` block.
-fn text_result_with_structured(text: String, structured: Option<Value>) -> Value {
-    let mut v = json!({"content": [{"type": "text", "text": text}], "isError": false});
-    if let Some(sc) = structured {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("structuredContent".to_string(), sc);
-        }
-    }
-    v
 }
 
 fn send(writer: &Writer, message: Value) {
@@ -898,11 +875,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     }
                 },
                 "additionalProperties": false
-            },
-            // The machine-readable envelope this tool also returns as `structuredContent`
-            // (MCP 2025-06-18): a discriminated running/completed union. Advertised so a client can
-            // validate the structured channel; the same envelope is in the text `_OUT` block too.
-            "outputSchema": crate::findings::output_schema()
+            }
         }),
         json!({
             "name": "cross_model_review_status",

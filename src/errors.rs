@@ -436,30 +436,6 @@ pub fn session_not_resumable(session: &str, reason: String) -> Failure {
     }
 }
 
-/// The session *store* itself did not parse — distinct from a single unresumable session. A
-/// corrupt store refuses every review, `fresh` included (a `fresh` write would clobber or merge
-/// into unreadable state), so the remediation must **not** route the caller to `fresh: true` the
-/// way [`session_not_resumable`] does — that would loop straight back into this same refusal.
-/// Recovery is an operator action: move the store aside, or point `--state-dir` elsewhere. Carries
-/// `state_corrupt` as its detail, per `docs/structured-findings-envelope.md`.
-pub fn store_corrupt(session: &str, store_path: &str) -> Failure {
-    Failure {
-        code: "SESSION_NOT_RESUMABLE",
-        summary: format!(
-            "Review session '{session}' cannot be started: the session store did not parse, so no \
-             review can run against it — resume or fresh alike."
-        ),
-        remediation: format!(
-            "This is a corrupt store, not a stale session, so starting a fresh review will not \
-             help — a fresh call is refused for the same reason, because writing a new record over \
-             an unreadable store could clobber or merge into it. Recovery is a manual step: move \
-             the store file aside ({store_path}), or point --state-dir at a clean directory, then \
-             retry. The corrupt file has been left untouched for recovery."
-        ),
-        detail: Some("state_corrupt".to_string()),
-    }
-}
-
 /// Bad tool arguments. This is the calling agent's mistake, not a setup problem, so it
 /// gets a plain correction instead of the stop-and-tell-the-user contract.
 pub fn bad_request(summary: impl Into<String>) -> Failure {
@@ -744,28 +720,6 @@ mod fallback_tests {
         assert_eq!(f.code, "RATE_LIMITED");
         assert!(f.remediation.contains("fresh: true"), "{}", f.remediation);
         assert!(f.summary.contains("codex"), "{}", f.summary);
-    }
-
-    #[test]
-    fn store_corrupt_points_at_the_store_not_fresh() {
-        // A corrupt store refuses `fresh` too, so the remediation must not tell the caller to retry
-        // with fresh=true (which would loop back into this same refusal). It points at the store
-        // file and carries `state_corrupt` as its detail.
-        let f = store_corrupt("default", "C:\\state\\sessions.json");
-        assert_eq!(f.code, "SESSION_NOT_RESUMABLE");
-        assert_eq!(f.detail.as_deref(), Some("state_corrupt"));
-        assert!(
-            f.remediation.contains("C:\\state\\sessions.json"),
-            "{}",
-            f.remediation
-        );
-        assert!(f.remediation.contains("--state-dir"), "{}", f.remediation);
-        // The distinguishing property: it does not route the caller to `fresh: true`.
-        assert!(
-            !f.remediation.contains("fresh: true"),
-            "corrupt-store remediation must not loop to fresh: {}",
-            f.remediation
-        );
     }
 
     #[test]

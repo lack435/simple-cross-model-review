@@ -141,9 +141,6 @@ pub struct Review {
     /// terminal result name the entry that actually ran rather than the whole chain. `None` until
     /// the first `set_active`. See `docs/reviewer-fallback-chain.md`.
     pub active: Option<String>,
-    /// The structured findings envelope this turn produced, once it has finished. `None` while
-    /// running or on a failed turn; the completed-result renderer emits both channels from it.
-    pub envelope: Option<crate::findings::Envelope>,
     pub cancel: Arc<AtomicBool>,
     /// Order in which this process finished the review, or 0 while it is still running.
     /// Assigned under the registry lock; see `State::finishes`.
@@ -178,8 +175,6 @@ pub struct Outcome {
     /// terminal result names the entry that ran (a fallback, when the walk fell through) rather
     /// than the whole chain. `None` leaves the response to fall back to the chain description.
     pub active: Option<String>,
-    /// The structured findings envelope this turn produced. `None` on a failed turn.
-    pub envelope: Option<crate::findings::Envelope>,
 }
 
 impl Outcome {
@@ -196,7 +191,6 @@ impl Outcome {
             resumable: false,
             usage: Usage::default(),
             active: None,
-            envelope: None,
         }
     }
 
@@ -214,7 +208,6 @@ impl Outcome {
             resumable: true,
             usage: Usage::default(),
             active: None,
-            envelope: None,
         }
     }
 }
@@ -400,7 +393,6 @@ impl Registry {
                 output_bytes: 0,
                 usage: Usage::default(),
                 active: None,
-                envelope: None,
                 cancel: Arc::clone(&cancel),
                 finish_seq: 0,
             },
@@ -490,7 +482,6 @@ impl Registry {
                 if outcome.active.is_some() {
                     review.active = outcome.active;
                 }
-                review.envelope = outcome.envelope;
                 match outcome.failure {
                     Some(failure) => {
                         review.status = Status::Failed;
@@ -708,9 +699,6 @@ pub struct Snapshot {
     pub usage: Usage,
     /// The reviewer entry currently (or last) running this review; see [`Review::active`].
     pub active: Option<String>,
-    /// The structured findings envelope, on a completed turn. `None` while running or on a
-    /// failed turn.
-    pub envelope: Option<crate::findings::Envelope>,
     /// The server had begun shutting down when this was taken. A `Running` snapshot with
     /// this set means the wait was cut short, not that the caller's budget ran out — and
     /// that no later call can collect the review, because the process is exiting.
@@ -741,7 +729,6 @@ impl Snapshot {
             output_bytes: review.output_bytes,
             usage: review.usage,
             active: review.active.clone(),
-            envelope: review.envelope.clone(),
             shutting_down,
         }
     }
