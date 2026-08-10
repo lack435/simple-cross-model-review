@@ -1,10 +1,10 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1 and 2.** This document is the plan.
-Per this repository's own rule it must go through the `cross-review` gate (Codex,
-gpt-5.6-luna, effort=max) and reach APPROVE before implementation begins. Rounds 1 and 2 each
-returned REQUEST CHANGES — seven findings then six, all accepted; the sections below fold each
-one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
+Status: **proposed — revised after cross-review rounds 1–3.** This document is the plan. Per
+this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
+effort=max) and reach APPROVE before implementation begins. Rounds 1–3 each returned REQUEST
+CHANGES — seven findings, then six, then five, all accepted; the sections below fold each one
+in, and [Review history](#review-history) records where. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -297,29 +297,42 @@ for rate-limit classification. So "a rate-limited entry returns fast" cannot be 
 the bound, and the earlier `capture + N×preflight_cap + timeout + grace` formula was wrong: N
 rate-limited entries can each consume almost a full `--timeout-seconds`.
 
-The honest bound budgets **every attempted entry for the worst case**:
+The honest bound budgets the worst case, and round 3 caught that my first formula silently
+changed the single-entry contract. Today `Config::max_wait_secs()` ([config.rs:575]) is
+**capture + `--timeout-seconds` + finalization** — it does *not* include preflight, because
+the selected entry's preflight runs in `start_review` *before* the worker and so before the
+collect wait even begins. The chain keeps that exactly, and adds budget only for the extra
+work a chain introduces — the *fallback* attempts, whose preflight and run happen inside the
+walk:
 
 ```
-chain_budget = capture_budget
-             + N × (preflight_cap + timeout + drain_grace)
-             + finalization_grace
+chain_budget = max_wait_secs_single                       # = today's capture + timeout + finalization
+             + (N - 1) × (preflight_cap + timeout + drain_grace)   # each fallback attempt
 ```
 
-where `N` is the chain length, `preflight_cap` bounds `resolve_bin` + `auth_check` (the
-auth-check timeout at [claude.rs:36]/[codex.rs:27], now cancellable), `timeout` is
-`--timeout-seconds`, and `drain_grace` is the per-invocation output-drain grace that already
-exists per turn ([reviewer/mod.rs:472]) — counted **per entry**, because each attempt is its
-own process with its own drain. This is deliberately generous (a three-entry chain of
-30-minute timeouts advertises a ~90-minute worst case), but it is the operator's own chain
-length, and an honest large bound beats a wrong small one.
-
+- **`N = 1` is byte-for-byte today's budget** — the `(N-1)` term is zero. This is the
+  invariant round 3 required; expressing `chain_budget` as *today's budget plus the fallback
+  terms* makes it hold by construction rather than by a claim.
+- **Lifecycle, stated explicitly.** The *selected* entry (entry 0 for a fresh review, the
+  recorded entry for a resume) is preflighted in `start_review`, before the worker, exactly
+  as the single reviewer is today — so its preflight is outside the collect wait and outside
+  the deadline. The **shared deadline starts when the walk starts** (worker entry) and spans
+  capture + the selected entry's turn + every fallback's preflight-and-turn. Only *fallback*
+  entries (1…N-1 of them) are preflighted inside the walk, which is why only they add a
+  `preflight_cap` term.
+- **`preflight_cap` bounds the whole auth invocation including its own drain** —
+  `resolve_bin` plus `auth_check` (the cancellable timeout at [claude.rs:36]/[codex.rs:27])
+  plus that process's output-drain grace — so no drain sits outside the bound. `drain_grace`
+  is the reviewer turn's own per-invocation drain ([reviewer/mod.rs:472]), counted once per
+  attempt because each attempt is its own process.
 - `max_wait_secs`, and the budget shown in the start/running responses and progress text —
   which today all display `cfg.timeout` ([tools.rs:316], [tools.rs:466]) — are all recomputed
-  from `chain_budget`, so what the caller is told to expect matches what the walk can take.
-  For a single-entry chain, `chain_budget` reduces exactly to today's `max_wait_secs`.
+  from `chain_budget`. This is deliberately generous (three entries at a 30-minute timeout
+  advertise a ~90-minute worst case), but it is the operator's own chain length, and an
+  honest large bound beats a wrong small one.
 - An **optional refinement**, not relied on: a separate short cap on an attempt that has
-  already produced rate-limit evidence could shrink the practical walk time. It is noted as a
-  future tightening; the worst-case bound above stands on its own without it.
+  already produced rate-limit evidence could shrink the practical walk time. Noted as a
+  future tightening; the worst-case bound stands without it.
 
 [tools.rs:276]: ../src/tools.rs
 [tools.rs:59]: ../src/tools.rs
@@ -355,22 +368,35 @@ Perforce is sharper still: self-serve there needs Codex *and* `--sandbox danger-
   merely when the primary does. Under-capturing produces a confident review of the wrong
   thing; over-capturing costs a little redundant work and some extra prompt text for a
   shell-capable entry, which is already the supported, harmless `--diff HEAD` mode. The
-  asymmetry decides it. The capture *data* (the git/p4 output) is gathered **once** at
-  start-of-review and retained.
-- **The capability *rendering* is per active entry.** `reviewer_capabilities`
-  ([config.rs:699]) and the VCS preamble are rendered from the **active** `ReviewerSpec` at
-  turn time, from the retained capture data — so each attempt is told the truth about *its*
-  shell and *its* self-serve ability. A Codex attempt is told it may fetch the diff; if the
-  walk advances to Claude, Claude's attempt is rendered the retained diff with "you have no
-  shell". `reviewer_has_shell` ([config.rs:583]) stays a per-reviewer predicate; what
-  generalises to the chain is only `chain_needs_capture()`.
+  asymmetry decides it. The captured change is gathered **once** at start-of-review.
+- **The capture render must become capability-neutral.** Round 3 found the real obstacle: the
+  retained `CapturedChange` holds only an *already-rendered* string ([shared.rs:44]), and that
+  render bakes in the primary's shell posture — `git::render(&change, &cwd,
+  cfg.reviewer_has_shell())` at [vcs/mod.rs:89], and the Perforce render likewise
+  ([perforce.rs:194]). So a mixed chain would hand the fallback a block written for the
+  primary; "render from retained data per entry" was not possible as the boundary stood. The
+  fix draws the line where it belongs: the capture render describes **only the change** (the
+  diff, status, untracked contents, truncation facts) and says nothing about what the
+  *reviewer* can do; every statement about the reviewer's abilities — shell, self-serve, "the
+  change was captured for you below" — lives in `reviewer_capabilities` ([config.rs:699]),
+  which is rendered per **active** `ReviewerSpec` at turn time. The `has_shell` parameter to
+  `git::render` (and its Perforce equivalent) is therefore removed: the captured block is
+  rendered once, identically for every entry, and always includes the full change (which is
+  exactly what a shell-less entry needs and a shell-capable one can ignore, the `--diff HEAD`
+  case). `reviewer_has_shell` ([config.rs:583]) stays a per-reviewer predicate used by
+  `chain_needs_capture()` and by `reviewer_capabilities`; nothing that varies by reviewer
+  stays inside the retained render.
+- **This does touch the VCS boundary**, so the round-2 "capture mechanics untouched" claim is
+  narrowed: the git/p4 *commands*, truncation and labelling are untouched, but the **render's
+  signature and the split of capability prose out of it** are in scope — `vcs/shared.rs`,
+  `vcs/mod.rs`, and the git and Perforce render paths join the blast radius and get mixed-chain
+  golden tests.
 - **`mcp.rs` tool descriptions must not advertise the primary as if it were the whole
   chain.** `tools/list` today describes the single reviewer's shell/capture behaviour
   ([mcp.rs:636]); with a chain it must describe the chain honestly (the primary, plus that
-  fallbacks exist and may differ) rather than imply one fixed posture. This file was missing
-  from the round-1 blast radius and is added.
-- Nothing about the classification-evidence or capture-labelling boundaries changes; the
-  capture *mechanics* (commands, truncation, labelling) are untouched.
+  fallbacks exist and may differ) rather than imply one fixed posture.
+- The classification-evidence and capture-*labelling* boundaries are unchanged: the change is
+  still fenced and labelled as evidence, not instructions.
 
 The other `--diff` modes are unaffected in spirit: `none` still supplies nothing, an explicit
 range or `HEAD` still captures regardless of shell. Only `auto`'s "does anyone need it?" test
@@ -383,6 +409,8 @@ one-shot render to a per-attempt one.
 [config.rs:699]: ../src/config.rs
 [vcs/mod.rs:89]: ../src/vcs/mod.rs
 [vcs/git.rs:445]: ../src/vcs/git.rs
+[shared.rs:44]: ../src/vcs/shared.rs
+[perforce.rs:194]: ../src/vcs/perforce.rs
 [mcp.rs:636]: ../src/mcp.rs
 
 ### 4. Same family: honoured, not enforced
@@ -433,17 +461,23 @@ specific** reviewer. Therefore:
   for a fresh start, entry 0 (then the walk). Preflight is run against the *selected* entry,
   never unconditionally against the primary. The `INVALID_REVIEWER_CHAIN` guard runs ahead of
   even this, so an invalid chain is reported before any record is read.
-- **The session record must store enough to identify the entry unambiguously.** Round 2
-  caught that `SessionRecord` holds `reviewer`/`model`/`effort` but **no `bin`**
-  ([session.rs:41]), while this plan allows two entries that differ only by `bin` (different
-  installation or account). Without persisting `bin`, a session created by the second such
-  entry could match the first on resume and run the wrong executable. So `SessionRecord`
-  gains the **resolved binary path**, added with `#[serde(default)]` exactly as
-  `cumulative_usage` was ([session.rs:52]), and the resume match compares the **full
-  operational identity — reviewer, model, effort, and resolved bin** (today's check at
-  [tools.rs:1535] compares only reviewer and model, so effort is added too). A record that
-  matches a chain entry on every field is resumed on that entry.
-- **Legacy and ambiguous records are refused, not guessed.** A record written before the
+- **The session record stores the *raw configured* identity, so the match needs no
+  preflight.** Round 2 caught that `SessionRecord` holds `reviewer`/`model`/`effort` but **no
+  `bin`** ([session.rs:41]); round 3 then caught that persisting the *resolved* path would be
+  self-defeating — comparing it would mean resolving other entries' `bin=None` to their paths,
+  which is preflighting the very entries the walk must not touch, and a resolved path cannot
+  tell a `bin=None` entry from an explicit `--bin` entry that happens to resolve to the same
+  executable (both allowed to coexist). So the record persists the **raw configured
+  identity**: `reviewer`, `model`, `effort`, and the **raw `bin` as configured** (the literal
+  `--bin` value, or a marker for "resolved from PATH"), added with `#[serde(default)]` exactly
+  as `cumulative_usage` was ([session.rs:52]). Resume matches this raw identity **against the
+  configured chain's raw specs — a pure comparison, resolving nothing** — so no unselected
+  entry is touched. Today's check compares only reviewer and model ([tools.rs:1535]); it now
+  compares the full raw identity, effort included.
+- **The selected entry is then preflighted, and only it.** After the raw-identity match picks
+  the entry, that one entry is preflighted (its `bin` resolved, auth checked); the resolved
+  path can be re-verified there if desired, but selection never depended on it.
+- **Legacy and ambiguous records are refused, not guessed.** A record written before the raw
   `bin` field existed has no bin to compare; it resumes only if **exactly one** chain entry
   matches on the fields it does carry. If it matches none, or more than one (e.g. two
   same-model/different-bin entries), resume is refused with `SESSION_NOT_RESUMABLE` and the
@@ -485,6 +519,15 @@ specific** reviewer. Therefore:
   responses render that identity instead of `describe_reviewer()`. A caller polling mid-walk
   sees the fallback; a fallback that fails in preflight is reported as the fallback. The
   earlier "registry untouched" claim is withdrawn.
+- **`set_active` obeys the existing lock discipline.** Round 3 noted the mutable identity must
+  not race the registry: `set_active` takes the same `State` mutex that `finish` and the
+  snapshot path already hold ([registry.rs:432], [registry.rs:637]), stores an owned clone of
+  the identity, updates only a review still `Running`, and snapshots copy it out under the same
+  lock. No new lock, no new ordering.
+- **The rendered identity includes the resolved bin.** Round 3 asked that same-model,
+  different-bin entries be distinguishable in the result: the active/result/attempt identity
+  carries reviewer, model, effort *and* the resolved binary path, so a caller can tell which
+  executable (and thus which account) actually ran, not merely the provider configuration.
 - **One logical turn, with an attempt history — turn semantics preserved.** Round 1 wanted a
   rate-limited primary to stay visible; round 2 warned that appending a second `Record` for
   the same review would double the metrics' *turn* contract — two turns, two wall-times, two
@@ -494,25 +537,37 @@ specific** reviewer. Therefore:
   optional `attempts` field on `Record` listing each earlier fallback attempt — its
   reviewer/model/effort, its `failure_code`, and its attempt-local wall time. The
   rate-limited primary is therefore visible without inflating any turn statistic.
-- **Failed-attempt token usage is not claimed.** The adapter API returns
-  `Result<Parsed, Failure>` and exposes `Parsed.usage` only on a successful parse
-  ([reviewer/mod.rs:118]); a rate-limit refusal yields a `Failure` with no usage, and the
-  CLI's usage on a refusal is not something this tool has verified it can read. So the
-  `attempts` entries record *that* the attempt happened and how it failed, with usage left
-  unknown — not a fabricated zero, and not an unverified figure. This keeps round 1's "claim
-  nothing about billing" while dropping round 2's double-counting. The adapter API is *not*
+- **Failed-attempt token usage is not claimed — and its absence propagates to completeness.**
+  The adapter API returns `Result<Parsed, Failure>` and exposes `Parsed.usage` only on a
+  successful parse ([reviewer/mod.rs:118]); a rate-limit refusal yields a `Failure` with no
+  usage, and the CLI's usage on a refusal is not something this tool has verified it can read.
+  So the `attempts` entries record *that* the attempt happened and how it failed, with usage
+  left unknown — not a fabricated zero, and not an unverified figure. The adapter API is *not*
   widened to carry usage on failure; that would be surface for a number we cannot trust.
+- **The accumulator must not report the logical turn as complete when an attempt's usage is
+  unknown.** Round 3's sharpest point: "do not fabricate zero" is not enough if the unknown
+  simply disappears. The summary derives completeness from the single `Record`'s usage
+  ([metrics.rs:631], [metrics.rs:734]); a successful fallback's own usage looks complete, so a
+  rate-limited primary that consumed unreported tokens would vanish and the turn's totals would
+  read as complete. So `Accumulator::push` inspects the `attempts` metadata and marks the
+  token/cost totals **partial / unknown** whenever any attempt carries usage it could not
+  report — the same "not complete" signal the summary already uses for a reviewer that omits a
+  field. One `Record` per turn stays; what changes is that the accumulator reads its
+  `attempts`. Backward-compatibility fixtures cover records both with and without `attempts`.
 - **`--doctor` / `status`** enumerate every entry with its resolved bin and auth, so a human
   sees the whole chain and any per-entry setup problem in one read. A degraded
   (`INVALID_REVIEWER_CHAIN`) config reports the validation failure here too.
 
 [metrics.rs]: ../src/metrics.rs
 [metrics.rs:304]: ../src/metrics.rs
+[metrics.rs:631]: ../src/metrics.rs
+[metrics.rs:734]: ../src/metrics.rs
 [metrics.rs:742]: ../src/metrics.rs
 [reviewer/mod.rs:118]: ../src/reviewer/mod.rs
 [tools.rs:462]: ../src/tools.rs
 [tools.rs:474]: ../src/tools.rs
 [registry.rs:150]: ../src/registry.rs
+[registry.rs:432]: ../src/registry.rs
 [registry.rs:637]: ../src/registry.rs
 
 ## The usage-remaining spike
@@ -577,13 +632,11 @@ when — it is real.
 Larger than the recent features, because it lifts a field out of `Config` — accepted by the
 maintainer as the cost of foundational completeness. Touched:
 
-- **`config.rs`**: new `ReviewerSpec`; `Config.reviewers: Vec<ReviewerSpec>` replacing the
-  four flat fields; per-entry parse loop and binding validation; `validate_chain`;
-  `describe_reviewer` renders the chain.
-- **`config.rs`**: `ReviewerSpec`; `Config.reviewers: Vec<ReviewerSpec>`; per-entry parse +
-  binding validation; `validate_chain`; `chain_needs_capture()`; `describe_reviewer` renders
-  the chain; `reviewer_capabilities` renders from an active `ReviewerSpec`; `max_wait_secs`
-  computes the shared `chain_budget`.
+- **`config.rs`**: `ReviewerSpec`; `Config.reviewers: Vec<ReviewerSpec>` replacing the four
+  flat fields; per-entry parse + binding validation; `validate_chain`; `chain_needs_capture()`;
+  `describe_reviewer` renders the chain; `reviewer_capabilities` renders from an active
+  `ReviewerSpec` and absorbs the reviewer-ability prose removed from the VCS render;
+  `max_wait_secs` computes the shared `chain_budget` as *today's budget + fallback terms*.
 - **`tools.rs`**: `App` holds the chain and a per-entry preflight cache (and, when invalid,
   the `INVALID_REVIEWER_CHAIN` `Failure`) and no longer a single fixed adapter; the `Job`
   carries the *active* adapter+bin+spec; the worker gains the fall-through loop, the shared
@@ -598,26 +651,31 @@ maintainer as the cost of foundational completeness. Touched:
   truncation/`spawn_failed` constructors and the `classify` identity arguments all take the
   active `ReviewerSpec` (or its fields) rather than `cfg`; `auth_check` accepts the
   cancellation token + deadline so a fallback preflight is interruptible.
-- **`registry.rs`**: a **mutable active identity** on the running state (set per attempt), and
-  `Outcome`/`Snapshot` carry the attempted reviewer/model/effort so both running and terminal
-  results name who reviewed. Concurrency, leasing and cancellation otherwise unchanged.
+- **`registry.rs`**: a **mutable active identity** on the running state, set per attempt via
+  `set_active` under the existing `State` mutex ([registry.rs:432]); `Outcome`/`Snapshot` carry
+  the attempted reviewer/model/effort/resolved-bin so both running and terminal results name who
+  reviewed. Concurrency, leasing and cancellation otherwise unchanged.
 - **`mcp.rs`**: `tools/list` descriptions ([mcp.rs:636]) describe the chain honestly (primary
   plus differing fallbacks) instead of advertising the primary's posture as the only one.
-- **`vcs/` and `config.rs` capability logic**: the `auto` capture *decision* generalises to
-  `chain_needs_capture()` (capture if *any* entry needs it); the capability *rendering* is
-  per active entry (git shell text; Perforce self-serve, which needs Codex +
-  `danger-full-access`). The capture *mechanics* (git/p4 commands, truncation, labelling) are
+- **`vcs/shared.rs`, `vcs/mod.rs`, `vcs/git.rs`, `vcs/perforce.rs`**: the `auto` capture
+  *decision* generalises to `chain_needs_capture()` (capture if *any* entry needs it); the
+  capture **render is made capability-neutral** — the `has_shell` parameter to `git::render`
+  ([vcs/mod.rs:89]) and the Perforce render ([perforce.rs:194]) drop the reviewer-ability
+  branch, which moves into `reviewer_capabilities`; the retained `CapturedChange` string is
+  then identical for every entry. The git/p4 *commands*, truncation and labelling are
   untouched.
 - **`errors.rs`**: two constructors — `invalid_reviewer_chain`, `reviewers_exhausted` — with
   codes, summaries, remediation, and `is_agent_correctable` returning false; a resume-aware
   `RATE_LIMITED` remediation path that does not disturb the shared `rate_limited` message; and
   a `.with_active(spec)` helper so a `Failure` can name the entry it came from.
-- **`session.rs`**: `SessionRecord` gains the resolved `bin` (`#[serde(default)]`); resume
-  match compares full identity (reviewer, model, effort, bin) against the chain, refusing
+- **`session.rs`**: `SessionRecord` gains the **raw configured `bin`** (`#[serde(default)]`),
+  not the resolved path; resume match compares the full *raw* identity (reviewer, model,
+  effort, raw bin) against the chain **without resolving/preflighting other entries**, refusing
   legacy-ambiguous matches with `SESSION_NOT_RESUMABLE`.
-- **`metrics.rs`**: `Record` gains an optional `attempts` list (schema addition, additive and
-  `#[serde(default)]`); still exactly one `Record` per logical turn, so turn/wall/token
-  accounting is unchanged.
+- **`metrics.rs`**: `Record` gains an optional `attempts` list (additive, `#[serde(default)]`);
+  still exactly one `Record` per logical turn, but `Accumulator::push` now reads `attempts` and
+  marks totals partial/unknown when an attempt's usage is unavailable ([metrics.rs:631],
+  [metrics.rs:734]).
 - **`main.rs`**: unchanged except that chain-semantic invalidity is now reported by the
   degraded `App`, not `exit(2)`.
 - **Docs/config**: `README.md` (Configuration table + a fallback section), `AGENTS.md` if
@@ -651,18 +709,25 @@ Unit tests (no network, no model call), extending the existing fakes:
   adapter and classifies Claude's output as Claude (asserted with fakes, no live model) — the
   primary adapter/identity is never used for the fallback.
 - **Cross-family capability**: a `Codex → Claude` chain under `--diff auto` captures the diff
-  (because Claude needs it) even though Codex is primary; the Codex attempt's preamble says it
-  may fetch the diff while the Claude attempt's preamble says it has none — both rendered from
-  the retained capture data. A Perforce mixed chain asserts self-serve is rendered only for a
-  Codex + `danger-full-access` active entry. All at rendering level, no live model.
+  (because Claude needs it) even though Codex is primary; the retained capture block is
+  **identical** for both entries (capability-neutral render), while `reviewer_capabilities`
+  renders per active entry — the Codex attempt is told it may inspect the change itself, the
+  Claude attempt that it has no shell and the change is captured below. A Perforce mixed chain
+  asserts self-serve prose appears only for a Codex + `danger-full-access` active entry. All at
+  rendering level, no live model.
 - **Non-rate error does not fall through**: primary `NOT_AUTHENTICATED` (or `CLI_NOT_FOUND`)
   ⇒ surfaced immediately, chain not advanced.
 - **Exhaustion**: every entry `RATE_LIMITED` ⇒ `REVIEWERS_EXHAUSTED` whose detail names each
   entry; a single-entry chain ⇒ plain `RATE_LIMITED`.
-- **Budget**: a walk of several rate-limited entries, each running near its `--timeout-seconds`
-  before being classified, stays within `chain_budget`; the displayed budget equals
-  `chain_budget`, not `cfg.timeout`; cancellation during a fallback preflight/auth check stops
-  the walk promptly (assert the cancel token reaches `auth_check`).
+- **Budget**: a single-entry `chain_budget` equals today's `max_wait_secs` exactly (the
+  invariant); a multi-entry walk of rate-limited entries, each running near its
+  `--timeout-seconds` before being classified, stays within `chain_budget`; the displayed
+  budget equals `chain_budget`, not `cfg.timeout`; cancellation during a fallback
+  preflight/auth check stops the walk promptly (assert the cancel token reaches `auth_check`).
+- **Metrics completeness**: a logical turn whose `attempts` include a rate-limited primary with
+  unavailable usage is summarised as **partial/unknown**, not complete, even though the
+  successful fallback's own usage is complete; fixtures cover records with and without the
+  `attempts` field (backward compatibility).
 - **Resume**: a session created on entry *k* resumes on entry *k* only, does not restart the
   walk, preflights only entry *k* (a primary made unavailable *after* the session was created
   does not break the resume — the round-1 regression test), and — when *k* is rate-limited on
@@ -732,6 +797,22 @@ now reflects.
   result interface]). (6) A `Record` per attempt breaks the turn contract and failed-attempt
   usage is not retrievable → one logical-turn `Record` plus an `attempts` history with usage
   left unknown ([Metrics]).
+
+- **Round 3 (same session, turn 3) — REQUEST CHANGES.** Four major + one minor, each a place a
+  round-2 fix had not been carried all the way to the code. (1) The budget formula silently
+  broke the single-entry invariant → re-expressed as *today's budget + fallback terms*, with an
+  explicit lifecycle (selected entry preflighted before the wait; deadline spans the walk)
+  ([The fall-through, budget]). (2) Per-entry capability rendering was infeasible because
+  `CapturedChange` retains a render that bakes in `reviewer_has_shell` → make the capture render
+  capability-neutral and move all reviewer-ability prose into per-active-entry
+  `reviewer_capabilities`; `vcs/shared.rs`/`vcs/mod.rs`/Perforce render join the blast radius
+  ([Capture in a mixed-family chain]). (3) Resolved-bin resume matching would preflight
+  unselected entries and could not distinguish `bin=None` from an equal explicit path → persist
+  and match the **raw** configured identity, resolving nothing ([Sessions and resume]).
+  (4) Unknown attempt usage vanished from summary completeness → `Accumulator::push` marks
+  totals partial when an attempt's usage is unknown ([Metrics]). Minor: (5) result/attempt
+  identity omitted the bin → include the resolved bin. Plus a note adopted: `set_active` uses
+  the existing `State` mutex ([Metrics, the result interface]).
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
