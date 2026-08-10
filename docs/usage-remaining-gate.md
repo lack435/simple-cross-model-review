@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan (round 7).** This document is the plan for the piece of [issue #48] that the
+Status: **plan — cross-review APPROVED (round 7).** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -691,3 +691,9 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
     a **cap-aware armed reader/runner** that counts raw bytes and lines incrementally at read
     time (not a post-run parse), and generalising `output_truncated` to name the bound that
     tripped (bytes / lines / deadline) (§4, blast radius).
+
+- **Round 7 (same session, turn 8) — APPROVE.** "f15 is resolved: §4 now specifies a distinct
+  read-time armed runner, explicit bounds, bound-aware errors, and boundary tests. No
+  regressions or new findings." All 21 findings (f1–f21) confirmed resolved; `converged: true`.
+  This is the merge gate's approval of the plan; implementation proceeds as a separate change
+  through its own gate.
