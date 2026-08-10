@@ -19,9 +19,9 @@ review. **That already exists for both backends** and is not what this proposal 
   the round trip and the documented fallbacks (rewritten branch, moved base, non-HEAD range,
   truncated capture, disabled flag) — though *not*, today, an ancestry-check error/timeout,
   which is one gap this proposal's `AncestryUndecidable` reason forces a test for.
-- **Perforce** (PR #38): per-file elision keyed on a fingerprint of what the reviewer was
-  last shown, fail-closed on every uncertain signal, with a durable in-progress marker so a
-  crash cannot collapse against a stale baseline. See
+- **Perforce** (PR #38): per-file elision keyed on a fingerprint of the evidence the server
+  rendered in the previous capture, fail-closed on every uncertain signal, with a durable
+  in-progress marker so a crash cannot collapse against a stale baseline. See
   [`perforce-resume-delta.md`](perforce-resume-delta.md).
 
 So the *mechanism* is built and robust. What is missing is one rung below it, and it is a
@@ -226,30 +226,59 @@ Then thread the disposition out through `Capture` (which already carries `head_s
 
 #### Perforce durability reasons
 
-The Perforce full-capture reasons are **decided in two different places**, and the round-3
-review found the first draft wrongly attributing all of them to `tools.rs`. The split follows
-where each decision actually lives:
+The Perforce full-capture reasons are **decided in two different places**, and each successive
+review found the first drafts under-enumerating them. The taxonomy below is meant to be
+*complete*: every path on which `elision_active` (`src/vcs/perforce.rs:149`) or the pre-capture
+guards return "do not elide" maps to exactly one reason, so a resumed Perforce full capture can
+never come back unclassified or mislabelled. The round-4 review found three such uncovered
+paths — an absent baseline, a `None` persisted binding field, and an *unconfirmed* (not
+*changed*) identity — which the earlier drafts left with no reason or blamed on
+`IdentityChanged`.
 
-- **Decided in `tools.rs`, before capture** (`:805-833`) — the durable-marker guards, which is
-  why `tools.rs` forces `resume = None` in these cases:
-  - `PriorTurnPending` — the *previous* turn left an uncleared in-progress marker
-    (`is_pending`): it crashed or failed to persist, so its baseline may be stale.
-  - `MarkerUnwritable` — *this* turn could not write its in-progress marker (`!pending_marked`),
-    so a later crash would be undetectable and the turn refuses to elide (and records
-    `Disabled`). A current durability failure, not evidence about the prior turn.
-- **Decided inside `perforce::capture`, via `elision_active`** (`src/vcs/perforce.rs:149`) —
-  the identity, mode and inventory checks:
-  - `IdentityChanged` — the resolved capture identity differs from the baseline's.
-  - `ModeOrShelvedChanged` — the shelved-capture flag differs.
-  - `PriorBaselineUnusable` — **restricted** to a prior baseline that is `Disabled` or an
-    otherwise unusable inventory. The first draft let this overlap the two reasons above by
-    including identity/mode mismatches; those are their *own* reasons, so this one is now only
-    the "the stored inventory itself is not usable" case.
+**Decided in `tools.rs`, before capture** (`:805-833`), which forces `resume = None` in these
+cases:
 
-So the backend returns its identity/mode/inventory decision and `tools.rs` combines it with the
-pre-capture marker decision. Precedence when several hold: the marker guards win (they mean the
-durability guarantee is absent at all), then identity/mode mismatch, then an unusable
-inventory.
+- `PriorBaselineMissing` — the session carries **no** Perforce baseline (a fresh Perforce
+  session, or a prior turn that persisted none). The Perforce analogue of git's
+  `NoCompleteBaselineRetained`.
+- The **marker guards**, decided from a three-valued marker read (present / absent /
+  **unreadable**), because `is_pending()` returns `true` on any marker-state I/O error
+  (`src/session.rs:321-326`) — so "the prior turn left a marker" and "the marker state could
+  not be read" must not collapse into one claim:
+  - `MarkerUnwritable` — *this* turn could not write its in-progress marker (`!pending_marked`);
+    a later crash would be undetectable, so the turn refuses to elide and records `Disabled`.
+  - `PriorTurnPending` — the marker read **confirmed present**: the previous turn crashed or
+    failed to persist, so its baseline may be stale.
+  - `MarkerStateUnreadable` — the marker read **errored**; fail-closed, but reported as its own
+    reason rather than as a false `PriorTurnPending`.
+
+**Decided inside `perforce::capture`, via `elision_active`/`matches`** (`src/vcs/baseline.rs:118`,
+`:125`):
+
+- `PriorBindingIncomplete` — the persisted binding is present but a field needed to compare is
+  `None`: `identity` or `include_shelved` was never recorded (a record predating those fields,
+  `src/session.rs:86`, `:91`). Not a *change* — there is nothing to compare against.
+- `IdentityUnconfirmed` — *this* turn's identity cannot be confirmed because its
+  `client_spec_digest` is `None`, which `matches` intentionally rejects
+  (`src/vcs/baseline.rs:118`, `:125`). Distinct from `IdentityChanged`: the identity did not
+  differ, it could not be *established*.
+- `IdentityChanged` — both identities are confirmed and **differ**.
+- `ModeOrShelvedChanged` — the shelved-capture flag differs.
+- `PriorBaselineUnusable` — **restricted** to a prior baseline that is `Disabled` or an
+  otherwise unusable inventory. No longer overlaps the identity/mode/binding reasons above,
+  each of which now has its own name.
+
+`tools.rs` combines the backend's decision with its pre-capture decision. **Precedence when
+several hold** (first wins): `MarkerUnwritable` (this turn cannot guarantee its *own*
+durability — the most immediate failure) → `PriorTurnPending` → `MarkerStateUnreadable` →
+`PriorBaselineMissing` → `PriorBindingIncomplete` → `IdentityUnconfirmed` → `IdentityChanged` →
+`ModeOrShelvedChanged` → `PriorBaselineUnusable`.
+
+**One case falls outside the disposition entirely:** `MarkerUnwritable` on a **fresh** turn
+(no `resume_id`). The disposition is suppressed there (nothing was resumed), but the failed
+marker write still means the *next* turn cannot safely elide — so it must surface as an
+ordinary **persistence warning**, on its own footing, independent of the disposition machinery,
+exactly as other persistence failures already do.
 
 ### What the detail can honestly say
 
@@ -379,6 +408,15 @@ nothing.
   but its existing `Capture::warn(...)` warning must still reach the caller unchanged; the test
   asserts both (the disposition is absent *and* the pre-existing failure warning is preserved),
   so the disposition gate cannot regress the fail-closed contract.
+- **Unit, Perforce reason coverage (round-4 finding 1–2):** each `elision_active`/marker
+  false-path maps to its distinct reason and none is left unclassified — `PriorBaselineMissing`
+  (no stored baseline), `PriorBindingIncomplete` (`None` persisted `identity`/`include_shelved`),
+  `IdentityUnconfirmed` (current `client_spec_digest` is `None`, asserting it is **not**
+  `IdentityChanged`), `IdentityChanged` (both confirmed and differing), `ModeOrShelvedChanged`,
+  `PriorBaselineUnusable` (`Disabled` inventory), and the three marker states from a
+  three-valued read — `MarkerUnwritable`, `PriorTurnPending` (confirmed present),
+  `MarkerStateUnreadable` (read errored, asserting it is **not** a false `PriorTurnPending`). A
+  precedence test exercises `MarkerUnwritable` winning when it and `PriorTurnPending` both hold.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
   `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
 - **Unit, tools:** a resumed turn that sent a change emits the disposition line; a fresh turn
