@@ -113,9 +113,14 @@ feature was switched off — so these are gates, not tree steps:
   particular a *fresh* Perforce session has no baseline, but that is `Full` (internal), **never**
   a `FellBackToFull` fall-back.
 - **G1 — `FullByDesign { Disabled }`** — `--no-incremental-resume` is set. Intentional, rendered
-  as an info line, **never warns** — and because it is a gate, it wins over *every* fall-back
-  reason below, including the Perforce marker guards, which run regardless of the flag. A
-  disabled feature must never produce a `FellBackToFull` warning.
+  as an info line, and it emits **no *disposition* warning** (the `FellBackToFull` cost-surprise
+  kind); as a gate it wins over *every* fall-back reason below, including the Perforce marker
+  guards. It also emits **no marker *persistence* warning**: those exist to protect a *future*
+  elision, and with the feature disabled there is no future elision to protect, so a failed
+  `mark_pending()` under G1 is immaterial. (This is the distinction the round-7 review forced —
+  a disposition warning and a persistence warning are two different channels; see
+  [`MarkerUnwritable`'s scope](#perforce-durability-reasons) and
+  [How the caller sees it](#how-the-caller-sees-it).)
 
 Only for a **resumed, change-sending, feature-enabled** turn does a backend fall-back tree run.
 The git backend then decides:
@@ -294,9 +299,11 @@ cases:
   *current* rather than the *persisted* side.)
 - `IdentityChanged` — both identities are confirmed and **differ**.
 - `ModeOrShelvedChanged` — the shelved-capture flag differs.
-- `PriorBaselineUnusable` — **restricted** to a prior baseline that is `Disabled` or an
-  otherwise unusable inventory. No longer overlaps the identity/mode/binding reasons above,
-  each of which now has its own name.
+- `PriorBaselineUnusable` — a prior baseline that is `Disabled` or an otherwise unusable
+  inventory. Its predicate can co-occur with the identity/mode/binding ones above, but it sits
+  **lowest in precedence**, so it is *selected* only when none of them applies — which is what
+  keeps its reported reason distinct without claiming the predicates are mutually exclusive
+  (the round-6/7 refinement of "non-overlapping").
 
 `tools.rs` combines the backend's decision with its pre-capture decision. **Precedence when
 several hold** (first wins): `MarkerUnwritable` (this turn cannot guarantee its *own*
@@ -304,15 +311,23 @@ durability — the most immediate failure) → `PriorTurnPending` → `MarkerSta
 `PriorBaselineMissing` → `PriorBindingIncomplete` → `IdentityUnconfirmed` → `IdentityChanged` →
 `ModeOrShelvedChanged` → `PriorBaselineUnusable`.
 
-**`MarkerUnwritable` always warns, independent of the disposition.** A failed `mark_pending()`
-means the *next* turn cannot safely elide, and that is true whether or not this turn rendered a
-disposition. So whenever a result reaches the caller, `MarkerUnwritable` surfaces as an ordinary
-**persistence warning**, on its own footing — not only on a fresh turn. The round-6 review found
-the gap: a **resumed** turn that sent no change has its disposition suppressed by G0, but if
-`mark_pending()` also failed, the turn is still forced to persist `Disabled` and the next turn
-still cannot elide, so the warning must fire there too. G0 suppresses only the *disposition*
-output, never this persistence warning — the same discipline as the failed-capture warnings
-above.
+**`MarkerUnwritable` warns whenever elision is enabled, independent of the disposition.** A
+failed `mark_pending()` means the *next* turn cannot safely elide — so, **when the feature is
+on**, it surfaces as an ordinary **persistence warning** on its own footing, whether or not this
+turn rendered a disposition. Two boundaries the reviews drew:
+
+- **G0 does not suppress it.** A *resumed* turn that sent no change has its disposition
+  suppressed by G0, but if `mark_pending()` failed, the turn still forces `Disabled` and the
+  next turn still cannot elide — so the persistence warning fires there too. G0 suppresses only
+  the *disposition* output, the same discipline as the failed-capture warnings.
+- **G1 *does* moot it.** Under `--no-incremental-resume` there is no future elision to protect,
+  so a failed marker write is immaterial and no persistence warning fires — this is why G1's
+  "no warning" and this "warns" rule do not contradict: the persistence warning is conditioned
+  on elision being enabled, and G1 is exactly the case where it is not.
+
+A **persistence warning** (durability of a future elision) and a **disposition warning** (this
+turn's `FellBackToFull` cost surprise) are separate channels; keeping them separate is what
+resolves the round-7 contradiction.
 
 ### What the detail can honestly say
 
@@ -344,9 +359,12 @@ into the caller-facing response. Two sub-decisions, both for the reviewer to wei
   through the result path — `Outcome` → `Review` → `Snapshot` in `src/registry.rs`
   (`:143-155`, `:558-599`), which the first draft omitted from the plumbing entirely — and
   render it into the response as its own informational `disposition:` line beside `usage:`.
-  Only one state also earns a `warnings` entry: **`FellBackToFull` on a resume**, the cost
-  surprise where the delta the caller configured for silently stopped happening.
-  `FullByDesign` never warns.
+  Only one state also earns a **disposition warning** in `warnings`: **`FellBackToFull` on a
+  resume**, the cost surprise where the delta the caller configured for silently stopped
+  happening. `FullByDesign` and `Incremental` produce no disposition warning. This is separate
+  from the pre-existing capture/persistence warnings (including `MarkerUnwritable`), which flow
+  on their own terms regardless of the disposition — see the two-channel distinction under
+  [Perforce durability reasons](#perforce-durability-reasons).
 - **Recording.** Record the disposition in the usage/metrics record next to `prompt_bytes`,
   so an after-the-fact audit of a session can see which turns deltaed and which re-billed
   the full range — the attribution point 1 above is missing today.
@@ -463,9 +481,13 @@ nothing.
   `MarkerUnwritable` over `PriorTurnPending`; G1 `Disabled` over a marker failure (info line,
   **no** warning); `PriorBindingIncomplete` over `PriorBaselineUnusable`; `IdentityChanged` over
   `ModeOrShelvedChanged`.
-- **Unit, persistence warning (round-6 finding 3):** a resumed, no-change turn whose
-  `mark_pending()` fails emits **no** disposition (G0) but **does** emit the ordinary
-  `MarkerUnwritable` persistence warning — asserting G0 suppresses only disposition output.
+- **Unit, persistence warning (round-6 finding 3, round-7 finding 1):** with the feature
+  **enabled**, a resumed no-change turn whose `mark_pending()` fails emits **no** disposition
+  (G0) but **does** emit the ordinary `MarkerUnwritable` persistence warning — G0 suppresses only
+  disposition output. Its counterpart: with `--no-incremental-resume` (G1), the *same*
+  marker-write failure emits **no** persistence warning either, because there is no future
+  elision to protect — the two tests together pin the enabled-only scope that resolves the
+  round-7 contradiction.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
   `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
 - **Unit, tools:** a resumed turn that sent a change emits the disposition line; a fresh turn
