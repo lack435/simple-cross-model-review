@@ -68,6 +68,18 @@ pub struct Parsed {
     pub usage_is_cumulative: bool,
 }
 
+/// Normalize a CLI-reported session id at the adapter boundary: trim surrounding whitespace and
+/// treat an empty (or all-whitespace) value as *absent*, never as a usable id.
+///
+/// A session id is the key a later turn resumes by. An empty or whitespace id is not a real handle,
+/// but the record path would otherwise persist it and advertise the turn resumable, so the next
+/// resume would try to continue an id no reviewer holds. Collapsing it to `None` here makes such a
+/// turn fall through to the not-durable path (the caller rebaselines fresh) instead. Both adapters
+/// funnel their reported id through this, so neither can leak a blank id into a `Parsed`.
+pub fn normalize_session_id(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub struct Invocation {
     pub command: Command,
     /// A file the CLI writes its final message to, when it supports that.
@@ -710,6 +722,27 @@ pub fn tmp_file(cfg: &Config, tmp_id: &str, name: &str) -> std::io::Result<PathB
     let dir = cfg.tmp_dir();
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{tmp_id}-{name}")))
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::normalize_session_id;
+
+    #[test]
+    fn empty_or_whitespace_session_ids_normalize_to_absent() {
+        // A real id is trimmed and kept.
+        assert_eq!(
+            normalize_session_id(Some("  abc-123  ".to_string())),
+            Some("abc-123".to_string())
+        );
+        // Empty and all-whitespace ids are not usable handles: collapse to absent so the record
+        // path never persists a blank id and advertises a doomed resume.
+        assert_eq!(normalize_session_id(Some(String::new())), None);
+        assert_eq!(normalize_session_id(Some("   ".to_string())), None);
+        assert_eq!(normalize_session_id(Some("\t\n".to_string())), None);
+        // Absent stays absent.
+        assert_eq!(normalize_session_id(None), None);
+    }
 }
 
 #[cfg(test)]

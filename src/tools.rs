@@ -306,7 +306,7 @@ impl App {
         // survives for the not-stale ones.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
-                return Err(errors::session_not_resumable(&session, reason));
+                return Err(resume_refusal(&session, reason, record));
             }
         }
 
@@ -2380,6 +2380,22 @@ fn resume_block(
     None
 }
 
+/// Build the `SESSION_NOT_RESUMABLE` failure for a `resume_block` refusal, tagging the
+/// unreadable-ledger case so a caller can tell it from a policy refusal.
+///
+/// The failure contract distinguishes an *unreadable ledger* (`ledger_unavailable`) from a whole-
+/// store parse failure (`state_corrupt`, refused earlier with its own error) and from a plain
+/// policy refusal (turns/idle/mismatch — no detail). The `ledger_unavailable` tag is attached
+/// exactly when the record's stored ledger fails to load, which is precisely the state that needs
+/// a fresh rebaseline rather than a retry.
+fn resume_refusal(session: &str, reason: String, record: &session::SessionRecord) -> Failure {
+    let mut failure = errors::session_not_resumable(session, reason);
+    if matches!(record.ledger_load(), session::LedgerLoad::Invalid) {
+        failure.detail = Some("ledger_unavailable".to_string());
+    }
+    failure
+}
+
 /// What to tell a caller holding the id of a review that has been evicted.
 ///
 /// Names both caps, not just the per-session one. Either can be the reason, and a caller
@@ -2745,6 +2761,19 @@ mod tests {
         rec.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
         let reason = resume_block(&cfg, &rec, &[], now).expect("invalid ledger is refused");
         assert!(reason.contains("unreadable or at an incompatible version"));
+        // The refusal is tagged machine-readably as `ledger_unavailable`, so a caller can tell an
+        // unreadable-ledger refusal from a policy one (turns/idle/mismatch, which carry no detail).
+        let failure = resume_refusal("default", reason, &rec);
+        assert_eq!(failure.code, "SESSION_NOT_RESUMABLE");
+        assert_eq!(failure.detail.as_deref(), Some("ledger_unavailable"));
+
+        // A policy refusal on a record whose ledger is fine carries no such detail.
+        let mut healthy = record_matching(&cfg, cfg.resume_max_turns + 1, now);
+        healthy.findings_ledger = None;
+        let policy_reason =
+            resume_block(&cfg, &healthy, &[], now).expect("too many turns is refused");
+        let policy_failure = resume_refusal("default", policy_reason, &healthy);
+        assert_eq!(policy_failure.detail, None);
     }
 
     #[test]

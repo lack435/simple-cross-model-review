@@ -27,9 +27,10 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > [Round 1](#round-1-response) … [Round 21](#round-21-response) responses. The sections they touched —
 > the block schema, ID reconciliation (total-accounting), degradation and the `converged` signal
 > (now including the budget/terminal condition), extraction (nonce-marked, dual-namespace, `_OUT`
-> nonce), durability (a write-ahead marker that must succeed or abort, fail-closed poison-writes,
-> and a sticky `terminal_reason`), the whole-conversation ledger rule (a one-way `ledger_coverage`
-> state machine), tri-state store load with record-vs-store `fresh` semantics, the
+> nonce), durability (a write-ahead marker that must succeed or abort, a fail-closed
+> derived-at-load `invalid` state, and a sticky `terminal_reason`), the whole-conversation ledger
+> rule (a one-way coverage state machine stored *inside* the ledger), tri-state store load with
+> record-vs-store `fresh` semantics, the
 > block-as-sole-machine-source contract, bounded growth with atomic over-cap persistence and
 > deterministic reason precedence, and a discriminated running/completed `outputSchema` — were
 > rewritten rather than patched. This document reflects the post-round-6 design.
@@ -121,7 +122,7 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `reviewer_blocked` | `verdict_detail` is `blocked` (the reviewer reports it cannot complete a clean review), at any `open_count`. | **Escalate to a human**; a blocked reviewer is not a re-review-and-hope state. |
 | `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
 | `ledger_unavailable` | On-disk coverage is a *readable* persisted break — `legacy_uncovered` or `needs_rebaseline` — whether from **this turn's coverage-break write persisting** *or* the **session already being broken on entry**. (A degraded turn whose *own* break-write failed reports `turn_not_durable` **only** when it entered `whole_conversation`/`unestablished`; on an already-broken session `ledger_unavailable` holds regardless — precedence. An *unreadable* ledger — `invalid` — never reaches a completed envelope; it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
-| `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
+| `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.findings-pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
 | `state_corrupt` | The session store itself did not parse. Like `invalid`, this is caught at load, so it is a **pre-model `SESSION_NOT_RESUMABLE`-class refusal** carrying `state_corrupt` as its detail — **never a completed-envelope `non_convergence_reason`** (round 21); no review runs. | **Escalate to a human**; operator moves the corrupt store aside / uses `--state-dir`; do not silently start fresh (below). |
 | `ledger_too_large` | The ledger/digest exceeded the bounded budget, before *or* after this turn ran. | **Escalate to a human**; the session cannot keep growing (below). |
 
@@ -733,15 +734,18 @@ actually lives.
 
 ## Wiring (the I/O edges)
 
-- **`src/session.rs`** — `SessionRecord` gains three optional, versioned fields: a
-  `findings_ledger`, the durable `ledger_coverage` provenance
-  ([whole-conversation rule](#convergence-requires-a-ledger-over-the-whole-conversation)), and a
-  sticky durable `terminal_reason` ([bounded growth](#bounded-growth-and-escalation-outcomes)) that
-  records `ledger_too_large` (and is the natural home for any future sticky escalation). `TurnFacts`
-  carries the reconciled ledger a completed turn produced; `record_turn` persists it — and sets
-  `terminal_reason` when the turn is over budget — under the existing exclusive-lock read-modify-
-  write. `resume_block` is extended to refuse a resume while `terminal_reason` is set, before the
-  session is claimed.
+- **`src/session.rs`** — `SessionRecord` gains **two** optional, versioned fields: a
+  `findings_ledger` and a sticky durable `terminal_reason`
+  ([bounded growth](#bounded-growth-and-escalation-outcomes)) that records `ledger_too_large` (and
+  is the natural home for any future sticky escalation). **Coverage provenance is *not* a separate
+  field — it lives *inside* the ledger** (`Ledger.coverage`,
+  [whole-conversation rule](#convergence-requires-a-ledger-over-the-whole-conversation)). Folding it
+  in is what makes the `invalid` state derive-at-load with no separate poison-write (see that rule):
+  an unreadable ledger has no independent `whole_conversation` stamp to keep. `TurnFacts` carries the
+  reconciled ledger a completed turn produced; `record_turn` persists it — and sets `terminal_reason`
+  when the turn is over budget — under the existing exclusive-lock read-modify-write. `resume_block`
+  is extended to refuse a resume while `terminal_reason` is set (and the call site refuses an
+  unreadable ledger, tagged `ledger_unavailable`), before the session is claimed.
 - **The write-ahead marker is a *dedicated* `.findings-pending` sidecar, a sibling of the existing
   Perforce `.pending` one** (round-7 minor #3 proposed reusing `.pending`; implementation review
   found the two must stay separate because a set marker means *different things* to the two
@@ -805,25 +809,27 @@ actually lives.
   store is documented explicitly; a journal/per-session-file layout is the more robust option if
   field-level recovery of arbitrary whole-file corruption is wanted later.
 - **The worker** (in `src/reviewer/mod.rs` / `src/tools.rs`) gains, around the existing review
-  call: on **every** turn — fresh or resumed — **`mark_pending` the `.pending` sidecar and confirm
-  the write succeeded before the reviewer is invoked** → load the prior ledger (if resuming) → hand
-  it to the prompt builder → after the review text is collected, extract + reconcile into an
-  envelope and a new ledger → **`record_turn` persists the new ledger (atomic JSON replace), then
-  `clear_pending` deletes the sidecar**. Round 4's finding: if the marker write itself *fails* and
-  the worker proceeds anyway (the existing code does `mark_pending().is_ok()` and continues,
-  `src/tools.rs:811`), a crash can advance the reviewer conversation with no durable marker — the
-  exact hole. So **a failed `mark_pending` aborts before the model call**, via an existing
-  failure/refusal path, rather than returning a review that could still be resumed unsafely. If the
-  post-review `record_turn` fails, degrade this turn (`turn_not_durable`); the sidecar was never
-  cleared, so the next call is refused a resume — an escalation → [rebaseline
+  call: on **every** turn — fresh or resumed — **`mark_findings_pending` the dedicated
+  `.findings-pending` sidecar (a sibling of, and independent from, the Perforce `.pending` one — see
+  the write-ahead-marker note above) and confirm the write succeeded before the reviewer is
+  invoked** → load the prior ledger (if resuming) → hand it to the prompt builder → after the review
+  text is collected, extract + reconcile into an envelope and a new ledger → **`record_turn` persists
+  the new ledger (atomic JSON replace), then `clear_findings_pending` deletes the sidecar**. Round
+  4's finding: if the marker write itself *fails* and the worker proceeds anyway, a crash can advance
+  the reviewer conversation with no durable marker — the exact hole. So **a failed
+  `mark_findings_pending` aborts before the model call**, via an existing failure/refusal path,
+  rather than returning a review that could still be resumed unsafely. If the post-review
+  `record_turn` fails, degrade this turn (`turn_not_durable`); the sidecar was never cleared, so the
+  next call is refused a resume — an escalation → [rebaseline
   handoff](#recovery-from-a-broken-ledger-is-a-human-rebaseline-not-an-autonomous-fresh), not an
   autonomous restart. Because the sidecar clear is a *separate* step after the atomic record, a crash
-  in the narrow gap between them leaves a **stale** marker on a turn that *was* durably recorded —
-  that over-refuses toward the escalation path (the safe direction), exactly as the existing Perforce
-  use of this sidecar already tolerates. **This
-  applies to `fresh` calls too** (round 9): a `fresh: true` that overwrites an existing record and
-  crashes before `record_turn` must leave the sidecar set, so the stale old record cannot be
-  resumed — see Decision 5.
+  in the narrow gap between them leaves a **stale** findings marker on a turn that *was* durably
+  recorded — that over-refuses toward the escalation path (the safe direction), the same fail-closed
+  tolerance the Perforce `.pending` sidecar already has. Keeping the two markers separate is what
+  lets a leftover `.findings-pending` refuse the resume while a leftover `.pending` only forces a
+  full re-capture (their recoveries differ — see above). **This applies to `fresh` calls too**
+  (round 9): a `fresh: true` that overwrites an existing record and crashes before `record_turn` must
+  leave the sidecar set, so the stale old record cannot be resumed — see Decision 5.
 - **`src/registry.rs`** — `Review`, `Outcome`, and `Snapshot` carry the `Envelope` so the
   result renderer can emit both channels. Computed once, when the turn finishes, travelling with
   the snapshot like `usage` and `warnings` already do.
@@ -859,14 +865,21 @@ a *subsequent* call from resuming: `start_review` reads the stored `SessionRecor
 `resume_block` allows, and `SessionRecord` ([`src/session.rs:28`](../src/session.rs)) has no
 durable "do not resume this" bit. Worse, a crash *before* the atomic replace has no chance to
 set even the in-memory flag — the process is gone. So the fix is a **durable write-ahead intent
-marker** — and this repository **already has one**: the `.pending` sidecar
-(`mark_pending`/`clear_pending`/`is_pending`, `src/session.rs:273`+), built for the Perforce
-baseline and reused here rather than re-invented (round-7 minor #3):
+marker**. The repository already had the *mechanism* — the Perforce `.pending` sidecar
+(`mark_pending`/`clear_pending`, `src/session.rs`) — and round-7 minor #3 proposed reusing that same
+file. Implementation review kept the mechanism but gave findings its **own** sidecar,
+`.findings-pending` (`mark_findings_pending`/`clear_findings_pending`/`findings_marker_state`),
+because a set marker triggers **opposite recoveries** for the two concerns: a leftover `.pending`
+means "take a full Perforce re-capture and continue" (not a refusal), while a leftover
+`.findings-pending` means "**refuse the resume**". Sharing one file would make a Perforce turn that
+only needed a re-capture over-refuse the next findings resume, and let the findings gate pre-empt the
+Perforce full-capture fallback in the cases where the ledger is provably not stale. So the two are
+separate, parallel, both fail-closed:
 
-- **The `.pending` sidecar is `mark_pending`-ed *before* the reviewer is called**, while the lease
-  is held. It is a per-session sibling file, so it survives a crash independently of the JSON and
-  needs no change to `SessionRecord`. It records that a turn is in flight against this session's
-  reviewer conversation.
+- **The `.findings-pending` sidecar is `mark_findings_pending`-ed *before* the reviewer is called**,
+  while the lease is held. It is a per-session sibling file, so it survives a crash independently of
+  the JSON and needs no change to `SessionRecord`. It records that a turn is in flight against this
+  session's reviewer conversation.
 - **The marker is written before *every* reviewer turn — resumed *and* fresh — not only resumes**
   (round 9 closed the exemption). The round-4 draft exempted a fresh turn because "a new
   conversation has nothing to strand," but round 9 found the hole: **`fresh: true` on a name that
@@ -889,13 +902,13 @@ baseline and reused here rather than re-invented (round-7 minor #3):
   is exactly the case round 9 exposed. Tested with a crash-injected failed fresh overwrite that must
   block a subsequent normal resume.
 - **On a clean turn**, `record_turn` durably writes the new ledger (atomic JSON replace) and *then*
-  `clear_pending` removes the sidecar. The order matters: the record is durable before the marker is
-  cleared, so a crash in the narrow gap leaves the marker *stale*-set on an already-recorded turn —
-  which over-refuses toward `fresh`, the safe direction, exactly as the Perforce use of this sidecar
-  already tolerates (a stale marker there just disables elision).
+  `clear_findings_pending` removes the sidecar. The order matters: the record is durable before the
+  marker is cleared, so a crash in the narrow gap leaves the marker *stale*-set on an already-recorded
+  turn — which over-refuses toward `fresh`, the safe direction, the same fail-closed tolerance the
+  Perforce `.pending` sidecar already has (a stale marker there just disables elision).
 - **On any crash, timeout, or persistence failure**, the marker survives on disk because it was
-  written first and cleared last. The next call finds it via `is_pending` (**fail-closed**: an I/O
-  error reading it counts as set). `resume_block` is extended to refuse a normal resume while the
+  written first and cleared last. The next call finds it via `findings_marker_state` (**fail-closed**:
+  an I/O error reading it counts as set). `start_review` refuses a non-`fresh` call while the
   sidecar is present, returning `SESSION_NOT_RESUMABLE`. This is not an invitation to *auto*-`fresh`:
   `SESSION_NOT_RESUMABLE` is itself an escalation outcome, and recovery goes through the
   [rebaseline handoff](#recovery-from-a-broken-ledger-is-a-human-rebaseline-not-an-autonomous-fresh)
@@ -920,7 +933,7 @@ baseline and reused here rather than re-invented (round-7 minor #3):
   special case: it is exactly the `unestablished` / `turn_not_durable` turn-1 case — the new
   conversation has no durable coverage yet, so the completed envelope reports `ledger_coverage:
   unestablished`, `findings_trusted: false`, `findings: []`, `non_convergence_reason:
-  turn_not_durable`, and the `.pending` sidecar (set before the reviewer call) refuses the next
+  turn_not_durable`, and the `.findings-pending` sidecar (set before the reviewer call) refuses the next
   resume. The old bad record is untouched on disk (the replacing write never landed), so nothing is
   lost that was not already lost; the next `fresh` retries. This is a completed envelope (a turn ran)
   — distinct from the corrupt-*store* case, which never runs a turn at all.
@@ -996,7 +1009,7 @@ implicit; both are now stated:
   result, the same rule as the over-cap path** (round-8 minor): the transition is written by the
   turn's `record_turn`; if that **succeeds**, coverage is durably `needs_rebaseline` and *this
   turn's* envelope reports `ledger_unavailable`; if it **fails**, nothing is persisted, the
-  `.pending` sidecar (set before the reviewer call) stays set, and *this turn* reports
+  `.findings-pending` sidecar (set before the reviewer call) stays set, and *this turn* reports
   `turn_not_durable` (the next call is refused a resume anyway). Either way the break is durable and
   no later turn can converge. Tested by: valid turn 1 → malformed turn 2 that adds a new prose
   finding → valid turn 3 must **not** converge (`ledger_unavailable`).
@@ -1054,7 +1067,7 @@ tested across *several* later turns, not just the first.
    `needs_rebaseline` mid-session) via `record_turn`.
 2. **If that persist fails**, no coverage transition took effect on disk (coverage is *unchanged*),
    so `ledger_unavailable`'s precondition (`coverage != whole_conversation`) is **not** met; the
-   turn reports **`turn_not_durable`**, and the `.pending` sidecar (set before the reviewer call)
+   turn reports **`turn_not_durable`**, and the `.findings-pending` sidecar (set before the reviewer call)
    enforces the break by refusing the next resume. Persistence is checked before the coverage-based
    reason precisely so the two cannot both fire.
 3. **If it succeeds**, coverage is now `legacy_uncovered`/`needs_rebaseline` on disk, and reason
@@ -1155,9 +1168,10 @@ degradation**:
   that crossed it rather than on the next one.
 - **The before-call path is fully defined** (round 11 found it was not). When the loaded ledger's
   digest is already over budget *on entry*, the server **does not invoke the reviewer and does not
-  advance a turn** — no `mark_pending`, no reviewer conversation, nothing billed. It **persists
+  advance a turn** — no findings write-ahead marker (the check precedes `mark_findings_pending`), no
+  reviewer conversation, nothing billed. It **persists
   `terminal_reason = ledger_too_large`** onto the record (an idempotent atomic replace of just that
-  field; the ledger is unchanged, so there is no ledger-vs-remote divergence and no `.pending`
+  field; the ledger is unchanged, so there is no ledger-vs-remote divergence and no findings-marker
   involvement) and returns a **completed** envelope with `structured: false`, `converged: false`,
   `non_convergence_reason: ledger_too_large`. This path exists for the case an after-check cannot
   cover: a ledger that became over-budget *without this process writing it* — a `--max-findings` or
@@ -1166,7 +1180,7 @@ degradation**:
   so this is not an autonomous-retry signal: the loop stops. If the terminal-flag persist itself
   fails, the call is still non-convergent `ledger_too_large`, and the flag write is simply
   re-attempted on the **next operator-directed call** — not retried by an autonomous loop; nothing
-  was billed or advanced, so there is no `turn_not_durable` to report and no `.pending` to strand.
+  was billed or advanced, so there is no `turn_not_durable` to report and no findings marker to strand.
   Tested with a pre-call over-cap (budget
   lowered between turns) asserting no reviewer invocation and a sticky `terminal_reason`.
 - **The after-reconciliation case has a durability rule** (round 5), because the reviewer's remote
@@ -1183,13 +1197,14 @@ degradation**:
   call clears `terminal_reason`** along with the rest of the record's durable non-convergent state
   (round-9 minor #3), so a `fresh` after an over-cap yields a clean, convergeable
   `whole_conversation` record rather than one that is permanently terminal. Only after that durable
-  record does `clear_pending` remove the `.pending` sidecar. The turn reports `converged: false`,
+  record does `clear_findings_pending` remove the `.findings-pending` sidecar (and, on a Perforce
+  turn, `clear_pending` the Perforce `.pending` one). The turn reports `converged: false`,
   `non_convergence_reason: ledger_too_large`.
 - **The failed-persist outcome is deterministic** (round 6 resolved the apparent precedence
   clash): the two are distinguished by *whether the atomic `record_turn` succeeded*, not by
   precedence. If it **succeeded**, `terminal_reason = ledger_too_large` is durable and every later
   call reports `ledger_too_large`. If it **failed**, *nothing* was written — no ledger, no terminal
-  flag — and the `.pending` sidecar (written before the reviewer call and never cleared) is still
+  flag — and the `.findings-pending` sidecar (written before the reviewer call and never cleared) is still
   set, so it is a plain `turn_not_durable` like any other persistence failure, and the
   reason-precedence order never has to choose between the two because only one of them was ever
   recorded.
@@ -1255,19 +1270,19 @@ structured contract**, and is not overclaimed beyond it.
 | The whole `sessions.json` store fails to parse | Tri-state load returns `invalid`, **not** empty: **all reviews refused before the model call** (resume *and* `fresh`) as a `SESSION_NOT_RESUMABLE`-class refusal with `state_corrupt` detail — **no one-shot review, no completed envelope** (round 21); corrupt file preserved, operator told; never silently a clean fresh conversation. |
 | New session, or `fresh: true` **on a valid store** | `ledger_coverage = whole_conversation`, covers the conversation from turn 1 → convergeable normally (even with zero findings). `fresh` heals a poisoned *record* by resetting **all** durable non-convergent state — stale sidecar, `ledger_coverage` (`invalid`/`legacy_uncovered`/`needs_rebaseline`), **and `terminal_reason=ledger_too_large`** — in a valid store (round-9 minor #3). |
 | Resumed conversation predating the ledger | `ledger_coverage = legacy_uncovered` (sticky, durable): reviewed but non-convergent (`ledger_unavailable`) for the life of the conversation; **escalate for a rebaseline handoff**, not an autonomous `fresh`. Later turns cannot launder it convergeable. |
-| Turn's ledger could not be persisted | Envelope degrades (`turn_not_durable`); the `.pending` sidecar stays set, so a resume is refused. Escalate; recovery is a `fresh` **carrying the preserved prior open findings** (Decision 5, rebaseline handoff). |
-| Over budget **on entry** (before-call path) | No reviewer invoked, **no turn advanced, no `mark_pending`**; `terminal_reason=ledger_too_large` persisted via an idempotent single-field replace (ledger unchanged); returns a **completed** `structured:false`, `converged:false`, `ledger_too_large` envelope. Covers a budget lowered between runs (round-11 major #3). |
-| That before-call terminal-flag persist itself fails | Still non-convergent (`ledger_too_large`, a human-escalation reason); the flag write is re-attempted on the next **operator-directed** call, not by an autonomous loop; **nothing billed or advanced, no `.pending`, no `turn_not_durable`** — there was no turn. |
-| Crosses budget **during a turn** (after-reconciliation path) | Over-cap ledger + sticky `terminal_reason=ledger_too_large` written in one atomic `record_turn`; the `.pending` sidecar cleared *afterward* (a clear failure leaves a stale marker that safely forces the escalation path); `resume_block` refuses resume while `terminal_reason` set; `converged:false`, `ledger_too_large`; **no id silently retired** ([bounded growth](#bounded-growth-and-escalation-outcomes)). |
-| That after-reconciliation `record_turn` itself fails | Nothing written; `.pending` sidecar still set → plain `turn_not_durable`; resume refused, escalate. Deterministic: success ⇒ `ledger_too_large`, failure ⇒ `turn_not_durable` (round-6 major #2). |
+| Turn's ledger could not be persisted | Envelope degrades (`turn_not_durable`); the `.findings-pending` sidecar stays set, so a resume is refused. Escalate; recovery is a `fresh` **carrying the preserved prior open findings** (Decision 5, rebaseline handoff). |
+| Over budget **on entry** (before-call path) | No reviewer invoked, **no turn advanced, no findings write-ahead marker** (the check precedes `mark_findings_pending`); `terminal_reason=ledger_too_large` persisted via an idempotent single-field replace (ledger unchanged); returns a **completed** `structured:false`, `converged:false`, `ledger_too_large` envelope. Covers a budget lowered between runs (round-11 major #3). |
+| That before-call terminal-flag persist itself fails | Still non-convergent (`ledger_too_large`, a human-escalation reason); the flag write is re-attempted on the next **operator-directed** call, not by an autonomous loop; **nothing billed or advanced, no findings marker, no `turn_not_durable`** — there was no turn. |
+| Crosses budget **during a turn** (after-reconciliation path) | Over-cap ledger + sticky `terminal_reason=ledger_too_large` written in one atomic `record_turn`; the `.findings-pending` sidecar cleared *afterward* (a clear failure leaves a stale marker that safely forces the escalation path); `resume_block` refuses resume while `terminal_reason` set; `converged:false`, `ledger_too_large`; **no id silently retired** ([bounded growth](#bounded-growth-and-escalation-outcomes)). |
+| That after-reconciliation `record_turn` itself fails | Nothing written; `.findings-pending` sidecar still set → plain `turn_not_durable`; resume refused, escalate. Deterministic: success ⇒ `ledger_too_large`, failure ⇒ `turn_not_durable` (round-6 major #2). |
 | `whole_conversation` record whose ledger later fails to load | Durable poison → `ledger_coverage` transitions to `invalid` and stays; never accepts a replacement ledger to reconverge (round-4 major #1). |
-| Poison-write (`whole_conversation → invalid`) itself fails | Detected at load, **before the model call** → resume refused (`SESSION_NOT_RESUMABLE`, `ledger_unavailable` — *not* `state_corrupt`); never runs as `whole_conversation`; re-attempts poison on next load (round-6 minor). |
+| Stored ledger found unreadable/incompatible at load (`invalid`) | No poison-*write* exists — coverage lives inside the ledger, so an unreadable ledger has no `whole_conversation` stamp to keep. Detected at load, **before the model call** → resume refused (`SESSION_NOT_RESUMABLE`, `ledger_unavailable` — *not* `state_corrupt`); never runs as `whole_conversation`; the corrupt bytes are never overwritten, so every later load re-derives `invalid` (self-durable across restarts). |
 | Degraded turn 1 (no valid block on a fresh conversation) | No clean anchor → `ledger_coverage = legacy_uncovered` (stamped before reason selection) → reported `ledger_unavailable` (escalate for rebaseline), not `unstructured`; non-convergent, since turn 1's prose findings were never grounded. If turn 1's *own* write fails instead, `turn_not_durable` (no persisted coverage yet, round-12 minor). |
-| `mark_pending` fails before **any** reviewer call (fresh or resumed) | Turn aborts before the model call (nothing billed); never proceeds marker-less. There is **no exemption** — a `fresh: true` that overwrites an existing record must be marked too, or a crash before `record_turn` leaves the old record resumable (round-9 major #1). The fresh/no-existing-record case is harmless, not exempt. (Decision 5, round-4 major #3.) |
+| `mark_findings_pending` fails before **any** reviewer call (fresh or resumed) | Turn aborts before the model call (nothing billed); never proceeds marker-less. There is **no exemption** — a `fresh: true` that overwrites an existing record must be marked too, or a crash before `record_turn` leaves the old record resumable (round-9 major #1). The fresh/no-existing-record case is harmless, not exempt. (Decision 5, round-4 major #3.) |
 | Corrupt store + `fresh: true` | `fresh` is gated too: no convergeable record is written on an `invalid` store; recovery is an explicit operator action, the corrupt file is never auto-replaced (round-4 major #2). |
 | Prose lists a finding the machine block omits | Not machine-detectable without a prose parser; narrowed by the prompt's completeness contract (block is the sole machine source) and by `converged` certifying only the structured contract; prose always returned for a human (round-4 major #5). |
 | Lookalike `_OUT` marker embedded in repo / quoted in prose | Server strips/neutralises non-nonce `_OUT` marker lines from prose; the real `_OUT` block carries this result's nonce; client parses only the nonce-matching one (round-4 major #4). |
-| Degraded turn mid-session (resumed turn, no valid block or reconciliation fail-closed) | Prior ledger preserved untouched, **and `ledger_coverage` transitions `whole_conversation → needs_rebaseline` durably and stickily** (round-7 major): the turn's ungrounded prose could carry an untracked finding, so the session can never again converge — reported `ledger_unavailable`, **escalate for a rebaseline handoff** (round-11 major #4), not an autonomous `fresh`. If that transition can't persist, the `.pending` marker (still set) blocks resume as `turn_not_durable`. |
+| Degraded turn mid-session (resumed turn, no valid block or reconciliation fail-closed) | Prior ledger preserved untouched, **and `ledger_coverage` transitions `whole_conversation → needs_rebaseline` durably and stickily** (round-7 major): the turn's ungrounded prose could carry an untracked finding, so the session can never again converge — reported `ledger_unavailable`, **escalate for a rebaseline handoff** (round-11 major #4), not an autonomous `fresh`. If that transition can't persist, the `.findings-pending` marker (still set) blocks resume as `turn_not_durable`. |
 
 Every "whole-turn degrade" row above is a *degraded turn*, so it also breaks coverage
 (`needs_rebaseline` on a resume, `legacy_uncovered` on turn 1) and its **top-level
@@ -1331,30 +1346,31 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   call as a `SESSION_NOT_RESUMABLE`-class refusal with `state_corrupt` detail — no model call, no
   one-shot review, no completed envelope — propagates `invalid` through
   `get`/`record_turn`/`forget`/`list`, and never poses as an empty/fresh session** (round-4 major #2
-  / round-21 major); a **failed poison-write leaves the record non-convergent and non-resumable,
-  never usable as `whole_conversation`** (round-5 major #5); an **incompatible-version or otherwise-unreadable
+  / round-21 major); because coverage lives inside the ledger, an **unreadable ledger is
+  self-durably `invalid` at load with no separate poison-write, and can never be usable as
+  `whole_conversation`** (round-5 major #5); an **incompatible-version or otherwise-unreadable
   ledger record is `invalid` → a pre-model `SESSION_NOT_RESUMABLE` resume refusal, not a completed
-  envelope** (round-17/18 major); the **reused
-  `.pending` sidecar blocks resume** (including a **pre-upgrade Perforce-only sidecar across a
-  restart**, round-7 minor #3), a **failed `mark_pending` aborts the turn before the model call on
-  every turn including `fresh`** (round-4 major #3), a **crash-injected failed `fresh` overwrite of
+  envelope** (round-17/18 major); the **dedicated `.findings-pending` sidecar blocks resume
+  independently of the Perforce `.pending` one** (including a **pre-upgrade Perforce-only sidecar
+  across a restart**, round-7 minor #3), a **failed `mark_findings_pending` aborts the turn before
+  the model call on every turn including `fresh`** (round-4 major #3), a **crash-injected failed `fresh` overwrite of
   an existing record blocks a subsequent normal resume** (round-9 major #1), and a `fresh` call
   clears it; a **during-turn over-cap ledger is persisted atomically with a sticky
   `terminal_reason=ledger_too_large` that `resume_block` then refuses on** (round-6 major #2), while
   a **failed during-turn `record_turn` reports `turn_not_durable`** (deterministic by persist
   result); a **before-call over-cap (budget lowered between turns) invokes no reviewer, advances no
-  turn, writes no `.pending`, persists `terminal_reason` via an idempotent single-field replace, and
+  turn, writes no findings marker, persists `terminal_reason` via an idempotent single-field replace, and
   returns a completed `ledger_too_large` (a human-escalation reason, so the loop stops); a failed
   terminal-flag persist there is simply non-convergent `ledger_too_large`, re-attempted only on the
   next operator-directed call (never an autonomous retry), never `turn_not_durable`** (round-11
   major #3 / round-12 major #2);
   **`fresh` after over-cap produces a clean, convergeable record** (`terminal_reason` cleared,
-  round-9 minor #3). **The load-time poison-write (`whole_conversation → invalid`) and the
-  during-turn `needs_rebaseline` transition are tested as *separate* paths** (round-11 major #2 —
-  they were wrongly conflated): the **poison-write is a load-time event before any model call**, so
-  *both* its success (record now `invalid`) and its failure (transition could not persist) surface
-  as a **resume refusal / `ledger_unavailable`**, never `turn_not_durable` (no turn ran) — asserted
-  same-process and across a restart; the **`needs_rebaseline` transition happens during a reviewer
+  round-9 minor #3). **The load-time `invalid` detection (`whole_conversation → invalid`, derived at
+  load) and the during-turn `needs_rebaseline` transition are tested as *separate* paths** (round-11
+  major #2 — they were wrongly conflated): the **`invalid` detection is a load-time event before any
+  model call**, so an unreadable ledger surfaces as a **resume refusal / `ledger_unavailable`**,
+  never `turn_not_durable` (no turn ran) — asserted same-process and across a restart; the
+  **`needs_rebaseline` transition happens during a reviewer
   turn**, so its `record_turn` **success ⇒ `ledger_unavailable`, failure ⇒ `turn_not_durable`**.
   **Fault-injection cases for the persistence-first rule** (round-10 minor): a failed coverage-break
   write during a turn on (i) a **fresh turn 1** and (ii) a **mid-session transition** from

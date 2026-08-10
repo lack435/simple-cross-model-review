@@ -143,10 +143,12 @@ impl Reviewer for ClaudeReviewer {
             }
         })?;
 
-        let session_id = parsed
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let session_id = super::normalize_session_id(
+            parsed
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
         let text = parsed
             .get("result")
             .and_then(Value::as_str)

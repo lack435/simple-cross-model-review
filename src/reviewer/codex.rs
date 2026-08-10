@@ -229,7 +229,7 @@ impl Reviewer for CodexReviewer {
 
         Ok(Parsed {
             text,
-            session_id: events.thread_id,
+            session_id: super::normalize_session_id(events.thread_id),
             denials,
             denial_count,
             // The router writes these to stderr, so a capped stderr drops the later ones and
