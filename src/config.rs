@@ -1089,7 +1089,12 @@ impl Config {
     /// the primary and then each fallback in order, so `tools/list`, `status`, and the config
     /// display advertise the chain honestly rather than implying the primary is the only one.
     pub fn describe_reviewer(&self) -> String {
-        let primary = self.primary().describe();
+        // Defensive: `from_args` never produces an empty chain, but a degraded `App` built from an
+        // invalid config must not panic here if something renders it before the chain-error guard.
+        let Some(first) = self.reviewers.first() else {
+            return "(no reviewer configured)".to_string();
+        };
+        let primary = first.describe();
         if self.reviewers.len() == 1 {
             return primary;
         }

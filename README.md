@@ -685,7 +685,9 @@ Report this to the user:
 ```
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
-`RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
+`RATE_LIMITED`, `REVIEWERS_EXHAUSTED` (every entry in a fallback chain hit a rate/usage
+limit), `INVALID_REVIEWER_CHAIN` (the configured chain is unusable, so every review is
+refused until it is fixed), `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
 `OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `CANCELLED`,
 `SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad tool arguments, a session already busy, a
 session refused as not resumable, and too many reviews already running (`TOO_MANY_RUNNING`,

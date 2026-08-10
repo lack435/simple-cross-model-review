@@ -48,15 +48,47 @@ struct Preflight {
     auth: String,
 }
 
+/// Per-chain-entry preflight cache, keyed by entry index. Shared (via `Arc`) between `App` and the
+/// worker's fall-through walk, so each entry is resolved and auth-checked at most once across the
+/// selected-entry check, `status`, and the walk.
+type PreflightCache = Arc<Mutex<std::collections::HashMap<usize, Preflight>>>;
+
+/// Resolve and auth-check a chain entry, returning a cached result when present and caching a
+/// fresh one otherwise. Successful preflights are cached for the process lifetime; failures are
+/// not, so a user who runs `codex login` can retry without restarting the agent session. The
+/// adapter is selected per entry (`for_kind`), so a mixed-family chain preflights each entry with
+/// its own CLI.
+fn ensure_entry_ready(
+    cache: &Mutex<std::collections::HashMap<usize, Preflight>>,
+    cfg: &Config,
+    index: usize,
+    cancel: &AtomicBool,
+) -> Result<Preflight, Failure> {
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    let spec = &cfg.reviewers[index];
+    let bin = reviewer::resolve_bin(spec)?;
+    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, cancel)?;
+    let ready = Preflight { bin, auth };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index, ready.clone());
+    Ok(ready)
+}
+
 pub struct App {
     cfg: Arc<Config>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
-    /// Successful preflights are cached for the process lifetime, keyed by chain-entry index, so
-    /// a chain's entries are each resolved and auth-checked at most once. Failures are not
-    /// cached, so a user who runs `codex login` can retry without restarting the agent session.
-    preflight: Mutex<std::collections::HashMap<usize, Preflight>>,
+    preflight: PreflightCache,
     /// Set when the reviewer chain is semantically invalid (`Config::validate_chain`). While
     /// present, every review is refused in-band with this `INVALID_REVIEWER_CHAIN` failure
     /// rather than the server exiting — see `docs/reviewer-fallback-chain.md`. Checked before
@@ -80,7 +112,7 @@ impl App {
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
-            preflight: Mutex::new(std::collections::HashMap::new()),
+            preflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
             chain_error,
         }
     }
@@ -118,42 +150,11 @@ impl App {
 
     /// Resolve and auth-check a specific chain entry, caching the result by index.
     ///
-    /// The adapter is selected per entry (`for_kind`), so a mixed-family chain preflights each
-    /// entry with its own CLI. Called for the *selected* entry (entry 0 for a fresh review, the
-    /// resume-matched entry otherwise) before the worker starts; fallback entries are preflighted
-    /// by the walk itself as it reaches them.
+    /// Delegates to the shared [`ensure_entry_ready`], which the worker's fall-through walk uses
+    /// too (via the same `Arc`-shared cache), so each entry is preflighted at most once across the
+    /// selected-entry check here, `status`, and the walk.
     fn ensure_ready_for(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
-        if let Some(cached) = self
-            .preflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&index)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-        let ready = self.resolve_uncached(index, cancel)?;
-        self.preflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(index, ready.clone());
-        Ok(ready)
-    }
-
-    /// Resolve and auth-check an entry, *bypassing the cache*, and refresh the cache with the
-    /// result. Used on resume, where a PATH change since the cache was warmed must not hide behind
-    /// a stale cached binary: the fresh resolution is what the drift check validates and what the
-    /// worker then runs.
-    fn resolve_uncached(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
-        let spec = &self.cfg.reviewers[index];
-        let bin = reviewer::resolve_bin(spec)?;
-        let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
-        let ready = Preflight { bin, auth };
-        self.preflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(index, ready.clone());
-        Ok(ready)
+        ensure_entry_ready(&self.preflight, &self.cfg, index, cancel)
     }
 
     // -----------------------------------------------------------------------
@@ -258,35 +259,44 @@ impl App {
             None => 0,
         };
         // A `notifications/cancelled` that arrived before the review is even registered still
-        // stops setup here, before the (bounded) preflight below spends its auth check.
+        // stops setup here; the flag below then interrupts the (bounded) auth check itself.
         if request.is_cancelled() {
             return Err(errors::cancelled());
         }
-        // The selected entry's preflight uses a bounded auth check; a fresh flag is the backstop
-        // since the review has no registry cancel yet (it is not registered until `try_start`).
-        let preflight_cancel = AtomicBool::new(false);
+        // The review has no registry cancel yet (it is not registered until `try_start`), so the
+        // selected entry's auth check observes the request's own cancel mirror instead.
+        let cancel = request.cancel_flag();
         let ready = match &prior {
-            // Resume: resolve the selected entry *uncached*, so a PATH change since the cache was
-            // warmed cannot hide behind a stale entry, validate the fresh path against what the
-            // session was created with, and run (and cache) that validated binary.
+            // Resume: resolve the selected entry *uncached* and validate its binary against what
+            // the session was created with **before** auth-checking or caching it -- so a PATH
+            // change cannot hide behind a stale cached entry, and a rejected resume never leaves a
+            // rejected binary in the cache for a later fresh review to reuse.
             Some(record) => {
-                let ready = self.resolve_uncached(start_index, &preflight_cancel)?;
+                let spec = &self.cfg.reviewers[start_index];
+                let bin = reviewer::resolve_bin(spec)?;
                 if let Some(stored) = &record.resolved_bin {
-                    let fresh = ready.bin.to_string_lossy();
-                    if fresh != *stored {
+                    if bin.to_string_lossy() != *stored {
                         return Err(errors::session_not_resumable(
                             &session,
                             format!(
                                 "it was created with the reviewer binary at '{stored}', but that \
-                                 entry now resolves to '{fresh}'; PATH or the install changed, so \
-                                 the conversation cannot be resumed through a different executable."
+                                 entry now resolves to '{}'; PATH or the install changed, so the \
+                                 conversation cannot be resumed through a different executable.",
+                                bin.display()
                             ),
                         ));
                     }
                 }
+                // Identity confirmed: now auth-check and cache the validated binary.
+                let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
+                let ready = Preflight { bin, auth };
+                self.preflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(start_index, ready.clone());
                 ready
             }
-            None => self.ensure_ready_for(start_index, &preflight_cancel)?,
+            None => self.ensure_ready_for(start_index, cancel)?,
         };
 
         // Claiming the session and registering the review are one atomic step, so two
@@ -320,6 +330,7 @@ impl App {
             reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
             spec: self.cfg.reviewers[start_index].clone(),
             start_index,
+            preflight: Arc::clone(&self.preflight),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             metrics: Arc::clone(&self.metrics),
@@ -868,6 +879,9 @@ struct Job {
     /// resume-matched entry (which runs alone, no fall-through). Its bin is already in `self.bin`,
     /// preflighted in `start_review`, so the walk does not re-resolve it.
     start_index: usize,
+    /// The `App`'s per-entry preflight cache, shared so the walk's fallback preflights reuse (and
+    /// populate) the same cache the selected-entry check and `status` use.
+    preflight: PreflightCache,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
@@ -1225,20 +1239,18 @@ impl Job {
             // is missing or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it
             // stops the walk) rather than troubling a healthy primary.
             if i != self.start_index {
-                match reviewer::resolve_bin(&entry) {
-                    Ok(bin) => self.bin = bin,
+                // Preflight the fallback through the shared cache (interruptible via the review's
+                // cancel), so a fallback already checked by `status` is not re-resolved.
+                match ensure_entry_ready(&self.preflight, &self.cfg, i, &self.cancel) {
+                    Ok(ready) => self.bin = ready.bin,
                     Err(f) => {
-                        // Resolution failed: `self.bin` still holds the previous entry's path, so
-                        // this attempt has no verified binary to attribute.
+                        // Preflight failed (resolution or auth): `self.bin` may still hold the
+                        // previous entry's path, so this attempt has no verified binary to
+                        // attribute in the record.
                         active_bin_resolved = false;
                         outcome = Some(Outcome::failed(f));
                         break;
                     }
-                }
-                // The review's own cancel flag, so a chain of fallback auth checks is interruptible.
-                if let Err(f) = self.reviewer.auth_check(&self.bin, &self.cfg, &self.cancel) {
-                    outcome = Some(Outcome::failed(f));
-                    break;
                 }
             }
 
