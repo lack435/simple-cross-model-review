@@ -1,10 +1,11 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1–5.** This document is the plan. Per
+Status: **proposed — revised after cross-review rounds 1–6.** This document is the plan. Per
 this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Rounds 1–5 each returned REQUEST
-CHANGES — seven findings, then six, five, six, and six, all accepted; the sections below fold
-each one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
+effort=max) and reach APPROVE before implementation begins. Rounds 1–6 each returned REQUEST
+CHANGES — seven findings, then six, five, six, six, and two, all accepted; the sections below
+fold each one in, and [Review history](#review-history) records where. It is the plan for
+[issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -361,7 +362,13 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
   turns and fallback preflights) it reads the registry stop flag the review already carries.
   One abstraction, two backing sources, chosen by phase — so a `notifications/cancelled` during
   selected-entry auth, *before a review_id even exists*, stops setup, and a cancel mid-walk
-  stops the fallback.
+  stops the fallback. Round 6 noted the probe stops the *child*, but `collect`'s output-drain
+  loop ([reviewer/mod.rs:440], [reviewer/mod.rs:472]) does not consult it: a cancelled auth
+  whose descendant holds a pipe open can still wait out the drain grace. That grace is already
+  a fixed, bounded tail, so the plan documents it as a **bounded non-cancellable tail** on
+  cancellation (the same residual the budget framing already carries) rather than threading the
+  probe into the drain — a proportionate choice, since the tail is bounded and short; passing
+  the probe into `collect` is noted as an optional future tightening.
 - `max_wait_secs`, and the budget shown in the start/running responses and progress text —
   which today all display `cfg.timeout` ([tools.rs:316], [tools.rs:466]) — are all recomputed
   from `chain_budget`. This is deliberately generous (three entries at a 30-minute timeout
@@ -382,6 +389,7 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
 [reviewer/mod.rs:154]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:359]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:424]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:440]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:472]: ../src/reviewer/mod.rs
 [single-blocking-collect.md:178]: single-blocking-collect.md
 [claude.rs:36]: ../src/reviewer/claude.rs
@@ -839,11 +847,14 @@ Unit tests (no network, no model call), extending the existing fakes:
   read by both.
 - **Prompt bytes**: after a fall-through, `Record.prompt_bytes` is the final attempt's size and
   each `Attempt.prompt_bytes` is its own.
-- **Budget**: a single-entry `chain_budget` equals today's `max_wait_secs` exactly (the
-  invariant); a multi-entry walk of rate-limited entries, each running near its
-  `--timeout-seconds` before being classified, stays within `chain_budget`; the displayed
-  budget equals `chain_budget`, not `cfg.timeout`; cancellation during a fallback
-  preflight/auth check stops the walk promptly (assert the cancel token reaches `auth_check`).
+- **Budget**: the tests assert the *arithmetic* and the *cancellable deadlines* separately,
+  never a hard wall-clock ceiling (round 6: the prose disclaims one, so a test must not
+  assert it). Specifically: a single-entry `chain_budget` equals today's `max_wait_secs`
+  exactly (the invariant); the multi-entry `chain_budget` equals the formula for given `N`,
+  `timeout`, and grace; the displayed budget equals `chain_budget`, not `cfg.timeout`; and
+  cancellation during a fallback auth check stops the walk promptly (assert the probe reaches
+  `auth_check`). The uninterruptible `resolve_bin` PATH-scan residual is explicitly *not*
+  asserted to fit inside the deadline.
 - **Metrics completeness**: a logical turn whose `attempts` include a rate-limited primary with
   unavailable usage is summarised as **partial/unknown**, not complete, even though the
   successful fallback's own usage is complete; fixtures cover records with and without the
@@ -974,6 +985,15 @@ now reflects.
   a bin → optional top-level resolved-bin on every `Record` ([Metrics]); (6) `status` still named
   only the primary → all tool descriptions render the chain ([Capture in a mixed-family chain]).
 
+- **Round 6 (same session, turn 6) — REQUEST CHANGES.** Two findings; the reviewer confirmed
+  round-5 #1/#2/#4/#5/#6 and found no new adapter, capture, session-identity, metrics-version,
+  or registry-lock issue. (1, major) The budget *test* still asserted a walk "stays within
+  `chain_budget`", contradicting the prose's practical-sizing disclaimer → the tests now assert
+  the arithmetic and the cancellable deadlines separately and explicitly exempt the PATH-scan
+  residual ([Testing]). (2, minor) The cancellation probe stopped the child but not `collect`'s
+  drain loop → the drain grace is documented as a bounded non-cancellable tail, with threading
+  the probe into `collect` noted as an optional tightening ([The fall-through, budget]).
+
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
 [The fall-through, budget]: #3-the-fall-through-reactive-and-rate-only
@@ -981,3 +1001,4 @@ now reflects.
 [Metrics]: #metrics-the-result-interface-status-doctor
 [Config validation]: #2-config-validation-two-tiers-and-where-each-is-reported
 [Per-entry adapter selection]: #per-entry-adapter-selection--every-identity-read-must-follow-the-active-entry
+[Testing]: #testing
