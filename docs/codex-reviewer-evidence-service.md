@@ -119,15 +119,21 @@ construction rather than by tool description.
 
 The parent process launches its own absolute executable path as this server through explicit
 `-c mcp_servers.<reserved-name>.*` overrides on `codex exec`. Those overrides are passed on
-fresh and resumed turns. Default isolation still passes `--ignore-user-config`, so user and
-project MCP servers, hooks, skills, and settings remain absent; the server-owned MCP entry is
-added afterward at invocation precedence. Add `--strict-config` so an older Codex CLI that
-does not accept the generated MCP configuration fails before a billed review can masquerade
-as fully equipped. Set `mcp_servers.<reserved-name>.required=true`, `.enabled=true`, an exact
-`.enabled_tools` list, and `.default_tools_approval_mode="approve"`. Auto-approval is safe
-only because the setting is scoped to this server-owned entry whose complete tool surface is
-read-only; it must never be applied at top level or to a user/repository MCP server. Phase 0
-tests that a second server still follows its own approval policy.
+fresh and resumed turns. Default isolation passes `--ignore-user-config` and `--ignore-rules`,
+and adds a command-line `projects.<canonical-root>.trust_level="untrusted"` override. The first
+flag skips `$CODEX_HOME/config.toml`, the second skips user/project exec-policy rules, and the
+trust override skips the reviewed repository's `.codex/` config, hooks, rules, agents, and
+other project layer even when the caller has trusted that checkout. `--ignore-user-config`
+alone does **not** suppress trusted-project config. System/managed policy remains in force.
+
+The server-owned MCP entry is then added at command-line precedence. Add `--strict-config`
+so an older Codex CLI that does not accept the generated MCP configuration fails before a
+billed review can masquerade as fully equipped. Set
+`mcp_servers.<reserved-name>.required=true`, `.enabled=true`, an exact `.enabled_tools` list,
+and `.default_tools_approval_mode="approve"`. Auto-approval is safe only because the setting
+is scoped to this server-owned entry whose complete tool surface is read-only; it must never
+be applied at top level or to a user/repository MCP server. Phase 0 tests that a second server
+still follows its own approval policy.
 
 The internal server receives an opaque, per-turn capability file path rather than a root and
 options assembled from model input. The parent creates that file in the existing state/temp
@@ -261,10 +267,10 @@ tool-call event shape is recorded above. Turn that manual probe into a tiny test
 then complete the compatibility proof by capturing CLI behavior when a required server
 fails, proving the exact per-server approval key leaves a second server untouched, checking
 command-line precedence over a colliding user config, observing whether the MCP child can
-break away from the reviewer job, and testing the lowest supported Codex CLI version. Also
-verify that `--ignore-user-config` suppresses both user and trusted-project MCP entries. If
-any remaining premise fails, stop and amend this plan; do not silently fall back to
-exec-policy rules.
+break away from the reviewer job, and testing the lowest supported Codex CLI version. Verify
+the explicit untrusted-project override suppresses a same-named trusted-project MCP entry;
+do not attribute that behavior to `--ignore-user-config`. If any remaining premise fails,
+stop and amend this plan; do not silently fall back to exec-policy rules.
 
 ### Phase 1: evidence core
 
@@ -307,7 +313,7 @@ unavoidable, captured as a named smoke artifact:
 | Area | Required proof |
 | --- | --- |
 | Invocation | Fresh and resume argv include the same strict, isolated evidence entry; TOML escaping covers spaces, quotes, backslashes, Unicode, and an unrepresentable executable path fails visibly. |
-| Isolation | Hostile user/project MCP servers, hooks, rules, skills, and config do not load by default; the evidence server exposes no review, shell, write, or network tool. |
+| Isolation | User config is skipped, user/project rules are skipped, and the canonical reviewed root is forced untrusted so its `.codex/` layer does not load; a colliding project MCP entry cannot replace the command-line evidence server; the evidence server exposes no review, shell, write, or network tool. |
 | Availability | Parent handshake and required Codex startup succeed with the correct bundle; missing, replayed, truncated, malformed, collision-replaced, wrong-schema, or dead services fail before a review verdict. A model that simply makes no tool call does not fail. |
 | Paths | Absolute, parent, UNC, device, ADS, case-folding, symlink, junction, deleted/replaced, and root-edge cases cannot escape the canonical root. |
 | Search/list/read | Deterministic pagination, literal matching, UTF-8/binary handling, long lines, large files, empty repos, subdirectory roots, ignored/untracked files, and cap/timeout accounting. |
@@ -320,8 +326,9 @@ unavoidable, captured as a named smoke artifact:
 ## Rollout and compatibility
 
 Make the evidence service mandatory for isolated Codex reviews once Phase 0 establishes the
-supported CLI floor. Older/incompatible CLIs receive `EVIDENCE_UNAVAILABLE` with an upgrade
-remediation; they do not fall back to an evidence-thinned approval. Claude reviews are
+supported CLI floor (initially the verified `codex-cli 0.144.5`). Older/incompatible CLIs
+receive `EVIDENCE_UNAVAILABLE` with an upgrade remediation; they do not fall back to an
+evidence-thinned approval. Claude reviews are
 unchanged. Keep the current shell guidance behind a temporary compatibility switch only
 during development, remove it before release, and do not expose a permanent flag that turns
 the service off while still claiming an equivalent review.

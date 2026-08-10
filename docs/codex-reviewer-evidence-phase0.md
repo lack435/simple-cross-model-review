@@ -45,6 +45,17 @@ the evidence server leaks to a second server.
   service cleanup.
 - After the Codex turn ended, the reported evidence-server PID no longer existed. The normal
   stdio-EOF path therefore reaped this fixture even though it had broken away from the job.
+- `--ignore-user-config` alone is not a project-isolation control: the official CLI contract
+  says it skips `$CODEX_HOME/config.toml`, while trusted `.codex/config.toml` files are a
+  separate higher-precedence layer. Adding `--ignore-rules` plus
+  `projects.'C:\dev\simple-cross-model-review'.trust_level='untrusted'` skipped that project
+  layer. A command-line evidence fixture deliberately named `cross_review` then replaced the
+  same-named project MCP server, `repository_scope` succeeded, and
+  `cross_model_review_status` was absent from the model's tool list.
+- The initial supported floor is `codex-cli 0.144.5`, the version these required/approval/
+  strict-config/fresh/resume/collision probes exercised. Compatibility is behavior-gated as
+  well: a CLI that rejects the strict config or cannot initialize the required server fails
+  closed before a review verdict.
 
 Unit coverage verifies the fixture's nonce validation, initialize/tools-list surface,
 read-only annotations, approval-control annotations, structured scope result, and rejection
@@ -53,10 +64,6 @@ and a release build passed after the Phase 0 fixture and control were added.
 
 ## Still required before product dependency
 
-- Prove command-line precedence over a colliding user/project server entry.
-- Prove `--ignore-user-config` suppresses both user and trusted-project MCP entries, not only
-  the base user config.
-- Run the fixture against the eventual lowest supported Codex CLI version, not only 0.144.5.
 - Test forced cancel, timeout, parent crash, and provider-child cleanup. Normal EOF is not a
   substitute for those paths.
 - Replace this temporary fixture with the real capability-bundle handshake and evidence
