@@ -30,7 +30,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// wrong, and the point is that it fails legibly rather than eating the machine.
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-use crate::config::{Config, ReviewerKind};
+use crate::config::{Config, ReviewerKind, ReviewerSpec};
 use crate::errors::{self, Failure};
 
 /// What the reviewer produced.
@@ -108,6 +108,7 @@ pub trait Reviewer: Send + Sync {
     fn invocation(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         bin: &Path,
         resume: Option<&str>,
         tmp_id: &str,
@@ -115,9 +116,13 @@ pub trait Reviewer: Send + Sync {
 
     /// `last_message_file` is whatever `invocation` asked the CLI to write its final
     /// message to. It is passed separately because the `Command` is consumed by `run`.
+    ///
+    /// `spec` is the *active* chain entry that ran, so model/effort in any classified failure
+    /// name the reviewer that actually produced the output, not the primary.
     fn parse(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         out: &RunOutcome,
         last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure>;
@@ -137,19 +142,19 @@ pub fn for_kind(kind: ReviewerKind) -> Box<dyn Reviewer> {
 /// Locate the reviewer CLI. An explicit `--bin` always wins; otherwise we search
 /// PATH with the Windows executable extensions and then a few well-known install
 /// locations, because npm-global and native installs land in different places.
-pub fn resolve_bin(cfg: &Config) -> Result<PathBuf, Failure> {
+pub fn resolve_bin(spec: &ReviewerSpec) -> Result<PathBuf, Failure> {
     let mut tried: Vec<String> = Vec::new();
 
-    if let Some(explicit) = &cfg.primary().bin {
+    if let Some(explicit) = &spec.bin {
         if explicit.is_file() {
             return Ok(explicit.clone());
         }
         tried.push(format!("{} (from --bin)", explicit.display()));
-        return Err(errors::cli_not_found(cfg.primary().reviewer.as_str(), &tried));
+        return Err(errors::cli_not_found(spec.reviewer.as_str(), &tried));
     }
 
     let exts = path_exts();
-    let stems = cfg.primary().reviewer.bin_stems();
+    let stems = spec.reviewer.bin_stems();
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -177,14 +182,14 @@ pub fn resolve_bin(cfg: &Config) -> Result<PathBuf, Failure> {
         tried.push("PATH is not set".to_string());
     }
 
-    for candidate in fallback_locations(cfg.primary().reviewer) {
+    for candidate in fallback_locations(spec.reviewer) {
         if candidate.is_file() {
             return Ok(candidate);
         }
         tried.push(candidate.display().to_string());
     }
 
-    Err(errors::cli_not_found(cfg.primary().reviewer.as_str(), &tried))
+    Err(errors::cli_not_found(spec.reviewer.as_str(), &tried))
 }
 
 /// Locate `stem` on PATH, and nowhere else.
@@ -600,7 +605,7 @@ fn collect(drain: &Drain, deadline: Instant) -> Collected {
 /// diagnosis unreliable -- a JSON document cut in half parses as nothing at all -- so the
 /// cap has to be named rather than left to surface as "the CLI wrote nothing", which is
 /// the opposite of what happened and points the caller at a useless retry.
-pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
+pub fn truncation_failure(spec: &ReviewerSpec, out: &RunOutcome) -> Option<Failure> {
     // Gated on stdout alone. A run whose stderr flooded but whose stdout is simply empty
     // failed for some other reason, and reporting it as truncation would tell the caller
     // not to retry when retrying is exactly right. `stdout_incomplete` (a partial prefix from a
@@ -609,7 +614,7 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     // fallback would otherwise return an earlier agent message as the review.
     if out.stdout_truncated {
         Some(errors::output_truncated(
-            cfg.primary().reviewer.as_str(),
+            spec.reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),
             out.diagnostics(),
         ))
@@ -617,7 +622,7 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
         // A partial prefix that did not hit the size cap: a distinct diagnostic, since the
         // truncation message would wrongly claim the CLI exceeded the cap.
         Some(errors::output_incomplete(
-            cfg.primary().reviewer.as_str(),
+            spec.reviewer.as_str(),
             out.diagnostics(),
         ))
     } else {
@@ -625,14 +630,15 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     }
 }
 
-/// Turn a non-success run into the right `Failure`.
-pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
-    let reviewer = cfg.primary().reviewer.as_str();
+/// Turn a non-success run into the right `Failure`. `spec` is the *active* entry that ran,
+/// not the primary, so a fallback's failure names the reviewer that actually produced it.
+pub fn failure_for(cfg: &Config, spec: &ReviewerSpec, out: &RunOutcome) -> Failure {
+    let reviewer = spec.reviewer.as_str();
     if out.cancelled {
         return errors::cancelled();
     }
     if out.timed_out {
-        if cfg.primary().reviewer == ReviewerKind::Codex {
+        if spec.reviewer == ReviewerKind::Codex {
             let policy_denials = codex::policy_denial_count(&out.stderr);
             if policy_denials > 0 {
                 return errors::timed_out_after_policy_denials(
@@ -649,8 +655,8 @@ pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
     }
     errors::classify(
         reviewer,
-        &cfg.primary().model,
-        &cfg.primary().effort,
+        &spec.model,
+        &spec.effort,
         out.exit,
         &out.diagnostics(),
         &out.diagnostics(),

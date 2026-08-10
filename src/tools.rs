@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::Config;
+use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -127,7 +127,7 @@ impl App {
         {
             return Ok(cached);
         }
-        let bin = reviewer::resolve_bin(&self.cfg)?;
+        let bin = reviewer::resolve_bin(self.cfg.primary())?;
         let auth = self.reviewer.auth_check(&bin, &self.cfg)?;
         let ready = Preflight { bin, auth };
         *self.preflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(ready.clone());
@@ -257,6 +257,7 @@ impl App {
         let job = Job {
             cfg: Arc::clone(&self.cfg),
             reviewer: Arc::clone(&self.reviewer),
+            spec: self.cfg.primary().clone(),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             metrics: Arc::clone(&self.metrics),
@@ -749,6 +750,11 @@ impl App {
 struct Job {
     cfg: Arc<Config>,
     reviewer: Arc<dyn Reviewer>,
+    /// The active chain entry this job runs. Its adapter is `reviewer` and its resolved binary
+    /// is `bin`. Every identity-bearing call on the run path reads this, never `cfg.primary()`,
+    /// so a fallback names the reviewer that actually ran. For now this is always the primary;
+    /// the fall-through walk that advances it lands in a later commit.
+    spec: ReviewerSpec,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
@@ -1158,7 +1164,7 @@ impl Job {
 
         eprintln!(
             "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}",
-            self.cfg.primary().reviewer.as_str(),
+            self.spec.reviewer.as_str(),
             facts.turn,
             self.session,
             status,
@@ -1185,9 +1191,9 @@ impl Job {
             turn: facts.turn,
             resumed: facts.resumed,
             gap_secs: facts.gap_secs,
-            reviewer: self.cfg.primary().reviewer.as_str().to_string(),
-            model: self.cfg.primary().model.clone(),
-            effort: self.cfg.primary().effort.clone(),
+            reviewer: self.spec.reviewer.as_str().to_string(),
+            model: self.spec.model.clone(),
+            effort: self.spec.effort.clone(),
             prompt_bytes: facts.prompt_bytes,
             diff_bytes,
             diff_truncated,
@@ -1268,10 +1274,10 @@ impl Job {
 
         let invocation = self
             .reviewer
-            .invocation(&self.cfg, &self.bin, resume_id, &self.id)
+            .invocation(&self.cfg, &self.spec, &self.bin, resume_id, &self.id)
             .map_err(|e| {
                 errors::spawn_failed(
-                    self.cfg.primary().reviewer.as_str(),
+                    self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
                 )
@@ -1291,7 +1297,7 @@ impl Job {
         )
         .map_err(|e| {
             errors::spawn_failed(
-                self.cfg.primary().reviewer.as_str(),
+                self.spec.reviewer.as_str(),
                 &self.bin.display().to_string(),
                 e.to_string(),
             )
@@ -1301,10 +1307,10 @@ impl Job {
         let result = match run {
             Ok(out) => {
                 if out.cancelled || out.timed_out {
-                    Err(reviewer::failure_for(&self.cfg, &out))
+                    Err(reviewer::failure_for(&self.cfg, &self.spec, &out))
                 } else {
                     self.reviewer
-                        .parse(&self.cfg, &out, last_message_file.as_deref())
+                        .parse(&self.cfg, &self.spec, &out, last_message_file.as_deref())
                 }
             }
             Err(failure) => Err(failure),
@@ -1386,10 +1392,10 @@ impl Job {
                 match self.sessions.record_turn(
                     &self.session,
                     session::TurnFacts {
-                        reviewer: self.cfg.primary().reviewer.as_str(),
+                        reviewer: self.spec.reviewer.as_str(),
                         cli_session_id: session_id,
-                        model: &self.cfg.primary().model,
-                        effort: &self.cfg.primary().effort,
+                        model: &self.spec.model,
+                        effort: &self.spec.effort,
                         cwd: &self.cfg.cwd.to_string_lossy(),
                         cumulative_usage: baseline_to_persist,
                         // Bind the session to the changelist set (Perforce only), canonicalised

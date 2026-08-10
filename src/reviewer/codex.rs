@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
-use crate::config::Config;
+use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
 
@@ -48,6 +48,7 @@ impl Reviewer for CodexReviewer {
     fn invocation(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         bin: &Path,
         resume: Option<&str>,
         tmp_id: &str,
@@ -72,7 +73,7 @@ impl Reviewer for CodexReviewer {
 
         cmd.arg("--json");
         cmd.arg("--skip-git-repo-check");
-        cmd.args(["-m", &cfg.primary().model]);
+        cmd.args(["-m", &spec.model]);
         // Stated on every turn, including resumes, via the config override that `resume`
         // does accept. A resumed session does appear to retain the policy it was created
         // with -- verified: a write attempt on turn 2 of a `-s read-only` session was
@@ -82,7 +83,7 @@ impl Reviewer for CodexReviewer {
         cmd.args(["-c", &format!("sandbox_mode=\"{}\"", cfg.sandbox)]);
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
-        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.primary().effort)]);
+        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", spec.effort)]);
         if cfg.isolate_reviewer {
             // `codex exec` does start configured MCP servers (verified: a marker server
             // ran and left a file), so a reviewer that also has cross-review registered
@@ -102,7 +103,8 @@ impl Reviewer for CodexReviewer {
 
     fn parse(
         &self,
-        cfg: &Config,
+        _cfg: &Config,
+        spec: &ReviewerSpec,
         out: &RunOutcome,
         last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
@@ -126,8 +128,8 @@ impl Reviewer for CodexReviewer {
             // An expired resume target is detected inside `classify`.
             return Err(errors::classify(
                 "codex",
-                &cfg.primary().model,
-                &cfg.primary().effort,
+                &spec.model,
+                &spec.effort,
                 out.exit,
                 &evidence,
                 &detail,
@@ -172,7 +174,7 @@ impl Reviewer for CodexReviewer {
                 // *fit*, so the reviewer's actual conclusion may be among the discarded
                 // bytes, and returning an earlier message as the verdict would be a
                 // silently wrong review rather than a visible failure.
-                if let Some(truncated) = super::truncation_failure(cfg, out) {
+                if let Some(truncated) = super::truncation_failure(spec, out) {
                     return Err(truncated);
                 }
                 events.last_message.clone().unwrap_or_default()

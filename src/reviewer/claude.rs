@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
-use crate::config::Config;
+use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
 
@@ -69,6 +69,7 @@ impl Reviewer for ClaudeReviewer {
     fn invocation(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         bin: &Path,
         resume: Option<&str>,
         _tmp_id: &str,
@@ -77,8 +78,8 @@ impl Reviewer for ClaudeReviewer {
         cmd.current_dir(&cfg.cwd);
         cmd.arg("-p");
         cmd.args(["--output-format", "json"]);
-        cmd.args(["--model", &cfg.primary().model]);
-        cmd.args(["--effort", &cfg.primary().effort]);
+        cmd.args(["--model", &spec.model]);
+        cmd.args(["--effort", &spec.effort]);
         // dontAsk denies anything outside the allow-list instead of prompting, so a
         // non-interactive run can neither hang nor escalate.
         cmd.args(["--permission-mode", "dontAsk"]);
@@ -119,6 +120,7 @@ impl Reviewer for ClaudeReviewer {
     fn parse(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
@@ -126,12 +128,12 @@ impl Reviewer for ClaudeReviewer {
         // not a parse failure to diagnose -- it is a document with its end missing, and
         // saying so is the only accurate report available.
         let parsed: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
-            if let Some(truncated) = super::truncation_failure(cfg, out) {
+            if let Some(truncated) = super::truncation_failure(spec, out) {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
             } else {
-                super::failure_for(cfg, out)
+                super::failure_for(cfg, spec, out)
             }
         })?;
 
@@ -180,8 +182,8 @@ impl Reviewer for ClaudeReviewer {
             // path reaches -- including the one where stdout never parses.
             return Err(errors::classify(
                 "claude",
-                &cfg.primary().model,
-                &cfg.primary().effort,
+                &spec.model,
+                &spec.effort,
                 out.exit,
                 &evidence,
                 &detail,
