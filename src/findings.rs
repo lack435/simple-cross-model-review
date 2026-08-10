@@ -254,15 +254,21 @@ impl Ledger {
             if !seen.insert(f.id.as_str()) {
                 return false; // duplicate id
             }
-            // Ids are minted as `f<n>`; anything else, or a seq >= next_seq, is inconsistent.
+            // Ids are minted as the *canonical* decimal `f<n>` (see `reconcile`). Accept only that
+            // exact spelling: a `u64::parse` alone would also accept `f007` or `f+7`, which parse to
+            // the same seq as `f7` and would defeat the duplicate-id check above (distinct strings,
+            // colliding seq). Round-trip the parsed number back to its canonical form and require an
+            // exact match.
             match f.id.strip_prefix('f').and_then(|n| n.parse::<u64>().ok()) {
-                Some(n) => max_seq = max_seq.max(n),
-                None => return false,
+                Some(n) if f.id == format!("f{n}") => max_seq = max_seq.max(n),
+                _ => return false,
             }
         }
         // The next id to mint must be strictly greater than every id already present, so a new
-        // finding can never collide with an existing one.
-        self.next_seq > max_seq
+        // finding can never collide with an existing one. `u64::MAX` is also rejected: minting at
+        // the ceiling would overflow the counter on the *next* finding and wrap back into the used
+        // range, so a ledger that cannot advance safely is treated as invalid rather than loaded.
+        self.next_seq > max_seq && self.next_seq != u64::MAX
     }
 }
 
@@ -365,6 +371,10 @@ pub enum ReconcileError {
     MissingId(String),
     /// The same id appeared twice in `prior_findings`.
     DuplicateId(String),
+    /// The id counter would overflow `u64` while minting new findings this turn. Degrading is the
+    /// only safe response: advancing past the ceiling would wrap the counter back into the range of
+    /// ids already issued and mint a colliding one.
+    CounterExhausted,
 }
 
 // --- Sentinel markers ----------------------------------------------------------------------
@@ -549,7 +559,10 @@ fn reconcile(
         })
         .collect();
 
-    // Append new findings with fresh monotonic ids, status Open.
+    // Append new findings with fresh monotonic ids, status Open. The counter is advanced with a
+    // checked add: a ledger loaded through `is_structurally_valid` cannot start at the ceiling, but
+    // a turn minting enough new findings to *reach* it must degrade rather than wrap `seq` back into
+    // the range of ids already issued and mint a duplicate.
     let mut seq = next_seq;
     for nf in &block.new_findings {
         out.push(Finding {
@@ -563,7 +576,7 @@ fn reconcile(
             first_seen_turn: turn,
             last_status_change_turn: turn,
         });
-        seq += 1;
+        seq = seq.checked_add(1).ok_or(ReconcileError::CounterExhausted)?;
     }
     Ok((out, seq))
 }
@@ -1014,6 +1027,7 @@ fn describe_reconcile(e: &ReconcileError) -> String {
         ReconcileError::UnknownId(id) => format!("status reported for unknown id {id}"),
         ReconcileError::MissingId(id) => format!("prior id {id} was not accounted for"),
         ReconcileError::DuplicateId(id) => format!("id {id} was reported twice"),
+        ReconcileError::CounterExhausted => "the finding id counter is exhausted".to_string(),
     };
     format!(
         "the machine block could not be reconciled ({what}); the review is returned unstructured"
@@ -1329,6 +1343,23 @@ mod tests {
             findings: vec![],
         };
         assert!(!poisoned.is_structurally_valid());
+        // A non-canonical id spelling (leading zeros) that `u64::parse` would accept but which is
+        // not how ids are minted: it shares a seq with `f7` and would defeat the duplicate check.
+        let noncanonical = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 8,
+            findings: vec![finding("f007", Status::Open, 1, 1)],
+        };
+        assert!(!noncanonical.is_structurally_valid());
+        // A counter parked at the ceiling would wrap on the next mint back into the used range.
+        let exhausted = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: u64::MAX,
+            findings: vec![finding("f0", Status::Open, 1, 1)],
+        };
+        assert!(!exhausted.is_structurally_valid());
         // A sound ledger passes.
         let ok = Ledger {
             schema_version: SCHEMA_VERSION,
@@ -1340,6 +1371,37 @@ mod tests {
             ],
         };
         assert!(ok.is_structurally_valid());
+    }
+
+    #[test]
+    fn reconcile_degrades_when_the_id_counter_would_overflow() {
+        // A ledger that loaded validly (next_seq below the ceiling) but whose next mint reaches
+        // u64::MAX must degrade rather than wrap `seq` back onto an id already in use. Two new
+        // findings from next_seq = MAX-1: the first mints f{MAX-1}, the second would overflow.
+        let b = ReviewerBlock {
+            verdict: VerdictDetail::RequestChanges,
+            prior_findings: vec![],
+            new_findings: vec![
+                NewFinding {
+                    severity: Severity::Major,
+                    title: "a".into(),
+                    file: None,
+                    line: None,
+                    detail: "d".into(),
+                },
+                NewFinding {
+                    severity: Severity::Major,
+                    title: "b".into(),
+                    file: None,
+                    line: None,
+                    detail: "d".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            reconcile(&[], u64::MAX - 1, &b, 1),
+            Err(ReconcileError::CounterExhausted)
+        );
     }
 
     #[test]

@@ -549,6 +549,14 @@ impl SessionStore {
         }
     }
 
+    /// Remove a session mapping. One of the four documented store accessors
+    /// (`get`/`record_turn`/`forget`/`list`) that must be fail-closed on a corrupt store — it reads
+    /// through [`read_or_corrupt`](Self::read_or_corrupt), so it errors rather than silently treating
+    /// an unreadable store as empty. It currently has no production caller: failed-turn recovery
+    /// relies on the durable write-ahead markers (which refuse a resume) and preserves the prior
+    /// record and its findings ledger for a human-directed rebaseline, rather than deleting the
+    /// mapping. Retained as part of that accessor contract and exercised by the tests below.
+    #[allow(dead_code)]
     pub fn forget(&self, name: &str) -> io::Result<bool> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;

@@ -965,8 +965,19 @@ impl App {
             out.push_str("usage log:     off (--no-metrics)\n");
         }
 
-        let sessions = self.sessions.list();
         out.push_str("\nsaved review sessions:\n");
+        // `list()` is tolerant (it reads a corrupt store as empty), so a bare "(none yet)" would
+        // misreport an unreadable store as a clean first run. Check the store state explicitly so
+        // this human-facing report distinguishes "no sessions" from "cannot read sessions".
+        if self.sessions.store_state() == crate::session::StoreState::Corrupt {
+            out.push_str(&format!(
+                "  (cannot read: the session store did not parse -- move {} aside or point \
+                 --state-dir at a clean directory)\n",
+                self.sessions.path().display()
+            ));
+            return out;
+        }
+        let sessions = self.sessions.list();
         if sessions.is_empty() {
             out.push_str("  (none yet)\n");
         } else {
@@ -1465,12 +1476,16 @@ impl Job {
                     break;
                 }
                 Err(failure) => {
-                    // A resume target the reviewer no longer has is a dead mapping: drop it so a
-                    // follow-up call is not billed for the same doomed resume. Reported rather
-                    // than silently retried into a fresh conversation -- the caller decides
-                    // whether to start over (fresh=true).
+                    // A resume target the reviewer no longer has is a dead mapping. Do *not*
+                    // `forget` it: reaching the reviewer means `mark_findings_pending` already
+                    // succeeded (a failed mark aborts earlier), so the findings write-ahead marker
+                    // is set and the next non-fresh call is refused at the findings gate before any
+                    // resume is billed -- the "not billed for the same doomed resume" goal is met
+                    // without deleting the record. Forgetting would only erase the prior findings
+                    // ledger the rebaseline handoff needs, exactly like the failed-persistence arms
+                    // in `attempt`. Reported rather than silently retried into a fresh conversation
+                    // -- the caller decides whether to start over (fresh=true).
                     if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
-                        self.sessions.forget(&self.session).ok();
                         eprintln!(
                             "cross-review: session '{}' could not be resumed (the reviewer no \
                              longer has it); reporting SESSION_NOT_FOUND rather than silently \
@@ -1938,9 +1953,15 @@ impl Job {
         // mapping but never advanced the baseline, so the next turn subtracted against a
         // stale total and double-counted this one.
         let record_under = parsed.session_id.as_deref().or(resume_id);
+        // Whether the findings write-ahead marker was successfully cleared after a durable record.
+        // A durable turn whose marker clear *failed* leaves the marker set, so the next non-fresh
+        // call will be refused at the findings gate -- such a turn must not advertise itself as
+        // resumable (finding: resumable ignored a failed marker clear). Set only in the record_turn
+        // Ok arm below; stays false on every non-durable path.
+        let mut findings_marker_cleared = false;
         // Whether this turn was durably recorded. Distinct from `resumable` below: a turn can be
         // durable yet non-resumable (an over-budget turn persists a terminal state that refuses the
-        // next resume).
+        // next resume, or a failed marker clear that refuses it).
         let durable = match record_under {
             Some(session_id) => {
                 if parsed.session_id.is_none() {
@@ -2005,101 +2026,64 @@ impl Job {
                             }
                         }
                         // Clear the findings write-ahead marker too (all backends). A failed delete
-                        // over-refuses the next resume toward `fresh` — the safe direction.
-                        if let Err(e) = self.sessions.clear_findings_pending(&self.session) {
-                            warnings.push(format!(
+                        // over-refuses the next resume toward `fresh` — the safe direction — so the
+                        // turn is recorded (durable) but reported non-resumable (`resumable` folds
+                        // in `findings_marker_cleared` below), matching what the next call will do.
+                        match self.sessions.clear_findings_pending(&self.session) {
+                            Ok(()) => findings_marker_cleared = true,
+                            Err(e) => warnings.push(format!(
                                 "This turn was saved, but the findings write-ahead marker could not \
                                  be cleared ({e}); the next review of session '{}' will be refused a \
                                  resume and must be restarted fresh.",
                                 self.session
-                            ));
+                            )),
                         }
                         true
                     }
                     Err(e) => {
-                        // The review itself succeeded; losing resumability is worth a
-                        // warning but not worth discarding the review.
+                        // The review itself succeeded; losing resumability is worth a warning but
+                        // not worth discarding the review.
                         //
-                        // Fail-closed for Perforce: the write left the persisted record at the
-                        // *prior* turn, so its stored inventory is now stale relative to what the
-                        // reviewer just saw. A later resume that collapsed files against it would
-                        // hide this turn's changes -- so poison the session by dropping the
-                        // mapping, forcing the next call to start fresh. Do this *before* the
-                        // diagnostics `eprintln!`, which can panic if stderr has closed (see the
-                        // FinishGuard note above), so a lost stderr cannot skip the cleanup. Git's
-                        // delta is ancestry-checked and has no equivalent hazard.
-                        if self.cfg.vcs == crate::config::Vcs::Perforce {
-                            match self.sessions.forget(&self.session) {
-                                // Only `Ok(true)` -- a mapping was actually removed -- proves the
-                                // session was reset. `Ok(false)` means nothing was removed, which
-                                // includes the case where `read()` silently fell back to an empty
-                                // store on a transient read error, leaving the stale mapping on
-                                // disk. Treat that as uncertain, like an outright error.
-                                Ok(true) => warnings.push(format!(
-                                    "This turn could not be saved to disk ({e}). To stop a later \
-                                     review from collapsing files against a stale baseline, session \
-                                     '{}' has been reset -- a follow-up call will start a fresh \
-                                     review. The review below is unaffected.",
-                                    self.session
-                                )),
-                                // Poisoning could not be confirmed (the store was unwritable, or a
-                                // read fell back to empty), so a stale mapping may survive. Say so
-                                // plainly and tell the caller to force a fresh review.
-                                other => {
-                                    let detail = match other {
-                                        Err(forget_err) => format!(" ({forget_err})"),
-                                        _ => String::new(),
-                                    };
-                                    warnings.push(format!(
-                                        "This turn could not be saved to disk ({e}), and session \
-                                         '{}' could not be reliably reset{detail}. A follow-up \
-                                         resume of this session could collapse files against a \
-                                         stale baseline -- pass fresh: true to review it safely. \
-                                         The review below is unaffected.",
-                                        self.session
-                                    ));
-                                }
-                            }
-                        } else {
-                            warnings.push(format!(
-                                "This turn could not be saved to disk ({e}), so session '{}' may \
-                                 not resume correctly. The review below is unaffected.",
-                                self.session
-                            ));
-                        }
+                        // Do *not* `forget` the record here. The prior ledger must stay intact on
+                        // disk so a human-directed rebaseline can carry its still-open findings
+                        // forward -- that is the `turn_not_durable` recovery contract (design
+                        // Decision 5). Resume is already blocked without deleting anything: the
+                        // findings write-ahead marker is still set (this Err arm never reached the
+                        // Ok arm that clears it), so the next non-fresh call is refused at the
+                        // findings gate regardless of backend. For Perforce the `.pending` marker
+                        // is set too, so even a crash before this point cannot collapse a later
+                        // resume against the stale baseline. The old destructive poisoning (drop
+                        // the mapping) predated the write-ahead markers and would now erase the
+                        // preserved findings for no added safety.
+                        warnings.push(format!(
+                            "This turn could not be saved to disk ({e}), so session '{}' cannot be \
+                             resumed: the next call is refused a resume because the write-ahead \
+                             marker is still set. Any prior findings are preserved on disk -- \
+                             recover by starting a fresh review (fresh: true) carrying the \
+                             still-open findings into the new instructions. The review below is \
+                             unaffected.",
+                            self.session
+                        ));
                         eprintln!("cross-review: warning: could not save session state: {e}");
                         false
                     }
                 }
             }
             None => {
-                // No session id means this turn cannot be recorded, so a prior Perforce mapping
-                // (with its now-stale baseline) would otherwise survive and be resumed. Drop it,
-                // before the panic-prone diagnostics. Report honestly: only a confirmed removal
-                // (`Ok(true)`) means the mapping is gone; any other result may leave it, so the
-                // caller is told to force `fresh: true`. (The durable pending marker still blocks a
-                // stale-baseline collapse when it was written.)
-                let forgot = if self.cfg.vcs == crate::config::Vcs::Perforce {
-                    matches!(self.sessions.forget(&self.session), Ok(true))
-                } else {
-                    self.sessions.forget(&self.session).unwrap_or(false)
-                };
-                if forgot || self.cfg.vcs != crate::config::Vcs::Perforce {
-                    warnings.push(format!(
-                        "The reviewer did not report a session id, so session '{}' cannot be \
-                         resumed. The review below is still valid, but a follow-up call with this \
-                         session name will start a fresh review with no memory of it.",
-                        self.session
-                    ));
-                } else {
-                    warnings.push(format!(
-                        "The reviewer did not report a session id, so session '{}' cannot be \
-                         resumed, and its stored mapping could not be reliably cleared. The review \
-                         below is valid; pass fresh: true on the next call to avoid resuming stale \
-                         state.",
-                        self.session
-                    ));
-                }
+                // No session id means this turn cannot be recorded. Do *not* `forget` the prior
+                // record: like the failed-persistence arm above, it must stay intact on disk so a
+                // rebaseline can carry its findings forward. Resume is already blocked -- the
+                // findings write-ahead marker was set before the reviewer ran and is never cleared
+                // without a durable record, so the next non-fresh call is refused at the findings
+                // gate for every backend. No destructive poisoning of the mapping is needed.
+                warnings.push(format!(
+                    "The reviewer did not report a session id, so this turn could not be recorded \
+                     and session '{}' cannot be resumed: the next call is refused a resume because \
+                     the write-ahead marker is still set. Any prior findings are preserved on disk \
+                     -- start a fresh review (fresh: true) carrying the still-open findings into \
+                     the new instructions. The review below is still valid.",
+                    self.session
+                ));
                 eprintln!(
                     "cross-review: warning: the reviewer did not report a session id, so review \
                      session '{}' cannot be resumed",
@@ -2120,8 +2104,10 @@ impl Job {
             crate::findings::not_durable_envelope(&self.session, turn, prior_snapshot.as_ref())
         };
         // A durable but over-budget turn has persisted a sticky `terminal_reason`, so the next
-        // resume will be refused: do not invite one. Only a durable, in-budget turn is resumable.
-        let resumable = durable && !turn_eval.over_budget;
+        // resume will be refused: do not invite one. A durable turn whose findings marker could not
+        // be cleared will likewise be refused at the findings gate. Only a durable, in-budget turn
+        // whose marker was cleared is genuinely resumable.
+        let resumable = durable && !turn_eval.over_budget && findings_marker_cleared;
 
         Ok(Outcome {
             review: Some(parsed.text),
