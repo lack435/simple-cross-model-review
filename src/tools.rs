@@ -1024,6 +1024,12 @@ impl Job {
                 ));
             }
         }
+        // The disposition describes what the capture *sent* (a delta, or the whole change and
+        // why), which is true whether or not the reviewer attempt below then succeeds. Take the
+        // metrics tag from the local now, before the disposition moves onto a *successful* outcome
+        // -- otherwise a failed reviewer attempt, which still sent this prompt, would record no
+        // disposition even though a change was captured.
+        let disposition_tag = disposition.as_ref().map(vcs::Disposition::tag);
         self.registry.set_phase(&self.id, Phase::Launching);
 
         // What this attempt did, for the usage record.
@@ -1068,12 +1074,11 @@ impl Job {
                 Outcome::failed(failure)
             }
         };
-        // Everything telemetry needs, taken before the outcome moves into the registry.
+        // Everything telemetry needs, taken before the outcome moves into the registry. The
+        // disposition tag was captured above (from the local, so a failed attempt still records
+        // what it sent).
         let usage = outcome.usage;
         let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
-        // The disposition, as a compact tag for the usage log. Read off the outcome (the Ok arm
-        // put it there; a failure carries none) before `finish` consumes it.
-        let disposition_tag = outcome.disposition.as_ref().map(vcs::Disposition::tag);
 
         // Deliver the review first, and disarm before any accounting runs. Recording used
         // to happen here, while the guard was still armed: `eprintln!` panics if stderr

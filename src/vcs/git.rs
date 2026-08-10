@@ -606,6 +606,22 @@ pub fn capture(
         (head_sha, base_sha)
     };
 
+    // Fill in the incremental commit count now -- *after* every mandatory capture (diff, status,
+    // untracked) has run -- so this extra `rev-list --count` can only ever spend budget the
+    // required work already survived. If the budget is gone it returns `None`, and the count is a
+    // nicety, so its absence changes nothing. The count runs on the pinned `<prior>..<head>`.
+    let disposition = match decision.disposition {
+        Some(Disposition::Incremental(Incremental::GitRange { prior, head, .. })) => {
+            let commits = git.count_commits(&prior, &head);
+            Some(Disposition::Incremental(Incremental::GitRange {
+                prior,
+                head,
+                commits,
+            }))
+        }
+        other => other,
+    };
+
     Capture {
         change: Some(Change {
             command: mode.command_line(),
@@ -627,9 +643,10 @@ pub fn capture(
         head_sha: baseline_head,
         base_sha: baseline_base,
         // The change was produced (this arm is the `change.is_some()` path), so the disposition
-        // the decision computed is carried to the caller. `None` here means this turn did not
-        // resume -- `tools.rs` then decides fresh (no line) versus resumed-with-no-baseline.
-        disposition: decision.disposition,
+        // the decision computed -- with the commit count filled in above -- is carried to the
+        // caller. `None` here means this turn did not resume: `tools.rs` then decides fresh (no
+        // line) versus resumed-with-no-baseline.
+        disposition,
     }
 }
 
@@ -743,32 +760,37 @@ fn decide_incremental(
         disposition,
     };
 
-    // Fresh vs resumed-with-no-baseline is invisible here (both arrive as `None`), so report no
-    // disposition and let `tools.rs`, which knows `resume_id`, assign it. Still resolve the base
-    // for the full range and the baseline this turn will store.
-    let Some(resume) = resume else {
-        return full(resolved_base, None);
-    };
-
-    // G1: the feature being off is an absolute gate above the fall-back tree, so a disabled run
-    // is `FullByDesign { Disabled }` and never a warning -- even when a later guard would also
-    // have fired.
+    // G1 and step 1 (`ModeNotDeltable`) are decided from `cfg` and the mode alone -- neither needs
+    // a baseline -- so they are settled *before* the fresh-vs-resumed split. This is the fix for a
+    // real bug: a resumed working-tree / staged / non-HEAD-range turn has no stored baseline, so
+    // it used to fall out of the `resume = None` return below with no disposition, which `tools.rs`
+    // then mislabelled `NoCompleteBaselineRetained` -- a warning -- when the mode simply never
+    // deltas. `tools.rs`'s G0 still suppresses these on a *fresh* turn. `Disabled` outranks
+    // `ModeNotDeltable` (the G1 gate sits above the tree).
     if !cfg.resume_incremental_diff {
         return full(
             resolved_base,
             Some(Disposition::FullByDesign(FullByDesign::Disabled)),
         );
     }
+    if matches!(&base_res, BaseResolution::NotDeltableMode) {
+        return full(
+            None,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+        );
+    }
 
-    // Step 1: the mode is not a HEAD-anchored range -- intentional, never warns. Steps 3-4: HEAD
-    // or the base could not be resolved this turn.
+    // The mode is a HEAD-anchored range. From here a baseline is required, and fresh vs
+    // resumed-with-no-baseline is invisible here (both arrive as `None`), so report no disposition
+    // and let `tools.rs`, which knows `resume_id`, assign `NoCompleteBaselineRetained` (or suppress
+    // it on a fresh turn). The base is still resolved, for the full range and the stored baseline.
+    let Some(resume) = resume else {
+        return full(resolved_base, None);
+    };
+
+    // Steps 3-4: HEAD or the base could not be resolved this turn (`NotDeltableMode` is handled).
     let resolved_base = match base_res {
-        BaseResolution::NotDeltableMode => {
-            return full(
-                None,
-                Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
-            )
-        }
+        BaseResolution::NotDeltableMode => unreachable!("handled before the resume split above"),
         BaseResolution::HeadUnavailable => {
             return full(
                 None,
@@ -829,15 +851,16 @@ fn decide_incremental(
         ),
         Ancestry::Yes => {
             // Step 9: the delta fires. The commit count is the one piece of detail that is not
-            // free -- an extra `rev-list --count` -- so it is best-effort and optional.
-            let commits = git.count_commits(resume.head, head);
+            // free -- an extra `rev-list --count` -- so it is deliberately left `None` here and
+            // filled in by `capture` *after* the mandatory diff, where it can spend leftover
+            // budget without ever starving the diff that must run. See the count call there.
             GitDecision {
                 delta_from: Some(resume.head.to_string()),
                 base: Some(resolved_base),
                 disposition: Some(Disposition::Incremental(Incremental::GitRange {
                     prior: resume.head.to_string(),
                     head: head.to_string(),
-                    commits,
+                    commits: None,
                 })),
             }
         }
@@ -2703,12 +2726,24 @@ mod tests {
         let cancel = idle();
         // `--diff HEAD` is a working-tree mode: it never deltas, and that is by design.
         let cfg = config_for(&dir, DiffMode::Head);
+        // With a baseline present.
         let cap = capture(&cfg, Some(baseline(&head1, &head1)), &cancel);
         assert_eq!(
             cap.disposition,
             Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable))
         );
         assert!(!cap.disposition.unwrap().warns());
+        // And -- the regression the impl review caught -- with *no* baseline, which is what
+        // `tools.rs` actually passes for a working-tree session (it stores no `base_sha`). The
+        // mode is not deltable regardless of the baseline, so the reason must still be
+        // `ModeNotDeltable` (never a warning), not a `None` that `tools.rs` would mislabel as a
+        // `NoCompleteBaselineRetained` fall-back that *does* warn.
+        let cap = capture(&cfg, None, &cancel);
+        assert_eq!(
+            cap.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+            "a working-tree mode is FullByDesign even with no baseline"
+        );
     }
 
     #[test]
