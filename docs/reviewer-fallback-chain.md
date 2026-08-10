@@ -1,10 +1,10 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1–4.** This document is the plan. Per
+Status: **proposed — revised after cross-review rounds 1–5.** This document is the plan. Per
 this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Rounds 1–4 each returned REQUEST
-CHANGES — seven findings, then six, five, and six, all accepted; the sections below fold each
-one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
+effort=max) and reach APPROVE before implementation begins. Rounds 1–5 each returned REQUEST
+CHANGES — seven findings, then six, five, six, and six, all accepted; the sections below fold
+each one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -314,11 +314,13 @@ for rate-limit classification. So "a rate-limited entry returns fast" cannot be 
 the bound, and the earlier `capture + N×preflight_cap + timeout + grace` formula was wrong: N
 rate-limited entries can each consume almost a full `--timeout-seconds`.
 
-The honest bound budgets the worst case, and round 3 caught that my first formula silently
-changed the single-entry contract. Today `Config::max_wait_secs()` ([config.rs:575]) is
+The sizing keeps the single-entry contract and, following this repository's existing framing,
+is a **practical sizing, not a proven ceiling** — the same honesty
+`docs/single-blocking-collect.md` already applies to the one-review budget
+([single-blocking-collect.md:178]). Today `Config::max_wait_secs()` ([config.rs:575]) is
 **capture + `--timeout-seconds` + finalization** — it does *not* include preflight, because
 the selected entry's preflight runs in `start_review` *before* the worker and so before the
-collect wait even begins. The chain keeps that exactly, and adds budget only for the extra
+collect wait even begins. The chain keeps that exactly, and adds sizing only for the extra
 work a chain introduces — the *fallback* attempts, whose preflight and run happen inside the
 walk:
 
@@ -337,37 +339,51 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
   capture + the selected entry's turn + every fallback's preflight-and-turn. Only *fallback*
   entries (1…N-1 of them) are preflighted inside the walk, which is why only they add a
   `preflight_cap` term.
-- **`preflight_cap` = a short bounded `resolve_bin` term + the cancellable auth invocation.**
-  Round 4 caught that `resolve_bin` is a synchronous PATH scan with no cancellation or deadline
-  ([reviewer/mod.rs:140]); it is bounded and fast (a fixed set of directories × stems ×
-  extensions, `is_file` each), so it contributes a small **fixed** term, but the plan does not
-  claim it is interruptible. What *is* cancellable is `auth_check` (the timeout at
-  [claude.rs:36]/[codex.rs:27], now given the cancel token + deadline) and its output-drain
-  grace. So a cancel or budget exhaustion during a fallback preflight lands on the auth
-  subprocess or the turn, not mid-scan — an honest, narrower claim than "the whole preflight is
-  cancellable". `drain_grace` is the reviewer turn's own per-invocation drain
-  ([reviewer/mod.rs:472]), counted once per attempt because each attempt is its own process.
-- **The selected entry's `start_review` preflight observes `RequestCancel` too.** It runs the
-  same `resolve_bin` (bounded) then `auth_check` with the request's cancel token, so a
-  `notifications/cancelled` arriving during setup stops before spawning the review, as it does
-  for the single reviewer today.
+- **`preflight_cap` sizes the cancellable auth invocation; `resolve_bin` is an
+  uninterruptible residual.** Round 4/5 established that `resolve_bin` scans PATH with
+  synchronous `is_file()` calls and no deadline or cancellation ([reviewer/mod.rs:140],
+  [reviewer/mod.rs:154]) — PATH can be arbitrarily long, so it is **not** a bounded fixed
+  term and the plan no longer claims it is. `preflight_cap` sizes the part that *is*
+  bounded and cancellable — `auth_check` (the timeout at [claude.rs:36]/[codex.rs:27], now
+  given the cancellation probe below) and its output-drain grace — and the PATH scan is an
+  explicit **uninterruptible residual** that sits outside the deadline, exactly the kind of
+  residual `single-blocking-collect.md` already documents for the drain grace. `drain_grace`
+  is the reviewer turn's own per-invocation drain ([reviewer/mod.rs:472]), counted once per
+  attempt because each attempt is its own process.
+- **The cancellation bridge is a single probe threaded through both phases.** Round 5 rightly
+  said "pass the cancel token" was under-defined: today `auth_check` hands `run` a *fresh,
+  uncancellable* `AtomicBool` ([reviewer/mod.rs:359]), and the selected entry's preflight runs
+  in `start_review` *before* `try_start`/`attach_owned` exist ([tools.rs:219], [tools.rs:234]),
+  so there is no registry stop-flag yet. The plan defines one **cancellation probe** — a
+  cheap `Fn() -> bool` (or a `&dyn` cancel trait) — that both `auth_check` and `run` accept in
+  place of the fresh `AtomicBool`. Before registry attachment (the selected entry's
+  `start_review` preflight) the probe reads `RequestCancel`; after attachment (the worker's
+  turns and fallback preflights) it reads the registry stop flag the review already carries.
+  One abstraction, two backing sources, chosen by phase — so a `notifications/cancelled` during
+  selected-entry auth, *before a review_id even exists*, stops setup, and a cancel mid-walk
+  stops the fallback.
 - `max_wait_secs`, and the budget shown in the start/running responses and progress text —
   which today all display `cfg.timeout` ([tools.rs:316], [tools.rs:466]) — are all recomputed
   from `chain_budget`. This is deliberately generous (three entries at a 30-minute timeout
-  advertise a ~90-minute worst case), but it is the operator's own chain length, and an
-  honest large bound beats a wrong small one.
+  advertise a ~90-minute sizing), but it is the operator's own chain length, and an honest
+  large sizing beats a wrong small one.
 - An **optional refinement**, not relied on: a separate short cap on an attempt that has
   already produced rate-limit evidence could shrink the practical walk time. Noted as a
-  future tightening; the worst-case bound stands without it.
+  future tightening; the sizing stands without it.
 
 [tools.rs:276]: ../src/tools.rs
 [tools.rs:59]: ../src/tools.rs
+[tools.rs:219]: ../src/tools.rs
+[tools.rs:234]: ../src/tools.rs
 [tools.rs:316]: ../src/tools.rs
 [tools.rs:466]: ../src/tools.rs
 [tools.rs:1253]: ../src/tools.rs
 [config.rs:575]: ../src/config.rs
+[reviewer/mod.rs:154]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:359]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:424]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:472]: ../src/reviewer/mod.rs
+[single-blocking-collect.md:178]: single-blocking-collect.md
 [claude.rs:36]: ../src/reviewer/claude.rs
 [codex.rs:27]: ../src/reviewer/codex.rs
 
@@ -417,10 +433,12 @@ Perforce is sharper still: self-serve there needs Codex *and* `--sandbox danger-
   signature and the split of capability prose out of it** are in scope — `vcs/shared.rs`,
   `vcs/mod.rs`, and the git and Perforce render paths join the blast radius and get mixed-chain
   golden tests.
-- **`mcp.rs` tool descriptions must not advertise the primary as if it were the whole
-  chain.** `tools/list` today describes the single reviewer's shell/capture behaviour
-  ([mcp.rs:636]); with a chain it must describe the chain honestly (the primary, plus that
-  fallbacks exist and may differ) rather than imply one fixed posture.
+- **Every `mcp.rs` tool description must describe the chain, not just the primary.**
+  `tools/list` today describes the single reviewer's shell/capture behaviour ([mcp.rs:636]),
+  and `cross_model_review_status` formats `cfg.reviewer.as_str()` and one CLI/model
+  ([mcp.rs:827], [mcp.rs:833]). Round 5 caught that the status description was still
+  primary-only. So *all* tool descriptions — including `status` — render the chain honestly
+  (the primary, plus that fallbacks exist and may differ), not one fixed posture.
 - The classification-evidence and capture-*labelling* boundaries are unchanged: the change is
   still fenced and labelled as evidence, not instructions.
 
@@ -438,6 +456,8 @@ one-shot render to a per-attempt one.
 [shared.rs:44]: ../src/vcs/shared.rs
 [perforce.rs:194]: ../src/vcs/perforce.rs
 [mcp.rs:636]: ../src/mcp.rs
+[mcp.rs:827]: ../src/mcp.rs
+[mcp.rs:833]: ../src/mcp.rs
 
 ### 4. Same family: honoured, not enforced
 
@@ -506,12 +526,24 @@ specific** reviewer. Therefore:
   `PathSearch | Explicit(PathBuf)`: a **new** record always writes `Some(PathSearch)` or
   `Some(Explicit(..))`, and only a **legacy** record deserializes to `None`. `#[serde(default)]`
   still gives the legacy `None`, but new records are never `None`.
-- **The resolved path is also persisted and verified after selection.** Alongside the raw
-  identity, the record stores the path the selected entry *resolved to*. After the raw match
-  picks the entry and it is preflighted, the freshly resolved path is compared to the stored
-  one; a mismatch (PATH changed under the session, so the same raw `PathSearch` now points at a
-  different executable/account) is refused with `SESSION_NOT_RESUMABLE` rather than resuming the
-  conversation through a different binary.
+- **The resolved path is persisted and verified against an *uncached* resolution.** Alongside
+  the raw identity, the record stores the path the selected entry *resolved to*. Round 5 caught
+  that the shared process-lifetime preflight cache ([tools.rs:57], [tools.rs:110]) would return
+  the *old* `Preflight` without re-running `resolve_bin`, so a session resumed in the same `App`
+  after PATH changed could pass the comparison against a stale path. So the resume verification
+  **forces an uncached `resolve_bin`** for the selected entry, compares it to the stored path,
+  and only then refreshes the cache. A mismatch (PATH now points at a different
+  executable/account) is refused with `SESSION_NOT_RESUMABLE` rather than resuming the
+  conversation through a different binary. A regression test prepopulates the cache before
+  changing the resolved executable.
+- **Both new fields are explicitly `#[serde(default)]`, so legacy session files still load.**
+  Round 5 caught that a *required* resolved-path field would fail deserialization on existing
+  session files, and the store reader treats a failed load as an empty store ([session.rs:362])
+  — silently losing every legacy session. So the resolved path is a defaulted
+  `Option<PathBuf>` (as the raw-bin field is a defaulted `Option<RawBin>`): a missing path is
+  permitted *only* for a legacy `None` raw-bin record, while a new tagged record always writes —
+  and on resume verifies — its path. A deserialization test runs against an actual pre-change
+  session file.
 - **The selected entry is then preflighted, and only it.** After the raw-identity match picks
   the entry, that one entry is preflighted (its `bin` resolved, auth checked); selection never
   depended on resolving anything.
@@ -538,6 +570,9 @@ specific** reviewer. Therefore:
 [session.rs:41]: ../src/session.rs
 [session.rs:42]: ../src/session.rs
 [session.rs:52]: ../src/session.rs
+[session.rs:362]: ../src/session.rs
+[tools.rs:57]: ../src/tools.rs
+[tools.rs:110]: ../src/tools.rs
 [tools.rs:175]: ../src/tools.rs
 [tools.rs:189]: ../src/tools.rs
 [tools.rs:1535]: ../src/tools.rs
@@ -584,6 +619,12 @@ specific** reviewer. Therefore:
   keeps its current meaning — the **final (terminal) attempt's** prompt size — and each
   `Attempt` carries its own `prompt_bytes`, so the per-attempt sizes are recoverable without
   redefining the top-level field.
+- **Every record names its resolved bin, not only fallback ones.** Round 5 noted that a
+  successful *single-entry* record has no `attempts`, so with bin only inside `Attempt` a
+  same-model/different-bin single run is indistinguishable in the log. So `Record` gains an
+  optional top-level resolved-bin field (additive, `#[serde(default)]`; no completeness
+  impact, so it needs no version bump and rides on `v1` records too), matching the result
+  interface's identity. The executable that ran is recoverable from every record.
 - **Failed-attempt token usage is not claimed — and its absence propagates to completeness.**
   The adapter API returns `Result<Parsed, Failure>` and exposes `Parsed.usage` only on a
   successful parse ([reviewer/mod.rs:118]); a rate-limit refusal yields a `Failure` with no
@@ -668,8 +709,10 @@ when — it is real.
 - **Must not preflight or bill an entry the review will not use.** An invalid chain is
   reported before any preflight; a resume preflights only its bound entry; fallback
   preflight stays lazy.
-- **Must not outrun its advertised budget.** The walk runs under one shared deadline that the
-  collect cap is sized to match; preflight and auth checks are cancellable.
+- **Must size its budget honestly.** The walk runs under one shared deadline the collect cap
+  is sized to match, and auth checks are cancellable — but, as `single-blocking-collect.md`
+  already says of the one-review budget, this is practical sizing, not a proven ceiling: the
+  uninterruptible `resolve_bin` PATH scan is an acknowledged residual, not a hidden overrun.
 - **Must not misattribute the review, at any stage.** The running snapshot and every terminal
   result — success or a fallback's own failure — name the entry actually being tried, and the
   metrics log keeps one logical turn plus an attempt history.
@@ -716,8 +759,10 @@ maintainer as the cost of foundational completeness. Touched:
   `set_active` under the existing `State` mutex ([registry.rs:432]); `Outcome`/`Snapshot` carry
   the attempted reviewer/model/effort/resolved-bin so both running and terminal results name who
   reviewed. Concurrency, leasing and cancellation otherwise unchanged.
-- **`mcp.rs`**: `tools/list` descriptions ([mcp.rs:636]) describe the chain honestly (primary
-  plus differing fallbacks) instead of advertising the primary's posture as the only one.
+- **`mcp.rs`**: *all* tool descriptions — `tools/list` ([mcp.rs:636]) and
+  `cross_model_review_status` ([mcp.rs:827], [mcp.rs:833]) — describe the chain honestly
+  (primary plus differing fallbacks) instead of advertising the primary's posture as the only
+  one.
 - **`vcs/shared.rs`, `vcs/mod.rs`, `vcs/git.rs`, `vcs/perforce.rs`**: the `auto` capture
   *decision* generalises to `chain_needs_capture()` (capture if *any* entry needs it); the
   capture **render is made capability-neutral** — the `has_shell` parameter to `git::render`
@@ -730,11 +775,12 @@ maintainer as the cost of foundational completeness. Touched:
   `RATE_LIMITED` remediation path that does not disturb the shared `rate_limited` message; and
   a `.with_active(spec)` helper so a `Failure` can name the entry it came from.
 - **`session.rs`**: `SessionRecord` gains a **tagged raw `bin`** (`Option<RawBin>` =
-  `None` legacy / `Some(PathSearch)` / `Some(Explicit(..))`, `#[serde(default)]`) **and** the
-  selected entry's **resolved path**; resume matches the full *raw* identity (reviewer, model,
+  `None` legacy / `Some(PathSearch)` / `Some(Explicit(..))`, `#[serde(default)]`) **and** a
+  defaulted `Option<PathBuf>` **resolved path** — both `#[serde(default)]` so legacy files at
+  [session.rs:362] still deserialize; resume matches the full *raw* identity (reviewer, model,
   effort, raw bin) against the chain **without resolving/preflighting other entries**, then
-  verifies the freshly resolved path against the stored one, refusing legacy-ambiguous or
-  PATH-drifted matches with `SESSION_NOT_RESUMABLE`.
+  verifies against a **forced-uncached** `resolve_bin` of the selected entry, refusing
+  legacy-ambiguous or PATH-drifted matches with `SESSION_NOT_RESUMABLE`.
 - **`metrics.rs`**: `Record` gains an optional `attempts` list of `Attempt`
   (reviewer/model/effort/resolved-bin, `failure_code`, wall, `prompt_bytes`; additive,
   `#[serde(default)]`); `RECORD_VERSION` bumps to `2` for attempt-bearing records with the new
@@ -810,8 +856,15 @@ Unit tests (no network, no model call), extending the existing fakes:
 - **Resume identity**: two same-model/different-bin entries — a session created by the second
   resumes on the second (raw-identity match, no other entry preflighted); a legacy (`None`)
   record matching both is refused with `SESSION_NOT_RESUMABLE`, one matching exactly one entry
-  still resumes; a `Some(PathSearch)` record is *not* treated as legacy; and a resume whose
-  selected entry now resolves to a different path than stored is refused (PATH drift).
+  still resumes; a `Some(PathSearch)` record is *not* treated as legacy; a resume whose selected
+  entry now resolves to a different path than stored is refused (PATH drift) — **including when
+  the preflight cache was warmed before the executable changed** (the forced-uncached resolve);
+  and an actual pre-change session file still deserializes (both new fields default).
+- **Cancellation before a review_id exists**: a `notifications/cancelled` during the selected
+  entry's `start_review` auth (before `try_start`) stops setup via the `RequestCancel`-backed
+  probe; a cancel mid-walk stops the fallback via the registry-stop-flag-backed probe.
+- **Tool descriptions**: `tools/list` *and* `cross_model_review_status` describe the chain
+  (primary plus differing fallbacks), not just the primary CLI.
 
 A test seam is required so the worker's per-entry reviewer is injectable (the existing
 CLI-free registry tests are the pattern). `smoke.ps1` may gain a real two-entry round trip;
@@ -905,6 +958,21 @@ now reflects.
   ([Metrics, the result interface]). (6) The attempt schema omitted bin and left prompt-byte
   accounting undefined → `Attempt` carries resolved bin and its own `prompt_bytes`; the
   top-level field stays the final attempt's ([Metrics]).
+
+- **Round 5 (same session, turn 5) — REQUEST CHANGES.** Four major + two minor, all residuals;
+  the reviewer confirmed round-4 #1/#4/#5/#6, the registry-lock note, the neutral-capture design
+  and all five open-question rulings resolved. (1) The resume PATH-drift check could be bypassed
+  by the shared preflight cache → force an uncached `resolve_bin` on resume, then refresh
+  ([Sessions and resume]). (2) The cancellation bridge was under-defined against the API → one
+  cancellation *probe* accepted by `auth_check` and `run`, backed by `RequestCancel` before
+  registry attachment and the stop flag after ([The fall-through, budget]). (3) `chain_budget`
+  was still called a hard ceiling though `resolve_bin` is an unbounded PATH scan → reframed as
+  practical sizing with an explicit uninterruptible residual, matching
+  `single-blocking-collect.md` ([The fall-through, budget]). (4) The new resolved-path field
+  lacked a legacy serde contract → both new session fields are `#[serde(default)]`, verified
+  against a real pre-change file ([Sessions and resume]). Minor: (5) single-entry records lacked
+  a bin → optional top-level resolved-bin on every `Record` ([Metrics]); (6) `status` still named
+  only the primary → all tool descriptions render the chain ([Capture in a mixed-family chain]).
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
