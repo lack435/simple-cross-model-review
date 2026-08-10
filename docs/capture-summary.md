@@ -27,6 +27,14 @@ summary to the caller in every review response").
   accepted on `success` alone today), and reframed the size figures as **"shown" counts** whose
   floor qualifier fires on any shortfall in the *relevant* evidence, not diff byte-truncation
   alone. Changes tagged *(r3)* below.
+- *r4 → r5:* three things. (a) The recognition of short/lossy diff streams exposed a **resume-baseline
+  bug** — the baseline gate drops only on `diff.truncated`, so an incomplete diff could seed a
+  baseline and permanently drop a prefix; the gate widens to `diff_incomplete` (diff-only, not the
+  other gaps). (b) The `diff:` **token** is redefined as one precise byte-budget fact for both
+  backends (`diff within budget` / `diff truncated at 400 KB`), so it can never contradict the
+  `partial` verdict; stream shortfalls are carried by the count floor, the verdict, and a warning.
+  (c) The Perforce `evidence_units` **floor** now also fires on `skipped > 0`. Changes tagged
+  *(r4)* below.
 
 ## Problem: the caller cannot see what change the reviewer was given
 
@@ -94,8 +102,8 @@ Add a `captured:` line to every completed review response that supplied a change
 and `disposition:`:
 
 ```
-captured: git diff <base>..<head> — 12 files, +487/-89, 0 untracked — diff intact — complete
-captured: changelists 43650, 43651 — 8 evidence units — diff intact — complete
+captured: git diff <base>..<head> — 12 files, +487/-89, 0 untracked — diff within budget — complete
+captured: changelists 43650, 43651 — 8 evidence units — diff within budget — complete
 ```
 
 The value is carried as a typed `CaptureSummary`, not a preformatted string, so it is testable,
@@ -138,8 +146,12 @@ pub enum CaptureSummary {
         deletions: usize,
         /// New files carried alongside the diff (git-untracked), which a diff cannot cover.
         untracked_files: usize,
-        /// The diff stream was shortened (byte cap, short pipe, or lossy decode), so the `+/-`
-        /// and file counts are a floor. Broader than the byte cap alone. See "shown counts".
+        /// The combined diff hit the byte cap. Drives the explicit `diff:` token — a precise,
+        /// unambiguous fact that cannot contradict the `partial` verdict. See "the diff token".
+        diff_truncated: bool,
+        /// The diff was shortened *at all* — byte cap, short pipe, or lossy decode. Broader than
+        /// the byte cap; drives the `+/-`/file count floor and the resume-baseline gate, not the
+        /// token. `diff_incomplete >= diff_truncated`.
         diff_incomplete: bool,
         /// Capture-level wholeness (streams, caps, enumeration, unrun commands, truncated included
         /// bodies) — NOT the per-file exclusion of un-includable files. See rule 3.
@@ -151,9 +163,11 @@ pub enum CaptureSummary {
         /// Requested changelists that were skipped, so the count is honestly a subset.
         skipped: usize,
         /// Captured changelists whose evidence was incomplete (binary/out-of-root/lossy/etc.),
-        /// distinct from skipped. Drives both the verdict and the new caller warning.
+        /// distinct from skipped. Drives the verdict and the new caller warning.
         incomplete_changelists: usize,
         evidence_units: usize,
+        /// The combined diff hit the byte budget. Drives the `diff:` token; segment-level short or
+        /// lossy `p4 diff` output is carried by `incomplete_changelists`, not this flag.
         diff_truncated: bool,
         complete: bool,
     },
@@ -219,6 +233,36 @@ from whether the evidence shown this turn was whole.
 **Set relationship** *(r2, corrected):* `complete` is the **stricter** condition — `complete`
 implies the diff and every other stream was whole, but a whole diff does **not** imply `complete`.
 
+### The resume-baseline gate must widen too *(r4)*
+
+Recognising a short or lossy diff stream as incompleteness exposes a correctness bug beyond the
+summary. A git HEAD-anchored capture seeds the next turn's incremental-resume baseline
+`(head_sha, base_sha)`, and the existing gate drops that baseline only on `diff.truncated`
+(`src/vcs/git.rs`):
+
+```rust
+let (baseline_head, baseline_base) = if diff.truncated { (None, None) } else { (head_sha, base_sha) };
+```
+
+A diff that ended as a short prefix under the byte cap, or decoded lossily, is `diff.truncated ==
+false` — so today it would **seed a baseline that never showed the whole range**, and a later
+incremental review would delta `<baseline>..HEAD` and silently omit the missing prefix forever.
+This is precisely the failure the truncation guard exists to prevent, arriving through a door the
+guard does not yet cover. So the gate widens to the same `diff_incomplete` predicate the count
+floor uses:
+
+```rust
+let (baseline_head, baseline_base) = if diff_incomplete { (None, None) } else { (head_sha, base_sha) };
+// diff_incomplete = diff.truncated || diff.stdout_incomplete || diff.stdout_lossy
+```
+
+*Only* the diff's own incompleteness voids the baseline — **not** the other completeness gaps. A
+truncated `git status`, a short untracked enumeration, or a truncated untracked body leaves the
+*committed-range diff* whole, and the baseline is a statement about that committed range alone; a
+working-tree-auxiliary gap has different baseline semantics and must not discard a sound baseline.
+This needs first-capture (an incomplete first diff seeds no baseline) and existing-baseline (an
+incomplete later diff neither advances nor corrupts the retained baseline) regression tests.
+
 ### The git range descriptor
 
 The round-1 review found that `change.command` is built from the raw revision spelling (`cfg.diff`)
@@ -261,7 +305,11 @@ is never an overstatement; when the relevant evidence was shortened, the render 
   alongside the diff and therefore *not* in the `+/-` counts. Reported separately (the review
   endorsed keeping it separate). *(r3)* It is itself a floor when the enumeration was shortened
   (`git ls-files` short-streamed) or the untracked listing was cut short — the render says so.
-- **`diff_incomplete`** as above; **`complete`** as defined above.
+- **`diff_truncated`** (`change.diff.truncated`, the byte cap) drives the `diff:` token;
+  **`diff_incomplete`** (above) drives the count floor and the baseline gate; **`complete`** as
+  defined above. The two diff bools are carried separately on purpose: the token states a precise
+  byte-cap fact, while the floor and the baseline must respond to a stream shortfall the cap flag
+  does not see.
 
 ### Perforce: what the numbers are, and where they come from
 
@@ -273,12 +321,15 @@ Constructed in `perforce::capture` (`src/vcs/perforce.rs`) where the `CapturedCh
   It drives the verdict **and** a new caller warning (below), because those segment details are
   rendered only into the prompt today, so a caller has no other way to see them.
 - **`evidence_units`** is the count of units across all captured segments
-  (`segments.iter().flat_map(|s| &s.units).count()`) — *(r3)* a shown count, a floor when
-  `diff_truncated || incomplete_changelists > 0`, since an incomplete segment or a budget-cut diff
-  means units were dropped or shortened. On an elided resume the *unit count* is unchanged — a
-  collapsed unit is still a unit — and the resent/collapsed split stays the disposition's job (the
-  review endorsed this, given `complete` now surfaces incompleteness).
-- **`diff_truncated`** is `budget.diff_truncated`; **`complete`** as defined above.
+  (`segments.iter().flat_map(|s| &s.units).count()`) — *(r3/r4)* the exact number of units the
+  reviewer was *sent*, marked a floor on the requested change whenever anything was missing:
+  `diff_truncated || incomplete_changelists > 0 || skipped > 0`. *(r4)* Skipped changelists are
+  included in the floor because a wholly skipped changelist is requested evidence that produced no
+  units at all — without it, `skipped > 0` with every captured segment complete would show an
+  exact-looking count beside missing changelists. On an elided resume the *unit count* is unchanged
+  — a collapsed unit is still a unit — and the resent/collapsed split stays the disposition's job.
+- **`diff_truncated`** is `budget.diff_truncated` (the combined-diff byte budget; segment-level
+  short/lossy `p4 diff` is folded into `incomplete_changelists`, not here); **`complete`** as above.
 
 ### The new warnings that keep the invariant *(r2)*
 
@@ -309,23 +360,28 @@ exclusion of an un-includable file warns *neither* and remains prompt-only, pres
 `render_completed` renders the shown counts, then an explicit diff token *(r2)*, then the
 completeness verdict. *(r3)* Each count is prefixed "at least" and flagged a floor when *its own*
 evidence was shortened — the diff figures on `diff_incomplete` (not the byte cap alone), the
-untracked figure on a short enumeration — so a shortfall in one stream does not falsely qualify a
-count drawn from another:
+untracked figure on a short enumeration, the Perforce unit figure on any skip/incompletion — so a
+shortfall in one stream does not falsely qualify a count drawn from another:
 
 ```
-… — 12 files, +487/-89, 0 untracked — diff intact — complete
-… — 12 files, +487/-89, 3 untracked — diff intact — partial (see warnings below)
-… — at least 40 files, +90000/-1200, 0 untracked — diff incomplete (counts are a floor) — partial (see warnings below)
-… — 12 files, +487/-89, at least 2 untracked — diff intact — partial (untracked listing short; see warnings below)
-… (perforce) — at least 8 evidence units — diff intact — partial (1 of 3 changelists incomplete; see warnings below)
+… — 12 files, +487/-89, 0 untracked — diff within budget — complete
+… — 12 files, +487/-89, 3 untracked — diff within budget — partial (see warnings below)
+… — at least 40 files, +90000/-1200, 0 untracked — diff truncated at 400 KB (counts are a floor) — partial (see warnings below)
+… — at least 12 files, +487/-89, 0 untracked — diff within budget (stream ended early; counts are a floor) — partial (see warnings below)
+… — 12 files, +487/-89, at least 2 untracked — diff within budget — partial (untracked listing short; see warnings below)
+… (perforce) — at least 8 evidence units — diff within budget — partial (1 of 3 changelists incomplete; see warnings below)
 ```
 
-*(r2)* The `diff:` token is **always** present. *(r3)* Its states are `diff intact` /
-`diff incomplete`, where `diff incomplete` covers the byte cap **and** a short or lossy stream —
-so a diff that ended as a prefix without hitting the cap does not read as `intact`; the warning it
-emits says which it was. The verdict is always `complete` / `partial`. When `partial`, the line
-points **below** to the WARNING lines — corrected from "above": `render_completed` prints the
-warnings *after* the `captured:` line — and, by rule 3, at least one such warning always exists.
+*(r4)* The `diff:` token reports **one precise, unambiguous fact for both backends: whether the
+combined diff hit the byte budget** (`diff_truncated`) — `diff within budget` / `diff truncated at
+400 KB`. It is deliberately *not* an overall diff-wholeness claim, so it can never contradict the
+verdict: a Perforce capture whose byte budget held but whose segment diff was short reads `diff
+within budget — partial`, which is exactly right. A *stream* shortfall (git `diff_incomplete`
+without the cap) is carried by three honest signals instead — the count floor ("at least"), the
+verdict (`partial`), and a warning — and the render notes it in the token's parenthetical ("stream
+ended early") without overloading the byte-cap word "truncated". The verdict is always `complete` /
+`partial`; when `partial`, the line points **below** to the WARNING lines (`render_completed`
+prints them after the `captured:` line), and by rule 3 at least one such warning always exists.
 
 ## How the caller sees it
 
@@ -335,7 +391,7 @@ warnings *after* the `captured:` line — and, by rule 3, at least one such warn
 
 ```
 usage:     …
-captured:  git diff <base>..<head> — 12 files, +487/-89, 0 untracked — diff intact — complete
+captured:  git diff <base>..<head> — 12 files, +487/-89, 0 untracked — diff within budget — complete
 disposition: incremental — only the delta since your last turn (<a>..<b>) was sent, 2 new commits
 
 WARNING: …
@@ -375,13 +431,13 @@ the gap this project closed for the resume disposition. The round-1 review was r
 counts-only tag (`git:12f+487-89`) defeats the field's purpose — it cannot tell two ranges apart
 or reveal a stale base — so the tag carries the **identity of the capture**, not its size:
 
-- Git: the resolved endpoints plus markers, e.g. `git:<base12>..<head12>` with `+d` (diff
-  incomplete — byte cap or short/lossy stream) / `+p` (capture partial) suffixes.
+- Git: the resolved endpoints plus markers, e.g. `git:<base12>..<head12>` with `+t` (combined diff
+  hit the byte cap) / `+p` (capture partial for any reason) suffixes.
 - Perforce: the captured changelist numbers plus the same markers, e.g. `p4:43650,43651+p`.
 
-(`+d` implies `+p`, since an incomplete diff makes the capture partial; both are shown when the
-partial verdict has causes beyond the diff, so an audit can tell "only the diff was cut" from
-"other evidence was missing too".)
+The two markers mirror the two rendered facts — `+t` is the byte-cap token, `+p` is the verdict —
+so an audit can tell "the diff hit the cap" (`+t+p`) from "some other evidence was missing" (`+p`
+alone: a short stream, an incomplete segment, a skipped changelist). `+t` implies `+p`.
 
 Both are built from the already-safe `range` / `changelists` fields and the whole tag is
 length-bounded before it is written. It is recorded on `Record` (`src/metrics.rs`) as
@@ -422,7 +478,8 @@ failure is still audited. Both come from the same `CaptureSummary`.
 New: `src/vcs/capture_summary.rs` (the enum, `summary()`, `tag()`, unit tests). Touched:
 `src/vcs/git.rs` (build the `Git` variant + `diff_line_counts` + the `range` descriptor; new field
 on the internal `Change`; *(r2)* surface `stdout_incomplete`/`stdout_lossy` on diff/status and the
-truncated-untracked-body warning; *(r3)* surface the `git ls-files` stream flags), `src/vcs/mod.rs`
+truncated-untracked-body warning; *(r3)* surface the `git ls-files` stream flags; *(r4)* widen the
+resume-baseline gate from `diff.truncated` to `diff_incomplete`), `src/vcs/mod.rs`
 (move the summary across in the adapter),
 `src/vcs/shared.rs` (field on `CapturedChange`; the `range` fallback reuses `safe_label`),
 `src/vcs/perforce.rs` (build the `Perforce` variant; *(r2)* the incomplete-segment warning),
@@ -441,11 +498,13 @@ a new injection surface.
 - **`capture_summary.rs` unit tests**: `summary()` for git (shown counts; `complete` vs `partial`;
   the floor wording with the "at least" prefix on the diff figures for a `diff_incomplete` capture
   *and* on `untracked_files` for a short enumeration — asserting each floor fires only for its own
-  count; the always-present `diff:` token in *both* an intact-diff partial and a diff-incomplete
-  partial; zero vs present untracked) and Perforce (evidence-unit count as a floor when incomplete;
-  `partial` from a skipped *or* an incomplete-but-not-skipped changelist, and the `N of M`
-  phrasing); `tag()` stability and bounding, including `+d` implies `+p`; singular vs plural
-  ("1 file" vs "12 files"), per the disposition doc's precedent.
+  count; the byte-budget `diff:` token in all of `diff within budget — complete`, `diff within
+  budget — partial` (a stream/segment shortfall with the byte budget intact — *the* non-contradiction
+  case), and `diff truncated at 400 KB`; zero vs present untracked) and Perforce (evidence-unit
+  count as a floor when incomplete; *(r4)* the floor also firing on `skipped > 0` with every
+  captured segment complete; `partial` from a skipped *or* an incomplete-but-not-skipped changelist,
+  and the `N of M` phrasing); `tag()` stability and bounding, including `+t` implies `+p`; singular
+  vs plural ("1 file" vs "12 files"), per the disposition doc's precedent.
 - **`diff_line_counts` unit tests** (git): plain multi-file diff; rename-only (file counted, zero
   lines); binary (file counted, zero lines); `+++`/`--- ` headers excluded; empty diff (0/0/0).
 - **`range` descriptor tests** (git): a pinned range renders resolved hex endpoints; working-tree
@@ -466,6 +525,13 @@ a new injection surface.
     `complete` field agrees with it.
   - The invariant itself: for each partial case above, assert `Capture::warnings` is non-empty
     (the "see warnings below" pointer is never dangling).
+- *(r4)* **Resume-baseline gate regression tests** (git, `src/vcs/git.rs`): a first capture whose
+  diff `RunOutcome` is `stdout_incomplete`/`stdout_lossy` (but under the byte cap) seeds **no**
+  baseline (`head_sha`/`base_sha` are `None`), so a later turn cannot delta from a range never shown
+  whole; and, with a sound baseline already retained, a later incomplete diff does not advance or
+  overwrite it. Conversely, a diff that is *whole* while only `status`/untracked are incomplete
+  **does** seed the baseline — the diff-only scope of the gate, asserted so it is not widened to the
+  other gaps by accident.
 - **`render_completed` tests** (`src/tools.rs`): the `captured:` line appears on a fresh completed
   turn (where no `disposition:` line does); it sits after `usage:` and before `disposition:`, with
   warnings after it; it is absent when the snapshot carried no change.
