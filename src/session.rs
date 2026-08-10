@@ -269,6 +269,12 @@ impl SessionStore {
         self.path.with_extension("json.lock")
     }
 
+    /// Fetch a record, tolerant of a corrupt store (reads it as empty) — the single-record parallel
+    /// to [`list`](Self::list). The review path deliberately does **not** use this: it goes through
+    /// the fail-closed [`get_checked`](Self::get_checked) so a transient read error cannot masquerade
+    /// as "no record" and overwrite a real one. Retained as part of the documented accessor set and
+    /// exercised by the tests below; it currently has no production caller.
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<SessionRecord> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.read().sessions.get(name).cloned()

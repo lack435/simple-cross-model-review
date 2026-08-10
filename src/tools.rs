@@ -297,13 +297,15 @@ impl App {
         // chooses to start fresh (fresh=true, or a new session name) rather than being
         // silently handed a review with no memory of the work it asked to continue.
         //
-        // Perforce contract note: because a failed reviewer turn leaves the findings marker set,
-        // the refusal above now pre-empts the Perforce full-capture fallback for that path — a
-        // failed turn requires an explicit `fresh` rather than a resume-with-full-recapture. This is
-        // intentional: a failed turn means the findings ledger is stale, and `fresh` recaptures in
-        // full anyway, so the fallback's safety goal (never collapse against a stale baseline) is
-        // still met. The Perforce marker's fallback remains reachable for a crash *before* the
-        // findings marker is written (during capture), where the findings ledger did not move.
+        // Perforce contract note: a set findings marker refuses the resume here, which pre-empts the
+        // Perforce full-capture fallback in `Job::run` — but *only* for failures where the reviewer
+        // may have advanced its conversation, so the ledger really could be stale and a full diff
+        // recapture would not repair it. The two cases where the ledger is provably *not* stale keep
+        // the fallback reachable, because the marker is not left set: a crash *before* the findings
+        // marker is written (during capture), and a reviewer failure that started no child process
+        // (`invocation` build error or `Command::spawn` failure), which `attempt` detects and clears
+        // the marker for on a resume. So the refusal covers exactly the stale-ledger case, and the
+        // Perforce full-recapture path survives for the not-stale ones.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
                 return Err(errors::session_not_resumable(&session, reason));
@@ -428,6 +430,26 @@ impl App {
                 .as_ref()
                 .and_then(|record| record.capture_identity.clone()),
             prior_include_shelved: prior.as_ref().and_then(|record| record.include_shelved),
+            // Resolve the prior findings state here, from the record validated under the lease.
+            // `Some` exactly when resuming (`prior.is_some()`). A `Valid` ledger carries its real
+            // coverage and findings; an `Absent` one is a legacy (pre-feature) resume treated as an
+            // already-broken `legacy_uncovered` prior so it stays non-convergent rather than posing
+            // as a fresh turn 1. `Invalid` cannot occur — `resume_block` already refused it above —
+            // but is mapped to the same legacy fallback defensively.
+            prior_findings: prior.as_ref().map(|record| match record.ledger_load() {
+                session::LedgerLoad::Valid(l) => crate::findings::PriorState {
+                    coverage: l.coverage,
+                    next_seq: l.next_seq,
+                    findings: l.findings,
+                },
+                session::LedgerLoad::Absent | session::LedgerLoad::Invalid => {
+                    crate::findings::PriorState {
+                        coverage: crate::findings::LedgerCoverage::LegacyUncovered,
+                        next_seq: 1,
+                        findings: Vec::new(),
+                    }
+                }
+            }),
             cancel,
             _lease: Some(lease),
         };
@@ -1085,6 +1107,13 @@ struct Job {
     prior_perforce_baseline: Option<crate::vcs::baseline::PerforceBaseline>,
     prior_capture_identity: Option<crate::vcs::baseline::CaptureIdentity>,
     prior_include_shelved: Option<bool>,
+    /// The prior findings state to evaluate this turn against, resolved from the *already validated*
+    /// session record in `start_review` (read under the lease, `Invalid` ledgers already refused by
+    /// `resume_block`). Carried in rather than re-read in the worker: a second, fail-open
+    /// `SessionStore::get` there could turn a transient read error into an empty `legacy_uncovered`
+    /// ledger and then mint fresh ids over a real one. `Some` exactly on a resume; `None` on a fresh
+    /// review or a new session.
+    prior_findings: Option<crate::findings::PriorState>,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -1669,6 +1698,27 @@ impl Job {
         });
     }
 
+    /// Clear this turn's findings write-ahead marker after a failure that provably started no child
+    /// process, so a *resumed* reviewer conversation could not have advanced and the ledger is not
+    /// stale. Only for resumes: the resume gate guaranteed the marker was absent on entry, so this
+    /// undoes exactly this turn's mark and lets the next call proceed — keeping the Perforce
+    /// `.pending` full-recapture path reachable rather than turning a benign pre-launch failure into
+    /// a hard resume refusal. A fresh turn does not clear: it bypasses the gate and may be sitting on
+    /// a marker an earlier failed turn set, which it must not silently drop. A failed clear only
+    /// over-refuses the next resume (the safe direction), so it is warned, not fatal.
+    fn clear_findings_marker_after_pre_launch_failure(&self, resuming: bool) {
+        if !resuming {
+            return;
+        }
+        if let Err(e) = self.sessions.clear_findings_pending(&self.session) {
+            eprintln!(
+                "cross-review: warning: could not clear the findings write-ahead marker after a \
+                 pre-launch failure for session '{}': {e}; the next resume may be refused",
+                self.session
+            );
+        }
+    }
+
     fn attempt(
         &self,
         resume_id: Option<&str>,
@@ -1720,27 +1770,14 @@ impl Job {
              differ from what you reviewed on the previous turn -- review what is shown here, and \
              do not treat a difference from your earlier reading as a contradiction.",
         );
-        // Load this session's prior findings ledger, used both for the resumed prompt's digest and
-        // for reconciliation after the reviewer answers. A resumed turn with no readable ledger is a
-        // legacy (pre-feature) conversation: treated as an already-broken `legacy_uncovered` prior
-        // so it stays non-convergent, never mistaken for a fresh turn 1. An `invalid` ledger or a
-        // set `terminal_reason` was already refused at the resume gate, so it will not appear here.
-        let prior_state: Option<crate::findings::PriorState> = if resume_id.is_some() {
-            match self.sessions.get(&self.session).map(|r| r.ledger_load()) {
-                Some(crate::session::LedgerLoad::Valid(l)) => Some(crate::findings::PriorState {
-                    coverage: l.coverage,
-                    next_seq: l.next_seq,
-                    findings: l.findings,
-                }),
-                _ => Some(crate::findings::PriorState {
-                    coverage: crate::findings::LedgerCoverage::LegacyUncovered,
-                    next_seq: 1,
-                    findings: Vec::new(),
-                }),
-            }
-        } else {
-            None
-        };
+        // This session's prior findings ledger, used both for the resumed prompt's digest and for
+        // reconciliation after the reviewer answers. Resolved once in `start_review` from the record
+        // validated under the lease and carried in on the job — NOT re-read here: a second, fail-open
+        // `SessionStore::get` could turn a transient read error into an empty ledger and then mint
+        // fresh ids over a real one, or report an empty ledger as trusted on a not-durable turn. An
+        // `invalid` ledger or a set `terminal_reason` was already refused at the resume gate, so it
+        // will not appear here; a legacy (pre-feature) resume arrives as `legacy_uncovered`.
+        let prior_state: Option<crate::findings::PriorState> = self.prior_findings.clone();
         // Before-call bounded-growth check, done *before* the findings write-ahead marker so this
         // path involves no marker at all: if the prior ledger is already over budget on entry (a
         // budget lowered between runs, or an older ledger under a tighter cap), do not invoke the
@@ -1817,20 +1854,29 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let invocation = self
+        let invocation = match self
             .reviewer
             .invocation(&self.cfg, &self.spec, &self.bin, resume_id, &self.id)
-            .map_err(|e| {
-                errors::spawn_failed(
+        {
+            Ok(inv) => inv,
+            Err(e) => {
+                // Building the invocation failed (e.g. a temp last-message file could not be
+                // created): no child process was ever started, so a resumed reviewer conversation
+                // could not have advanced and this session's findings ledger is not stale. Undo this
+                // turn's findings marker so the next resume is not refused — and, for Perforce, so
+                // Job::run's `.pending` full-recapture fallback stays reachable.
+                self.clear_findings_marker_after_pre_launch_failure(resume_id.is_some());
+                return Err(errors::spawn_failed(
                     self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
-                )
-            })?;
+                ));
+            }
+        };
 
         let last_message_file = invocation.last_message_file.clone();
 
-        let run = reviewer::run_observed(
+        let run = match reviewer::run_observed(
             invocation.command,
             &text,
             self.cfg.timeout,
@@ -1839,14 +1885,24 @@ impl Job {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);
             },
-        )
-        .map_err(|e| {
-            errors::spawn_failed(
-                self.spec.reviewer.as_str(),
-                &self.bin.display().to_string(),
-                e.to_string(),
-            )
-        });
+        ) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // A `Spawn` failure means the child never started — same reasoning as the invocation
+                // failure above, so clear the resume's findings marker and keep the Perforce
+                // full-recapture path reachable. An `Observe` failure happened after the child was
+                // already running, so the conversation may have advanced: keep the marker set and
+                // let the findings gate refuse the next resume.
+                if e.child_never_started() {
+                    self.clear_findings_marker_after_pre_launch_failure(resume_id.is_some());
+                }
+                Err(errors::spawn_failed(
+                    self.spec.reviewer.as_str(),
+                    &self.bin.display().to_string(),
+                    e.to_string(),
+                ))
+            }
+        };
         self.registry.set_phase(&self.id, Phase::Finalizing);
 
         let result = match run {
