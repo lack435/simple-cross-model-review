@@ -381,6 +381,10 @@ pub struct Change {
     /// commit so the render can name it and tell the reviewer the earlier full diff is still
     /// in its resumed context. `None` for a full capture.
     pub incremental_from: Option<String>,
+    /// What was captured and sent, for the caller's `captured:` response line and the metrics
+    /// tag. Carried here where the resolved endpoints and the mode are in scope; the adapter in
+    /// `mod.rs` moves it onto the unified `CapturedChange`.
+    pub summary: crate::vcs::CaptureSummary,
 }
 
 /// The result of trying to capture the change: what was captured, and what the *caller*
@@ -513,8 +517,15 @@ pub fn capture(
 
     let mut diff_args = vec!["diff"];
     diff_args.extend(mode.diff_args());
-    let diff = match git.run(&diff_args) {
-        Some(out) if out.success => truncate(out.stdout, MAX_DIFF_BYTES),
+    // The stream flags travel alongside the truncation flag: a diff can end as a short prefix
+    // under the byte cap (`stdout_incomplete`) or decode lossily (`stdout_lossy`) without
+    // `truncate` seeing it. Both make the diff not-whole, which the summary, the count floor and
+    // the resume-baseline gate all have to honour -- so they are captured here, not discarded.
+    let (diff, diff_stdout_incomplete, diff_stdout_lossy) = match git.run(&diff_args) {
+        Some(out) if out.success => {
+            let (incomplete, lossy) = (out.stdout_incomplete, out.stdout_lossy);
+            (truncate(out.stdout, MAX_DIFF_BYTES), incomplete, lossy)
+        }
         Some(out) => {
             // A bad revision is the likely cause and it is worth saying loudly: the caller
             // configured `--diff main...HEAD` and would otherwise get silently nothing.
@@ -550,22 +561,35 @@ pub fn capture(
     // dirty-tree warning in the one case where nothing else can reveal it -- the reviewer
     // would hold a committed diff, read a tree that might be a different revision, and be
     // told only that some command failed.
-    let (status, status_known) = match git.run(&["status", "--porcelain", "--", "."]) {
-        Some(out) if out.success => (truncate(out.stdout, MAX_DIFF_BYTES), true),
-        _ => {
-            notes.push(
-                "`git status` did not complete, so no status listing is included below."
-                    .to_string(),
-            );
-            (Section::empty(), false)
-        }
-    };
+    let (status, status_known, status_stdout_incomplete, status_stdout_lossy) =
+        match git.run(&["status", "--porcelain", "--", "."]) {
+            Some(out) if out.success => {
+                let (incomplete, lossy) = (out.stdout_incomplete, out.stdout_lossy);
+                (
+                    truncate(out.stdout, MAX_DIFF_BYTES),
+                    true,
+                    incomplete,
+                    lossy,
+                )
+            }
+            _ => {
+                notes.push(
+                    "`git status` did not complete, so no status listing is included below."
+                        .to_string(),
+                );
+                (Section::empty(), false, false, false)
+            }
+        };
 
-    let (untracked, omissions) = if mode.includes_untracked() {
+    // Whether the untracked enumeration was whole. `Failed` already carries a prompt note (and so
+    // a caller warning); `StreamShort` is raised as a caller-only warning below, leaving the prompt
+    // untouched. Either makes the untracked count a floor and the capture partial.
+    let (untracked, omissions, ls_files) = if mode.includes_untracked() {
         git.untracked(&mut notes)
     } else {
-        (Vec::new(), OmissionReport::default())
+        (Vec::new(), OmissionReport::default(), LsFiles::Ok)
     };
+    let ls_files_incomplete = !matches!(ls_files, LsFiles::Ok);
 
     // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
     // its review; the caller needs them to know the review it is reading was made on
@@ -597,12 +621,90 @@ pub fn capture(
              differs from the diff"
         )));
     }
+    // Stream shortfalls the byte cap does not see. `stdout_incomplete` is a short pipe;
+    // `stdout_lossy` is a bad decode -- two different faults, named separately here where the
+    // flags are still distinct (the summary folds them into one `diff_incomplete` bool).
+    push_stream_warnings(
+        &mut warnings,
+        "diff",
+        diff_stdout_incomplete,
+        diff_stdout_lossy,
+    );
+    push_stream_warnings(
+        &mut warnings,
+        "`git status`",
+        status_stdout_incomplete,
+        status_stdout_lossy,
+    );
+    // A successful-but-short untracked enumeration is caller-only: the reviewer's prompt is left
+    // unchanged (the `Failed` case's note is pre-existing), so this warning is the only place the
+    // caller hears the untracked set may be short of the whole.
+    if matches!(ls_files, LsFiles::StreamShort) {
+        warnings.push(incomplete(
+            "the untracked-file listing (`git ls-files`) returned a short or undecodable result, \
+             so some new files may be missing from the count and the prompt",
+        ));
+    }
+    // A new file shown only as a prefix is a caller-facing gap; the per-file bodies already say so
+    // in the prompt, but the caller cannot read the prompt.
+    let untracked_bodies_truncated = untracked.iter().filter(|f| f.body.truncated).count();
+    if untracked_bodies_truncated > 0 {
+        warnings.push(incomplete(&format!(
+            "{untracked_bodies_truncated} untracked file(s) were shown only in part, so the \
+             reviewer did not see all of their contents"
+        )));
+    }
 
-    // A truncated diff did not show the reviewer the whole range, so it must not become a
-    // delta baseline: a later `<head>..HEAD` would never re-show the omitted part. Drop both
-    // halves of the baseline together, so the next turn re-captures in full (or, if this turn
-    // was itself a delta, deltas from the last *complete* baseline the record still holds).
-    let (baseline_head, baseline_base) = if diff.truncated {
+    // The diff was shortened *at all* -- byte cap or stream. Drives the count floor and the
+    // resume-baseline gate; the byte cap alone drives the caller-facing `diff:` token.
+    let diff_incomplete = diff.truncated || diff_stdout_incomplete || diff_stdout_lossy;
+
+    // Capture-level wholeness: no stream ran short, no cap dropped intended content, no required
+    // command failed, no included body was cut. Computed from the gap facts, not inferred from
+    // `warnings.is_empty()` -- so a future non-completeness git warning could not silently flip it.
+    // The per-file exclusion of an un-includable file (binary/out-of-root) is deliberately absent
+    // from this list; see `an_ordinary_skipped_file_does_not_warn_the_caller`.
+    let complete = !diff_incomplete
+        && !status.truncated
+        && !status_stdout_incomplete
+        && !status_stdout_lossy
+        && notes.is_empty()
+        && omissions.capture_level.is_empty()
+        && untracked_bodies_truncated == 0
+        && !ls_files_incomplete;
+
+    // A safe, bounded range descriptor for the caller line -- resolved hex endpoints for a pinned
+    // range, a fixed string for working-tree/staged, or the sanitised configured spelling
+    // otherwise. Built from the same resolution the pinned `effective` mode used, so it names the
+    // commits the reviewer actually saw without reusing the raw command string.
+    let range = git_range_descriptor(
+        cfg,
+        &incremental_base,
+        head_sha.as_deref(),
+        base_sha.as_deref(),
+    );
+
+    let (files, insertions, deletions) = diff_line_counts(&diff.text);
+    let summary = crate::vcs::CaptureSummary::Git {
+        range,
+        files,
+        insertions,
+        deletions,
+        untracked_files: untracked.len(),
+        // The untracked count understates the true set when the enumeration was short or a
+        // capture-level omission (content cap, listing cut short) dropped files -- but NOT when a
+        // per-file exclusion left an un-includable file out, which does not undercount.
+        untracked_files_floor: ls_files_incomplete || !omissions.capture_level.is_empty(),
+        diff_truncated: diff.truncated,
+        diff_incomplete,
+        complete,
+    };
+
+    // A diff that was shortened at all -- byte cap OR a short/lossy stream -- did not show the
+    // reviewer the whole range, so it must not become a delta baseline: a later `<head>..HEAD`
+    // would never re-show the omitted part. Only the *diff's* incompleteness voids the baseline;
+    // a truncated status or short untracked enumeration leaves the committed range whole.
+    let (baseline_head, baseline_base) = if diff_incomplete {
         (None, None)
     } else {
         (head_sha, base_sha)
@@ -640,6 +742,7 @@ pub fn capture(
             untracked_omitted: omissions.notes,
             notes,
             incremental_from: incremental_base,
+            summary,
         }),
         warnings,
         head_sha: baseline_head,
@@ -887,6 +990,96 @@ fn is_object_name(s: &str) -> bool {
 /// says so in its own words -- see `Capture::warn`.
 fn incomplete(note: &str) -> String {
     format!("The captured change was incomplete: {note}")
+}
+
+/// The wholeness of the untracked *enumeration* (`git ls-files`), as [`Git::untracked`] saw it.
+///
+/// `Failed` (the command did not complete) already carries a prompt note and thus a caller
+/// warning, so it is unchanged. `StreamShort` (a successful run whose stream was cut or decoded
+/// lossily) is new, and is deliberately kept out of the prompt: `capture` raises a caller-only
+/// warning for it. Both make `untracked_files` a floor and the capture partial.
+enum LsFiles {
+    Ok,
+    Failed,
+    StreamShort,
+}
+
+/// Push a caller warning for each distinct stream fault, naming the precise cause. `what` is the
+/// stream label ("diff", "`git status`"). Kept apart from the byte-cap truncation warnings, which
+/// have their own wording, so a short pipe is never described as a byte-cap cut.
+fn push_stream_warnings(
+    warnings: &mut Vec<String>,
+    what: &str,
+    incomplete_stream: bool,
+    lossy: bool,
+) {
+    if incomplete_stream {
+        warnings.push(incomplete(&format!(
+            "the {what} stream ended before it was fully read, so the reviewer was not shown all \
+             of it"
+        )));
+    }
+    if lossy {
+        warnings.push(incomplete(&format!(
+            "the {what} output did not decode cleanly, so some of it may be misrepresented"
+        )));
+    }
+}
+
+/// Count files, insertions and deletions in a unified diff, for the caller's size summary.
+///
+/// A cheap parse of the diff text already captured -- no extra `git` call. `files` counts
+/// `diff --git ` headers (a rename-only, mode-only or binary file emits one with zero line
+/// changes, which is correct); insertions and deletions count `+`/`-` lines excluding the
+/// `+++ `/`--- ` file headers. On a truncated or short-streamed diff the counts are a floor, which
+/// the summary marks; this function just counts what is present.
+fn diff_line_counts(diff: &str) -> (usize, usize, usize) {
+    let mut files = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            files += 1;
+        } else if line.starts_with("+++ ") || line.starts_with("--- ") {
+            // File headers, not content lines.
+        } else if line.starts_with('+') {
+            insertions += 1;
+        } else if line.starts_with('-') {
+            deletions += 1;
+        }
+    }
+    (files, insertions, deletions)
+}
+
+/// The safe, bounded range descriptor for the caller's `captured:` line.
+///
+/// Resolved hex endpoints for a pinned HEAD-anchored range (the base commit is the tell for a
+/// stale-`main` capture); fixed strings for the working-tree and staged modes; and, only for a
+/// mode whose endpoints did not resolve, the configured spelling passed through `safe_label`
+/// (control-filtered, backtick-stripped, length-bounded). The match mirrors the `effective`-mode
+/// resolution the diff itself ran under, so the descriptor names what the reviewer actually saw.
+fn git_range_descriptor(
+    cfg: &Config,
+    incremental_base: &Option<String>,
+    head_sha: Option<&str>,
+    base_sha: Option<&str>,
+) -> String {
+    let short = |id: &str| -> String {
+        let end = id.len().min(12);
+        id[..end].to_string()
+    };
+    match (incremental_base, head_sha, base_sha) {
+        (Some(prior), Some(head), _) => format!("git diff {}..{}", short(prior), short(head)),
+        (None, Some(head), Some(base)) => format!("git diff {}..{}", short(base), short(head)),
+        _ => match &cfg.diff {
+            DiffMode::Auto | DiffMode::Head => "git diff HEAD".to_string(),
+            DiffMode::Staged => "git diff --cached".to_string(),
+            // Not reached when a change was captured (`supplies_change()` is false for `None`),
+            // but answered rather than left to a wildcard.
+            DiffMode::None => "git diff".to_string(),
+            DiffMode::Rev(spec) => format!("git diff {}", safe_label(spec)),
+        },
+    }
 }
 
 /// Render a captured change as the prompt section the reviewer reads.
@@ -1235,9 +1428,16 @@ impl<'a> Git<'a> {
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
-    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<NewFile>, OmissionReport) {
-        let listing = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
-            Some(out) if out.success => out.stdout,
+    ///
+    /// The third return reports whether the *enumeration itself* was whole -- see [`LsFiles`]. It
+    /// makes `untracked_files` a floor and the capture partial: a successful-but-short listing
+    /// silently drops files the count would otherwise present as exact. The `Failed` case pushes a
+    /// prompt note (pre-existing behaviour, so the reviewer sees it); the `StreamShort` case does
+    /// **not** touch the prompt -- `capture` raises a caller-only warning for it -- so this change
+    /// adds no new line to the reviewer's prompt.
+    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<NewFile>, OmissionReport, LsFiles) {
+        let out = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
+            Some(out) if out.success => out,
             // An absent section reads as "there were none", and the reviewer has no shell
             // with which to discover otherwise.
             _ => {
@@ -1247,9 +1447,15 @@ impl<'a> Git<'a> {
                      shows."
                         .to_string(),
                 );
-                return (Vec::new(), OmissionReport::default());
+                return (Vec::new(), OmissionReport::default(), LsFiles::Failed);
             }
         };
+        // Success does not mean whole: the stream can end short of the full list or decode
+        // lossily. Either way the enumeration is not to be trusted as complete -- but this is a
+        // caller-facing fact, not part of the evidence, so it is signalled out rather than noted
+        // into the prompt.
+        let stream_short = out.stdout_truncated || out.stdout_incomplete || out.stdout_lossy;
+        let listing = out.stdout;
 
         // NUL-separated, so a path containing a newline -- legal, and a way to hide a file
         // from a line-oriented reader -- cannot split into two entries. Paths are not
@@ -1330,7 +1536,15 @@ impl<'a> Git<'a> {
             });
         }
 
-        (files, omitted.finish())
+        (
+            files,
+            omitted.finish(),
+            if stream_short {
+                LsFiles::StreamShort
+            } else {
+                LsFiles::Ok
+            },
+        )
     }
 }
 
@@ -1533,6 +1747,22 @@ mod tests {
             untracked_omitted: Vec::new(),
             notes: Vec::new(),
             incremental_from: None,
+            summary: test_git_summary(),
+        }
+    }
+
+    /// A representative git capture summary for `Change` fixtures whose tests do not exercise it.
+    fn test_git_summary() -> crate::vcs::CaptureSummary {
+        crate::vcs::CaptureSummary::Git {
+            range: "git diff HEAD".into(),
+            files: 0,
+            insertions: 0,
+            deletions: 0,
+            untracked_files: 0,
+            untracked_files_floor: false,
+            diff_truncated: false,
+            diff_incomplete: false,
+            complete: true,
         }
     }
 
@@ -1750,6 +1980,7 @@ mod tests {
             untracked_omitted: vec!["`blob.bin` is binary".into()],
             notes: Vec::new(),
             incremental_from: None,
+            summary: test_git_summary(),
         };
         let text = render(&change, Path::new("C:\\repo"));
         assert!(text.contains("diff above was truncated"), "{text}");
@@ -1928,6 +2159,204 @@ mod tests {
         let text = render(&change, &dir);
         assert!(text.contains("+modified"), "{text}");
         assert!(text.contains("#### untracked.txt"), "{text}");
+    }
+
+    #[test]
+    fn diff_line_counts_parses_files_insertions_and_deletions() {
+        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n\
+                    diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -0,0 +1 @@\n+added\n";
+        // Two `diff --git` headers; the `+++ `/`--- ` file headers are not counted as content.
+        assert_eq!(diff_line_counts(diff), (2, 2, 1));
+        // A rename-only entry: a header, no `+/-` content lines.
+        assert_eq!(
+            diff_line_counts(
+                "diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\n"
+            ),
+            (1, 0, 0)
+        );
+        // A binary entry: a header and a "Binary files ... differ" line, no `+/-` lines.
+        assert_eq!(
+            diff_line_counts(
+                "diff --git a/b.bin b/b.bin\nBinary files a/b.bin and b/b.bin differ\n"
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(diff_line_counts(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_range_descriptor_is_resolved_hex_a_fixed_string_or_a_sanitised_spelling() {
+        let dir = temp_dir();
+        // A pinned full range renders base..head, 12 hex chars each, base first.
+        let cfg = config_for(&dir, DiffMode::Rev("main...HEAD".into()));
+        assert_eq!(
+            git_range_descriptor(
+                &cfg,
+                &None,
+                Some("0123456789abcdef"),
+                Some("fedcba9876543210")
+            ),
+            "git diff fedcba987654..0123456789ab"
+        );
+        // An incremental delta renders prior..head.
+        assert_eq!(
+            git_range_descriptor(
+                &cfg,
+                &Some("aaaaaaaaaaaa1111".into()),
+                Some("bbbbbbbbbbbb2222"),
+                Some("cccccccccccc3333")
+            ),
+            "git diff aaaaaaaaaaaa..bbbbbbbbbbbb"
+        );
+        // Working-tree and staged modes render fixed strings, with no resolved endpoints.
+        assert_eq!(
+            git_range_descriptor(&config_for(&dir, DiffMode::Head), &None, None, None),
+            "git diff HEAD"
+        );
+        assert_eq!(
+            git_range_descriptor(&config_for(&dir, DiffMode::Auto), &None, None, None),
+            "git diff HEAD"
+        );
+        assert_eq!(
+            git_range_descriptor(&config_for(&dir, DiffMode::Staged), &None, None, None),
+            "git diff --cached"
+        );
+        // A mode whose endpoints did not resolve keeps the configured spelling, sanitised.
+        let window = config_for(&dir, DiffMode::Rev("HEAD~3..HEAD~1".into()));
+        assert_eq!(
+            git_range_descriptor(&window, &None, None, None),
+            "git diff HEAD~3..HEAD~1"
+        );
+        let backticked = config_for(&dir, DiffMode::Rev("a`b".into()));
+        let out = git_range_descriptor(&backticked, &None, None, None);
+        assert!(!out.contains('`'), "{out}");
+    }
+
+    #[test]
+    fn a_clean_capture_summarises_as_complete() {
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
+            .change
+            .expect("a change");
+        let crate::vcs::CaptureSummary::Git {
+            range,
+            files,
+            untracked_files,
+            untracked_files_floor,
+            diff_truncated,
+            diff_incomplete,
+            complete,
+            ..
+        } = &change.summary
+        else {
+            panic!("git summary, got {:?}", change.summary);
+        };
+        assert_eq!(range, "git diff HEAD");
+        assert!(*files >= 1, "{files}");
+        assert_eq!(*untracked_files, 1);
+        assert!(!*untracked_files_floor);
+        assert!(!*diff_truncated);
+        assert!(!*diff_incomplete);
+        assert!(*complete, "{:?}", change.summary);
+    }
+
+    #[test]
+    fn a_pinned_range_capture_summary_carries_resolved_hex_endpoints() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cfg = config_for(&dir, DiffMode::Rev("HEAD~1..HEAD".into()));
+        let change = capture(&cfg, None, &idle()).change.expect("a change");
+        let crate::vcs::CaptureSummary::Git {
+            range, complete, ..
+        } = &change.summary
+        else {
+            panic!("git summary");
+        };
+        assert!(range.contains(&base[..12]), "{range} / {base}");
+        assert!(range.contains(&head1[..12]), "{range} / {head1}");
+        // A committed range carries no untracked files and was not truncated.
+        assert!(*complete, "{:?}", change.summary);
+    }
+
+    #[test]
+    fn a_truncated_untracked_body_makes_the_summary_partial_without_flooring_the_count() {
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        // A new file larger than the per-file cap: its body is truncated, but the file is still
+        // included and counted, and the total budget is not exhausted so nothing is skipped.
+        std::fs::write(
+            dir.join("big-new.txt"),
+            vec![b'z'; MAX_UNTRACKED_FILE_BYTES + 10_000],
+        )
+        .expect("write");
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
+            .change
+            .expect("a change");
+        let crate::vcs::CaptureSummary::Git {
+            complete,
+            untracked_files_floor,
+            ..
+        } = &change.summary
+        else {
+            panic!("git summary");
+        };
+        // A truncated body is a capture-level gap, so the capture is partial ...
+        assert!(!*complete, "{:?}", change.summary);
+        // ... but it does not undercount the *number* of untracked files.
+        assert!(!*untracked_files_floor, "{:?}", change.summary);
+    }
+
+    #[test]
+    fn exhausting_the_untracked_content_budget_floors_the_untracked_count() {
+        let Some(dir) = repo_with_untracked_budget_spent(MAX_UNTRACKED_TOTAL_BYTES) else {
+            return;
+        };
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
+            .change
+            .expect("a change");
+        let crate::vcs::CaptureSummary::Git {
+            complete,
+            untracked_files_floor,
+            ..
+        } = &change.summary
+        else {
+            panic!("git summary");
+        };
+        // Whole files were dropped when the budget hit zero: the count is a floor and the
+        // capture is partial.
+        assert!(*untracked_files_floor, "{:?}", change.summary);
+        assert!(!*complete, "{:?}", change.summary);
+    }
+
+    #[test]
+    fn a_binary_untracked_file_keeps_the_summary_complete_and_the_count_exact() {
+        // The contract boundary, checked on the summary fields: a reached-but-un-includable file
+        // is not a capture-level gap. This is the field-level companion to
+        // `an_ordinary_skipped_file_does_not_warn_the_caller`.
+        let Some(dir) = repo_with_a_change() else {
+            return;
+        };
+        std::fs::write(dir.join("blob.bin"), [0u8, 1, 2, 0, 3]).expect("write");
+        let change = capture(&config_for(&dir, DiffMode::Head), None, &idle())
+            .change
+            .expect("a change");
+        let crate::vcs::CaptureSummary::Git {
+            complete,
+            untracked_files_floor,
+            untracked_files,
+            ..
+        } = &change.summary
+        else {
+            panic!("git summary");
+        };
+        assert!(*complete, "{:?}", change.summary);
+        assert!(!*untracked_files_floor, "{:?}", change.summary);
+        // Only the includable untracked file is counted; the binary one is not.
+        assert_eq!(*untracked_files, 1);
     }
 
     #[test]

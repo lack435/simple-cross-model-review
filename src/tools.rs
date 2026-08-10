@@ -637,6 +637,16 @@ impl App {
             out.push_str(&format!("usage:     {}\n\n", snapshot.usage.summary()));
         }
 
+        // What the server captured and sent this turn: the resolved command/range, a size
+        // summary, whether the diff hit the byte cap, and whether the capture was otherwise
+        // complete. Present whenever a change was sent -- on a fresh turn as well as a resume, so
+        // it sits above the resume-only `disposition:` line. A caller can confirm the reviewer saw
+        // the intended change from this alone, without re-running git or p4. When the capture was
+        // partial, this line points at the WARNING lines rendered just below.
+        if let Some(summary) = &snapshot.capture_summary {
+            out.push_str(&format!("captured:  {}\n\n", summary.summary()));
+        }
+
         // Only on a resumed turn that sent a change; a fresh or no-change turn carries `None`.
         // This is informational -- it says what the server *sent* this turn (a delta, or the whole
         // change and why). A fall-back that the caller was configured for also raises a WARNING
@@ -1163,6 +1173,14 @@ impl Job {
             pending_marked,
         );
 
+        // What the server captured and sent this turn, for the `captured:` response line. Present
+        // exactly when a change was sent (`capture.change.is_some()`) -- no resume gate, so it is
+        // there on a fresh turn too. Its metrics tag is taken from the local now, before the value
+        // moves onto a *successful* outcome, so a failed reviewer attempt that still captured and
+        // sent a change is logged with what it sent -- the same split as the disposition tag.
+        let mut capture_summary = capture.change.as_ref().map(|c| c.summary.clone());
+        let captured_tag = capture_summary.as_ref().map(vcs::CaptureSummary::tag);
+
         // A failed `mark_pending` means the *next* turn cannot safely elide. When the feature is
         // enabled that is worth an ordinary persistence warning on its own footing, independent of
         // the disposition (which G0 suppresses on a no-change resume): the durability guarantee is
@@ -1271,10 +1289,11 @@ impl Job {
                 &mut facts.prompt_bytes,
             ) {
                 Ok(mut o) => {
-                    // The disposition rides on the successful outcome so the response can render
-                    // it. A failed turn keeps `None` (`Outcome::failed`): it sent no reviewable
-                    // change.
+                    // The disposition and capture summary ride on the successful outcome so the
+                    // response can render them. A failed turn keeps `None` (`Outcome::failed`): it
+                    // sent no reviewable change.
                     o.disposition = disposition.take();
+                    o.capture_summary = capture_summary.take();
                     outcome = Some(o);
                     break;
                 }
@@ -1365,6 +1384,7 @@ impl Job {
             usage,
             failure_code,
             disposition_tag,
+            captured_tag,
             capture.change.as_ref(),
             started,
             facts,
@@ -1387,6 +1407,7 @@ impl Job {
         usage: crate::metrics::Usage,
         failure_code: Option<String>,
         disposition: Option<String>,
+        captured: Option<String>,
         change: Option<&vcs::CapturedChange>,
         started: std::time::Instant,
         facts: AttemptFacts,
@@ -1453,6 +1474,7 @@ impl Job {
             disposition,
             resolved_bin,
             attempts,
+            captured,
         });
     }
 
@@ -1794,6 +1816,9 @@ impl Job {
             // capture plus the fresh-vs-resumed framing only `run` holds, and `active` from the
             // entry the walk settled on.
             disposition: None,
+            // Likewise filled in by `run`, which holds the capture. Rides the successful outcome
+            // for the response; a failed attempt renders as an error and shows no `captured:` line.
+            capture_summary: None,
             resumable,
             usage: parsed.usage,
             active: None,
@@ -2551,6 +2576,82 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "BAD_REQUEST");
         assert!(err.summary.contains("rv-nope-1"));
+    }
+
+    /// A completed git capture summary for the render tests.
+    fn git_summary() -> crate::vcs::CaptureSummary {
+        crate::vcs::CaptureSummary::Git {
+            range: "git diff a1b2c3d4e5f6..0f1e2d3c4b5a".into(),
+            files: 12,
+            insertions: 487,
+            deletions: 89,
+            untracked_files: 0,
+            untracked_files_floor: false,
+            diff_truncated: false,
+            diff_incomplete: false,
+            complete: true,
+        }
+    }
+
+    fn completed_outcome(capture_summary: Option<crate::vcs::CaptureSummary>) -> Outcome {
+        Outcome {
+            review: Some("APPROVE".into()),
+            failure: None,
+            denials: Vec::new(),
+            denial_count: 0,
+            denial_count_is_floor: false,
+            warnings: Vec::new(),
+            disposition: Some(crate::vcs::Disposition::Incremental(
+                crate::vcs::disposition::Incremental::GitRange {
+                    prior: "aaaaaaaaaaaa".into(),
+                    head: "bbbbbbbbbbbb".into(),
+                    commits: Some(1),
+                },
+            )),
+            capture_summary,
+            resumable: true,
+            usage: crate::metrics::Usage::default(),
+            active: None,
+        }
+    }
+
+    fn render_completed_for(capture_summary: Option<crate::vcs::CaptureSummary>) -> String {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let app = App::new(cfg);
+        let (id, _c) = app.registry().try_start("default", 2, true).expect("start");
+        app.registry()
+            .finish(&id, completed_outcome(capture_summary));
+        app.review_result(
+            &json!({"review_id": id, "wait_seconds": 0}),
+            &RequestCancel::new(),
+        )
+        .expect("completed render")
+    }
+
+    #[test]
+    fn the_captured_line_is_rendered_and_precedes_the_disposition_line() {
+        let out = render_completed_for(Some(git_summary()));
+        assert!(
+            out.contains(
+                "captured:  git diff a1b2c3d4e5f6..0f1e2d3c4b5a — 12 files, +487/-89, 0 untracked \
+                 — diff within budget — complete"
+            ),
+            "{out}"
+        );
+        let captured = out.find("captured:").expect("captured line");
+        let disposition = out.find("disposition:").expect("disposition line");
+        assert!(
+            captured < disposition,
+            "captured must precede disposition:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_captured_line_when_the_turn_sent_no_change() {
+        let out = render_completed_for(None);
+        assert!(!out.contains("captured:"), "{out}");
+        // The rest of the response is unaffected -- the disposition still renders.
+        assert!(out.contains("disposition:"), "{out}");
     }
 
     /// Finish enough reviews on one session to push its oldest past the retention cap.

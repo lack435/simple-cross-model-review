@@ -130,8 +130,9 @@ pub fn serve(app: Arc<App>) {
 /// needs a test of its own, and a test needs a seam.
 fn drain_in_flight(app: &Arc<App>, in_flight: Vec<std::thread::JoinHandle<()>>) {
     // A `cross_model_review_result` parked in `Registry::wait` has no other way to learn
-    // stdin has closed, so a 300s budget would hold the join below for the rest of it and
-    // then write to a stdout nobody is reading.
+    // stdin has closed, so its full collect wait budget -- the cap derived from the review
+    // timeout, up to tens of minutes at defaults -- would hold the join below for the rest
+    // of it and then write to a stdout nobody is reading.
     app.begin_shutdown();
 
     let unfinished = in_flight.iter().filter(|h| !h.is_finished()).count();
@@ -234,7 +235,8 @@ fn start_tool_call(
             // than something this function can see, so it is stated in the doc comment.
             // Off the reader thread the cost is only a response sent for a request that
             // was cancelled in the window, which the spec tolerates: no review can be
-            // killed either way, since `attach_review` only runs inside `dispatch_tool`.
+            // killed either way, since `attach_owned`/`attach_wait` only run inside
+            // `dispatch_tool`.
             send(writer, handler_thread_unavailable_response(&id, &tool, &e));
             None
         }

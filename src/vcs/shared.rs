@@ -52,6 +52,10 @@ pub struct CapturedChange {
     /// Bytes of diff text that went into the prompt (post-truncation), for the usage log.
     pub diff_bytes: usize,
     pub diff_truncated: bool,
+    /// What was captured and sent, surfaced to the caller as the `captured:` response line and to
+    /// the metrics log as a compact tag. Present whenever a change was sent -- so it lives here,
+    /// on the struct that exists if and only if `change.is_some()`, rather than as an `Option`.
+    pub summary: super::capture_summary::CaptureSummary,
 }
 
 /// The result of trying to capture the change: what was captured, and what the *caller* has
