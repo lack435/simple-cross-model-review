@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan (round 3).** This document is the plan for the piece of [issue #48] that the
+Status: **plan (round 4).** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -49,10 +49,11 @@ finding f13).
   2 `assistant`, 1 `rate_limit_event`, 1 `result`), so the armed invocation does not need
   that flag; the Codex `exec --json` **stdout** carries **no** `rate_limits`; the Codex
   **rollout log** does, in a `token_count` event; the `thread_id` on Codex stdout equals the
-  id embedded in the rollout filename; a stable account identifier is readable **cheaply and
-  locally** for Codex (`tokens.account_id` in `$CODEX_HOME/auth.json`) and via a **cheap CLI
-  call** for Claude (`orgId`/`email` in `claude auth status`, which `auth_check` already runs,
-  [claude.rs:46]).
+  id embedded in the rollout filename; a stable account identifier is readable **cheaply from a
+  current local file** for **both** reviewers — Codex `tokens.account_id` in
+  `$CODEX_HOME/auth.json`, Claude `oauthAccount.accountUuid`/`organizationUuid` in
+  `~/.claude.json` — with no CLI call (the OAuth credentials themselves live elsewhere and are
+  not read).
 - **Assumed, and *not* depended on (labelled so):**
   - *"Once per turn."* Each probe emitted the event once, but the design never assumes a
     count — it takes the **last** such event in the stream/log, which is correct for zero, one,
@@ -64,7 +65,6 @@ finding f13).
   - *Codex multiple windows.* The probe's `secondary` window was `null`; primary/secondary
     handling below is defensive, driven by the field shape, not by an observed two-window case.
 
-[claude.rs:46]: ../src/reviewer/claude.rs
 [claude.rs:85]: ../src/reviewer/claude.rs
 [codex.rs:66]: ../src/reviewer/codex.rs
 
@@ -241,22 +241,48 @@ added** (in particular *not* `--include-partial-messages`; verified unnecessary)
 consequences must be handled, or the switch would change a review's *outcome*, not just add an
 observation:
 
-- **JSONL-aware parse and failure classification (finding f14).** The stream is not one JSON
-  document, so the current whole-stdout `serde_json::from_str` and the generic `failure_for`
-  path — whose diagnostics fold in raw stdout ([reviewer/mod.rs:710]) and could let event or
-  model text drive classification — **must not** be reused as-is for the armed case. The armed
-  Claude path parses the JSONL, extracts the outcome from the terminal `result` event's
-  **CLI-owned fields only** (`is_error`, `subtype`, `result`, `usage`, `session_id`, denials,
-  warnings), and classifies failure from those fields — never from arbitrary stdout text.
-- **Cap-preserving incremental retention (finding f15).** `stream-json` is larger than the
-  buffered document (~5.5× for a trivial reply; roughly 2× the review text for a large one,
-  since the text appears in both `assistant` events and the `result` event). Read under the
-  shared `MAX_OUTPUT_BYTES` cap ([reviewer/mod.rs:662]), a large review could hit the cap
-  **before** its terminal `result` and turn a today-successful review into `OUTPUT_TRUNCATED`.
-  So the armed path consumes the stream **incrementally, retaining only the latest `result`
-  and `rate_limit_event`** as they arrive — retained bytes ≈ one document regardless of stream
-  length — so stream verbosity cannot induce truncation of the terminal result. A test induces
-  a large stream and asserts no spurious `OUTPUT_TRUNCATED`.
+- **JSONL-aware parse and failure classification (finding f14, still open after round 3).**
+  The stream is not one JSON document, so the current whole-stdout `serde_json::from_str` and
+  the generic `failure_for` path — whose diagnostics fold in raw stdout ([reviewer/mod.rs:710])
+  and could let event or model text drive classification — **must not** be reused as-is for the
+  armed case. Two distinctions are load-bearing:
+  - **`result` is the model's review *content*, not classification evidence.** Round 3 caught
+    that an earlier draft listed `result` among the "CLI-owned" fields; it is model prose and
+    is used **only** as the review text, never as evidence — otherwise a review that *mentions*
+    "rate limit" could drive classification, the exact failure [errors.rs:558] forbids. Failure
+    is classified **only** from the CLI's own structured metadata: `type`, `is_error`,
+    `subtype`, `api_error_status`, `stop_reason`, `terminal_reason`, `permission_denials`,
+    `usage`, `session_id`. The armed parser extracts content and metadata from separate,
+    named fields — it never runs free text through the classifier.
+  - **The no-terminal-`result` case is defined.** If the stream carries a `rate_limit_event`
+    (or other events) but **no** terminal `result` event — the CLI died or was rejected
+    mid-stream — the turn is a **failure**, classified from whatever CLI-owned metadata the
+    stream did carry (e.g. a `result` event with `is_error:true`, an error event) or, absent
+    any, a defined "no result event" failure; and the `rate_limit_event`, if present, is still
+    captured as headroom by `observe_headroom` regardless. A missing `result` is never treated
+    as an empty successful review.
+- **Two separate bounds — retained bytes *and* total work (finding f15, still open after
+  round 3).** `stream-json` is larger than the buffered document (~5.5× for a trivial reply;
+  roughly 2× the review text for a large one, since the text appears in both `assistant`
+  events and the `result` event). Round 3 caught a contradiction in "just retain the latest
+  events": that bounds *memory*, but the shared `MAX_OUTPUT_BYTES` cap ([reviewer/mod.rs:662])
+  also serves as the **total-work** bound against a runaway CLI — and counting the whole stream
+  against it can truncate before `result`, while *not* counting it makes total reading
+  unbounded. So the armed path defines **two independent bounds**:
+  - **Retention bound** — memory held is ~one document: only the latest `result` and
+    `rate_limit_event` are kept as lines arrive; earlier `assistant`/`system`/`stream_event`
+    lines are parsed for those two and dropped.
+  - **Total-input bound** — a distinct `MAX_ARMED_STREAM_BYTES` (and/or a wall/​event cap)
+    bounds the bytes *read*, sized at **≥ 2× `MAX_OUTPUT_BYTES`** so that any review whose text
+    would fit the buffered path also fits here (the stream carries the text ~twice). Reading
+    stops at this bound; if it is hit **before** the terminal `result`, that is a **defined
+    truncation failure** (`OUTPUT_TRUNCATED`), never a silent success and never unbounded
+    reading.
+
+  So a runaway stream is bounded, and a review buffered mode would have accepted is **not**
+  turned into `OUTPUT_TRUNCATED` by the format switch. Tests cover both: a huge run-on stream
+  hits the total-input bound and fails as `OUTPUT_TRUNCATED` (bounded), and a large-but-valid
+  review that fits buffered mode still yields its terminal `result` under the armed path.
 
 The behaviour-preservation invariant is **field-level `Parsed` equivalence** between the armed
 and buffered paths (not byte-equivalence — a JSONL line is not a buffered document, finding
@@ -273,26 +299,32 @@ read-modify-write, atomic rename, corrupt-file preservation, and stale-write rej
 entry advances only when the incoming `observed_at` is newer, finding f5). Any lock/IO error
 degrades that one operation to `Unknown`/no-op.
 
-**Keyed by resolved identity *and* a verified account fingerprint (findings f4, first raised
-round 1, sharpened round 2).** A resolved binary path is not enough: the same binary and
-`$CODEX_HOME` can be re-authenticated as a *different account*, and `$CODEX_HOME` names
-storage, not the logged-in identity. So a stored observation is **actionable only when the
-account fingerprint it was recorded under still matches the current one**, established
-cheaply and without a model call:
+**Keyed by resolved identity *and* a verified account fingerprint, read from a *current local*
+source — never a preflight, never a cache (findings f4 and the round-3 f2 regression).** A
+resolved binary path is not enough: the same binary and home can be re-authenticated as a
+*different account*, so `$CODEX_HOME`/`bin` names storage, not the logged-in identity. Round 3
+rejected two tempting shortcuts: obtaining the fingerprint from `auth_check` **re-introduces a
+preflight before the gate** on a cache miss (the f2 regression), and a **process-lifetime
+cache goes stale** across an account switch (f4). Both are avoided by reading the identity from
+the **same current, local, cheap file the CLI itself keeps its logged-in account in** — a plain
+file read, no CLI call, no preflight, and *current* (it changes on re-login, so a switch is
+detected):
 
-- **Codex** — the fingerprint is `tokens.account_id`, read from `$CODEX_HOME/auth.json` (a
-  local **file** read — the *identifier*, never the OAuth tokens). Available at selection time
-  with no CLI call.
-- **Claude** — the fingerprint is `orgId` (with `email`) from `claude auth status`, which is
-  exactly what `auth_check` already runs ([claude.rs:46]); the result is cached in the shared
-  preflight cache, so obtaining it during selection is the auth check that would run anyway
-  (no model call) and is a cache hit when the entry later runs. A genuine `NOT_AUTHENTICATED`
-  or `CLI_NOT_FOUND` surfaced while establishing it is **not** masked by the gate — it stops
-  as it does today.
-- **When the fingerprint cannot be established, or does not match, the observation is
-  `Unknown` and the entry is not skipped** (fail-open — the reviewer's explicit "disable
-  gating when identity cannot be established"). Proactive gating is therefore only ever a skip
-  on *positively matched* identity; the reactive limit still protects an ungated entry.
+- **Codex** — `tokens.account_id` from `$CODEX_HOME/auth.json`. (Verified present; the
+  *identifier*, never the OAuth tokens.)
+- **Claude** — `oauthAccount.accountUuid` (with `organizationUuid`) from the CLI's account file
+  `~/.claude.json` (honouring `CLAUDE_CONFIG_DIR`/`HOME` as the CLI does). (Verified present;
+  the account *identifier*, never the credentials in the separate `~/.claude/.credentials.json`,
+  which this tool does not read.)
+
+The fingerprint is read the **same way at observation time** (stored on the record) **and at
+selection time** (compared), so no preflight and no cache sit between them. **When the current
+fingerprint cannot be read, or does not match the stored one, the observation is `Unknown` and
+the entry is not skipped** (fail-open — the reviewer's "current local identity source, or treat
+as Unknown"). Proactive gating is therefore only ever a skip on *positively matched, currently
+read* identity; an account switch flips the read fingerprint immediately and the stale snapshot
+stops gating. A genuine auth failure is still surfaced by the normal preflight when the selected
+entry actually runs — the gate neither triggers nor masks it.
 
 **Actionable only while fresh and unreset (finding f9).** A snapshot gates only if `now <
 resets_at` **and** `now − observed_at < TTL` (the window's own length when known —
@@ -307,13 +339,15 @@ first review against a never-seen (or identity-changed) entry is **ungated**.
 Round-1 finding f2 (gate must precede primary preflight and capture) and round-2 findings f7,
 f17, f18 together pin the exact placement:
 
-- **Selection (fresh review), before capture, the Perforce pending-marker, and any model
-  spawn.** Walk the chain from entry 0; for each entry with a minimum, establish its account
-  fingerprint (Codex: local `auth.json`; Claude: the cached `auth_check`), read the store, and
-  skip the entry if its observation is matched-identity, actionable, and below-minimum. The
-  first entry that clears is the start entry. If **every** entry is gated out, return
-  `REVIEWERS_EXHAUSTED` (gated variant) **before** capture / marker / preflight — nothing is
-  captured or billed.
+- **Selection (fresh review), before capture, the Perforce pending-marker, and *any*
+  preflight or model spawn.** Walk the chain from entry 0; for each entry with a minimum, read
+  its current account fingerprint from the **local file** (Codex `auth.json`, Claude
+  `~/.claude.json`) — **not** an `auth_check`, so selection never triggers a preflight (the
+  round-3 f2 regression) — read the store, and skip the entry if its observation is
+  matched-identity, actionable, and below-minimum. The first entry that clears is the start
+  entry. If **every** entry is gated out, return `REVIEWERS_EXHAUSTED` (gated variant)
+  **before** capture / marker / preflight — nothing is captured, resolved, auth-checked, or
+  billed.
 - **Skipped-entry metadata is carried into the `Job` and seeded into its `metrics_attempts`
   (finding f17)**, because selection runs before the worker while the attempt history is built
   inside the walk. A pre-start skip of entry 0 therefore still appears as its promised
@@ -420,8 +454,9 @@ no attempts. One `Record` per logical turn is unchanged.
 - **`reviewer/codex.rs`**: armed rollout read (date-scoped, suffix-matched, tailed, fail-open);
   `tokens.account_id` fingerprint read from `$CODEX_HOME/auth.json`. No invocation change.
 - **`reviewer/claude.rs`**: armed invocation (`json`→`stream-json --verbose`, nothing else
-  added); JSONL-aware parse and failure classification on CLI-owned fields only; `orgId`
-  fingerprint from the existing `auth_check`. Buffered `json` retained when disarmed.
+  added); JSONL-aware parse and failure classification on CLI-owned metadata only (`result`
+  is content, not evidence); the total-input + retention bounds; the `oauthAccount.accountUuid`
+  fingerprint read from `~/.claude.json`. Buffered `json` retained when disarmed.
 - **New `usage.rs`**: the `usage-headroom.json` store — resolved-bin + account-fingerprint key,
   TTL/reset actionability, and the `SessionStore` lock/atomic/merge/corrupt-preserve/stale-reject
   discipline (shared with, or factored out of, `session.rs`).
@@ -470,7 +505,7 @@ Unit tests, no network and no model call, extending the existing fakes:
   (truncation, denials, usage, warnings, CLI events), with fixtures captured from the armed
   production invocation.
 - **Account identity (f4)**: a snapshot recorded under account A is `Unknown` when the current
-  fingerprint is B (Codex via a swapped `auth.json`; Claude via a swapped `auth_check`
+  fingerprint is B (Codex via a swapped `auth.json`; Claude via a swapped `~/.claude.json`
   result); an unreadable/absent fingerprint fails open (entry runs); a matching fingerprint
   gates.
 - **Store lifecycle (f5)**: write/read round-trip; two same-model/different-`bin` (or
@@ -532,3 +567,20 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
   skipped fallback is never published active → §6); f19 (`HeadroomLevel` needs an explicit rank,
   not derived `Ord` → §2); f20 (round-1 severity counts were wrong → corrected above to 9 major /
   4 minor). f20 is a doc-accounting fix, applied here.
+
+- **Round 3 (same session, turn 3) — REQUEST CHANGES.** Confirmed **resolved**: f1, f3, f5–f13,
+  f16–f20 (16 of 20). **Open/regressed** and addressed in round 4:
+  - **f2 regressed** — sourcing Claude's fingerprint from the cached `auth_check` re-introduced
+    a preflight before the gate on a cache miss. Fixed by reading the fingerprint from a
+    **current local file** (`~/.claude.json`), never `auth_check`, so selection triggers no
+    preflight (§5, §6).
+  - **f4** — a process-lifetime cache could reuse account A's fingerprint after a switch to B.
+    Fixed by the same current-local-file read, which changes on re-login and so detects the
+    switch immediately; unreadable/mismatched → `Unknown` (§5).
+  - **f14** — `result` is model prose and must not be classification evidence; failure is now
+    classified only from CLI-owned structured metadata, and the no-terminal-`result` case is
+    defined (§4).
+  - **f15** — the retention idea did not resolve the cap's dual role; round 4 defines **two
+    independent bounds** (retention ≈ one document; a separate total-input bound ≥ 2×
+    `MAX_OUTPUT_BYTES` whose breach before `result` is a defined `OUTPUT_TRUNCATED`), so a
+    runaway stream is bounded and a review buffered mode would accept is not truncated (§4).
