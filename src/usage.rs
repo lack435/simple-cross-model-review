@@ -56,7 +56,10 @@ struct StoreFile {
 /// account fingerprint passes `None` and gets no key, so the entry is never gated.
 pub fn entry_key(reviewer: &str, resolved_bin: &Path, account: &str) -> String {
     // Windows paths are case-insensitive; lower-case so the same executable keys consistently.
-    let bin = resolved_bin.to_string_lossy().to_lowercase().replace('\\', "/");
+    let bin = resolved_bin
+        .to_string_lossy()
+        .to_lowercase()
+        .replace('\\', "/");
     format!("{reviewer}\u{1f}{bin}\u{1f}{account}")
 }
 

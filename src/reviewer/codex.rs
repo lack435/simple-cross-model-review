@@ -609,7 +609,11 @@ mod tests {
                 resets_at,
             } => {
                 assert!((remaining_pct - 10.0).abs() < 1e-9);
-                assert_eq!(resets_at, Some(999), "must keep the limiting window's reset");
+                assert_eq!(
+                    resets_at,
+                    Some(999),
+                    "must keep the limiting window's reset"
+                );
             }
             other => panic!("expected Fraction, got {other:?}"),
         }
@@ -652,7 +656,10 @@ mod tests {
         .unwrap();
         match headroom_from_rollout(&path) {
             Headroom::Fraction { remaining_pct, .. } => {
-                assert!((remaining_pct - 5.0).abs() < 1e-9, "must use the last event");
+                assert!(
+                    (remaining_pct - 5.0).abs() < 1e-9,
+                    "must use the last event"
+                );
             }
             other => panic!("expected Fraction, got {other:?}"),
         }

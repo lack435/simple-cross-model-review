@@ -236,6 +236,39 @@ pub fn reviewers_exhausted(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// Exhaustion where every entry was **skipped by the proactive usage gate** — none ran, so the
+/// rate-limit wording of [`reviewers_exhausted`] would be false. See `docs/usage-remaining-gate.md`.
+pub fn reviewers_exhausted_gated(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWERS_EXHAUSTED",
+        "Every reviewer in the fallback chain was skipped because its last-observed usage \
+         remaining was below its configured minimum, so the review was refused.",
+        "The cross-model review could not run because every configured reviewer was gated out \
+         by its --min-usage-remaining / --min-usage-status: each one's most recent observation \
+         was below the minimum you set.\n\n\
+         Nothing is broken. Wait for a usage window to reset, lower or remove a reviewer's \
+         minimum, or add a reviewer entry on an account with more remaining capacity.\n\n\
+         The review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
+/// Exhaustion where the chain ran out through a **mix** of rate limits and proactive gate skips.
+pub fn reviewers_exhausted_mixed(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWERS_EXHAUSTED",
+        "The fallback chain was exhausted: every reviewer was either rate-limited or skipped for \
+         low usage remaining, so the review was refused.",
+        "The cross-model review could not run: each configured reviewer in turn either hit a \
+         rate/usage limit or was gated out by its --min-usage-remaining / --min-usage-status. \
+         The per-entry reasons are listed below.\n\n\
+         Nothing is broken. Wait for a window to reset, lower or remove a minimum, or add a \
+         reviewer entry on an account with more remaining capacity.\n\n\
+         The review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
 pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failure {
     Failure::new(
         "TIMEOUT",
@@ -370,6 +403,29 @@ pub fn output_truncated(reviewer: &str, megabytes: usize, detail: impl Into<Stri
             "The cross-model review produced far more output than a review should. Collection is \
              capped at {megabytes} MiB per stream, so the transcript is incomplete and the \
              reviewer's own result could not be recovered from it.\n\n\
+             This is not a normal failure: real reviews are kilobytes. Report it to the user \
+             rather than retrying blindly, and do not continue as if the review had passed."
+        ),
+    )
+    .with_detail(detail)
+}
+
+/// Like [`output_truncated`], but names *which* bound tripped rather than assuming a byte size.
+/// The armed Claude reader bounds the stream on raw bytes, event lines, *and* the collect
+/// deadline; a line-count or deadline breach reported with byte wording would misdescribe the
+/// cause, so the tripped bound (e.g. `"32 MiB"`, `"500000 event lines"`) is named. See
+/// `docs/usage-remaining-gate.md` (round-6 finding f15).
+pub fn output_truncated_at(reviewer: &str, bound: &str, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "OUTPUT_TRUNCATED",
+        format!(
+            "The '{reviewer}' CLI produced more output than the armed stream bound ({bound}) \
+             allows, so it was truncated and the review could not be read from what remained."
+        ),
+        format!(
+            "The cross-model review produced far more output than a review should. The armed \
+             (usage-observing) reader bounds the stream at {bound}, so the transcript is \
+             incomplete and the reviewer's own result could not be recovered from it.\n\n\
              This is not a normal failure: real reviews are kilobytes. Report it to the user \
              rather than retrying blindly, and do not continue as if the review had passed."
         ),

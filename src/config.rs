@@ -1520,14 +1520,22 @@ mod tests {
     #[test]
     fn min_usage_remaining_range_is_1_to_100() {
         for bad in ["0", "101", "x"] {
-            let err =
-                Config::from_args(&args(&["--reviewer", "codex", "--min-usage-remaining", bad]))
-                    .unwrap_err();
+            let err = Config::from_args(&args(&[
+                "--reviewer",
+                "codex",
+                "--min-usage-remaining",
+                bad,
+            ]))
+            .unwrap_err();
             assert!(err.contains("--min-usage-remaining"), "{bad}: {err}");
         }
-        assert!(
-            Config::from_args(&args(&["--reviewer", "codex", "--min-usage-remaining", "1"])).is_ok()
-        );
+        assert!(Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "1"
+        ]))
+        .is_ok());
         assert!(Config::from_args(&args(&[
             "--reviewer",
             "codex",

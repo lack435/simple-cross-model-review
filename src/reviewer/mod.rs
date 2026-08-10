@@ -922,7 +922,10 @@ mod headroom_tests {
 
     #[test]
     fn status_strings_map_and_unknown_is_none() {
-        assert_eq!(HeadroomLevel::from_status("allowed"), Some(HeadroomLevel::Ample));
+        assert_eq!(
+            HeadroomLevel::from_status("allowed"),
+            Some(HeadroomLevel::Ample)
+        );
         assert_eq!(
             HeadroomLevel::from_status("allowed_warning"),
             Some(HeadroomLevel::Warning)

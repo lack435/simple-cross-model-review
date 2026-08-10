@@ -23,10 +23,10 @@ mod prompt;
 mod registry;
 mod reviewer;
 mod session;
-mod usage;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod usage;
 mod vcs;
 mod winjob;
 
