@@ -1128,15 +1128,14 @@ impl Job {
         let mut facts = AttemptFacts::new(self.turn, resume_id.is_some(), self.gap_secs);
 
         // The fall-through walk. A **fresh** review walks the reviewer chain, advancing to the
-        // next entry only on RATE_LIMITED; a **resume** runs exactly its bound entry (entry 0 for
-        // now -- identity-matched selection lands with the session-identity work), never falling
-        // through, because the reviewer's memory lives on one specific reviewer. The captured
-        // change is reused across attempts -- it was gathered once above. See
-        // docs/reviewer-fallback-chain.md.
+        // next entry only on RATE_LIMITED; a **resume** runs exactly its bound entry (selected by
+        // identity in `start_review`), never falling through, because the reviewer's memory lives
+        // on one specific reviewer. The captured change is reused across attempts -- it was
+        // gathered once above. See docs/reviewer-fallback-chain.md.
         let chain = self.cfg.reviewers.clone();
         let n = chain.len();
-        // A fresh review walks from the selected start (0) to the end; a resume runs its single
-        // bound entry alone.
+        // A fresh review walks from the selected start to the end; a resume runs its single bound
+        // entry alone.
         let walk: Vec<usize> = if resume_id.is_none() {
             (self.start_index..n).collect()
         } else {
@@ -1144,7 +1143,11 @@ impl Job {
         };
 
         let mut disposition = disposition;
+        // Describe strings of every rate-limited entry, for the REVIEWERS_EXHAUSTED detail.
         let mut rate_limited_attempts: Vec<String> = Vec::new();
+        // The earlier rate-limited attempts, for the metrics record's `attempts` history (the
+        // terminal attempt is the record itself, so it is not repeated here).
+        let mut metrics_attempts: Vec<metrics::Attempt> = Vec::new();
         let mut outcome: Option<Outcome> = None;
 
         for (pos, &i) in walk.iter().enumerate() {
@@ -1173,6 +1176,7 @@ impl Job {
             }
 
             facts.prompt_bytes = 0;
+            let attempt_started = std::time::Instant::now();
             match self.attempt(
                 resume_id.as_deref(),
                 self.turn,
@@ -1223,7 +1227,17 @@ impl Job {
                             ))));
                             break;
                         }
-                        // Advance to the next entry.
+                        // An earlier rate-limited attempt: record it for the metrics history
+                        // (usage unknown -- a refusal exposes none) and advance to the next entry.
+                        metrics_attempts.push(metrics::Attempt {
+                            reviewer: entry.reviewer.as_str().to_string(),
+                            model: entry.model.clone(),
+                            effort: entry.effort.clone(),
+                            resolved_bin: Some(self.bin.to_string_lossy().into_owned()),
+                            failure_code: "RATE_LIMITED".to_string(),
+                            wall_secs: attempt_started.elapsed().as_secs(),
+                            prompt_bytes: facts.prompt_bytes,
+                        });
                         continue;
                     }
                     outcome = Some(Outcome::failed(failure));
@@ -1260,6 +1274,7 @@ impl Job {
             capture.change.as_ref(),
             started,
             facts,
+            metrics_attempts,
         );
     }
 
@@ -1279,6 +1294,7 @@ impl Job {
         change: Option<&vcs::CapturedChange>,
         started: std::time::Instant,
         facts: AttemptFacts,
+        attempts: Vec<metrics::Attempt>,
     ) {
         let status = if failure_code.is_some() {
             "failed"
@@ -1313,7 +1329,9 @@ impl Job {
         );
 
         self.metrics.record(&metrics::Record {
-            v: metrics::RECORD_VERSION,
+            // A record carrying fall-through attempts is stamped v2, so an old reader skips it
+            // rather than reading the terminal usage as a complete accounting of the turn.
+            v: metrics::record_version_for(!attempts.is_empty()),
             ts_unix: now_unix(),
             review_id: self.id.clone(),
             session: self.session.clone(),
@@ -1336,6 +1354,8 @@ impl Job {
             status: status.to_string(),
             failure_code,
             disposition,
+            resolved_bin: Some(self.bin.to_string_lossy().into_owned()),
+            attempts,
         });
     }
 
