@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::cancel::RequestCancel;
+use crate::cancel::{CancelAction, RequestCancel};
 use crate::tools::{version_line, App, VERSION};
 
 /// Versions we can speak. They are equivalent for a tools-only server; we echo the
@@ -392,12 +392,15 @@ impl Drop for PendingEntry<'_> {
     }
 }
 
-/// Honour `notifications/cancelled`: stop the work and send no response.
+/// Honour `notifications/cancelled`: send no response, and act on the review per the request's
+/// ownership.
 ///
-/// Suppressing the response is what the spec asks for. Stopping the review is what saves
-/// money: a reviewer nobody is waiting on otherwise runs out its full timeout budget, and
-/// holds the session lease for just as long, so the next review of the same session is
-/// refused as busy until it expires.
+/// Suppressing the response is what the spec asks for, in every case. What happens to the review
+/// is not uniform (see `CancelAction`): a cancelled start call is a `Kill` — its `review_id` was
+/// never delivered, so the reviewer is stopped to save the money a result nobody can collect would
+/// otherwise spend — while a cancelled result poll is a `Detach` — the caller holds the id and can
+/// still collect, so the reviewer is left running and only the parked wait is woken. `Nothing`
+/// covers a request with no review bound or one already answered.
 ///
 /// Runs on the reader thread, which is also the only thread that inserts into the map.
 /// A notification therefore cannot overtake the insert for the request it names.
@@ -433,17 +436,32 @@ fn handle_cancellation(app: &App, pending: &Pending, params: &Value) {
         return;
     };
 
-    // stderr is the only visibility this path has, so the three outcomes are told apart:
-    // no review bound to the request, one that was still running, one already finished.
+    // stderr is the only visibility this path has, so the outcomes are told apart. `Kill` is a
+    // cancelled start call, whose review_id was never delivered and so can never be collected;
+    // `Detach` is a cancelled result poll, which leaves the review running and collectible and only
+    // wakes the parked wait; `Nothing` is a request with no review bound (or one already answered).
     match entry.cancel() {
-        None => eprintln!("cross-review: request {shown} cancelled ({reason})"),
-        Some(review_id) if app.cancel_review(&review_id) => eprintln!(
+        CancelAction::Nothing => {
+            eprintln!("cross-review: request {shown} cancelled ({reason})")
+        }
+        CancelAction::Kill(review_id) if app.cancel_review(&review_id) => eprintln!(
             "cross-review: request {shown} cancelled ({reason}); stopped review {review_id}"
         ),
-        Some(review_id) => eprintln!(
+        CancelAction::Kill(review_id) => eprintln!(
             "cross-review: request {shown} cancelled ({reason}); review {review_id} had already \
              finished"
         ),
+        CancelAction::Detach => {
+            // The review is left running; only wake the parked poll so its handler thread does not
+            // linger for the rest of the (now much larger) wait budget. The request's cancelled
+            // flag was set by `entry.cancel()` above, before this wake, so the state lock inside
+            // `wake` orders the two and the waiter cannot miss it.
+            app.wake_waiters();
+            eprintln!(
+                "cross-review: result poll {shown} cancelled ({reason}); detached the wait, review \
+                 left running"
+            );
+        }
     }
 }
 
@@ -753,13 +771,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_result",
             "description": format!(
-                "Wait for and return the review from {reviewer}.\n\n\
-                 This call blocks while the reviewer works, up to wait_seconds. When the MCP \
-                 client supplies a progress token, it emits live phase, elapsed-time, reviewer \
-                 liveness, and output-activity updates during the wait. If it returns \
-                 status=running, that is normal; call it again with the same review_id. In this \
-                 project's usage, reviews commonly take at least five minutes, and complex changes \
-                 can take 20 minutes or longer.\n\n\
+                "Wait for and return the review from {reviewer}. Blocks until the review is done: \
+                 omit wait_seconds to wait to completion in one call, so no poll loop is needed. \
+                 When the MCP client supplies a progress token, it emits live phase, elapsed-time, \
+                 reviewer liveness, and output-activity updates during the wait. In this project's \
+                 usage, reviews commonly take at least five minutes, and complex changes can take \
+                 20 minutes or longer.\n\n\
+                 If the wait_seconds budget elapses before the review finishes it returns \
+                 status=running; that is normal, just call again with the same review_id. \
+                 Abandoning this call does NOT cancel the review: the reviewer keeps running and \
+                 the result stays collectible by review_id, so if your client's own tool timeout \
+                 cuts the call short (you get a client-side timeout rather than a result), simply \
+                 call again with the same review_id. Use cross_model_review_cancel to actually stop \
+                 a reviewer.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),
@@ -779,13 +803,20 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     "wait_seconds": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": crate::config::MAX_WAIT_SECS,
+                        "maximum": cfg.max_wait_secs(),
                         "description": format!(
-                            "How long to wait for the review before returning. Defaults to {}, \
-                             capped at {}. Prefer the maximum: progress notifications make a long \
-                             wait observable without frequent polling.",
-                            crate::config::DEFAULT_WAIT_SECS,
-                            crate::config::MAX_WAIT_SECS
+                            "How long to wait for the review before returning, in seconds. Omit it \
+                             to block until the review is done (the default is the {max}s cap, which \
+                             covers a whole review), or pass 0 for an immediate snapshot. Capped at \
+                             {max}, which tracks the review budget so a single call can collect a \
+                             20-minute review. Progress notifications make the long wait observable. \
+                             If this budget elapses before the review finishes, the call returns \
+                             status=running; call again with the same review_id. (Separately, if \
+                             your client's own tool timeout is shorter and cuts the call short, you \
+                             get a client-side timeout rather than a status=running result -- the \
+                             review keeps running regardless, so just call again with the same \
+                             review_id.)",
+                            max = cfg.max_wait_secs()
                         )
                     }
                 },
@@ -806,9 +837,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_cancel",
             "description":
-                "Stop a review that is still running. Use it when the work it was reviewing has \
-                 changed underneath it, or the user has moved on. The review session itself \
-                 survives, so a later cross_model_review with the same session name still resumes.",
+                "Stop a review that is still running, and free the reviewer. This is the only \
+                 operation that stops a running reviewer: abandoning a cross_model_review_result \
+                 poll only detaches the wait and leaves the reviewer running. Use it when the work \
+                 it was reviewing has changed underneath it, or the user has moved on. The review \
+                 session itself survives, so a later cross_model_review with the same session name \
+                 still resumes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -874,6 +908,35 @@ mod tests {
     fn app() -> Arc<App> {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         Arc::new(App::new(cfg))
+    }
+
+    #[test]
+    fn the_wait_seconds_schema_maximum_tracks_a_non_default_timeout() {
+        // The advertised cap must follow --timeout-seconds, so the schema and the runtime clamp in
+        // review_result cannot silently disagree.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--timeout-seconds".into(),
+            "3600".into(),
+        ])
+        .expect("config");
+        let expected = cfg.max_wait_secs();
+        let app = Arc::new(App::new(cfg));
+
+        let tools = tool_definitions(&app);
+        let result_tool = tools
+            .iter()
+            .find(|t| t["name"] == "cross_model_review_result")
+            .expect("cross_model_review_result tool");
+        let maximum = result_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"]
+            .as_u64()
+            .expect("wait_seconds.maximum is an integer");
+        assert_eq!(
+            maximum, expected,
+            "the advertised cap must match the runtime cap"
+        );
+        assert!(maximum > 300, "the cap should exceed the old fixed 300");
     }
 
     #[test]
@@ -1117,7 +1180,7 @@ mod tests {
         let app = app();
         let pending = pending();
         let request = Arc::new(RequestCancel::new());
-        request.attach_review("rv-1-1");
+        request.attach_owned("rv-1-1");
         pending
             .lock()
             .unwrap()
@@ -1132,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_request_stops_the_review_it_is_bound_to() {
+    fn cancelling_an_owned_start_request_stops_its_review() {
         use std::sync::atomic::Ordering;
 
         let app = app();
@@ -1141,8 +1204,10 @@ mod tests {
             .try_start("default", 1, false)
             .expect("start");
 
+        // `attach_owned` is the start call's binding: its review_id was never delivered, so a
+        // cancellation must stop the reviewer, not merely detach.
         let request = Arc::new(RequestCancel::new());
-        request.attach_review(&review_id);
+        request.attach_owned(&review_id);
         let pending = pending();
         pending
             .lock()
@@ -1158,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancellation_mid_poll_ends_the_wait_rather_than_parking_the_thread() {
+    fn a_cancellation_mid_poll_detaches_the_wait_and_leaves_the_review_running() {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
@@ -1175,49 +1240,43 @@ mod tests {
             .unwrap()
             .insert(request_key(&json!(9)), Arc::clone(&request));
 
-        // Stands in for the review worker: watches its cancel flag the way reviewer::run
-        // does, and records a terminal state once it is set. That `finish` is what wakes
-        // the poll, so the test exercises the real chain rather than shortcutting it.
-        let worker = {
-            let app = Arc::clone(&app);
-            let review_id = review_id.clone();
-            std::thread::spawn(move || {
-                // Bounded: `cargo test` has no per-test timeout, so an unbounded spin
-                // would turn a broken invariant into a silent CI hang instead of a
-                // failure anyone can read.
-                let give_up = std::time::Instant::now() + Duration::from_secs(10);
-                while !reviewer_cancel.load(Ordering::SeqCst) {
-                    assert!(
-                        std::time::Instant::now() < give_up,
-                        "the reviewer's cancel flag was never set"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                app.registry().finish(
-                    &review_id,
-                    crate::registry::Outcome::failed(crate::errors::cancelled()),
-                );
-            })
-        };
-
-        // A budget far longer than this test can take: if the cancellation fails to end
-        // the wait, this hangs rather than quietly passing.
+        // A budget far longer than this test can take: only the detach wake should end the wait,
+        // and if it does not this joins slowly rather than quietly passing.
         let poller = {
             let app = Arc::clone(&app);
             let request = Arc::clone(&request);
-            let args = json!({"review_id": review_id, "wait_seconds": 300});
-            std::thread::spawn(move || {
-                app.review_result(&args, &request)
-                    .err()
-                    .map(|failure| failure.code)
-            })
+            let args = json!({"review_id": review_id.clone(), "wait_seconds": 300});
+            std::thread::spawn(move || app.review_result(&args, &request))
         };
 
+        // Give the poll time to reach attach_wait and park, then cancel it.
         std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
         handle_cancellation(&app, &pending, &json!({"requestId": 9}));
 
-        worker.join().expect("worker");
-        assert_eq!(poller.join().expect("poller"), Some("CANCELLED"));
+        let result = poller.join().expect("poller");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancellation did not end the wait"
+        );
+        // Either a running snapshot (cancelled after parking) or CANCELLED (cancelled before the
+        // attach_wait); both are correct, and both must leave the review running.
+        match &result {
+            Ok(text) => assert!(text.contains("status:    running"), "{text}"),
+            Err(failure) => assert_eq!(failure.code, "CANCELLED"),
+        }
+        // The review must NOT have been stopped -- a poll cancellation detaches, it does not kill.
+        assert!(
+            !reviewer_cancel.load(Ordering::SeqCst),
+            "a poll cancellation must not stop the review"
+        );
+        assert_eq!(
+            app.registry()
+                .snapshot(&review_id)
+                .expect("still tracked")
+                .status,
+            crate::registry::Status::Running,
+        );
         // Cancelled, so the handler thread would send nothing.
         assert!(!request.try_claim_response());
     }

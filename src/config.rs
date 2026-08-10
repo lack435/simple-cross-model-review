@@ -238,8 +238,24 @@ fn permits_bash(rule: &str) -> bool {
 }
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
-pub const DEFAULT_WAIT_SECS: u64 = 60;
-pub const MAX_WAIT_SECS: u64 = 300;
+
+/// Upper bound on `--timeout-seconds`, rejected above this at parse time. Besides catching a
+/// typo, it keeps every `Instant::now() + timeout` deadline clear of overflow: the collect wait
+/// cap is derived from the timeout, which makes those deadline sites easier to reach.
+pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Headroom folded into the collect wait cap on top of the capture budget and the reviewer turn.
+/// It covers the tail after the reviewer clock stops — output drain, transcript parse, session
+/// persistence — so a single blocking `cross_model_review_result` observes the terminal state in
+/// every realistic case. It is a sizing, not an enforced deadline; see
+/// `docs/single-blocking-collect.md` for the two residual terms that are not themselves bounded.
+pub const FINALIZATION_GRACE_SECS: u64 = 30;
+
+/// Default per-process cap on concurrently-running reviews. A backstop against a runaway caller
+/// accumulating full-budget reviews across distinct session names, not a normal limit — a serial
+/// review flow runs one at a time. `0` disables the check. It is per process: N servers sharing a
+/// state directory admit up to N times this.
+pub const DEFAULT_MAX_CONCURRENT_REVIEWS: u32 = 8;
 
 /// Refuse to resume a review session idle longer than this. Past this window the reviewer's
 /// prompt cache may no longer be warm -- its lifetime depends on how the CLI is
@@ -340,6 +356,10 @@ pub struct Config {
     ///
     /// `--no-incremental-resume` turns it off for both.
     pub resume_incremental_diff: bool,
+    /// Per-process cap on how many reviews may be `Running` at once. `0` disables the check. See
+    /// `DEFAULT_MAX_CONCURRENT_REVIEWS`. Enforced in `Registry::try_start` under the state lock, so
+    /// two concurrent starts cannot both slip past it.
+    pub max_concurrent_reviews: u32,
 }
 
 impl Config {
@@ -352,6 +372,7 @@ impl Config {
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
         let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
         let mut resume_max_turns = DEFAULT_RESUME_MAX_TURNS;
+        let mut max_concurrent_reviews = DEFAULT_MAX_CONCURRENT_REVIEWS;
         let mut state_dir: Option<PathBuf> = None;
         let mut sandbox = "read-only".to_string();
         let mut allowed_tools: Option<String> = None;
@@ -404,6 +425,20 @@ impl Config {
                     if timeout_secs == 0 {
                         return Err("--timeout-seconds must be greater than 0".into());
                     }
+                    if timeout_secs > MAX_TIMEOUT_SECS {
+                        return Err(format!(
+                            "--timeout-seconds must be at most {MAX_TIMEOUT_SECS} ({}h), got {timeout_secs}",
+                            MAX_TIMEOUT_SECS / 3600
+                        ));
+                    }
+                }
+                "--max-concurrent-reviews" => {
+                    let v = take("--max-concurrent-reviews")?;
+                    max_concurrent_reviews = v.parse().map_err(|_| {
+                        format!(
+                            "--max-concurrent-reviews must be an integer (0 disables), got '{v}'"
+                        )
+                    })?;
                 }
                 "--session-max-turns" => {
                     let v = take("--session-max-turns")?;
@@ -525,7 +560,23 @@ impl Config {
             diff,
             vcs,
             resume_incremental_diff,
+            max_concurrent_reviews,
         })
+    }
+
+    /// Longest a single `cross_model_review_result` call will block, in seconds.
+    ///
+    /// Sized to cover the whole review lifecycle — the capture budget, the reviewer turn, and a
+    /// finalization grace for the tail after the reviewer clock stops — so one blocking call
+    /// observes the terminal state in every realistic case rather than a `running` snapshot. It is
+    /// a practical sizing, not a proven ceiling (two tail terms are not themselves deadline-bounded;
+    /// see `docs/single-blocking-collect.md`), which is acceptable because a boundary miss now costs
+    /// one more poll rather than a lost review. Saturating, so no `--timeout-seconds` overflows it.
+    pub fn max_wait_secs(&self) -> u64 {
+        crate::vcs::CAPTURE_BUDGET
+            .as_secs()
+            .saturating_add(self.timeout.as_secs())
+            .saturating_add(FINALIZATION_GRACE_SECS)
     }
 
     /// True when the reviewer has any shell at all.
@@ -826,7 +877,13 @@ OPTIONS:
                               codex:  low|medium|high|xhigh|max|ultra    (default max)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
-  --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800.
+  --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800. Max: 86400 (24h).
+  --max-concurrent-reviews <n>
+                              Per-process cap on reviews running at once. A backstop against a
+                              runaway caller, not a normal limit; a serial flow runs one at a
+                              time. Two servers sharing a state dir admit up to 2x this. The
+                              caller is told to collect or cancel an outstanding review. 0
+                              disables. Default: 8.
   --session-max-turns <n>     Refuse to resume a review session once it has run this many
                               turns; the caller must start fresh (fresh=true) or use a new
                               session name. Each turn re-processes the whole conversation, so
@@ -1005,6 +1062,66 @@ mod tests {
         let err = Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "0"]))
             .unwrap_err();
         assert!(err.contains("greater than 0"));
+
+        // Over the 24h ceiling is rejected, so the Instant + timeout deadline sites cannot overflow.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--timeout-seconds",
+            "99999999",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+
+        // Exactly the ceiling is accepted.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--timeout-seconds",
+            &MAX_TIMEOUT_SECS.to_string(),
+        ]))
+        .expect("the ceiling itself is allowed");
+        assert_eq!(cfg.timeout.as_secs(), MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn max_concurrent_reviews_defaults_and_parses() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.max_concurrent_reviews, DEFAULT_MAX_CONCURRENT_REVIEWS);
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-concurrent-reviews",
+            "0",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.max_concurrent_reviews, 0);
+
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-concurrent-reviews",
+            "lots",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must be an integer"), "{err}");
+    }
+
+    #[test]
+    fn the_collect_cap_covers_the_whole_lifecycle_and_tracks_the_timeout() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        // Capture budget + reviewer turn + finalization grace, so a single blocking collect can
+        // cover a whole review rather than a fixed 300s window.
+        let expected =
+            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        assert_eq!(cfg.max_wait_secs(), expected);
+        assert!(cfg.max_wait_secs() > 300);
+
+        let bigger =
+            Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "3600"]))
+                .expect("config");
+        assert!(bigger.max_wait_secs() > cfg.max_wait_secs());
     }
 
     #[test]

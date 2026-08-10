@@ -245,11 +245,12 @@ pub fn cancelled() -> Failure {
     Failure::new(
         "CANCELLED",
         "The review was cancelled before it finished.",
-        "The cross-model review was cancelled, so there is no review feedback. Either \
-         cross_model_review_cancel was called, or the request waiting on the review was \
-         abandoned by the client -- an interrupted turn or a client-side tool timeout \
-         does that, and cancels the review with it. Start a new review if one is still \
-         needed.",
+        "The cross-model review was cancelled, so there is no review feedback. This happens \
+         when cross_model_review_cancel is called on the review, or when a cross_model_review \
+         start call is abandoned before its review_id is delivered. Abandoning a \
+         cross_model_review_result collect does NOT cause this -- that only detaches the wait, \
+         and the review keeps running and stays collectible by its review_id, so try collecting \
+         it again before starting over. Start a new review if one is still needed.",
     )
 }
 
@@ -510,13 +511,30 @@ pub fn session_busy(session: &str, review_id: &str) -> Failure {
     }
 }
 
+/// Too many reviews are already running in this server process.
+pub fn too_many_running(limit: u32) -> Failure {
+    Failure {
+        code: "TOO_MANY_RUNNING",
+        summary: format!(
+            "This server already has {limit} review(s) running, which is its per-process \
+             --max-concurrent-reviews limit, so it did not start another."
+        ),
+        remediation: "Collect an outstanding review with cross_model_review_result, or cancel one \
+                      with cross_model_review_cancel, then start this one. If several reviews were \
+                      started and left uncollected, that is the situation the limit guards against: \
+                      finish or cancel them rather than starting more."
+            .to_string(),
+        detail: None,
+    }
+}
+
 impl Failure {
     /// True when the failure is the agent's own fault and it should just retry
     /// differently, rather than stopping to involve the user.
     pub fn is_agent_correctable(&self) -> bool {
         matches!(
             self.code,
-            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE"
+            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE" | "TOO_MANY_RUNNING"
         )
     }
 

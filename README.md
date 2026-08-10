@@ -21,17 +21,31 @@ This makes that a single tool call.
 | Tool | Purpose |
 | --- | --- |
 | `cross_model_review` | Start a review. Returns a `review_id` immediately. |
-| `cross_model_review_result` | Wait for and return the review, with live progress when the client supports it. |
+| `cross_model_review_result` | Wait for and return the review — one blocking call, with live progress when the client supports it. |
 | `cross_model_review_status` | Is the reviewer CLI installed and signed in? Costs nothing, calls no model. |
-| `cross_model_review_cancel` | Stop a review that is still running. |
+| `cross_model_review_cancel` | Stop a review that is still running. This is the tool that frees the reviewer; abandoning a `cross_model_review_result` poll does not. |
 
 Reviews are asynchronous because a serious review of real work takes time. In this
 project's usage, reviews commonly take at least five minutes, and complex changes can take
 20 minutes or longer; a running review in that window is normal, not a reason to cancel or
-start over. Starting and collecting are separate calls, so the harness is never blocked on
-a single long-running request. The default per-turn hard limit is 30 minutes and can be
-changed with `--timeout-seconds`. Raising that limit also lets a wedged reviewer bill and
-hold its session lease for longer before the server stops it.
+start over. Starting and collecting are separate calls, so the harness is never blocked
+before it chooses to wait. **A single `cross_model_review_result` collects a whole review in
+one blocking call** — omit `wait_seconds` to block to completion — so the mandatory
+poll-again loop is gone. The wait cap tracks the review budget rather than a fixed 300s: it
+is the capture budget plus `--timeout-seconds` plus a finalization grace. The default
+per-turn hard limit is 30 minutes and can be changed with `--timeout-seconds` (bounded at
+24h). Raising it also lets a wedged reviewer bill and hold its session lease for longer
+before the server stops it, and it widens the collect cap to match.
+
+Two things can end a collect before the review does, and they look different to the caller.
+If the `wait_seconds` budget elapses server-side, the call *returns* `status=running` — call
+again with the same `review_id`. If the client's own tool timeout is shorter and fires first,
+the client sends `notifications/cancelled` and the response is suppressed — the caller sees a
+client-side timeout, not a `status=running` result — so issue a fresh collect with the same
+`review_id`. Either way polling still works as a fallback, and crucially it is no longer
+destructive: abandoning a collect leaves the reviewer running and the result collectible (see
+[A cancelled request](#a-cancelled-request), and `docs/single-blocking-collect.md` for the
+design).
 
 While `cross_model_review_result` is open, the server emits standard MCP
 `notifications/progress` every 30 seconds when the client supplied a progress token. The
@@ -87,7 +101,14 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
---timeout-seconds <n>       Per-turn budget. Default 1800.
+--timeout-seconds <n>       Per-turn budget. Default 1800. Max 86400 (24h); an over-range
+                            value is rejected at startup so the deadline arithmetic cannot
+                            overflow.
+--max-concurrent-reviews <n>
+                            Per-process cap on reviews running at once. A backstop against a
+                            caller that starts reviews and abandons the polls, not a normal
+                            limit; a serial flow runs one at a time. Two servers sharing a
+                            state directory admit up to 2x this. Default 8. 0 disables.
 --session-max-turns <n>     Refuse to resume a review session past this many turns; the
                             caller starts fresh (fresh=true) or uses a new session name.
                             Default 10. 0 disables.
@@ -632,10 +653,11 @@ Report this to the user:
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
 `OUTPUT_TRUNCATED`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `CANCELLED`,
-`SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad tool arguments, a session already busy, and a
-session refused as not resumable get a plain correction instead, since each is the agent's
-own call to make and not something to escalate; so does a tool call the server could not
-start a thread for -- neither says anything about the reviewer's state.
+`SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad tool arguments, a session already busy, a
+session refused as not resumable, and too many reviews already running (`TOO_MANY_RUNNING`,
+the `--max-concurrent-reviews` backstop) get a plain correction instead, since each is the
+agent's own call to make and not something to escalate; so does a tool call the server could
+not start a thread for -- neither says anything about the reviewer's state.
 
 When a Codex timeout includes repeated command-policy refusals, it remains `TIMEOUT` but the
 message names the refusal count and advises against simply raising the budget. Successful
@@ -703,10 +725,13 @@ cargo test          # unit tests only: no network, no model calls
 
 `smoke.ps1` speaks real MCP over stdio to the built executable and checks the whole
 round trip: initialize, `tools/list`, a live review, a resumed follow-up review that
-proves the reviewer retained context, the error paths, a cancellation that must leave the
-request unanswered and the reviewer dead, and that session state landed on disk. It calls
-the reviewer model for real, so it costs tokens — it defaults to `--effort low` for that
-reason.
+proves the reviewer retained context, the error paths, two cancellation cases — a
+`cross_model_review_result` poll cancellation that must leave the response unanswered while
+the reviewer keeps running, and an explicit `cross_model_review_cancel` that must leave the
+reviewer dead — and that session state landed on disk. The deterministic cancellation
+contract lives in the unit tests; the smoke checks are best-effort against real-model timing.
+It calls the reviewer model for real, so it costs tokens — it defaults to `--effort low` for
+that reason.
 
 Both directions pass against live CLIs.
 
@@ -774,38 +799,53 @@ Both directions pass against live CLIs.
   and the parent/child links are gone, and invoking it by bare name is an execution hazard,
   because Windows resolves an unqualified executable through the current directory — the
   repository under review — before System32.
-- **A cancelled request cancels its review.** `notifications/cancelled` suppresses the
-  response, as the spec requires, and stops the reviewer the request started or was
-  waiting on. Suppressing the response alone would be the cheap half: the reviewer would
-  keep working — and keep costing — for the rest of its timeout budget for a result
-  nobody will read, and would hold the session lease for just as long, so the next review
-  of that session is refused as busy in the meantime.
+<a id="a-cancelled-request"></a>
+- **A cancelled request: what stops depends on which request.** `notifications/cancelled`
+  always suppresses the response, as the spec requires. What it does to the *review* is not
+  uniform, and deliberately so:
 
-  For a cancelled `cross_model_review` that is unarguable — the `review_id` was never
-  delivered, so nothing could ever collect the review. For a cancelled
-  `cross_model_review_result` it is a real trade: the caller does hold the `review_id`
-  and could have come back for it, but the protocol cannot distinguish a caller that will
-  from one that will not. **So the client's tool timeout must exceed `MAX_WAIT_SECS`
-  (300s), or a client giving up on a poll will destroy a review that was still coming.**
-  Both example configurations pin it and say why — `timeout` in `.mcp.json`,
-  `tool_timeout_sec` in `.codex/config.toml`. Pinning is not a no-op: a per-server
-  `timeout` *overrides* `MCP_TOOL_TIMEOUT`, so `600000` lowers the hard per-call ceiling
-  from that variable's ~28-hour default to ten minutes. That is still roughly double the
-  worst case any single call can reach — the 300s poll cap, a 30s auth preflight, a 3s
-  session lease wait — and it makes the margin explicit instead of inherited. The
-  30-minute idle window for a stdio server genuinely is unchanged, because a per-server
-  `timeout` acts as a floor on it rather than a cap.
+  | Cancelled call | Effect on the review |
+  | --- | --- |
+  | `cross_model_review` (start) | **stopped** — its `review_id` was never delivered, so nobody could ever collect it |
+  | `cross_model_review_result` (poll) | **left running and collectible** — only the wait detaches |
+  | `cross_model_review_cancel` | **stopped** — this is the tool whose job is to stop it |
 
-  Cancelling the review is also what ends the poll: the worker sees the flag within
-  100 ms, and the terminal state it records wakes the waiter. Promptly, not instantly —
-  a worker already past the child and writing session state finishes that first — but
-  bounded, so a suppressed response does not park a handler thread.
+  The start-call case is unarguable: a review nobody can collect should not keep billing. The
+  poll case is the one that changed. It used to stop the review too, on the reasoning that a
+  reviewer nobody waits on burns its budget — but that guess fired mostly on *false* positives.
+  A client sends `notifications/cancelled` when its own tool timeout fires, which the server
+  cannot tell from a real user cancellation, so a long wait that tripped the client timeout
+  destroyed a review the caller fully intended to collect. Now the poll detaches instead: the
+  reviewer keeps running, the result stays collectible by `review_id`, and a client timeout
+  shorter than the review degrades to polling rather than to lost work. That decoupling is what
+  lets the collect cap rise to cover a whole review (see [the tools](#the-tools)). The cost —
+  a genuinely abandoned poll leaves its reviewer billing to the budget — is bounded per review
+  by `--timeout-seconds`, capped across the process by `--max-concurrent-reviews`, and always
+  stoppable with `cross_model_review_cancel`.
+
+  This is a deliberate, documented deviation from MCP's cancellation guidance, which says a
+  receiver SHOULD stop processing and *free the associated resources*: a cancelled poll frees
+  its own handler but keeps the reviewer and session lease alive on purpose, because the caller
+  can still collect the result. `cross_model_review_cancel` is the operation that frees the
+  reviewer.
+
+  A per-server `timeout` in the client config should exceed the collect cap so one blocking
+  call completes; below it you poll, you do not lose work. Pinning it *overrides*
+  `MCP_TOOL_TIMEOUT`, making the hard per-call ceiling explicit rather than inherited from that
+  variable's ~28-hour default. The 30-minute idle window for a stdio server is unchanged,
+  because a per-server `timeout` acts as a floor on it rather than a cap.
+
+  Ending the poll on the detach path is `registry.wake()`'s job, driven from
+  `handle_cancellation`: it publishes under the same mutex the condition variable waits on —
+  exactly as shutdown does — after the request's cancelled flag is set, so the parked waiter
+  re-checks that flag and returns without the review having to reach a terminal state. A
+  suppressed response therefore does not park a handler thread, and the review is left alone.
 - **Closing stdin ends a long poll immediately.** `serve` joins every in-flight `tools/call`
   before returning, because exiting mid-flight dropped responses a client was still waiting
   on. A poll parked on a review has no deadline worth honouring once the client is gone, so
   stdin closure sets a shutdown flag that waiters observe alongside their own deadline —
-  otherwise a `wait_seconds: 300` call held the process open for the rest of the five
-  minutes and then wrote to a stdout nobody was reading. The flag is published under the
+  otherwise a long `wait_seconds` call (now up to the full review budget) held the process
+  open for the rest of it and then wrote to a stdout nobody was reading. The flag is published under the
   same mutex the condition variable uses; set outside it, a waiter that had read it but not
   yet parked would miss the wake and sleep out its budget regardless. A review that reaches
   a terminal state in that same moment still returns its result rather than a running

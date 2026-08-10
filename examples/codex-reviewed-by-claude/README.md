@@ -20,15 +20,18 @@ The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 4.8
    command = "tools/cross-review.exe"
    args = ["--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium"]
    startup_timeout_sec = 30
-   tool_timeout_sec = 400
+   tool_timeout_sec = 2400
    ```
 
    Relative paths resolve against the project root, so this config travels with the repo.
 
-   `tool_timeout_sec` must stay above 300, the cap on a single
-   `cross_model_review_result` poll. The server honours `notifications/cancelled` by
-   stopping the reviewer, so a client that gives up on a poll first would discard a
-   review that was still coming.
+   `tool_timeout_sec` should exceed the server's collect cap (capture budget +
+   `--timeout-seconds` + a finalization grace, ~1890s at the defaults), because a single
+   `cross_model_review_result` call now blocks until the review is done. Below the cap is no
+   longer destructive: abandoning a collect only detaches the wait — the reviewer keeps running
+   and the result stays collectible by `review_id` — so a shorter timeout degrades to polling
+   rather than discarding a review that was still coming. `cross_model_review_cancel` is what
+   stops a reviewer.
 
 3. Reopen the project in Codex.
 

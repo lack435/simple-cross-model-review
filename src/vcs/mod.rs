@@ -21,6 +21,10 @@ use std::sync::atomic::AtomicBool;
 use crate::config::{Config, Vcs};
 pub use git::{DiffMode, GitResumeBaseline};
 pub use shared::{Capture, CapturedChange};
+// `mod shared` is private, so these crate-visible items are not otherwise nameable from outside
+// `vcs` (e.g. `config::max_wait_secs`, `reviewer::codex`). Re-exported here rather than widening
+// the module, so the reachable surface stays explicit.
+pub(crate) use shared::{read_capped, CAPTURE_BUDGET};
 
 /// Capture the change under review, using whichever backend the configuration selected.
 ///

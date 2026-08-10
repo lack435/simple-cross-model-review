@@ -48,10 +48,12 @@ args = [
 # discards the local tip. A branch based on something other than main needs a different pin;
 # there is no per-call override, so it cannot be gated from this entry.
 
-# Reviews are collected by polling, so a tool call returns promptly and this budget only
-# covers a single request rather than a whole review. It must still exceed the 300s cap on
-# a single cross_model_review_result poll: the server honours notifications/cancelled by
-# stopping the reviewer, so a client that gives up first would discard a review that was
-# still coming.
+# A single cross_model_review_result call now blocks until the review is done, so this budget
+# must exceed the server's collect cap (CAPTURE_BUDGET + --timeout-seconds + finalization grace;
+# ~1890s at the defaults). 2400s leaves margin. Below the cap is no longer destructive: abandoning
+# a collect only detaches the wait -- the reviewer keeps running and the result stays collectible
+# by review_id -- so a client timeout shorter than the review degrades to polling rather than
+# discarding a review that was still coming. cross_model_review_cancel is the tool that stops a
+# reviewer.
 startup_timeout_sec = 30
-tool_timeout_sec = 400
+tool_timeout_sec = 2400

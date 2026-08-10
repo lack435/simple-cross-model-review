@@ -31,6 +31,9 @@ pub enum StartRefused {
     /// The session already has a review in flight. Carries that review's id, which the
     /// caller is told to collect or cancel.
     Busy(String),
+    /// The per-process cap on concurrently-running reviews is already reached. Carries the
+    /// configured limit. The caller is told to collect or cancel an outstanding review.
+    TooManyRunning { limit: u32 },
     /// Stdin has closed and the process is on its way out.
     ShuttingDown,
 }
@@ -251,6 +254,10 @@ pub struct Registry {
     state: Mutex<State>,
     changed: Condvar,
     counter: AtomicU64,
+    /// Per-process cap on concurrently-running reviews, enforced in `try_start`. `0` disables it.
+    /// Held here rather than passed per call so the many `Registry::new()` test call sites keep the
+    /// cap off by default and only the cap's own test opts in.
+    max_concurrent: u32,
     /// Bumped immediately before each `wait_timeout`, while the state lock is still held.
     ///
     /// That timing is the whole point, and it is what lets a test prove a waiter has parked
@@ -262,8 +269,19 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// The tests want a registry with the concurrency cap off; production always goes through
+    /// `with_max_concurrent` with the configured limit.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry that refuses to start more than `max_concurrent` reviews at once (`0` disables).
+    pub fn with_max_concurrent(max_concurrent: u32) -> Self {
+        Self {
+            max_concurrent,
+            ..Self::default()
+        }
     }
 
     /// Claim a session and register a new review for it, or fail with the id of the
@@ -299,6 +317,23 @@ impl Registry {
             .find(|r| r.session == session && r.status == Status::Running)
         {
             return Err(StartRefused::Busy(running.id.clone()));
+        }
+
+        // The concurrency backstop is checked after the same-session busy check, so a re-entry on
+        // a session that is already running gets the specific, actionable `Busy` error rather than
+        // the coarser cap. Counted under the same lock that inserts below, so two concurrent starts
+        // cannot both pass a cap of `n` into `n + 1`. `0` disables the cap entirely.
+        if self.max_concurrent > 0 {
+            let running = guard
+                .reviews
+                .values()
+                .filter(|r| r.status == Status::Running)
+                .count();
+            if running >= self.max_concurrent as usize {
+                return Err(StartRefused::TooManyRunning {
+                    limit: self.max_concurrent,
+                });
+            }
         }
 
         // Ids are unique per process and readable in logs. No RNG dependency: the
@@ -511,15 +546,43 @@ impl Registry {
         self.changed.notify_all();
     }
 
+    /// Wake every parked waiter so it re-evaluates its own exit conditions — in practice, a caller
+    /// that has abandoned its `cross_model_review_result` poll and whose `wait` should stop even
+    /// though the review keeps running.
+    ///
+    /// It takes and drops the state lock before notifying, exactly as `begin_shutdown` does, and
+    /// for the same reason: `wait` checks the caller's cancelled flag *while holding this lock*, so
+    /// a `notify_all` sent without acquiring it could land after the waiter read the flag as clear
+    /// but before it joined the wait set, be lost, and leave it parked out its whole budget. The
+    /// caller must set whatever the waiter checks (the request's cancelled flag) *before* calling
+    /// this — `handle_cancellation` does, via `RequestCancel::cancel` — so the lock here orders the
+    /// two: either the waiter parks first and this wakes it, or this runs first and the waiter's
+    /// next check under the lock sees the set flag.
+    pub fn wake(&self) {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        drop(guard);
+        self.changed.notify_all();
+    }
+
     /// How many times a waiter has reached the point of parking. See `Registry::parks`.
     #[cfg(test)]
     fn parks(&self) -> u64 {
         self.parks.load(Ordering::SeqCst)
     }
 
-    /// Block until this review leaves `Running`, until `timeout` elapses, or until
-    /// shutdown begins. Returns a snapshot in every case.
-    pub fn wait(&self, id: &str, timeout: Duration) -> Option<Snapshot> {
+    /// Block until this review leaves `Running`, until `timeout` elapses, until shutdown begins, or
+    /// until the caller abandons the request (`is_cancelled`). Returns a snapshot in every case.
+    ///
+    /// `is_cancelled` is the poll's own cancellation flag. When it trips, the wait returns but the
+    /// review is left running and collectible — abandoning a poll detaches the wait, it does not
+    /// stop the reviewer. It is read under the state lock so a `wake()` cannot be lost between the
+    /// read and the park; see `wake` for the ordering argument.
+    pub fn wait(
+        &self,
+        id: &str,
+        timeout: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Option<Snapshot> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -534,6 +597,12 @@ impl Registry {
             // Tested after the terminal state above, so a review that landed in the same
             // moment stdin closed is still returned as the result it is.
             if shutting_down {
+                return Some(Snapshot::of(review, shutting_down));
+            }
+            // The caller abandoned this poll. Stop waiting, but leave the review running — it is
+            // still collectible by `review_id`. Read under the lock, after the terminal check, so a
+            // review that finished in the same moment is still returned as its result.
+            if is_cancelled() {
                 return Some(Snapshot::of(review, shutting_down));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -693,7 +762,7 @@ mod tests {
 
         // And it is still waitable, which is the property that actually matters.
         let snapshot = registry
-            .wait(&running, Duration::from_millis(1))
+            .wait(&running, Duration::from_millis(1), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
     }
@@ -721,7 +790,7 @@ mod tests {
             "the review that just finished was evicted by its own sweep"
         );
         let snapshot = registry
-            .wait(&slow, Duration::from_millis(1))
+            .wait(&slow, Duration::from_millis(1), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.review.as_deref(), Some("worth having"));
     }
@@ -744,7 +813,7 @@ mod tests {
         // Nothing in the sweep reads a timestamp: the finish times of the busy reviews are
         // free to be identical to each other and to `slow`.
         let snapshot = registry
-            .wait(&slow, Duration::from_millis(1))
+            .wait(&slow, Duration::from_millis(1), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.review.as_deref(), Some("worth having"));
     }
@@ -857,7 +926,7 @@ mod tests {
         // Already terminal: must not burn the timeout.
         let started = Instant::now();
         let snapshot = registry
-            .wait(&id, Duration::from_secs(30))
+            .wait(&id, Duration::from_secs(30), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Failed);
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -880,7 +949,7 @@ mod tests {
 
         let started = Instant::now();
         let snapshot = registry
-            .wait(&id, Duration::from_secs(30))
+            .wait(&id, Duration::from_secs(30), &|| false)
             .expect("snapshot");
         worker.join().expect("worker");
         assert_eq!(snapshot.status, Status::Completed);
@@ -896,7 +965,7 @@ mod tests {
         let registry = Registry::new();
         let (id, _c) = registry.try_start("default", 1, false).expect("start");
         let snapshot = registry
-            .wait(&id, Duration::from_millis(50))
+            .wait(&id, Duration::from_millis(50), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
     }
@@ -946,7 +1015,7 @@ mod tests {
         // regression fails on the assertion below rather than stalling CI for minutes.
         let started = Instant::now();
         let snapshot = registry
-            .wait(&id, Duration::from_secs(30))
+            .wait(&id, Duration::from_secs(30), &|| false)
             .expect("snapshot");
         closer.join().expect("closer");
         assert_eq!(snapshot.status, Status::Running);
@@ -976,7 +1045,7 @@ mod tests {
         let poller = {
             let registry = Arc::clone(&registry);
             let id = id.clone();
-            std::thread::spawn(move || registry.wait(&id, Duration::from_secs(30)))
+            std::thread::spawn(move || registry.wait(&id, Duration::from_secs(30), &|| false))
         };
 
         // Bounded: `cargo test` has no per-test timeout, so an unbounded spin would turn a
@@ -998,6 +1067,87 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the notify did not free a waiter that was definitely parked"
         );
+    }
+
+    /// The detach wake: abandoning a `cross_model_review_result` poll must free the parked wait
+    /// *without* stopping the review. Uses the same `parks` barrier as the shutdown test above so a
+    /// lost-notification regression fails here rather than passing on timing luck — the flag is set
+    /// and `wake()` called only once the waiter is provably in the condvar's wait set.
+    #[test]
+    fn a_cancelled_poll_frees_the_waiter_without_stopping_the_review() {
+        let registry = Arc::new(Registry::new());
+        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let poller = {
+            let registry = Arc::clone(&registry);
+            let id = id.clone();
+            let cancelled = Arc::clone(&cancelled);
+            std::thread::spawn(move || {
+                registry.wait(&id, Duration::from_secs(30), &|| {
+                    cancelled.load(Ordering::SeqCst)
+                })
+            })
+        };
+
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while registry.parks() == 0 {
+            assert!(
+                Instant::now() < give_up,
+                "no waiter ever reached the point of parking"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Set the flag *before* wake(), exactly as `handle_cancellation` sets the request's
+        // cancelled flag before calling `registry.wake()`. The state lock in `wake()` is the
+        // barrier that orders the two.
+        let started = Instant::now();
+        cancelled.store(true, Ordering::SeqCst);
+        registry.wake();
+        let snapshot = poller.join().expect("poller").expect("snapshot");
+
+        // The wait ended because the poll was abandoned, not because of shutdown...
+        assert!(!snapshot.shutting_down);
+        // ...and the review was left running and collectible, not stopped.
+        assert_eq!(snapshot.status, Status::Running);
+        assert_eq!(
+            registry.snapshot(&id).expect("still tracked").status,
+            Status::Running
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancellation wake did not free a waiter that was definitely parked"
+        );
+    }
+
+    #[test]
+    fn the_concurrency_cap_refuses_starts_past_the_limit() {
+        let registry = Registry::with_max_concurrent(2);
+        let (a, _ca) = registry.try_start("a", 1, false).expect("first");
+        let (_b, _cb) = registry.try_start("b", 1, false).expect("second");
+        assert_eq!(
+            registry.try_start("c", 1, false).unwrap_err(),
+            StartRefused::TooManyRunning { limit: 2 }
+        );
+        // A running session still reports the specific, actionable Busy rather than the cap.
+        assert!(matches!(
+            registry.try_start("a", 2, true).unwrap_err(),
+            StartRefused::Busy(_)
+        ));
+        // Finishing a review frees its slot.
+        registry.finish(&a, Outcome::completed("done"));
+        registry.try_start("c", 1, false).expect("a slot freed up");
+    }
+
+    #[test]
+    fn a_zero_concurrency_cap_is_disabled() {
+        let registry = Registry::with_max_concurrent(0);
+        for name in ["a", "b", "c", "d", "e"] {
+            registry
+                .try_start(name, 1, false)
+                .unwrap_or_else(|_| panic!("start {name}"));
+        }
     }
 
     #[test]
@@ -1022,7 +1172,7 @@ mod tests {
 
         let started = Instant::now();
         let snapshot = registry
-            .wait(&id, Duration::from_secs(30))
+            .wait(&id, Duration::from_secs(30), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Running);
         assert!(snapshot.shutting_down);
@@ -1039,7 +1189,7 @@ mod tests {
         registry.finish(&id, Outcome::completed("just in time"));
 
         let snapshot = registry
-            .wait(&id, Duration::from_secs(30))
+            .wait(&id, Duration::from_secs(30), &|| false)
             .expect("snapshot");
         assert_eq!(snapshot.status, Status::Completed);
         assert_eq!(snapshot.review.as_deref(), Some("just in time"));
@@ -1075,7 +1225,9 @@ mod tests {
                 ..Outcome::completed("ok")
             },
         );
-        let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
+        let snapshot = registry
+            .wait(&id, Duration::ZERO, &|| false)
+            .expect("snapshot");
         assert_eq!(
             snapshot.warnings,
             vec!["could not save session".to_string()]
@@ -1097,7 +1249,9 @@ mod tests {
                 ..Outcome::completed("ok")
             },
         );
-        let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
+        let snapshot = registry
+            .wait(&id, Duration::ZERO, &|| false)
+            .expect("snapshot");
         assert_eq!(snapshot.denial_count, 101);
         assert_eq!(snapshot.denials, vec!["git grep example"]);
         // The floor flag must travel with the count, or the render presents a truncated
@@ -1110,7 +1264,9 @@ mod tests {
         let registry = Registry::new();
         let (id, _c) = registry.try_start("default", 1, false).expect("start");
         registry.finish(&id, Outcome::completed("ok"));
-        let snapshot = registry.wait(&id, Duration::ZERO).expect("snapshot");
+        let snapshot = registry
+            .wait(&id, Duration::ZERO, &|| false)
+            .expect("snapshot");
         assert!(snapshot.resumable);
         assert!(snapshot.warnings.is_empty());
     }
