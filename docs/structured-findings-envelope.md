@@ -8,7 +8,7 @@ autonomous "re-review until converged" loop stops re-deriving structure the tool
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
-> **Review history.** Twenty rounds against this repository's own gate (Codex, gpt-5.6-luna,
+> **Review history.** Twenty-one rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
 > `major`), round 2 (four `major` + one `minor`), round 3 (four `major` + one `minor`), round 4
 > (five `major` + one `minor`), round 5 (five `major` + one `minor`), round 6 (three `major` +
@@ -22,9 +22,9 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > a stale re-report, tightened further), round 17 (one `major` + one `minor`, the `invalid`
 > resume-refusal split), round 18 (one `major`, propagating that split to Decision 3 and the tables),
 > round 19 (one `minor`, qualifying persistence-failure reasons against already-broken coverage),
-> round 20 (one `minor`, truth-table footnote 4). Rounds 1–19 confirmed resolved; round 20 now
-> closed. Recorded in the
-> [Round 1](#round-1-response) … [Round 20](#round-20-response) responses. The sections they touched —
+> round 20 (one `minor`, truth-table footnote 4), round 21 (a fresh-reviewer pass, one `major`: the
+> corrupt-store one-shot path). Rounds 1–20 confirmed resolved; round 21 now closed. Recorded in the
+> [Round 1](#round-1-response) … [Round 21](#round-21-response) responses. The sections they touched —
 > the block schema, ID reconciliation (total-accounting), degradation and the `converged` signal
 > (now including the budget/terminal condition), extraction (nonce-marked, dual-namespace, `_OUT`
 > nonce), durability (a write-ahead marker that must succeed or abort, fail-closed poison-writes,
@@ -122,7 +122,7 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
 | `ledger_unavailable` | On-disk coverage is a *readable* persisted break — `legacy_uncovered` or `needs_rebaseline` — whether from **this turn's coverage-break write persisting** *or* the **session already being broken on entry**. (A degraded turn whose *own* break-write failed reports `turn_not_durable` **only** when it entered `whole_conversation`/`unestablished`; on an already-broken session `ledger_unavailable` holds regardless — precedence. An *unreadable* ledger — `invalid` — never reaches a completed envelope; it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
 | `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
-| `state_corrupt` | The session store itself did not parse; this name's history cannot be trusted. | **Escalate to a human**; do not silently start fresh (below). |
+| `state_corrupt` | The session store itself did not parse. Like `invalid`, this is caught at load, so it is a **pre-model `SESSION_NOT_RESUMABLE`-class refusal** carrying `state_corrupt` as its detail — **never a completed-envelope `non_convergence_reason`** (round 21); no review runs. | **Escalate to a human**; operator moves the corrupt store aside / uses `--state-dir`; do not silently start fresh (below). |
 | `ledger_too_large` | The ledger/digest exceeded the bounded budget, before *or* after this turn ran. | **Escalate to a human**; the session cannot keep growing (below). |
 
 `unstructured` is **not** a value of `non_convergence_reason` (round 8). "No valid block this turn"
@@ -168,11 +168,14 @@ The **persistence-first rule runs *before* precedence**: a degraded turn whose c
 turn 1), and only a degraded turn whose break *persisted* becomes a `ledger_unavailable` case. Once
 each turn's reason is classified that way, precedence picks the first that applies:
 
-`state_corrupt` → `ledger_too_large` → `ledger_unavailable` (the completed-envelope readable-break
-states `legacy_uncovered` / `needs_rebaseline` — *not* a degraded turn whose own write failed, which
-is `turn_not_durable`; and *not* `invalid`, which is refused before a completed envelope exists) →
-`turn_not_durable` → `reviewer_blocked` → `verdict_contradiction` → `reviewer_withheld_approve` →
-`open_findings`.
+This precedence is over the reasons a **completed envelope** can carry — `state_corrupt` and
+`invalid` are *not* among them (both are pre-model refusals, caught before any completed envelope
+exists), so they never enter this ordering:
+
+`ledger_too_large` → `ledger_unavailable` (the completed-envelope readable-break states
+`legacy_uncovered` / `needs_rebaseline` — *not* a degraded turn whose own write failed, which is
+`turn_not_durable`) → `turn_not_durable` → `reviewer_blocked` → `verdict_contradiction` →
+`reviewer_withheld_approve` → `open_findings`.
 
 A permanently-uncovered session therefore always reports `ledger_unavailable` (**escalate →
 rebaseline**), never `open_findings` ("re-review"), no matter how many findings it also has — so the
@@ -770,9 +773,17 @@ actually lives.
   brand-new `whole_conversation`-convergeable record on top of unreadable state — either
   clobbering the corrupt file or merging into it. So **an `invalid` store gates `fresh` too.**
   While the store is `invalid`:
-  - **No convergeable state is established or claimed by any call, `fresh` included.** A review may
-    still *run*, but only as a one-shot, non-resumable, non-convergent turn stamped
-    `non_convergence_reason: state_corrupt`; nothing is persisted as resumable.
+  - **Every review is *refused before the model call*, `fresh` included — no one-shot review runs**
+    (round 21 corrected an earlier "one-shot" idea). Exactly like an unreadable *ledger* (the
+    `invalid` coverage state), a corrupt *store* is caught at load, so it is a **pre-model
+    `SESSION_NOT_RESUMABLE`-class refusal** carrying `state_corrupt` as its detail — **not** a
+    completed envelope. This is deliberate: a completed envelope must carry a defined
+    `ledger_coverage` (one of the four run-reachable states), `findings_trusted`, and `open_count`,
+    and a corrupt store can support none of them (nothing can be read or persisted), so a "one-shot
+    completed envelope" would have no valid schema representation. Refusing is both the safe choice
+    and the only representable one. `state_corrupt` is therefore an **error/refusal outcome, never a
+    completed-envelope `non_convergence_reason`** (parallel to how `invalid` delivers
+    `ledger_unavailable` as a refusal detail, round 17).
   - **The corrupt file is never overwritten or auto-replaced.** Recovery is an explicit operator
     action — move the corrupt `sessions.json` aside, or point `--state-dir` at a clean directory —
     not something the server does silently, because auto-replacing it would destroy the evidence of
@@ -895,6 +906,15 @@ baseline and reused here rather than re-invented (round-7 minor #3):
   write one record into a file it cannot read without either clobbering it or losing the rest, and
   recovery is an explicit operator action. Record-level poison → `fresh` heals it; store-level
   corruption → operator recovery. The two are never conflated.
+
+  **If that `fresh`-over-a-bad-record turn 1 *itself* fails to persist** (round 21), it is not a
+  special case: it is exactly the `unestablished` / `turn_not_durable` turn-1 case — the new
+  conversation has no durable coverage yet, so the completed envelope reports `ledger_coverage:
+  unestablished`, `findings_trusted: false`, `findings: []`, `non_convergence_reason:
+  turn_not_durable`, and the `.pending` sidecar (set before the reviewer call) refuses the next
+  resume. The old bad record is untouched on disk (the replacing write never landed), so nothing is
+  lost that was not already lost; the next `fresh` retries. This is a completed envelope (a turn ran)
+  — distinct from the corrupt-*store* case, which never runs a turn at all.
 - **The reviewer turn and the ledger cannot silently diverge**, because the sidecar is cleared
   only *after* the atomic `record_turn` that wrote the matching ledger; any path that advanced the
   reviewer conversation but did not reach that record leaves the marker set, which blocks resume.
@@ -1216,7 +1236,7 @@ structured contract**, and is not overclaimed beyond it.
 | Prior id the reviewer failed to account for | Whole-turn degrade; every prior id must appear exactly once — silence on any id is never an implied status. Being a degraded turn it also breaks coverage → `ledger_unavailable` when the on-disk break is persisted (this turn's, or already-broken session); `turn_not_durable` only if it entered `whole_conversation`/`unestablished` and its own write fails (persistence-first rule). |
 | Regression of a previously resolved finding | Reviewer sends `f1: regressed` (resolved findings are in the injected digest, which lists every prior id); `f1` reopens, no new id. |
 | One ledger *record* incompatible/undeserializable, store otherwise valid | Field-level tolerant load keeps the store and other sessions intact, but *this* session's ledger is unreadable → it is `invalid` → a **`SESSION_NOT_RESUMABLE` resume refusal** (pre-model, carrying `ledger_unavailable` as detail), **not** a completed envelope; record preserved, **not** reset to a fresh zero-open ledger (round 17). |
-| The whole `sessions.json` store fails to parse | Tri-state load returns `invalid`, **not** empty: resume refused, any review non-convergent (`state_corrupt`), corrupt file preserved, operator told — never silently a clean fresh conversation. |
+| The whole `sessions.json` store fails to parse | Tri-state load returns `invalid`, **not** empty: **all reviews refused before the model call** (resume *and* `fresh`) as a `SESSION_NOT_RESUMABLE`-class refusal with `state_corrupt` detail — **no one-shot review, no completed envelope** (round 21); corrupt file preserved, operator told; never silently a clean fresh conversation. |
 | New session, or `fresh: true` **on a valid store** | `ledger_coverage = whole_conversation`, covers the conversation from turn 1 → convergeable normally (even with zero findings). `fresh` heals a poisoned *record* by resetting **all** durable non-convergent state — stale sidecar, `ledger_coverage` (`invalid`/`legacy_uncovered`/`needs_rebaseline`), **and `terminal_reason=ledger_too_large`** — in a valid store (round-9 minor #3). |
 | Resumed conversation predating the ledger | `ledger_coverage = legacy_uncovered` (sticky, durable): reviewed but non-convergent (`ledger_unavailable`) for the life of the conversation; **escalate for a rebaseline handoff**, not an autonomous `fresh`. Later turns cannot launder it convergeable. |
 | Turn's ledger could not be persisted | Envelope degrades (`turn_not_durable`); the `.pending` sidecar stays set, so a resume is refused. Escalate; recovery is a `fresh` **carrying the preserved prior open findings** (Decision 5, rebaseline handoff). |
@@ -1288,11 +1308,15 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   **does not converge** and reports `ledger_unavailable` (round-7 major); a **`whole_conversation`
   record whose ledger later fails to load poisons durably to `invalid` and never accepts a
   replacement** (round-4 major #1); a corrupt-ledger *record* degrades only its own session, and
-  **`fresh` heals a poisoned record in a valid store** (round-5 major #1); **a corrupt whole store
-  loads `invalid`, refuses resume *and `fresh`*, propagates `invalid` through
-  `get`/`record_turn`/`forget`/`list`, and never poses as an empty/fresh session** (round-4 major
-  #2); a **failed poison-write leaves the record non-convergent and non-resumable, never usable as
-  `whole_conversation`** (round-5 major #5); an **incompatible-version or otherwise-unreadable
+  **`fresh` heals a poisoned record in a valid store** (round-5 major #1), and **a `fresh`-over-a-bad-
+  record turn 1 whose own `record_turn` fails yields `ledger_coverage: unestablished` /
+  `turn_not_durable` / `findings: []`, leaving the old record untouched** (round-21 major); **a
+  corrupt whole store loads `invalid`, refuses *every* review (resume *and `fresh`*) before the model
+  call as a `SESSION_NOT_RESUMABLE`-class refusal with `state_corrupt` detail — no model call, no
+  one-shot review, no completed envelope — propagates `invalid` through
+  `get`/`record_turn`/`forget`/`list`, and never poses as an empty/fresh session** (round-4 major #2
+  / round-21 major); a **failed poison-write leaves the record non-convergent and non-resumable,
+  never usable as `whole_conversation`** (round-5 major #5); an **incompatible-version or otherwise-unreadable
   ledger record is `invalid` → a pre-model `SESSION_NOT_RESUMABLE` resume refusal, not a completed
   envelope** (round-17/18 major); the **reused
   `.pending` sidecar blocks resume** (including a **pre-upgrade Perforce-only sidecar across a
@@ -1909,14 +1933,36 @@ write failed.
 
 No open questions remain.
 
+## Round 21 response
+
+Round 21 was a **fresh reviewer** (the prior session hit its 10-turn limit again). It confirmed the
+normal convergence contract coherent and caught one genuinely new gap the resumed reviews had
+missed: the **corrupt-store one-shot path had no valid envelope representation**. The plan had said a
+corrupt `sessions.json` could run a one-shot review returning `state_corrupt`, but a completed
+envelope requires a defined `ledger_coverage` (one of four), `findings_trusted`, and `open_count`,
+and a corrupt store can supply none — so that "one-shot completed envelope" could not validate.
+Accepted; not disputed. Resolved by making a corrupt store a **pre-model refusal**, exactly like an
+unreadable ledger:
+
+- A corrupt store **refuses every review (resume *and* `fresh`) before the model call**, as a
+  `SESSION_NOT_RESUMABLE`-class refusal carrying `state_corrupt` as its detail — **no one-shot
+  review, no completed envelope**. `state_corrupt` is therefore an error/refusal outcome, **never a
+  completed-envelope `non_convergence_reason`**, and is removed from the completed-envelope
+  precedence (the store-load wiring, the reason table, the precedence, and the failure/test rows).
+- The reviewer's second ask is specified: a **`fresh`-over-a-bad-record turn 1 whose own persistence
+  fails** is not special — it is the existing `unestablished` / `turn_not_durable` turn-1 case
+  (completed envelope, `findings: []`, old record untouched), *distinct* from the corrupt-*store*
+  case which runs no turn.
+
+No open questions remain.
+
 ## Status
 
-Twenty rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
-accepted and none disputed. Round 11 (a fresh-reviewer holistic pass) opened the
-escalation/rebaseline seam and the coverage discriminator; rounds 12–20 carried it fully through the
-example, reason contract, precedence with persistence-first, Decision 3 scope, state machine, schema,
-failure table, truth-table footnotes, and tests, closed the `unestablished` edge, made `invalid`
-uniformly a pre-model resume refusal, and qualified every persistence-failure reason against
-already-broken coverage. The plan is submitted for a final pass; if it is judged sound,
-implementation begins against the [wiring](#wiring-the-io-edges), [tests](#tests), and
-[module](#new-module--srcfindingsrs) plan above.
+Twenty-one rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
+accepted and none disputed. Rounds 11 and 21 were fresh-reviewer holistic passes; the twenty-one
+rounds carried the design from the block schema and ID reconciliation through the
+escalation/rebaseline seam, the five-state coverage machine, `invalid`/`state_corrupt` as pre-model
+refusals, the four over-cap paths, the persistence-first reason rule, and the discriminated
+`outputSchema`. The plan is submitted for a final pass; if it is judged sound, implementation begins
+against the [wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs)
+plan above.
