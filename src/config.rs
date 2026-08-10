@@ -5,12 +5,38 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::reviewer::HeadroomLevel;
 use crate::vcs::DiffMode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReviewerKind {
     Claude,
     Codex,
+}
+
+/// A per-entry proactive usage-remaining minimum. Two shapes, one per reviewer family, because
+/// the two CLIs expose differently-shaped signals: Codex a numeric remaining percentage, Claude
+/// a categorical status. The parser rejects a family/flag mismatch, so a Codex entry only ever
+/// carries `Remaining` and a Claude entry only `Status`. `None` (unset) never gates. See
+/// `docs/usage-remaining-gate.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UsageMinimum {
+    /// Never gated (flag unset, or set to a value that never gates).
+    None,
+    /// Codex: skip the entry when its last-observed remaining is known and below this percentage
+    /// (`1..=100`).
+    Remaining(u8),
+    /// Claude: skip the entry when its last-observed status is below this level (the level named
+    /// is the *lowest acceptable* one).
+    Status(HeadroomLevel),
+}
+
+impl UsageMinimum {
+    /// Whether this minimum ever causes a proactive skip. `None` does not; a set value does.
+    /// Used to decide whether the chain arms usage observation at all.
+    pub fn is_gating(&self) -> bool {
+        !matches!(self, UsageMinimum::None)
+    }
 }
 
 impl ReviewerKind {
@@ -88,9 +114,25 @@ pub struct ReviewerSpec {
     pub effort: String,
     /// Explicit path to the reviewer CLI. When absent we resolve it from PATH.
     pub bin: Option<PathBuf>,
+    /// Proactive usage-remaining minimum. A *gating policy*, deliberately **not** part of the
+    /// reviewer's identity: it is excluded from the fully-identical-duplicate rule
+    /// ([`Config::validate_chain`]) and from resume matching ([`Config::resume_entry_index`]),
+    /// so a duplicate that differs only by minimum is still a duplicate and editing a threshold
+    /// between runs does not break resume. See `docs/usage-remaining-gate.md`.
+    pub usage_minimum: UsageMinimum,
 }
 
 impl ReviewerSpec {
+    /// Identity for the fully-identical-duplicate rule: reviewer, model, effort, and bin —
+    /// **not** `usage_minimum`, which is a gating policy, not identity. `validate_chain` uses
+    /// this rather than `==` so two entries differing only by minimum are still caught as
+    /// duplicates. See `docs/usage-remaining-gate.md`.
+    pub fn same_reviewer_identity(&self, other: &ReviewerSpec) -> bool {
+        self.reviewer == other.reviewer
+            && self.model == other.model
+            && self.effort == other.effort
+            && self.bin == other.bin
+    }
     /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
     /// legacy session record with no stored bin. Persisted on the session for resume matching.
     pub fn raw_bin(&self) -> crate::session::RawBin {
@@ -147,6 +189,7 @@ struct PendingEntry {
     model: Option<String>,
     effort: Option<String>,
     bin: Option<PathBuf>,
+    usage_minimum: Option<UsageMinimum>,
 }
 
 impl PendingEntry {
@@ -156,7 +199,73 @@ impl PendingEntry {
             model: None,
             effort: None,
             bin: None,
+            usage_minimum: None,
         }
+    }
+
+    /// Bind `--min-usage-remaining <1..=100>` to this entry. Codex only: Claude exposes no
+    /// numeric remaining, so a numeric minimum there would silently collapse to a categorical
+    /// decision — rejected rather than mislead. `0`/`101`/non-integer are errors.
+    fn set_min_usage_remaining(&mut self, v: &str) -> Result<(), String> {
+        if self.reviewer != ReviewerKind::Codex {
+            return Err(format!(
+                "--min-usage-remaining applies to a numeric-usage reviewer (codex); reviewer '{}' \
+                 exposes only a categorical usage status. Use --min-usage-status <ample|warning> \
+                 for it.",
+                self.reviewer.as_str()
+            ));
+        }
+        if self.usage_minimum.is_some() {
+            return Err(format!(
+                "a usage minimum was given twice for the same --reviewer '{}' (did you forget a \
+                 --reviewer before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        let pct: u8 = v.parse().map_err(|_| {
+            format!("--min-usage-remaining must be an integer in 1..=100, got '{v}'")
+        })?;
+        if !(1..=100).contains(&pct) {
+            return Err(format!(
+                "--min-usage-remaining must be in 1..=100, got {pct} (0 would never gate; omit \
+                 the flag instead)"
+            ));
+        }
+        self.usage_minimum = Some(UsageMinimum::Remaining(pct));
+        Ok(())
+    }
+
+    /// Bind `--min-usage-status <ample|warning>` to this entry. Claude only: Codex exposes a
+    /// numeric percentage, for which `--min-usage-remaining` is the honest flag.
+    fn set_min_usage_status(&mut self, v: &str) -> Result<(), String> {
+        if self.reviewer != ReviewerKind::Claude {
+            return Err(format!(
+                "--min-usage-status applies to a categorical-usage reviewer (claude); reviewer \
+                 '{}' exposes a numeric usage remaining. Use --min-usage-remaining <1..=100> for \
+                 it.",
+                self.reviewer.as_str()
+            ));
+        }
+        if self.usage_minimum.is_some() {
+            return Err(format!(
+                "a usage minimum was given twice for the same --reviewer '{}' (did you forget a \
+                 --reviewer before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        let level = match v {
+            // The lowest *acceptable* level: `ample` gates on warning-or-rejected, `warning`
+            // gates only on rejected. `exhausted` would never gate, so it is not offered.
+            "ample" => HeadroomLevel::Ample,
+            "warning" => HeadroomLevel::Warning,
+            other => {
+                return Err(format!(
+                    "--min-usage-status must be 'ample' or 'warning', got '{other}'"
+                ))
+            }
+        };
+        self.usage_minimum = Some(UsageMinimum::Status(level));
+        Ok(())
     }
 
     fn set_model(&mut self, v: String) -> Result<(), String> {
@@ -206,6 +315,7 @@ impl PendingEntry {
                 .unwrap_or_else(|| self.reviewer.default_effort().to_string()),
             bin: self.bin,
             reviewer: self.reviewer,
+            usage_minimum: self.usage_minimum.unwrap_or(UsageMinimum::None),
         }
     }
 }
@@ -583,6 +693,20 @@ impl Config {
                         .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
                         .set_bin(PathBuf::from(v))?;
                 }
+                "--min-usage-remaining" => {
+                    let v = take("--min-usage-remaining")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--min-usage-remaining must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_min_usage_remaining(&v)?;
+                }
+                "--min-usage-status" => {
+                    let v = take("--min-usage-status")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--min-usage-status must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_min_usage_status(&v)?;
+                }
                 "--cwd" => cwd = Some(PathBuf::from(take("--cwd")?)),
                 "--timeout-seconds" => {
                     let v = take("--timeout-seconds")?;
@@ -749,6 +873,14 @@ impl Config {
         &self.reviewers[0]
     }
 
+    /// Whether any chain entry configures a usage minimum. When false, the whole proactive
+    /// gate is inert: no observation, no store, and Claude keeps its buffered `json` output —
+    /// behaviour is byte-for-byte the pre-gate walk. Mirrors `chain_needs_capture()`. See
+    /// `docs/usage-remaining-gate.md`.
+    pub fn chain_gates_on_usage(&self) -> bool {
+        self.reviewers.iter().any(|s| s.usage_minimum.is_gating())
+    }
+
     /// The chain index of the entry that matches a stored session's identity, if any.
     ///
     /// A resume must run the entry that *created* the session (which may be a fallback), not the
@@ -802,7 +934,9 @@ impl Config {
         }
         for (i, a) in reviewers.iter().enumerate() {
             for b in &reviewers[i + 1..] {
-                if a == b {
+                // Identity excludes `usage_minimum` (a gating policy, not identity), so two
+                // entries differing only by minimum are still rejected as duplicates.
+                if a.same_reviewer_identity(b) {
                     return Err(format!(
                         "reviewer chain has a duplicate entry ({}): a fallback identical to an \
                          earlier entry in reviewer, model, effort and bin can never help, because \
@@ -1199,6 +1333,14 @@ OPTIONS:
                               claude: low|medium|high|xhigh|max          (default medium)
                               codex:  low|medium|high|xhigh|max|ultra    (default max)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
+  --min-usage-remaining <n>   Proactive gate (codex only): skip this entry when its
+                              last-observed usage remaining is known and below n% (1..=100),
+                              advancing to the next reviewer before spending a call. Optional;
+                              unset never gates. Needs a two+ entry chain to fall back to.
+  --min-usage-status <lvl>    Proactive gate (claude only): claude reports a categorical usage
+                              status, not a percentage. 'ample' skips this entry when the
+                              status is a warning or worse; 'warning' skips only when rejected.
+                              Optional; unset never gates.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
   --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800. Max: 86400 (24h).
   --max-concurrent-reviews <n>
@@ -1341,6 +1483,129 @@ mod tests {
         .expect("config");
         assert_eq!(cfg.primary().model, "gpt-5.6-sol");
         assert_eq!(cfg.primary().effort, "ultra");
+    }
+
+    #[test]
+    fn min_usage_remaining_binds_to_codex_and_arms_the_chain() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "10",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.primary().usage_minimum, UsageMinimum::Remaining(10));
+        assert!(cfg.chain_gates_on_usage());
+    }
+
+    #[test]
+    fn unset_minimum_does_not_arm_the_chain() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.primary().usage_minimum, UsageMinimum::None);
+        assert!(!cfg.chain_gates_on_usage());
+    }
+
+    #[test]
+    fn min_usage_remaining_rejects_claude_family() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--min-usage-remaining",
+            "10",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--min-usage-status"), "{err}");
+    }
+
+    #[test]
+    fn min_usage_remaining_range_is_1_to_100() {
+        for bad in ["0", "101", "x"] {
+            let err =
+                Config::from_args(&args(&["--reviewer", "codex", "--min-usage-remaining", bad]))
+                    .unwrap_err();
+            assert!(err.contains("--min-usage-remaining"), "{bad}: {err}");
+        }
+        assert!(
+            Config::from_args(&args(&["--reviewer", "codex", "--min-usage-remaining", "1"])).is_ok()
+        );
+        assert!(Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "100"
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn min_usage_status_binds_to_claude_and_rejects_codex() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--min-usage-status",
+            "warning",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.primary().usage_minimum,
+            UsageMinimum::Status(HeadroomLevel::Warning)
+        );
+
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-status",
+            "warning",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--min-usage-remaining"), "{err}");
+
+        let bad = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--min-usage-status",
+            "plenty",
+        ]))
+        .unwrap_err();
+        assert!(bad.contains("'ample' or 'warning'"), "{bad}");
+    }
+
+    #[test]
+    fn min_usage_before_any_reviewer_errors() {
+        let err = Config::from_args(&args(&["--min-usage-remaining", "10"])).unwrap_err();
+        assert!(err.contains("must follow a --reviewer"), "{err}");
+    }
+
+    #[test]
+    fn min_usage_twice_in_one_entry_errors() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "10",
+            "--min-usage-remaining",
+            "20",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("usage minimum was given twice"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_entry_differing_only_by_minimum_is_still_rejected() {
+        // The minimum is a gating policy, not identity: two otherwise-identical codex entries
+        // are still a fully-identical duplicate even if their minimums differ.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "10",
+            "--reviewer",
+            "codex",
+            "--min-usage-remaining",
+            "20",
+        ]))
+        .expect("parses");
+        assert!(Config::validate_chain(&cfg.reviewers).is_err());
     }
 
     // ---- reviewer fallback chain (issue #48) ----

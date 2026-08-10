@@ -30,8 +30,105 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// wrong, and the point is that it fails legibly rather than eating the machine.
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-use crate::config::{Config, ReviewerKind, ReviewerSpec};
+/// Total raw stdout bytes the *armed* Claude reader will read before declaring the stream
+/// truncated. Larger than `MAX_OUTPUT_BYTES` because `--output-format stream-json` carries the
+/// review text more than once (assistant events plus the terminal `result`), so a review whose
+/// content fits the buffered path produces a stream several times its size. Practical sizing,
+/// not a proven ceiling -- its job is to stop a runaway stream, not to decide ordinary
+/// truncation. See `docs/usage-remaining-gate.md`.
+pub const MAX_ARMED_STREAM_BYTES: usize = 4 * MAX_OUTPUT_BYTES;
+
+/// Companion line/event cap for the armed reader: a stream may stay under the byte cap while
+/// emitting a pathological number of tiny events. Bounds work independently of byte size.
+pub const MAX_ARMED_STREAM_LINES: usize = 500_000;
+
+use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
+
+/// A reviewer's usage-remaining headroom, observed from the CLI's own machine output (Codex's
+/// rollout `token_count.rate_limits`, Claude's `rate_limit_event`) -- never the model's prose.
+///
+/// Three-state with an explicit `Unknown`: an absent, unparseable, unrecognised, stale, or
+/// identity-mismatched signal is `Unknown`, and `Unknown` never gates (fail-open). See
+/// `docs/usage-remaining-gate.md`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Headroom {
+    /// No usable signal -- fail-open, always clears any minimum.
+    Unknown,
+    /// Codex: remaining percentage of the *limiting* (lowest-remaining) window, with that
+    /// window's own reset time.
+    Fraction {
+        remaining_pct: f64,
+        resets_at: Option<u64>,
+    },
+    /// Claude: a categorical level, with the window's reset time.
+    Level {
+        level: HeadroomLevel,
+        resets_at: Option<u64>,
+    },
+}
+
+/// Claude's categorical usage status, normalized. Rank is explicit (`Exhausted < Warning <
+/// Ample`) rather than derived from declaration order, so a comparison cannot silently invert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadroomLevel {
+    Exhausted,
+    Warning,
+    Ample,
+}
+
+impl HeadroomLevel {
+    /// Higher rank = more headroom. Load-bearing for `clears`; do not replace with a derived
+    /// `Ord`, whose declaration-order default would rank `Ample` lowest and invert the decision.
+    pub fn rank(self) -> u8 {
+        match self {
+            HeadroomLevel::Exhausted => 0,
+            HeadroomLevel::Warning => 1,
+            HeadroomLevel::Ample => 2,
+        }
+    }
+
+    /// Map Claude's `status` string to a level; an unrecognised value yields `None` (the caller
+    /// treats it as `Headroom::Unknown`, so an unlisted future value cannot mis-gate).
+    pub fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "allowed" => Some(HeadroomLevel::Ample),
+            "allowed_warning" => Some(HeadroomLevel::Warning),
+            "rejected" => Some(HeadroomLevel::Exhausted),
+            _ => None,
+        }
+    }
+}
+
+impl Headroom {
+    /// The reset time this observation is tied to, if any (the limiting window for a Codex
+    /// `Fraction`). `None` for `Unknown` and for a signal that carried no reset.
+    pub fn resets_at(&self) -> Option<u64> {
+        match self {
+            Headroom::Unknown => None,
+            Headroom::Fraction { resets_at, .. } | Headroom::Level { resets_at, .. } => *resets_at,
+        }
+    }
+
+    /// Does this observation clear the configured minimum? `Unknown` always clears (fail-open).
+    /// Each shape is only ever compared against its own-shaped minimum -- the config grammar
+    /// guarantees a Codex entry carries `Remaining(_)` and a Claude entry `Status(_)`; a
+    /// mismatched pairing (which the grammar forbids) also clears, never gating on a signal it
+    /// cannot interpret. See `docs/usage-remaining-gate.md`.
+    pub fn clears(&self, min: &UsageMinimum) -> bool {
+        match (self, min) {
+            (Headroom::Unknown, _) | (_, UsageMinimum::None) => true,
+            (Headroom::Fraction { remaining_pct, .. }, UsageMinimum::Remaining(pct)) => {
+                *remaining_pct >= f64::from(*pct)
+            }
+            (Headroom::Level { level, .. }, UsageMinimum::Status(min_level)) => {
+                level.rank() >= min_level.rank()
+            }
+            // Shape/minimum mismatch (forbidden by the grammar): fail-open.
+            _ => true,
+        }
+    }
+}
 
 /// What the reviewer produced.
 #[derive(Debug)]
