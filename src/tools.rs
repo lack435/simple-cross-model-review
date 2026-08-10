@@ -533,7 +533,10 @@ impl App {
             snapshot.id,
             snapshot.session,
             snapshot.turn,
-            self.cfg.describe_reviewer(),
+            snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
             snapshot.elapsed.as_secs(),
             self.cfg.timeout.as_secs(),
             render_progress(snapshot, self.cfg.timeout, !snapshot.shutting_down),
@@ -570,7 +573,10 @@ impl App {
             } else {
                 "turn 1, new review".to_string()
             },
-            self.cfg.describe_reviewer(),
+            snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
             snapshot.elapsed.as_secs(),
         ));
 
@@ -988,6 +994,10 @@ impl Job {
 
         // Captured once, before the attempt runs, so the reviewer's prompt and the usage
         // metrics below describe the same diff.
+        // Publish the selected entry before capture, so a snapshot taken during the Capturing
+        // phase names the reviewer that will run rather than a default.
+        self.registry
+            .set_active(&self.id, self.cfg.reviewers[self.start_index].describe());
         if self.cfg.chain_needs_capture() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
@@ -1139,9 +1149,11 @@ impl Job {
 
         for (pos, &i) in walk.iter().enumerate() {
             let entry = chain[i].clone();
-            // Publish the active entry: every identity-bearing read on the run path follows it.
+            // Publish the active entry: every identity-bearing read on the run path follows it,
+            // and a running poll now names this entry.
             self.reviewer = Arc::from(reviewer::for_kind(entry.reviewer));
             self.spec = entry.clone();
+            self.registry.set_active(&self.id, entry.describe());
             // The selected entry was preflighted in `start_review` (its bin is in `self.bin`). A
             // *fallback* entry is resolved and auth-checked here, lazily -- a fallback whose CLI
             // is missing or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it
@@ -1222,7 +1234,10 @@ impl Job {
 
         // The walk always assigns `outcome` (every branch sets it or the loop covers every
         // index), so this fallback is a safety net rather than an expected path.
-        let outcome = outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
+        let mut outcome = outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
+        // Attribute the terminal outcome to the entry that produced it (`self.spec` is the last
+        // entry the walk touched), so the completed response names the reviewer that actually ran.
+        outcome.active = Some(self.spec.describe());
         // Everything telemetry needs, taken before the outcome moves into the registry. The
         // disposition tag was captured above (from the local, so a failed attempt still records
         // what it sent).
@@ -1659,10 +1674,12 @@ impl Job {
             denial_count_is_floor: parsed.denial_count_is_floor,
             warnings,
             // Filled in by `run` after `attempt` returns: the disposition is assembled from the
-            // capture plus the fresh-vs-resumed framing only `run` holds.
+            // capture plus the fresh-vs-resumed framing only `run` holds, and `active` from the
+            // entry the walk settled on.
             disposition: None,
             resumable,
             usage: parsed.usage,
+            active: None,
         })
     }
 }
