@@ -354,6 +354,13 @@ pub struct Record {
     /// live, kept in the log too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The capture identity of this turn, as a compact tag (`git:<base12>..<head12>+t+p`,
+    /// `p4:43650,43651+p`, ...). Present whenever a change was sent (fresh or resumed), absent on a
+    /// no-change turn or a record written before this field existed. Lets an after-the-fact audit
+    /// see which range each turn actually reviewed and whether it was truncated or partial -- the
+    /// attribution the response's `captured:` line gives live, kept in the log too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured: Option<String>,
 }
 
 /// Append-only usage log.
@@ -1105,7 +1112,28 @@ mod tests {
             status: "completed".into(),
             failure_code: None,
             disposition: None,
+            captured: None,
         }
+    }
+
+    #[test]
+    fn the_captured_tag_round_trips_and_is_omitted_when_absent() {
+        let mut with = record("s", 1, None, usage(0, 0, 0));
+        with.captured = Some("git:a1b2c3d4e5f6..0f1e2d3c4b5a+p".to_string());
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains("\"captured\":\"git:a1b2c3d4e5f6"), "{json}");
+        let back: Record = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.captured, with.captured);
+
+        // A no-change turn carries no tag, and the field is skipped -- older readers and older
+        // records stay clean, as with `disposition`.
+        let without = record("s", 1, None, usage(0, 0, 0));
+        let json = serde_json::to_string(&without).expect("serialize");
+        assert!(!json.contains("captured"), "{json}");
+        // And a record written before the field existed still parses (default None).
+        let legacy = json.replace("\"disposition\"", "\"unused_legacy\"");
+        let back: Record = serde_json::from_str(&legacy).expect("legacy deserialize");
+        assert_eq!(back.captured, None);
     }
 
     fn usage(cache_write: u64, cache_read: u64, output: u64) -> Usage {
