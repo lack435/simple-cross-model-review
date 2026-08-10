@@ -134,6 +134,60 @@ pub struct SessionRecord {
     /// binary. `None` on a legacy record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_bin: Option<String>,
+    /// The structured findings ledger for this session, stored as a raw JSON value rather than a
+    /// typed field on purpose: a single unreadable or incompatible ledger degrades only *this*
+    /// session (to [`LedgerLoad::Invalid`]) instead of failing the whole store parse, which is the
+    /// difference between a bad record and a corrupt store. `None` for a session with no ledger
+    /// yet, or a record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_ledger: Option<serde_json::Value>,
+    /// A sticky terminal escalation state — currently only `"ledger_too_large"`. Once set, a resume
+    /// is refused (the session outgrew a single review conversation) until it is restarted `fresh`.
+    /// `None` for a healthy session or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
+}
+
+/// The tri-state result of loading a session's findings ledger. A single record whose ledger is
+/// unreadable or at an incompatible version is `Invalid` — that session is refused a resume — while
+/// the store and other sessions stay usable (the difference from a corrupt *store*, [`StoreState`]).
+#[derive(Clone, Debug)]
+pub enum LedgerLoad {
+    /// No ledger has been attached to this session yet.
+    Absent,
+    /// A readable ledger at a compatible version.
+    Valid(crate::findings::Ledger),
+    /// A ledger value is present but could not be read as a compatible ledger.
+    Invalid,
+}
+
+impl SessionRecord {
+    /// Load this session's findings ledger, tri-state. `Invalid` is a durable poison: a resume of
+    /// such a session is refused before the model call (an unreadable ledger cannot be injected).
+    pub fn ledger_load(&self) -> LedgerLoad {
+        match &self.findings_ledger {
+            None => LedgerLoad::Absent,
+            Some(v) => match serde_json::from_value::<crate::findings::Ledger>(v.clone()) {
+                Ok(l) if l.schema_version == crate::findings::SCHEMA_VERSION => {
+                    LedgerLoad::Valid(l)
+                }
+                _ => LedgerLoad::Invalid,
+            },
+        }
+    }
+}
+
+/// Whether the session *store* file parses. Distinct from a single bad ledger record: a corrupt
+/// store means every session is inaccessible, so all reviews are refused before the model call
+/// rather than silently starting a clean, convergeable conversation over unreadable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreState {
+    /// No store file yet — genuinely empty, the normal first-run state.
+    Absent,
+    /// The store parses.
+    Valid,
+    /// The store file is present but did not parse. Refuse resume *and* fresh.
+    Corrupt,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -169,6 +223,13 @@ pub struct TurnFacts<'a> {
     /// can match this entry and detect PATH drift.
     pub raw_bin: RawBin,
     pub resolved_bin: String,
+    /// The reconciled findings ledger this turn produced, already serialized. Stored directly (the
+    /// new ledger already includes the prior findings) — never inherited from a prior turn. `None`
+    /// for a turn that produced no ledger.
+    pub findings_ledger: Option<serde_json::Value>,
+    /// The sticky terminal state this turn resolves to (`Some("ledger_too_large")` when the turn is
+    /// over budget), or `None`. Set on the record so a later resume is refused.
+    pub terminal_reason: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -230,6 +291,8 @@ impl SessionStore {
             perforce_baseline,
             raw_bin,
             resolved_bin,
+            findings_ledger,
+            terminal_reason,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -290,6 +353,11 @@ impl SessionStore {
                 perforce_baseline,
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
+                // The findings ledger and terminal state are this turn's alone: the new ledger
+                // already includes the prior findings, and the terminal state is recomputed each
+                // turn (sticky terminal states are re-supplied by the caller from the prior record).
+                findings_ledger,
+                terminal_reason,
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -311,6 +379,8 @@ impl SessionStore {
                 perforce_baseline,
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
+                findings_ledger,
+                terminal_reason,
             },
         };
 
@@ -377,6 +447,40 @@ impl SessionStore {
             Ok(true) => MarkerState::Present,
             Ok(false) => MarkerState::Absent,
             Err(_) => MarkerState::Unreadable,
+        }
+    }
+
+    /// Whether the store file parses, tri-state. Used to gate *every* review — resume and fresh
+    /// alike — when the store is `Corrupt`: a corrupt store is caught before the model call and is a
+    /// resume refusal, never a silent clean start over unreadable state (which could converge on
+    /// untracked history). A missing file is `Absent` (the normal first-run state), not corrupt.
+    pub fn store_state(&self) -> StoreState {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match std::fs::read_to_string(&self.path) {
+            Err(_) => StoreState::Absent,
+            Ok(text) if text.trim().is_empty() => StoreState::Absent,
+            Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
+                Ok(_) => StoreState::Valid,
+                Err(_) => StoreState::Corrupt,
+            },
+        }
+    }
+
+    /// Set a session's sticky `terminal_reason` without advancing a turn — used by the
+    /// before-reviewer over-budget path, which runs no reviewer and records no turn but must make
+    /// the terminal state durable so the next resume is refused. Idempotent: writing the same
+    /// reason again is a no-op replace. Returns whether the named session existed.
+    pub fn set_terminal_reason(&self, name: &str, reason: &str) -> io::Result<bool> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
+        let mut store = self.read();
+        match store.sessions.get_mut(name) {
+            Some(record) => {
+                record.terminal_reason = Some(reason.to_string());
+                self.write(&store)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -582,6 +686,8 @@ mod tests {
                     perforce_baseline: None,
                     raw_bin: RawBin::PathSearch,
                     resolved_bin: String::new(),
+                    findings_ledger: None,
+                    terminal_reason: None,
                 },
             )
             .expect("record turn")
@@ -593,6 +699,51 @@ mod tests {
         let store = SessionStore::new(&dir);
         assert!(store.get("default").is_none());
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn store_state_distinguishes_absent_valid_and_corrupt() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        // No file yet -> Absent (the normal first-run state, not corrupt).
+        assert_eq!(store.store_state(), StoreState::Absent);
+        // After a turn the store parses -> Valid.
+        record(&store, "s", "thread-1");
+        assert_eq!(store.store_state(), StoreState::Valid);
+        // Corrupt the file -> Corrupt, so all reviews are refused before the model call.
+        std::fs::write(store.path(), b"{ not valid json").expect("write garbage");
+        assert_eq!(store.store_state(), StoreState::Corrupt);
+    }
+
+    #[test]
+    fn ledger_load_is_tri_state_per_record() {
+        use crate::findings::{Budget, LedgerCoverage};
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+
+        // Absent: a record with no ledger.
+        let rec = record(&store, "s", "thread-1");
+        assert!(matches!(rec.ledger_load(), LedgerLoad::Absent));
+
+        // Valid: attach a real ledger produced by the pure module.
+        let ev = crate::findings::evaluate_turn(
+            "s",
+            1,
+            "rv-1-1",
+            "<<<CROSS_REVIEW_FINDINGS_IN:rv-1-1>>>\n{\"verdict\":\"approve\"}\n<<<CROSS_REVIEW_FINDINGS_IN_END:rv-1-1>>>",
+            None,
+            Budget::default(),
+        );
+        let mut rec = rec;
+        rec.findings_ledger = Some(serde_json::to_value(&ev.ledger).expect("serialize ledger"));
+        match rec.ledger_load() {
+            LedgerLoad::Valid(l) => assert_eq!(l.coverage, LedgerCoverage::WholeConversation),
+            other => panic!("expected valid ledger, got {other:?}"),
+        }
+
+        // Invalid: a ledger value that is not a compatible ledger.
+        rec.findings_ledger = Some(serde_json::json!({"schema_version": 999, "nonsense": true}));
+        assert!(matches!(rec.ledger_load(), LedgerLoad::Invalid));
     }
 
     #[test]
@@ -648,6 +799,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -692,6 +845,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -744,6 +899,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
         };
         // The old conversation establishes a complete baseline.
         store
@@ -781,6 +938,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -817,6 +976,8 @@ mod tests {
             perforce_baseline: baseline,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,
