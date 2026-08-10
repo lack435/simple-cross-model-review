@@ -8,7 +8,7 @@ autonomous "re-review until converged" loop stops re-deriving structure the tool
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
-> **Review history.** Nineteen rounds against this repository's own gate (Codex, gpt-5.6-luna,
+> **Review history.** Twenty rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
 > `major`), round 2 (four `major` + one `minor`), round 3 (four `major` + one `minor`), round 4
 > (five `major` + one `minor`), round 5 (five `major` + one `minor`), round 6 (three `major` +
@@ -21,9 +21,10 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > four-state summaries), round 15 (two `major` + one `minor`, precedence + last blind-fresh strings), round 16 (one `major`,
 > a stale re-report, tightened further), round 17 (one `major` + one `minor`, the `invalid`
 > resume-refusal split), round 18 (one `major`, propagating that split to Decision 3 and the tables),
-> round 19 (one `minor`, qualifying persistence-failure reasons against already-broken coverage).
-> Rounds 1–18 confirmed resolved; round 19 now closed. Recorded in the
-> [Round 1](#round-1-response) … [Round 19](#round-19-response) responses. The sections they touched —
+> round 19 (one `minor`, qualifying persistence-failure reasons against already-broken coverage),
+> round 20 (one `minor`, truth-table footnote 4). Rounds 1–19 confirmed resolved; round 20 now
+> closed. Recorded in the
+> [Round 1](#round-1-response) … [Round 20](#round-20-response) responses. The sections they touched —
 > the block schema, ID reconciliation (total-accounting), degradation and the `converged` signal
 > (now including the budget/terminal condition), extraction (nonce-marked, dual-namespace, `_OUT`
 > nonce), durability (a write-ahead marker that must succeed or abort, fail-closed poison-writes,
@@ -667,10 +668,13 @@ must not re-review-and-hope against a reviewer that has declared itself blocked.
 ⁴ An unstructured turn's *top-level* reason is `ledger_unavailable`, not `unstructured` (round 8):
 a degraded turn breaks coverage (`needs_rebaseline` mid-session, `legacy_uncovered` on turn 1), and
 coverage is stamped before reason selection, so the reason that reaches the caller is
-`ledger_unavailable` (**escalate for a rebaseline**, not a blind `fresh`) — **unless this turn's own
-coverage-break write failed**, in which case it reports `turn_not_durable` (the one exception; see
-the persistence-first rule). Both escalate. `unstructured` is the internal cause, carried by
-`structured: false` and the warning, never a `non_convergence_reason` value.
+`ledger_unavailable` (**escalate for a rebaseline**, not a blind `fresh`) whenever the on-disk break
+is persisted — this turn's write landed, *or* the session was already
+`legacy_uncovered`/`needs_rebaseline`. It reports `turn_not_durable` **only** when the turn entered
+`whole_conversation`/`unestablished` and its *own* coverage-break write failed (round 19; an
+already-broken session stays `ledger_unavailable` by precedence). Both escalate. `unstructured` is
+the internal cause, carried by `structured: false` and the warning, never a `non_convergence_reason`
+value.
 
 ## Prompt changes (`src/prompt.rs`)
 
@@ -1893,13 +1897,26 @@ always `ledger_unavailable`.
 
 No open questions remain.
 
+## Round 20 response
+
+Codex (gpt-5.6-luna, effort=max, resumed) confirmed everything else resolved and flagged the single
+remaining unqualified spot: **truth-table footnote 4** still said a failed current coverage write
+reports `turn_not_durable` without excluding an already-broken session. Accepted; not disputed.
+Footnote 4 now matches the formal rule: `ledger_unavailable` whenever the on-disk break is persisted
+(this turn's write landed, or the session was already `legacy_uncovered`/`needs_rebaseline`);
+`turn_not_durable` **only** when the turn entered `whole_conversation`/`unestablished` and its own
+write failed.
+
+No open questions remain.
+
 ## Status
 
-Nineteen rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
+Twenty rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
 accepted and none disputed. Round 11 (a fresh-reviewer holistic pass) opened the
-escalation/rebaseline seam and the coverage discriminator; rounds 12–19 carried it fully through the
+escalation/rebaseline seam and the coverage discriminator; rounds 12–20 carried it fully through the
 example, reason contract, precedence with persistence-first, Decision 3 scope, state machine, schema,
-failure table, and tests, closed the `unestablished` edge, made `invalid` uniformly a pre-model
-resume refusal, and qualified every persistence-failure reason against already-broken coverage. The
-plan is submitted for a final pass; if it is judged sound, implementation begins against the
-[wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs) plan above.
+failure table, truth-table footnotes, and tests, closed the `unestablished` edge, made `invalid`
+uniformly a pre-model resume refusal, and qualified every persistence-failure reason against
+already-broken coverage. The plan is submitted for a final pass; if it is judged sound,
+implementation begins against the [wiring](#wiring-the-io-edges), [tests](#tests), and
+[module](#new-module--srcfindingsrs) plan above.
