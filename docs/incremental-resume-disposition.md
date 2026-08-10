@@ -15,8 +15,10 @@ review. **That already exists for both backends** and is not what this proposal 
   turn — instead of the whole range. Guarded by an ancestry check (a rewritten branch
   falls back to the full range), a base-identity check (a moved base ref falls back), a
   truncation guard (a truncated capture never becomes a baseline), and mode (working-tree
-  and staged diffs never delta). ~15 tests in `src/vcs/git.rs` cover the round trip and
-  every fallback.
+  and staged diffs never delta). Around 15 incremental-resume tests in `src/vcs/git.rs` cover
+  the round trip and the documented fallbacks (rewritten branch, moved base, non-HEAD range,
+  truncated capture, disabled flag) — though *not*, today, an ancestry-check error/timeout,
+  which is one gap this proposal's `AncestryUndecidable` reason forces a test for.
 - **Perforce** (PR #38): per-file elision keyed on a fingerprint of what the reviewer was
   last shown, fail-closed on every uncertain signal, with a durable in-progress marker so a
   crash cannot collapse against a stale baseline. See
@@ -69,44 +71,75 @@ Every capture already *decides* its disposition — that decision is what select
 The proposal is to name that decision, carry it out to the caller, and record it, without
 changing which range is captured.
 
-### The disposition value
+### When a disposition exists at all
 
-A small, VCS-neutral enum. The first review of this design conflated two very different
-things under "not a delta" — an intentional non-delta and a *failed* delta — and the
-distinction is the crux of getting the warning channel right (see
-[How the caller sees it](#how-the-caller-sees-it)). So the enum has four states, not three:
+Before the value, the precondition, because the second review found the first draft computing
+a disposition in cases where the server sent nothing. **A disposition is emitted only when
+both** (a) the turn is a resume (`resume_id.is_some()`) **and** (b) the server actually sent a
+change (`capture.change.is_some()`). If either is false there is no line and no warning:
 
-- **`Full`** — a fresh review: turn 1, or a resumed turn with no prior baseline to be
-  incremental against. Reported as nothing on a fresh call; see
-  [Only on resume](#only-on-resume).
-- **`FullByDesign { reason }`** — the configuration *never intended* a delta this turn, so
-  its absence is correct and unremarkable, **not** a fall-back and **never** a warning:
-  - `Disabled` — `--no-incremental-resume`.
-  - `ModeNotDeltable` — the mode is not a HEAD-anchored committed range: a working-tree
-    (`auto`/`HEAD`) or staged diff (which carry uncommitted work a commit delta would drop),
-    or a fixed window like `HEAD~3..HEAD~1` (which does not move with HEAD). These are the
-    common, correct cases — warning on a resumed `--diff HEAD` review would be a false alarm
-    that trains callers to ignore the channel.
-- **`Incremental`** — the delta fired. Carries the range `<prior>..<HEAD>` (git, free — the
-  endpoints are already pinned) and optional backend detail; see
-  [What the detail can honestly say](#what-the-detail-can-honestly-say).
-- **`FellBackToFull { reason }`** — an *eligible* delta (a HEAD-anchored range, feature on)
-  that failed a safety guard and re-captured the whole range. This is the state worth a
-  warning, because it is where the delta the caller configured for stopped happening:
-  - `BranchRewritten` — the prior HEAD is a valid commit that is **not** an ancestor of HEAD
-    (rebase, amend, force-push). Distinct from the next one — see
-    [Reasons the code must be refactored to tell apart](#reasons-the-code-must-be-refactored-to-tell-apart).
-  - `BaseMoved` — the configured base still resolves, but to a different commit than the
-    baseline's recorded base (`main` advanced, or `--diff` was repointed).
-  - `NoCompleteBaselineRetained` — the session holds no complete `(head, base)` pair to
-    delta from (the prior turn truncated *and* no earlier complete baseline survived, or HEAD
-    could not be resolved). **Not** simply "the prior capture was truncated" — see finding 3
-    below.
-  - `AncestryUndecidable` — the ancestry check could not be *run* (git error/timeout), as
-    opposed to answering "no". Conservatively a full re-capture, but reported as its own
-    reason rather than mislabelled `BranchRewritten`.
-  - Perforce-specific: `IdentityChanged`, `ModeOrShelvedChanged`, `PriorTurnUnpersisted`
-    (the durable-marker cases already decided in `tools.rs`).
+- A **fresh** turn (turn 1, or a name rebound to a new reviewer session) has no prior turn to
+  be incremental against. Internally this is the `Full` state; it is never rendered.
+- A turn where the server **sent no change** — `--diff none`, `--diff auto` with a
+  shell-equipped reviewer (`supplies_change()` is false, `capture.change` is `None`), or a
+  capture that **failed or was cancelled** — cannot honestly carry a disposition about a diff
+  the reviewer was never handed. Saying "full re-capture" there would violate the
+  say-only-what-was-sent boundary as surely as an overclaiming `Incremental` line would.
+
+So the disposition is `Option`-typed and computed from `capture.change`, not alongside it.
+
+### The disposition value: an ordered decision, not a flat list
+
+The states below are **decided in order**; the first matching rule wins. Presenting them as a
+flat list is what let the first two drafts leave a resumed-no-baseline turn described by two
+states at once, and let a single `None` from `effective_base` stand in for five different
+facts. The order *is* the precedence:
+
+Given a resumed turn that sent a change, the git backend decides:
+
+1. **`FullByDesign { Disabled }`** — `--no-incremental-resume` is set. Intentional; **never
+   warns**.
+2. **`FullByDesign { ModeNotDeltable }`** — the mode is not a HEAD-anchored committed range: a
+   working-tree (`auto`/`HEAD`) or staged diff (which carry uncommitted work a commit delta
+   would drop), or a fixed window like `HEAD~3..HEAD~1` (which does not move with HEAD).
+   Intentional; **never warns**. Warning on a resumed `--diff HEAD` review would be the false
+   alarm the round-1 review flagged.
+3. **`FellBackToFull { NoCompleteBaselineRetained }`** — the mode *is* an eligible
+   HEAD-anchored range, but the session carries **no complete `(head, base)` pair** to delta
+   from. This is where a resumed turn with no usable baseline lands — resolving the ambiguity
+   the round-2 review found: `Full` is reserved for *fresh* turns; a resumed eligible turn
+   without a baseline is a fall-back, not a `Full`. It covers first-turn truncation followed
+   by a resume (no baseline ever persisted). It does **not** cover truncation *after* an
+   established baseline, because the session retains the prior complete pair
+   (`src/session.rs:208`) and that later turn stays `Incremental`.
+4. **`FellBackToFull { CurrentHeadUnavailable }`** — HEAD will not resolve now (unborn,
+   detached, git failed), so there is no right endpoint to delta to. Distinct from #3: a
+   complete prior baseline may still exist; what is missing is *this* turn's HEAD.
+5. **`FellBackToFull { CurrentBaseUnresolvable }`** — the configured range's left ref no longer
+   resolves, or a three-dot merge-base cannot be computed. The base is unknown, so `BaseMoved`
+   cannot even be evaluated — this is why it must be a *separate* reason decided *before* it.
+6. **`FellBackToFull { BaseMoved }`** — both the prior baseline's base and the current
+   effective base are usable **and differ** (`main` advanced, or `--diff` was repointed). Only
+   reachable once #5 has established the current base resolves.
+7. **`FellBackToFull { PriorBaselineInvalid }`** — the current base matches, but the stored
+   prior HEAD is not a usable object id (a corrupt or truncated record). Guards the ancestry
+   check's input.
+8. **`FellBackToFull { AncestryUndecidable }`** — the ancestry check could not be *run* (git
+   error/timeout): a *three-way* result, not the `false` that today's `is_ancestor` collapses
+   error into. Reported as its own reason rather than mislabelled `BranchRewritten`.
+9. **`FellBackToFull { BranchRewritten }`** — the prior HEAD is a valid commit that is
+   definitively **not** an ancestor of HEAD (rebase, amend, force-push).
+10. **`Incremental`** — none of the above fired: the delta is `<prior>..<HEAD>`. Carries the
+    range (git, free — both endpoints are already pinned) and optional backend detail; see
+    [What the detail can honestly say](#what-the-detail-can-honestly-say).
+
+Every `FellBackToFull { … }` reason warns (an eligible delta that stopped happening is a cost
+surprise); every `FullByDesign { … }` reason does not; `Incremental` does not. That mapping is
+now a property of the state, not a per-call judgement.
+
+The **Perforce** backend substitutes its own durability/identity reasons for #3–#9, decided in
+`tools.rs` before capture (see [finding 4](#perforce-durability-reasons)); #1, #2 and #10 apply
+unchanged.
 
 Making it an enum — not a prose sentence — is the point: machine-checkable by the calling
 agent, assertable in unit tests, greppable in the smoke test. The prose the caller reads is
@@ -123,18 +156,31 @@ them to preserve it. Concretely, three call sites lose information today:
 
 #### Reasons the code must be refactored to tell apart
 
-- **`effective_base` (`src/vcs/git.rs:643-663`) returns `None` for both "the mode is not a
-  HEAD-anchored range" and "the base ref would not resolve."** The first is `FullByDesign
-  { ModeNotDeltable }`; the second, on a resume that had a baseline, is a genuine fall-back.
-  Split the return so the caller can tell an ineligible mode from a resolution failure.
+- **`effective_base` (`src/vcs/git.rs:643-663`) collapses *five* outcomes into one `None`:**
+  a non-HEAD-anchored mode, an unresolvable left ref, an unavailable current HEAD (the
+  three-dot path needs it — `:660`), a missing merge-base, and a merge-base *command* failure.
+  Two drafts treated `None` as a single fact; it is not. Split the return into a status enum
+  distinguishing at least `ModeNotDeltable`, `CurrentHeadUnavailable`, and
+  `CurrentBaseUnresolvable` (the last folding "left ref won't resolve", "no merge base", and
+  "merge-base failed" — all "the base is unknown"). Only once a base *is* known can
+  `BaseMoved` be evaluated against the prior baseline; deciding `BaseMoved` on an unresolved
+  base is the bug this split exists to prevent.
 - **`is_ancestor` (`src/vcs/git.rs:1012-1018`) returns `false` for both "not an ancestor" and
-  "git errored / timed out."** Labelling every `false` as `BranchRewritten` would be a
-  factual claim the code cannot back. Return a three-way answer (yes / no / undecidable) so
-  the no-case is `BranchRewritten` and the error-case is `AncestryUndecidable`.
-- **The Perforce pending-marker cases are turned into `resume = None` in `tools.rs:805-833`
-  *before* `capture` runs,** so the backend never sees why. The reason has to be captured at
-  that pre-capture decision point and carried into the disposition explicitly, not
-  reconstructed inside the backend.
+  "git errored / timed out."** Labelling every `false` as `BranchRewritten` would be a factual
+  claim the code cannot back. Return a three-way answer (yes / no / undecidable) so the
+  no-case is `BranchRewritten` and the error-case is `AncestryUndecidable`.
+- **The prior HEAD is validated before the ancestry check**, so a corrupt/truncated stored id
+  is `PriorBaselineInvalid`, not fed to git.
+- **Fresh-vs-resumed is invisible to `vcs::capture`, which receives only `Option<Resume>`
+  (`src/vcs/mod.rs:34-38`).** `None` there means *both* "a fresh turn" and "a resumed turn
+  whose session held no baseline" — the backend cannot tell them apart, and it must not, since
+  the fresh case emits nothing while the resumed-no-baseline case is
+  `FellBackToFull { NoCompleteBaselineRetained }`. So the **fresh-vs-resumed framing and the
+  no-baseline reason are assigned in `tools.rs`**, which knows `resume_id` and whether a
+  baseline was passed; the backend only reports the decisions that are its own (mode, base,
+  ancestry).
+- **The Perforce durability reasons are decided in `tools.rs:805-833` *before* `capture`
+  runs** — see [below](#perforce-durability-reasons).
 
 None of these add a git/p4 call for the *decision* (the ancestry and base-resolve commands
 already run); they change what the existing calls' outcomes are allowed to say. The one place
@@ -142,7 +188,26 @@ a new query would be needed is an optional commit *count* — see below.
 
 Then thread the disposition out through `Capture` (which already carries `head_sha` /
 `base_sha` — note that `CapturedChange` does **not**; the first draft misplaced this) to
-`tools.rs`.
+`tools.rs`, where the fresh/resumed layer above is applied.
+
+#### Perforce durability reasons
+
+The Perforce full-capture cases are already *decided* in `tools.rs` (`:805-833`, `:862`), but
+the first draft's single `PriorTurnUnpersisted` conflated distinct ones. Separate them (or use
+one `DurabilityGuard` reason carrying structured detail), with a defined precedence when more
+than one holds:
+
+- `PriorTurnPending` — the *previous* turn left an uncleared in-progress marker
+  (`is_pending`): it crashed or failed to persist, so its baseline may be stale.
+- `MarkerUnwritable` — *this* turn could not write its in-progress marker (`!pending_marked`),
+  so a later crash would be undetectable and the turn refuses to elide (and records
+  `Disabled`). A current durability failure, not evidence about the prior turn.
+- `PriorBaselineUnusable` — the prior turn persisted `PerforceBaseline::Disabled` or an
+  inventory that does not match this turn's identity/mode. Distinct from a missing marker.
+
+Plus the identity/mode cases already named: `IdentityChanged`, `ModeOrShelvedChanged`. When
+several apply at once, precedence is: marker failures (they mean the durability guarantee is
+absent) before identity/mode mismatches before baseline-content mismatches.
 
 ### What the detail can honestly say
 
@@ -154,19 +219,23 @@ Then thread the disposition out through `Capture` (which already carries `head_s
 - **Perforce:** `baseline.rs` stores *evidence entries*, not file counts, and the fingerprint
   is over **rendered evidence**, not arbitrary file state (`src/vcs/perforce.rs:503-510`). So
   the honest phrasing is "N of M evidence units re-sent, the rest collapsed as byte-identical
-  to what you were last shown," with the counts computed *during* elision (they are not stored
-  today) — never "M of K files changed," which claims a file-level comparison Perforce does
-  not perform.
+  to evidence included in the previous server-generated capture" — with the counts computed
+  *during* elision (they are not stored today). Note the careful wording the round-2 review
+  drew out: the server knows only what it **generated and sent last turn**, not what the
+  reviewer received or retained, so the phrasing says "the previous server-generated capture,"
+  never "what you were last shown." And never "M of K files changed," which would claim a
+  file-level comparison Perforce does not perform.
 
 ### How the caller sees it
 
-In `tools.rs`, on a **resumed** turn, render the disposition into the caller-facing response.
-Two sub-decisions, both for the reviewer to weigh in on:
+In `tools.rs`, on a **resumed turn that sent a change** (see
+[When a disposition exists at all](#when-a-disposition-exists-at-all)), render the disposition
+into the caller-facing response. Two sub-decisions, both for the reviewer to weigh in on:
 
 - **Channel — a typed field, not a warning string.** `warnings` is framed as "the captured
-  change was incomplete" — a shortfall — and it is a `Vec<String>`. A clean `Incremental`,
-  `Full`, or `FullByDesign` turn is not a shortfall, and encoding structured data as prose in
-  the warning list is the wrong shape twice over. So carry a **typed disposition field**
+  change was incomplete" — a shortfall — and it is a `Vec<String>`. A clean `Incremental` or
+  `FullByDesign` turn is not a shortfall, and encoding structured data as prose in the warning
+  list is the wrong shape twice over. So carry a **typed disposition field**
   through the result path — `Outcome` → `Review` → `Snapshot` in `src/registry.rs`
   (`:143-155`, `:558-599`), which the first draft omitted from the plumbing entirely — and
   render it into the response as its own informational `disposition:` line beside `usage:`.
@@ -176,12 +245,6 @@ Two sub-decisions, both for the reviewer to weigh in on:
 - **Recording.** Record the disposition in the usage/metrics record next to `prompt_bytes`,
   so an after-the-fact audit of a session can see which turns deltaed and which re-billed
   the full range — the attribution point 1 above is missing today.
-
-### Only on resume
-
-A fresh review (turn 1, `resume_id` is `None`) says nothing new — there is no prior turn to
-be incremental against, and emitting "full re-capture" there would be noise on every first
-call. The disposition line appears only when `resume_id.is_some()`.
 
 ## What this must not do
 
@@ -197,8 +260,9 @@ call. The disposition line appears only when `resume_id.is_some()`.
   review.
 - **It must not claim more than it verified.** The new caller-facing `Incremental` line says
   what the server *sent* — the range, and (for Perforce) which evidence was collapsed as
-  byte-identical to what was last shown. It must not assert the reviewer still holds the
-  earlier context, which the server cannot know.
+  byte-identical to evidence in the previous **server-generated** capture. It must not assert
+  the reviewer received, retained, or still holds the earlier context, none of which the
+  server can know.
 
   One honesty note the first review drew out: the **existing reviewer-facing prompt already**
   asserts "that conversation is still in your context" (`src/vcs/git.rs:748-759`). That is a
@@ -214,49 +278,64 @@ call. The disposition line appears only when `resume_id.is_some()`.
 Additive to the response and to one enum return type — but wider than the first draft
 admitted. Touched files:
 
-- `src/vcs/git.rs` — the disposition and the reason-preserving refactors of `effective_base`
-  (ineligible-mode vs unresolved-base) and `is_ancestor` (three-way), plus the optional
+- `src/vcs/git.rs` — the disposition, and the reason-preserving refactors: `effective_base`
+  split into a status enum (`ModeNotDeltable` / `CurrentHeadUnavailable` /
+  `CurrentBaseUnresolvable` / resolved-base), `is_ancestor` made three-way (yes / no /
+  undecidable), the prior-HEAD validation ahead of the ancestry check, plus the optional
   `rev-list --count`.
 - `src/vcs/perforce.rs` — compute the re-sent/collapsed evidence-unit counts during elision
   (not stored today).
-- `src/vcs/shared.rs` / `src/vcs/mod.rs` — carry the typed disposition on `Capture` (**not**
-  `CapturedChange`, which does not hold the baseline).
-- `src/tools.rs` — capture the Perforce pending-marker reason at its pre-capture decision
-  point (`:805-833`) rather than losing it to `resume = None`, and surface + record the
-  disposition on a resumed turn.
+- `src/vcs/shared.rs` / `src/vcs/mod.rs` — carry the *optional* typed disposition on `Capture`
+  (**not** `CapturedChange`, which does not hold the baseline), computed only when
+  `change.is_some()`.
+- `src/tools.rs` — the layer the backend cannot see: apply the fresh-vs-resumed framing and
+  the `NoCompleteBaselineRetained` reason (the backend receives only `Option<Resume>`), split
+  the Perforce durability reasons at their pre-capture decision point (`:805-833`) rather than
+  losing them to `resume = None`, gate on `change.is_some()`, and surface + record.
 - `src/registry.rs` — thread the typed field through `Outcome` → `Review` → `Snapshot`
   (`:143-155`, `:558-599`); this is the plumbing the first draft missed.
 - `src/metrics.rs` — the record field, plus tests throughout.
 
 Per the task framing, foundational completeness is preferred over minimising this. The change
-is cohesive, but it is not a one-liner: getting the *reasons* accurate (findings 2 and 3) is
-most of the work, and doing it wrong — a mislabelled `BranchRewritten`, a false `FellBackToFull`
-warning on an intentional `--diff HEAD` — would be worse than reporting nothing.
+is cohesive, but it is not a one-liner: getting the *reasons* accurate (round-1 findings 2–3,
+round-2 findings 1–4) is most of the work, and doing it wrong — a mislabelled `BranchRewritten`,
+a `BaseMoved` decided on an unresolved base, a false `FellBackToFull` warning on an intentional
+`--diff HEAD`, or a disposition emitted when nothing was sent — would be worse than reporting
+nothing.
 
 ## Testing
 
-- **Unit, git — every reason maps correctly, including the ones the code must now tell
-  apart:**
-  - `BranchRewritten` — prior HEAD valid but not an ancestor.
-  - `AncestryUndecidable` — the ancestry check could not run (distinct from the above; test
-    by pointing it at a prior commit git cannot place).
-  - `BaseMoved` — base ref advanced to a different commit.
+- **Unit, git — every reason maps correctly, including the ones the code must now tell apart.
+  The distinctions the round-2 review forced each need their own test:**
+  - `BranchRewritten` — prior HEAD is a valid, *available* commit that is genuinely not an
+    ancestor (a divergent branch), producing a definite "no" from the three-way check.
+  - `AncestryUndecidable` — the check could not *run*. Test with a syntactically **valid but
+    unavailable** object id (or a forced git failure), **not** an invalid string (rejected by
+    `is_object_name` before ancestry) and **not** a valid unrelated commit (that is
+    `BranchRewritten`). This is the case with no coverage today.
+  - `BaseMoved` — base ref advanced to a different, *resolvable* commit.
+  - `CurrentBaseUnresolvable` — the configured left ref no longer resolves; asserts it does
+    **not** get mislabelled `BaseMoved`.
+  - `CurrentHeadUnavailable` — HEAD will not resolve; asserts a retained prior baseline is not
+    mislabelled `NoCompleteBaselineRetained`.
+  - `PriorBaselineInvalid` — a corrupt stored prior HEAD; asserts it never reaches the
+    ancestry command.
   - `FullByDesign { ModeNotDeltable }` — a working-tree (`--diff HEAD`) or non-HEAD range
-    resume, asserting it does **not** produce a warning.
-  - `FullByDesign { Disabled }` — `--no-incremental-resume`.
-  - **`NoCompleteBaselineRetained`, both ways (finding 3):** (a) first-turn truncation, where
-    no baseline ever existed, and (b) truncation *after* an established baseline, which must
-    still delta from the retained older complete `(head, base)` pair
-    (`src/session.rs:197-214`, `src/tools.rs:821-825`) rather than fall back — proving the
-    reason is "no complete baseline retained," not "the last capture truncated."
-
-  These extend the existing fall-back tests, which today assert only that the *range* fell
-  back, by additionally asserting the *reason*.
+    resume; asserts it emits the info line but **no** warning.
+  - `FullByDesign { Disabled }` — `--no-incremental-resume`; same no-warning assertion.
+  - **`NoCompleteBaselineRetained`, both ways (round-1 finding 3):** (a) first-turn truncation,
+    where no baseline ever existed → fall-back; and (b) truncation *after* an established
+    baseline, which must still delta from the retained older complete `(head, base)` pair
+    (`src/session.rs:208`, `src/tools.rs:821-825`) → **`Incremental`**, proving the reason is
+    "no complete baseline retained," not "the last capture truncated."
+- **Unit, no-capture states (round-2 finding 3):** `--diff auto` with a shell-equipped
+  reviewer, `--diff none`, a cancelled capture, and a failed capture each emit **no**
+  disposition and **no** warning — the server sent no change, so it says nothing about one.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
   `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
-- **Unit, tools:** a resumed turn emits the disposition line; a fresh turn does not; a
-  `FellBackToFull` resume also emits the warning; a `FullByDesign` resume emits the info line
-  but **no** warning.
+- **Unit, tools:** a resumed turn that sent a change emits the disposition line; a fresh turn
+  does not; a `FellBackToFull` resume also emits the warning; a `FullByDesign` resume emits the
+  info line but **no** warning.
 - **`smoke.ps1`:** on a resumed run, assert the disposition line appears in the response
   (real model call — run only when the change touches this path, and note the cost).
 
