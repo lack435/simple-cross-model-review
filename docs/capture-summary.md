@@ -1,11 +1,15 @@
 # Capture summary, surfaced to the caller — design
 
-Status: **approved for implementation.** This document is the plan. It went through this
-repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max) over seven rounds, ending
-in APPROVE — "the design is sound and complete enough to implement" — the same way
-[`incremental-resume-disposition.md`](incremental-resume-disposition.md) did before it. Filed
-against issue [#46](https://github.com/lack435/simple-cross-model-review/issues/46) ("Surface a
-capture summary to the caller in every review response").
+Status: **implemented and merge-gate approved.** This document was the plan; it went through this
+repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max) over seven rounds ending in
+APPROVE — "the design is sound and complete enough to implement" — and the implementation then
+went through two more rounds of the same gate ending in APPROVE ("both round-1 findings are
+resolved, and I found no new implementation regressions"), the same way
+[`incremental-resume-disposition.md`](incremental-resume-disposition.md) did before it. The code
+lives in `src/vcs/capture_summary.rs`, `src/vcs/git.rs`, `src/vcs/perforce.rs`, `src/vcs/mod.rs`,
+`src/vcs/shared.rs`, `src/registry.rs`, `src/tools.rs` and `src/metrics.rs`. Filed against issue
+[#46](https://github.com/lack435/simple-cross-model-review/issues/46) ("Surface a capture summary
+to the caller in every review response").
 
 **Revision note.**
 
