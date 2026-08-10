@@ -9,10 +9,14 @@ provide: a top-level verdict, an `open_count`, stable finding IDs carried across
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
 > **Review history.** Round 1 (Codex, gpt-5.6-luna, effort=max) returned REQUEST CHANGES with
-> seven `major` findings. All seven are addressed below and the changes are recorded in
-> [Round 1 response](#round-1-response); the sections they touched — the block schema, ID
-> reconciliation, degradation, extraction, idempotency, ledger loading, and the verdict truth
-> table — were rewritten rather than patched. This document reflects the post-round-1 design.
+> seven `major` findings; round 2 returned REQUEST CHANGES with four `major` + one `minor`,
+> confirming five round-1 items resolved. Both rounds are recorded in
+> [Round 1 response](#round-1-response) and [Round 2 response](#round-2-response); every finding
+> was accepted, none disputed. The sections they touched — the block schema, ID reconciliation
+> (now total-accounting), degradation and the `converged` signal, extraction (now nonce-marked),
+> durability (now a write-ahead marker), the whole-conversation ledger rule, and the verdict
+> truth table — were rewritten rather than patched. This document reflects the post-round-2
+> design.
 
 ## Problem
 
@@ -52,18 +56,51 @@ valid block, a corrupt ledger, a persistence failure — could otherwise present
 0` without any structure behind it and be read as success.
 
 So the server computes one boolean, **`converged`**, and that is the only signal a loop is
-told to stop on. `converged == true` requires **all** of:
+told to stop on. `converged == true` is defined as the conjunction — there is no other
+definition of it anywhere in this document, and where an earlier draft said "structured
+convergence is `open_count == 0`" that was a round-2 self-contradiction and is now removed.
+`converged == true` requires **all** of:
 
+- **A ledger that covers the whole reviewer conversation.** The session either began its
+  reviewer conversation on this feature (a ledger exists from its own turn 1) or is a genuinely
+  fresh turn 1 now. A conversation that predates the ledger is explicitly *not* convergeable —
+  see [the pre-feature rule](#convergence-requires-a-ledger-over-the-whole-conversation).
 - the reviewer emitted exactly one valid, well-formed machine block this turn
   (`structured == true`), and
 - the session's finding ledger is present and readable at a compatible version, and
-- reconciliation completed without a fail-closed condition (no unknown/duplicate IDs), and
+- reconciliation completed without any fail-closed condition (below: unknown/duplicate id, a
+  schema violation, **or any prior id the reviewer failed to account for**), and
 - every finding in the ledger has `status == resolved`, so `open_count == 0`, and
-- the reviewer's own verdict is `approve` (it agrees nothing is open).
+- the reviewer's own `verdict_detail` is exactly `approve` — not `approve_with_comments`, not
+  `request_changes`, not `blocked`. The reviewer's own top-level judgement must itself be a
+  clean approve; numeric zero is necessary but not sufficient.
 
-If any one is false, `converged` is `false`. `open_count` is a number **only** when the first
-three hold; otherwise it is `null`, never `0`. A caller loops `while (!converged)`; it never
-has to reason about *why* a turn was not convergent to stay safe, only to report it.
+If any one is false, `converged` is `false`, and the envelope carries a machine-readable
+`non_convergence_reason` (below) naming which one, so an autonomous loop can tell "keep working,
+findings still open" from "the reviewer withheld a clean approve, a human should look" and
+**cannot livelock silently**. `open_count` is a number **only** when the block is structured,
+the ledger is valid, and reconciliation was clean; otherwise it is `null`, never `0`. A caller
+loops `while (!converged)`; it never has to reason about *why* a turn was not convergent to stay
+safe, only to report the reason it is handed.
+
+### `non_convergence_reason`
+
+A non-convergent turn is not necessarily a *broken* turn, and an autonomous loop must be able
+to act differently on the two. The envelope carries one machine-readable reason (or `null` when
+`converged`):
+
+| `non_convergence_reason` | Meaning | What a loop should do |
+| --- | --- | --- |
+| `open_findings` | Structured, valid, but `open_count > 0`. | Act on the findings, re-review. |
+| `reviewer_withheld_approve` | `open_count == 0` but `verdict_detail` is `approve_with_comments`. | The reviewer left only comments and declined a clean approve. Do **not** auto-stop; surface to a human. |
+| `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
+| `unstructured` | No valid block this turn. | Re-review; do not read absence as convergence. |
+| `ledger_unavailable` | Ledger unreadable, incompatible, or the conversation predates the ledger. | Start a `fresh` session to establish a convergeable ledger. |
+| `turn_not_durable` | This turn's ledger could not be persisted. | Start a `fresh` session; do not resume (stale-id risk). |
+
+The `reviewer_withheld_approve` row is the livelock guard round 2 asked for: the loop is not
+told "done," but it *is* told exactly why it is not done, so it stops spinning and escalates
+rather than re-reviewing forever against a reviewer that will keep leaving the same comment.
 
 ## The three hard parts
 
@@ -140,19 +177,28 @@ reported as `f1: regressed` rather than being forced to appear as an unrelated n
 round 1 caught that the earlier "inject only open findings" draft made the `regressed` status
 unreachable for anything already resolved. After the review, the server reconciles:
 
-- **Each `prior_findings` entry** must name an id the ledger owns. Its status is applied to
-  that ledger entry. The ledger entry's content is untouched.
-- **A prior ledger finding the reviewer did not mention** stays at its current status and, if
-  it was open, is flagged `unaddressed_this_turn` — never auto-resolved. Silence is not
-  resolution.
+- **`prior_findings` must account for every id the ledger owns — open *and* resolved — exactly
+  once.** This is the round-2 fix, and it is load-bearing. An earlier draft flagged only omitted
+  *open* findings and let omitted resolved ones keep `resolved` silently; that left a hole where
+  a finding regressed but unmentioned would keep every ledger entry resolved, the block would
+  validate, and `converged` could go true. So the contract is total: the resumed reviewer is
+  handed the full id list and must return a status for **each** one. A single missing id, or one
+  extra id the ledger never issued, or any id twice, degrades the whole turn (below). There is
+  no "the reviewer stayed silent on `f1`" path any more — silence on any id is a degraded turn,
+  never an implied status.
+- **Each `prior_findings` entry's** status is applied to its ledger entry; the entry's content
+  is untouched. A resolved entry the reviewer now reports `regressed` reopens under its original
+  id (this is why the digest includes resolved findings — round 1).
 - **`new_findings`** get fresh monotonic ids, `status: open`, and are appended.
-- **Fail-closed conditions that degrade the *entire* turn** (→ `structured: false`, see
-  Decision 3): a `prior_findings` id the ledger never issued; the same id appearing twice in
-  `prior_findings`; a `prior_findings` object carrying any field other than `id`/`status`; a
-  `new_findings` object carrying a `status`; any enum out of range. The block is trusted as a
-  whole or not at all — a block the server had to *partially* discard is a block it cannot
-  reason about, and round 1 was right that "ignore the bad entry with a warning" is exactly
-  how a serious finding silently leaves `open_count`.
+- **Fail-closed conditions that degrade the *entire* turn** (→ `structured: false`,
+  `non_convergence_reason: unstructured`, see Decision 3): the set of ids in `prior_findings` is
+  not *exactly* the ledger's id set (a missing id, an extra/unknown id, or any duplicate); a
+  `prior_findings` object carrying any field other than `id`/`status`; a `new_findings` object
+  carrying a `status`; any enum out of range. The block is trusted as a whole or not at all — a
+  block the server had to *partially* discard is a block it cannot reason about, and round 1 was
+  right that "ignore the bad entry with a warning" is exactly how a serious finding silently
+  leaves `open_count`. Whole-turn is the correct granularity precisely because per-finding
+  salvage is what re-opens that hole.
 
 Reconciliation is therefore **keyed by explicit server-owned ids the reviewer is handed and
 hands back, and the reviewer cannot rewrite what an id means** — only report its status. The
@@ -200,12 +246,18 @@ actually cleared everything it raised, because nothing in the pipeline can manuf
 boolean without the structure behind it.
 
 Robustness rule that makes even the *structured* path safe: **`verdict` and `open_count` are
-kept consistent by the server, deterministically.** In the structured path, `converged` (and
-thus the two-value `verdict`) is defined as `open_count == 0`. If the reviewer's block claims
-`verdict: approve` while the ledger still has open findings, that is a contradiction; the
-server resolves it in favour of the ledger (machine verdict `changes`, `converged: false`) and
-warns, naming the disagreement. A loop cannot be talked into stopping by a reviewer that wrote
-`approve` at the top and left a `major` open below.
+kept consistent by the server, deterministically.** `converged` is **not** "`open_count == 0`";
+it is the full conjunction defined at the top of this document — validated structure, valid
+ledger over the whole conversation, clean reconciliation, `open_count == 0`, *and* a clean
+`approve` from the reviewer. (Round 2 caught the earlier draft asserting the shorthand here
+while the truth table required the reviewer's verdict too; the shorthand is gone.) If the
+reviewer's block claims `verdict: approve` while the ledger still has open findings, that is a
+contradiction; the server resolves it in favour of the ledger (machine verdict `changes`,
+`converged: false`, `non_convergence_reason: verdict_contradiction`) and warns. If the reviewer
+reports `approve_with_comments` with nothing open, that is not a contradiction but it is not a
+clean approve either: `converged: false`, `non_convergence_reason: reviewer_withheld_approve`.
+A loop cannot be talked into stopping by a reviewer that wrote `approve` at the top and left a
+`major` open below, nor left spinning silently by one that only ever comments.
 
 ### Decision 4 — extraction is fail-closed on ambiguity, and the ledger is injected as quoted evidence
 
@@ -213,17 +265,30 @@ Round 1 was right that "a fenced ```json block" is underspecified: a review can 
 several JSON fences, quoted examples, or a sentinel copied out of the repository under review.
 So:
 
-- The block is delimited by **exact begin/end sentinel lines** that are unlikely to occur in
-  ordinary prose or code, on their own lines — not by a bare ```` ```json ```` fence.
-- Extraction requires **exactly one** complete, well-formed sentinel block. **Zero → degrade**
-  (no structure this turn). **More than one → degrade** (fail-closed on ambiguity; the server
-  does not pick "the first" or "the last"). A block that opens and never closes → degrade.
+- The block is delimited by **exact begin/end sentinel lines carrying a per-review nonce**, on
+  their own lines — not by a bare ```` ```json ```` fence, and not by a fixed marker either. The
+  nonce is derived from the server's unique review id (ids are `rv-<pid>-<counter>`, so each
+  review's markers differ) and is placed in the prompt only, never in the repository. This
+  defeats the round-2 case of a repository embedding a *static* lookalike sentinel in its own
+  source and having it quoted back as the sole block: a fixed marker could be forged from source
+  the Codex reviewer can read; a per-review marker cannot be known ahead of the review.
+  **Honest limit:** the nonce is in the prompt the reviewer sees, so it stops a *static* embed,
+  not an *active* prompt-injection that reads the current turn's nonce out of its own context and
+  reproduces it. It is defence-in-depth over the exactly-one-block rule, not a substitute for it.
+- Extraction requires **exactly one** complete, well-formed sentinel block bearing this review's
+  nonce. **Zero → degrade** (no structure this turn). **More than one → degrade** (fail-closed on
+  ambiguity; the server does not pick "the first" or "the last"). A block that opens and never
+  closes → degrade.
 - The block body has a **strict size cap** and per-field length caps; over-cap → degrade. This
   is defence against a block that is technically parseable but pathological.
-- The prior-findings digest the server injects on a resumed turn is rendered as **quoted
-  evidence, not instructions**, exactly as the change capture and CLAUDE.md already are
+- The prior-findings digest the server injects on a resumed turn is rendered as **evidence,
+  labelled as evidence, not as instructions** — exactly as the change capture and CLAUDE.md are
   (README's "labelled as evidence, not instructions"). It carries ids, titles, locations and
-  statuses — never anything that reads as a directive to the reviewer.
+  statuses. Note what this does and does not claim: the *titles and locations are themselves
+  model-authored data* from earlier turns, so the labelling frames them as evidence and cannot
+  guarantee their content never reads as a directive — the guarantee is the framing and the
+  fencing, not that model-authored strings are inherently inert. That is the same honesty the
+  README already applies to the diff capture, and the same residual below applies.
 
 The extractor treats the reviewer's block as *more trusted than the repository* but still
 validates defensively: it is model output shaped by a prompt the server controls, but "more
@@ -265,10 +330,11 @@ must not break the prose channel anything already depends on:
   "result_status": "completed",  // present so one schema covers running/completed (see below)
   "structured": true,            // false on any degradation (Decision 3)
   "converged": false,            // the ONLY safe loop-termination signal
+  "non_convergence_reason": "open_findings",  // null iff converged; see the reason table
   "verdict": "approve" | "changes" | "unknown",   // "unknown" only when structured == false
   "verdict_source": "structured" | "prose" | "none",
   "verdict_detail": "approve" | "approve_with_comments" | "request_changes" | "blocked" | null,
-  "open_count": 2,               // NUMBER only when structured; otherwise null
+  "open_count": 2,               // NUMBER only when structured+valid+clean; otherwise null
   "total_count": 5,              // findings ever raised on this session, any status; null when unstructured
   "findings": [
     {
@@ -280,8 +346,7 @@ must not break the prose channel anything already depends on:
       "line": 129,               // optional; omitted when the finding is not line-scoped
       "detail": "<the reviewer's prose for this finding, as first captured>",
       "first_seen_turn": 1,
-      "last_seen_turn": 3,
-      "unaddressed_this_turn": false
+      "last_seen_turn": 3
     }
   ],
   "warnings": [ "reviewer marked verdict approve but 2 finding(s) are still open; treated as changes" ]
@@ -379,18 +444,22 @@ actually lives.
 
 ## Wiring (the I/O edges)
 
-- **`src/session.rs`** — `SessionRecord` gains an optional, versioned `findings_ledger`. Round
-  1 flagged that the store loads by whole-file deserialization (`src/session.rs:342`), so a
-  malformed ledger must not erase the session: the field deserializes tolerantly (into a
+- **`src/session.rs`** — `SessionRecord` gains two optional, versioned fields: a
+  `findings_ledger`, and a durable `pending_turn` intent marker (Decision 5). Round 1 flagged
+  that the store loads by whole-file deserialization (`src/session.rs:342`), so a malformed
+  ledger must not erase the session: the ledger field deserializes tolerantly (into a
   raw/optional value that degrades to "ledger unreadable" rather than failing the record), so a
   bad ledger becomes a field-level *degradation of that session's convergence*, not a lost
   session. `TurnFacts` carries the reconciled ledger a completed turn produced; `record_turn`
-  persists it under the existing exclusive-lock read-modify-write.
+  persists it — and clears the pending marker — under the existing exclusive-lock read-modify-
+  write. `resume_block` is extended to refuse a resume while a pending marker is set.
 - **The worker** (in `src/reviewer/mod.rs` / `src/tools.rs`) gains, around the existing review
-  call: load the prior ledger → hand it to the prompt builder → after the review text is
-  collected, extract + reconcile into an envelope and a new ledger → **persist the new ledger
-  before the result is delivered**, and if that persist fails, degrade this turn's envelope
-  (`structured: false`, non-convergent) and mark the session non-resumable — see Decision 5.
+  call: **write the durable `pending_turn` marker before the reviewer is invoked** → load the
+  prior ledger → hand it to the prompt builder → after the review text is collected, extract +
+  reconcile into an envelope and a new ledger → **persist the new ledger and clear the marker in
+  the one atomic replace before the result is delivered**. If that persist fails, degrade this
+  turn's envelope (`structured: false`, `non_convergence_reason: turn_not_durable`); the marker
+  stays set on disk, so the next call is refused a resume and must go `fresh` — see Decision 5.
 - **`src/registry.rs`** — `Review`, `Outcome`, and `Snapshot` carry the `Envelope` so the
   result renderer can emit both channels. Computed once, when the turn finishes, travelling with
   the snapshot like `usage` and `warnings` already do.
@@ -409,32 +478,69 @@ persist after the reviewer has already accepted and advanced its conversation, t
 conversation is ahead of the local ledger; a naïve retry would resume with stale ids and could
 mint colliding ones.
 
-This project already has the mechanism to lean on: a turn whose session state could not be
-persisted is reported as a warning and **the response stops inviting a resume** (README, "A
-session that could not be persisted is reported as a warning with the review, and the response
-then stops inviting a resume that would silently start over"). The ledger is persisted as part
-of that same session record under the same lock, so it inherits that behaviour, and the design
-tightens it for findings specifically:
+Round 2 was right that the round-1 answer did not actually close this. Pointing at the existing
+"stops inviting a resume" behaviour is not enough, because that behaviour is **in-memory
+rendering state** (`Snapshot.resumable`, which only changes the response text). It does not stop
+a *subsequent* call from resuming: `start_review` reads the stored `SessionRecord`
+([`src/tools.rs:179`](../src/tools.rs), under the held lease) and resumes it whenever
+`resume_block` allows, and `SessionRecord` ([`src/session.rs:28`](../src/session.rs)) has no
+durable "do not resume this" bit. Worse, a crash *before* the atomic replace has no chance to
+set even the in-memory flag — the process is gone. So the fix is a **durable write-ahead intent
+marker**, not a rendering flag:
 
-- The ledger write is part of the **same atomic session-record replace** as the existing
-  resume state, so the two never diverge on disk: either both this turn's resume state and its
-  ledger land, or neither does.
-- **If persistence fails after the reviewer turn**, the turn's envelope degrades
-  (`structured: false`, `open_count: null`, `converged: false`, warning), and the session is
-  marked non-resumable — so the next call is a fresh session with a fresh ledger rather than a
-  resume that reuses ids the remote conversation has moved past. No stale-id retry is possible
-  because no resume is offered.
-- **A resume is admitted only when the local ledger and the reviewer session agree** on turn
-  count / identity, which the existing resume-guard (`SESSION_NOT_RESUMABLE` on a turn/idle/
-  identity mismatch) already enforces at the session level; the ledger travels inside that same
-  guarded record, so a resume that passes the guard has a ledger consistent with the turn being
-  resumed.
+- **A pending-turn marker is written durably into the session record *before* the reviewer is
+  called**, while the lease is held, in the same atomic-replace discipline the record already
+  uses. It records that a turn is in flight against this session's reviewer conversation. (This
+  is new persisted state on `SessionRecord`, versioned like every other added field.)
+- **On a clean turn**, the atomic replace that writes the new ledger and resume state also
+  clears the marker — one write, so a reader never sees a new ledger beside a stale marker or
+  vice versa.
+- **On any crash, timeout, or persistence failure**, the marker survives on disk because it was
+  written first and never cleared. The next call finds it. `resume_block` is extended to refuse
+  a normal resume while a pending marker is present, returning `SESSION_NOT_RESUMABLE` and
+  pointing the caller at `fresh: true` (or a new session name) — exactly the existing
+  refuse-don't-silently-restart path this project already prefers. A `fresh: true` call ignores
+  the stored record entirely (`start_review` sets `prior = None`), so it starts a new
+  conversation with a new ledger and no stale ids; the poisoned record is replaced.
+- **The reviewer turn and the ledger cannot silently diverge**, because the only way to a
+  *clean* (marker-cleared) record is the atomic replace that also wrote the matching ledger; any
+  path that advanced the reviewer conversation but did not reach that replace leaves the marker
+  set, which blocks resume.
 
-The residual honest limitation: a crash in the narrow window *after* the reviewer accepted the
-turn and *before* the atomic replace commits loses this turn's status updates, and the session
-falls back to fresh. That is the safe direction — a lost turn re-reviews from scratch rather
-than resuming on a ledger that disagrees with the reviewer — and it is stated rather than
-papered over.
+The residual honest limitation, unchanged and now genuinely the *only* one: a crash in the
+narrow window after the reviewer accepted a turn and before the atomic replace loses that turn's
+status updates, and the session must be restarted `fresh`. That is the safe direction — a lost
+turn re-reviews from scratch rather than resuming on a ledger that disagrees with the reviewer —
+and it costs one re-review, not a corrupted convergence. It is stated rather than papered over.
+
+## Convergence requires a ledger over the whole conversation
+
+Round 2's third finding: "no ledger" is not uniformly safe. A session that began its reviewer
+*conversation* before this feature existed has real findings living only in that conversation's
+prose history, with **no server ids**. If such a session is resumed, the reviewer holds those
+old concerns but the server's ledger is empty, the resumed prompt can omit them, and an
+`approve` with no new findings would let an empty ledger read as `open_count == 0` and converge —
+while the old issues remain untracked. That is exactly the false convergence this design exists
+to prevent.
+
+So convergence is gated on the ledger covering the **whole** conversation, and the three "no
+current ledger" cases are *not* equivalent:
+
+- **Genuinely fresh turn 1** (new session, or `fresh: true`) — the ledger is created now and
+  covers the conversation from its first turn. **Convergeable.**
+- **Resumed session whose reviewer conversation predates the ledger** (turns > 0, no ledger on
+  record) — the conversation carries ungrounded prose findings the ledger does not know.
+  **Not convergeable.** The envelope reports normally but with `converged: false`,
+  `non_convergence_reason: ledger_unavailable`; the caller is told to start `fresh` to establish
+  a ledger that covers the whole conversation from turn 1. It is never silently treated as a
+  clean turn-1.
+- **Resumed session whose ledger is present but unreadable/incompatible** — same outcome,
+  `non_convergence_reason: ledger_unavailable`, session preserved (the record is not erased, per
+  the tolerant load below), never reset to a fresh zero-open ledger.
+
+The rule in one line: **a session can converge only if a ledger has covered it since its own
+turn 1.** Everything else can still be reviewed, and still gets an envelope, but cannot report
+`converged: true` until a fresh conversation gives it a whole-conversation ledger.
 
 ## What deliberately does not change
 
@@ -463,31 +569,38 @@ Every uncertain signal degrades toward "still open / say so / not converged," ne
 | `new_findings` object carries a `status` field | Whole-turn degrade + warning; new findings are server-forced `open`. |
 | Reviewer says `approve` but ledger has open findings | Machine verdict `changes`, `converged:false`, warning names the disagreement. |
 | Reviewer says `request_changes`/`blocked` with zero open | Machine verdict `changes`, `converged:false`; uncertainty never converges. |
-| Prior open finding the reviewer never mentions | Stays `open`, flagged `unaddressed_this_turn`; never auto-resolved. |
-| Regression of a previously resolved finding | Reviewer sends `f1: regressed` (resolved findings are in the injected digest); `f1` reopens, no new id. |
-| Ledger persisted by an incompatible schema version | Treated as unreadable → non-convergent + warning; **not** reset to a fresh zero-open ledger on an existing session. |
-| Ledger bytes corrupt / undeserializable | Field-level tolerant load → session survives, but that session is non-convergent + warning until a fresh session is started. |
-| Session recorded before ledgers existed | No ledger ever ≠ corrupt ledger: reconciles as a genuine fresh turn-1; no error, and it can converge normally. |
-| Ledger could not be persisted this turn | Envelope degrades, session marked non-resumable (Decision 5); no stale-id retry. |
+| Prior id the reviewer failed to account for | Whole-turn degrade (`non_convergence_reason: unstructured`); every prior id must appear exactly once — silence on any id is never an implied status. |
+| Regression of a previously resolved finding | Reviewer sends `f1: regressed` (resolved findings are in the injected digest, which lists every prior id); `f1` reopens, no new id. |
+| Ledger persisted by an incompatible schema version | Treated as unreadable → non-convergent (`ledger_unavailable`); **not** reset to a fresh zero-open ledger on an existing session. |
+| Ledger bytes corrupt / undeserializable | Field-level tolerant load → session survives, but is non-convergent (`ledger_unavailable`) until a fresh session is started. |
+| New session, or `fresh: true` | Ledger created now, covers the conversation from turn 1 → convergeable normally. |
+| Resumed session whose conversation predates the ledger (no ledger on record, turns > 0) | Reviewed, but non-convergent (`ledger_unavailable`): old prose findings have no ids and could be silently omitted. Caller must go `fresh` to gain a whole-conversation ledger. |
+| Turn's ledger could not be persisted | Envelope degrades (`turn_not_durable`); durable pending marker stays set, so the next call is refused a resume and must go `fresh` (Decision 5). |
 | Degraded turn mid-session | Prior ledger preserved untouched; that turn contributes no status updates, says so, and cannot converge. |
 
-The distinction round 1 sharpened: **"this session never had a ledger" (pre-feature, safe to
-treat as fresh and convergeable) is not the same as "this session's ledger is now unreadable"
-(unsafe — block convergence, do not reset).** The loader tells them apart; only the first can
-reach `converged`.
+The distinction round 2 sharpened, and it is three-way, not two: **a genuinely fresh turn 1**
+(ledger from turn 1 → convergeable) is not the same as **a resumed conversation that predates the
+ledger** (ungrounded prose history → non-convergent, must go `fresh`), which is not the same as
+**a present-but-unreadable ledger** (corrupt/incompatible → non-convergent, session preserved,
+never reset). The loader tells all three apart; only the first can reach `converged`.
 
 ## Tests
 
-- **`src/findings.rs` unit tests** — extraction (one clean block; block among other fences and
-  quoted examples; zero blocks; two blocks → degrade; unterminated block; over-cap field);
+- **`src/findings.rs` unit tests** — extraction (one clean block bearing the review nonce; a
+  block among other fences and quoted examples; a block with a *stale/foreign* nonce → not
+  matched; zero blocks; two blocks → degrade; unterminated block; over-cap field);
   reconciliation (turn-1 assignment; resolve; still-open; regressed-from-resolved; new finding
-  mid-session; unaddressed prior finding; unknown-id → whole-turn degrade; duplicate-id →
-  degrade; `new_findings` with a status → degrade; monotonic non-reuse of ids across many
-  turns); convergence + verdict (every row of the truth table; approve-with-open contradiction;
-  request-changes-with-none contradiction; unstructured → `converged:false`, `open_count:null`).
-- **`src/session.rs`** — ledger round-trips through persistence; a pre-ledger record loads and
-  can converge; a corrupt-ledger record loads *without erasing the session* and is
-  non-convergent; an incompatible version is not misread.
+  mid-session; **a prior id the reviewer omitted → whole-turn degrade**; unknown-id → degrade;
+  duplicate-id → degrade; `new_findings` with a status → degrade; monotonic non-reuse of ids
+  across many turns); convergence + verdict (every row of the truth table; approve-with-open
+  contradiction → `verdict_contradiction`; request-changes-with-none → `verdict_contradiction`;
+  approve-with-comments + zero open → `reviewer_withheld_approve`, not converged; unstructured →
+  `converged:false`, `open_count:null`, `non_convergence_reason:unstructured`).
+- **`src/session.rs`** — ledger round-trips through persistence; a genuinely fresh turn-1
+  converges; a **resumed pre-ledger conversation is non-convergent** (`ledger_unavailable`), not
+  treated as a clean turn-1; a corrupt-ledger record loads *without erasing the session* and is
+  non-convergent; an incompatible version is not misread; a **pending-turn marker blocks resume**
+  and a `fresh` call clears it.
 - **`src/prompt.rs`** — the resumed prompt lists prior findings (open and resolved) with ids as
   quoted evidence; a fresh prompt does not; the block-format instruction (exact markers,
   two-array split) is present on turn 1.
@@ -549,20 +662,57 @@ disputed. What changed:
    schema validates running and completed results alike (["One schema for every successful
    response"](#one-schema-for-every-successful-response)).
 
+## Round 2 response
+
+Codex (gpt-5.6-luna, effort=max) returned REQUEST CHANGES again, confirming round-1 items #1,
+#3-schema, #4, #5-core and #9 resolved and flagging four majors + one minor. All accepted; none
+disputed. What changed:
+
+1. **A resolved prior finding could be omitted and silently keep `resolved`** (only omitted
+   *open* findings were flagged), so an unmentioned regression could leave every entry resolved
+   and converge → **`prior_findings` must now account for every prior id, open and resolved,
+   exactly once; any omission degrades the whole turn** (Decision 2; the `converged` conjunction;
+   failure table). The `unaddressed_this_turn` silent-keep path is gone entirely.
+2. **Decision 5 did not actually prevent stale resumes** — `resumable` is in-memory rendering
+   state, `SessionRecord` had no durable non-resumable bit, and a crash before the replace could
+   mark nothing → **a durable `pending_turn` write-ahead marker**, written before the reviewer
+   call and cleared only by the atomic replace that writes the matching ledger; `resume_block`
+   refuses a resume while it is set, forcing `fresh` (Decision 5, wiring).
+3. **A pre-feature session with no ledger is not safely convergeable if its conversation is
+   resumed** (ungrounded prose findings with no ids) → **the three-way rule**: only a ledger that
+   has covered a conversation since its own turn 1 permits convergence; a resumed pre-ledger
+   conversation is reviewed but non-convergent (`ledger_unavailable`) until a `fresh` restart
+   ([new section](#convergence-requires-a-ledger-over-the-whole-conversation)).
+4. **Self-contradiction: `converged` "defined as `open_count == 0`" vs. the truth table needing
+   the reviewer's verdict too** → the shorthand is removed; `converged` is only ever the full
+   conjunction, and a new machine-readable [`non_convergence_reason`](#non_convergence_reason)
+   both resolves the contradiction and adds the livelock guard the reviewer asked for
+   (`reviewer_withheld_approve` tells a loop to escalate rather than spin).
+5. **(minor) Per-review nonce + honesty about quoted evidence** → the sentinel now carries a
+   per-review nonce derived from the review id (defeats a *static* embedded lookalike; stated not
+   to defeat an *active* injection reading the current nonce), and the "quoted evidence" claim is
+   softened to acknowledge the injected titles/locations are themselves model-authored data
+   (Decision 4).
+
+Two of the reviewer's closing notes are adopted directly: the **content hash is dropped** (with
+the reviewer no longer resupplying prior content, it would only detect the server's own rendering
+drift; if ledger-record integrity is ever wanted, a record-level checksum/version is the right
+tool, noted as a future option), and **flag-and-keep-open remains the default with no
+auto-resolve** — reinforced now that omission degrades rather than being silently kept, so a
+finding cannot be quietly waited out at all.
+
 ## Open questions for the reviewer
 
-1. **Convergence on `approve_with_comments` with zero open findings.** The truth table keeps
-   this non-convergent (footnote 1): the reviewer declined a clean `approve`, so the loop keeps
-   going until it gets one. The alternative is to converge on zero open findings regardless of
-   the reviewer's four-level nuance. Is deferring to the reviewer's own top-level judgement the
-   right call, or should numeric zero win?
-2. **Should a prior finding the reviewer ignores for K consecutive turns escalate** (e.g. a
-   distinct warning, or forcing attention) so it cannot be quietly waited out across many
-   rounds, or is flag-and-keep-open per turn sufficient?
-3. **Is the content hash still worth adding** now that the reviewer no longer resupplies prior
-   findings' content at all? With content server-owned and immutable, the paraphrase/retarget
-   vector is closed structurally; a hash would only detect the server's own rendering drift. Is
-   there a remaining case it earns its complexity for?
-4. **Sentinel design.** Is an exact begin/end marker pair plus exactly-one-block plus size caps
-   sufficient against a repository that embeds a lookalike sentinel in its own source (which the
-   Codex reviewer can read), or is a per-review nonce in the marker warranted?
+1. **Is requiring the reviewer to re-state a status for *every* prior id on every resumed turn
+   the right cost trade?** It is the fix for the round-2 omission hole and it is cheap per entry
+   (`{id, status}` pairs), but on a long session the id list grows unbounded across turns. Is
+   total-accounting-or-degrade correct, or should resolved findings eventually be retired from
+   the required set (and if so, by what rule that does not reopen the regression hole)?
+2. **Does the `reviewer_withheld_approve` reason fully close the livelock**, or should there be
+   an explicit turn-count ceiling after which the loop is told to stop regardless, so an
+   autonomous caller cannot spin indefinitely against a reviewer that never returns a clean
+   `approve`?
+3. **Is the per-review nonce derived from the review id strong enough**, given ids are
+   `rv-<pid>-<counter>` and therefore guessable, or should the nonce be a random token generated
+   per review (at the cost of one more thing to thread through and log)? The threat it defends —
+   a *static* embedded lookalike — does not obviously need unguessability, but I want your read.
