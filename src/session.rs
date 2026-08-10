@@ -1155,6 +1155,47 @@ mod tests {
     }
 
     #[test]
+    fn the_findings_marker_is_independent_of_the_perforce_pending_marker() {
+        // The findings write-ahead is a *separate* sidecar from the Perforce `.pending` baseline
+        // marker on purpose: a set `.pending` means "take a full re-capture and continue", while a
+        // set `.findings-pending` means "refuse the resume". Sharing one file would entangle those
+        // opposite recoveries, so the two must be fully independent — setting or clearing one must
+        // never move the other, and each must survive a restart on its own.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        assert_eq!(store.marker_state("s"), MarkerState::Absent);
+        assert_eq!(store.findings_marker_state("s"), MarkerState::Absent);
+
+        // Setting the findings marker leaves the Perforce marker untouched.
+        store.mark_findings_pending("s").expect("mark findings");
+        assert_eq!(store.findings_marker_state("s"), MarkerState::Present);
+        assert_eq!(
+            store.marker_state("s"),
+            MarkerState::Absent,
+            "a findings marker must not set the Perforce pending marker"
+        );
+
+        // Setting the Perforce marker too: both are now present and distinct.
+        store.mark_pending("s").expect("mark pending");
+        assert_eq!(store.marker_state("s"), MarkerState::Present);
+        assert_eq!(store.findings_marker_state("s"), MarkerState::Present);
+
+        // Both survive a restart (a fresh store over the same directory).
+        let restarted = SessionStore::new(&dir);
+        assert_eq!(restarted.marker_state("s"), MarkerState::Present);
+        assert_eq!(restarted.findings_marker_state("s"), MarkerState::Present);
+
+        // Clearing one leaves the other set.
+        store.clear_findings_pending("s").expect("clear findings");
+        assert_eq!(store.findings_marker_state("s"), MarkerState::Absent);
+        assert_eq!(
+            store.marker_state("s"),
+            MarkerState::Present,
+            "clearing the findings marker must not clear the Perforce pending marker"
+        );
+    }
+
+    #[test]
     fn rebinding_a_name_to_a_new_reviewer_session_restarts_the_count() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
@@ -1231,6 +1272,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    raw_bin: RawBin::PathSearch,
+                    resolved_bin: String::new(),
                     findings_ledger: None,
                     terminal_reason: None,
                 },

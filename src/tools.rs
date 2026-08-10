@@ -242,12 +242,9 @@ impl App {
         // never something the server does silently. A missing store is `Absent`, the normal
         // first-run state, and passes.
         if self.sessions.store_state() == crate::session::StoreState::Corrupt {
-            return Err(errors::session_not_resumable(
+            return Err(errors::store_corrupt(
                 &session,
-                "the session store is corrupt (it did not parse), so no review can be started \
-                 against it — resume or fresh. Move the store file aside or point --state-dir at a \
-                 clean directory, then retry. The corrupt file has been left untouched for recovery."
-                    .to_string(),
+                &self.sessions.path().display().to_string(),
             ));
         }
 
@@ -1821,6 +1818,10 @@ impl Job {
                     capture_summary: None,
                     resumable: false,
                     usage: crate::metrics::Usage::default(),
+                    // No reviewer ran; `run` attributes the terminal outcome to the entry the walk
+                    // settled on. This over-budget short-circuit sits inside that walk, so leave it
+                    // to `run` to name the active entry.
+                    active: None,
                     envelope: Some(envelope),
                 });
             }
@@ -2023,6 +2024,19 @@ impl Job {
         // mapping but never advanced the baseline, so the next turn subtracted against a
         // stale total and double-counted this one.
         let record_under = parsed.session_id.as_deref().or(resume_id);
+        // A resume whose reviewer answered under a *different* nonempty session id is a conversation
+        // identity change: the id that answered is not the one we resumed, so this turn's reviewer
+        // never held the session's earlier turn-by-turn history -- only the injected findings digest
+        // (a summary, not the full prior prose/diffs). Recording the resumed ledger -- still stamped
+        // `whole_conversation` -- under that new id would let a re-keyed, effectively first-turn
+        // conversation converge as though it had reviewed the whole thread. Fail closed: do not
+        // record. The findings write-ahead marker stays set (it is only cleared in the durable Ok
+        // arm), so the next non-fresh call is refused at the findings gate and the caller rebaselines
+        // fresh; the prior ledger is preserved on disk for that handoff. The review prose below is
+        // unaffected. A fresh turn (`resume_id` is `None`) and a resume that echoes the same id or no
+        // id at all are all unaffected.
+        let resumed_id_mismatch =
+            resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref());
         // Whether the findings write-ahead marker was successfully cleared after a durable record.
         // A durable turn whose marker clear *failed* leaves the marker set, so the next non-fresh
         // call will be refused at the findings gate -- such a turn must not advertise itself as
@@ -2032,74 +2046,96 @@ impl Job {
         // Whether this turn was durably recorded. Distinct from `resumable` below: a turn can be
         // durable yet non-resumable (an over-budget turn persists a terminal state that refuses the
         // next resume, or a failed marker clear that refuses it).
-        let durable = match record_under {
-            Some(session_id) => {
-                if parsed.session_id.is_none() {
-                    eprintln!(
+        let durable = if resumed_id_mismatch {
+            warnings.push(format!(
+                "The reviewer answered under a different session id ('{}') than the one this resume \
+                 targeted ('{}'), so its conversation did not contain this session's earlier turns \
+                 -- only the findings digest. This turn was not recorded and session '{}' cannot be \
+                 resumed: the next call is refused a resume (the write-ahead marker is still set). \
+                 Any prior findings are preserved on disk -- start a fresh review (fresh: true) \
+                 carrying the still-open findings into the new instructions. The review below is \
+                 still valid.",
+                parsed.session_id.as_deref().unwrap_or_default(),
+                resume_id.unwrap_or_default(),
+                self.session
+            ));
+            eprintln!(
+                "cross-review: warning: reviewer reported session id '{}' on a resume of '{}' \
+                 (expected '{}'); not recording, leaving the session non-resumable",
+                parsed.session_id.as_deref().unwrap_or_default(),
+                self.session,
+                resume_id.unwrap_or_default()
+            );
+            false
+        } else {
+            match record_under {
+                Some(session_id) => {
+                    if parsed.session_id.is_none() {
+                        eprintln!(
                         "cross-review: warning: the reviewer reported no session id on a resumed \
                          turn; recording under the resumed id for session '{}'",
                         self.session
                     );
-                }
-                match self.sessions.record_turn(
-                    &self.session,
-                    session::TurnFacts {
-                        reviewer: self.spec.reviewer.as_str(),
-                        cli_session_id: session_id,
-                        model: &self.spec.model,
-                        effort: &self.spec.effort,
-                        cwd: &self.cfg.cwd.to_string_lossy(),
-                        cumulative_usage: baseline_to_persist,
-                        // Bind the session to the changelist set (Perforce only), canonicalised
-                        // so a re-review naming the same changelists in another order resumes.
-                        changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
-                            .then(|| crate::changeset::canonical(&self.changes)),
-                        // The (HEAD, base) baseline this turn captured, so the next resume
-                        // reviews only what changed since it -- and only when its own range
-                        // still resolves to the same base. Both come from the capture, which
-                        // leaves them `None` (together) for Perforce, an unresolved HEAD, or a
-                        // truncated diff; the record then advances or retains them as a pair.
-                        head_sha: head_sha.map(str::to_string),
-                        base_sha: base_sha.map(str::to_string),
-                        // The Perforce resume-delta binding and baseline. `backend` and the
-                        // shelved flag are known from config; the capture identity and per-file
-                        // baseline come from the capture (both `None` for git).
-                        backend: Some(self.cfg.vcs.backend_id()),
-                        include_shelved: (self.cfg.vcs == crate::config::Vcs::Perforce)
-                            .then_some(self.include_shelved),
-                        capture_identity: capture_identity.cloned(),
-                        perforce_baseline: perforce_baseline.cloned(),
-                        // The active entry's identity, so a resume can match this exact entry and
-                        // detect PATH drift.
-                        raw_bin: self.spec.raw_bin(),
-                        resolved_bin: self.bin.to_string_lossy().into_owned(),
-                        // Filled by the findings-envelope worker wiring (see `attempt`); the
-                        // reconciled ledger and any terminal state this turn produced.
-                        findings_ledger: findings_ledger_to_persist.clone(),
-                        terminal_reason: terminal_reason_to_persist.clone(),
-                    },
-                ) {
-                    Ok(_) => {
-                        // Durably recorded: clear the Perforce in-progress marker so the next resume
-                        // trusts this turn's baseline. Only reached after `record_turn` returned
-                        // `Ok`. If the delete fails the marker may survive and wrongly disable the
-                        // *next* incremental review, so say so rather than letting it silently
-                        // persist.
-                        if self.cfg.vcs == crate::config::Vcs::Perforce {
-                            if let Err(e) = self.sessions.clear_pending(&self.session) {
-                                warnings.push(format!(
+                    }
+                    match self.sessions.record_turn(
+                        &self.session,
+                        session::TurnFacts {
+                            reviewer: self.spec.reviewer.as_str(),
+                            cli_session_id: session_id,
+                            model: &self.spec.model,
+                            effort: &self.spec.effort,
+                            cwd: &self.cfg.cwd.to_string_lossy(),
+                            cumulative_usage: baseline_to_persist,
+                            // Bind the session to the changelist set (Perforce only), canonicalised
+                            // so a re-review naming the same changelists in another order resumes.
+                            changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                                .then(|| crate::changeset::canonical(&self.changes)),
+                            // The (HEAD, base) baseline this turn captured, so the next resume
+                            // reviews only what changed since it -- and only when its own range
+                            // still resolves to the same base. Both come from the capture, which
+                            // leaves them `None` (together) for Perforce, an unresolved HEAD, or a
+                            // truncated diff; the record then advances or retains them as a pair.
+                            head_sha: head_sha.map(str::to_string),
+                            base_sha: base_sha.map(str::to_string),
+                            // The Perforce resume-delta binding and baseline. `backend` and the
+                            // shelved flag are known from config; the capture identity and per-file
+                            // baseline come from the capture (both `None` for git).
+                            backend: Some(self.cfg.vcs.backend_id()),
+                            include_shelved: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                                .then_some(self.include_shelved),
+                            capture_identity: capture_identity.cloned(),
+                            perforce_baseline: perforce_baseline.cloned(),
+                            // The active entry's identity, so a resume can match this exact entry and
+                            // detect PATH drift.
+                            raw_bin: self.spec.raw_bin(),
+                            resolved_bin: self.bin.to_string_lossy().into_owned(),
+                            // Filled by the findings-envelope worker wiring (see `attempt`); the
+                            // reconciled ledger and any terminal state this turn produced.
+                            findings_ledger: findings_ledger_to_persist.clone(),
+                            terminal_reason: terminal_reason_to_persist.clone(),
+                        },
+                    ) {
+                        Ok(_) => {
+                            // Durably recorded: clear the Perforce in-progress marker so the next resume
+                            // trusts this turn's baseline. Only reached after `record_turn` returned
+                            // `Ok`. If the delete fails the marker may survive and wrongly disable the
+                            // *next* incremental review, so say so rather than letting it silently
+                            // persist.
+                            if self.cfg.vcs == crate::config::Vcs::Perforce {
+                                if let Err(e) = self.sessions.clear_pending(&self.session) {
+                                    warnings.push(format!(
                                     "This turn was saved, but the session's in-progress marker \
                                      could not be cleared ({e}); the next review of session '{}' \
                                      may re-send the whole change instead of only what changed.",
                                     self.session
                                 ));
+                                }
                             }
-                        }
-                        // Clear the findings write-ahead marker too (all backends). A failed delete
-                        // over-refuses the next resume toward `fresh` — the safe direction — so the
-                        // turn is recorded (durable) but reported non-resumable (`resumable` folds
-                        // in `findings_marker_cleared` below), matching what the next call will do.
-                        match self.sessions.clear_findings_pending(&self.session) {
+                            // Clear the findings write-ahead marker too (all backends). A failed delete
+                            // over-refuses the next resume toward `fresh` — the safe direction — so the
+                            // turn is recorded (durable) but reported non-resumable (`resumable` folds
+                            // in `findings_marker_cleared` below), matching what the next call will do.
+                            match self.sessions.clear_findings_pending(&self.session) {
                             Ok(()) => findings_marker_cleared = true,
                             Err(e) => warnings.push(format!(
                                 "This turn was saved, but the findings write-ahead marker could not \
@@ -2108,24 +2144,24 @@ impl Job {
                                 self.session
                             )),
                         }
-                        true
-                    }
-                    Err(e) => {
-                        // The review itself succeeded; losing resumability is worth a warning but
-                        // not worth discarding the review.
-                        //
-                        // Do *not* `forget` the record here. The prior ledger must stay intact on
-                        // disk so a human-directed rebaseline can carry its still-open findings
-                        // forward -- that is the `turn_not_durable` recovery contract (design
-                        // Decision 5). Resume is already blocked without deleting anything: the
-                        // findings write-ahead marker is still set (this Err arm never reached the
-                        // Ok arm that clears it), so the next non-fresh call is refused at the
-                        // findings gate regardless of backend. For Perforce the `.pending` marker
-                        // is set too, so even a crash before this point cannot collapse a later
-                        // resume against the stale baseline. The old destructive poisoning (drop
-                        // the mapping) predated the write-ahead markers and would now erase the
-                        // preserved findings for no added safety.
-                        warnings.push(format!(
+                            true
+                        }
+                        Err(e) => {
+                            // The review itself succeeded; losing resumability is worth a warning but
+                            // not worth discarding the review.
+                            //
+                            // Do *not* `forget` the record here. The prior ledger must stay intact on
+                            // disk so a human-directed rebaseline can carry its still-open findings
+                            // forward -- that is the `turn_not_durable` recovery contract (design
+                            // Decision 5). Resume is already blocked without deleting anything: the
+                            // findings write-ahead marker is still set (this Err arm never reached the
+                            // Ok arm that clears it), so the next non-fresh call is refused at the
+                            // findings gate regardless of backend. For Perforce the `.pending` marker
+                            // is set too, so even a crash before this point cannot collapse a later
+                            // resume against the stale baseline. The old destructive poisoning (drop
+                            // the mapping) predated the write-ahead markers and would now erase the
+                            // preserved findings for no added safety.
+                            warnings.push(format!(
                             "This turn could not be saved to disk ({e}), so session '{}' cannot be \
                              resumed: the next call is refused a resume because the write-ahead \
                              marker is still set. Any prior findings are preserved on disk -- \
@@ -2134,19 +2170,19 @@ impl Job {
                              unaffected.",
                             self.session
                         ));
-                        eprintln!("cross-review: warning: could not save session state: {e}");
-                        false
+                            eprintln!("cross-review: warning: could not save session state: {e}");
+                            false
+                        }
                     }
                 }
-            }
-            None => {
-                // No session id means this turn cannot be recorded. Do *not* `forget` the prior
-                // record: like the failed-persistence arm above, it must stay intact on disk so a
-                // rebaseline can carry its findings forward. Resume is already blocked -- the
-                // findings write-ahead marker was set before the reviewer ran and is never cleared
-                // without a durable record, so the next non-fresh call is refused at the findings
-                // gate for every backend. No destructive poisoning of the mapping is needed.
-                warnings.push(format!(
+                None => {
+                    // No session id means this turn cannot be recorded. Do *not* `forget` the prior
+                    // record: like the failed-persistence arm above, it must stay intact on disk so a
+                    // rebaseline can carry its findings forward. Resume is already blocked -- the
+                    // findings write-ahead marker was set before the reviewer ran and is never cleared
+                    // without a durable record, so the next non-fresh call is refused at the findings
+                    // gate for every backend. No destructive poisoning of the mapping is needed.
+                    warnings.push(format!(
                     "The reviewer did not report a session id, so this turn could not be recorded \
                      and session '{}' cannot be resumed: the next call is refused a resume because \
                      the write-ahead marker is still set. Any prior findings are preserved on disk \
@@ -2154,12 +2190,13 @@ impl Job {
                      the new instructions. The review below is still valid.",
                     self.session
                 ));
-                eprintln!(
+                    eprintln!(
                     "cross-review: warning: the reviewer did not report a session id, so review \
                      session '{}' cannot be resumed",
                     self.session
                 );
-                false
+                    false
+                }
             }
         };
 
@@ -2204,6 +2241,20 @@ impl Job {
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
+
+/// Whether a resumed turn's reviewer answered under a *different* conversation than the one we
+/// resumed, which must fail closed (the ledger is not durably recorded — see the call site).
+///
+/// True only when this was a resume (`resume_id` is `Some`) **and** the reviewer reported a
+/// nonempty session id that differs from it. A fresh turn (`resume_id` is `None`), a resume that
+/// echoes the same id, and a resume that reports no id at all (handled as "still the same thread")
+/// are all *not* mismatches.
+fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) -> bool {
+    matches!(
+        (resume_id, reported),
+        (Some(resumed), Some(reported)) if resumed != reported
+    )
+}
 
 /// Why a stored session must not be resumed, phrased for the calling agent, or `None` when
 /// it may be. Checked while the session lease is held and before any reviewer is spawned,
@@ -2501,6 +2552,19 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resumed_session_id_mismatch_only_fires_on_a_resume_with_a_different_reported_id() {
+        // A resume whose reviewer answered under a different nonempty id is the one fail-closed case.
+        assert!(resumed_session_id_mismatch(Some("A"), Some("B")));
+        // Same id echoed back: the normal resume, not a mismatch.
+        assert!(!resumed_session_id_mismatch(Some("A"), Some("A")));
+        // Resume that reported no id: handled elsewhere as "still the same thread", not a mismatch.
+        assert!(!resumed_session_id_mismatch(Some("A"), None));
+        // A fresh turn (no resume target) with any reported id is never a mismatch.
+        assert!(!resumed_session_id_mismatch(None, Some("B")));
+        assert!(!resumed_session_id_mismatch(None, None));
+    }
 
     // -----------------------------------------------------------------------
     // assemble_disposition: the gates and framing the tools layer supplies over the backend.

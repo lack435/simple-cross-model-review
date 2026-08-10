@@ -742,20 +742,29 @@ actually lives.
   `terminal_reason` when the turn is over budget — under the existing exclusive-lock read-modify-
   write. `resume_block` is extended to refuse a resume while `terminal_reason` is set, before the
   session is claimed.
-- **The write-ahead marker *reuses the existing `.pending` sidecar*, it does not add a parallel
-  field** (round-7 minor #3). This repository already has exactly the mechanism Decision 5 needs:
-  `mark_pending` / `clear_pending` / `is_pending` (`src/session.rs:273`+) write a `.pending` sibling
-  file *before* a turn does anything that could deliver a review without persisting, clear it only
-  once the turn is durably recorded, and are **fail-closed** (`is_pending` returns `true` on an I/O
-  error). It was built for the Perforce resume-delta baseline, but its contract — "a set marker
-  means the last turn did not durably record; fall back / refuse resume" — is exactly the findings
-  write-ahead too. So the findings path **reuses the same per-session sidecar** rather than
-  introducing `SessionRecord.pending_turn`: one marker, one meaning ("this session's last turn is
-  not durably recorded"), consulted by `resume_block` for both purposes. Coexistence is therefore
-  trivial — a marker set by a Perforce turn and one set by a findings turn are indistinguishable and
-  both correctly block a findings resume; a **pre-upgrade** `.pending` left by an older Perforce-only
-  build is understood unchanged by `is_pending`, and is tested across a restart. This is a strictly
-  smaller change than a new field and inherits the sidecar's already-verified fail-closed behaviour.
+- **The write-ahead marker is a *dedicated* `.findings-pending` sidecar, a sibling of the existing
+  Perforce `.pending` one** (round-7 minor #3 proposed reusing `.pending`; implementation review
+  found the two must stay separate because a set marker means *different things* to the two
+  concerns). The repository already has the sidecar *mechanism* — `mark_pending` / `clear_pending` /
+  `marker_state` write a sibling file *before* a turn does anything that could deliver a review
+  without persisting, clear it only once the turn is durably recorded, and are **fail-closed**
+  (`marker_state` treats an I/O error as `Present`). The findings path takes a **parallel** marker
+  (`mark_findings_pending` / `clear_findings_pending` / `findings_marker_state`) built on the same
+  `marker_path` helper, rather than sharing the one file. The reason is that a set marker triggers
+  **opposite recoveries**: a leftover `.pending` (Perforce baseline) tells the next turn to take a
+  **full re-capture** and keep going — not a refusal; a leftover `.findings-pending` tells
+  `start_review` to **refuse the resume** (`SESSION_NOT_RESUMABLE`), because the ledger may now be
+  stale relative to the reviewer's advanced conversation and a full diff re-capture would not repair
+  that. Sharing one marker would entangle these: a Perforce turn that only needed a re-capture would
+  over-refuse the next findings resume, and the findings gate would pre-empt the Perforce
+  full-capture fallback even in the two cases where the ledger is provably *not* stale (a crash
+  before the findings marker is written during capture, and a pre-launch reviewer failure that
+  started no child — both of which `attempt` detects and clears the findings marker for). Keeping
+  the two markers distinct lets each fire its own recovery. Both are still per-session sidecars, both
+  fail-closed, both survive a crash/restart, and a **pre-upgrade** `.pending` left by an older
+  Perforce-only build is understood unchanged (it is never read as a findings marker). This
+  separation is tested: a set findings marker refuses the resume while the Perforce full-recapture
+  path stays reachable for the not-stale cases.
 - **`src/session.rs` — the store load itself becomes tri-state, which round 3 showed is the real
   fix, not a tolerant field.** Today `read()` (`src/session.rs:342`) maps *both* "file missing"
   and "file present but unparseable" to `StoreFile::default()` — an empty set — so a corrupt
@@ -991,31 +1000,38 @@ implicit; both are now stated:
   `turn_not_durable` (the next call is refused a resume anyway). Either way the break is durable and
   no later turn can converge. Tested by: valid turn 1 → malformed turn 2 that adds a new prose
   finding → valid turn 3 must **not** converge (`ledger_unavailable`).
-- **`invalid`** — a **durable poison**, not a per-load observation. Round 4's finding: if `invalid`
-  meant only "unreadable *this* load," a `whole_conversation` record whose ledger bytes later
-  failed to parse could keep its `whole_conversation` stamp and then accept a *replacement* ledger
-  and converge. So a `whole_conversation` (or any) record whose ledger is found unreadable/
-  incompatible **transitions durably to `invalid` and that transition is persisted and sticky**:
-  `whole_conversation → invalid` is a one-way door. An `invalid` conversation is non-convergent
-  for the rest of its life, the record is preserved (never reset to a fresh zero-open ledger), and
-  only a human-directed rebaseline `fresh` escapes it. Because the unreadable ledger is caught **at
-  load, before any reviewer runs**, an `invalid` resume is a **`SESSION_NOT_RESUMABLE` refusal** (a
-  machine-readable error, no completed envelope and no prose — nothing ran), *not* a completed
-  envelope; `invalid` is therefore never a completed-envelope `ledger_coverage` value. The ledger's
-  findings are unrecoverable from the server, so the `fresh` re-reviews from scratch.
+- **`invalid`** — a **durable poison, derived at load** — and the implementation reaches that
+  durability by *construction* rather than by writing a separate transition. Round 4's finding was
+  that if `invalid` meant only "unreadable *this* load" **and coverage lived in a field separate
+  from the ledger**, a `whole_conversation` record whose ledger bytes later failed to parse could
+  keep its `whole_conversation` stamp and then accept a *replacement* ledger and converge. The
+  implementation removes the premise: **coverage is stored *inside* the ledger JSON**
+  (`Ledger.coverage`), not in a separate `SessionRecord` field, so there is no independent
+  `whole_conversation` stamp that could outlive an unreadable ledger. When the ledger bytes fail to
+  parse, deserialize at an incompatible version, or fail `is_structurally_valid`, the load yields
+  `invalid` and *nothing readable claims `whole_conversation`*. `whole_conversation → invalid` is
+  therefore a one-way door that needs **no poison-*write*** to be durable: the corruption is
+  self-durable (nothing overwrites it on a refused resume), so every later load re-derives `invalid`.
+  An `invalid` conversation is non-convergent for the rest of its life, the record is preserved
+  (never reset to a fresh zero-open ledger), and only a human-directed rebaseline `fresh` escapes it.
+  Because the unreadable ledger is caught **at load, before any reviewer runs**, an `invalid` resume
+  is a **`SESSION_NOT_RESUMABLE` refusal** (a machine-readable error, no completed envelope and no
+  prose — nothing ran), *not* a completed envelope; `invalid` is therefore never a completed-envelope
+  `ledger_coverage` value. The ledger's findings are unrecoverable from the server, so the `fresh`
+  re-reviews from scratch.
 
-  **If persisting the poison transition itself fails, the turn fails closed** (round 5): the
-  server must **not** fall back to treating the record as still `whole_conversation` (which would
-  leave it convergeable and able to accept a replacement ledger). The corrupt ledger is detected
-  **at load time, before the model call**, so a failed poison-write is a **resume refusal before
+  **The turn fails closed with no write at all** (round 5's invariant, reached without a poison-write
+  step): the server never falls back to treating the record as still `whole_conversation`, because
+  the only place coverage is read from is the ledger, and the ledger did not parse. The corrupt
+  ledger is detected **at load time, before the model call**, so it is a **resume refusal before
   anything is billed**: `resume_block` returns `SESSION_NOT_RESUMABLE` with the ledger reported
   `ledger_unavailable` (the record's own ledger is unreadable — *not* `state_corrupt`, which is
   reserved for a whole-store parse failure), which is an escalation → rebaseline, not an autonomous
   restart. Nothing runs as a `whole_conversation` turn. The next process load re-reads the
-  still-corrupt ledger and re-attempts the poison, so the
-  state is self-healing toward `invalid`, never toward `whole_conversation`. This is tested both
-  same-process (the refusal) and across a restart (the record is still not convergeable) by
-  injecting a poison-write failure.
+  still-corrupt ledger and again derives `invalid`, so the state is self-healing toward `invalid`,
+  never toward `whole_conversation`. This holds across a restart because the on-disk bytes are
+  unchanged, and `is_structurally_valid` additionally rejects a ledger that somehow carries an
+  `invalid` (or transient `unestablished`) coverage on disk, so neither can ever load as usable.
 
 The one-way lattice: the initial state before anything durably persists is **`unestablished`**
 (round 13) — a fresh turn that has not yet recorded; a clean turn 1 moves it to

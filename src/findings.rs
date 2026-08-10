@@ -101,10 +101,20 @@ pub enum VerdictSource {
     None,
 }
 
-/// The durable, persisted coverage provenance — a one-way state machine (see the module doc and
-/// the design). Only `whole_conversation` can converge. `invalid` is stored to poison a record
-/// whose ledger became unreadable, but it never appears in a *completed* envelope: an unreadable
-/// ledger is caught at load and is a pre-model resume refusal.
+/// The coverage provenance carried *inside* the persisted ledger — a one-way state machine (see the
+/// module doc and the design). Only `whole_conversation` can converge.
+///
+/// Because coverage lives inside the ledger JSON rather than in a separate record field, `invalid`
+/// is **derived at load, not written**: there is no independent coverage stamp that could survive
+/// an unreadable ledger. If the ledger bytes fail to parse, deserialize at an incompatible version,
+/// or fail [`Ledger::is_structurally_valid`], the load yields `invalid` and `resume_block` refuses
+/// the resume before any model call. The corruption is self-durable — nothing overwrites it on a
+/// refused resume, so the next load re-derives `invalid` — which is exactly why no separate
+/// poison-*write* is needed: there is no readable `whole_conversation` stamp left to keep, so the
+/// design's replacement-ledger-converges hazard is unreachable by construction. `invalid` therefore
+/// never appears in a *completed* envelope; it is only ever a pre-model resume refusal, and this
+/// variant exists so [`is_structurally_valid`](Ledger::is_structurally_valid) can reject a ledger
+/// that somehow carries it on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LedgerCoverage {
@@ -116,8 +126,8 @@ pub enum LedgerCoverage {
     NeedsRebaseline,
     /// A turn that ran but persisted no coverage (a fresh turn 1 whose write failed). Non-convergent.
     Unestablished,
-    /// The persisted ledger became unreadable/incompatible. A resume-refusal state, never a
-    /// completed-envelope value.
+    /// The persisted ledger was found unreadable/incompatible/structurally invalid at load. Derived,
+    /// never written (see the enum doc); a resume-refusal state, never a completed-envelope value.
     Invalid,
 }
 
@@ -241,11 +251,17 @@ impl Ledger {
     /// version. A loader must reject a ledger that fails this: exact-set reconciliation and
     /// monotonic id assignment both assume it, so a persisted ledger with duplicate ids, or a
     /// `next_seq` that is not strictly greater than every existing `f<n>`, could mint a colliding id
-    /// and eventually let a bad turn converge. Also rejects a stored `invalid` coverage, which is a
-    /// resume-refusal poison and must never load as a usable ledger. Fail-closed: any doubt is
-    /// invalid.
+    /// and eventually let a bad turn converge. Also rejects a stored `invalid` *or* `unestablished`
+    /// coverage: `invalid` is a resume-refusal poison, and `unestablished` is a purely transient
+    /// "nothing durably persisted yet" state that `coverage_after_turn` never produces — a ledger
+    /// carrying either on disk is a tampered or impossible record, and loading it would let a valid
+    /// resumed turn emit `findings_trusted: false` beside a non-empty findings list. Neither may
+    /// ever load as a usable ledger. Fail-closed: any doubt is invalid.
     pub fn is_structurally_valid(&self) -> bool {
-        if self.coverage == LedgerCoverage::Invalid {
+        if matches!(
+            self.coverage,
+            LedgerCoverage::Invalid | LedgerCoverage::Unestablished
+        ) {
             return false;
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -481,10 +497,14 @@ pub fn strip_marker_lines(text: &str) -> String {
 }
 
 /// Drop everything from a begin marker line through its matching end marker line (inclusive). An
-/// **unterminated** block — a begin marker with no matching end — is also removed, from the begin
-/// line to end-of-text: a malformed or truncated block still degrades the turn, and leaving its raw
-/// marker and payload in the rendered prose would expose exactly the transport block this strips (a
-/// begin line with no end has no legitimate content after it that we would want to keep).
+/// **unterminated** block — a begin marker with no matching end — drops *only its begin marker
+/// line*, keeping the lines after it. This is the degraded-turn path: extraction already failed
+/// `Unterminated`, so the whole review is returned unstructured precisely so a human can read the
+/// reviewer's prose, and dropping from the marker to end-of-text would delete exactly that prose —
+/// the truncated block's own payload plus any narrative the reviewer wrote after it. Only the
+/// marker *line* is transport; the payload left behind is inert (no matching end delimiter, so
+/// nothing parses it), and the whole rendered body is swept once more by `strip_marker_lines`
+/// before the canonical `_OUT` block is appended, so no stray marker survives regardless.
 fn strip_between(text: &str, (begin, end): &(String, String)) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
@@ -497,8 +517,12 @@ fn strip_between(text: &str, (begin, end): &(String, String)) -> String {
                     i = j + 1;
                     continue;
                 }
-                // Unterminated: drop from the begin marker to end-of-text.
-                None => break,
+                // Unterminated: drop only this begin marker line and keep the rest, so a degraded
+                // turn's prose is not silently truncated to end-of-text.
+                None => {
+                    i += 1;
+                    continue;
+                }
             }
         }
         out.push(lines[i]);
@@ -863,9 +887,14 @@ pub fn output_schema() -> Value {
             "findings": {"type": "array", "items": finding},
             "warnings": {"type": "array", "items": {"type": "string"}}
         },
+        // Every key the completed renderer emits is required: `non_convergence_reason`,
+        // `verdict_detail`, `open_count` and `total_count` are always present (as `null` when
+        // absent — the renderer emits them via `json!`, never `skip_serializing_if`), so a schema
+        // that left them optional would under-describe the wire format a client parses.
         "required": [
             "schema_version", "session", "turn", "result_status", "structured", "converged",
-            "verdict", "verdict_source", "ledger_coverage", "findings_trusted", "findings", "warnings"
+            "non_convergence_reason", "verdict", "verdict_source", "verdict_detail",
+            "ledger_coverage", "findings_trusted", "open_count", "total_count", "findings", "warnings"
         ],
         "additionalProperties": false
     });
@@ -882,7 +911,12 @@ pub fn output_schema() -> Value {
             "activity_age_seconds": {"type": "integer"},
             "output_bytes": {"type": "integer"}
         },
-        "required": ["schema_version", "session", "turn", "result_status"],
+        // The running renderer always emits the progress/liveness group too (see
+        // `running_structured_value`), so require it rather than describing it as optional.
+        "required": [
+            "schema_version", "session", "turn", "result_status", "elapsed_seconds", "phase",
+            "phase_elapsed_seconds", "activity_age_seconds", "output_bytes"
+        ],
         "additionalProperties": false
     });
     json!({ "oneOf": [completed, running] })
@@ -1307,15 +1341,23 @@ mod tests {
     }
 
     #[test]
-    fn strips_an_unterminated_in_block_to_end_of_text() {
-        // A begin marker with no matching end still degrades the turn; its raw payload must not
-        // survive into the rendered prose.
+    fn an_unterminated_in_block_drops_only_its_marker_line_not_the_tail() {
+        // A begin marker with no matching end degrades the turn (extraction returns `Unterminated`),
+        // so the whole review is rendered unstructured for a human to read. The stripper must drop
+        // only the transport marker *line*, not everything after it: the reviewer's actual findings
+        // prose can sit after a truncated/garbled block, and nuking to end-of-text would delete the
+        // very narrative the degraded path exists to surface. The leftover payload is inert (no end
+        // delimiter parses it) and the marker line itself is gone.
         let (b, _e) = markers(IN_TAG, "rv-1-1");
-        let text = format!("keep me\n{b}\n{{\"verdict\":\"approve\" (truncated...");
+        let text =
+            format!("keep me\n{b}\n{{\"verdict\":\"approve\" (garbled)\n## Findings\n- a real bug");
         let stripped = strip_reviewer_block(&text, "rv-1-1");
         assert!(stripped.contains("keep me"));
+        // The degraded prose after the unterminated marker is preserved.
+        assert!(stripped.contains("## Findings"));
+        assert!(stripped.contains("a real bug"));
+        // But the transport marker line is removed.
         assert!(!stripped.contains("CROSS_REVIEW_FINDINGS_IN"));
-        assert!(!stripped.contains("truncated"));
     }
 
     #[test]
@@ -1348,6 +1390,17 @@ mod tests {
             findings: vec![],
         };
         assert!(!poisoned.is_structurally_valid());
+        // A stored `unestablished` coverage is impossible from `coverage_after_turn` (it is a purely
+        // transient "nothing persisted yet" state); a record carrying it is tampered/impossible and
+        // must not load, or a valid resumed turn could emit `findings_trusted: false` beside a
+        // non-empty findings list. Rejected even with an otherwise-sound findings set.
+        let stray_unestablished = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::Unestablished,
+            next_seq: 2,
+            findings: vec![finding("f1", Status::Open, 1, 1)],
+        };
+        assert!(!stray_unestablished.is_structurally_valid());
         // A non-canonical id spelling (leading zeros) that `u64::parse` would accept but which is
         // not how ids are minted: it shares a seq with `f7` and would defeat the duplicate check.
         let noncanonical = Ledger {

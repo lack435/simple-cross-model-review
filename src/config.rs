@@ -1527,6 +1527,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: Some(RawBin::PathSearch),
             resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
         };
         // Matches the fallback entry (index 1), not the primary.
         assert_eq!(cfg.resume_entry_index(&rec), Some(1));
@@ -1557,6 +1559,8 @@ mod tests {
             perforce_baseline: None,
             raw_bin: None, // legacy: no stored bin
             resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
         let ambiguous = Config::from_args(&args(&[
