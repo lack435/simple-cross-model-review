@@ -114,6 +114,9 @@ pub struct Review {
     /// full change by design, or a full change because an intended delta fell back -- and why.
     /// `None` on a fresh turn or a turn that sent no change, which render no disposition line.
     pub disposition: Option<crate::vcs::Disposition>,
+    /// What the server captured and sent this turn, for the `captured:` response line. `None`
+    /// when no change was sent (`--diff none`, a shell-equipped reviewer, or a failed capture).
+    pub capture_summary: Option<crate::vcs::CaptureSummary>,
     /// Whether a follow-up call on this session name will actually reach the same
     /// reviewer conversation. Tracked rather than assumed, so the response never invites
     /// a resume that would silently start over.
@@ -158,6 +161,8 @@ pub struct Outcome {
     pub warnings: Vec<String>,
     /// The resume disposition of this turn; see [`Review::disposition`].
     pub disposition: Option<crate::vcs::Disposition>,
+    /// What the server captured and sent this turn; see [`Review::capture_summary`].
+    pub capture_summary: Option<crate::vcs::CaptureSummary>,
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
     pub usage: Usage,
@@ -173,6 +178,7 @@ impl Outcome {
             denial_count_is_floor: false,
             warnings: Vec::new(),
             disposition: None,
+            capture_summary: None,
             resumable: false,
             usage: Usage::default(),
         }
@@ -188,6 +194,7 @@ impl Outcome {
             denial_count_is_floor: false,
             warnings: Vec::new(),
             disposition: None,
+            capture_summary: None,
             resumable: true,
             usage: Usage::default(),
         }
@@ -365,6 +372,7 @@ impl Registry {
                 denial_count_is_floor: false,
                 warnings: Vec::new(),
                 disposition: None,
+                capture_summary: None,
                 resumable: false,
                 started: now,
                 finished: None,
@@ -442,6 +450,7 @@ impl Registry {
                 review.denial_count_is_floor = outcome.denial_count_is_floor;
                 review.warnings = outcome.warnings;
                 review.disposition = outcome.disposition;
+                review.capture_summary = outcome.capture_summary;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
                 match outcome.failure {
@@ -650,6 +659,8 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     /// The resume disposition of this turn; see [`Review::disposition`].
     pub disposition: Option<crate::vcs::Disposition>,
+    /// What the server captured and sent this turn; see [`Review::capture_summary`].
+    pub capture_summary: Option<crate::vcs::CaptureSummary>,
     pub resumable: bool,
     pub elapsed: Duration,
     pub phase: Phase,
@@ -678,6 +689,7 @@ impl Snapshot {
             denial_count_is_floor: review.denial_count_is_floor,
             warnings: review.warnings.clone(),
             disposition: review.disposition.clone(),
+            capture_summary: review.capture_summary.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
             phase: review.phase,

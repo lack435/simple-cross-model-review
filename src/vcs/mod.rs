@@ -12,6 +12,7 @@
 //! live in [`shared`], single-sourced so a second backend cannot fork the security logic.
 
 pub mod baseline;
+pub mod capture_summary;
 pub mod disposition;
 pub mod git;
 pub mod perforce;
@@ -20,6 +21,7 @@ mod shared;
 use std::sync::atomic::AtomicBool;
 
 use crate::config::{Config, Vcs};
+pub use capture_summary::CaptureSummary;
 pub use disposition::Disposition;
 pub use git::{DiffMode, GitResumeBaseline};
 pub use shared::{Capture, CapturedChange};
@@ -83,10 +85,16 @@ fn git_capture(
     cancel: &AtomicBool,
 ) -> Capture {
     let captured = git::capture(cfg, resume, cancel);
-    let change = captured.change.map(|change| CapturedChange {
-        diff_bytes: change.diff.text.len(),
-        diff_truncated: change.diff.truncated,
-        rendered: git::render(&change, &cfg.cwd, cfg.reviewer_has_shell()),
+    let change = captured.change.map(|change| {
+        let rendered = git::render(&change, &cfg.cwd, cfg.reviewer_has_shell());
+        CapturedChange {
+            diff_bytes: change.diff.text.len(),
+            diff_truncated: change.diff.truncated,
+            rendered,
+            // The git backend built the summary where the resolved endpoints and mode were in
+            // scope; move it across unchanged.
+            summary: change.summary,
+        }
     });
     Capture {
         change,
@@ -141,6 +149,19 @@ mod golden_tests {
             untracked_omitted: vec!["`blob.bin` is binary".into()],
             notes: vec!["`git status` did not complete for some reason.".into()],
             incremental_from: None,
+            // The render does not read the summary, so its exact values do not affect this golden
+            // snapshot; a representative value keeps the fixture constructible.
+            summary: super::CaptureSummary::Git {
+                range: "git diff HEAD".into(),
+                files: 1,
+                insertions: 1,
+                deletions: 0,
+                untracked_files: 1,
+                untracked_files_floor: false,
+                diff_truncated: false,
+                diff_incomplete: false,
+                complete: true,
+            },
         }
     }
 

@@ -210,6 +210,12 @@ pub fn capture(
         .sum();
     let diff_truncated = budget.diff_truncated;
 
+    // How much of the requested change did not arrive whole, for the caller summary and its
+    // warnings. A captured-but-incomplete segment (a binary/out-of-root/lossy file) is distinct
+    // from a wholly skipped changelist, and both are distinct from the byte-budget truncation.
+    let incomplete_changelists = segments.iter().filter(|s| !s.complete).count();
+    let evidence_units = segments.iter().flat_map(|s| &s.units).count();
+
     // Skipped changelists are a bound on the evidence the caller is reading, so they are
     // surfaced as a warning too, not only rendered into the prompt.
     let mut warnings = Vec::new();
@@ -230,6 +236,16 @@ pub fn capture(
         warnings.push(format!(
             "The captured change was incomplete: the combined diff was cut short at the \
              {MAX_DIFF_BYTES}-byte cap, so the reviewer was not shown all of it."
+        ));
+    }
+    // Captured-but-incomplete changelists are prompt-only otherwise; the caller cannot see the
+    // prompt, so the count reaches it here too (the per-file reasons stay in the prompt).
+    if incomplete_changelists > 0 {
+        warnings.push(format!(
+            "The captured change was incomplete: {incomplete_changelists} of {} captured \
+             changelist(s) had evidence that could not be fully shown (for example a binary, \
+             out-of-root, or lossily-decoded file); the per-file reasons are in the prompt.",
+            captured.len()
         ));
     }
 
@@ -280,6 +296,18 @@ pub fn capture(
             rendered,
             diff_bytes,
             diff_truncated,
+            summary: crate::vcs::CaptureSummary::Perforce {
+                skipped: skipped.len(),
+                incomplete_changelists,
+                evidence_units,
+                diff_truncated,
+                // Whole only when nothing was skipped, every captured segment was complete, and
+                // the combined diff was not budget-cut. Narrower than `capture_complete`, which
+                // also gates baseline eligibility on the client-spec digest -- a different
+                // question from whether the evidence shown this turn was whole.
+                complete: skipped.is_empty() && incomplete_changelists == 0 && !diff_truncated,
+                changelists: captured,
+            },
         }),
         warnings,
         // Perforce has no git HEAD; the git incremental-resume baseline is git-only.
