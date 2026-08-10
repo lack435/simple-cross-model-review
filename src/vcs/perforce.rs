@@ -2430,13 +2430,13 @@ mod tests {
     #[test]
     fn info_parses_client_root_and_ignores_unknown_client() {
         let info = parse_info(
-            "... userName dwellman\n... clientName dwellman_W680\n... clientRoot C:\\dev\\main\\UE\n\
-             ... clientHost W680\n",
+            "... userName alice\n... clientName alice_ws\n... clientRoot C:\\work\\project\n\
+             ... clientHost BUILDHOST\n",
         );
-        assert_eq!(info.client, "dwellman_W680");
-        assert_eq!(info.root, "C:\\dev\\main\\UE");
-        assert_eq!(info.user, "dwellman");
-        assert_eq!(info.host, "W680");
+        assert_eq!(info.client, "alice_ws");
+        assert_eq!(info.root, "C:\\work\\project");
+        assert_eq!(info.user, "alice");
+        assert_eq!(info.host, "BUILDHOST");
         assert!(info.has_client());
 
         // An unresolved client reports the sentinel and no root -> not a workspace.
@@ -2447,15 +2447,15 @@ mod tests {
     #[test]
     fn clients_parse_client_root_and_host() {
         let raw = "\
-... client dwellman_main\n... Owner dwellman\n... Host W680\n... Root C:\\dev\\main\\UE\n\n\
+... client alice_main\n... Owner alice\n... Host BUILDHOST\n... Root C:\\work\\project\n\n\
 ... client hostless\n... Root C:\\dev\\other\n\n\
 ... Owner nobody\n... Root C:\\nope\n";
         let clients = parse_clients_ztag(raw);
         // The record with no `client` field is skipped, not defaulted.
         assert_eq!(clients.len(), 2);
-        assert_eq!(clients[0].client, "dwellman_main");
-        assert_eq!(clients[0].root, "C:\\dev\\main\\UE");
-        assert_eq!(clients[0].host, "W680");
+        assert_eq!(clients[0].client, "alice_main");
+        assert_eq!(clients[0].root, "C:\\work\\project");
+        assert_eq!(clients[0].host, "BUILDHOST");
         // A client with no Host line is host-unlocked (empty), a wildcard downstream.
         assert_eq!(clients[1].client, "hostless");
         assert!(clients[1].host.is_empty());
@@ -2472,18 +2472,18 @@ mod tests {
     #[test]
     fn select_client_takes_the_host_matched_longest_root() {
         let clients = vec![
-            spec("outer", "C:\\dev\\main\\UE", "W680"),
-            spec("nested", "C:\\dev\\main\\UE\\Bobcat", "W680"),
-            spec("otherbox", "C:\\dev\\main\\UE", "OTHERBOX"),
+            spec("outer", "C:\\work\\project", "BUILDHOST"),
+            spec("nested", "C:\\work\\project\\Bobcat", "BUILDHOST"),
+            spec("otherbox", "C:\\work\\project", "OTHERBOX"),
         ];
         // Under the outer root but not the nested one -> outer wins.
         assert!(matches!(
-            select_client(&clients, Path::new("C:\\dev\\main\\UE\\Foo"), "W680"),
+            select_client(&clients, Path::new("C:\\work\\project\\Foo"), "BUILDHOST"),
             ClientChoice::One(c) if c.client == "outer"
         ));
         // Under the nested root -> the deeper client wins.
         assert!(matches!(
-            select_client(&clients, Path::new("C:\\dev\\main\\UE\\Bobcat\\Sub"), "W680"),
+            select_client(&clients, Path::new("C:\\work\\project\\Bobcat\\Sub"), "BUILDHOST"),
             ClientChoice::One(c) if c.client == "nested"
         ));
     }
@@ -2496,7 +2496,7 @@ mod tests {
         ];
         // The host-unlocked client is usable on this machine; the locked one is not.
         assert!(matches!(
-            select_client(&clients, Path::new("C:\\ws\\sub"), "W680"),
+            select_client(&clients, Path::new("C:\\ws\\sub"), "BUILDHOST"),
             ClientChoice::One(c) if c.client == "anywhere"
         ));
         // With only the host-locked client, nothing matches on this host -- it is not a
@@ -2505,7 +2505,7 @@ mod tests {
             select_client(
                 &[spec("locked", "C:\\ws", "OTHERBOX")],
                 Path::new("C:\\ws\\sub"),
-                "W680"
+                "BUILDHOST"
             ),
             ClientChoice::None
         ));
@@ -2516,7 +2516,7 @@ mod tests {
         // Two clients share the deepest containing root: ambiguous, not a coin toss.
         let tie = vec![spec("a", "C:\\ws", ""), spec("b", "C:\\ws", "")];
         assert!(matches!(
-            select_client(&tie, Path::new("C:\\ws\\x"), "W680"),
+            select_client(&tie, Path::new("C:\\ws\\x"), "BUILDHOST"),
             ClientChoice::Ambiguous
         ));
         // A longer root later in the list still breaks what would have been a tie.
@@ -2526,7 +2526,7 @@ mod tests {
             spec("deep", "C:\\ws\\x", ""),
         ];
         assert!(matches!(
-            select_client(&broken, Path::new("C:\\ws\\x\\y"), "W680"),
+            select_client(&broken, Path::new("C:\\ws\\x\\y"), "BUILDHOST"),
             ClientChoice::One(c) if c.client == "deep"
         ));
         // No client root contains the working root.
@@ -2534,7 +2534,7 @@ mod tests {
             select_client(
                 &[spec("elsewhere", "C:\\other", "")],
                 Path::new("C:\\ws\\x"),
-                "W680"
+                "BUILDHOST"
             ),
             ClientChoice::None
         ));
@@ -2565,13 +2565,13 @@ mod tests {
     fn describe_meta_parses_multiline_desc_status_and_indexed_files() {
         // BOM + CRLF + a multi-line description with a blank line inside it, then the
         // single-line fields and indexed files that follow it.
-        let raw = "\u{feff}... change 43650\r\n... client dwellman_W680\r\n\
+        let raw = "\u{feff}... change 43650\r\n... client alice_ws\r\n\
 ... desc Add cross-review\r\n\r\nSecond paragraph of the description.\r\n\
 ... status pending\r\n... depotFile0 //depot/a\r\n... action0 edit\r\n\
 ... depotFile1 //depot/b\r\n... action1 add\r\n";
         let meta = parse_describe_ztag(raw).expect("meta");
         assert!(!meta.submitted);
-        assert_eq!(meta.client, "dwellman_W680");
+        assert_eq!(meta.client, "alice_ws");
         assert!(meta.description.contains("Add cross-review"));
         assert!(meta.description.contains("Second paragraph"));
         assert_eq!(meta.files.len(), 2);
@@ -2668,7 +2668,7 @@ Change 5 by u@c on 2026/01/01\n\n\
 
     #[test]
     fn identity_validation_rejects_sentinels_and_non_specs() {
-        assert!(is_real_identity_field("ssl:perforce:1666"));
+        assert!(is_real_identity_field("ssl:perforce.example:1666"));
         assert!(!is_real_identity_field(""));
         assert!(!is_real_identity_field("   "));
         assert!(!is_real_identity_field("*unknown*"));
@@ -2763,33 +2763,33 @@ Change 5 by u@c on 2026/01/01\n\n\
 
     #[test]
     fn containment_is_cwd_only_and_fails_closed_on_parent_dir() {
-        let cwd = Path::new("C:\\dev\\main\\UE");
+        let cwd = Path::new("C:\\work\\project");
         // A nonexistent path outside cwd is rejected, even if it is under a broader client
         // root -- the reviewer's reads are scoped to cwd, so ours are too.
-        assert!(!within_root(Path::new("C:\\dev\\main\\Other\\x.txt"), cwd));
-        assert!(within_root(Path::new("C:\\dev\\main\\UE\\gone.txt"), cwd));
+        assert!(!within_root(Path::new("C:\\work\\Other\\x.txt"), cwd));
+        assert!(within_root(Path::new("C:\\work\\project\\gone.txt"), cwd));
         // A `..` component cannot be seen through by a lexical prefix test, so it fails closed.
         assert!(!lexically_within(
-            Path::new("C:\\dev\\main\\UE\\..\\Other\\x"),
+            Path::new("C:\\work\\project\\..\\Other\\x"),
             cwd
         ));
     }
 
     #[test]
     fn lexical_containment_keeps_deleted_files_and_rejects_siblings() {
-        let root = Path::new("C:\\dev\\main\\UE");
+        let root = Path::new("C:\\work\\project");
         // A file with nothing on disk still counts as inside by its lexical path.
         assert!(lexically_within(
-            Path::new("C:\\dev\\main\\UE\\gone.txt"),
+            Path::new("C:\\work\\project\\gone.txt"),
             root
         ));
         assert!(lexically_within(
-            Path::new("C:/dev/main/UE/sub/gone.txt"),
+            Path::new("C:/work/project/sub/gone.txt"),
             root
         ));
         // A sibling directory sharing a prefix is not inside.
         assert!(!lexically_within(
-            Path::new("C:\\dev\\main\\UE-other\\x"),
+            Path::new("C:\\work\\project-other\\x"),
             root
         ));
         assert!(!lexically_within(Path::new("C:\\dev\\other\\x"), root));
@@ -3128,11 +3128,11 @@ Change 5 by u@c on 2026/01/01\n\n\
         ])
         .expect("config");
         let info = Info {
-            client: "dwellman_W680".into(),
-            root: "C:\\dev\\main\\UE".into(),
-            user: "dwellman".into(),
-            host: "W680".into(),
-            server: "ssl:perforce:1666".into(),
+            client: "alice_ws".into(),
+            root: "C:\\work\\project".into(),
+            user: "alice".into(),
+            host: "BUILDHOST".into(),
+            server: "ssl:perforce.example:1666".into(),
             trustworthy: true,
         };
         let captured: Vec<u64> = segments.iter().map(|s| s.change).collect();

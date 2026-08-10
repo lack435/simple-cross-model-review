@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn capture_identity_matches_only_with_a_confirmed_spec() {
         let base = CaptureIdentity {
-            server: "ssl:perforce:1666".into(),
+            server: "ssl:perforce.example:1666".into(),
             client: "ws".into(),
             charset: "utf8".into(),
             client_spec_digest: Some("abc".into()),
