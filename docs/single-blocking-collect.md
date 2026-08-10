@@ -1,8 +1,8 @@
 # Single blocking collect — design
 
-Status: **plan, approved for implementation** — round 4 of cross-model review returned APPROVE
-(see [Review history](#review-history)); the round-4 comments are folded in and a confirming pass
-is pending.
+Status: **plan, approved for implementation** — cross-model review returned APPROVE in rounds 4 and
+5 with no correctness or security blocker (see [Review history](#review-history)); the shrinking
+minor comments from each have been folded in.
 
 Addresses [#39](../../issues/39): `cross_model_review_result` caps `wait_seconds` at 300, but
 reviews in this project routinely run 5–25 minutes, so every review forces the caller into a
@@ -175,9 +175,14 @@ draft got wrong:
     (`src/vcs/shared.rs`) and the boundary/decode helpers take `String`; truncating 8 MiB of bytes
     can land mid-codepoint, so the path must not `from_utf8`/lossy-decode the truncated bytes at all
     on the over-cap branch — it returns `OUTPUT_TRUNCATED` straight from the flag, and only decodes
-    when the read was within cap. (`src/vcs/shared.rs` is `pub(crate)`, so `reviewer/codex.rs` can
-    call `read_capped` directly; if a text-returning wrapper reads better, add or re-export one
-    rather than widening visibility ad hoc.) An over-limit test asserts the read yields
+    when the read was within cap. (`read_capped` is a `pub(crate)` *item*, but its
+    module is declared `mod shared;` — **private** — at [`src/vcs/mod.rs:17`](../src/vcs/mod.rs),
+    which today re-exports only `Capture, CapturedChange`. A `pub(crate)` item in a private module is
+    not nameable from `reviewer/codex.rs`, so this PR adds an explicit re-export —
+    `pub(crate) use shared::read_capped;` from `vcs/mod.rs` (preferred), or makes the module
+    `pub(crate) mod shared;` — rather than assuming the path already resolves. The same plumbing
+    applies to `CAPTURE_BUDGET`, which `Config::max_wait()` now needs: re-export it from `vcs/mod.rs`
+    the same way, or lift the constant somewhere already reachable from `config.rs`.) An over-limit test asserts the read yields
     `OUTPUT_TRUNCATED` rather than a partial review presented as complete. This tightens today's
     behaviour, where an over-8-MiB final message would otherwise have been returned as a valid review.
   - **Session persistence has no wall-clock deadline** (`src/session.rs`), so a stalled disk write
@@ -526,3 +531,9 @@ the server can wake the agent on its own.
   3. smoke Review B tolerates "already completed before cancel"; the deterministic kill proof is the
      unit test.
   4. "never lost work" qualified to "while the process stays alive."
+
+- **Round 5** (same session) — APPROVE WITH COMMENTS; all round-4 findings confirmed resolved, "no
+  correctness or security blocker remains." One plumbing detail: `mod shared;` is private in
+  `vcs/mod.rs`, so `pub(crate)` items in it are not nameable from `reviewer/codex.rs`/`config.rs`.
+  Folded in: the PR adds explicit `pub(crate)` re-exports of `read_capped` and `CAPTURE_BUDGET` from
+  `vcs/mod.rs`. No behavioural change.
