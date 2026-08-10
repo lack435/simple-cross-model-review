@@ -18,8 +18,9 @@ spelling.
 
 The existing Windows restricted-token sandbox remains in force for every shell command
 the Codex reviewer might still request. The evidence server adds no write or network tool,
-does not load repository code or configuration, and runs in the reviewer's existing
-kill-on-close job object.
+and does not load repository code or configuration. Whether Codex's MCP child inherits the
+reviewer's kill-on-close job object is a compatibility premise to verify, not a boundary this
+plan assumes; the service also owns cleanup for any provider process it starts.
 
 ## Why an allow-list is the wrong boundary
 
@@ -41,11 +42,14 @@ Two narrower hypotheses were ruled out:
 
 The replacement path was also probed before this plan was committed. An explicit stdio MCP
 entry added with `-c mcp_servers.issue47_probe.*` loaded under `--ignore-user-config` and
-`--strict-config` on both a fresh turn and `codex exec resume`. With `required=true` and
-`default_tools_approval_mode="approve"`, the model called the server tool successfully. The
+`--strict-config` on both a fresh turn and `codex exec resume`. With
+`mcp_servers.issue47_probe.required=true` and
+`mcp_servers.issue47_probe.default_tools_approval_mode="approve"`, the model called the
+server tool successfully. The latter is documented as a per-server key, not a global MCP
+default; Phase 0 still verifies that it has no effect on a second server. The
 JSONL stream produced paired `item.started` / `item.completed` events of type
 `mcp_tool_call`, carrying server, tool, arguments, result, error, and status -- enough for
-the parent to attest a completed evidence call without parsing model prose. Without the
+the parent to observe completed evidence calls without parsing model prose. Without the
 explicit tool approval mode, the non-interactive call was cancelled, so that setting is a
 required part of the design rather than an incidental test detail.
 
@@ -64,7 +68,7 @@ are the [Codex rules documentation](https://developers.openai.com/codex/rules) a
 ## Goals
 
 1. An isolated Codex reviewer can list repository files, search content, read files, inspect
-   the configured change, and request bounded history without shell-policy denials.
+   the configured change, and (for Git) request bounded history without shell-policy denials.
 2. The default review path preserves configuration isolation, the OS-enforced no-write
    boundary, no-network behavior, process-tree cleanup, and stdout-as-protocol-only.
 3. Evidence operations are path-confined, deterministic, resource-bounded, observable, and
@@ -73,8 +77,8 @@ are the [Codex rules documentation](https://developers.openai.com/codex/rules) a
    full review into a thinner review that can still report approval.
 5. Resume turns get the same evidence contract as fresh turns and cannot inherit a stale
    repository root or stale service instance.
-6. The abstraction is VCS-neutral at the MCP layer. Git and Perforce may implement different
-   history/change providers underneath it, but the reviewer gets one vocabulary.
+6. The abstraction is VCS-neutral at the MCP layer. Provider-specific gaps are explicit
+   `unsupported` results; they are never papered over by network access or shell fallback.
 
 ## Non-goals
 
@@ -87,6 +91,21 @@ are the [Codex rules documentation](https://developers.openai.com/codex/rules) a
 - Do not add a network-capable evidence operation.
 - Do not remove policy-denial reporting. Denials remain useful evidence for shell calls that
   occur outside the new service.
+
+## Scope choice
+
+This is intentionally larger than an issue-specific prompt workaround because the rejected
+commands are symptoms of a release-specific shell router, while dependable repository
+evidence is a product requirement. The project remains one Windows executable with its
+existing `serde` dependencies; the evidence mode is a second dispatcher in that executable,
+not a new daemon or package.
+
+The first implementation is nevertheless bounded: scope/list/search/read/change for local
+workspaces, plus Git history/revision because the issue explicitly includes Git discovery
+and history. It does not add regex, Perforce history/network access, general command
+execution, write tools, or a plugin system. Those omissions are conscious stopping points,
+not deferred claims. This balance accepts internal blast radius to remove the policy-router
+dependency without turning `cross-review` into a general repository service.
 
 ## Architecture
 
@@ -104,10 +123,11 @@ fresh and resumed turns. Default isolation still passes `--ignore-user-config`, 
 project MCP servers, hooks, skills, and settings remain absent; the server-owned MCP entry is
 added afterward at invocation precedence. Add `--strict-config` so an older Codex CLI that
 does not accept the generated MCP configuration fails before a billed review can masquerade
-as fully equipped. Set `required=true`, `enabled=true`, an exact `enabled_tools` list, and
-`default_tools_approval_mode="approve"`. Auto-approval is safe only because this is a
-server-owned entry whose complete tool surface is read-only; it must never be applied to a
-user or repository MCP server.
+as fully equipped. Set `mcp_servers.<reserved-name>.required=true`, `.enabled=true`, an exact
+`.enabled_tools` list, and `.default_tools_approval_mode="approve"`. Auto-approval is safe
+only because the setting is scoped to this server-owned entry whose complete tool surface is
+read-only; it must never be applied at top level or to a user/repository MCP server. Phase 0
+tests that a second server still follows its own approval policy.
 
 The internal server receives an opaque, per-turn capability file path rather than a root and
 options assembled from model input. The parent creates that file in the existing state/temp
@@ -122,8 +142,8 @@ Expose the following tools with closed JSON schemas (`additionalProperties: fals
 small defaults:
 
 - `repository_scope()` returns the canonical root, VCS kind, configured change label,
-  current status summary, service schema version, limits, and per-turn nonce. The reviewer
-  must call this first.
+  current status summary, service schema version, limits, and per-turn nonce. The preamble
+  recommends it first, but review validity does not depend on the model choosing to call it.
 - `repository_list(path?, cursor?, limit?)` returns repository-relative entries and type,
   with deterministic ordinal pagination. It never follows directory links or descends into
   VCS metadata, build output, or the service's state directory.
@@ -136,10 +156,11 @@ small defaults:
 - `repository_change(cursor?, limit_bytes?)` returns the already selected/captured change
   and omission metadata in pages rather than asking the reviewer to reconstruct it with
   `git diff` or `p4 describe`.
-- `repository_history(path?, before?, cursor?, limit?)` returns a normalized, bounded commit
-  or changelist summary. A subsequent `repository_revision(id, path?, cursor?)` reads a
-  validated revision through fixed provider-owned arguments. Reviewer input is data, never
-  spliced into an option or shell command.
+- `repository_history(path?, before?, cursor?, limit?)` returns a normalized, bounded Git
+  commit summary. A subsequent `repository_revision(id, path?, cursor?)` reads a validated
+  Git revision through fixed provider-owned arguments. Reviewer input is data, never spliced
+  into an option or shell command. Perforce returns `unsupported` for both tools in this
+  implementation; its configured change remains available through `repository_change`.
 
 Every result reports `complete`, `truncated`, and a continuation cursor. A cap can reduce an
 answer, but it cannot silently label a prefix as the whole result. Cursors are opaque,
@@ -157,12 +178,20 @@ component that resolves through a symlink or junction outside the root. Open han
 verify final paths before reading to close path-check/path-open races as far as the standard
 library and existing Win32 surface allow. Listing and search do not follow reparse points.
 
-Reuse the repository's existing capture hardening instead of inventing a second Git/Perforce
-runner. Git subprocesses are resolved from `PATH`, never the application directory, receive
-fixed argv, `--no-pager`, `--no-ext-diff`, `--no-textconv`, disabled fsmonitor, and isolated
-Git config/pager environment. Perforce history/change access reuses the current client and
-network policy decisions. No provider invokes a shell. Unsupported provider capabilities
-return `unsupported`, not guessed output.
+Factor the repository's existing executable resolution, cancellation, output caps, and Git
+environment/argv hardening into shared helpers rather than copying them. `repository_change`
+pages the existing captured result. History and revision are **new** `git log` / `git show`
+subprocess surfaces, so each gets its own fixed-argv implementation and tests for `--no-pager`,
+`--no-ext-diff`, `--no-textconv`, disabled fsmonitor, PATH-only executable resolution, and
+isolated Git config/pager environment; none of that hardening is assumed to arrive for free
+from the diff runner. No provider invokes a shell.
+
+Perforce list/search/read operate on the local workspace, and `repository_change` pages the
+snapshot the parent already captured under the existing Perforce policy. Perforce history or
+arbitrary revision reads would require new network calls, so this plan does not implement
+them. They return `unsupported` regardless of whether the reviewer's sandbox could reach the
+server. Adding them later requires a separate plan that names and secures each permitted p4
+operation.
 
 The configured change is captured once by the parent before the reviewer starts and stored
 in the capability bundle with the same omission accounting used in the prompt today. The
@@ -170,29 +199,32 @@ service pages that immutable snapshot. Live file reads include a digest and stat
 if the working tree changes after capture, `repository_scope` and subsequent reads surface
 drift rather than presenting two revisions as one coherent snapshot.
 
-### 4. Invocation and attestation
+### 4. Invocation and deterministic availability
 
-Extend `Invocation` with an evidence expectation. For an isolated Codex review, parsing is
-successful only if the Codex JSON event stream contains a completed call to
-`repository_scope` whose result carries the expected turn nonce and schema version. This
-cheap first call proves that:
-
-- the generated `-c mcp_servers...` override was accepted;
-- the internal server started and completed MCP initialization;
-- the reviewer could call the service; and
-- the service was bound to this turn and root.
+Do not make a paid review's validity depend on a discretionary model tool call. Before
+launching Codex, the parent starts the exact evidence-server executable and capability bundle
+with a no-model MCP handshake, checks `initialize` plus `tools/list`, validates the schema and
+tool allow-list, then closes it. This proves the internal mode and this turn's bundle work.
+Codex independently receives the same bundle with
+`mcp_servers.<reserved-name>.required=true`; the verified CLI contract must abort startup or
+resume when that server cannot initialize. `--strict-config` makes a rejected config shape a
+startup error as well. Together these are deterministic availability signals, independent of
+what the model decides to inspect.
 
 The preamble tells the reviewer to use evidence tools for repository discovery and to reserve
 the shell for information the service explicitly does not provide. It removes the current
 advice to avoid `git grep`/`git ls-files`; tool descriptions, not a release-specific list of
 forbidden spellings, become the primary route.
 
-If attestation is absent, malformed, from another nonce, or reports a narrower schema than
-required, return a dedicated `EVIDENCE_UNAVAILABLE` failure with remediation. Do not return
-the review text or a machine `approve` verdict. A service tool failure after attestation is
-included in the review warnings and structured result; whether it is fatal is based on the
-operation's typed error (`invalid request` is not an infrastructure failure, `service died`
-is). Continue collecting ordinary shell policy denials independently.
+If the parent handshake fails, the required server fails Codex startup/resume, or strict
+configuration is rejected, return a dedicated `EVIDENCE_UNAVAILABLE` failure with
+remediation. A completed review with no evidence-tool call is still a completed review; the
+service was available and the model may reasonably not need it. Completed JSONL
+`mcp_tool_call` events remain useful observability: if the model attempts an evidence call
+and receives an infrastructure/service-death error, return `EVIDENCE_UNAVAILABLE` rather
+than a possibly evidence-thinned verdict. Invalid model arguments are not infrastructure
+failure and remain visible as ordinary tool errors. Continue collecting ordinary shell
+policy denials independently.
 
 Non-isolated `--allow-reviewer-config` reviews still receive the server-owned evidence entry
 at command-line precedence. Tests must show that a user entry with the reserved name cannot
@@ -211,10 +243,13 @@ Use the existing capture budget as the parent ceiling and add per-call limits be
 - cancellation propagated from review cancellation and job termination.
 
 All counters use checked arithmetic. Directory walks are iterative and deterministic. The
-child logs diagnostics only to stderr. The evidence server and any provider subprocess stay
-inside the existing reviewer job object and die on cancel, timeout, server shutdown, or
-parent exit. Temporary capability/snapshot files are best-effort deleted on every terminal
-path and are bounded/expired so a crash cannot grow state forever.
+child logs diagnostics only to stderr. Phase 0 verifies whether Codex's MCP child inherits
+the outer reviewer job. Independently, the evidence service puts every provider subprocess
+in its own kill-on-close job, watches stdio EOF/parent death, and terminates its provider job
+before exit. Cancel, timeout, shutdown, and parent-exit tests must observe both the service
+and provider gone; if Codex can break away and EOF/parent-death cleanup is not reliable, the
+architecture must change before release. Temporary capability/snapshot files are best-effort
+deleted on every terminal path and are bounded/expired so a crash cannot grow state forever.
 
 ## Implementation sequence
 
@@ -224,15 +259,19 @@ The installed development CLI has already proved that explicit `-c mcp_servers..
 load after `--ignore-user-config` on both fresh and `exec resume` forms, and its actual JSONL
 tool-call event shape is recorded above. Turn that manual probe into a tiny test fixture,
 then complete the compatibility proof by capturing CLI behavior when a required server
-fails, checking command-line precedence over a colliding user config, and testing the lowest
-supported Codex CLI version. If any remaining premise fails, stop and amend this plan; do
-not silently fall back to exec-policy rules.
+fails, proving the exact per-server approval key leaves a second server untouched, checking
+command-line precedence over a colliding user config, observing whether the MCP child can
+break away from the reviewer job, and testing the lowest supported Codex CLI version. Also
+verify that `--ignore-user-config` suppresses both user and trusted-project MCP entries. If
+any remaining premise fails, stop and amend this plan; do not silently fall back to
+exec-policy rules.
 
 ### Phase 1: evidence core
 
-Implement typed scope/list/search/read/change/history APIs, canonical path confinement,
-pagination cursors, caps, drift metadata, provider hardening, and direct unit tests. Keep
-serialization and MCP concerns out of this layer.
+Implement typed scope/list/search/read/change APIs plus Git-only history/revision, canonical
+path confinement, pagination cursors, caps, drift metadata, provider hardening, and direct
+unit tests. Perforce history/revision return `unsupported`. Keep serialization and MCP
+concerns out of this layer.
 
 ### Phase 2: internal MCP server
 
@@ -242,9 +281,10 @@ tests using only the existing `serde` dependencies.
 
 ### Phase 3: Codex integration
 
-Generate strict MCP overrides for fresh/resume invocations, create and clean turn bundles,
-extend JSONL parsing for evidence events, enforce attestation, update capabilities/preamble,
-and expose service readiness/schema in `cross_model_review_status`.
+Generate strict per-server MCP overrides for fresh/resume invocations, add the no-model
+handshake, create and clean turn bundles, parse evidence events for observability, classify
+required-server startup failures, update capabilities/preamble, and expose service
+readiness/schema in `cross_model_review_status`.
 
 ### Phase 4: result contract and documentation
 
@@ -268,10 +308,10 @@ unavoidable, captured as a named smoke artifact:
 | --- | --- |
 | Invocation | Fresh and resume argv include the same strict, isolated evidence entry; TOML escaping covers spaces, quotes, backslashes, Unicode, and an unrepresentable executable path fails visibly. |
 | Isolation | Hostile user/project MCP servers, hooks, rules, skills, and config do not load by default; the evidence server exposes no review, shell, write, or network tool. |
-| Attestation | Correct nonce succeeds; missing, replayed, truncated, malformed, collision-replaced, or wrong-schema evidence fails closed. |
+| Availability | Parent handshake and required Codex startup succeed with the correct bundle; missing, replayed, truncated, malformed, collision-replaced, wrong-schema, or dead services fail before a review verdict. A model that simply makes no tool call does not fail. |
 | Paths | Absolute, parent, UNC, device, ADS, case-folding, symlink, junction, deleted/replaced, and root-edge cases cannot escape the canonical root. |
 | Search/list/read | Deterministic pagination, literal matching, UTF-8/binary handling, long lines, large files, empty repos, subdirectory roots, ignored/untracked files, and cap/timeout accounting. |
-| VCS | Git worktree, staged, HEAD and range changes; hostile pager/ext-diff/textconv/fsmonitor/config; submodules; Perforce offline/networked and restricted changelists. |
+| VCS | Git worktree, staged, HEAD and range changes plus the new fixed `log`/`show` runners; hostile pager/ext-diff/textconv/fsmonitor/config; submodules; Perforce local evidence and captured offline/networked/restricted changelists; Perforce history/revision explicitly unsupported. |
 | Lifecycle | Cancel, timeout, parent crash, MCP EOF, provider hang, output cap, and handler-thread failure reap the complete process tree and clean bounded temporaries. |
 | Regression | Existing review capture, findings envelope, fallback chain, usage gate, policy-denial reporting, and Claude reviewer behavior remain unchanged. |
 | Security | Model attempts to write inside/outside the repo and reach network still fail; evidence tools reject every write-shaped or option-shaped input; an evidence read succeeds. |
@@ -295,7 +335,7 @@ separate Codex shell remains read-unconfined and subject to Codex policy.
 
 1. Compatibility evidence and core path/security tests.
 2. Internal MCP server with protocol and resource-limit tests.
-3. Fresh-turn Codex integration and attestation.
+3. Fresh-turn Codex integration and deterministic availability checks.
 4. Resume, collision, cancellation, and failure-contract coverage.
 5. Documentation, full build, real Codex smoke, and cross-model review of the exact final
    implementation diff.
