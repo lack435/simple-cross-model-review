@@ -356,6 +356,15 @@ pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 /// `docs/single-blocking-collect.md` for the two residual terms that are not themselves bounded.
 pub const FINALIZATION_GRACE_SECS: u64 = 30;
 
+/// Sizing for one fallback entry's preflight, folded into the chain's collect-wait cap.
+///
+/// Bounds the cancellable auth invocation (the 30 s `auth_check` timeout in the adapters) plus
+/// its output-drain grace. `resolve_bin` is a fast but uninterruptible PATH scan and is *not*
+/// covered here; it is an acknowledged residual, exactly as `docs/reviewer-fallback-chain.md`
+/// and `docs/single-blocking-collect.md` describe. Only *fallback* entries add this term — the
+/// selected entry is preflighted in `start_review`, before the collect wait begins.
+pub const PREFLIGHT_CAP_SECS: u64 = 40;
+
 /// Default per-process cap on concurrently-running reviews. A backstop against a runaway caller
 /// accumulating full-budget reviews across distinct session names, not a normal limit — a serial
 /// review flow runs one at a time. `0` disables the check. It is per process: N servers sharing a
@@ -746,10 +755,22 @@ impl Config {
     /// see `docs/single-blocking-collect.md`), which is acceptable because a boundary miss now costs
     /// one more poll rather than a lost review. Saturating, so no `--timeout-seconds` overflows it.
     pub fn max_wait_secs(&self) -> u64 {
-        crate::vcs::CAPTURE_BUDGET
+        // Today's single-reviewer budget: capture + one turn + finalization. For N == 1 this is
+        // the whole cap, byte-for-byte as before.
+        let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
             .saturating_add(self.timeout.as_secs())
-            .saturating_add(FINALIZATION_GRACE_SECS)
+            .saturating_add(FINALIZATION_GRACE_SECS);
+        // Each *fallback* entry can add its own preflight + turn + drain to the walk, because a
+        // rate-limited attempt is not guaranteed to fail fast. Expressed as "today's budget plus
+        // the fallback terms" so the single-entry invariant holds by construction. This is a
+        // practical sizing, not a proven ceiling (the resolve_bin residual is uninterruptible);
+        // see docs/reviewer-fallback-chain.md.
+        let fallbacks = (self.reviewers.len() as u64).saturating_sub(1);
+        let per_fallback = PREFLIGHT_CAP_SECS
+            .saturating_add(self.timeout.as_secs())
+            .saturating_add(crate::reviewer::DRAIN_GRACE.as_secs());
+        single.saturating_add(fallbacks.saturating_mul(per_fallback))
     }
 
     /// True when the reviewer has any shell at all.

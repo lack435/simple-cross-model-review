@@ -206,9 +206,6 @@ pub fn invalid_reviewer_chain(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
-// Wired into the fall-through walk (the multi-entry exhaustion outcome); the walk lands in a
-// later commit of the reviewer-fallback-chain implementation.
-#[allow(dead_code)]
 pub fn reviewers_exhausted(detail: impl Into<String>) -> Failure {
     Failure::new(
         "REVIEWERS_EXHAUSTED",

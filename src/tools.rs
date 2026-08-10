@@ -931,7 +931,7 @@ impl Job {
         )
     }
 
-    fn run(self, resume_id: Option<String>) {
+    fn run(mut self, resume_id: Option<String>) {
         let started = std::time::Instant::now();
         let mut guard = FinishGuard {
             registry: &self.registry,
@@ -1070,45 +1070,110 @@ impl Job {
         // What this attempt did, for the usage record.
         let mut facts = AttemptFacts::new(self.turn, resume_id.is_some(), self.gap_secs);
 
-        let outcome = match self.attempt(
-            resume_id.as_deref(),
-            self.turn,
-            self.prior_cumulative,
-            CaptureOutputs {
-                change: change.as_deref(),
-                head_sha: head_sha.as_deref(),
-                base_sha: base_sha.as_deref(),
-                capture_identity: capture_identity.as_ref(),
-                perforce_baseline: perforce_baseline.as_ref(),
-            },
-            &capture_warnings,
-            &mut facts.prompt_bytes,
-        ) {
-            Ok(mut outcome) => {
-                // The disposition rides on the successful outcome so the response can render it.
-                // A failed turn keeps `None` (`Outcome::failed`): it sent no reviewable change.
-                outcome.disposition = disposition;
-                outcome
-            }
-            Err(failure) => {
-                // A resume target the reviewer no longer has is a dead mapping: drop it so a
-                // follow-up call is not billed for the same doomed resume. The failure is
-                // then reported rather than silently retried into a fresh conversation --
-                // the caller is told the session expired and decides whether to start over
-                // (fresh=true), the same explicit contract the pre-flight resume checks use.
-                // Its remediation already says exactly that.
-                if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
-                    self.sessions.forget(&self.session).ok();
-                    eprintln!(
-                        "cross-review: session '{}' could not be resumed (the reviewer no \
-                         longer has it); reporting SESSION_NOT_FOUND rather than silently \
-                         starting a fresh session",
-                        self.session
-                    );
-                }
-                Outcome::failed(failure)
-            }
+        // The fall-through walk. A **fresh** review walks the reviewer chain, advancing to the
+        // next entry only on RATE_LIMITED; a **resume** runs exactly its bound entry (entry 0 for
+        // now -- identity-matched selection lands with the session-identity work), never falling
+        // through, because the reviewer's memory lives on one specific reviewer. The captured
+        // change is reused across attempts -- it was gathered once above. See
+        // docs/reviewer-fallback-chain.md.
+        let chain = self.cfg.reviewers.clone();
+        let n = chain.len();
+        let walk: Vec<usize> = if resume_id.is_none() {
+            (0..n).collect()
+        } else {
+            vec![0]
         };
+
+        let mut disposition = disposition;
+        let mut rate_limited_attempts: Vec<String> = Vec::new();
+        let mut outcome: Option<Outcome> = None;
+
+        for (pos, &i) in walk.iter().enumerate() {
+            let entry = chain[i].clone();
+            // Publish the active entry: every identity-bearing read on the run path follows it.
+            self.reviewer = Arc::from(reviewer::for_kind(entry.reviewer));
+            self.spec = entry.clone();
+            // Entry 0 was preflighted in `start_review` (its bin is in `self.bin`). A *fallback*
+            // entry is resolved and auth-checked here, lazily -- a fallback whose CLI is missing
+            // or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it stops the
+            // walk) rather than troubling a healthy primary.
+            if i != 0 {
+                match reviewer::resolve_bin(&entry) {
+                    Ok(bin) => self.bin = bin,
+                    Err(f) => {
+                        outcome = Some(Outcome::failed(f));
+                        break;
+                    }
+                }
+                if let Err(f) = self.reviewer.auth_check(&self.bin, &self.cfg) {
+                    outcome = Some(Outcome::failed(f));
+                    break;
+                }
+            }
+
+            facts.prompt_bytes = 0;
+            match self.attempt(
+                resume_id.as_deref(),
+                self.turn,
+                self.prior_cumulative,
+                CaptureOutputs {
+                    change: change.as_deref(),
+                    head_sha: head_sha.as_deref(),
+                    base_sha: base_sha.as_deref(),
+                    capture_identity: capture_identity.as_ref(),
+                    perforce_baseline: perforce_baseline.as_ref(),
+                },
+                &capture_warnings,
+                &mut facts.prompt_bytes,
+            ) {
+                Ok(mut o) => {
+                    // The disposition rides on the successful outcome so the response can render
+                    // it. A failed turn keeps `None` (`Outcome::failed`): it sent no reviewable
+                    // change.
+                    o.disposition = disposition.take();
+                    outcome = Some(o);
+                    break;
+                }
+                Err(failure) => {
+                    // A resume target the reviewer no longer has is a dead mapping: drop it so a
+                    // follow-up call is not billed for the same doomed resume. Reported rather
+                    // than silently retried into a fresh conversation -- the caller decides
+                    // whether to start over (fresh=true).
+                    if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
+                        self.sessions.forget(&self.session).ok();
+                        eprintln!(
+                            "cross-review: session '{}' could not be resumed (the reviewer no \
+                             longer has it); reporting SESSION_NOT_FOUND rather than silently \
+                             starting a fresh session",
+                            self.session
+                        );
+                    }
+
+                    // Only a rate/usage limit on a fresh multi-entry walk falls through; every
+                    // other failure surfaces at once, and a single-entry chain returns the plain
+                    // RATE_LIMITED it always did.
+                    let is_last = pos == walk.len() - 1;
+                    if resume_id.is_none() && n > 1 && failure.code == "RATE_LIMITED" {
+                        rate_limited_attempts.push(entry.describe());
+                        if is_last {
+                            outcome = Some(Outcome::failed(errors::reviewers_exhausted(format!(
+                                "every configured reviewer reported a rate/usage limit, in order: {}",
+                                rate_limited_attempts.join("; ")
+                            ))));
+                            break;
+                        }
+                        // Advance to the next entry.
+                        continue;
+                    }
+                    outcome = Some(Outcome::failed(failure));
+                    break;
+                }
+            }
+        }
+
+        // The walk always assigns `outcome` (every branch sets it or the loop covers every
+        // index), so this fallback is a safety net rather than an expected path.
+        let outcome = outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
         // Everything telemetry needs, taken before the outcome moves into the registry. The
         // disposition tag was captured above (from the local, so a failed attempt still records
         // what it sent).

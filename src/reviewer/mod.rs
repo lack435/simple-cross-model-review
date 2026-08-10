@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// How long to keep draining the output pipes after the child is gone. A descendant that
 /// inherited a pipe handle can hold it open past its parent's exit, so output collection
 /// is bounded rather than an unbounded join.
-const DRAIN_GRACE: Duration = Duration::from_secs(10);
+pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Ceiling on what we keep from one output pipe.
 ///
