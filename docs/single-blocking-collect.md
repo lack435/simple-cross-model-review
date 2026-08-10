@@ -164,13 +164,28 @@ draft got wrong:
   - The Codex **final-message file read** is currently unbounded (`src/reviewer/codex.rs:138`,
     `std::fs::read_to_string`). This PR **caps that read** at the existing 8 MiB stream cap, so the
     one adversarially-controllable term becomes bounded and consistent with the pipe cap the README
-    already documents.
+    already documents. **A capped read must never be parsed as an authoritative review.** The
+    project already has `read_capped` (`src/vcs/shared.rs`), which returns the truncated bytes *and*
+    an over-cap flag; the Codex path uses it and, when the flag is set, surfaces the existing
+    `OUTPUT_TRUNCATED` failure — which is exactly the right code, since the README already defines it
+    as "the CLI wrote far too much, a retry will do the same again" as opposed to `EMPTY_REVIEW`.
+    The truncation is taken on a UTF-8 character boundary (the shared truncation helper already does
+    this), and an over-limit test asserts the read yields `OUTPUT_TRUNCATED` rather than a partial
+    review presented as complete. This tightens today's behaviour, where an over-8-MiB final message
+    would otherwise have been returned as a valid review.
   - **Session persistence has no wall-clock deadline** (`src/session.rs`), so a stalled disk write
     could in principle push the terminal state past `max_wait()`. This PR does **not** add a
     persistence timeout: the code deliberately treats session-mapping durability as load-bearing (a
     session that cannot be persisted is reported as a warning and the response stops inviting a
     resume), and a timeout there risks dropping a mapping that is mid-write. It is a small JSON
     write of local state, not attacker-controlled latency, so it is left as documented residual.
+    **The "one extra poll" degradation assumes persistence eventually completes.** A *transiently*
+    slow write costs a poll; a *permanently* stalled one is worse than one poll — the review's entry
+    stays `Running` and its session lease stays held until the process is restarted, so the affected
+    session cannot be re-reviewed and repeated collects keep returning `running`. That is the honest
+    worst case of declining the deadline, and it is judged acceptable because a local JSON write that
+    never returns is a failed machine, not a normal operating condition, and the blast radius is one
+    session on one process rather than lost review work.
   - **Why the residual is acceptable here specifically:** because the whole design is now
     non-destructive, a wait that expires one moment before the terminal state simply returns a
     `running` snapshot and the caller polls once more — cheap, and it cannot lose the review. Under
@@ -193,9 +208,12 @@ draft got wrong:
   the full effective cap. The ergonomic no-argument path — `cross_model_review_result` with just a
   `review_id` — becomes the one blocking call the issue asks for. A caller that wants a quick "is
   it done yet?" peek passes `wait_seconds: 0`, which returns the current snapshot immediately.
-- **The tool schema reflects the real cap.** `inputSchema.wait_seconds.maximum` and its description
-  are already built from `cfg` at `tools/list` time ([`mcp.rs:782`](../src/mcp.rs)), so they will
-  report the configured budget rather than a stale `300`.
+- **The tool schema must be changed to report the real cap.** Today `inputSchema.wait_seconds.maximum`
+  and its description use the compile-time constant `crate::config::MAX_WAIT_SECS`
+  ([`mcp.rs:782`](../src/mcp.rs)) — *not* `cfg`, despite the surrounding `format!` reading other
+  `cfg` fields. This is an edit, not a free consequence: schema generation must take the configured
+  `max_wait()` (the `cfg` is in scope where the tool list is built), and a test must cover a
+  non-default `--timeout-seconds` so the schema and the runtime cap cannot silently diverge.
 
 ## Sequencing (why the two changes ship together)
 
@@ -292,8 +310,9 @@ of scope.
   `too_many_running` correction (not an escalation code), telling the caller to collect or cancel an
   outstanding review. `src/tools.rs`/`src/mcp.rs`: map it on the start path next to `Busy`/`ShuttingDown`.
 - `src/reviewer/codex.rs`: cap the final-message file read at the existing 8 MiB stream cap instead
-  of an unbounded `read_to_string`, so the one adversarially-sized term in the finalization tail is
-  bounded and consistent with the pipe cap.
+  of an unbounded `read_to_string`, using `read_capped` (`src/vcs/shared.rs`) so the over-cap flag is
+  observed. On overflow, return `OUTPUT_TRUNCATED` rather than parsing the truncated bytes as a
+  review; truncate on a UTF-8 boundary. Add an over-limit test.
 - `src/tools.rs` `review_result`: `wait = args.wait_seconds.unwrap_or(max_wait()).min(max_wait())`.
 - `src/tools.rs` `render_start`: the "Use wait_seconds=300; if it returns status=running, call it
   again" guidance becomes "collect it with one call; it blocks until the review is done."
@@ -450,3 +469,20 @@ the server can wake the agent on its own.
      "the wait is woken promptly," noting the pre-existing progress-join caveat, and adding a
      progress-enabled cancellation test; the lease-release-vs-`finish` distinction is now stated
      precisely.
+
+  The reviewer confirmed the three scoped-out residuals (persistence deadline, cross-process slot
+  counting, interruptible stdout) are legitimate out-of-scope choices given the revised claims, not
+  correctness blockers.
+
+- **Round 3** (same session) — REQUEST CHANGES. All five round-2 findings confirmed resolved; three
+  smaller items, all accepted:
+  1. *major* — the new 8 MiB Codex read cap did not specify over-limit behaviour, so a truncated
+     final message could be parsed as a valid review. Resolved: use `read_capped`, and on the
+     over-cap flag return `OUTPUT_TRUNCATED` (never parse the partial), truncate on a UTF-8 boundary,
+     add an over-limit test. This tightens today's unbounded behaviour.
+  2. *minor* — the "one extra poll" degradation assumes persistence completes; a permanently stalled
+     write holds the `Running` entry and lease until process restart. Resolved: documented as the
+     honest worst case of declining the persistence deadline.
+  3. *minor* — the plan wrongly said the schema `maximum` was already built from `cfg`; it uses the
+     compile-time `MAX_WAIT_SECS` const. Resolved: corrected to require the schema edit, with a
+     non-default-timeout test so schema and runtime cap cannot diverge.
