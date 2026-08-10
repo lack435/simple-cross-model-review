@@ -26,6 +26,7 @@ mod session;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod usage;
 mod vcs;
 mod winjob;
 

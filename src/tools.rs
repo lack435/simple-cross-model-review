@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerSpec};
+use crate::config::{Config, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -16,8 +16,9 @@ use crate::registry::{
     IdState, Outcome, Phase, Registry, Snapshot, StartRefused, Status, MAX_TERMINAL_PER_SESSION,
     MAX_TERMINAL_TOTAL,
 };
-use crate::reviewer::{self, Reviewer};
+use crate::reviewer::{self, Headroom, Reviewer};
 use crate::session::{self, now_unix, ExclusiveLock, SessionStore};
+use crate::usage::HeadroomStore;
 use crate::vcs;
 
 /// How long to wait for another server process to release a named session.
@@ -83,11 +84,88 @@ fn ensure_entry_ready(
     Ok(ready)
 }
 
+/// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
+/// so is never gated: the chain is not armed, the entry has no minimum, its binary cannot be
+/// resolved, or its account fingerprint cannot be read. Reads only cheap local sources — a
+/// PATH resolve and a local account file — so it neither auth-checks nor spawns; it is safe to
+/// call during selection, before any preflight. The account fingerprint is read *here*, once,
+/// so the gate decision and the later store write for this entry share one reading (no
+/// read-time/observe-time TOCTOU). See `docs/usage-remaining-gate.md`.
+fn usage_headroom_key(cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+    if !cfg.chain_gates_on_usage() {
+        return None;
+    }
+    let bin = reviewer::resolve_bin(spec).ok()?;
+    let account = reviewer::for_kind(spec.reviewer).account_fingerprint(cfg, spec)?;
+    Some(crate::usage::entry_key(
+        spec.reviewer.as_str(),
+        &bin,
+        &account,
+    ))
+}
+
+/// The terminal `REVIEWERS_EXHAUSTED` failure, worded for the actual cause (round-6 finding f7):
+/// pure rate-limited (today's exact detail, so the single-reviewer path is unchanged), pure
+/// proactive-gate, or a mix. `rate` holds `describe_with_bin` strings of rate-limited entries;
+/// `gated` holds already-reasoned describe strings of gated entries. See
+/// `docs/usage-remaining-gate.md`.
+fn exhaustion_failure(rate: &[String], gated: &[String]) -> Failure {
+    if gated.is_empty() {
+        errors::reviewers_exhausted(format!(
+            "every configured reviewer reported a rate/usage limit, in order: {}",
+            rate.join("; ")
+        ))
+    } else if rate.is_empty() {
+        errors::reviewers_exhausted_gated(format!(
+            "every configured reviewer was skipped for low usage remaining, in order: {}",
+            gated.join("; ")
+        ))
+    } else {
+        let mut parts: Vec<String> = rate.iter().map(|d| format!("{d} (rate-limited)")).collect();
+        parts.extend(gated.iter().cloned());
+        errors::reviewers_exhausted_mixed(format!(
+            "every configured reviewer was exhausted (rate limit or usage minimum): {}",
+            parts.join("; ")
+        ))
+    }
+}
+
+/// The result of the fresh-review proactive gate selection: the entry to start on, the
+/// non-billed skips recorded before it, and that entry's usage-store key (one fingerprint
+/// reading, carried so the later store write matches the gate decision). See
+/// `docs/usage-remaining-gate.md`.
+struct FreshSelection {
+    start_index: usize,
+    pre_start_skips: Vec<metrics::Attempt>,
+    pre_start_gated_descs: Vec<String>,
+    start_usage_key: Option<String>,
+}
+
+/// Build the non-billed metrics `Attempt` that records a gated skip (no spawn, no usage). Kept
+/// as one helper so the pre-start selection and the in-walk fallback gate record it identically.
+/// `resolved_bin` is the binary selection already resolved for the store key, so two
+/// installations of the same reviewer stay distinguishable in the log (round-1-impl finding f8).
+fn gated_skip_attempt(spec: &ReviewerSpec, resolved_bin: Option<PathBuf>) -> metrics::Attempt {
+    metrics::Attempt {
+        reviewer: spec.reviewer.as_str().to_string(),
+        model: spec.model.clone(),
+        effort: spec.effort.clone(),
+        resolved_bin: resolved_bin.map(|p| p.to_string_lossy().into_owned()),
+        failure_code: "USAGE_BELOW_MINIMUM".to_string(),
+        wall_secs: 0,
+        prompt_bytes: 0,
+        billed: false,
+    }
+}
+
 pub struct App {
     cfg: Arc<Config>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
+    /// Persisted last-observed usage headroom per reviewer entry, for the proactive gate. Shared
+    /// with the worker so an attempt can record its observation. See `docs/usage-remaining-gate.md`.
+    usage: Arc<HeadroomStore>,
     preflight: PreflightCache,
     /// Set when the reviewer chain is semantically invalid (`Config::validate_chain`). While
     /// present, every review is refused in-band with this `INVALID_REVIEWER_CHAIN` failure
@@ -100,6 +178,7 @@ impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
         let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
+        let usage = HeadroomStore::new(&cfg.state_dir);
         // The chain's semantics are validated once, here. On failure the server still starts,
         // but every review is refused in-band with this failure (see `chain_error`).
         let chain_error = Config::validate_chain(&cfg.reviewers)
@@ -112,6 +191,7 @@ impl App {
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
+            usage: Arc::new(usage),
             preflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
             chain_error,
         }
@@ -155,6 +235,44 @@ impl App {
     /// selected-entry check here, `status`, and the walk.
     fn ensure_ready_for(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
         ensure_entry_ready(&self.preflight, &self.cfg, index, cancel)
+    }
+
+    /// Proactive gate for a **fresh review**: walk the chain from the primary, skipping any entry
+    /// whose last-observed headroom is known-and-below its minimum, and return the first entry
+    /// that clears along with the skips recorded before it. `Err(REVIEWERS_EXHAUSTED)` when every
+    /// entry is gated out. Resolves bins and reads local account files only — no auth preflight,
+    /// no spawn, no capture — so it is safe to run before the session lease. See
+    /// `docs/usage-remaining-gate.md`.
+    fn gate_fresh_selection(&self, now: u64) -> Result<FreshSelection, Failure> {
+        let mut pre_start_skips: Vec<metrics::Attempt> = Vec::new();
+        let mut pre_start_gated_descs: Vec<String> = Vec::new();
+        for (i, spec) in self.cfg.reviewers.iter().enumerate() {
+            // The key resolves the bin (a cheap PATH scan, no auth) and reads the account
+            // fingerprint from a local file; `None` when the chain is unarmed or identity cannot
+            // be established, in which case the entry is never gated (fail-open).
+            let key = usage_headroom_key(&self.cfg, spec);
+            if spec.usage_minimum.is_gating() {
+                if let Some(k) = &key {
+                    if !self.usage.get(k, now).clears(&spec.usage_minimum) {
+                        pre_start_skips
+                            .push(gated_skip_attempt(spec, reviewer::resolve_bin(spec).ok()));
+                        pre_start_gated_descs
+                            .push(format!("{} (usage below minimum)", spec.describe()));
+                        continue;
+                    }
+                }
+            }
+            return Ok(FreshSelection {
+                start_index: i,
+                pre_start_skips,
+                pre_start_gated_descs,
+                start_usage_key: key,
+            });
+        }
+        Err(errors::reviewers_exhausted_gated(format!(
+            "every configured reviewer was skipped for low usage remaining, in order: {}",
+            pre_start_gated_descs.join("; ")
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -222,6 +340,18 @@ impl App {
             ));
         }
         let changes_canonical = crate::changeset::canonical(&changes);
+
+        // Fresh-review usage gate, before the session lease and store read: a `fresh: true` call
+        // is a fresh review by definition (no prior), so if the whole chain is gated out we refuse
+        // immediately — touching no lease, store, marker, preflight, or capture (round-1-impl
+        // finding f5). A non-fresh call might be a resume (never gated), so its fresh-review gate
+        // (for a genuinely new session) waits until the store read below confirms there is no
+        // prior; reading before the lease would be the stale-read race the lease exists to prevent.
+        let mut pre_lease_fresh_sel = if fresh {
+            Some(self.gate_fresh_selection(now_unix())?)
+        } else {
+            None
+        };
 
         // The lease comes first, before the session record is read. Reading first would
         // be a stale-read race: another server process can finish a `fresh` review, or
@@ -358,9 +488,32 @@ impl App {
         // (matched above by `resume_block`, so `resume_entry_index` is `Some`). This is what keeps
         // a resume of a fell-back session from dying on the primary's CLI. Preflight runs here,
         // under the lease and after selection, never unconditionally against the primary.
-        let start_index = match &prior {
-            Some(record) => self.cfg.resume_entry_index(record).unwrap_or(0),
-            None => 0,
+        //
+        // A **resume** is never gated — it runs its bound entry, and if genuinely out takes the
+        // reactive RATE_LIMITED path with its `fresh: true` remediation — but its usage key is
+        // still computed so the resumed turn records its own headroom observation (round-1-impl
+        // finding f4). A **fresh review** was already gate-selected: a `fresh: true` call before
+        // the lease, and a non-fresh call on a genuinely new session here (after the store read
+        // confirmed no prior). See `docs/usage-remaining-gate.md`.
+        let FreshSelection {
+            start_index,
+            pre_start_skips,
+            pre_start_gated_descs,
+            start_usage_key,
+        } = match &prior {
+            Some(record) => {
+                let idx = self.cfg.resume_entry_index(record).unwrap_or(0);
+                FreshSelection {
+                    start_index: idx,
+                    pre_start_skips: Vec::new(),
+                    pre_start_gated_descs: Vec::new(),
+                    start_usage_key: usage_headroom_key(&self.cfg, &self.cfg.reviewers[idx]),
+                }
+            }
+            None => match pre_lease_fresh_sel.take() {
+                Some(sel) => sel,
+                None => self.gate_fresh_selection(now_unix())?,
+            },
         };
         // A `notifications/cancelled` that arrived before the review is even registered still
         // stops setup here; the flag below then interrupts the (bounded) auth check itself.
@@ -439,6 +592,10 @@ impl App {
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             metrics: Arc::clone(&self.metrics),
+            usage: Arc::clone(&self.usage),
+            pre_start_skips,
+            pre_start_gated_descs,
+            start_usage_key,
             bin: ready.bin,
             id: id.clone(),
             session: session.clone(),
@@ -920,6 +1077,60 @@ impl App {
         out
     }
 
+    /// One `status`/`--doctor` line describing an entry's proactive usage gate: its configured
+    /// minimum and its last-observed headroom. `None` when the chain is not armed (the gate is
+    /// inert, so there is nothing to show). Reads only the store — no additional CLI call beyond
+    /// the auth check `status` already performs. See `docs/usage-remaining-gate.md`.
+    fn usage_gate_status_line(&self, spec: &ReviewerSpec) -> Option<String> {
+        if !self.cfg.chain_gates_on_usage() {
+            return None;
+        }
+        let level_name = |l: crate::reviewer::HeadroomLevel| match l {
+            crate::reviewer::HeadroomLevel::Ample => "ample",
+            crate::reviewer::HeadroomLevel::Warning => "warning",
+            crate::reviewer::HeadroomLevel::Exhausted => "exhausted",
+        };
+        let min = match spec.usage_minimum {
+            UsageMinimum::None => "no gate".to_string(),
+            UsageMinimum::Remaining(p) => format!("skip below {p}% remaining"),
+            UsageMinimum::Status(l) => format!("skip below '{}'", level_name(l)),
+        };
+        let now = now_unix();
+        let observed = match usage_headroom_key(&self.cfg, spec) {
+            None => "unknown (identity unavailable)".to_string(),
+            Some(key) => match self.usage.observation(&key, now) {
+                None => "none recorded yet".to_string(),
+                Some(o) => {
+                    let value = match o.headroom {
+                        Headroom::Unknown => "unknown".to_string(),
+                        Headroom::Fraction { remaining_pct, .. } => {
+                            format!("{remaining_pct:.0}% remaining")
+                        }
+                        Headroom::Level { level, .. } => level_name(level).to_string(),
+                    };
+                    let age = fmt_elapsed(Duration::from_secs(now.saturating_sub(o.observed_at)));
+                    let resets = match o.resets_at {
+                        Some(r) if r > now => {
+                            format!(", resets in {}", fmt_elapsed(Duration::from_secs(r - now)))
+                        }
+                        Some(_) => ", window reset".to_string(),
+                        None => String::new(),
+                    };
+                    // `actionable` is what the gate would actually use: a past-reset or
+                    // TTL-aged observation reads as no-longer-gating even though the value is
+                    // still shown (round-1-impl finding f9).
+                    let status = if o.actionable {
+                        "actionable"
+                    } else {
+                        "aged out - not gating"
+                    };
+                    format!("{value} ({age} ago{resets}; {status})")
+                }
+            },
+        };
+        Some(format!("usage gate:    {min}; last observed: {observed}\n"))
+    }
+
     // -----------------------------------------------------------------------
     // cross_model_review_status
     // -----------------------------------------------------------------------
@@ -971,6 +1182,12 @@ impl App {
                         failure.code, failure.summary
                     ));
                 }
+            }
+            // The proactive usage gate, when the chain is armed: this entry's configured minimum
+            // and its last-observed headroom (a store read, no CLI call beyond the auth check
+            // above). Claude's signal is categorical, Codex's numeric -- shown as reported.
+            if let Some(line) = self.usage_gate_status_line(spec) {
+                out.push_str(&line);
             }
         }
         if multi {
@@ -1115,6 +1332,19 @@ struct Job {
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
+    /// The shared usage-headroom store: an attempt records its observation here, keyed by the
+    /// active entry's `active_usage_key`. See `docs/usage-remaining-gate.md`.
+    usage: Arc<HeadroomStore>,
+    /// Non-billed `Attempt`s for entries the proactive gate skipped during pre-start selection,
+    /// seeded into the walk's metrics history so a pre-start skip is still recorded on the turn.
+    pre_start_skips: Vec<metrics::Attempt>,
+    /// Describe strings of the pre-start-gated entries, prepended to a terminal
+    /// `REVIEWERS_EXHAUSTED` detail so an exhaustion names every entry and its reason.
+    pre_start_gated_descs: Vec<String>,
+    /// The store key for the start entry, computed at selection from one fingerprint reading, so
+    /// this entry's observation is written under the same identity the gate read (no TOCTOU).
+    /// `None` when unarmed or identity could not be established.
+    start_usage_key: Option<String>,
     bin: PathBuf,
     id: String,
     session: String,
@@ -1476,9 +1706,14 @@ impl Job {
         let mut disposition = disposition;
         // Describe strings of every rate-limited entry, for the REVIEWERS_EXHAUSTED detail.
         let mut rate_limited_attempts: Vec<String> = Vec::new();
-        // The earlier rate-limited attempts, for the metrics record's `attempts` history (the
-        // terminal attempt is the record itself, so it is not repeated here).
-        let mut metrics_attempts: Vec<metrics::Attempt> = Vec::new();
+        // Describe strings of every entry the proactive gate skipped (pre-start + in-walk), for a
+        // terminal REVIEWERS_EXHAUSTED detail. Seeded from the pre-start selection so an exhaustion
+        // names entries skipped before the walk too. See `docs/usage-remaining-gate.md`.
+        let mut gated_descs: Vec<String> = std::mem::take(&mut self.pre_start_gated_descs);
+        // The earlier attempts, for the metrics record's `attempts` history (the terminal attempt
+        // is the record itself, so it is not repeated here). Seeded with the pre-start gated skips
+        // (non-billed), so a skip selected before the walk is still recorded on the turn.
+        let mut metrics_attempts: Vec<metrics::Attempt> = std::mem::take(&mut self.pre_start_skips);
         // False once a fallback entry's binary could not be resolved: its path is unverified, so
         // the record must not attribute the previous entry's binary to it.
         let mut active_bin_resolved = true;
@@ -1486,6 +1721,41 @@ impl Job {
 
         for (pos, &i) in walk.iter().enumerate() {
             let entry = chain[i].clone();
+            // The active entry's usage-store key: the start entry's was computed at selection (one
+            // fingerprint reading, carried in), a fallback's is computed here at its own launch.
+            // `None` when unarmed or identity could not be established.
+            let active_usage_key = if i == self.start_index {
+                self.start_usage_key.clone()
+            } else {
+                usage_headroom_key(&self.cfg, &entry)
+            };
+            // Proactive gate for a *fallback* entry, checked as the first thing in the iteration —
+            // before `set_active` (so a skipped entry is never published as the active reviewer)
+            // and before its lazy preflight (so a skip resolves nothing and spawns nothing). The
+            // start entry was already gate-selected in `start_review`, so it is not re-gated here.
+            // See `docs/usage-remaining-gate.md`.
+            if i != self.start_index && entry.usage_minimum.is_gating() {
+                let gated = active_usage_key
+                    .as_ref()
+                    .is_some_and(|k| !self.usage.get(k, now_unix()).clears(&entry.usage_minimum));
+                if gated {
+                    metrics_attempts.push(gated_skip_attempt(
+                        &entry,
+                        reviewer::resolve_bin(&entry).ok(),
+                    ));
+                    gated_descs.push(format!("{} (usage below minimum)", entry.describe()));
+                    if pos == walk.len() - 1 {
+                        // The last entry was gated: the chain is exhausted. Set the terminal
+                        // outcome explicitly rather than falling through to WORKER_PANICKED.
+                        outcome = Some(Outcome::failed(exhaustion_failure(
+                            &rate_limited_attempts,
+                            &gated_descs,
+                        )));
+                        break;
+                    }
+                    continue;
+                }
+            }
             // Each iteration starts a fresh attempt: reset the phase to Launching. Set per
             // iteration rather than once before the loop so a fallback taken after a rate-limited
             // attempt (which ended in Finalizing) is not still reported as Finalizing while it
@@ -1538,6 +1808,7 @@ impl Job {
                 },
                 &capture_warnings,
                 &mut facts.prompt_bytes,
+                active_usage_key.as_deref(),
             ) {
                 Ok(mut o) => {
                     // The disposition and capture summary ride on the successful outcome so the
@@ -1577,10 +1848,12 @@ impl Job {
                         // provider config.
                         rate_limited_attempts.push(self.spec.describe_with_bin(&self.bin));
                         if is_last {
-                            outcome = Some(Outcome::failed(errors::reviewers_exhausted(format!(
-                                "every configured reviewer reported a rate/usage limit, in order: {}",
-                                rate_limited_attempts.join("; ")
-                            ))));
+                            // Cause-worded: pure rate-limited keeps today's exact detail; a chain
+                            // that also gated some entries reports the mix (round-6 finding f7).
+                            outcome = Some(Outcome::failed(exhaustion_failure(
+                                &rate_limited_attempts,
+                                &gated_descs,
+                            )));
                             break;
                         }
                         // An earlier rate-limited attempt: record it for the metrics history
@@ -1593,6 +1866,9 @@ impl Job {
                             failure_code: "RATE_LIMITED".to_string(),
                             wall_secs: attempt_started.elapsed().as_secs(),
                             prompt_bytes: facts.prompt_bytes,
+                            // A rate-limited attempt spent a model call whose usage the CLI did
+                            // not report back, so it is billed and taints completeness.
+                            billed: true,
                         });
                         continue;
                     }
@@ -1764,6 +2040,7 @@ impl Job {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attempt(
         &self,
         resume_id: Option<&str>,
@@ -1772,6 +2049,10 @@ impl Job {
         captured: CaptureOutputs<'_>,
         capture_warnings: &[String],
         prompt_bytes: &mut usize,
+        // The store key for this attempt's entry (from the walk), or `None` when unarmed /
+        // identity unavailable. When `Some`, the observed headroom is recorded under it on both
+        // the success and failure paths. See `docs/usage-remaining-gate.md`.
+        usage_key: Option<&str>,
     ) -> Result<Outcome, Failure> {
         let CaptureOutputs {
             change,
@@ -1951,6 +2232,10 @@ impl Job {
             &text,
             self.cfg.timeout,
             &self.cancel,
+            // The armed Claude path raises the stdout cap and terminates a runaway stream at the
+            // byte/line bound; every other path keeps the retain-and-drain default. See
+            // docs/usage-remaining-gate.md.
+            self.reviewer.output_limits(&self.cfg),
             |activity| {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);
@@ -1977,6 +2262,16 @@ impl Job {
 
         let result = match run {
             Ok(out) => {
+                // Observe usage headroom from the raw outcome BEFORE it is turned into a Parsed or
+                // a Failure, so a rate-limited turn is observed exactly like a successful one
+                // (round-1 finding f1). Read only when the entry is armed and keyable; store only
+                // a real reading. Best-effort — the store never fails a review.
+                if let Some(key) = usage_key {
+                    let headroom = self.reviewer.observe_headroom(&self.cfg, &self.spec, &out);
+                    if headroom != Headroom::Unknown {
+                        self.usage.record(key, headroom, now_unix());
+                    }
+                }
                 if out.cancelled || out.timed_out {
                     Err(reviewer::failure_for(&self.cfg, &self.spec, &out))
                 } else {
@@ -2669,6 +2964,53 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exhaustion_failure_words_itself_by_cause() {
+        // Pure rate-limited keeps today's exact single-reviewer detail (byte-for-byte contract).
+        let rate_only = exhaustion_failure(&["a".into(), "b".into()], &[]);
+        assert_eq!(rate_only.code, "REVIEWERS_EXHAUSTED");
+        assert!(
+            rate_only
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("rate/usage limit, in order: a; b"),
+            "{rate_only:?}"
+        );
+        assert!(rate_only.summary.contains("rate or usage limit"));
+
+        // All-gated names the usage minimum, not a rate limit.
+        let gated_only = exhaustion_failure(&[], &["x (usage below minimum)".into()]);
+        assert!(
+            gated_only.summary.contains("below its configured minimum"),
+            "{gated_only:?}"
+        );
+
+        // Mixed names both causes.
+        let mixed = exhaustion_failure(&["a".into()], &["x (usage below minimum)".into()]);
+        assert!(
+            mixed.summary.contains("rate-limited or skipped"),
+            "{mixed:?}"
+        );
+        let d = mixed.detail.as_deref().unwrap();
+        assert!(
+            d.contains("a (rate-limited)") && d.contains("usage below minimum"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn a_gated_skip_attempt_is_non_billed() {
+        let spec = Config::from_args(&["--reviewer".into(), "codex".into()])
+            .unwrap()
+            .primary()
+            .clone();
+        let a = gated_skip_attempt(&spec, Some(PathBuf::from("C:/x/codex.exe")));
+        assert_eq!(a.failure_code, "USAGE_BELOW_MINIMUM");
+        assert!(!a.billed);
+        assert_eq!(a.resolved_bin.as_deref(), Some("C:/x/codex.exe"));
+    }
 
     #[test]
     fn resumed_session_id_mismatch_only_fires_on_a_resume_with_a_different_reported_id() {

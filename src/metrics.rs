@@ -391,10 +391,14 @@ pub struct Record {
     pub captured: Option<String>,
 }
 
-/// One fall-through attempt that did not become the turn's outcome (it was rate-limited and the
-/// walk advanced). Recorded for visibility only; its token usage is deliberately **unknown**
-/// (the adapter exposes usage only on a successful parse, and a refusal's usage is not something
-/// this tool has verified it can read), which the accumulator propagates as partial totals.
+/// One attempt that did not become the turn's outcome. Two kinds:
+/// - **Billed** — an entry that ran and was rate-limited (`RATE_LIMITED`), so the walk advanced.
+///   Its token usage is deliberately **unknown** (the adapter exposes usage only on a successful
+///   parse, and a refusal's usage is not something this tool has verified it can read), which the
+///   accumulator propagates as partial totals.
+/// - **Non-billed** — an entry the proactive gate *skipped before spawning*
+///   (`USAGE_BELOW_MINIMUM`), so no tokens were consumed. Recorded for visibility, but it must
+///   **not** taint completeness, since it burned nothing. See `docs/usage-remaining-gate.md`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attempt {
     pub reviewer: String,
@@ -402,11 +406,21 @@ pub struct Attempt {
     pub effort: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_bin: Option<String>,
-    /// Why this attempt did not become the outcome (always `RATE_LIMITED` today, since only a
-    /// rate/usage limit falls through).
+    /// Why this attempt did not become the outcome: `RATE_LIMITED` for a billed fall-through, or
+    /// `USAGE_BELOW_MINIMUM` for a non-billed proactive skip.
     pub failure_code: String,
     pub wall_secs: u64,
     pub prompt_bytes: usize,
+    /// Whether this attempt actually spent a model call. A rate-limited fall-through did (with
+    /// usage the CLI did not report back → completeness is partial); a gated skip did not (→ it
+    /// does not affect completeness). Defaulted `true` so records written before this field
+    /// existed — which only ever carried billed rate-limit attempts — still read as billed.
+    #[serde(default = "default_billed")]
+    pub billed: bool,
+}
+
+fn default_billed() -> bool {
+    true
 }
 
 /// Append-only usage log.
@@ -804,11 +818,13 @@ impl Accumulator {
         // A turn that reported nothing still consumed tokens -- we simply do not know how
         // many. Treating it as complete, as an earlier version did, presents the total as
         // exact when it is a floor.
-        // A fall-through attempt consumed tokens the CLI did not report back (a rate-limit
-        // refusal exposes no usage), so a turn that fell back is never a complete accounting even
-        // when its terminal attempt reported full usage. Fold that in alongside the per-field
-        // checks, so a total carrying a hidden attempt is presented as a floor, not as exact.
-        let attempt_free = record.attempts.is_empty();
+        // A *billed* fall-through attempt consumed tokens the CLI did not report back (a
+        // rate-limit refusal exposes no usage), so a turn that fell back is never a complete
+        // accounting even when its terminal attempt reported full usage. Fold that in alongside
+        // the per-field checks, so a total carrying a hidden billed attempt is presented as a
+        // floor, not as exact. A *non-billed* attempt (a proactive gate skip that spawned nothing)
+        // burned no tokens, so it does not taint completeness -- only billed attempts count here.
+        let attempt_free = !record.attempts.iter().any(|a| a.billed);
         let input_ok = record.usage.input_complete() && attempt_free;
         let output_ok = record.usage.output_tokens.is_some() && attempt_free;
         self.cache_write_complete &= record.usage.cache_creation_tokens.is_some() && attempt_free;
@@ -1222,12 +1238,27 @@ mod tests {
             failure_code: "RATE_LIMITED".into(),
             wall_secs: 3,
             prompt_bytes: 100,
+            billed: true,
         }];
         assert!(!summarise(&[with_attempt]).input_complete());
 
         // The same usage with no fall-through is complete.
         let clean = record("s", 1, None, usage(1_000, 9_000, 500));
         assert!(summarise(&[clean]).input_complete());
+
+        // A non-billed gated skip (no tokens spent) does NOT taint completeness.
+        let mut with_skip = record("s", 1, None, usage(1_000, 9_000, 500));
+        with_skip.attempts = vec![Attempt {
+            reviewer: "claude".into(),
+            model: "claude-opus-4-8".into(),
+            effort: "medium".into(),
+            resolved_bin: None,
+            failure_code: "USAGE_BELOW_MINIMUM".into(),
+            wall_secs: 0,
+            prompt_bytes: 0,
+            billed: false,
+        }];
+        assert!(summarise(&[with_skip]).input_complete());
     }
 
     #[test]

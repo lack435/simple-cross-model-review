@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Invocation, Parsed, Reviewer, RunOutcome};
+use super::{Headroom, Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
@@ -244,6 +244,159 @@ impl Reviewer for CodexReviewer {
             usage_is_cumulative: true,
         })
     }
+
+    /// Codex writes its usage headroom to the per-session rollout log, not to `exec --json`
+    /// stdout: locate the rollout by the `thread_id` stdout announced, read a bounded tail, and
+    /// take the last `token_count.rate_limits`. Fail-open to `Unknown` on any miss. This is a
+    /// pure post-turn read that changes no invocation. See `docs/usage-remaining-gate.md`.
+    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, out: &RunOutcome) -> Headroom {
+        let Some(thread_id) = parse_events(&out.stdout).thread_id else {
+            return Headroom::Unknown;
+        };
+        match find_rollout(&codex_home(), &thread_id) {
+            Some(path) => headroom_from_rollout(&path),
+            None => Headroom::Unknown,
+        }
+    }
+
+    /// The logged-in ChatGPT account id, read from `$CODEX_HOME/auth.json` — a local file, the
+    /// account *identifier* (never the OAuth tokens beside it), and no CLI call.
+    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
+        codex_account_id(&codex_home())
+    }
+}
+
+/// `$CODEX_HOME`, or `~/.codex` when unset — the same resolution the CLI uses for its session
+/// and auth state.
+fn codex_home() -> std::path::PathBuf {
+    if let Some(h) = std::env::var_os("CODEX_HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    super::home_dir()
+        .map(|h| h.join(".codex"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".codex"))
+}
+
+/// Read `tokens.account_id` from `$CODEX_HOME/auth.json`. Returns `None` on any miss so the gate
+/// fails open rather than gating on an identity it could not establish.
+fn codex_account_id(home: &Path) -> Option<String> {
+    let bytes = std::fs::read(home.join("auth.json")).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("tokens")?
+        .get("account_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Locate the rollout log for a thread by descending the newest day directories under
+/// `sessions/` (bounded: at most a few `read_dir`s, never a recursive `**` walk), matching the
+/// `-<thread_id>.jsonl` filename suffix. See `docs/usage-remaining-gate.md`.
+fn find_rollout(home: &Path, thread_id: &str) -> Option<std::path::PathBuf> {
+    let sessions = home.join("sessions");
+    let suffix = format!("-{thread_id}.jsonl");
+    // Descend year -> month -> day, taking the newest few names at each level (lexicographic
+    // order equals chronological for the zero-padded YYYY/MM/DD layout). Two days cover a
+    // midnight rollover.
+    let newest = |dir: &Path, keep: usize| -> Vec<std::path::PathBuf> {
+        let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+        names.sort();
+        names.into_iter().rev().take(keep).collect()
+    };
+    for year in newest(&sessions, 2) {
+        for month in newest(&year, 2) {
+            for day in newest(&month, 2) {
+                if let Ok(entries) = std::fs::read_dir(&day) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        if name.to_string_lossy().ends_with(&suffix) {
+                            return Some(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a bounded tail of a rollout log and return the headroom from its last `token_count`
+/// event's `rate_limits`. Bounded so a large rollout cannot cost unbounded work.
+fn headroom_from_rollout(path: &Path) -> Headroom {
+    // Read at most the last few MiB: the token_count events refresh every turn, so the last one
+    // is near the end.
+    const TAIL_BYTES: u64 = 4 * 1024 * 1024;
+    let text = match read_tail(path, TAIL_BYTES) {
+        Some(t) => t,
+        None => return Headroom::Unknown,
+    };
+    let mut latest: Option<Headroom> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') || !line.contains("rate_limits") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = value.get("payload").unwrap_or(&value);
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        if let Some(rl) = payload.get("rate_limits") {
+            latest = Some(rate_limits_to_headroom(rl));
+        }
+    }
+    latest.unwrap_or(Headroom::Unknown)
+}
+
+/// Read up to `max` bytes from the end of a file as UTF-8 (lossy), or `None` if it cannot be
+/// opened. A tail read may start mid-line; the caller only keeps lines that parse as JSON.
+fn read_tail(path: &Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Convert a Codex `rate_limits` object to `Headroom`, tied to the *limiting* (highest-used,
+/// lowest-remaining) window and that window's own reset time. `Unknown` if no window carries a
+/// `used_percent`.
+fn rate_limits_to_headroom(rl: &Value) -> Headroom {
+    let mut limiting: Option<(f64, Option<u64>)> = None;
+    for key in ["primary", "secondary"] {
+        let Some(win) = rl.get(key) else { continue };
+        let Some(used) = win.get("used_percent").and_then(Value::as_f64) else {
+            continue;
+        };
+        // Fail open on a nonsensical value rather than closed: a non-finite or out-of-range
+        // `used_percent` is skipped, so a garbled field cannot clamp to "0% remaining" and gate
+        // an entry that is actually fine (round-1-impl finding f6).
+        if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+            continue;
+        }
+        let resets_at = win.get("resets_at").and_then(Value::as_u64);
+        // Keep the window with the highest used_percent (least remaining).
+        if limiting.map(|(u, _)| used > u).unwrap_or(true) {
+            limiting = Some((used, resets_at));
+        }
+    }
+    match limiting {
+        Some((used, resets_at)) => Headroom::Fraction {
+            remaining_pct: (100.0 - used).clamp(0.0, 100.0),
+            resets_at,
+        },
+        None => Headroom::Unknown,
+    }
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -433,6 +586,93 @@ mod tests {
     }
 
     #[test]
+    fn rate_limits_uses_the_limiting_window_and_its_own_reset() {
+        // Real shape from a rollout token_count event: single primary window.
+        let rl: Value = serde_json::from_str(
+            r#"{"primary":{"used_percent":83.0,"window_minutes":10080,"resets_at":1786826027},"secondary":null}"#,
+        )
+        .unwrap();
+        match rate_limits_to_headroom(&rl) {
+            Headroom::Fraction {
+                remaining_pct,
+                resets_at,
+            } => {
+                assert!((remaining_pct - 17.0).abs() < 1e-9);
+                assert_eq!(resets_at, Some(1786826027));
+            }
+            other => panic!("expected Fraction, got {other:?}"),
+        }
+
+        // Two windows: the limiting one is the *higher* used_percent (less remaining), and its
+        // own reset is kept -- not the nearer reset of the other window (round-1 finding f3).
+        let two: Value = serde_json::from_str(
+            r#"{"primary":{"used_percent":40.0,"resets_at":100},"secondary":{"used_percent":90.0,"resets_at":999}}"#,
+        )
+        .unwrap();
+        match rate_limits_to_headroom(&two) {
+            Headroom::Fraction {
+                remaining_pct,
+                resets_at,
+            } => {
+                assert!((remaining_pct - 10.0).abs() < 1e-9);
+                assert_eq!(
+                    resets_at,
+                    Some(999),
+                    "must keep the limiting window's reset"
+                );
+            }
+            other => panic!("expected Fraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limits_without_a_window_is_unknown() {
+        let rl: Value = serde_json::from_str(r#"{"primary":null,"secondary":null}"#).unwrap();
+        assert_eq!(rate_limits_to_headroom(&rl), Headroom::Unknown);
+    }
+
+    #[test]
+    fn codex_account_id_reads_the_identifier_only() {
+        let dir = std::env::temp_dir().join(format!("cr-codex-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"account_id":"acct-123","access_token":"SECRET"},"last_refresh":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_account_id(&dir), Some("acct-123".to_string()));
+        assert_eq!(codex_account_id(&dir.join("nope")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn headroom_from_rollout_takes_the_last_token_count() {
+        let dir = std::env::temp_dir().join(format!("cr-codex-roll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-08-10T10-00-00-abc.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"primary":{"used_percent":10.0,"resets_at":1}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"primary":{"used_percent":95.0,"resets_at":2}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        match headroom_from_rollout(&path) {
+            Headroom::Fraction { remaining_pct, .. } => {
+                assert!(
+                    (remaining_pct - 5.0).abs() < 1e-9,
+                    "must use the last event"
+                );
+            }
+            other => panic!("expected Fraction, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn cumulative_usage_is_taken_last_wins_and_converted_to_our_convention() {
         // Real values, captured from `codex exec --json`: two one-word turns on a single
         // thread. The second reply was the word "two", yet reports output_tokens 10 --
@@ -544,6 +784,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
@@ -745,6 +986,7 @@ ordinary diagnostic
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 

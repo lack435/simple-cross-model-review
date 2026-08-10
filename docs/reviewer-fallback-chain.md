@@ -687,6 +687,15 @@ specific** reviewer. Therefore:
 
 ## The usage-remaining spike
 
+> **Resolved (2026-08): signal verified for both reviewers → proactive gate built.** The spike
+> below ran, and — contrary to this document's own earlier assumption that "that number is not
+> available" — **both CLIs do expose a usage-remaining signal**: Codex a numeric `used_percent`
+> per window in its rollout log, Claude a categorical `rate_limit_event` status in
+> `--output-format stream-json`. The proactive `--min-usage-remaining` (Codex) /
+> `--min-usage-status` (Claude) gate is designed and implemented on top of the reactive chain in
+> [docs/usage-remaining-gate.md](usage-remaining-gate.md) (cross-review APPROVED). The reserved
+> grammar slot is now filled. The original spike plan is kept below for the record.
+
 Run as a **separate, bounded investigation**, gating any proactive feature:
 
 1. Determine whether `claude` and `codex`, run non-interactively, expose a machine-readable

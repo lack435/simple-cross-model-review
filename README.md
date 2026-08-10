@@ -103,6 +103,12 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
+--min-usage-remaining <n>   Proactive gate (codex only): skip this entry when its last-observed
+                            usage remaining is known and below n% (1..=100), before spending a
+                            call. Optional; unset never gates. See the usage-remaining gate below.
+--min-usage-status <lvl>    Proactive gate (claude only): claude reports a categorical usage
+                            status, not a percentage. 'ample' skips this entry when the status is
+                            a warning or worse; 'warning' skips only when rejected. Optional.
 --timeout-seconds <n>       Per-turn budget. Default 1800. Max 86400 (24h); an over-range
                             value is rejected at startup so the deadline arithmetic cannot
                             overflow.
@@ -159,9 +165,9 @@ substitute. If **every** entry is rate-limited the review is refused with
 `REVIEWERS_EXHAUSTED`, naming each entry tried. A **single** `--reviewer` behaves exactly as
 before: one reviewer, and a rate limit surfaces as `RATE_LIMITED`.
 
-There is no automatic fallback — the chain is only ever what the arguments declare — and no
-usage threshold: the trigger is the reviewer actually reporting a limit, because neither CLI
-exposes remaining-headroom for the server to gate on ahead of time. Same-family fallbacks
+There is no automatic fallback — the chain is only ever what the arguments declare. The
+reactive trigger is the reviewer actually reporting a limit; a **proactive** trigger is
+available on top of it (see the usage-remaining gate below). Same-family fallbacks
 (`gpt-5.6-luna` → `gpt-5.6-sol`, say) are honoured as written; the only chain the tool
 refuses is one with a *fully identical* entry (same reviewer, model, effort and bin), which
 could never be a fallback for the one before it. A misconfigured chain does not stop the
@@ -170,8 +176,41 @@ server — it starts and refuses every review with `INVALID_REVIEWER_CHAIN` unti
 A re-review resumes the entry that created the session (which may be a fallback), never the
 primary, and never falls through — the reviewer's memory lives on one specific reviewer, so a
 rate-limited resume is reported as such and the caller chooses `fresh: true` to restart chain
-selection. The full design, including the deferred usage-threshold spike, is in
+selection. The full design is in
 [docs/reviewer-fallback-chain.md](docs/reviewer-fallback-chain.md).
+
+### Proactive usage-remaining gate
+
+The fallback chain above is *reactive*: it advances after a reviewer fails. A reviewer entry
+can also be gated **proactively** — skipped before it is spawned — when its last-observed
+usage remaining is below a configured minimum, so a review lands on an account with capacity
+without first spending a call to discover the primary is throttled.
+
+```
+--reviewer codex  --model gpt-5.6-luna    --min-usage-remaining 10 \
+--reviewer claude --model claude-opus-4-8
+```
+
+The two reviewer CLIs expose usage headroom in different shapes, so the flag is
+family-specific and a mismatch is a startup error:
+
+- **`--min-usage-remaining <1..=100>`** — Codex, which reports a numeric remaining percentage
+  (read from its rollout log). Skips the entry when the last observation is below N %.
+- **`--min-usage-status <ample|warning>`** — Claude, which reports a categorical status, not a
+  percentage (read from its `stream-json` `rate_limit_event`). `ample` skips on a warning or
+  worse; `warning` skips only when rejected.
+
+It is **optional and fail-open**. An entry with no minimum is never gated; and an entry whose
+headroom is *unknown* — never observed, aged past its window reset, or an account whose
+identity can't be confirmed — is never gated either. The signal is observed during a turn and
+persisted per account, so the gate acts on the freshest prior observation; the first review
+against a never-seen account is ungated because there is nothing yet to gate on. Nothing
+proactive happens unless at least one entry sets a minimum: with none, Claude keeps its
+buffered output and no usage store is touched. If every entry is gated out (or rate-limited),
+the review is refused with `REVIEWERS_EXHAUSTED`, naming each entry's reason. `status` /
+`--doctor` show each entry's minimum and last-observed headroom. Full design, including the
+verified spike that found these signals, is in
+[docs/usage-remaining-gate.md](docs/usage-remaining-gate.md).
 
 ## The change under review is fetched for you
 

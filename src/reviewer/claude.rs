@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Invocation, Parsed, Reviewer, RunOutcome};
+use super::{Headroom, HeadroomLevel, Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
@@ -95,7 +95,16 @@ impl Reviewer for ClaudeReviewer {
         };
         cmd.current_dir(cwd);
         cmd.arg("-p");
-        cmd.args(["--output-format", "json"]);
+        if cfg.chain_gates_on_usage() {
+            // Armed: stream-json carries the `rate_limit_event` we read headroom from; its terminal
+            // `result` event otherwise carries the same fields the buffered document does.
+            // `--verbose` is required with `-p` + `stream-json`. Nothing else is added (in
+            // particular not `--include-partial-messages`, verified unnecessary). See
+            // `docs/usage-remaining-gate.md`.
+            cmd.args(["--output-format", "stream-json", "--verbose"]);
+        } else {
+            cmd.args(["--output-format", "json"]);
+        }
         cmd.args(["--model", &spec.model]);
         cmd.args(["--effort", &spec.effort]);
         // dontAsk denies anything outside the allow-list instead of prompting, so a
@@ -142,6 +151,12 @@ impl Reviewer for ClaudeReviewer {
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
+        // Armed (usage-observing) runs use `--output-format stream-json`, a JSONL event stream
+        // rather than one buffered document, so they take the JSONL path below. A disarmed run is
+        // byte-for-byte the buffered `json` path this reviewer has always used.
+        if cfg.chain_gates_on_usage() {
+            return parse_stream_json(spec, out);
+        }
         // The review is stdout-only for this reviewer, so a stdout that hit the cap is
         // not a parse failure to diagnose -- it is a document with its end missing, and
         // saying so is the only accurate report available.
@@ -154,7 +169,51 @@ impl Reviewer for ClaudeReviewer {
                 super::failure_for(cfg, spec, out)
             }
         })?;
+        from_result_document(spec, out, &parsed)
+    }
 
+    /// Armed runs raise the stdout byte cap (`stream-json` carries the review text more than
+    /// once), add a line cap, and terminate the child at either bound. Disarmed keeps the
+    /// historic retain-and-drain default.
+    fn output_limits(&self, cfg: &Config) -> super::StdoutLimits {
+        if cfg.chain_gates_on_usage() {
+            super::StdoutLimits {
+                max_bytes: super::MAX_ARMED_STREAM_BYTES,
+                max_lines: super::MAX_ARMED_STREAM_LINES,
+                terminate_at_cap: true,
+            }
+        } else {
+            super::StdoutLimits::default_retain()
+        }
+    }
+
+    /// Claude reports headroom as a `rate_limit_event` in its `stream-json` output. When the
+    /// chain is armed the invocation uses `stream-json` (so the event is present); otherwise the
+    /// buffered `json` document carries none and this yields `Unknown`. Reads only the CLI-owned
+    /// event fields, never model prose. See `docs/usage-remaining-gate.md`.
+    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, out: &RunOutcome) -> Headroom {
+        last_rate_limit_event(&out.stdout)
+            .map(headroom_from_rate_limit_event)
+            .unwrap_or(Headroom::Unknown)
+    }
+
+    /// The logged-in account, read from the CLI's local account file `~/.claude.json`
+    /// (`oauthAccount.accountUuid`, with the org uuid to disambiguate) — a local file, the
+    /// account *identifier* only, never the credentials in `~/.claude/.credentials.json`.
+    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
+        claude_account_id(&claude_config_path()?)
+    }
+}
+
+/// Turn a Claude result document — from the buffered `json` path or the terminal `result`
+/// event of the armed `stream-json` path — into a `Parsed`. Classification reads only the CLI's
+/// own structured fields; `result` is the review *content*, never evidence.
+fn from_result_document(
+    spec: &ReviewerSpec,
+    out: &RunOutcome,
+    parsed: &Value,
+) -> Result<Parsed, Failure> {
+    {
         let session_id = super::normalize_session_id(
             parsed
                 .get("session_id")
@@ -191,6 +250,18 @@ impl Reviewer for ClaudeReviewer {
             }
             if let Some(status) = parsed.get("api_error_status").filter(|v| !v.is_null()) {
                 evidence = format!("api_error_status: {status}\n{evidence}");
+            }
+            // Other CLI-owned structured fields that can carry an actionable failure reason (a
+            // rate limit surfaced only here, say). Structured metadata, not model prose, so they
+            // are evidence; the review text never is (round-1-impl finding f3).
+            for field in ["stop_reason", "terminal_reason"] {
+                if let Some(v) = parsed
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    evidence = format!("{field}: {v}\n{evidence}");
+                }
             }
 
             // The review text is still shown, just never matched against.
@@ -231,7 +302,7 @@ impl Reviewer for ClaudeReviewer {
             );
         }
 
-        let denials = collect_denials(&parsed);
+        let denials = collect_denials(parsed);
         let denial_count = parsed
             .get("permission_denials")
             .and_then(Value::as_array)
@@ -247,13 +318,182 @@ impl Reviewer for ClaudeReviewer {
             // reaches here counted the whole document -- it is never a floor.
             denial_count_is_floor: false,
             warnings,
-            usage: collect_usage(&parsed),
+            usage: collect_usage(parsed),
             // Claude's result document describes the turn that just ran, not the
             // conversation. Verified by the fields themselves: `num_turns` is this
             // invocation's model-call count, and a resumed turn does not inherit the
             // previous one's totals.
             usage_is_cumulative: false,
         })
+    }
+}
+
+/// Parse the armed `--output-format stream-json` JSONL stream into a `Parsed`, enforcing the
+/// armed truncation contract at read time. `result` (model prose) is used only as content; a
+/// `rejected` rate-limit event is mapped to `RATE_LIMITED` so the reactive chain still advances;
+/// classification never runs raw stdout through the generic classifier. See
+/// `docs/usage-remaining-gate.md`.
+fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
+    // The armed reader terminated the child the moment a raw byte/line bound was overrun and
+    // recorded which; that is authoritative, so report OUTPUT_TRUNCATED naming the bound before
+    // trusting a possibly-partial stream (round-2-impl finding f10). A byte overrun may still have
+    // let a terminal `result` line through, but the stream is truncated either way.
+    if let Some(kind) = out.stdout_cap_hit {
+        let bound = match kind {
+            super::StreamCapKind::Bytes => {
+                format!("{} MiB", super::MAX_ARMED_STREAM_BYTES / (1024 * 1024))
+            }
+            super::StreamCapKind::Lines => format!("{} event lines", super::MAX_ARMED_STREAM_LINES),
+        };
+        return Err(errors::output_truncated_at(
+            "claude",
+            &bound,
+            out.diagnostics(),
+        ));
+    }
+    // The stream ended before it was fully drained -- a pipe read error or the collect deadline --
+    // so it may be a partial prefix; do not parse it as whole (round-2-impl finding f11).
+    if out.stdout_incomplete {
+        return Err(errors::output_incomplete("claude", out.diagnostics()));
+    }
+
+    let mut result_event: Option<Value> = None;
+    // The last CLI-owned failure event (a top-level `error`, or a `result` with `is_error`), kept
+    // so a failure represented only by such an event is classified from its structured fields
+    // rather than becoming a generic REVIEWER_FAILED (round-2-impl finding f3).
+    let mut error_event: Option<Value> = None;
+    let mut rate_rejected = false;
+    for line in out.stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ty = value.get("type").and_then(Value::as_str);
+        let is_error = value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match ty {
+            // Keep the last result event: it is the terminal document.
+            Some("result") => {
+                if is_error {
+                    error_event = Some(value.clone());
+                }
+                result_event = Some(value);
+            }
+            // A top-level structured error event.
+            Some("error") => error_event = Some(value),
+            Some("rate_limit_event")
+                if value
+                    .get("rate_limit_info")
+                    .and_then(|i| i.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("rejected") =>
+            {
+                rate_rejected = true;
+            }
+            _ => {}
+        }
+    }
+
+    // A `rejected` rate-limit event maps to RATE_LIMITED **whether or not** a terminal result
+    // event also appears (round-1-impl finding f1): the plan's contract is that the CLI's own
+    // structured "no capacity" signal drives fall-through, and checking it only on the no-result
+    // path would let a result event mask it and strand the chain. Checked before the result so
+    // the rejection wins; `result` content is still never used as evidence.
+    if rate_rejected {
+        return Err(errors::rate_limited(
+            "claude",
+            "the reviewer reported a usage limit (rate_limit_event status=rejected)",
+        ));
+    }
+
+    // A successful terminal result is the review. `from_result_document` also classifies a result
+    // that carries `is_error`, from its CLI-owned fields.
+    if let Some(parsed) = result_event {
+        return from_result_document(spec, out, &parsed);
+    }
+    // No result, but a structured error event: classify it through the same CLI-owned-fields path.
+    if let Some(err) = error_event {
+        return from_result_document(spec, out, &err);
+    }
+    // No result and no structured error event. Classify from stderr and the exit code (CLI-owned),
+    // never the JSONL body, which can carry model prose.
+    if out.success {
+        return Err(errors::empty_review("claude", out.diagnostics()));
+    }
+    Err(errors::classify(
+        "claude",
+        &spec.model,
+        &spec.effort,
+        out.exit,
+        out.stderr.trim(),
+        &format!(
+            "the reviewer produced no terminal result event.\n{}",
+            out.stderr.trim()
+        ),
+    ))
+}
+
+/// Path to Claude Code's account file: `$CLAUDE_CONFIG_DIR/.claude.json` when set, else
+/// `~/.claude.json` — the same resolution the CLI uses.
+fn claude_config_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+    }
+    super::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// Read a stable account identifier from `~/.claude.json`: the OAuth account uuid, combined with
+/// the organization uuid so two accounts in different orgs never collide. `None` on any miss so
+/// the gate fails open.
+fn claude_account_id(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let acct = v.get("oauthAccount")?;
+    let uuid = acct.get("accountUuid").and_then(Value::as_str)?;
+    let org = acct
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(format!("{org}/{uuid}"))
+}
+
+/// The last `rate_limit_event.rate_limit_info` object in a `stream-json` stream, if any. Scans
+/// JSONL lines and keeps the last match (the freshest reading). Non-JSON and other event types
+/// are skipped.
+fn last_rate_limit_event(stdout: &str) -> Option<Value> {
+    let mut last = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') || !line.contains("rate_limit_event") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
+            if let Some(info) = value.get("rate_limit_info") {
+                last = Some(info.clone());
+            }
+        }
+    }
+    last
+}
+
+/// Map a `rate_limit_info` object to `Headroom`. An unrecognised `status` yields `Unknown` so an
+/// unlisted future value cannot mis-gate.
+fn headroom_from_rate_limit_event(info: Value) -> Headroom {
+    let status = info.get("status").and_then(Value::as_str).unwrap_or("");
+    match HeadroomLevel::from_status(status) {
+        Some(level) => Headroom::Level {
+            level,
+            resets_at: info.get("resetsAt").and_then(Value::as_u64),
+        },
+        None => Headroom::Unknown,
     }
 }
 
@@ -333,7 +573,185 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
+    }
+
+    #[test]
+    fn rate_limit_event_maps_status_to_level() {
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1786393200}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok"}"#,
+        );
+        match ClaudeReviewer.observe_headroom(&cfg(), cfg().primary(), &outcome(stream, true)) {
+            Headroom::Level { level, resets_at } => {
+                assert_eq!(level, HeadroomLevel::Warning);
+                assert_eq!(resets_at, Some(1786393200));
+            }
+            other => panic!("expected Level, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffered_json_has_no_rate_limit_event_so_headroom_is_unknown() {
+        // The disarmed default: a single buffered result document carries no rate_limit_event.
+        let json = r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#;
+        assert_eq!(
+            ClaudeReviewer.observe_headroom(&cfg(), cfg().primary(), &outcome(json, true)),
+            Headroom::Unknown
+        );
+    }
+
+    #[test]
+    fn unrecognised_status_is_unknown_not_mis_gated() {
+        let info: Value = serde_json::from_str(r#"{"status":"some_future_state"}"#).unwrap();
+        assert_eq!(headroom_from_rate_limit_event(info), Headroom::Unknown);
+    }
+
+    #[test]
+    fn claude_account_id_combines_org_and_account_uuid() {
+        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".claude.json");
+        std::fs::write(
+            &path,
+            r#"{"userID":"u","oauthAccount":{"accountUuid":"acc-9","emailAddress":"x@y.z","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_account_id(&path), Some("org-1/acc-9".to_string()));
+        assert_eq!(claude_account_id(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn armed_invocation_switches_to_stream_json() {
+        let armed = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--min-usage-status".into(),
+            "warning".into(),
+        ])
+        .expect("config");
+        let inv = ClaudeReviewer
+            .invocation(&armed, armed.primary(), Path::new("claude"), None, "id")
+            .expect("invocation");
+        let argv: Vec<String> = inv
+            .command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "{argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--verbose"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--include-partial-messages"),
+            "{argv:?}"
+        );
+        // Disarmed keeps buffered json.
+        let dis: Vec<String> = ClaudeReviewer
+            .invocation(&cfg(), cfg().primary(), Path::new("claude"), None, "id")
+            .expect("invocation")
+            .command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            dis.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "json"),
+            "{dis:?}"
+        );
+    }
+
+    #[test]
+    fn armed_parse_extracts_the_terminal_result_event() {
+        // A stream-json stream: system + assistant + rate_limit_event + terminal result. The
+        // result's fields are parsed exactly as the buffered document's would be.
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r###"{"type":"assistant","message":{"content":[{"type":"text","text":"## Verdict APPROVE"}]}}"###,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            "\n",
+            r###"{"type":"result","is_error":false,"result":"## Verdict APPROVE","session_id":"s-1","usage":{"input_tokens":5}}"###,
+        );
+        let parsed = parse_stream_json(cfg().primary(), &outcome(stream, true)).expect("parsed");
+        assert_eq!(parsed.text, "## Verdict APPROVE");
+        assert_eq!(parsed.session_id.as_deref(), Some("s-1"));
+        assert_eq!(parsed.usage.input_tokens, Some(5));
+    }
+
+    #[test]
+    fn armed_rejected_rate_limit_without_result_is_rate_limited() {
+        // The CLI emitted a rejected rate_limit_event and no terminal result: must map to
+        // RATE_LIMITED so the reactive fall-through fires, not a generic failure.
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1}}"#,
+        );
+        let err = parse_stream_json(cfg().primary(), &outcome(stream, false)).unwrap_err();
+        assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
+    }
+
+    #[test]
+    fn armed_rejected_rate_limit_wins_even_with_a_result_event() {
+        // f1: a rejected rate_limit_event maps to RATE_LIMITED even when a (possibly successful)
+        // result event also appears, so the reactive chain still advances.
+        let stream = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#,
+        );
+        let err = parse_stream_json(cfg().primary(), &outcome(stream, true)).unwrap_err();
+        assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
+    }
+
+    #[test]
+    fn armed_cap_hit_is_a_defined_truncation_naming_the_bound() {
+        // The reader (not the parser) detects the overrun and records which bound; the parser
+        // reports OUTPUT_TRUNCATED naming it, before trusting the possibly-partial stream.
+        let mut lines = outcome("{\"type\":\"system\"}\n", true);
+        lines.stdout_cap_hit = Some(crate::reviewer::StreamCapKind::Lines);
+        let err = parse_stream_json(cfg().primary(), &lines).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_TRUNCATED", "{err:?}");
+        assert!(err.summary.contains("event lines"), "{err:?}");
+
+        let mut bytes = outcome("{\"type\":\"system\"}\n", true);
+        bytes.stdout_cap_hit = Some(crate::reviewer::StreamCapKind::Bytes);
+        let err = parse_stream_json(cfg().primary(), &bytes).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_TRUNCATED", "{err:?}");
+        assert!(err.summary.contains("MiB"), "{err:?}");
+    }
+
+    #[test]
+    fn armed_incomplete_stream_is_not_parsed_as_whole() {
+        // A pipe error / collect-deadline cut (stdout_incomplete) must not be read as a complete
+        // (possibly empty) review (round-2-impl finding f11).
+        let mut inc = outcome(r#"{"type":"result","is_error":false,"result":"ok"}"#, true);
+        inc.stdout_incomplete = true;
+        let err = parse_stream_json(cfg().primary(), &inc).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_INCOMPLETE", "{err:?}");
+    }
+
+    #[test]
+    fn armed_error_event_without_result_is_classified_not_generic() {
+        // A structured error event (no result) is classified from its CLI-owned fields rather
+        // than falling through to a generic failure (round-2-impl finding f3).
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"result","is_error":true,"subtype":"error_max_turns"}"#,
+        );
+        // A result-with-is_error is a failure; from_result_document classifies it (not EMPTY_REVIEW).
+        let err = parse_stream_json(cfg().primary(), &outcome(stream, false)).unwrap_err();
+        assert_ne!(err.code, "EMPTY_REVIEW", "{err:?}");
     }
 
     #[test]
@@ -493,6 +911,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
@@ -565,6 +984,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let err = ClaudeReviewer
             .parse(&cfg(), cfg().primary(), &out, None)
@@ -602,6 +1022,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let err = ClaudeReviewer
             .parse(&cfg(), cfg().primary(), &out, None)

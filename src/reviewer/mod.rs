@@ -30,8 +30,137 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// wrong, and the point is that it fails legibly rather than eating the machine.
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-use crate::config::{Config, ReviewerKind, ReviewerSpec};
+/// Total raw stdout bytes the *armed* Claude reader will read before declaring the stream
+/// truncated. Larger than `MAX_OUTPUT_BYTES` because `--output-format stream-json` carries the
+/// review text more than once (assistant events plus the terminal `result`), so a review whose
+/// content fits the buffered path produces a stream several times its size. Practical sizing,
+/// not a proven ceiling -- its job is to stop a runaway stream, not to decide ordinary
+/// truncation. See `docs/usage-remaining-gate.md`.
+pub const MAX_ARMED_STREAM_BYTES: usize = 4 * MAX_OUTPUT_BYTES;
+
+/// Companion line/event cap for the armed reader: a stream may stay under the byte cap while
+/// emitting a pathological number of tiny events. Bounds work independently of byte size.
+pub const MAX_ARMED_STREAM_LINES: usize = 500_000;
+
+/// The stdout bounds [`run_observed`] enforces for one reviewer. The default keeps the historic
+/// behaviour — retain up to `max_bytes`, but keep draining past it so the child never blocks on a
+/// full pipe (`terminate_at_cap: false`). The **armed** Claude path sets `terminate_at_cap: true`
+/// so a runaway stream is *killed* at the byte or line bound rather than held until the timeout
+/// (round-1-impl finding f2). See `docs/usage-remaining-gate.md`.
+#[derive(Clone, Copy, Debug)]
+pub struct StdoutLimits {
+    pub max_bytes: usize,
+    pub max_lines: usize,
+    pub terminate_at_cap: bool,
+}
+
+/// Which armed stdout bound a stream overran, so the failure can name it accurately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCapKind {
+    Bytes,
+    Lines,
+}
+
+impl StdoutLimits {
+    /// The historic default: cap retention at `MAX_OUTPUT_BYTES`, no line cap, keep draining past
+    /// the cap (do not kill the child). This preserves e.g. Codex finishing its final-message file
+    /// even when its stdout event stream exceeds the cap.
+    pub fn default_retain() -> Self {
+        Self {
+            max_bytes: MAX_OUTPUT_BYTES,
+            max_lines: usize::MAX,
+            terminate_at_cap: false,
+        }
+    }
+}
+
+use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
+
+/// A reviewer's usage-remaining headroom, observed from the CLI's own machine output (Codex's
+/// rollout `token_count.rate_limits`, Claude's `rate_limit_event`) -- never the model's prose.
+///
+/// Three-state with an explicit `Unknown`: an absent, unparseable, unrecognised, stale, or
+/// identity-mismatched signal is `Unknown`, and `Unknown` never gates (fail-open). See
+/// `docs/usage-remaining-gate.md`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Headroom {
+    /// No usable signal -- fail-open, always clears any minimum.
+    Unknown,
+    /// Codex: remaining percentage of the *limiting* (lowest-remaining) window, with that
+    /// window's own reset time.
+    Fraction {
+        remaining_pct: f64,
+        resets_at: Option<u64>,
+    },
+    /// Claude: a categorical level, with the window's reset time.
+    Level {
+        level: HeadroomLevel,
+        resets_at: Option<u64>,
+    },
+}
+
+/// Claude's categorical usage status, normalized. Rank is explicit (`Exhausted < Warning <
+/// Ample`) rather than derived from declaration order, so a comparison cannot silently invert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HeadroomLevel {
+    Exhausted,
+    Warning,
+    Ample,
+}
+
+impl HeadroomLevel {
+    /// Higher rank = more headroom. Load-bearing for `clears`; do not replace with a derived
+    /// `Ord`, whose declaration-order default would rank `Ample` lowest and invert the decision.
+    pub fn rank(self) -> u8 {
+        match self {
+            HeadroomLevel::Exhausted => 0,
+            HeadroomLevel::Warning => 1,
+            HeadroomLevel::Ample => 2,
+        }
+    }
+
+    /// Map Claude's `status` string to a level; an unrecognised value yields `None` (the caller
+    /// treats it as `Headroom::Unknown`, so an unlisted future value cannot mis-gate).
+    pub fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "allowed" => Some(HeadroomLevel::Ample),
+            "allowed_warning" => Some(HeadroomLevel::Warning),
+            "rejected" => Some(HeadroomLevel::Exhausted),
+            _ => None,
+        }
+    }
+}
+
+impl Headroom {
+    /// The reset time this observation is tied to, if any (the limiting window for a Codex
+    /// `Fraction`). `None` for `Unknown` and for a signal that carried no reset.
+    pub fn resets_at(&self) -> Option<u64> {
+        match self {
+            Headroom::Unknown => None,
+            Headroom::Fraction { resets_at, .. } | Headroom::Level { resets_at, .. } => *resets_at,
+        }
+    }
+
+    /// Does this observation clear the configured minimum? `Unknown` always clears (fail-open).
+    /// Each shape is only ever compared against its own-shaped minimum -- the config grammar
+    /// guarantees a Codex entry carries `Remaining(_)` and a Claude entry `Status(_)`; a
+    /// mismatched pairing (which the grammar forbids) also clears, never gating on a signal it
+    /// cannot interpret. See `docs/usage-remaining-gate.md`.
+    pub fn clears(&self, min: &UsageMinimum) -> bool {
+        match (self, min) {
+            (Headroom::Unknown, _) | (_, UsageMinimum::None) => true,
+            (Headroom::Fraction { remaining_pct, .. }, UsageMinimum::Remaining(pct)) => {
+                *remaining_pct >= f64::from(*pct)
+            }
+            (Headroom::Level { level, .. }, UsageMinimum::Status(min_level)) => {
+                level.rank() >= min_level.rank()
+            }
+            // Shape/minimum mismatch (forbidden by the grammar): fail-open.
+            _ => true,
+        }
+    }
+}
 
 /// What the reviewer produced.
 #[derive(Debug)]
@@ -105,6 +234,15 @@ pub fn neutral_dir(cfg: &Config) -> PathBuf {
 ///
 /// Shared with the diff capture, which uses it as a security check rather than a
 /// convenience, so there is deliberately one implementation and not two.
+/// The user's home directory, for locating a CLI's local account/session files. Honours the
+/// platform's usual variables (`USERPROFILE` on Windows, then `HOME`). `None` if neither is set.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
@@ -244,6 +382,35 @@ pub trait Reviewer: Send + Sync {
         out: &RunOutcome,
         last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure>;
+
+    /// Observe this reviewer's usage-remaining headroom from its own machine output, read on
+    /// **both** the success and failure paths (a rate-limited refusal is exactly the account the
+    /// gate should skip next time). Reads only CLI-owned machine output — Codex's rollout
+    /// `token_count.rate_limits`, Claude's `rate_limit_event` — never the model's prose. Called
+    /// only when the chain is armed (`Config::chain_gates_on_usage`). Default `Unknown`
+    /// (fail-open). See `docs/usage-remaining-gate.md`.
+    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, _out: &RunOutcome) -> Headroom {
+        Headroom::Unknown
+    }
+
+    /// A cheap, *current*, local account identifier for this reviewer — the one the store keys a
+    /// usage observation under, so a snapshot cannot cross an account switch. Read from the CLI's
+    /// own local account file (Codex `$CODEX_HOME/auth.json`, Claude `~/.claude.json`), never via
+    /// a CLI call and never a secret; `None` when it cannot be read (the gate then fails open).
+    /// See `docs/usage-remaining-gate.md`.
+    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
+        None
+    }
+
+    /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
+    /// `MAX_OUTPUT_BYTES`; the armed Claude path raises the byte cap, adds a line cap, and asks
+    /// the runner to *terminate* the child at either bound (because `stream-json` carries the
+    /// review text more than once and a runaway stream must not hold the worker until timeout).
+    /// This is the single truncation contract on raw bytes/lines read — overrun before the
+    /// terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
+    fn output_limits(&self, _cfg: &Config) -> StdoutLimits {
+        StdoutLimits::default_retain()
+    }
 }
 
 pub fn for_kind(kind: ReviewerKind) -> Box<dyn Reviewer> {
@@ -423,6 +590,11 @@ pub struct RunOutcome {
     /// cleanly. The Perforce capture treats this like truncation: an incomplete list or diff must
     /// not be parsed as a whole and seed an elision baseline.
     pub stdout_incomplete: bool,
+    /// Set when an **armed** stdout stream overran its byte or line bound and the reader
+    /// terminated the child at that point (`StdoutLimits::terminate_at_cap`). Names which bound
+    /// tripped so the armed parser can report an accurate `OUTPUT_TRUNCATED`. `None` on every
+    /// non-armed run. See `docs/usage-remaining-gate.md`.
+    pub stdout_cap_hit: Option<StreamCapKind>,
 }
 
 /// Why [`run_observed`] failed. The distinction is a durability boundary, not cosmetic: a `Spawn`
@@ -522,8 +694,16 @@ pub fn run(
     cancel: &AtomicBool,
 ) -> std::io::Result<RunOutcome> {
     // The status/liveness probes that use this wrapper do not need the spawn/observe distinction, so
-    // flatten it back to a plain `io::Error`.
-    run_observed(command, stdin_data, timeout, cancel, |_| {}).map_err(RunError::into_io)
+    // flatten it back to a plain `io::Error`. They keep the ordinary retain-and-drain limits.
+    run_observed(
+        command,
+        stdin_data,
+        timeout,
+        cancel,
+        StdoutLimits::default_retain(),
+        |_| {},
+    )
+    .map_err(RunError::into_io)
 }
 
 /// Run a reviewer child and periodically report that it was observed alive.
@@ -536,6 +716,10 @@ pub fn run_observed(
     stdin_data: &str,
     timeout: Duration,
     cancel: &AtomicBool,
+    // Bounds on the retained stdout buffer, and whether to kill the child at the bound. The armed
+    // Claude path raises the byte cap and terminates at it; every other path keeps the historic
+    // retain-and-drain (see StdoutLimits). stderr always uses MAX_OUTPUT_BYTES retention.
+    stdout_limits: StdoutLimits,
     mut on_activity: impl FnMut(Activity),
 ) -> Result<RunOutcome, RunError> {
     command
@@ -579,8 +763,15 @@ pub fn run_observed(
     // holds a pipe open past the drain deadline we still get everything that arrived --
     // returning at EOF meant abandoning the channel discarded the whole transcript, and
     // for Claude, whose review is stdout-only, a completed review became EMPTY_REVIEW.
-    let stdout_buf = drain(child.stdout.take().expect("stdout was piped"));
-    let stderr_buf = drain(child.stderr.take().expect("stderr was piped"));
+    let stdout_buf = drain(
+        child.stdout.take().expect("stdout was piped"),
+        stdout_limits,
+    );
+    // stderr is never the review, so it keeps the historic retain-and-drain (no early kill).
+    let stderr_buf = drain(
+        child.stderr.take().expect("stderr was piped"),
+        StdoutLimits::default_retain(),
+    );
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -598,11 +789,20 @@ pub fn run_observed(
                     });
                     next_activity = now + Duration::from_secs(5);
                 }
+                // The armed stdout reader stops and flags which bound it overran; kill the child
+                // it left blocked on a full pipe.
+                let over_cap = stdout_buf.cap_hit().is_some();
                 let stop = if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
                     true
                 } else if now >= deadline {
                     timed_out = true;
+                    true
+                } else if over_cap {
+                    // Armed stream ran past its byte or line bound: kill it now rather than hold
+                    // the worker until the timeout (round-1-impl finding f2). `stdout_truncated`
+                    // (byte cap) and the retained line count let the parser name which bound
+                    // tripped and return OUTPUT_TRUNCATED. Not flagged as timed_out/cancelled.
                     true
                 } else {
                     false
@@ -633,12 +833,18 @@ pub fn run_observed(
     let drain_by = Instant::now() + DRAIN_GRACE;
     let stdout = collect(&stdout_buf, drain_by);
     let stderr = collect(&stderr_buf, drain_by);
+    // Read the cap signal *after* `collect` has waited for the reader thread (round-2-impl
+    // finding f10 propagation race): the reader sets `cap_hit` and then `done`, and `collect`
+    // blocks on `done`, so sampling it before could miss an overrun the reader recorded a moment
+    // later — letting a truncated stream through as accepted.
+    let stdout_cap_hit = stdout_buf.cap_hit();
 
     Ok(RunOutcome {
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
         stdout_lossy: stdout.lossy,
         stdout_incomplete: stdout.incomplete,
+        stdout_cap_hit,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -658,11 +864,23 @@ struct Drain {
     /// mid-stream. Distinct from `truncated` (the deliberate size cap): a consumer that needs a
     /// complete stream (the Perforce capture) must treat this as untrustworthy.
     errored: Arc<AtomicBool>,
+    /// For an **armed** stream (`StdoutLimits::terminate_at_cap`), which bound the reader first
+    /// overran — at which point it stops reading, so the child blocks and the poll loop kills it.
+    /// `0` none, `1` bytes, `2` lines. `None` shape via [`Drain::cap_hit`].
+    cap_hit: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Drain {
     fn len(&self) -> usize {
         self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    fn cap_hit(&self) -> Option<StreamCapKind> {
+        match self.cap_hit.load(Ordering::SeqCst) {
+            1 => Some(StreamCapKind::Bytes),
+            2 => Some(StreamCapKind::Lines),
+            _ => None,
+        }
     }
 }
 
@@ -671,24 +889,31 @@ impl Drain {
 /// Reading incrementally rather than returning at EOF is what makes a partial transcript
 /// recoverable: whatever arrived before the deadline is already in the buffer.
 ///
-/// The buffer is capped, but the *reading* is not. Once the cap is reached the reader
-/// keeps consuming the pipe and throws the bytes away, because a reader that stopped
-/// would fill the pipe and block the child forever -- trading unbounded memory for a
-/// hung review, which is a worse bargain. Reaching the cap is recorded, so a transcript
-/// that lost its middle is reported as truncated rather than as merely short.
-fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
+/// The buffer is capped at `limits.max_bytes`. For a **non-armed** stream
+/// (`terminate_at_cap == false`) the reader keeps consuming the pipe past the cap and throws the
+/// bytes away, because a reader that stopped would fill the pipe and block the child forever --
+/// trading unbounded memory for a hung review, which is a worse bargain; reaching the cap is
+/// recorded as `truncated`. For an **armed** stream the reader instead **stops at the first
+/// raw-byte or raw-line overrun**, records which bound it was, and returns: the pipe then fills,
+/// the child blocks, and the poll loop terminates it — so raw input is bounded to the cap plus at
+/// most one chunk rather than read to completion (round-2-impl finding f10).
+fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
     let errored = Arc::new(AtomicBool::new(false));
+    let cap_hit = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
     let writer_errored = Arc::clone(&errored);
+    let writer_cap_hit = Arc::clone(&cap_hit);
     std::thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
+        let mut raw_bytes: usize = 0;
+        let mut raw_lines: usize = 0;
         loop {
+            let mut chunk = [0u8; 8192];
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
                 Err(_) => {
@@ -698,16 +923,31 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
                     break;
                 }
                 Ok(n) => {
-                    let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
-                    if room == 0 {
-                        writer_truncated.store(true, Ordering::SeqCst);
-                        continue;
+                    raw_bytes = raw_bytes.saturating_add(n);
+                    let newlines = chunk[..n].iter().filter(|&&b| b == b'\n').count();
+                    raw_lines = raw_lines.saturating_add(newlines);
+                    {
+                        let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
+                        let room = limits.max_bytes.saturating_sub(buffer.len());
+                        if n > room {
+                            writer_truncated.store(true, Ordering::SeqCst);
+                        }
+                        buffer.extend_from_slice(&chunk[..n.min(room)]);
                     }
-                    if n > room {
-                        writer_truncated.store(true, Ordering::SeqCst);
+                    // Armed: stop at the first bound overrun (strictly exceeding the bound, so a
+                    // stream exactly at the bound is allowed), recording which bound it was. The
+                    // poll loop then kills the child. Bytes checked before lines only to pick one
+                    // when a single chunk crosses both.
+                    if limits.terminate_at_cap {
+                        if raw_bytes > limits.max_bytes {
+                            writer_cap_hit.store(1, Ordering::SeqCst);
+                            break;
+                        }
+                        if raw_lines > limits.max_lines {
+                            writer_cap_hit.store(2, Ordering::SeqCst);
+                            break;
+                        }
                     }
-                    buffer.extend_from_slice(&chunk[..n.min(room)]);
                 }
             }
         }
@@ -719,6 +959,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
         done,
         truncated,
         errored,
+        cap_hit,
     }
 }
 
@@ -848,11 +1089,79 @@ mod session_id_tests {
 }
 
 #[cfg(test)]
+mod headroom_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_always_clears() {
+        assert!(Headroom::Unknown.clears(&UsageMinimum::Remaining(90)));
+        assert!(Headroom::Unknown.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+    }
+
+    #[test]
+    fn fraction_clears_at_or_above_the_minimum() {
+        let h = Headroom::Fraction {
+            remaining_pct: 17.0,
+            resets_at: None,
+        };
+        assert!(h.clears(&UsageMinimum::Remaining(10)));
+        assert!(h.clears(&UsageMinimum::Remaining(17)));
+        assert!(!h.clears(&UsageMinimum::Remaining(18)));
+        assert!(h.clears(&UsageMinimum::None));
+    }
+
+    #[test]
+    fn level_ranks_ample_highest_not_by_declaration_order() {
+        // The load-bearing check: an accidental derived Ord would rank Ample lowest.
+        assert!(HeadroomLevel::Ample.rank() > HeadroomLevel::Warning.rank());
+        assert!(HeadroomLevel::Warning.rank() > HeadroomLevel::Exhausted.rank());
+
+        let ample = Headroom::Level {
+            level: HeadroomLevel::Ample,
+            resets_at: None,
+        };
+        let warning = Headroom::Level {
+            level: HeadroomLevel::Warning,
+            resets_at: None,
+        };
+        let rejected = Headroom::Level {
+            level: HeadroomLevel::Exhausted,
+            resets_at: None,
+        };
+        // min=ample: only ample clears.
+        assert!(ample.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        assert!(!warning.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        assert!(!rejected.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        // min=warning: ample and warning clear, rejected does not.
+        assert!(ample.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+        assert!(warning.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+        assert!(!rejected.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+    }
+
+    #[test]
+    fn status_strings_map_and_unknown_is_none() {
+        assert_eq!(
+            HeadroomLevel::from_status("allowed"),
+            Some(HeadroomLevel::Ample)
+        );
+        assert_eq!(
+            HeadroomLevel::from_status("allowed_warning"),
+            Some(HeadroomLevel::Warning)
+        );
+        assert_eq!(
+            HeadroomLevel::from_status("rejected"),
+            Some(HeadroomLevel::Exhausted)
+        );
+        assert_eq!(HeadroomLevel::from_status("some_new_state"), None);
+    }
+}
+
+#[cfg(test)]
 mod drain_tests {
     use super::*;
 
     fn drained(bytes: Vec<u8>) -> Collected {
-        let drain = drain(std::io::Cursor::new(bytes));
+        let drain = drain(std::io::Cursor::new(bytes), StdoutLimits::default_retain());
         collect(&drain, Instant::now() + Duration::from_secs(5))
     }
 
@@ -861,6 +1170,46 @@ mod drain_tests {
         let collected = drained(b"a normal transcript".to_vec());
         assert_eq!(collected.text, "a normal transcript");
         assert!(!collected.truncated);
+    }
+
+    #[test]
+    fn armed_cap_hit_is_visible_after_collect_even_on_natural_eof() {
+        // Regression for the f10 propagation race: a finite stream (EOF, like a child that exits
+        // right after overrunning) that exceeds the byte bound must have `cap_hit` observable
+        // once `collect` has waited for the reader. `collect` blocks on the reader's `done`, and
+        // the reader sets `cap_hit` before `done`, so reading it after `collect` is race-free.
+        let limits = StdoutLimits {
+            max_bytes: 16,
+            max_lines: usize::MAX,
+            terminate_at_cap: true,
+        };
+        let bytes_drain = drain(std::io::Cursor::new(vec![b'x'; 64]), limits);
+        let _ = collect(&bytes_drain, Instant::now() + Duration::from_secs(5));
+        assert_eq!(bytes_drain.cap_hit(), Some(StreamCapKind::Bytes));
+
+        // The line bound likewise, and a stream exactly at neither bound is not flagged.
+        let line_limits = StdoutLimits {
+            max_bytes: usize::MAX,
+            max_lines: 3,
+            terminate_at_cap: true,
+        };
+        let d = drain(
+            std::io::Cursor::new(b"a\nb\nc\nd\ne\n".to_vec()),
+            line_limits,
+        );
+        let _ = collect(&d, Instant::now() + Duration::from_secs(5));
+        assert_eq!(d.cap_hit(), Some(StreamCapKind::Lines));
+
+        let ok = drain(
+            std::io::Cursor::new(b"a\nb\n".to_vec()),
+            StdoutLimits {
+                max_bytes: 1024,
+                max_lines: 10,
+                terminate_at_cap: true,
+            },
+        );
+        let _ = collect(&ok, Instant::now() + Duration::from_secs(5));
+        assert_eq!(ok.cap_hit(), None);
     }
 
     #[test]
@@ -875,6 +1224,7 @@ mod drain_tests {
             "",
             Duration::from_secs(5),
             &std::sync::atomic::AtomicBool::new(false),
+            StdoutLimits::default_retain(),
             |_| {},
         );
         match result {
@@ -934,10 +1284,13 @@ mod drain_tests {
         // therefore have passed.
         let source = MAX_OUTPUT_BYTES * 2;
         let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let drain = drain(Counting {
-            remaining: source,
-            taken: Arc::clone(&taken),
-        });
+        let drain = drain(
+            Counting {
+                remaining: source,
+                taken: Arc::clone(&taken),
+            },
+            StdoutLimits::default_retain(),
+        );
         let collected = collect(&drain, Instant::now() + Duration::from_secs(10));
 
         assert!(collected.truncated);
@@ -968,6 +1321,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
@@ -998,6 +1352,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let failure = truncation_failure(cfg.primary(), &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
@@ -1029,6 +1384,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
 
         let failure = failure_for(&cfg, cfg.primary(), &out);
