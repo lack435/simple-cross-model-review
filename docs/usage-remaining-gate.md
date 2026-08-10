@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan — cross-review APPROVED (round 7).** This document is the plan for the piece of [issue #48] that the
+Status: **implemented — plan and implementation both cross-review APPROVED.** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -697,3 +697,34 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
   regressions or new findings." All 21 findings (f1–f21) confirmed resolved; `converged: true`.
   This is the merge gate's approval of the plan; implementation proceeds as a separate change
   through its own gate.
+
+## Implementation review history
+
+The implementation went through the same `cross-review` gate (Codex, gpt-5.6-luna, effort=max),
+a separate session from the plan:
+
+- **Round 1 — REQUEST CHANGES (9 findings: 5 major, 4 minor), all accepted.** Major: a rejected
+  `rate_limit_event` was ignored when a `result` event also appeared; the armed stream bounds were
+  enforced only after the child exited (not read-time); `from_result_document` ignored
+  `stop_reason`/`terminal_reason`; resumed attempts recorded no headroom; all-gated selection ran
+  after the session lease. Minor: malformed Codex percentages failed closed; an equal-second stale
+  write could regress; a gated skip lost the resolved bin; `status` omitted observation metadata.
+- **Round 2 — REQUEST CHANGES (f3 + two new).** f3 (only the terminal `result` was classified, not
+  standalone structured `error` events); the armed bounds were still *retention* bounds, not
+  read-time (the reader kept draining past the cap and the poll loop only sampled every 100 ms);
+  and `parse_stream_json` ignored `stdout_incomplete`. All accepted and fixed: the armed reader now
+  stops at the first raw byte/line overrun and records which via `RunOutcome.stdout_cap_hit`.
+- **Round 3 — REQUEST CHANGES (one).** A propagation race: `stdout_cap_hit` was sampled before
+  `collect()` waited for the reader thread, so a child exiting right after an overrun could slip
+  truncated output through. Fixed by sampling after `collect()`, with a natural-EOF regression test.
+- **Round 4 — APPROVE.** "the cap signal is now sampled only after the reader has finished, closing
+  f10 without introducing regressions." f1–f11 resolved; `converged: true`.
+- **Post-merge (round 5) — APPROVE.** `main` advanced while the branch was open — PR #56
+  ("neutral-cwd reviewer fix") landed, touching the same files — so `main` was merged in and the
+  integrated diff re-gated. "The neutral-cwd and usage-gate implementations coexist correctly, with
+  no regressions found." No findings.
+
+Build state on the merged tree: `cargo fmt --check` clean, `cargo clippy --all-targets -D warnings`
+clean, unit tests pass, release build succeeds. The `build.ps1` staging of `dist\cross-review.exe`
+and the opt-in `smoke.ps1 -Reviewer codex` end-to-end round trip (which bills tokens) are the
+remaining pre-merge steps.
