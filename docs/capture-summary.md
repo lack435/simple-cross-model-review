@@ -18,6 +18,15 @@ summary to the caller in every review response").
   below" pointer never dangles. This adds a caller warning for incomplete-but-not-skipped Perforce
   segments (prompt-only today). Also: explicit `diff:` token, corrected warning ordering, required
   smoke run, fixed set-relationship wording. Changes tagged *(r2)* below.
+- *r3 → r4:* pinned down the *scope* of `complete`. It covers **capture-level wholeness** — the
+  streams, caps, enumeration, and unrun commands — and explicitly **not** the deliberate per-file
+  exclusion of un-includable files (a binary, out-of-root, deleted, or unreadable untracked file),
+  which the repository already treats as reviewer-facing detail, not a caller warning, and guards
+  with a standing test (`an_ordinary_skipped_file_does_not_warn_the_caller`, `src/vcs/git.rs`).
+  Added the untracked *enumeration* (`git ls-files`) stream flags to that wholeness set (they are
+  accepted on `success` alone today), and reframed the size figures as **"shown" counts** whose
+  floor qualifier fires on any shortfall in the *relevant* evidence, not diff byte-truncation
+  alone. Changes tagged *(r3)* below.
 
 ## Problem: the caller cannot see what change the reviewer was given
 
@@ -63,9 +72,21 @@ Three rules govern the design. Two are inherited; the third the round-2 review f
 3. *(r2)* **Every completeness gap that sets `complete = false` also emits a caller-facing
    warning.** The `captured:` line states the verdict and points at the warnings for detail;
    this invariant is what makes that pointer honest. It is maintained by construction — the same
-   gap facts drive both the verdict and the warnings — and it forces two gaps that are silent to
-   the caller today (a truncated untracked body; an incomplete-but-not-skipped Perforce segment)
-   to become warnings.
+   gap facts drive both the verdict and the warnings — and it forces gaps that are silent to the
+   caller today (a truncated untracked body; a short-streamed untracked enumeration; an
+   incomplete-but-not-skipped Perforce segment) to become warnings.
+
+   *(r3)* A "completeness gap" here means a **capture-level** shortfall — something wrong with the
+   capture *as a package*: a stream that ran short or decoded badly, a size cap that dropped
+   intended content, an enumeration cut off, a required command that did not run, or an included
+   file's body shown only as a prefix. It deliberately does **not** include the per-file exclusion
+   of an *un-includable* file: a binary, out-of-root, deleted, or unreadable untracked file is not
+   evidence that could have been sent, so its omission is surfaced to the reviewer per-file (which
+   can open the file) and is not a caller-level completeness gap. That line is the repository's
+   existing, tested design — `an_ordinary_skipped_file_does_not_warn_the_caller` (`src/vcs/git.rs`)
+   asserts exactly that a binary untracked file leaves `Capture::warnings` empty, and its comment
+   names it as "the assertion that stops 'warn about everything' arriving later as an obvious
+   improvement." `complete` respects that boundary rather than moving it.
 
 ## Proposal: a typed `CaptureSummary`, computed by each backend, rendered once
 
@@ -117,9 +138,11 @@ pub enum CaptureSummary {
         deletions: usize,
         /// New files carried alongside the diff (git-untracked), which a diff cannot cover.
         untracked_files: usize,
-        /// The diff specifically was cut at MAX_DIFF_BYTES, so the counts above are a floor.
-        diff_truncated: bool,
-        /// The whole capture is complete: nothing truncated, omitted, unrun, or streamed short.
+        /// The diff stream was shortened (byte cap, short pipe, or lossy decode), so the `+/-`
+        /// and file counts are a floor. Broader than the byte cap alone. See "shown counts".
+        diff_incomplete: bool,
+        /// Capture-level wholeness (streams, caps, enumeration, unrun commands, truncated included
+        /// bodies) — NOT the per-file exclusion of un-includable files. See rule 3.
         complete: bool,
     },
     Perforce {
@@ -150,33 +173,51 @@ computed **at the backend, from the full set of gap facts** — not re-derived a
 would wrongly count the Perforce *over-caps* warning, a statement about the *next* turn's resume,
 not this capture's evidence).
 
-**Git `complete` is false if any of these holds** — the first four are surfaced as caller warnings
-today; *(r2)* the last two are the gaps round-2 found silent and this design turns into warnings:
+**Git `complete` is false if any of these capture-level shortfalls holds.** The first four are
+surfaced as caller warnings today; *(r2)*/*(r3)* the rest are the gaps rounds 2–3 found silent,
+which this design turns into warnings:
 
 - `diff.truncated` — the diff hit `MAX_DIFF_BYTES`;
 - `status.truncated` — the `git status` listing hit the cap;
-- a non-empty `notes` — e.g. `git status` did not run at all;
+- a non-empty `notes` — a required command did not run: `git status` failed, or *(r3)* the
+  `git ls-files` untracked enumeration failed (both already push a note that becomes a warning);
 - a non-empty `OmissionReport::capture_level` — untracked content cap reached, or the untracked
   listing was cut short;
 - *(r2)* any `untracked` file with `body.truncated` — an included new file was shown only as a
-  prefix (per-file or total-budget cap; `src/vcs/git.rs` untracked read). This is *not* a
-  capture-level omission today, so it needs to be counted and warned;
+  prefix (per-file or total-budget cap; `src/vcs/git.rs` untracked read). Not a capture-level
+  omission today, so it needs to be counted and warned;
 - *(r2)* `stdout_incomplete` or `stdout_lossy` on the diff **or** the status `RunOutcome`
   (`src/reviewer/mod.rs` `RunOutcome`; `src/vcs/git.rs` where the diff and status are run). The git
   path reads only `success`/`stdout` today and discards these, so a diff that ended as a short
   prefix under the byte cap, or decoded lossily, is currently invisible. The Perforce path already
-  treats these as truncation; git must too.
+  treats these as truncation; git must too;
+- *(r3)* `stdout_truncated`, `stdout_incomplete`, or `stdout_lossy` on the **`git ls-files`**
+  `RunOutcome` (`src/vcs/git.rs` `untracked`). Today that listing is accepted on `out.success`
+  alone, so a *successful but short* enumeration silently drops untracked files — the count comes
+  out low and nothing warns. This is the round-3 gap; it makes `untracked_files` a floor, sets
+  `complete = false`, and emits a warning, exactly like the diff/status streams.
+
+**What `complete` deliberately excludes** *(r3):* the per-file exclusion of an un-includable
+untracked file — a binary, out-of-root, deleted, or unreadable file the enumeration *reached* and
+then could not include. Those are noted to the reviewer per-file (`change.untracked_omitted`,
+rendered into the prompt) and are **not** caller warnings, per rule 3 and the standing test
+`an_ordinary_skipped_file_does_not_warn_the_caller`. `complete` is about whether the capture
+*package* is whole — the streams, caps, enumeration, and commands — not about whether every file's
+bytes were includable. The `content_cap_skipped` case *is* capture-level (intended content dropped
+because the budget ran out) and stays a gap; a *binary* file is not (its bytes were never sendable)
+and does not.
 
 **Perforce `complete`** is `skipped.is_empty() && incomplete_changelists == 0 && !diff_truncated`,
 where `incomplete_changelists` counts captured segments with `complete == false`
 (`src/vcs/perforce.rs` per-segment completeness — a binary or unreadable added file, an
-out-of-root or deleted file, a lossy or truncated `p4 describe`). This is deliberately *narrower*
-than the existing `capture_complete` local, which also requires `identity.client_spec_digest.is_some()`:
+out-of-root or deleted file, a lossy or truncated `p4 describe`; the Perforce path already folds
+its stream-incompleteness into that per-segment flag). This is deliberately *narrower* than the
+existing `capture_complete` local, which also requires `identity.client_spec_digest.is_some()`:
 that extra condition governs whether the capture may seed a resume *baseline*, a different question
 from whether the evidence shown this turn was whole.
 
 **Set relationship** *(r2, corrected):* `complete` is the **stricter** condition — `complete`
-implies `!diff_truncated`, but `!diff_truncated` does **not** imply `complete`.
+implies the diff and every other stream was whole, but a whole diff does **not** imply `complete`.
 
 ### The git range descriptor
 
@@ -203,7 +244,8 @@ always safe to interpolate into Markdown and into the JSON log.
 ### Git: what the numbers are, and where they come from
 
 Constructed in `git::capture` (`src/vcs/git.rs`), which has every input in scope where it builds
-the `Change`:
+the `Change`. *(r3)* Every figure is a **shown count** — what actually reached the reviewer — so it
+is never an overstatement; when the relevant evidence was shortened, the render marks it a floor:
 
 - **`range`** as above.
 - **`files` / `insertions` / `deletions`** are a cheap parse of the captured diff text
@@ -213,10 +255,13 @@ the `Change`:
     emits that header, so it is counted with zero line changes — which is correct.
   - `insertions` = lines beginning with `+` **excluding** the `+++ ` file header;
     `deletions` = lines beginning with `-` **excluding** the `--- ` file header.
+  - These are a floor whenever the diff stream was shortened, which is more than the byte cap:
+    `diff_incomplete = change.diff.truncated || diff.stdout_incomplete || diff.stdout_lossy`.
 - **`untracked_files`** is `change.untracked.len()` — new files git has never seen, carried
   alongside the diff and therefore *not* in the `+/-` counts. Reported separately (the review
-  endorsed keeping it separate) so the line is honest about what the `+/-` figures include.
-- **`diff_truncated`** is `change.diff.truncated`; **`complete`** as defined above.
+  endorsed keeping it separate). *(r3)* It is itself a floor when the enumeration was shortened
+  (`git ls-files` short-streamed) or the untracked listing was cut short — the render says so.
+- **`diff_incomplete`** as above; **`complete`** as defined above.
 
 ### Perforce: what the numbers are, and where they come from
 
@@ -228,9 +273,11 @@ Constructed in `perforce::capture` (`src/vcs/perforce.rs`) where the `CapturedCh
   It drives the verdict **and** a new caller warning (below), because those segment details are
   rendered only into the prompt today, so a caller has no other way to see them.
 - **`evidence_units`** is the count of units across all captured segments
-  (`segments.iter().flat_map(|s| &s.units).count()`). On an elided resume the *unit count* is
-  unchanged — a collapsed unit is still a unit — and the resent/collapsed split stays the
-  disposition's job (the review endorsed this, given `complete` now surfaces incompleteness).
+  (`segments.iter().flat_map(|s| &s.units).count()`) — *(r3)* a shown count, a floor when
+  `diff_truncated || incomplete_changelists > 0`, since an incomplete segment or a budget-cut diff
+  means units were dropped or shortened. On an elided resume the *unit count* is unchanged — a
+  collapsed unit is still a unit — and the resent/collapsed split stays the disposition's job (the
+  review endorsed this, given `complete` now surfaces incompleteness).
 - **`diff_truncated`** is `budget.diff_truncated`; **`complete`** as defined above.
 
 ### The new warnings that keep the invariant *(r2)*
@@ -240,35 +287,45 @@ caller today:
 
 - **Git — truncated untracked bodies.** When one or more included untracked files were shown only
   in part, emit one `incomplete(...)` warning naming the count (the per-file bodies are already in
-  the prompt; the caller needs the fact). Similarly, when a diff/status stream came back
+  the prompt; the caller needs the fact).
+- **Git — short-streamed diff or status.** When a diff/status stream came back
   `stdout_incomplete`/`stdout_lossy`, emit an `incomplete(...)` warning — the same wording the
   Perforce path uses for its stream gaps.
+- *(r3)* **Git — short-streamed untracked enumeration.** When `git ls-files` returned success but
+  `stdout_truncated`/`stdout_incomplete`/`stdout_lossy`, emit an `incomplete(...)` warning that the
+  untracked file set may be short (the existing note only fires when `ls-files` *fails*).
 - **Perforce — incomplete segments.** When `incomplete_changelists > 0`, emit a warning naming how
   many captured changelists were incomplete and that their per-file reasons are in the prompt. This
   mirrors the existing skipped-changelist and diff-truncation warnings, which already reach the
   caller.
 
-Every other gap already warns, so no change is needed there. The result: `complete == false` iff at
-least one capture-completeness warning was emitted.
+Every other capture-level gap already warns, so no change is needed there. The result:
+`complete == false` iff at least one capture-completeness warning was emitted — while the per-file
+exclusion of an un-includable file warns *neither* and remains prompt-only, preserving
+`an_ordinary_skipped_file_does_not_warn_the_caller`.
 
 ### How the size and completeness read together
 
-`render_completed` renders the size, then an explicit diff token *(r2)*, then the completeness
-verdict, marking the counts a floor only when the diff specifically was truncated:
+`render_completed` renders the shown counts, then an explicit diff token *(r2)*, then the
+completeness verdict. *(r3)* Each count is prefixed "at least" and flagged a floor when *its own*
+evidence was shortened — the diff figures on `diff_incomplete` (not the byte cap alone), the
+untracked figure on a short enumeration — so a shortfall in one stream does not falsely qualify a
+count drawn from another:
 
 ```
 … — 12 files, +487/-89, 0 untracked — diff intact — complete
 … — 12 files, +487/-89, 3 untracked — diff intact — partial (see warnings below)
-… — at least 40 files, +90000/-1200, 0 untracked — diff truncated (counts are a floor) — partial (see warnings below)
-… (perforce) — 8 evidence units — diff intact — partial (1 of 3 changelists incomplete; see warnings below)
+… — at least 40 files, +90000/-1200, 0 untracked — diff incomplete (counts are a floor) — partial (see warnings below)
+… — 12 files, +487/-89, at least 2 untracked — diff intact — partial (untracked listing short; see warnings below)
+… (perforce) — at least 8 evidence units — diff intact — partial (1 of 3 changelists incomplete; see warnings below)
 ```
 
-*(r2)* The `diff:` token is **always** present (`diff intact` / `diff truncated`), so a partial
-capture with an intact diff still states the diff's status explicitly rather than leaving it
-inferred. The verdict is always `complete` / `partial`. When `partial`, the line points **below**
-to the WARNING lines — corrected from "above": `render_completed` prints the warnings *after* the
-`captured:` line — and, by rule 3, at least one such warning always exists. When `diff_truncated`,
-the file and `+/-` figures are prefixed "at least" and flagged a floor.
+*(r2)* The `diff:` token is **always** present. *(r3)* Its states are `diff intact` /
+`diff incomplete`, where `diff incomplete` covers the byte cap **and** a short or lossy stream —
+so a diff that ended as a prefix without hitting the cap does not read as `intact`; the warning it
+emits says which it was. The verdict is always `complete` / `partial`. When `partial`, the line
+points **below** to the WARNING lines — corrected from "above": `render_completed` prints the
+warnings *after* the `captured:` line — and, by rule 3, at least one such warning always exists.
 
 ## How the caller sees it
 
@@ -318,9 +375,13 @@ the gap this project closed for the resume disposition. The round-1 review was r
 counts-only tag (`git:12f+487-89`) defeats the field's purpose — it cannot tell two ranges apart
 or reveal a stale base — so the tag carries the **identity of the capture**, not its size:
 
-- Git: the resolved endpoints plus markers, e.g. `git:<base12>..<head12>` with `+t` (diff
-  truncated) / `+p` (partial) suffixes.
+- Git: the resolved endpoints plus markers, e.g. `git:<base12>..<head12>` with `+d` (diff
+  incomplete — byte cap or short/lossy stream) / `+p` (capture partial) suffixes.
 - Perforce: the captured changelist numbers plus the same markers, e.g. `p4:43650,43651+p`.
+
+(`+d` implies `+p`, since an incomplete diff makes the capture partial; both are shown when the
+partial verdict has causes beyond the diff, so an audit can tell "only the diff was cut" from
+"other evidence was missing too".)
 
 Both are built from the already-safe `range` / `changelists` fields and the whole tag is
 length-bounded before it is written. It is recorded on `Record` (`src/metrics.rs`) as
@@ -339,16 +400,19 @@ failure is still audited. Both come from the same `CaptureSummary`.
 
 - **It must not run any new VCS subprocess.** Every figure is a parse of what was already captured
   or a count of a vector already in memory. No extra `git diff --numstat`, no extra `p4` call.
-  *(r2)* The added `stdout_incomplete`/`stdout_lossy` checks read flags already on the `RunOutcome`
-  the diff and status commands already returned — no new command is run.
+  *(r2, r3)* The added stream-flag checks (`stdout_incomplete`/`stdout_lossy` on diff and status;
+  the same plus `stdout_truncated` on `git ls-files`) read flags already on the `RunOutcome` those
+  commands already returned — no new command is run.
 - **It must not change what is captured or rendered into the prompt.** The summary is a read of the
   capture, computed after it. The golden prompt snapshot in `src/vcs/mod.rs` must be
   byte-for-byte unchanged — the reviewer's prompt does not gain the `captured:` line, only the tool
   response does. *(r2)* The new warnings are caller-facing (`Capture::warnings`); they do not alter
   the prompt body, so the golden test still holds.
-- **It must not overclaim on a truncated or partial capture.** `complete` is `false` on *any* gap,
-  and by rule 3 each gap also emits a warning; a truncated diff additionally makes the counts a
-  floor. The existing warnings still fire on their own terms.
+- **It must not overclaim on a truncated or partial capture.** `complete` is `false` on any
+  *capture-level* gap, and by rule 3 each such gap also emits a warning; a shortened stream
+  additionally makes the counts drawn from it a floor. *(r3)* Equally, it must not *under*claim:
+  `complete` stays `true` for the deliberate per-file exclusion of an un-includable file, which the
+  repository intends to keep prompt-only. The existing warnings still fire on their own terms.
 - **It must not carry unsanitised operator text.** The git `range` is hex or `safe_label`-bounded
   at construction; the metrics tag is built from those safe fields and length-bounded.
 - **It must not restate the reviewer's confidence.** It reports the *evidence sent*, full stop.
@@ -358,7 +422,8 @@ failure is still audited. Both come from the same `CaptureSummary`.
 New: `src/vcs/capture_summary.rs` (the enum, `summary()`, `tag()`, unit tests). Touched:
 `src/vcs/git.rs` (build the `Git` variant + `diff_line_counts` + the `range` descriptor; new field
 on the internal `Change`; *(r2)* surface `stdout_incomplete`/`stdout_lossy` on diff/status and the
-truncated-untracked-body warning), `src/vcs/mod.rs` (move the summary across in the adapter),
+truncated-untracked-body warning; *(r3)* surface the `git ls-files` stream flags), `src/vcs/mod.rs`
+(move the summary across in the adapter),
 `src/vcs/shared.rs` (field on `CapturedChange`; the `range` fallback reuses `safe_label`),
 `src/vcs/perforce.rs` (build the `Perforce` variant; *(r2)* the incomplete-segment warning),
 `src/registry.rs` (field on `Outcome`/`Review`/`Snapshot`, threaded through `finish`/`of`),
@@ -373,12 +438,14 @@ a new injection surface.
 
 ## Testing
 
-- **`capture_summary.rs` unit tests**: `summary()` for git (exact counts; `complete` vs `partial`;
-  the diff-truncated floor wording with the "at least" prefix; the always-present `diff:` token in
-  *both* an intact-diff partial and a truncated partial; zero vs present untracked) and Perforce
-  (evidence-unit count; `partial` from a skipped *or* an incomplete-but-not-skipped changelist, and
-  the `N of M` phrasing); `tag()` stability and bounding; singular vs plural ("1 file" vs "12
-  files"), per the disposition doc's precedent.
+- **`capture_summary.rs` unit tests**: `summary()` for git (shown counts; `complete` vs `partial`;
+  the floor wording with the "at least" prefix on the diff figures for a `diff_incomplete` capture
+  *and* on `untracked_files` for a short enumeration — asserting each floor fires only for its own
+  count; the always-present `diff:` token in *both* an intact-diff partial and a diff-incomplete
+  partial; zero vs present untracked) and Perforce (evidence-unit count as a floor when incomplete;
+  `partial` from a skipped *or* an incomplete-but-not-skipped changelist, and the `N of M`
+  phrasing); `tag()` stability and bounding, including `+d` implies `+p`; singular vs plural
+  ("1 file" vs "12 files"), per the disposition doc's precedent.
 - **`diff_line_counts` unit tests** (git): plain multi-file diff; rename-only (file counted, zero
   lines); binary (file counted, zero lines); `+++`/`--- ` headers excluded; empty diff (0/0/0).
 - **`range` descriptor tests** (git): a pinned range renders resolved hex endpoints; working-tree
@@ -390,8 +457,13 @@ a new injection surface.
     caller warning.
   - Git: a truncated `status`; a `git status` that did not run; an untracked listing cut short;
     *(r2)* an included untracked file with `body.truncated == true`; *(r2)* a diff whose
-    `RunOutcome` reports `stdout_incomplete`/`stdout_lossy` — each yields `complete == false` with
-    a matching caller warning while the diff bytes are otherwise intact.
+    `RunOutcome` reports `stdout_incomplete`/`stdout_lossy`; *(r3)* a `git ls-files` that returned
+    success but `stdout_incomplete`/`stdout_lossy`/`stdout_truncated` — each yields
+    `complete == false` with a matching caller warning while the diff bytes are otherwise intact.
+  - *(r3)* The excluded case, guarding the contract boundary: a binary/out-of-root untracked file
+    the enumeration *reached* keeps `complete == true` and `Capture::warnings` empty — i.e. the
+    existing `an_ordinary_skipped_file_does_not_warn_the_caller` still passes unchanged, and the new
+    `complete` field agrees with it.
   - The invariant itself: for each partial case above, assert `Capture::warnings` is non-empty
     (the "see warnings below" pointer is never dangling).
 - **`render_completed` tests** (`src/tools.rs`): the `captured:` line appears on a fresh completed
