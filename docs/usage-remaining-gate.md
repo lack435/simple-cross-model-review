@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan (round 4).** This document is the plan for the piece of [issue #48] that the
+Status: **plan (round 5).** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -254,13 +254,20 @@ observation:
     `subtype`, `api_error_status`, `stop_reason`, `terminal_reason`, `permission_denials`,
     `usage`, `session_id`. The armed parser extracts content and metadata from separate,
     named fields — it never runs free text through the classifier.
-  - **The no-terminal-`result` case is defined.** If the stream carries a `rate_limit_event`
-    (or other events) but **no** terminal `result` event — the CLI died or was rejected
-    mid-stream — the turn is a **failure**, classified from whatever CLI-owned metadata the
-    stream did carry (e.g. a `result` event with `is_error:true`, an error event) or, absent
-    any, a defined "no result event" failure; and the `rate_limit_event`, if present, is still
-    captured as headroom by `observe_headroom` regardless. A missing `result` is never treated
-    as an empty successful review.
+  - **A `rejected` rate-limit event classifies the turn as `RATE_LIMITED` (round-5 finding
+    f14).** A `rate_limit_event` with `status: "rejected"` is the CLI telling us, in its own
+    structured metadata, that the account has no capacity — so the armed parser maps it to the
+    **`RATE_LIMITED`** code, exactly the trigger the reactive fall-through advances on. Mapping
+    it to a *generic* failure would strand the chain (no fall-through, no `REVIEWERS_EXHAUSTED`),
+    which is the whole point of the reactive layer this feature sits on. This holds whether or
+    not a terminal `result` accompanies the rejection.
+  - **The no-terminal-`result` case is defined.** If the stream carries events but **no**
+    terminal `result` — the CLI died or was rejected mid-stream — the turn is a **failure**:
+    a `rejected` `rate_limit_event` → `RATE_LIMITED` (above); otherwise classified from whatever
+    CLI-owned metadata the stream carried (a `result`/error event with `is_error:true`), or,
+    absent any, a defined "no result event" failure. The `rate_limit_event`, if present, is
+    still captured as headroom by `observe_headroom` regardless. A missing `result` is never
+    treated as an empty successful review.
 - **Two separate bounds — retained bytes *and* total work (finding f15, still open after
   round 3).** `stream-json` is larger than the buffered document (~5.5× for a trivial reply;
   roughly 2× the review text for a large one, since the text appears in both `assistant`
@@ -269,20 +276,30 @@ observation:
   also serves as the **total-work** bound against a runaway CLI — and counting the whole stream
   against it can truncate before `result`, while *not* counting it makes total reading
   unbounded. So the armed path defines **two independent bounds**:
-  - **Retention bound** — memory held is ~one document: only the latest `result` and
-    `rate_limit_event` are kept as lines arrive; earlier `assistant`/`system`/`stream_event`
-    lines are parsed for those two and dropped.
-  - **Total-input bound** — a distinct `MAX_ARMED_STREAM_BYTES` (and/or a wall/​event cap)
-    bounds the bytes *read*, sized at **≥ 2× `MAX_OUTPUT_BYTES`** so that any review whose text
-    would fit the buffered path also fits here (the stream carries the text ~twice). Reading
-    stops at this bound; if it is hit **before** the terminal `result`, that is a **defined
-    truncation failure** (`OUTPUT_TRUNCATED`), never a silent success and never unbounded
-    reading.
+  - **Content bound — the review-truncation threshold is the same as buffered mode.** Buffered
+    mode's `MAX_OUTPUT_BYTES` effectively caps the review *content*. The armed path applies
+    `MAX_OUTPUT_BYTES` to the **retained result text** (the content it keeps), not to the raw
+    stream — so a review is truncated on the *same content threshold* in both modes. The format
+    switch therefore does not move the line at which a review is considered too large; that was
+    the round-3 worry, and pinning the cap to retained content (not raw bytes) is what removes
+    it. Round 5 rightly rejected the earlier "≥ 2× raw bytes proves equivalence" claim —
+    per-event/tool-output framing makes the raw multiple unprovable — so the equivalence is
+    asserted on **retained content**, which *is* the comparable quantity, and no raw-size proof
+    is claimed.
+  - **Runaway bound — a concrete, separate guard on total work.** Independently, the bytes
+    *read* from the pipe are bounded by a concrete `MAX_ARMED_STREAM_BYTES` **and** a concrete
+    line/event count, on top of the collect wall-deadline the walk already enforces. This is a
+    *runaway* guard, framed — like `single-blocking-collect.md`'s budget — as **practical
+    sizing, not a proven ceiling**: its only job is to stop an unbounded or pathological stream,
+    and hitting it before a terminal `result` is a **defined** `OUTPUT_TRUNCATED`, never a
+    silent success and never unbounded reading. Because it is deliberately far larger than any
+    real review's stream, it does not decide ordinary truncation — the content bound above does.
 
-  So a runaway stream is bounded, and a review buffered mode would have accepted is **not**
-  turned into `OUTPUT_TRUNCATED` by the format switch. Tests cover both: a huge run-on stream
-  hits the total-input bound and fails as `OUTPUT_TRUNCATED` (bounded), and a large-but-valid
-  review that fits buffered mode still yields its terminal `result` under the armed path.
+  So the review-truncation threshold is content-equivalent to buffered mode, a runaway stream
+  is concretely bounded, and neither claim rests on an unprovable raw-size multiple. Tests
+  cover both: a review whose *content* fits buffered mode still yields its terminal `result`
+  armed; and a pathological run-on stream trips the runaway guard as a defined
+  `OUTPUT_TRUNCATED`.
 
 The behaviour-preservation invariant is **field-level `Parsed` equivalence** between the armed
 and buffered paths (not byte-equivalence — a JSONL line is not a buffered document, finding
@@ -317,14 +334,22 @@ detected):
   the account *identifier*, never the credentials in the separate `~/.claude/.credentials.json`,
   which this tool does not read.)
 
-The fingerprint is read the **same way at observation time** (stored on the record) **and at
-selection time** (compared), so no preflight and no cache sit between them. **When the current
-fingerprint cannot be read, or does not match the stored one, the observation is `Unknown` and
-the entry is not skipped** (fail-open — the reviewer's "current local identity source, or treat
-as Unknown"). Proactive gating is therefore only ever a skip on *positively matched, currently
-read* identity; an account switch flips the read fingerprint immediately and the stale snapshot
-stops gating. A genuine auth failure is still surfaced by the normal preflight when the selected
-entry actually runs — the gate neither triggers nor masks it.
+**One read per review, at launch, carried through — no read-time/observe-time TOCTOU (round-5
+finding f4).** The fingerprint is read **once, at the start of the review (selection/launch)**,
+and that single launch-time value is carried through the whole review: it is what the gate
+compares against the stored snapshot, *and* it is what a fresh observation is written under
+when the turn completes. Reading it a second time at observation would open a
+time-of-check/time-of-use gap — an account switch mid-review could file the observation under a
+different identity than the gate decision used. Binding both to the one launch-time read closes
+that: within a review the identity is fixed, and the turn's own auth (the preflight that runs
+right after launch) executes under that same account. **Across reviews, the next launch reads
+the fingerprint afresh; if it differs from the stored one the snapshot is `Unknown`** and does
+not gate. **When the fingerprint cannot be read at all, the observation is `Unknown` and the
+entry is not skipped** (fail-open — the reviewer's "current local identity source, or treat as
+Unknown"). Proactive gating is therefore only ever a skip on a *positively matched* launch-time
+identity; an account switch between reviews flips it immediately and the stale snapshot stops
+gating. A genuine auth failure is still surfaced by the normal preflight when the selected entry
+runs — the gate neither triggers nor masks it.
 
 **Actionable only while fresh and unreset (finding f9).** A snapshot gates only if `now <
 resets_at` **and** `now − observed_at < TTL` (the window's own length when known —
@@ -340,14 +365,19 @@ Round-1 finding f2 (gate must precede primary preflight and capture) and round-2
 f17, f18 together pin the exact placement:
 
 - **Selection (fresh review), before capture, the Perforce pending-marker, and *any*
-  preflight or model spawn.** Walk the chain from entry 0; for each entry with a minimum, read
-  its current account fingerprint from the **local file** (Codex `auth.json`, Claude
+  auth preflight or model spawn.** Walk the chain from entry 0; for each entry with a minimum,
+  read its launch-time account fingerprint from the **local file** (Codex `auth.json`, Claude
   `~/.claude.json`) — **not** an `auth_check`, so selection never triggers a preflight (the
-  round-3 f2 regression) — read the store, and skip the entry if its observation is
-  matched-identity, actionable, and below-minimum. The first entry that clears is the start
-  entry. If **every** entry is gated out, return `REVIEWERS_EXHAUSTED` (gated variant)
-  **before** capture / marker / preflight — nothing is captured, resolved, auth-checked, or
-  billed.
+  round-3 f2 regression) — resolve its binary with the cheap `resolve_bin` PATH scan to form
+  the store key, read the store, and skip the entry if its observation is matched-identity,
+  actionable, and below-minimum. The first entry that clears is the start entry. If **every**
+  entry is gated out, return `REVIEWERS_EXHAUSTED` (gated variant) with **no auth preflight, no
+  capture, no pending-marker, no spawn, and no billing**. (Round-5 finding f21: the store key
+  is `resolved-bin` + fingerprint, so `resolve_bin` — a PATH scan, no auth, no model — *does*
+  run to form it; "nothing resolved" would be inaccurate. It is only the *auth* preflight,
+  capture, marker, spawn, and billing that the all-gated path avoids. A `resolve_bin` failure
+  during selection yields no key → `Unknown` → the entry is not gated and takes the normal
+  path, where its `CLI_NOT_FOUND` surfaces.)
 - **Skipped-entry metadata is carried into the `Job` and seeded into its `metrics_attempts`
   (finding f17)**, because selection runs before the worker while the attempt history is built
   inside the walk. A pre-start skip of entry 0 therefore still appears as its promised
@@ -584,3 +614,24 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
     independent bounds** (retention ≈ one document; a separate total-input bound ≥ 2×
     `MAX_OUTPUT_BYTES` whose breach before `result` is a defined `OUTPUT_TRUNCATED`), so a
     runaway stream is bounded and a review buffered mode would accept is not truncated (§4).
+
+- **Round 4 (same session, turn 4) — REQUEST CHANGES**, restated on turn 5 (the client that
+  collected turn 4 crashed on a text-encoding bug before its verdict was read; the doc was
+  unchanged, so turn 5 re-reported the same assessment). Confirmed **resolved**: f1–f3, f5–f13,
+  f16–f20 (no regressions). **Still open**, addressed in round 5:
+  - **f4** — reading the identity file at *both* selection and observation is a TOCTOU gap if
+    the account changes mid-review. Fixed: the fingerprint is read **once at launch** and that
+    single value is carried through the review for both the gate decision and the observation
+    write; across reviews a changed launch read invalidates the snapshot (§5).
+  - **f14** — a `rejected` `rate_limit_event` was captured as headroom but not mapped to a
+    failure code; a generic failure would block reactive fall-through. Fixed: a `rejected`
+    event classifies the turn as **`RATE_LIMITED`**, with or without a terminal `result` (§4).
+  - **f15** — "≥ 2× raw bytes" does not *prove* every buffered-acceptable stream fits. Fixed:
+    the review-truncation threshold is pinned to the **retained result content** at
+    `MAX_OUTPUT_BYTES` (content-equivalent to buffered), and the raw-read guard is reframed as a
+    concrete *runaway* bound (bytes + line/event count + the collect wall-deadline), practical
+    sizing rather than a proven ceiling; the unprovable raw-multiple claim is withdrawn (§4).
+  - **f21 (new, minor)** — the all-gated path must `resolve_bin` to form the store key, so
+    "nothing resolved" was inaccurate. Fixed: clarified that `resolve_bin` (a PATH scan, no
+    auth, no model) runs to build the key, while auth preflight, capture, the marker, spawning,
+    and billing are what the all-gated path avoids (§6).
