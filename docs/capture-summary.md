@@ -35,6 +35,13 @@ summary to the caller in every review response").
   `partial` verdict; stream shortfalls are carried by the count floor, the verdict, and a warning.
   (c) The Perforce `evidence_units` **floor** now also fires on `skipped > 0`. Changes tagged
   *(r4)* below.
+- *r5 → r6:* two refinements. (a) `untracked_files` gets its own typed floor,
+  `untracked_files_floor`, set for a short/lossy enumeration, a listing cut short, **and**
+  content-budget skips (whole later files dropped) — false for deliberate per-file exclusions —
+  because `complete` cannot stand in for a count-specific floor. (b) `stdout_lossy` (invalid-UTF-8
+  replacement) is no longer described as a stream that "ended early"; the token parenthetical uses
+  neutral "stream incomplete or lossy" and the warning names the precise cause. Changes tagged
+  *(r5)* below.
 
 ## Problem: the caller cannot see what change the reviewer was given
 
@@ -144,8 +151,16 @@ pub enum CaptureSummary {
         files: usize,
         insertions: usize,
         deletions: usize,
-        /// New files carried alongside the diff (git-untracked), which a diff cannot cover.
+        /// New files carried alongside the diff (git-untracked), which a diff cannot cover — the
+        /// count of files whose content was included. Deliberately excluded files (binary,
+        /// out-of-root, unreadable) are not in it, by the rule-3 contract.
         untracked_files: usize,
+        /// `untracked_files` may be lower than the true count of new files: the enumeration
+        /// short-streamed, its listing was cut at `MAX_UNTRACKED_EXAMINED`, or the total content
+        /// budget dropped whole files. Its own typed floor — NOT `complete`, since a diff/status
+        /// gap must not put "at least" on the untracked figure. False for deliberate per-file
+        /// exclusions, which do not undercount.
+        untracked_files_floor: bool,
         /// The combined diff hit the byte cap. Drives the explicit `diff:` token — a precise,
         /// unambiguous fact that cannot contradict the `partial` verdict. See "the diff token".
         diff_truncated: bool,
@@ -301,10 +316,17 @@ is never an overstatement; when the relevant evidence was shortened, the render 
     `deletions` = lines beginning with `-` **excluding** the `--- ` file header.
   - These are a floor whenever the diff stream was shortened, which is more than the byte cap:
     `diff_incomplete = change.diff.truncated || diff.stdout_incomplete || diff.stdout_lossy`.
-- **`untracked_files`** is `change.untracked.len()` — new files git has never seen, carried
-  alongside the diff and therefore *not* in the `+/-` counts. Reported separately (the review
-  endorsed keeping it separate). *(r3)* It is itself a floor when the enumeration was shortened
-  (`git ls-files` short-streamed) or the untracked listing was cut short — the render says so.
+- **`untracked_files`** is the count of new files whose content was included, carried alongside the
+  diff and therefore *not* in the `+/-` counts. Reported separately (the review endorsed keeping it
+  separate). *(r3/r5)* It carries its own typed floor, `untracked_files_floor`,
+  set true when the count may understate the true number of new files:
+  `ls_files_stream_short || !omissions.capture_level.is_empty()`. That covers all three
+  capture-level shortfalls — a short/lossy `git ls-files` stream, the listing cut at
+  `MAX_UNTRACKED_EXAMINED`, and *(r5)* the total content budget reaching zero and dropping whole
+  later files (`content_cap_skipped`, `src/vcs/git.rs`) — and is **false** for the deliberate
+  per-file exclusion of a binary/out-of-root/unreadable file, which does not undercount by the
+  rule-3 contract. It is a separate bool precisely because `complete` cannot stand in: a truncated
+  `status` or `diff` must not add "at least" to the *untracked* figure.
 - **`diff_truncated`** (`change.diff.truncated`, the byte cap) drives the `diff:` token;
   **`diff_incomplete`** (above) drives the count floor and the baseline gate; **`complete`** as
   defined above. The two diff bools are carried separately on purpose: the token states a precise
@@ -340,8 +362,10 @@ caller today:
   in part, emit one `incomplete(...)` warning naming the count (the per-file bodies are already in
   the prompt; the caller needs the fact).
 - **Git — short-streamed diff or status.** When a diff/status stream came back
-  `stdout_incomplete`/`stdout_lossy`, emit an `incomplete(...)` warning — the same wording the
-  Perforce path uses for its stream gaps.
+  `stdout_incomplete` or `stdout_lossy`, emit an `incomplete(...)` warning. *(r5)* The warning
+  names the precise cause — "ended before it was fully read" for `stdout_incomplete`, "did not
+  decode cleanly" for `stdout_lossy` — since the two flags are distinct here even though the
+  summary's `diff_incomplete` bool and the token parenthetical treat them together.
 - *(r3)* **Git — short-streamed untracked enumeration.** When `git ls-files` returned success but
   `stdout_truncated`/`stdout_incomplete`/`stdout_lossy`, emit an `incomplete(...)` warning that the
   untracked file set may be short (the existing note only fires when `ls-files` *fails*).
@@ -360,14 +384,15 @@ exclusion of an un-includable file warns *neither* and remains prompt-only, pres
 `render_completed` renders the shown counts, then an explicit diff token *(r2)*, then the
 completeness verdict. *(r3)* Each count is prefixed "at least" and flagged a floor when *its own*
 evidence was shortened — the diff figures on `diff_incomplete` (not the byte cap alone), the
-untracked figure on a short enumeration, the Perforce unit figure on any skip/incompletion — so a
-shortfall in one stream does not falsely qualify a count drawn from another:
+untracked figure on `untracked_files_floor` (short/lossy enumeration, listing cut short, or
+content-cap skips), the Perforce unit figure on any skip/incompletion — so a shortfall in one
+stream does not falsely qualify a count drawn from another:
 
 ```
 … — 12 files, +487/-89, 0 untracked — diff within budget — complete
 … — 12 files, +487/-89, 3 untracked — diff within budget — partial (see warnings below)
 … — at least 40 files, +90000/-1200, 0 untracked — diff truncated at 400 KB (counts are a floor) — partial (see warnings below)
-… — at least 12 files, +487/-89, 0 untracked — diff within budget (stream ended early; counts are a floor) — partial (see warnings below)
+… — at least 12 files, +487/-89, 0 untracked — diff within budget (stream incomplete or lossy; counts are a floor) — partial (see warnings below)
 … — 12 files, +487/-89, at least 2 untracked — diff within budget — partial (untracked listing short; see warnings below)
 … (perforce) — at least 8 evidence units — diff within budget — partial (1 of 3 changelists incomplete; see warnings below)
 ```
@@ -378,8 +403,12 @@ combined diff hit the byte budget** (`diff_truncated`) — `diff within budget` 
 verdict: a Perforce capture whose byte budget held but whose segment diff was short reads `diff
 within budget — partial`, which is exactly right. A *stream* shortfall (git `diff_incomplete`
 without the cap) is carried by three honest signals instead — the count floor ("at least"), the
-verdict (`partial`), and a warning — and the render notes it in the token's parenthetical ("stream
-ended early") without overloading the byte-cap word "truncated". The verdict is always `complete` /
+verdict (`partial`), and a warning — and the render notes it in the token's parenthetical without
+overloading the byte-cap word "truncated". *(r5)* Because `diff_incomplete` folds together
+`stdout_incomplete` (the pipe ended before the diff was fully read) and `stdout_lossy` (bytes that
+did not decode as UTF-8 and were replaced) — two different faults — the parenthetical uses neutral
+wording, "stream incomplete or lossy", and it is the **warning** that names the precise cause,
+since it is generated where the two flags are still distinct. The verdict is always `complete` /
 `partial`; when `partial`, the line points **below** to the WARNING lines (`render_completed`
 prints them after the `captured:` line), and by rule 3 at least one such warning always exists.
 
@@ -497,14 +526,17 @@ a new injection surface.
 
 - **`capture_summary.rs` unit tests**: `summary()` for git (shown counts; `complete` vs `partial`;
   the floor wording with the "at least" prefix on the diff figures for a `diff_incomplete` capture
-  *and* on `untracked_files` for a short enumeration — asserting each floor fires only for its own
-  count; the byte-budget `diff:` token in all of `diff within budget — complete`, `diff within
-  budget — partial` (a stream/segment shortfall with the byte budget intact — *the* non-contradiction
-  case), and `diff truncated at 400 KB`; zero vs present untracked) and Perforce (evidence-unit
-  count as a floor when incomplete; *(r4)* the floor also firing on `skipped > 0` with every
-  captured segment complete; `partial` from a skipped *or* an incomplete-but-not-skipped changelist,
-  and the `N of M` phrasing); `tag()` stability and bounding, including `+t` implies `+p`; singular
-  vs plural ("1 file" vs "12 files"), per the disposition doc's precedent.
+  *and* on `untracked_files` for an `untracked_files_floor` capture — asserting each floor fires
+  only for its own count (a diff-only shortfall leaves `untracked_files` exact, and vice versa);
+  *(r5)* the neutral "stream incomplete or lossy" token parenthetical for a `diff_incomplete`
+  capture that did not hit the byte cap; the byte-budget `diff:` token in all of `diff within budget
+  — complete`, `diff within budget — partial` (a stream/segment shortfall with the byte budget
+  intact — *the* non-contradiction case), and `diff truncated at 400 KB`; zero vs present untracked)
+  and Perforce (evidence-unit count as a floor when incomplete; *(r4)* the floor also firing on
+  `skipped > 0` with every captured segment complete; `partial` from a skipped *or* an
+  incomplete-but-not-skipped changelist, and the `N of M` phrasing); `tag()` stability and bounding,
+  including `+t` implies `+p`; singular vs plural ("1 file" vs "12 files"), per the disposition
+  doc's precedent.
 - **`diff_line_counts` unit tests** (git): plain multi-file diff; rename-only (file counted, zero
   lines); binary (file counted, zero lines); `+++`/`--- ` headers excluded; empty diff (0/0/0).
 - **`range` descriptor tests** (git): a pinned range renders resolved hex endpoints; working-tree
@@ -520,9 +552,13 @@ a new injection surface.
     success but `stdout_incomplete`/`stdout_lossy`/`stdout_truncated` — each yields
     `complete == false` with a matching caller warning while the diff bytes are otherwise intact.
   - *(r3)* The excluded case, guarding the contract boundary: a binary/out-of-root untracked file
-    the enumeration *reached* keeps `complete == true` and `Capture::warnings` empty — i.e. the
-    existing `an_ordinary_skipped_file_does_not_warn_the_caller` still passes unchanged, and the new
-    `complete` field agrees with it.
+    the enumeration *reached* keeps `complete == true`, `untracked_files_floor == false`, and
+    `Capture::warnings` empty — i.e. the existing `an_ordinary_skipped_file_does_not_warn_the_caller`
+    still passes unchanged, and the new fields agree with it.
+  - *(r5)* `untracked_files_floor` specifically: a `content_cap_skipped` capture (total budget
+    reached, whole later files dropped) sets `untracked_files_floor == true` (and `complete ==
+    false`), while a diff-only shortfall leaves `untracked_files_floor == false` — the two floors
+    are independent.
   - The invariant itself: for each partial case above, assert `Capture::warnings` is non-empty
     (the "see warnings below" pointer is never dangling).
 - *(r4)* **Resume-baseline gate regression tests** (git, `src/vcs/git.rs`): a first capture whose
