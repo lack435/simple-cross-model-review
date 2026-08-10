@@ -1,12 +1,14 @@
 # Reviewer fallback chain — design
 
-Status: **plan approved by the merge gate — implementation in progress.** This document is the
-plan. Per this repository's own rule it went through the `cross-review` gate (Codex,
-gpt-5.6-luna, effort=max): rounds 1–7 each returned REQUEST CHANGES — seven findings, then six,
-five, six, six, two, and one, all accepted — and round 8 returned **APPROVE** ("the plan is
-implementation-ready"). The sections below fold every finding in, and
-[Review history](#review-history) records where. The implementation is a separate change that
-goes through its own cross-review rounds. It is the plan for [issue #48].
+Status: **implemented and merge-gate approved.** This document was the plan. Per this
+repository's own rule it went through the `cross-review` gate (Codex, gpt-5.6-luna, effort=max)
+twice over. **The plan** took rounds 1–7 (REQUEST CHANGES: seven findings, then six, five, six,
+six, two, one — all accepted) and round 8 **APPROVE** ("the plan is implementation-ready").
+**The implementation** then went through the same gate: rounds 1–3 REQUEST CHANGES (eight
+findings, then five, then two — all accepted) and round 4 **APPROVE** ("both round-3 findings
+are fixed, with no new regressions found"). The sections below fold every plan finding in, and
+[Review history](#review-history) records where; the implementation findings are summarised at
+the end of that section. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -1009,6 +1011,26 @@ now reflects.
   is now described consistently, and the plan is implementation-ready." All earlier findings
   confirmed resolved, no new regressions. This is the merge gate's approval of the plan;
   implementation proceeds as a separate change through its own gate.
+
+### Implementation review history
+
+The implementation went through the same gate (a separate `cross-review` session), four rounds:
+
+- **Impl round 1 — REQUEST CHANGES (8 findings, all accepted).** Resume PATH-drift validated a
+  fresh resolve but used the cached bin; auth checks were uncancellable and misclassified;
+  terminal failures dropped the active-entry attribution and `describe` omitted the bin; `status`
+  checked only the primary; a rate-limited resume lacked `fresh: true` guidance; start/running/
+  progress showed the per-turn timeout not the chain budget; a failed fallback resolve recorded
+  the previous entry's binary; the worker-thread spawn error named the primary.
+- **Impl round 2 — REQUEST CHANGES (5 findings, all accepted).** `resolve_uncached` auth-checked
+  and cached before the drift comparison (poisoning the cache on a rejected resume); the walk
+  bypassed the shared preflight cache; a cancelled auth was still classifiable as
+  `NOT_AUTHENTICATED`; the selected-entry preflight was uncancellable; `status`/`describe_reviewer`
+  could panic on an empty chain.
+- **Impl round 3 — REQUEST CHANGES (2 findings, all accepted).** Both adapters' `auth_check` still
+  omitted the `out.cancelled` check; `mcp.rs` `tools/list` still indexed `primary()` on an empty
+  chain.
+- **Impl round 4 — APPROVE.** "Both round-3 findings are fixed, with no new regressions found."
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
