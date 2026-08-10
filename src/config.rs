@@ -100,15 +100,24 @@ impl ReviewerSpec {
         }
     }
 
-    /// A short identity label for prompts, errors, and the chain description.
+    /// A short identity label for prompts, errors, and the chain description. Includes the
+    /// explicit `--bin` when one is set, so two same-reviewer/same-model entries that differ only
+    /// by binary (a distinct install or account) are distinguishable wherever this is shown. A
+    /// PATH-resolved entry omits it; two PATH entries with the same reviewer/model would be a
+    /// fully-identical duplicate, which `validate_chain` rejects, so this cannot be ambiguous.
     pub fn describe(&self) -> String {
-        format!(
-            "{} ({}, model={}, effort={})",
+        let mut out = format!(
+            "{} ({}, model={}, effort={}",
             self.reviewer.vendor(),
             self.reviewer.as_str(),
             self.model,
             self.effort,
-        )
+        );
+        if let Some(bin) = &self.bin {
+            out.push_str(&format!(", bin={}", bin.display()));
+        }
+        out.push(')');
+        out
     }
 }
 

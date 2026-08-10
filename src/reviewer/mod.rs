@@ -103,7 +103,11 @@ pub fn is_within(path: &Path, root: &Path) -> bool {
 pub trait Reviewer: Send + Sync {
     /// Cheap check that the CLI exists and is signed in. Runs before we spend a
     /// model call, so an unconfigured machine fails fast and legibly.
-    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure>;
+    ///
+    /// `cancel` interrupts the check: a fallback entry's preflight runs inside the review's walk,
+    /// so a cancellation (or shutdown) must be able to stop a 30-second auth probe rather than
+    /// wait it out. See `docs/reviewer-fallback-chain.md`.
+    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure>;
 
     fn invocation(
         &self,

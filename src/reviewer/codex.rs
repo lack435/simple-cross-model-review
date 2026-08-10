@@ -15,7 +15,7 @@ use crate::metrics::Usage;
 pub struct CodexReviewer;
 
 impl Reviewer for CodexReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure> {
+    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
         // Run outside the project, like `invocation`, so this preflight is not the one
         // invocation that loads the reviewed repository's configuration. `login status`
@@ -23,10 +23,9 @@ impl Reviewer for CodexReviewer {
         // what it is checking.
         cmd.current_dir(super::neutral_dir(cfg));
         cmd.arg("login").arg("status");
-        let out =
-            super::run(cmd, "", Duration::from_secs(30), &AtomicBool::new(false)).map_err(|e| {
-                errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
-            })?;
+        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
+            errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
+        })?;
 
         // The exit code is the signal here, not the text: `codex login status` writes
         // "Logged in using ChatGPT" to stderr, and prints nothing at all when its

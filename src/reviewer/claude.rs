@@ -19,7 +19,7 @@ const DENIED_TOOLS: &str = "Edit,Write,NotebookEdit";
 pub struct ClaudeReviewer;
 
 impl Reviewer for ClaudeReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure> {
+    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
         // Isolated and run outside the project, like `invocation`. The stated policy is
         // that the reviewer CLI never loads the reviewed repository's configuration, and
@@ -32,10 +32,9 @@ impl Reviewer for ClaudeReviewer {
             cmd.arg("--strict-mcp-config");
         }
         cmd.arg("auth").arg("status");
-        let out =
-            super::run(cmd, "", Duration::from_secs(30), &AtomicBool::new(false)).map_err(|e| {
-                errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
-            })?;
+        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
+            errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
+        })?;
 
         // `claude auth status` prints JSON on success.
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(out.stdout.trim()) {

@@ -116,17 +116,13 @@ impl App {
         &self.registry
     }
 
-    fn ensure_ready(&self) -> Result<Preflight, Failure> {
-        self.ensure_ready_for(0)
-    }
-
     /// Resolve and auth-check a specific chain entry, caching the result by index.
     ///
     /// The adapter is selected per entry (`for_kind`), so a mixed-family chain preflights each
     /// entry with its own CLI. Called for the *selected* entry (entry 0 for a fresh review, the
     /// resume-matched entry otherwise) before the worker starts; fallback entries are preflighted
     /// by the walk itself as it reaches them.
-    fn ensure_ready_for(&self, index: usize) -> Result<Preflight, Failure> {
+    fn ensure_ready_for(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
         if let Some(cached) = self
             .preflight
             .lock()
@@ -136,9 +132,22 @@ impl App {
         {
             return Ok(cached);
         }
+        let ready = self.resolve_uncached(index, cancel)?;
+        self.preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index, ready.clone());
+        Ok(ready)
+    }
+
+    /// Resolve and auth-check an entry, *bypassing the cache*, and refresh the cache with the
+    /// result. Used on resume, where a PATH change since the cache was warmed must not hide behind
+    /// a stale cached binary: the fresh resolution is what the drift check validates and what the
+    /// worker then runs.
+    fn resolve_uncached(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
         let spec = &self.cfg.reviewers[index];
         let bin = reviewer::resolve_bin(spec)?;
-        let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg)?;
+        let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
         let ready = Preflight { bin, auth };
         self.preflight
             .lock()
@@ -248,28 +257,37 @@ impl App {
             Some(record) => self.cfg.resume_entry_index(record).unwrap_or(0),
             None => 0,
         };
-        let ready = self.ensure_ready_for(start_index)?;
-
-        // PATH-drift guard on resume: the selected entry's binary is re-resolved *uncached* and
-        // compared to what the session was created with. A mismatch means PATH now points at a
-        // different executable (or account), so the conversation must not be resumed through it.
-        if let Some(record) = &prior {
-            if let Some(stored) = &record.resolved_bin {
-                let fresh = reviewer::resolve_bin(&self.cfg.reviewers[start_index])
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if &fresh != stored {
-                    return Err(errors::session_not_resumable(
-                        &session,
-                        format!(
-                            "it was created with the reviewer binary at '{stored}', but that entry \
-                             now resolves to '{fresh}'; PATH or the install changed, so the \
-                             conversation cannot be resumed through a different executable."
-                        ),
-                    ));
-                }
-            }
+        // A `notifications/cancelled` that arrived before the review is even registered still
+        // stops setup here, before the (bounded) preflight below spends its auth check.
+        if request.is_cancelled() {
+            return Err(errors::cancelled());
         }
+        // The selected entry's preflight uses a bounded auth check; a fresh flag is the backstop
+        // since the review has no registry cancel yet (it is not registered until `try_start`).
+        let preflight_cancel = AtomicBool::new(false);
+        let ready = match &prior {
+            // Resume: resolve the selected entry *uncached*, so a PATH change since the cache was
+            // warmed cannot hide behind a stale entry, validate the fresh path against what the
+            // session was created with, and run (and cache) that validated binary.
+            Some(record) => {
+                let ready = self.resolve_uncached(start_index, &preflight_cancel)?;
+                if let Some(stored) = &record.resolved_bin {
+                    let fresh = ready.bin.to_string_lossy();
+                    if fresh != *stored {
+                        return Err(errors::session_not_resumable(
+                            &session,
+                            format!(
+                                "it was created with the reviewer binary at '{stored}', but that \
+                                 entry now resolves to '{fresh}'; PATH or the install changed, so \
+                                 the conversation cannot be resumed through a different executable."
+                            ),
+                        ));
+                    }
+                }
+                ready
+            }
+            None => self.ensure_ready_for(start_index, &preflight_cancel)?,
+        };
 
         // Claiming the session and registering the review are one atomic step, so two
         // concurrent calls cannot both start a review against the same conversation. It
@@ -341,7 +359,7 @@ impl App {
             self.registry.finish(
                 &id,
                 Outcome::failed(errors::spawn_failed(
-                    self.cfg.primary().reviewer.as_str(),
+                    self.cfg.reviewers[start_index].reviewer.as_str(),
                     "worker thread",
                     e.to_string(),
                 )),
@@ -375,7 +393,10 @@ impl App {
                 }
             ));
         }
-        out.push_str(&format!("budget:    {}\n\n", fmt_elapsed(self.cfg.timeout)));
+        out.push_str(&format!(
+            "budget:    {}\n\n",
+            fmt_elapsed(Duration::from_secs(self.cfg.max_wait_secs()))
+        ));
         out.push_str(&format!(
             "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
              until the review is done -- omit wait_seconds to wait to completion in one call -- and \
@@ -494,10 +515,18 @@ impl App {
         match snapshot.status {
             Status::Running => Ok(self.render_running(&snapshot, wait)),
             Status::Completed => Ok(self.render_completed(&snapshot)),
-            Status::Failed => Err(snapshot
-                .failure
-                .clone()
-                .unwrap_or_else(|| errors::empty_review(self.cfg.primary().reviewer.as_str(), ""))),
+            Status::Failed => {
+                // Preserve the active-entry attribution the completed path renders: a failed
+                // review names the entry that ran, not just the reviewer family in the message.
+                let failure = snapshot
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| {
+                        errors::empty_review(self.cfg.primary().reviewer.as_str(), "")
+                    })
+                    .with_active_note(snapshot.active.as_deref());
+                Err(failure)
+            }
         }
     }
 
@@ -538,8 +567,12 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| self.cfg.describe_reviewer()),
             snapshot.elapsed.as_secs(),
-            self.cfg.timeout.as_secs(),
-            render_progress(snapshot, self.cfg.timeout, !snapshot.shutting_down),
+            self.cfg.max_wait_secs(),
+            render_progress(
+                snapshot,
+                Duration::from_secs(self.cfg.max_wait_secs()),
+                !snapshot.shutting_down,
+            ),
         )
     }
 
@@ -553,8 +586,13 @@ impl App {
             string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
         })?;
         let snapshot = self.registry.snapshot(&id)?;
-        (snapshot.status == Status::Running)
-            .then(|| render_progress(&snapshot, self.cfg.timeout, !snapshot.shutting_down))
+        (snapshot.status == Status::Running).then(|| {
+            render_progress(
+                &snapshot,
+                Duration::from_secs(self.cfg.max_wait_secs()),
+                !snapshot.shutting_down,
+            )
+        })
     }
 
     fn render_completed(&self, snapshot: &Snapshot) -> String {
@@ -676,22 +714,44 @@ impl App {
             return out;
         }
 
-        match self.ensure_ready() {
-            Ok(ready) => {
-                out.push_str(&format!("cli:           {}\n", ready.bin.display()));
-                out.push_str(&format!(
-                    "auth:          {}\n",
-                    ready.auth.replace('\n', " ")
-                ));
-                out.push_str("ready:         yes\n");
+        // Preflight every entry in the chain, not just the primary: a fallback is only useful if
+        // its CLI is installed and signed in, and a human running --doctor wants to see that now
+        // rather than discover it mid-walk. Each entry uses its own adapter (`for_kind`).
+        let multi = self.cfg.reviewers.len() > 1;
+        let mut all_ready = true;
+        for (i, spec) in self.cfg.reviewers.iter().enumerate() {
+            if multi {
+                let role = if i == 0 { "primary" } else { "fallback" };
+                out.push_str(&format!("\nentry {i} ({role}): {}\n", spec.describe()));
             }
-            Err(failure) => {
-                out.push_str("ready:         NO\n");
-                out.push_str(&format!(
-                    "problem:       {} - {}\n",
-                    failure.code, failure.summary
-                ));
+            match self.ensure_ready_for(i, &AtomicBool::new(false)) {
+                Ok(ready) => {
+                    out.push_str(&format!("cli:           {}\n", ready.bin.display()));
+                    out.push_str(&format!(
+                        "auth:          {}\n",
+                        ready.auth.replace('\n', " ")
+                    ));
+                    out.push_str("ready:         yes\n");
+                }
+                Err(failure) => {
+                    all_ready = false;
+                    out.push_str("ready:         NO\n");
+                    out.push_str(&format!(
+                        "problem:       {} - {}\n",
+                        failure.code, failure.summary
+                    ));
+                }
             }
+        }
+        if multi {
+            out.push_str(&format!(
+                "\nchain ready:   {}\n",
+                if all_ready {
+                    "yes"
+                } else {
+                    "NO (see entries above)"
+                }
+            ));
         }
 
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
@@ -1148,6 +1208,9 @@ impl Job {
         // The earlier rate-limited attempts, for the metrics record's `attempts` history (the
         // terminal attempt is the record itself, so it is not repeated here).
         let mut metrics_attempts: Vec<metrics::Attempt> = Vec::new();
+        // False once a fallback entry's binary could not be resolved: its path is unverified, so
+        // the record must not attribute the previous entry's binary to it.
+        let mut active_bin_resolved = true;
         let mut outcome: Option<Outcome> = None;
 
         for (pos, &i) in walk.iter().enumerate() {
@@ -1165,11 +1228,15 @@ impl Job {
                 match reviewer::resolve_bin(&entry) {
                     Ok(bin) => self.bin = bin,
                     Err(f) => {
+                        // Resolution failed: `self.bin` still holds the previous entry's path, so
+                        // this attempt has no verified binary to attribute.
+                        active_bin_resolved = false;
                         outcome = Some(Outcome::failed(f));
                         break;
                     }
                 }
-                if let Err(f) = self.reviewer.auth_check(&self.bin, &self.cfg) {
+                // The review's own cancel flag, so a chain of fallback auth checks is interruptible.
+                if let Err(f) = self.reviewer.auth_check(&self.bin, &self.cfg, &self.cancel) {
                     outcome = Some(Outcome::failed(f));
                     break;
                 }
@@ -1240,6 +1307,15 @@ impl Job {
                         });
                         continue;
                     }
+                    // A resume runs its bound entry only and never falls through, so a rate limit
+                    // here is terminal -- but the remediation points at `fresh: true`, which does
+                    // restart chain selection (at the cost of the reviewer's memory).
+                    if resume_id.is_some() && failure.code == "RATE_LIMITED" {
+                        outcome = Some(Outcome::failed(errors::rate_limited_on_resume(
+                            self.spec.reviewer.as_str(),
+                        )));
+                        break;
+                    }
                     outcome = Some(Outcome::failed(failure));
                     break;
                 }
@@ -1268,6 +1344,11 @@ impl Job {
         self.registry.finish(&self.id, outcome);
         guard.armed = false;
 
+        // The terminal entry's resolved binary, but only when it was actually resolved: a
+        // fallback whose resolution failed leaves `self.bin` holding the previous entry's path,
+        // which must not be attributed to it.
+        let resolved_bin = active_bin_resolved.then(|| self.bin.to_string_lossy().into_owned());
+
         self.record_usage(
             usage,
             failure_code,
@@ -1276,6 +1357,7 @@ impl Job {
             started,
             facts,
             metrics_attempts,
+            resolved_bin,
         );
     }
 
@@ -1297,6 +1379,7 @@ impl Job {
         started: std::time::Instant,
         facts: AttemptFacts,
         attempts: Vec<metrics::Attempt>,
+        resolved_bin: Option<String>,
     ) {
         let status = if failure_code.is_some() {
             "failed"
@@ -1356,7 +1439,7 @@ impl Job {
             status: status.to_string(),
             failure_code,
             disposition,
-            resolved_bin: Some(self.bin.to_string_lossy().into_owned()),
+            resolved_bin,
             attempts,
         });
     }
@@ -1925,7 +2008,7 @@ fn fmt_elapsed(duration: Duration) -> String {
     }
 }
 
-fn render_progress(snapshot: &Snapshot, turn_budget: Duration, reassure: bool) -> String {
+fn render_progress(snapshot: &Snapshot, review_budget: Duration, reassure: bool) -> String {
     let observed = if snapshot.phase == Phase::Reviewing {
         "reviewer process confirmed alive"
     } else {
@@ -1950,8 +2033,8 @@ fn render_progress(snapshot: &Snapshot, turn_budget: Duration, reassure: bool) -
     if reassure {
         message.push_str(&format!(
             " In this project's usage, long reviews are normal and complex changes can take 20 \
-             minutes or longer. This turn's configured budget is {}.",
-            fmt_elapsed(turn_budget)
+             minutes or longer. This review's configured budget is {}.",
+            fmt_elapsed(review_budget)
         ));
     }
     message
