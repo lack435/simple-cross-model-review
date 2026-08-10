@@ -85,6 +85,12 @@ pub struct Capture {
     /// The Perforce resume-delta baseline this turn produced (`Full` inventory or `Disabled`),
     /// stored so the next turn knows what it may collapse against. Always `None` for git.
     pub perforce_baseline: Option<super::baseline::PerforceBaseline>,
+    /// The resume disposition of this turn, surfaced to the *caller*: whether the delta fired,
+    /// was never intended, or fell back to a full re-capture, and why. `Some` only when the
+    /// turn both resumed and sent a change (`change.is_some()`) -- a fresh turn and a no-change
+    /// turn carry `None` and render nothing. The backend fills the decisions that are its own;
+    /// `tools.rs` supplies the fresh-vs-resumed framing it alone can see.
+    pub disposition: Option<super::disposition::Disposition>,
 }
 
 impl Capture {
@@ -96,6 +102,9 @@ impl Capture {
             base_sha: None,
             capture_identity: None,
             perforce_baseline: None,
+            // A failed capture sent no change, so it carries no disposition (the caller is told
+            // about the failure through the warning above, not through a disposition line).
+            disposition: None,
         }
     }
 }

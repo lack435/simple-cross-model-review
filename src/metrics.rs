@@ -347,6 +347,13 @@ pub struct Record {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
+    /// The resume disposition of this turn, as a compact tag (`incremental:git`,
+    /// `fell-back:base-moved`, ...). Absent on a fresh turn, a turn that sent no change, or a
+    /// record written before this field existed. Lets an after-the-fact audit see which turns
+    /// deltaed and which re-billed the full range -- the attribution the response line gives
+    /// live, kept in the log too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
 }
 
 /// Append-only usage log.
@@ -1097,6 +1104,7 @@ mod tests {
             retried: false,
             status: "completed".into(),
             failure_code: None,
+            disposition: None,
         }
     }
 

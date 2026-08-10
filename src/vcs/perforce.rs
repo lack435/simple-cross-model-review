@@ -37,6 +37,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use super::baseline;
+use super::disposition::{Disposition, FellBack, FullByDesign, Incremental};
 use super::shared::{
     evidence_preamble, push_fenced, read_cap, read_capped, safe_label, truncate, Capture,
     CapturedChange, Omissions, CAPTURE_BUDGET, MAX_DIFF_BYTES, MAX_UNTRACKED_EXAMINED,
@@ -164,6 +165,32 @@ pub fn capture(
         apply_elision(&mut segments, prior);
     }
 
+    // The caller-facing disposition: whether this turn eluded, was disabled, or fell back, and
+    // why. Computed after `apply_elision` so the evidence-unit counts reflect what was collapsed.
+    // Only the reasons the backend can see are decided here; a `None` resume (a fresh turn, an
+    // absent prior baseline, or a marker guard that forced `resume = None`) yields `None` and is
+    // resolved in `tools.rs`.
+    let (resent, collapsed) =
+        segments
+            .iter()
+            .flat_map(|s| &s.units)
+            .fold((0usize, 0usize), |(r, c), u| {
+                if u.collapsed {
+                    (r, c + 1)
+                } else {
+                    (r + 1, c)
+                }
+            });
+    let disposition = perforce_disposition(
+        cfg,
+        &resume,
+        include_shelved,
+        &identity,
+        elision_active,
+        resent,
+        collapsed,
+    );
+
     let rendered = render(
         cfg,
         &info,
@@ -260,7 +287,70 @@ pub fn capture(
         base_sha: None,
         capture_identity: Some(identity),
         perforce_baseline,
+        disposition,
     }
+}
+
+/// The Perforce resume disposition for the reasons the backend can see, in the plan's precedence.
+///
+/// `None` when this turn did not carry a resume baseline into the backend -- a fresh turn, an
+/// absent prior baseline, or a marker guard that forced `resume = None` in `tools.rs`; those are
+/// `tools.rs`'s to name (`PriorBaselineMissing`, `PriorTurnPending`, `MarkerUnwritable`,
+/// `MarkerStateUnreadable`), which sit *above* these in precedence. The identity split mirrors
+/// [`CaptureIdentity::matches`] (`self == other && self.client_spec_digest.is_some()`): a `None`
+/// digest on the *persisted* side is an incomplete binding, on the *current* side is an
+/// unconfirmed identity, and only two confirmed-but-unequal identities are a genuine change.
+fn perforce_disposition(
+    cfg: &Config,
+    resume: &Option<PerforceResume<'_>>,
+    include_shelved: bool,
+    identity: &baseline::CaptureIdentity,
+    elision_active: bool,
+    resent: usize,
+    collapsed: usize,
+) -> Option<Disposition> {
+    let Some(r) = resume else {
+        return None;
+    };
+    // G1: the feature being off is a by-design full capture, never a warning.
+    if !cfg.resume_incremental_diff {
+        return Some(Disposition::FullByDesign(FullByDesign::Disabled));
+    }
+    // The binding cannot be compared: a `None` on any field needed to compare -- the persisted
+    // shelved flag, the persisted identity, or the persisted identity's nested client-spec digest.
+    let binding_incomplete = r.include_shelved.is_none()
+        || r.identity.is_none()
+        || r.identity.is_some_and(|p| p.client_spec_digest.is_none());
+    if binding_incomplete {
+        return Some(Disposition::FellBackToFull(
+            FellBack::PriorBindingIncomplete,
+        ));
+    }
+    // This turn's identity could not be *established* (its own digest is absent).
+    if identity.client_spec_digest.is_none() {
+        return Some(Disposition::FellBackToFull(FellBack::IdentityUnconfirmed));
+    }
+    // Both sides confirmed (digests present, checked above), but they differ.
+    if r.identity.is_some_and(|p| !p.matches(identity)) {
+        return Some(Disposition::FellBackToFull(FellBack::IdentityChanged));
+    }
+    // The shelved-capture mode differs (both flags present, so this is a real change).
+    if r.include_shelved != Some(include_shelved) {
+        return Some(Disposition::FellBackToFull(FellBack::ModeOrShelvedChanged));
+    }
+    // Lowest precedence: the prior baseline itself is `Disabled` or otherwise unusable.
+    if r.baseline.usable_inventory().is_none() {
+        return Some(Disposition::FellBackToFull(FellBack::PriorBaselineUnusable));
+    }
+    // None of the guards fired, so the delta fired -- which is exactly `elision_active`.
+    debug_assert!(
+        elision_active,
+        "no fall-back reason held, so elision must have been active"
+    );
+    Some(Disposition::Incremental(Incremental::PerforceEvidence {
+        resent,
+        collapsed,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3371,6 +3461,244 @@ Change 5 by u@c on 2026/01/01\n\n\
         assert!(
             r2 < r1 / 2,
             "an all-unchanged delta must be far smaller than the full capture: {r1} -> {r2}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume disposition: every `elision_active` false-path the backend can see maps to exactly
+    // one reason, in precedence, and none is left unclassified. `perforce_disposition` is a pure
+    // function, so these need no p4 server. See `docs/incremental-resume-disposition.md`.
+    // -----------------------------------------------------------------------
+
+    fn cfg_perforce(incremental: bool) -> Config {
+        let mut cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--vcs".into(),
+            "perforce".into(),
+        ])
+        .expect("config");
+        cfg.resume_incremental_diff = incremental;
+        cfg
+    }
+
+    fn ident(digest: Option<&str>) -> baseline::CaptureIdentity {
+        baseline::CaptureIdentity {
+            server: "ssl:perforce.example:1666".into(),
+            client: "alice_ws".into(),
+            charset: "utf8".into(),
+            client_spec_digest: digest.map(str::to_string),
+        }
+    }
+
+    fn usable_full() -> baseline::PerforceBaseline {
+        baseline::PerforceBaseline::Full {
+            schema: baseline::INVENTORY_SCHEMA,
+            entries: vec![baseline::InventoryEntry {
+                change: 42,
+                basis: baseline::Basis::Workspace,
+                kind: baseline::UnitKind::TextDiff,
+                depot: "//depot/a".into(),
+                comparator: "3".into(),
+                fingerprint: Fingerprint::of(b"x"),
+            }],
+        }
+    }
+
+    /// The disposition for a resumed Perforce turn, given the pieces the backend sees.
+    fn disp(
+        incremental: bool,
+        baseline: &baseline::PerforceBaseline,
+        prior_identity: Option<&baseline::CaptureIdentity>,
+        prior_shelved: Option<bool>,
+        current: &baseline::CaptureIdentity,
+        include_shelved: bool,
+        elision_active: bool,
+    ) -> Option<Disposition> {
+        let resume = Some(PerforceResume {
+            baseline,
+            identity: prior_identity,
+            include_shelved: prior_shelved,
+        });
+        perforce_disposition(
+            &cfg_perforce(incremental),
+            &resume,
+            include_shelved,
+            current,
+            elision_active,
+            1,
+            0,
+        )
+    }
+
+    #[test]
+    fn no_resume_baseline_leaves_the_reason_to_tools() {
+        // The backend cannot see fresh vs missing vs marker-forced; it returns `None`.
+        assert!(perforce_disposition(
+            &cfg_perforce(true),
+            &None,
+            false,
+            &ident(Some("d")),
+            false,
+            0,
+            0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn disabled_is_full_by_design() {
+        let full = usable_full();
+        let id = ident(Some("d"));
+        let d = disp(false, &full, Some(&id), Some(false), &id, false, false);
+        assert_eq!(d, Some(Disposition::FullByDesign(FullByDesign::Disabled)));
+    }
+
+    #[test]
+    fn an_active_elision_is_incremental_with_counts() {
+        let full = usable_full();
+        let id = ident(Some("d"));
+        let resume = Some(PerforceResume {
+            baseline: &full,
+            identity: Some(&id),
+            include_shelved: Some(false),
+        });
+        let d = perforce_disposition(&cfg_perforce(true), &resume, false, &id, true, 3, 5);
+        assert_eq!(
+            d,
+            Some(Disposition::Incremental(Incremental::PerforceEvidence {
+                resent: 3,
+                collapsed: 5
+            }))
+        );
+    }
+
+    #[test]
+    fn each_binding_shape_is_prior_binding_incomplete() {
+        let full = usable_full();
+        let id = ident(Some("d"));
+        // include_shelved None.
+        assert_eq!(
+            disp(true, &full, Some(&id), None, &id, false, false),
+            Some(Disposition::FellBackToFull(
+                FellBack::PriorBindingIncomplete
+            ))
+        );
+        // outer identity None.
+        assert_eq!(
+            disp(true, &full, None, Some(false), &id, false, false),
+            Some(Disposition::FellBackToFull(
+                FellBack::PriorBindingIncomplete
+            ))
+        );
+        // persisted identity present but its nested digest is None (round-5 case).
+        let prior_no_digest = ident(None);
+        assert_eq!(
+            disp(
+                true,
+                &full,
+                Some(&prior_no_digest),
+                Some(false),
+                &id,
+                false,
+                false
+            ),
+            Some(Disposition::FellBackToFull(
+                FellBack::PriorBindingIncomplete
+            ))
+        );
+    }
+
+    #[test]
+    fn a_none_current_digest_is_identity_unconfirmed_not_changed() {
+        let full = usable_full();
+        let prior = ident(Some("d"));
+        let current = ident(None);
+        assert_eq!(
+            disp(
+                true,
+                &full,
+                Some(&prior),
+                Some(false),
+                &current,
+                false,
+                false
+            ),
+            Some(Disposition::FellBackToFull(FellBack::IdentityUnconfirmed))
+        );
+    }
+
+    #[test]
+    fn two_confirmed_but_different_identities_are_identity_changed() {
+        let full = usable_full();
+        let prior = ident(Some("d1"));
+        let current = ident(Some("d2"));
+        assert_eq!(
+            disp(
+                true,
+                &full,
+                Some(&prior),
+                Some(false),
+                &current,
+                false,
+                false
+            ),
+            Some(Disposition::FellBackToFull(FellBack::IdentityChanged))
+        );
+    }
+
+    #[test]
+    fn a_differing_shelved_flag_is_mode_or_shelved_changed() {
+        let full = usable_full();
+        let id = ident(Some("d"));
+        // Prior captured shelved=false; this turn asks for shelved=true.
+        assert_eq!(
+            disp(true, &full, Some(&id), Some(false), &id, true, false),
+            Some(Disposition::FellBackToFull(FellBack::ModeOrShelvedChanged))
+        );
+    }
+
+    #[test]
+    fn a_disabled_prior_inventory_is_prior_baseline_unusable() {
+        let disabled = baseline::PerforceBaseline::Disabled;
+        let id = ident(Some("d"));
+        assert_eq!(
+            disp(true, &disabled, Some(&id), Some(false), &id, false, false),
+            Some(Disposition::FellBackToFull(FellBack::PriorBaselineUnusable))
+        );
+    }
+
+    #[test]
+    fn precedence_binding_incomplete_beats_baseline_unusable() {
+        // Both hold at once (a disabled baseline AND a None persisted shelved flag); the
+        // higher-precedence binding reason is the one selected.
+        let disabled = baseline::PerforceBaseline::Disabled;
+        let id = ident(Some("d"));
+        assert_eq!(
+            disp(true, &disabled, Some(&id), None, &id, false, false),
+            Some(Disposition::FellBackToFull(
+                FellBack::PriorBindingIncomplete
+            ))
+        );
+    }
+
+    #[test]
+    fn precedence_identity_changed_beats_mode_shelved_changed() {
+        // Identity differs AND the shelved flag differs; identity wins.
+        let full = usable_full();
+        let prior = ident(Some("d1"));
+        let current = ident(Some("d2"));
+        assert_eq!(
+            disp(
+                true,
+                &full,
+                Some(&prior),
+                Some(false),
+                &current,
+                true,
+                false
+            ),
+            Some(Disposition::FellBackToFull(FellBack::IdentityChanged))
         );
     }
 }

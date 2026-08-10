@@ -110,6 +110,10 @@ pub struct Review {
     pub denial_count_is_floor: bool,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn: whether the reviewer was sent only the delta, a
+    /// full change by design, or a full change because an intended delta fell back -- and why.
+    /// `None` on a fresh turn or a turn that sent no change, which render no disposition line.
+    pub disposition: Option<crate::vcs::Disposition>,
     /// Whether a follow-up call on this session name will actually reach the same
     /// reviewer conversation. Tracked rather than assumed, so the response never invites
     /// a resume that would silently start over.
@@ -152,6 +156,8 @@ pub struct Outcome {
     /// Whether `denial_count` is a lower bound (the source output was capped).
     pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn; see [`Review::disposition`].
+    pub disposition: Option<crate::vcs::Disposition>,
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
     pub usage: Usage,
@@ -166,6 +172,7 @@ impl Outcome {
             denial_count: 0,
             denial_count_is_floor: false,
             warnings: Vec::new(),
+            disposition: None,
             resumable: false,
             usage: Usage::default(),
         }
@@ -180,6 +187,7 @@ impl Outcome {
             denial_count: 0,
             denial_count_is_floor: false,
             warnings: Vec::new(),
+            disposition: None,
             resumable: true,
             usage: Usage::default(),
         }
@@ -356,6 +364,7 @@ impl Registry {
                 denial_count: 0,
                 denial_count_is_floor: false,
                 warnings: Vec::new(),
+                disposition: None,
                 resumable: false,
                 started: now,
                 finished: None,
@@ -432,6 +441,7 @@ impl Registry {
                 review.denial_count = outcome.denial_count;
                 review.denial_count_is_floor = outcome.denial_count_is_floor;
                 review.warnings = outcome.warnings;
+                review.disposition = outcome.disposition;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
                 match outcome.failure {
@@ -638,6 +648,8 @@ pub struct Snapshot {
     /// Whether `denial_count` is a lower bound (the source output was capped).
     pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn; see [`Review::disposition`].
+    pub disposition: Option<crate::vcs::Disposition>,
     pub resumable: bool,
     pub elapsed: Duration,
     pub phase: Phase,
@@ -665,6 +677,7 @@ impl Snapshot {
             denial_count: review.denial_count,
             denial_count_is_floor: review.denial_count_is_floor,
             warnings: review.warnings.clone(),
+            disposition: review.disposition.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
             phase: review.phase,

@@ -520,6 +520,14 @@ impl App {
             out.push_str(&format!("usage:     {}\n\n", snapshot.usage.summary()));
         }
 
+        // Only on a resumed turn that sent a change; a fresh or no-change turn carries `None`.
+        // This is informational -- it says what the server *sent* this turn (a delta, or the whole
+        // change and why). A fall-back that the caller was configured for also raises a WARNING
+        // below; a clean delta or a by-design full capture does not.
+        if let Some(disposition) = &snapshot.disposition {
+            out.push_str(&format!("disposition: {}\n\n", disposition.summary()));
+        }
+
         for warning in &snapshot.warnings {
             out.push_str(&format!("WARNING: {warning}\n\n"));
         }
@@ -808,7 +816,86 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
+/// Combine the backend's disposition with the framing only the tools layer can supply.
+///
+/// Free of `Job` so the gate/precedence logic is unit-testable. See [`Job::resolve_disposition`]
+/// for the contract and `docs/incremental-resume-disposition.md` for the decision order.
+fn assemble_disposition(
+    vcs: crate::config::Vcs,
+    resume_incremental_diff: bool,
+    resumed: bool,
+    change_present: bool,
+    backend: Option<vcs::Disposition>,
+    marker_state: Option<crate::session::MarkerState>,
+    pending_marked: bool,
+) -> Option<vcs::Disposition> {
+    use crate::session::MarkerState;
+    use crate::vcs::disposition::{FellBack, FullByDesign};
+
+    // G0: no disposition on a fresh turn or a turn that sent no change.
+    if !resumed || !change_present {
+        return None;
+    }
+    if let Some(d) = backend {
+        return Some(d);
+    }
+    // The backend saw no resume baseline. G1: a disabled feature is by-design and wins over the
+    // fall-back reasons below, so it never warns -- even when a marker also failed.
+    if !resume_incremental_diff {
+        return Some(vcs::Disposition::FullByDesign(FullByDesign::Disabled));
+    }
+    let reason = match vcs {
+        crate::config::Vcs::Git => FellBack::NoCompleteBaselineRetained,
+        crate::config::Vcs::Perforce => {
+            if !pending_marked {
+                FellBack::MarkerUnwritable
+            } else {
+                match marker_state {
+                    Some(MarkerState::Present) => FellBack::PriorTurnPending,
+                    Some(MarkerState::Unreadable) => FellBack::MarkerStateUnreadable,
+                    // Markers are fine, so `resume = None` means there was no prior baseline.
+                    _ => FellBack::PriorBaselineMissing,
+                }
+            }
+        }
+    };
+    Some(vcs::Disposition::FellBackToFull(reason))
+}
+
 impl Job {
+    /// Combine the backend's disposition with the framing only this layer can supply.
+    ///
+    /// A disposition exists only on a **resumed** turn that **sent a change** -- the two gates the
+    /// backend cannot see (it receives only `Option<Resume>`, which conflates a fresh turn with a
+    /// resumed one whose session held no baseline). When the backend already named the reason
+    /// (`Some`), use it. When it did not (`None`), name it here in the plan's precedence:
+    ///
+    /// - **G1** first: a disabled feature is `FullByDesign { Disabled }`, above every fall-back --
+    ///   even a marker failure -- so a disabled run never produces a warning.
+    /// - git: a resumed turn with no complete baseline is `NoCompleteBaselineRetained`.
+    /// - Perforce: the marker/missing reasons `tools.rs` forced `resume = None` for --
+    ///   `MarkerUnwritable` (this turn's marker unwritable) > `PriorTurnPending` (prior marker
+    ///   present) > `MarkerStateUnreadable` (prior marker unreadable) > `PriorBaselineMissing`
+    ///   (no prior baseline at all).
+    fn resolve_disposition(
+        &self,
+        resumed: bool,
+        change_present: bool,
+        backend: Option<vcs::Disposition>,
+        marker_state: Option<crate::session::MarkerState>,
+        pending_marked: bool,
+    ) -> Option<vcs::Disposition> {
+        assemble_disposition(
+            self.cfg.vcs,
+            self.cfg.resume_incremental_diff,
+            resumed,
+            change_present,
+            backend,
+            marker_state,
+            pending_marked,
+        )
+    }
+
     fn run(self, resume_id: Option<String>) {
         let started = std::time::Instant::now();
         let mut guard = FinishGuard {
@@ -825,9 +912,17 @@ impl Job {
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
         // marker -- it crashed, panicked, or failed to persist its baseline -- the persisted
         // baseline may be stale relative to what the reviewer last saw, so do not collapse against
-        // it. Read this before marking the current turn pending.
-        let prior_pending =
-            self.cfg.vcs == crate::config::Vcs::Perforce && self.sessions.is_pending(&self.session);
+        // it. Read this before marking the current turn pending. The read is three-valued
+        // (`Present`/`Absent`/`Unreadable`) so the disposition can tell a confirmed leftover
+        // marker (`PriorTurnPending`) from a marker whose state could not be read
+        // (`MarkerStateUnreadable`); `prior_pending` folds both non-`Absent` states fail-closed,
+        // exactly as the previous `is_pending` did.
+        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce)
+            .then(|| self.sessions.marker_state(&self.session));
+        let prior_pending = matches!(
+            marker_state,
+            Some(crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable)
+        );
         // Mark this Perforce turn in progress; cleared only once it is durably recorded, so a
         // failure anywhere below leaves the marker set for the next resume to see. If the marker
         // cannot be written, a later crash could not be detected, so this turn must not produce a
@@ -888,7 +983,47 @@ impl Job {
         } else {
             capture.perforce_baseline.clone()
         };
-        let capture_warnings = capture.warnings;
+        let mut capture_warnings = capture.warnings;
+
+        // The caller-facing resume disposition. The backend fills the decisions it can see; here
+        // we supply the framing it cannot: a disposition exists only on a resumed turn that sent a
+        // change, and a resumed turn whose backend saw no baseline is named by *this* layer, which
+        // alone knows whether it resumed and why the baseline was withheld.
+        let disposition = self.resolve_disposition(
+            resume_id.is_some(),
+            capture.change.is_some(),
+            capture.disposition.clone(),
+            marker_state,
+            pending_marked,
+        );
+
+        // A failed `mark_pending` means the *next* turn cannot safely elide. When the feature is
+        // enabled that is worth an ordinary persistence warning on its own footing, independent of
+        // the disposition (which G0 suppresses on a no-change resume): the durability guarantee is
+        // gone. When the feature is off there is no future elision to protect, so it is immaterial.
+        if self.cfg.vcs == crate::config::Vcs::Perforce
+            && !pending_marked
+            && self.cfg.resume_incremental_diff
+        {
+            capture_warnings.push(
+                "The next incremental re-review could not be protected: this turn could not \
+                 record a durable in-progress marker, so the next review of this session will \
+                 re-send the whole change rather than only what changed."
+                    .to_string(),
+            );
+        }
+
+        // A delta that was expected and fell back to a full re-capture is a cost surprise the
+        // caller should hear about -- the one disposition that also earns a warning. `FullByDesign`
+        // and `Incremental` do not; a fresh or no-change turn has no disposition at all.
+        if let Some(d) = &disposition {
+            if d.warns() {
+                capture_warnings.push(format!(
+                    "Incremental re-review did not happen: {}.",
+                    d.summary()
+                ));
+            }
+        }
         self.registry.set_phase(&self.id, Phase::Launching);
 
         // What this attempt did, for the usage record.
@@ -908,7 +1043,12 @@ impl Job {
             &capture_warnings,
             &mut facts.prompt_bytes,
         ) {
-            Ok(outcome) => outcome,
+            Ok(mut outcome) => {
+                // The disposition rides on the successful outcome so the response can render it.
+                // A failed turn keeps `None` (`Outcome::failed`): it sent no reviewable change.
+                outcome.disposition = disposition;
+                outcome
+            }
             Err(failure) => {
                 // A resume target the reviewer no longer has is a dead mapping: drop it so a
                 // follow-up call is not billed for the same doomed resume. The failure is
@@ -931,6 +1071,9 @@ impl Job {
         // Everything telemetry needs, taken before the outcome moves into the registry.
         let usage = outcome.usage;
         let failure_code = outcome.failure.as_ref().map(|f| f.code.to_string());
+        // The disposition, as a compact tag for the usage log. Read off the outcome (the Ok arm
+        // put it there; a failure carries none) before `finish` consumes it.
+        let disposition_tag = outcome.disposition.as_ref().map(vcs::Disposition::tag);
 
         // Deliver the review first, and disarm before any accounting runs. Recording used
         // to happen here, while the guard was still armed: `eprintln!` panics if stderr
@@ -941,7 +1084,14 @@ impl Job {
         self.registry.finish(&self.id, outcome);
         guard.armed = false;
 
-        self.record_usage(usage, failure_code, capture.change.as_ref(), started, facts);
+        self.record_usage(
+            usage,
+            failure_code,
+            disposition_tag,
+            capture.change.as_ref(),
+            started,
+            facts,
+        );
     }
 
     /// Append this turn to the usage log, and say the same thing on stderr.
@@ -956,6 +1106,7 @@ impl Job {
         &self,
         usage: crate::metrics::Usage,
         failure_code: Option<String>,
+        disposition: Option<String>,
         change: Option<&vcs::CapturedChange>,
         started: std::time::Instant,
         facts: AttemptFacts,
@@ -1015,6 +1166,7 @@ impl Job {
             retried: false,
             status: status.to_string(),
             failure_code,
+            disposition,
         });
     }
 
@@ -1344,6 +1496,9 @@ impl Job {
             denial_count: parsed.denial_count,
             denial_count_is_floor: parsed.denial_count_is_floor,
             warnings,
+            // Filled in by `run` after `attempt` returns: the disposition is assembled from the
+            // capture plus the fresh-vs-resumed framing only `run` holds.
+            disposition: None,
             resumable,
             usage: parsed.usage,
         })
@@ -1617,6 +1772,126 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // assemble_disposition: the gates and framing the tools layer supplies over the backend.
+    // -----------------------------------------------------------------------
+    mod disposition {
+        use super::assemble_disposition;
+        use crate::config::Vcs;
+        use crate::session::MarkerState;
+        use crate::vcs::disposition::{Disposition, FellBack, FullByDesign};
+
+        /// A convenience: git, feature on, resumed, change present, backend `None`, markers moot.
+        fn git_no_backing() -> Option<Disposition> {
+            assemble_disposition(Vcs::Git, true, true, true, None, None, false)
+        }
+
+        #[test]
+        fn g0_suppresses_a_fresh_or_no_change_turn() {
+            // Not resumed: no disposition even with a backend reason present.
+            assert!(assemble_disposition(
+                Vcs::Git,
+                true,
+                false,
+                true,
+                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                None,
+                true,
+            )
+            .is_none());
+            // Resumed but no change sent: also none.
+            assert!(assemble_disposition(
+                Vcs::Git,
+                true,
+                true,
+                false,
+                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                None,
+                true,
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn a_backend_reason_passes_through_unchanged() {
+            let d = assemble_disposition(
+                Vcs::Git,
+                true,
+                true,
+                true,
+                Some(Disposition::FellBackToFull(FellBack::BranchRewritten)),
+                None,
+                true,
+            );
+            assert_eq!(
+                d,
+                Some(Disposition::FellBackToFull(FellBack::BranchRewritten))
+            );
+        }
+
+        #[test]
+        fn a_resumed_git_turn_with_no_baseline_is_no_complete_baseline_retained() {
+            assert_eq!(
+                git_no_backing(),
+                Some(Disposition::FellBackToFull(
+                    FellBack::NoCompleteBaselineRetained
+                ))
+            );
+        }
+
+        #[test]
+        fn g1_disabled_wins_over_the_perforce_marker_reasons() {
+            // Disabled AND the marker could not be written: G1 is a gate, so it is FullByDesign,
+            // never a MarkerUnwritable warning. This is the round-7 contradiction, resolved.
+            let d = assemble_disposition(
+                Vcs::Perforce,
+                false, // disabled
+                true,
+                true,
+                None,
+                Some(MarkerState::Present),
+                false, // marker unwritable
+            );
+            assert_eq!(d, Some(Disposition::FullByDesign(FullByDesign::Disabled)));
+            assert!(!d.unwrap().warns());
+        }
+
+        #[test]
+        fn perforce_marker_precedence() {
+            let p = |marker: Option<MarkerState>, pending_marked: bool| {
+                assemble_disposition(
+                    Vcs::Perforce,
+                    true,
+                    true,
+                    true,
+                    None,
+                    marker,
+                    pending_marked,
+                )
+            };
+            // MarkerUnwritable wins even when a prior marker is also present.
+            assert_eq!(
+                p(Some(MarkerState::Present), false),
+                Some(Disposition::FellBackToFull(FellBack::MarkerUnwritable))
+            );
+            // Then a confirmed-present prior marker.
+            assert_eq!(
+                p(Some(MarkerState::Present), true),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending))
+            );
+            // Then an unreadable marker state -- not a false PriorTurnPending.
+            assert_eq!(
+                p(Some(MarkerState::Unreadable), true),
+                Some(Disposition::FellBackToFull(FellBack::MarkerStateUnreadable))
+            );
+            // Markers fine: `resume = None` reaching here means no prior baseline existed.
+            assert_eq!(
+                p(Some(MarkerState::Absent), true),
+                Some(Disposition::FellBackToFull(FellBack::PriorBaselineMissing))
+            );
+        }
+    }
 
     /// A session record identical to what `cfg` would create, aged and lengthened to order.
     fn record_matching(

@@ -20,6 +20,19 @@ use crate::vcs::baseline::{CaptureIdentity, PerforceBaseline};
 /// Distinguishes temp files written by concurrent writers in this process.
 static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// The three states a turn's in-progress marker can be read in. `Present` and `Unreadable` both
+/// disable the next elision (fail-closed), but the resume disposition reports them as different
+/// reasons -- a confirmed leftover marker versus a marker whose state could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerState {
+    /// No marker: the previous turn cleared it, so its baseline is trustworthy.
+    Absent,
+    /// A marker is present: the previous turn crashed or failed to persist.
+    Present,
+    /// The marker state could not be read (an I/O error). Fail-closed to "do not elide".
+    Unreadable,
+}
+
 /// How long to wait for another process to release the session file. Short: this only
 /// guards a read-modify-write of a small JSON file.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -294,8 +307,8 @@ impl SessionStore {
     /// Mark a Perforce turn as in progress. The marker is written *before* the turn does anything
     /// that could deliver a review without persisting its baseline, and cleared only once the turn
     /// is durably recorded. A crash, panic, or write failure in between therefore leaves it set,
-    /// and [`is_pending`](Self::is_pending) tells the next resume to fall back to a full capture
-    /// rather than collapse against a baseline that never advanced.
+    /// and [`marker_state`](Self::marker_state) tells the next resume to fall back to a full
+    /// capture rather than collapse against a baseline that never advanced.
     ///
     /// Returns an error if the marker could not be written: the caller must then refuse to produce
     /// a resumable baseline this turn, since a later crash could not be detected.
@@ -318,12 +331,17 @@ impl SessionStore {
         }
     }
 
-    /// Whether the previous turn of this session left an uncleared in-progress marker -- it
-    /// crashed, panicked, or failed to persist. **Fail-closed:** an I/O error deciding this
-    /// returns `true`, so an unreadable marker state disables elision rather than risking a
-    /// collapse against a baseline that never advanced.
-    pub fn is_pending(&self, name: &str) -> bool {
-        self.pending_marker(name).try_exists().unwrap_or(true)
+    /// The three states of the previous turn's in-progress marker. Kept distinct because the
+    /// resume disposition must tell a *confirmed* leftover marker (`Present` -- the previous turn
+    /// crashed or failed to persist) from a marker state that could not be *read* (`Unreadable`):
+    /// both disable elision, but they are different facts to report to the caller, and folding
+    /// the I/O error into "present" would be a claim the read cannot support.
+    pub fn marker_state(&self, name: &str) -> MarkerState {
+        match self.pending_marker(name).try_exists() {
+            Ok(true) => MarkerState::Present,
+            Ok(false) => MarkerState::Absent,
+            Err(_) => MarkerState::Unreadable,
+        }
     }
 
     pub fn forget(&self, name: &str) -> io::Result<bool> {
@@ -788,18 +806,30 @@ mod tests {
         // recorded, so a crash/failure in between leaves it set for the next resume to see.
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
-        assert!(!store.is_pending("p4"), "nothing pending initially");
+        assert_eq!(
+            store.marker_state("p4"),
+            MarkerState::Absent,
+            "nothing pending initially"
+        );
         store.mark_pending("p4").expect("mark");
-        assert!(store.is_pending("p4"), "marked pending");
+        assert_eq!(
+            store.marker_state("p4"),
+            MarkerState::Present,
+            "marked pending"
+        );
         // It survives a fresh store over the same directory (i.e. an MCP server restart).
-        assert!(SessionStore::new(&dir).is_pending("p4"));
+        assert_eq!(
+            SessionStore::new(&dir).marker_state("p4"),
+            MarkerState::Present
+        );
         store.clear_pending("p4").expect("clear");
-        assert!(!store.is_pending("p4"), "cleared");
+        assert_eq!(store.marker_state("p4"), MarkerState::Absent, "cleared");
         // Clearing an already-absent marker is not an error.
         store.clear_pending("p4").expect("clear absent is ok");
         // Distinct session names have distinct markers.
         store.mark_pending("a").expect("mark a");
-        assert!(store.is_pending("a") && !store.is_pending("b"));
+        assert_eq!(store.marker_state("a"), MarkerState::Present);
+        assert_eq!(store.marker_state("b"), MarkerState::Absent);
     }
 
     #[test]
