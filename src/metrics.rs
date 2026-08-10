@@ -1162,6 +1162,8 @@ mod tests {
             status: "completed".into(),
             failure_code: None,
             disposition: None,
+            resolved_bin: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -1175,6 +1177,29 @@ mod tests {
             api_calls: Some(8),
             api_duration_ms: Some(30_000),
         }
+    }
+
+    #[test]
+    fn a_fall_through_attempt_makes_the_turn_totals_partial() {
+        // A record whose terminal usage is complete but which carries a rate-limited attempt
+        // (usage unknown) must not summarise as a complete accounting: the attempt consumed
+        // tokens the CLI never reported. See docs/reviewer-fallback-chain.md.
+        let mut with_attempt = record("s", 1, None, usage(1_000, 9_000, 500));
+        with_attempt.v = RECORD_VERSION_ATTEMPTS;
+        with_attempt.attempts = vec![Attempt {
+            reviewer: "claude".into(),
+            model: "claude-opus-4-8".into(),
+            effort: "medium".into(),
+            resolved_bin: None,
+            failure_code: "RATE_LIMITED".into(),
+            wall_secs: 3,
+            prompt_bytes: 100,
+        }];
+        assert!(!summarise(&[with_attempt]).input_complete());
+
+        // The same usage with no fall-through is complete.
+        let clean = record("s", 1, None, usage(1_000, 9_000, 500));
+        assert!(summarise(&[clean]).input_complete());
     }
 
     #[test]

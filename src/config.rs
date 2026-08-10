@@ -615,9 +615,11 @@ impl Config {
         }
 
         if entries.is_empty() {
-            return Err("--reviewer is required (use '--reviewer codex' when the caller is Claude \
+            return Err(
+                "--reviewer is required (use '--reviewer codex' when the caller is Claude \
                         Code, '--reviewer claude' when the caller is Codex)"
-                .to_string());
+                    .to_string(),
+            );
         }
 
         let cwd = match cwd {
@@ -656,12 +658,13 @@ impl Config {
         // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. The
         // unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
         // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer.
-        let reviewers: Vec<ReviewerSpec> = entries
-            .into_iter()
-            .map(|e| e.finalize())
-            .collect();
+        let reviewers: Vec<ReviewerSpec> = entries.into_iter().map(|e| e.finalize()).collect();
         for spec in &reviewers {
-            if !spec.reviewer.known_efforts().contains(&spec.effort.as_str()) {
+            if !spec
+                .reviewer
+                .known_efforts()
+                .contains(&spec.effort.as_str())
+            {
                 eprintln!(
                     "cross-review: warning: effort '{}' is not one of the known levels for {} \
                      ({}). Passing it through anyway.",
@@ -741,7 +744,11 @@ impl Config {
                 .position(|s| base_match(s) && &s.raw_bin() == raw),
             None => {
                 // Legacy record: match on the fields it carries, but only if unambiguous.
-                let mut matches = self.reviewers.iter().enumerate().filter(|(_, s)| base_match(s));
+                let mut matches = self
+                    .reviewers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| base_match(s));
                 match (matches.next(), matches.next()) {
                     (Some((i, _)), None) => Some(i),
                     _ => None,
@@ -1268,19 +1275,27 @@ mod tests {
 
     #[test]
     fn reviewer_is_required() {
+        let err = Config::from_args(&args(&[])).unwrap_err();
+        assert!(err.contains("--reviewer is required"), "{err}");
+    }
+
+    #[test]
+    fn identity_flag_before_any_reviewer_is_rejected() {
+        // `--model` binds to the most recent `--reviewer`; with none before it, that is almost
+        // always a forgotten `--reviewer`, so it is a parse error rather than a silent bind.
         let err = Config::from_args(&args(&["--model", "x"])).unwrap_err();
-        assert!(err.contains("--reviewer is required"));
+        assert!(err.contains("--model must follow a --reviewer"), "{err}");
     }
 
     #[test]
     fn defaults_are_pinned_per_reviewer() {
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert_eq!(claude.model, "claude-opus-4-8");
-        assert_eq!(claude.effort, "medium");
+        assert_eq!(claude.primary().model, "claude-opus-4-8");
+        assert_eq!(claude.primary().effort, "medium");
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert_eq!(codex.model, "gpt-5.6-luna");
-        assert_eq!(codex.effort, "max");
+        assert_eq!(codex.primary().model, "gpt-5.6-luna");
+        assert_eq!(codex.primary().effort, "max");
     }
 
     #[test]
@@ -1294,8 +1309,217 @@ mod tests {
             "ultra",
         ]))
         .expect("config");
-        assert_eq!(cfg.model, "gpt-5.6-sol");
-        assert_eq!(cfg.effort, "ultra");
+        assert_eq!(cfg.primary().model, "gpt-5.6-sol");
+        assert_eq!(cfg.primary().effort, "ultra");
+    }
+
+    // ---- reviewer fallback chain (issue #48) ----
+
+    #[test]
+    fn single_reviewer_is_a_one_entry_chain() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.reviewers.len(), 1);
+        assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex);
+        // Byte-for-byte the same budget as before the chain existed: capture + timeout + grace.
+        let single =
+            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        assert_eq!(cfg.max_wait_secs(), single);
+    }
+
+    #[test]
+    fn a_repeated_reviewer_starts_a_new_chain_entry_in_order() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "medium",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.reviewers.len(), 2);
+        assert_eq!(cfg.reviewers[0].reviewer, ReviewerKind::Claude);
+        assert_eq!(cfg.reviewers[0].model, "claude-opus-4-8");
+        assert_eq!(cfg.reviewers[1].reviewer, ReviewerKind::Codex);
+        assert_eq!(cfg.reviewers[1].model, "gpt-5.6-luna");
+        // Each entry takes its own per-reviewer defaults when unspecified.
+        let defaulted = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
+            .expect("config");
+        assert_eq!(defaulted.reviewers[0].model, "claude-opus-4-8");
+        assert_eq!(defaulted.reviewers[1].model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn a_doubled_identity_flag_in_one_entry_is_rejected() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "a",
+            "--model",
+            "b",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--model given twice"), "{err}");
+    }
+
+    #[test]
+    fn a_multi_entry_budget_adds_a_term_per_fallback() {
+        let cfg = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
+            .expect("config");
+        let single =
+            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        let per_fallback =
+            PREFLIGHT_CAP_SECS + cfg.timeout.as_secs() + crate::reviewer::DRAIN_GRACE.as_secs();
+        assert_eq!(cfg.max_wait_secs(), single + per_fallback);
+    }
+
+    #[test]
+    fn validate_chain_rejects_a_fully_identical_entry_but_allows_a_different_one() {
+        let dup = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "codex"]))
+            .expect("config");
+        assert!(Config::validate_chain(&dup.reviewers).is_err());
+
+        // Same reviewer, different model: a legitimate same-family fallback, honoured.
+        let same_family = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+        ]))
+        .expect("config");
+        assert!(Config::validate_chain(&same_family.reviewers).is_ok());
+
+        assert!(Config::validate_chain(&[]).is_err());
+    }
+
+    #[test]
+    fn chain_needs_capture_folds_across_entries() {
+        // Codex has a shell and needs no diff; Claude has none and does. A Codex->Claude chain
+        // under --diff auto must still capture, for the Claude fallback.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
+            .expect("config");
+        assert!(!cfg.supplies_change_of(ReviewerKind::Codex));
+        assert!(cfg.supplies_change_of(ReviewerKind::Claude));
+        assert!(cfg.chain_needs_capture());
+    }
+
+    #[test]
+    fn describe_reviewer_names_the_whole_chain() {
+        let one = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(!one.describe_reviewer().contains("falling back"));
+
+        let two = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
+            .expect("config");
+        let desc = two.describe_reviewer();
+        assert!(desc.contains("falling back"), "{desc}");
+        assert!(desc.contains("claude"), "{desc}");
+    }
+
+    #[test]
+    fn resume_entry_index_matches_the_creating_entry() {
+        use crate::session::{RawBin, SessionRecord};
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "medium",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+        ]))
+        .expect("config");
+        let mut rec = SessionRecord {
+            reviewer: "codex".into(),
+            cli_session_id: "t".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::PathSearch),
+            resolved_bin: None,
+        };
+        // Matches the fallback entry (index 1), not the primary.
+        assert_eq!(cfg.resume_entry_index(&rec), Some(1));
+        // A model the chain no longer has: no match.
+        rec.model = "gpt-5.6-sol".into();
+        assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn a_legacy_record_matches_only_when_unambiguous() {
+        use crate::session::SessionRecord;
+        let mk = |reviewer: &str, model: &str| SessionRecord {
+            reviewer: reviewer.into(),
+            cli_session_id: "t".into(),
+            model: model.into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: None, // legacy: no stored bin
+            resolved_bin: None,
+        };
+        // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
+        let ambiguous = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--bin",
+            "C:\\a\\codex.exe",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--bin",
+            "C:\\b\\codex.exe",
+        ]))
+        .expect("config");
+        assert_eq!(
+            ambiguous.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            None
+        );
+        // Exactly one match: resumes.
+        let single = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(
+            single.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1303,19 +1527,23 @@ mod tests {
         // MCP config files vary in how they split args, so both forms must work.
         let cfg =
             Config::from_args(&args(&["--reviewer=claude", "--effort=xhigh"])).expect("config");
-        assert_eq!(cfg.reviewer, ReviewerKind::Claude);
-        assert_eq!(cfg.effort, "xhigh");
+        assert_eq!(cfg.primary().reviewer, ReviewerKind::Claude);
+        assert_eq!(cfg.primary().effort, "xhigh");
     }
 
     #[test]
     fn reviewer_aliases_resolve() {
         for alias in ["codex", "chatgpt", "openai", "gpt", "CODEX"] {
             let cfg = Config::from_args(&args(&["--reviewer", alias])).expect("config");
-            assert_eq!(cfg.reviewer, ReviewerKind::Codex, "alias {alias}");
+            assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex, "alias {alias}");
         }
         for alias in ["claude", "claude-code", "anthropic"] {
             let cfg = Config::from_args(&args(&["--reviewer", alias])).expect("config");
-            assert_eq!(cfg.reviewer, ReviewerKind::Claude, "alias {alias}");
+            assert_eq!(
+                cfg.primary().reviewer,
+                ReviewerKind::Claude,
+                "alias {alias}"
+            );
         }
     }
 
@@ -1882,7 +2110,7 @@ mod tests {
         // rebuild of this tool.
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--effort", "hyper"]))
             .expect("unusual effort should warn, not fail");
-        assert_eq!(cfg.effort, "hyper");
+        assert_eq!(cfg.primary().effort, "hyper");
     }
 
     #[test]

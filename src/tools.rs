@@ -1248,7 +1248,8 @@ impl Job {
 
         // The walk always assigns `outcome` (every branch sets it or the loop covers every
         // index), so this fallback is a safety net rather than an expected path.
-        let mut outcome = outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
+        let mut outcome =
+            outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
         // Attribute the terminal outcome to the entry that produced it (`self.spec` is the last
         // entry the walk touched), so the completed response names the reviewer that actually ran.
         outcome.active = Some(self.spec.describe());
@@ -1286,6 +1287,7 @@ impl Job {
     ///
     /// Best effort by construction: it runs after the review has been handed over, so
     /// nothing it does can affect the result.
+    #[allow(clippy::too_many_arguments)]
     fn record_usage(
         &self,
         usage: crate::metrics::Usage,
@@ -2113,6 +2115,9 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            // Match what `cfg`'s primary entry would record, so the resume identity check binds.
+            raw_bin: Some(cfg.primary().raw_bin()),
+            resolved_bin: None,
         }
     }
 

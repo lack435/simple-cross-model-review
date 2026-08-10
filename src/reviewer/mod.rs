@@ -799,7 +799,7 @@ mod drain_tests {
             stdout_lossy: false,
             stdout_incomplete: false,
         };
-        let failure = truncation_failure(&cfg, &out).expect("a truncation failure");
+        let failure = truncation_failure(cfg.primary(), &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
 
         let intact = RunOutcome {
@@ -807,7 +807,7 @@ mod drain_tests {
             stderr_truncated: false,
             ..out
         };
-        assert!(truncation_failure(&cfg, &intact).is_none());
+        assert!(truncation_failure(cfg.primary(), &intact).is_none());
     }
 
     #[test]
@@ -831,7 +831,7 @@ mod drain_tests {
             stdout_incomplete: false,
         };
 
-        let failure = failure_for(&cfg, &out);
+        let failure = failure_for(&cfg, cfg.primary(), &out);
         assert_eq!(failure.code, "TIMEOUT");
         assert!(failure.summary.contains("refused 2 shell command(s)"));
         assert!(failure
@@ -845,7 +845,7 @@ mod drain_tests {
             stderr_truncated: true,
             ..out
         };
-        let failure = failure_for(&cfg, &capped);
+        let failure = failure_for(&cfg, cfg.primary(), &capped);
         assert_eq!(failure.code, "TIMEOUT");
         assert!(
             failure

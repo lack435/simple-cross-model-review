@@ -329,14 +329,14 @@ mod tests {
             ..outcome(cut_short, true)
         };
         let failure = ClaudeReviewer
-            .parse(&cfg(), &truncated, None)
+            .parse(&cfg(), cfg().primary(), &truncated, None)
             .expect_err("truncated JSON cannot parse");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
 
         // The same unparseable stdout without the cap having been hit is still an empty
         // review, so the new code cannot swallow the old diagnosis.
         let failure = ClaudeReviewer
-            .parse(&cfg(), &outcome(cut_short, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(cut_short, true), None)
             .expect_err("still a failure");
         assert_eq!(failure.code, "EMPTY_REVIEW");
     }
@@ -357,7 +357,7 @@ mod tests {
             ..outcome(&padded, true)
         };
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &truncated, None)
+            .parse(&cfg(), cfg().primary(), &truncated, None)
             .expect("a complete document still parses");
         assert_eq!(parsed.text, "APPROVE");
         assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
@@ -369,7 +369,7 @@ mod tests {
 
         // And an untruncated run of the same shape carries no warning.
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &outcome(&padded, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(&padded, true), None)
             .expect("parse");
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
@@ -380,7 +380,7 @@ mod tests {
             "result":"## Verdict\nAPPROVE","session_id":"3d759777-4801-4e26-b6c5-4fbdb70adbbf",
             "permission_denials":[]}"###;
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(json, true), None)
             .expect("parse");
         assert_eq!(parsed.text, "## Verdict\nAPPROVE");
         assert_eq!(
@@ -399,7 +399,7 @@ mod tests {
             "usage":{"input_tokens":142,"output_tokens":9021,
                      "cache_creation_input_tokens":648000,"cache_read_input_tokens":5170000}}"#;
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(json, true), None)
             .expect("parse");
 
         assert_eq!(parsed.usage.input_tokens, Some(142));
@@ -421,7 +421,7 @@ mod tests {
         // Escaped rather than raw: the value contains `"##`, which closes an `r#"`.
         let json = "{\"is_error\":false,\"result\":\"## Verdict\\nAPPROVE\",\"session_id\":\"s\"}";
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(json, true), None)
             .expect("parse");
         assert_eq!(parsed.text, "## Verdict\nAPPROVE");
         assert!(parsed.usage.is_empty());
@@ -432,7 +432,7 @@ mod tests {
         let json = r#"{"is_error":false,"result":"ok","session_id":"s",
             "permission_denials":[{"tool_name":"Bash","tool_input":{"command":"echo pwned > EVIL.txt"}}]}"#;
         let parsed = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(json, true), None)
             .expect("parse");
         assert_eq!(parsed.denials, vec!["Bash: echo pwned > EVIL.txt"]);
         assert_eq!(parsed.denial_count, 1);
@@ -442,7 +442,7 @@ mod tests {
     fn empty_result_is_not_a_review() {
         let json = r#"{"is_error":false,"result":"   ","session_id":"s"}"#;
         let err = ClaudeReviewer
-            .parse(&cfg(), &outcome(json, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(json, true), None)
             .unwrap_err();
         assert_eq!(err.code, "EMPTY_REVIEW");
     }
@@ -482,7 +482,9 @@ mod tests {
             "## Findings\n- `src/lib.rs:429` returns 429 on quota exhaustion; too many requests \
              are not retried.",
         );
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
         // The text is still shown to the user, just never matched against.
         assert!(err.detail.unwrap_or_default().contains("429"));
@@ -493,7 +495,9 @@ mod tests {
         let out = failure_with_review_text(
             "The parser does not support nested groups; this is an invalid model of the grammar.",
         );
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
     }
 
@@ -503,7 +507,9 @@ mod tests {
             "`tools.rs:200` returns 'no conversation found' when the session not found branch is \
              hit, which is confusing.",
         );
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
     }
 
@@ -513,7 +519,9 @@ mod tests {
         // CLI's own diagnosis.
         let mut out = failure_with_review_text("a perfectly ordinary review");
         out.stderr = "Error: 429 Too Many Requests".into();
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "RATE_LIMITED");
     }
 
@@ -538,7 +546,9 @@ mod tests {
             stdout_lossy: false,
             stdout_incomplete: false,
         };
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
     }
 
@@ -546,7 +556,9 @@ mod tests {
     fn non_json_stdout_on_failure_is_classified_not_swallowed() {
         let mut out = outcome("Invalid API key · Please run /login", false);
         out.stderr = "401 unauthorized".into();
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN");
     }
 
@@ -571,7 +583,9 @@ mod tests {
             stdout_lossy: false,
             stdout_incomplete: false,
         };
-        let err = ClaudeReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");
     }
 }

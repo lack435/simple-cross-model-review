@@ -580,6 +580,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    raw_bin: RawBin::PathSearch,
+                    resolved_bin: String::new(),
                 },
             )
             .expect("record turn")
@@ -644,6 +646,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
         };
         store
             .record_turn("default", facts(turn_one))
@@ -686,6 +690,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -736,6 +742,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
         };
         // The old conversation establishes a complete baseline.
         store
@@ -771,6 +779,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -805,6 +815,8 @@ mod tests {
             include_shelved: Some(false),
             capture_identity: None,
             perforce_baseline: baseline,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,

@@ -96,7 +96,9 @@ the single source of truth. There is no config file of our own to drift out of s
 
 ```
 --reviewer <claude|codex>   Which CLI reviews. Required. Pick the model that is NOT
-                            the calling agent.
+                            the calling agent. Repeat it to configure a fallback chain
+                            (see below); --model/--effort/--bin bind to the --reviewer
+                            before them.
 --model <id>                Reviewer model. Pin the full id, never an alias.
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
@@ -138,6 +140,38 @@ Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 > Pin models by full id, not an alias. `--model opus` resolves to whatever the provider
 > currently maps that alias to and can move as releases ship — verified once as
 > `claude-opus-4-8`. Pinning the exact id keeps the reviewer fixed to the one you chose.
+
+### Reviewer fallback chain
+
+Repeat `--reviewer` to configure an ordered fallback chain. `--model`, `--effort` and
+`--bin` bind to the `--reviewer` before them, and argument order is fallback order:
+
+```
+--reviewer codex  --model gpt-5.6-luna    --effort max \
+--reviewer claude --model claude-opus-4-8 --effort medium
+```
+
+A **fresh** review runs the first entry; if it reports a rate or usage limit
+(`RATE_LIMITED`), the server automatically advances to the next entry, and so on. Only a
+rate/usage limit falls through — an auth error, a missing CLI, a bad model or a timeout
+surfaces immediately, so a real misconfiguration is never masked behind a working
+substitute. If **every** entry is rate-limited the review is refused with
+`REVIEWERS_EXHAUSTED`, naming each entry tried. A **single** `--reviewer` behaves exactly as
+before: one reviewer, and a rate limit surfaces as `RATE_LIMITED`.
+
+There is no automatic fallback — the chain is only ever what the arguments declare — and no
+usage threshold: the trigger is the reviewer actually reporting a limit, because neither CLI
+exposes remaining-headroom for the server to gate on ahead of time. Same-family fallbacks
+(`gpt-5.6-luna` → `gpt-5.6-sol`, say) are honoured as written; the only chain the tool
+refuses is one with a *fully identical* entry (same reviewer, model, effort and bin), which
+could never be a fallback for the one before it. A misconfigured chain does not stop the
+server — it starts and refuses every review with `INVALID_REVIEWER_CHAIN` until fixed.
+
+A re-review resumes the entry that created the session (which may be a fallback), never the
+primary, and never falls through — the reviewer's memory lives on one specific reviewer, so a
+rate-limited resume is reported as such and the caller chooses `fresh: true` to restart chain
+selection. The full design, including the deferred usage-threshold spike, is in
+[docs/reviewer-fallback-chain.md](docs/reviewer-fallback-chain.md).
 
 ## The change under review is fetched for you
 
