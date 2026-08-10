@@ -441,6 +441,39 @@ impl App {
             }
         }
 
+        // Cwd-mode migration, applied only *after* the identity and binding checks above so it
+        // never bypasses them. A session that is otherwise resumable still cannot be resumed in
+        // place if the reviewer's working-directory mode changed since it was created: the
+        // conversation lives under the other process cwd, so Claude Code would not find it.
+        // Rebind to a fresh full-capture turn (drop `prior`) rather than fail. `resume_block`
+        // refuses a session whose entry is not in the chain, so `resume_entry_index` is `Some`
+        // here -- the mode is judged on the exact entry that will run, never a default. A record
+        // predating the field reads as "project". See `docs/resume-cache-cwd-invalidation.md`.
+        let prior = match prior {
+            Some(record) => match self.cfg.resume_entry_index(&record) {
+                Some(entry) => {
+                    let now_mode = crate::reviewer::claude_cwd_mode(
+                        &self.cfg,
+                        self.cfg.reviewers[entry].reviewer,
+                    );
+                    let then_mode = record
+                        .reviewer_cwd_mode
+                        .as_deref()
+                        .unwrap_or(crate::reviewer::CWD_MODE_PROJECT);
+                    if now_mode == then_mode {
+                        Some(record)
+                    } else {
+                        None
+                    }
+                }
+                // Unreachable after `resume_block` (which refuses a None entry); if it ever were,
+                // do not guess an entry and do not rebind -- leave the resume path to its own
+                // handling rather than defaulting to index 0.
+                None => Some(record),
+            },
+            None => None,
+        };
+
         let (resume_id, turn, resumed) = match &prior {
             Some(record) => (
                 Some(record.cli_session_id.clone()),
@@ -2130,9 +2163,28 @@ impl Job {
         let prior_findings_digest: Option<String> = prior_state
             .as_ref()
             .map(|p| crate::findings::render_digest(&p.findings));
+
+        // When the reviewer runs from a neutral working directory, its process cwd is not the
+        // project, so it must be told to read by absolute path and the caller's context paths --
+        // which it would otherwise resolve against the neutral dir -- are made absolute under the
+        // working root. `None` (the common case) leaves both as they were.
+        let neutral = crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer);
+        let (neutral_root, context_paths): (Option<&std::path::Path>, std::borrow::Cow<[String]>) =
+            match &neutral {
+                Some(_) => (
+                    Some(self.cfg.cwd.as_path()),
+                    std::borrow::Cow::Owned(
+                        self.context_paths
+                            .iter()
+                            .map(|p| absolutize_under(&self.cfg.cwd, p))
+                            .collect(),
+                    ),
+                ),
+                None => (None, std::borrow::Cow::Borrowed(&self.context_paths)),
+            };
         let text = prompt::build(&PromptParts {
             instructions: &self.instructions,
-            context_paths: &self.context_paths,
+            context_paths: &context_paths,
             cwd: &self.cfg.cwd,
             turn,
             resumed: resume_id.is_some(),
@@ -2146,6 +2198,7 @@ impl Job {
             // first-turn form.
             nonce: Some(&self.id),
             prior_findings_digest: prior_findings_digest.as_deref(),
+            neutral_root,
         });
         // Reported back through the out-parameter so it survives the error paths below:
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
@@ -2410,6 +2463,12 @@ impl Job {
                             // reconciled ledger and any terminal state this turn produced.
                             findings_ledger: findings_ledger_to_persist.clone(),
                             terminal_reason: terminal_reason_to_persist.clone(),
+                            // The working-directory mode this turn ran in, so a later resume can
+                            // detect a mode change it cannot survive and rebind fresh.
+                            reviewer_cwd_mode: crate::reviewer::claude_cwd_mode(
+                                &self.cfg,
+                                self.spec.reviewer,
+                            ),
                         },
                     ) {
                         Ok(_) => {
@@ -2725,6 +2784,20 @@ fn resume_refusal(
 /// that ran a single review in this session, told it keeps "only the 3 most recent per
 /// session", can see that the explanation does not fit -- which undermines the message at
 /// exactly the moment it is meant to be believed.
+/// Make a caller-supplied context path absolute under `root`, for the neutral-cwd case where a
+/// relative path would otherwise resolve against the reviewer's neutral working directory. An
+/// already-absolute path is left as-is. This is display text for the reviewer's own reads; the
+/// read-scope rule (pinned to `root`) remains the boundary, so a path that resolves outside the
+/// root is still denied there.
+fn absolutize_under(root: &std::path::Path, p: &str) -> String {
+    let candidate = std::path::Path::new(p);
+    if candidate.is_absolute() {
+        p.to_string()
+    } else {
+        root.join(candidate).to_string_lossy().into_owned()
+    }
+}
+
 fn evicted_error(id: &str) -> Failure {
     errors::bad_request(format!(
         "Review '{id}' finished earlier and its result has since been discarded: this server \
@@ -3100,6 +3173,7 @@ mod tests {
             resolved_bin: None,
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: None,
         }
     }
 

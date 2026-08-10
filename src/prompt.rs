@@ -64,6 +64,13 @@ pub struct PromptParts<'a> {
     /// rendered inside the machine-block section only on a resumed turn. Built by the caller from
     /// the persisted ledger; `None` on a first turn (there is nothing prior to account for).
     pub prior_findings_digest: Option<&'a str>,
+    /// Set only when the reviewer runs from a neutral working directory (see
+    /// `claude_neutral_target`): its process cwd is *not* this project, so relative paths would
+    /// resolve in the wrong place. Carries the absolute working root the reviewer must read
+    /// under, and triggers an explicit absolute-path instruction. `None` (the common case)
+    /// means the process cwd is the working root and relative reads resolve correctly.
+    /// Rendered regardless of `--no-preamble`: it is operational, not framing.
+    pub neutral_root: Option<&'a Path>,
 }
 
 pub fn build(parts: &PromptParts) -> String {
@@ -121,6 +128,25 @@ pub fn build(parts: &PromptParts) -> String {
             "\n## Working directory\n\n{}\n",
             parts.cwd.display()
         ));
+        // When the reviewer runs outside the project, relative paths resolve against the wrong
+        // directory, so it must be told to read by absolute path. Rendered even under
+        // `--no-preamble`: without it a real review cannot read the code. The working root is
+        // the git top-level here (a precondition of running neutral), so every path shown in the
+        // change/status listings is relative to it -- one rule for all of them.
+        if let Some(root) = parts.neutral_root {
+            out.push_str(&format!(
+                "\n## Reading files\n\nYour tools run from a different working directory than the \
+                 project, so relative paths will not resolve. To read any file, work out its real \
+                 path relative to the project and join that to the working directory above \
+                 ({root}) to form an absolute path. Paths in the listings below are often \
+                 decorated rather than plain: a git diff shows `a/` and `b/` prefixes, \
+                 `rename from`/`rename to` and `Binary files ...` lines, and `diff --git`/`---`/\
+                 `+++`/`@@` markers that are not paths at all -- use the underlying \
+                 project-relative path in each case, not the decorated text, then join it to the \
+                 working directory.\n",
+                root = root.display()
+            ));
+        }
     }
 
     // The machine-readable findings-block contract is rendered on every turn (the nonce changes
@@ -225,6 +251,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -250,6 +277,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -301,6 +329,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(first.contains("## Your access"));
         assert!(first.contains("You have no shell."));
@@ -318,6 +347,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(!resumed.contains("## Your access"));
     }
@@ -337,6 +367,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
@@ -361,6 +392,7 @@ mod tests {
                 resumed_capture_note: None,
                 nonce: None,
                 prior_findings_digest: None,
+                neutral_root: None,
             });
             assert!(text.contains("## Change under review"), "resumed={resumed}");
             assert!(text.contains("+ added a line"), "resumed={resumed}");
@@ -384,6 +416,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
@@ -406,6 +439,7 @@ mod tests {
             resumed_capture_note: Some(note),
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         };
         // First turn: suppressed even when supplied -- there is no prior snapshot to differ
         // from.
@@ -434,6 +468,7 @@ mod tests {
                 resumed_capture_note: None,
                 nonce: Some("rv-42-7"),
                 prior_findings_digest: None,
+                neutral_root: None,
             });
             assert!(
                 text.contains("## Machine-readable findings block (required)"),
@@ -472,6 +507,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: Some("rv-42-3"),
             prior_findings_digest: Some(digest),
+            neutral_root: None,
         });
         assert!(text.contains(digest));
         assert!(text.contains("report a status for **every** id above, **exactly once**"));
@@ -491,6 +527,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: Some("rv-42-1"),
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(first.contains("empty array on this first turn"));
         assert!(!first.contains("exactly once"));
@@ -511,8 +548,36 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(!text.contains("Machine-readable findings block"));
+    }
+
+    #[test]
+    fn the_neutral_root_instruction_renders_and_handles_diff_prefixes() {
+        let parts = |neutral_root| PromptParts {
+            instructions: "x",
+            context_paths: &[],
+            cwd: Path::new("C:\\repo"),
+            turn: 1,
+            resumed: false,
+            // Deliberately no preamble: the instruction is operational and must render anyway.
+            preamble: None,
+            capabilities: None,
+            change: None,
+            resumed_capture_note: None,
+            nonce: None,
+            prior_findings_digest: None,
+            neutral_root,
+        };
+        let text = build(&parts(Some(Path::new("C:\\repo"))));
+        assert!(text.contains("## Reading files"), "{text}");
+        assert!(text.contains("absolute path"), "{text}");
+        // It must not tell the reviewer to blindly prefix diff paths: those carry `a/`/`b/`.
+        assert!(text.contains("`a/`") && text.contains("`b/`"), "{text}");
+
+        // Project mode (the default) renders no such section.
+        assert!(!build(&parts(None)).contains("## Reading files"));
     }
 
     #[test]
@@ -529,6 +594,7 @@ mod tests {
             resumed_capture_note: None,
             nonce: None,
             prior_findings_digest: None,
+            neutral_root: None,
         });
         assert!(!text.contains("flagged"));
     }
