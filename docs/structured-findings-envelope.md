@@ -8,7 +8,7 @@ autonomous "re-review until converged" loop stops re-deriving structure the tool
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
-> **Review history.** Fifteen rounds against this repository's own gate (Codex, gpt-5.6-luna,
+> **Review history.** Sixteen rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
 > `major`), round 2 (four `major` + one `minor`), round 3 (four `major` + one `minor`), round 4
 > (five `major` + one `minor`), round 5 (five `major` + one `minor`), round 6 (three `major` +
@@ -18,9 +18,10 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > two stale table rows from the round-9 rewrite), round 11 (a fresh-reviewer holistic pass, four
 > `major`), round 12 (four `major` + one `minor`, carrying round 11 through the tables and schema), round 13
 > (two `major` + two `minor`, the `unestablished` edge), round 14 (two `major` + two `minor`, stale
-> four-state summaries), round 15 (two `major` + one `minor`, precedence + last blind-fresh strings).
-> Rounds 1–13 confirmed resolved; rounds 14–15 now closed. Recorded in the
-> [Round 1](#round-1-response) … [Round 15](#round-15-response) responses. The sections they touched —
+> four-state summaries), round 15 (two `major` + one `minor`, precedence + last blind-fresh strings), round 16 (one `major`,
+> a stale re-report of an already-fixed paragraph, tightened further). Rounds 1–15 confirmed resolved;
+> round 16 now closed. Recorded in the
+> [Round 1](#round-1-response) … [Round 16](#round-16-response) responses. The sections they touched —
 > the block schema, ID reconciliation (total-accounting), degradation and the `converged` signal
 > (now including the budget/terminal condition), extraction (nonce-marked, dual-namespace, `_OUT`
 > nonce), durability (a write-ahead marker that must succeed or abort, fail-closed poison-writes,
@@ -871,13 +872,16 @@ baseline and reused here rather than re-invented (round-7 minor #3):
   The one direction this can err is over-caution — a stale marker after a durable record — which
   costs an unnecessary escalation-and-rebaseline, never a bad resume.
 
-The residual honest limitation, unchanged and now genuinely the *only* one: a crash in the
-narrow window after the reviewer accepted a turn and before the atomic `record_turn` loses that
-turn's status updates (`turn_not_durable`), so the session escalates and is recovered by a
-**human-directed rebaseline `fresh`** carrying the preserved prior findings. That is the safe
-direction — a lost turn re-reviews from scratch rather than resuming on a ledger that disagrees with
-the reviewer — and it costs one rebaseline, not a corrupted convergence. It is stated rather than
-papered over.
+The residual honest limitation, unchanged and now genuinely the *only* one: a crash in the narrow
+window after the reviewer accepted a turn and before the atomic `record_turn` loses that turn's
+status updates. This is reported as **`turn_not_durable`** — **not** an autonomous-`fresh` signal:
+**the loop stops and escalates**, and recovery is a **human-directed rebaseline** in which a human
+starts `fresh` carrying the preserved prior findings (the on-disk ledger from before the lost turn is
+intact and its open findings are listed in `findings`) plus anything the human recovers from the
+lost turn's prose. There is no path here on which an autonomous caller silently restarts and
+discards the unpersisted findings. That is the safe direction — a lost turn re-reviews from scratch
+under human direction rather than resuming on a ledger that disagrees with the reviewer — and it
+costs one rebaseline, not a corrupted convergence. It is stated rather than papered over.
 
 ## Convergence requires a ledger over the whole conversation
 
@@ -1764,13 +1768,31 @@ All accepted; none disputed. What changed:
 
 No open questions remain.
 
+## Round 16 response
+
+Codex (gpt-5.6-luna, effort=max, resumed) confirmed round-15's precedence/persistence-first fix, the
+degraded-turn classifications, the five-state model, trust semantics, schema, tests, and over-cap
+paths all resolved and internally consistent, and re-flagged the Decision 5 residual-limitation
+paragraph as still saying "restarted `fresh`" without escalation. That paragraph had in fact already
+been converted to the escalation/rebaseline framing in round 15 (it read `turn_not_durable` →
+"the session escalates and is recovered by a human-directed rebaseline `fresh` carrying the preserved
+prior findings"), and a full grep confirmed no active "restart(ed) `fresh`" / "must be restarted"
+passage remained anywhere — so the re-flag was a stale re-report against the pre-round-15 text.
+Rather than dispute it and stop, the paragraph was tightened further to be unambiguous: it now states
+`turn_not_durable` explicitly, that **the loop stops and escalates**, that recovery is a
+**human-directed rebaseline** carrying the intact prior findings plus anything recovered from the
+lost turn's prose, and that **no autonomous caller silently restarts and discards** the unpersisted
+findings.
+
+No open questions remain.
+
 ## Status
 
-Fifteen rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
+Sixteen rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
 accepted and none disputed. Round 11 (a fresh-reviewer holistic pass) opened the
-escalation/rebaseline seam and the coverage discriminator; rounds 12–15 carried it fully through the
+escalation/rebaseline seam and the coverage discriminator; rounds 12–16 carried it fully through the
 example, reason contract, precedence, state machine, schema, failure table, and tests, closed the
-`unestablished` edge, and swept the last stale four-state/blind-`fresh` summaries. All are now
-closed. The plan is submitted for a final pass. If it is judged sound, implementation begins against
-the [wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs) plan
-above.
+`unestablished` edge, and made every active recovery path explicitly escalate → human-directed
+rebaseline. The reviewer confirms the contract internally consistent. The plan is submitted for a
+final pass; if it is judged sound, implementation begins against the [wiring](#wiring-the-io-edges),
+[tests](#tests), and [module](#new-module--srcfindingsrs) plan above.
