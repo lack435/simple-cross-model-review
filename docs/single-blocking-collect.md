@@ -1,10 +1,11 @@
 # Single blocking collect — design
 
-Status: **implemented; merge gate pending.** The plan went through six rounds of cross-model
-review ending in a clean **APPROVE, no findings** (see [Review history](#review-history)). The
-implementation is built and passes `cargo fmt --check`, clippy `-D warnings`, and the unit tests
-(including the new cancellation, concurrency-cap, wait-cap, and Codex read-cap tests); the
-implementation diff still needs its own pass through this repository's cross-review merge gate.
+Status: **implemented and merge-gate approved.** The plan went through six rounds of cross-model
+review ending in a clean APPROVE; the implementation then went through four more rounds of this
+repository's own `cross-review` gate (Codex, gpt-5.6-luna, effort=max) ending in **APPROVE, no
+findings** (see [Review history](#review-history)). It passes `cargo fmt --check`, clippy
+`-D warnings`, and all 364 unit tests. The real-model `smoke.ps1` round trip has not been run here
+(it bills a model and needs `dist\` unloaded).
 
 ## Implementation status
 
@@ -574,3 +575,12 @@ the server can wake the agent on its own.
      finish inside the 2s window); made tolerant, with suppression left to the unit tests.
   3. added a `tools/list` test asserting the advertised `wait_seconds.maximum` tracks a non-default
      `--timeout-seconds`.
+
+- **Round 8** (implementation) — REQUEST CHANGES: `render_start`'s runtime response and the
+  `handle_cancellation` doc comment still described the old "cancellation stops the review" /
+  "client timeout returns status=running" behaviour. Corrected both.
+- **Round 9** (implementation) — REQUEST CHANGES: the `CANCELLED` remediation text
+  (`errors::cancelled()`) still said an abandoned poll / client-side timeout cancels the review.
+  Rewritten to name the real causes and to say a poll cancellation only detaches.
+- **Round 10** (implementation) — **APPROVE, no findings.** All earlier findings resolved, the
+  sweep introduced nothing new. Implementation approved through the merge gate.
