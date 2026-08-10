@@ -279,13 +279,14 @@ impl App {
                 crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
             )
         {
-            return Err(errors::session_not_resumable(
+            return Err(resume_refusal(
                 &session,
                 "the previous turn did not finish durably (its findings write-ahead marker is \
                  still set), so its findings ledger may be stale or the turn was lost. Start a \
                  fresh review (fresh: true) carrying any still-open findings into the new \
                  instructions."
                     .to_string(),
+                prior.as_ref(),
             ));
         }
 
@@ -306,7 +307,7 @@ impl App {
         // survives for the not-stale ones.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
-                return Err(resume_refusal(&session, reason, record));
+                return Err(resume_refusal(&session, reason, Some(record)));
             }
         }
 
@@ -346,7 +347,7 @@ impl App {
                 let bin = reviewer::resolve_bin(spec)?;
                 if let Some(stored) = &record.resolved_bin {
                     if bin.to_string_lossy() != *stored {
-                        return Err(errors::session_not_resumable(
+                        return Err(resume_refusal(
                             &session,
                             format!(
                                 "it was created with the reviewer binary at '{stored}', but that \
@@ -354,6 +355,7 @@ impl App {
                                  conversation cannot be resumed through a different executable.",
                                 bin.display()
                             ),
+                            Some(record),
                         ));
                     }
                 }
@@ -2270,6 +2272,20 @@ fn resume_block(
     requested_changes: &[u64],
     now: u64,
 ) -> Option<String> {
+    // A stored session id that normalizes to absent (empty or whitespace-only) is not a real
+    // resume handle: `--resume ""` would try to continue a conversation no reviewer holds. Newly
+    // reported ids are normalized away at the adapter boundary (`reviewer::normalize_session_id`),
+    // but a record persisted before that guard (or by any other path) could still carry a blank id,
+    // so refuse it here before the model call rather than passing it through. Recovery is a fresh
+    // rebaseline.
+    if record.cli_session_id.trim().is_empty() {
+        return Some(
+            "its stored reviewer session id is blank, so there is no conversation to resume. Start \
+             a fresh review (fresh: true) carrying any still-open findings into the new \
+             instructions."
+                .to_string(),
+        );
+    }
     // Identity first: a session belongs to the reviewer, model and working root that
     // created it. A configuration that now points elsewhere cannot resume that conversation
     // at all, so the honest answer is to start over -- explicitly, so the caller learns the
@@ -2380,17 +2396,29 @@ fn resume_block(
     None
 }
 
-/// Build the `SESSION_NOT_RESUMABLE` failure for a `resume_block` refusal, tagging the
+/// Build the `SESSION_NOT_RESUMABLE` failure for a pre-model resume refusal, tagging the
 /// unreadable-ledger case so a caller can tell it from a policy refusal.
 ///
 /// The failure contract distinguishes an *unreadable ledger* (`ledger_unavailable`) from a whole-
 /// store parse failure (`state_corrupt`, refused earlier with its own error) and from a plain
-/// policy refusal (turns/idle/mismatch — no detail). The `ledger_unavailable` tag is attached
-/// exactly when the record's stored ledger fails to load, which is precisely the state that needs
-/// a fresh rebaseline rather than a retry.
-fn resume_refusal(session: &str, reason: String, record: &session::SessionRecord) -> Failure {
+/// policy refusal (turns/idle/mismatch/PATH-drift/stale-marker — no detail). The `ledger_unavailable`
+/// tag is attached exactly when the record's stored ledger fails to load, which is precisely the
+/// state that needs a fresh rebaseline rather than a retry — so **every** existing-record refusal
+/// on the pre-model path routes through here (the findings-marker gate, the `resume_block` policy
+/// gate, and the resolved-binary identity gate), not just one of them, so a record whose ledger is
+/// unreadable is tagged whichever gate happens to fire first. `record` is `None` for the one refusal
+/// that can fire with no stored record (a leftover findings marker on a name with no record); it
+/// then carries no detail.
+fn resume_refusal(
+    session: &str,
+    reason: String,
+    record: Option<&session::SessionRecord>,
+) -> Failure {
     let mut failure = errors::session_not_resumable(session, reason);
-    if matches!(record.ledger_load(), session::LedgerLoad::Invalid) {
+    if matches!(
+        record.map(|r| r.ledger_load()),
+        Some(session::LedgerLoad::Invalid)
+    ) {
         failure.detail = Some("ledger_unavailable".to_string());
     }
     failure
@@ -2753,6 +2781,25 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_stored_session_id_is_refused_resume() {
+        // A record persisted with a blank/whitespace cli_session_id is not a resumable handle:
+        // resume_block refuses it before the model call rather than attempting `--resume ""`.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+        for blank in ["", "   ", "\t"] {
+            let mut rec = record_matching(&cfg, 1, now);
+            rec.cli_session_id = blank.to_string();
+            let reason =
+                resume_block(&cfg, &rec, &[], now).expect("a blank session id is refused resume");
+            assert!(reason.contains("blank"), "{reason}");
+        }
+        // A real id still resumes (no blank-id refusal).
+        let ok = record_matching(&cfg, 1, now);
+        assert!(!ok.cli_session_id.trim().is_empty());
+        assert!(resume_block(&cfg, &ok, &[], now).is_none());
+    }
+
+    #[test]
     fn an_invalid_findings_ledger_is_refused_resume() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let now = 1_000_000;
@@ -2763,17 +2810,36 @@ mod tests {
         assert!(reason.contains("unreadable or at an incompatible version"));
         // The refusal is tagged machine-readably as `ledger_unavailable`, so a caller can tell an
         // unreadable-ledger refusal from a policy one (turns/idle/mismatch, which carry no detail).
-        let failure = resume_refusal("default", reason, &rec);
+        // The tag rides whichever gate fires, so a record with an unreadable ledger is tagged even
+        // when the *shown* reason is a different policy refusal — assert that compound case too.
+        let failure = resume_refusal("default", reason, Some(&rec));
         assert_eq!(failure.code, "SESSION_NOT_RESUMABLE");
         assert_eq!(failure.detail.as_deref(), Some("ledger_unavailable"));
 
-        // A policy refusal on a record whose ledger is fine carries no such detail.
+        // Compound: an unreadable ledger AND over the turn limit -> the turns message is shown, but
+        // the ledger_unavailable tag still rides (the recovery, a fresh rebaseline, is identical).
+        let mut invalid_and_stale = record_matching(&cfg, cfg.resume_max_turns + 1, now);
+        invalid_and_stale.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
+        let compound_reason =
+            resume_block(&cfg, &invalid_and_stale, &[], now).expect("too many turns is refused");
+        assert!(compound_reason.contains("turn"));
+        let compound = resume_refusal("default", compound_reason, Some(&invalid_and_stale));
+        assert_eq!(compound.detail.as_deref(), Some("ledger_unavailable"));
+
+        // A policy refusal on a record whose ledger is fine carries no such detail; nor does a
+        // refusal with no record at all (a leftover findings marker on a name with no record).
         let mut healthy = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         healthy.findings_ledger = None;
         let policy_reason =
             resume_block(&cfg, &healthy, &[], now).expect("too many turns is refused");
-        let policy_failure = resume_refusal("default", policy_reason, &healthy);
-        assert_eq!(policy_failure.detail, None);
+        assert_eq!(
+            resume_refusal("default", policy_reason, Some(&healthy)).detail,
+            None
+        );
+        assert_eq!(
+            resume_refusal("default", "no record".to_string(), None).detail,
+            None
+        );
     }
 
     #[test]

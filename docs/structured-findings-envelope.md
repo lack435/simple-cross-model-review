@@ -1275,8 +1275,7 @@ structured contract**, and is not overclaimed beyond it.
 | That before-call terminal-flag persist itself fails | Still non-convergent (`ledger_too_large`, a human-escalation reason); the flag write is re-attempted on the next **operator-directed** call, not by an autonomous loop; **nothing billed or advanced, no findings marker, no `turn_not_durable`** — there was no turn. |
 | Crosses budget **during a turn** (after-reconciliation path) | Over-cap ledger + sticky `terminal_reason=ledger_too_large` written in one atomic `record_turn`; the `.findings-pending` sidecar cleared *afterward* (a clear failure leaves a stale marker that safely forces the escalation path); `resume_block` refuses resume while `terminal_reason` set; `converged:false`, `ledger_too_large`; **no id silently retired** ([bounded growth](#bounded-growth-and-escalation-outcomes)). |
 | That after-reconciliation `record_turn` itself fails | Nothing written; `.findings-pending` sidecar still set → plain `turn_not_durable`; resume refused, escalate. Deterministic: success ⇒ `ledger_too_large`, failure ⇒ `turn_not_durable` (round-6 major #2). |
-| `whole_conversation` record whose ledger later fails to load | Durable poison → `ledger_coverage` transitions to `invalid` and stays; never accepts a replacement ledger to reconverge (round-4 major #1). |
-| Stored ledger found unreadable/incompatible at load (`invalid`) | No poison-*write* exists — coverage lives inside the ledger, so an unreadable ledger has no `whole_conversation` stamp to keep. Detected at load, **before the model call** → resume refused (`SESSION_NOT_RESUMABLE`, `ledger_unavailable` — *not* `state_corrupt`); never runs as `whole_conversation`; the corrupt bytes are never overwritten, so every later load re-derives `invalid` (self-durable across restarts). |
+| `whole_conversation` record whose ledger later fails to load / stored ledger found unreadable or incompatible at load (`invalid`) | No poison-*write* exists — coverage lives inside the ledger, so an unreadable ledger has no `whole_conversation` stamp to keep (round-4 major #1's hazard is unreachable by construction). Detected at load, **before the model call** → resume refused (`SESSION_NOT_RESUMABLE`, `ledger_unavailable` — *not* `state_corrupt`); never runs as `whole_conversation`; never accepts a replacement ledger to reconverge without an explicit human `fresh`; the corrupt bytes are never overwritten, so every later load re-derives `invalid` (self-durable across restarts). |
 | Degraded turn 1 (no valid block on a fresh conversation) | No clean anchor → `ledger_coverage = legacy_uncovered` (stamped before reason selection) → reported `ledger_unavailable` (escalate for rebaseline), not `unstructured`; non-convergent, since turn 1's prose findings were never grounded. If turn 1's *own* write fails instead, `turn_not_durable` (no persisted coverage yet, round-12 minor). |
 | `mark_findings_pending` fails before **any** reviewer call (fresh or resumed) | Turn aborts before the model call (nothing billed); never proceeds marker-less. There is **no exemption** — a `fresh: true` that overwrites an existing record must be marked too, or a crash before `record_turn` leaves the old record resumable (round-9 major #1). The fresh/no-existing-record case is harmless, not exempt. (Decision 5, round-4 major #3.) |
 | Corrupt store + `fresh: true` | `fresh` is gated too: no convergeable record is written on an `invalid` store; recovery is an explicit operator action, the corrupt file is never auto-replaced (round-4 major #2). |
@@ -1293,13 +1292,17 @@ write failed (the persistence-first rule). `unstructured` is never a top-level r
 cause in the warning detail. Both `ledger_unavailable` and `turn_not_durable` **escalate to a human
 rebaseline** (round-11 major #4), never an autonomous `fresh`.
 
-The distinction is durable and **five-way**, keyed on the persisted `ledger_coverage`, not inferred
-per turn: **`whole_conversation`** (ledger from turn 1 → convergeable) ≠ **`legacy_uncovered`**
-(pre-feature / degraded-turn-1 ungrounded history → non-convergent, sticky) ≠ **`needs_rebaseline`**
-(a mid-session degraded turn broke coverage → non-convergent, sticky) ≠ **`invalid`**
-(present-but-unreadable ledger → non-convergent, session preserved, never reset) ≠
-**`unestablished`** (nothing durably persisted yet — a fresh turn 1 whose write failed). Delivery
-differs by readability: the two **readable** break states
+The distinction is durable and keyed on the coverage stored **inside the ledger** (`Ledger.coverage`,
+not a separate `SessionRecord` field), not inferred per turn. The `LedgerCoverage` enum has five
+values, but **only three are ever persisted**: **`whole_conversation`** (ledger from turn 1 →
+convergeable), **`legacy_uncovered`** (pre-feature / degraded-turn-1 ungrounded history →
+non-convergent, sticky), and **`needs_rebaseline`** (a mid-session degraded turn broke coverage →
+non-convergent, sticky). The other two are never written to disk: **`invalid`** (present-but-unreadable
+ledger → non-convergent, session preserved, never reset) is **derived at load** from the ledger bytes
+— because coverage lives inside the ledger, an unreadable ledger simply has no readable coverage, so
+there is no separate poison-write; and **`unestablished`** (nothing durably persisted yet — a fresh
+turn 1 whose write failed) is a **transient** report-only value that `is_structurally_valid` rejects
+if it is ever found on disk. Delivery differs by readability: the two **readable** break states
 (`legacy_uncovered`/`needs_rebaseline`) come back as **completed envelopes** with
 `non_convergence_reason: ledger_unavailable`; **`invalid`** (unreadable) is caught at load and comes
 back as a **`SESSION_NOT_RESUMABLE` refusal** carrying `ledger_unavailable` as its detail (never a
@@ -1337,8 +1340,9 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   (round-4 major #1); a **mid-session degraded turn transitions `whole_conversation →
   needs_rebaseline`**, tested as valid t1 → malformed t2 with a new prose finding → valid t3 that
   **does not converge** and reports `ledger_unavailable` (round-7 major); a **`whole_conversation`
-  record whose ledger later fails to load poisons durably to `invalid` and never accepts a
-  replacement** (round-4 major #1); a corrupt-ledger *record* degrades only its own session, and
+  record whose ledger later fails to load is `invalid` at load (derived from the unreadable bytes,
+  no poison-write) and never accepts a replacement** (round-4 major #1's hazard is unreachable
+  because coverage lives inside the ledger); a corrupt-ledger *record* degrades only its own session, and
   **`fresh` heals a poisoned record in a valid store** (round-5 major #1), and **a `fresh`-over-a-bad-
   record turn 1 whose own `record_turn` fails yields `ledger_coverage: unestablished` /
   `turn_not_durable` / `findings: []`, leaving the old record untouched** (round-21 major); **a
