@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan (round 5).** This document is the plan for the piece of [issue #48] that the
+Status: **plan (round 6).** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -268,44 +268,44 @@ observation:
     absent any, a defined "no result event" failure. The `rate_limit_event`, if present, is
     still captured as headroom by `observe_headroom` regardless. A missing `result` is never
     treated as an empty successful review.
-- **Two separate bounds — retained bytes *and* total work (finding f15, still open after
-  round 3).** `stream-json` is larger than the buffered document (~5.5× for a trivial reply;
-  roughly 2× the review text for a large one, since the text appears in both `assistant`
-  events and the `result` event). Round 3 caught a contradiction in "just retain the latest
-  events": that bounds *memory*, but the shared `MAX_OUTPUT_BYTES` cap ([reviewer/mod.rs:662])
-  also serves as the **total-work** bound against a runaway CLI — and counting the whole stream
-  against it can truncate before `result`, while *not* counting it makes total reading
-  unbounded. So the armed path defines **two independent bounds**:
-  - **Content bound — the review-truncation threshold is the same as buffered mode.** Buffered
-    mode's `MAX_OUTPUT_BYTES` effectively caps the review *content*. The armed path applies
-    `MAX_OUTPUT_BYTES` to the **retained result text** (the content it keeps), not to the raw
-    stream — so a review is truncated on the *same content threshold* in both modes. The format
-    switch therefore does not move the line at which a review is considered too large; that was
-    the round-3 worry, and pinning the cap to retained content (not raw bytes) is what removes
-    it. Round 5 rightly rejected the earlier "≥ 2× raw bytes proves equivalence" claim —
-    per-event/tool-output framing makes the raw multiple unprovable — so the equivalence is
-    asserted on **retained content**, which *is* the comparable quantity, and no raw-size proof
-    is claimed.
-  - **Runaway bound — a concrete, separate guard on total work.** Independently, the bytes
-    *read* from the pipe are bounded by a concrete `MAX_ARMED_STREAM_BYTES` **and** a concrete
-    line/event count, on top of the collect wall-deadline the walk already enforces. This is a
-    *runaway* guard, framed — like `single-blocking-collect.md`'s budget — as **practical
-    sizing, not a proven ceiling**: its only job is to stop an unbounded or pathological stream,
-    and hitting it before a terminal `result` is a **defined** `OUTPUT_TRUNCATED`, never a
-    silent success and never unbounded reading. Because it is deliberately far larger than any
-    real review's stream, it does not decide ordinary truncation — the content bound above does.
+- **One truncation contract, on raw stdout bytes, with explicit bounds (finding f15).** Round
+  5 was right that the earlier "cap the retained result text" framing was a category error:
+  buffered mode caps **raw stdout bytes** at `MAX_OUTPUT_BYTES` ([reviewer/mod.rs:31],
+  [reviewer/mod.rs:600]) and *then* parses that possibly-truncated buffer ([claude.rs:136]), so
+  a cap on the *parsed result text* is a different quantity and cannot be equated with it. The
+  two modes read fundamentally different byte streams — a buffered JSON document vs a JSONL
+  event stream — so there is **no** byte-level or content-level truncation *equivalence* between
+  them, and none is claimed (this is the honest consequence of finding f11, not a gap). Instead
+  the armed path has **one** truncation contract, the *same shape* as buffered mode's — **the
+  raw bytes read from the child's stdout are bounded, and overrun before the terminal `result`
+  is a defined `OUTPUT_TRUNCATED`** — with its own explicit constant because the stream is
+  inherently larger than the document:
+  - Buffered: `MAX_OUTPUT_BYTES` (today's `8 * 1024 * 1024` = 8 MiB).
+  - Armed: `MAX_ARMED_STREAM_BYTES` = **`4 * MAX_OUTPUT_BYTES`** (32 MiB), plus a
+    `MAX_ARMED_STREAM_LINES` = **500,000** event-line cap, plus the collect wall-deadline the
+    walk already enforces. Concrete named constants, stated here so the implementation is not
+    free to leave them implicit.
 
-  So the review-truncation threshold is content-equivalent to buffered mode, a runaway stream
-  is concretely bounded, and neither claim rests on an unprovable raw-size multiple. Tests
-  cover both: a review whose *content* fits buffered mode still yields its terminal `result`
-  armed; and a pathological run-on stream trips the runaway guard as a defined
-  `OUTPUT_TRUNCATED`.
+  These armed bounds are **practical sizing, not a proven ceiling** (the discipline
+  `single-blocking-collect.md` already applies to the collect budget): they exist to stop an
+  unbounded or pathological stream, and are set far above any realistic review's stream (a
+  review whose text approaches 8 MiB is already extraordinary; its ~2× stream still sits well
+  under 32 MiB). Because the two modes cap different streams, a *pathological* review right at
+  the multi-MiB boundary could truncate in one mode and not the other — that residual is
+  **documented, not hidden behind a false equivalence claim**, and it is bounded to sizes no
+  real review reaches. Memory is a **separate** concern: the reader retains only the latest
+  `result` and `rate_limit_event` regardless of stream length — an implementation optimisation
+  that does **not** affect the truncation contract (which is decided on bytes *read*, not bytes
+  *retained*). Tests exercise **both boundary cases** of the one contract: a stream just under
+  `MAX_ARMED_STREAM_BYTES`/`_LINES` whose terminal `result` is delivered and parsed, and one
+  just over that fails as a defined `OUTPUT_TRUNCATED`.
 
-The behaviour-preservation invariant is **field-level `Parsed` equivalence** between the armed
-and buffered paths (not byte-equivalence — a JSONL line is not a buffered document, finding
-f11): identical `result` text, `session_id`, `denials`/`denial_count`/`denial_count_is_floor`,
-`warnings`, `usage`, `usage_is_cumulative`. The buffered `json` path is retained unchanged for
-the disarmed case.
+For a turn that completes **within bounds in both modes**, the behaviour-preservation invariant
+is **field-level `Parsed` equivalence** — identical `result` text, `session_id`,
+`denials`/`denial_count`/`denial_count_is_floor`, `warnings`, `usage`, `usage_is_cumulative`
+(not byte-equivalence — a JSONL line is not a buffered document, finding f11). Truncation is
+governed by the explicit contract above, not by this equivalence; the buffered `json` path is
+retained unchanged for the disarmed case.
 
 ### 5. Persisting the observation — cross-process safety and verified account identity
 
@@ -425,9 +425,12 @@ no attempts. One `Record` per logical turn is unchanged.
   column itself costs nothing beyond the store read (round-2 finding f16). This is where
   Claude's categorical-only limit is spelled out for a human.
 
+[reviewer/mod.rs:31]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:138]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:600]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:662]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:710]: ../src/reviewer/mod.rs
+[claude.rs:136]: ../src/reviewer/claude.rs
 [tools.rs:894]: ../src/tools.rs
 [tools.rs:1467]: ../src/tools.rs
 [tools.rs:1584]: ../src/tools.rs
@@ -456,9 +459,11 @@ no attempts. One `Record` per logical turn is unchanged.
   reactive-only.
 - **Must not lose the observation on a failed turn**, nor read it from model prose:
   `observe_headroom` runs on both arms, from the raw `RunOutcome`, on CLI-owned fields only.
-- **Must not change a Claude review's outcome when armed** — field-equivalent `Parsed`,
-  JSONL-aware failure classification on CLI-owned fields, and incremental retention so stream
-  verbosity cannot induce `OUTPUT_TRUNCATED`.
+- **Must not change a Claude review's outcome when armed** — field-equivalent `Parsed` for a
+  turn within bounds in both modes, JSONL-aware failure classification on CLI-owned fields
+  (`result` is content, not evidence; a `rejected` event → `RATE_LIMITED`), and one explicit
+  raw-byte truncation contract (`MAX_ARMED_STREAM_BYTES`/`_LINES`) sized far above any realistic
+  review so the format switch does not truncate a review the buffered path would accept.
 - **Must not run capture, the pending-marker, or a model spawn for an all-gated review**, must
   never publish a skipped entry as active, must never fall through to `WORKER_PANICKED`, and
   must not gate a resume.
@@ -479,8 +484,8 @@ no attempts. One `Record` per logical turn is unchanged.
   rendering; status/doctor rendering.
 - **`reviewer/mod.rs`**: `Headroom` + `HeadroomLevel` (explicit rank) + `clears`; headroom
   carried out of `attempt`/`run` on both arms (the `AttemptResult` shape); the armed Claude
-  path's incremental, bounded JSONL reader so `MAX_OUTPUT_BYTES` cannot truncate the terminal
-  result.
+  path's JSONL reader with the explicit raw-byte truncation contract
+  (`MAX_ARMED_STREAM_BYTES`/`MAX_ARMED_STREAM_LINES`) and retain-latest-only memory bound.
 - **`reviewer/codex.rs`**: armed rollout read (date-scoped, suffix-matched, tailed, fail-open);
   `tokens.account_id` fingerprint read from `$CODEX_HOME/auth.json`. No invocation change.
 - **`reviewer/claude.rs`**: armed invocation (`json`→`stream-json --verbose`, nothing else
@@ -529,11 +534,13 @@ Unit tests, no network and no model call, extending the existing fakes:
 - **Armed Claude (f13/f14/f15)**: the armed invocation is exactly today's args with
   `json`→`stream-json --verbose` and no `--include-partial-messages` (assert the argv);
   failure classification uses only CLI-owned event fields (a `result` event with model prose
-  containing "rate limit" is **not** misclassified); a large synthetic stream that would
-  exceed `MAX_OUTPUT_BYTES` still yields the terminal `result` (no spurious
-  `OUTPUT_TRUNCATED`); `Parsed` from the armed path is field-equal to the buffered parse
-  (truncation, denials, usage, warnings, CLI events), with fixtures captured from the armed
-  production invocation.
+  containing "rate limit" is **not** misclassified); a `rejected` `rate_limit_event` classifies
+  the turn as `RATE_LIMITED` (with, and without, a terminal `result`); a stream just **under**
+  `MAX_ARMED_STREAM_BYTES`/`_LINES` yields its terminal `result` parsed, and one just **over**
+  fails as a defined `OUTPUT_TRUNCATED` (both boundary cases of the one truncation contract);
+  for a within-bounds turn, `Parsed` from the armed path is field-equal to the buffered parse
+  (denials, usage, warnings, CLI events), with fixtures captured from the armed production
+  invocation.
 - **Account identity (f4)**: a snapshot recorded under account A is `Unknown` when the current
   fingerprint is B (Codex via a swapped `auth.json`; Claude via a swapped `~/.claude.json`
   result); an unreadable/absent fingerprint fails open (entry runs); a matching fingerprint
@@ -635,3 +642,17 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
     "nothing resolved" was inaccurate. Fixed: clarified that `resolve_bin` (a PATH scan, no
     auth, no model) runs to build the key, while auth preflight, capture, the marker, spawning,
     and billing are what the all-gated path avoids (§6).
+
+- **Round 5 (same session, turn 6) — REQUEST CHANGES.** Confirmed **resolved**: f1–f14,
+  f16–f21 (20 of 21). One open:
+  - **f15** — the round-4 "pin the cap to retained *result content*" framing was itself a
+    category error: buffered mode caps raw stdout **bytes** and then parses that buffer, so a
+    content-text cap is a different quantity and cannot claim `Parsed` equivalence, and the
+    armed bounds had no concrete values. Fixed by defining **one** truncation contract of the
+    same shape as buffered mode — *raw bytes read* are bounded; overrun before the terminal
+    `result` is a defined `OUTPUT_TRUNCATED` — with explicit constants (`MAX_ARMED_STREAM_BYTES
+    = 4× MAX_OUTPUT_BYTES = 32 MiB`, `MAX_ARMED_STREAM_LINES = 500,000`, plus the collect
+    deadline), framed as practical sizing; the equivalence claim is dropped entirely (there is
+    none between two different byte streams, per f11), the residual boundary divergence is
+    documented, and retention is separated out as a memory optimisation that does not decide
+    truncation. Both boundary cases are tested (§4).
