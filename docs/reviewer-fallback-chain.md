@@ -1,10 +1,10 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review round 1.** This document is the plan. Per
-this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Round 1 returned REQUEST CHANGES
-with seven findings, all accepted; the sections below fold each one in, and
-[Review history](#review-history) records where. It is the plan for [issue #48].
+Status: **proposed — revised after cross-review rounds 1 and 2.** This document is the plan.
+Per this repository's own rule it must go through the `cross-review` gate (Codex,
+gpt-5.6-luna, effort=max) and reach APPROVE before implementation begins. Rounds 1 and 2 each
+returned REQUEST CHANGES — seven findings then six, all accepted; the sections below fold each
+one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -121,10 +121,37 @@ behaviour flags — `--sandbox` (Codex-only), `--tools`/`--allow-tools` (Claude-
 than merely convenient: `sandbox` is read only by the Codex invocation and `tools` only by
 the Claude invocation, so a global value already applies to whichever entries are of that
 family and is inert for the others. A mixed chain therefore needs no per-entry behaviour
-overrides to be correct. (Whether per-entry overrides are ever *wanted* is left open for the
-reviewer, [Open questions].)
+overrides to be correct. (Whether per-entry overrides are ever *wanted* is resolved against
+in [Open questions].)
 
-[Open questions]: #open-questions-for-the-reviewer
+[Open questions]: #open-questions--resolved-in-round-1
+
+### Per-entry adapter selection — every identity read must follow the active entry
+
+Round 2 found that saying "invocation and auth use the active spec" was not enough: `App`
+holds a single `Arc<dyn Reviewer>` built once at [tools.rs:66], the `Job` holds one adapter
+and one `bin` ([tools.rs:720]), and a scatter of call sites read the *primary* `Config`
+identity — `resolve_bin`, `failure_for`, the truncation/spawn error constructors, and
+`classify`'s `reviewer` argument. If any of those keeps reading the primary while a fallback
+runs, a `Codex → Claude` walk could invoke Claude but classify its output as Codex, or
+resolve the wrong binary. So the design is explicit:
+
+- **The adapter is selected per entry, not held once.** `reviewer::for_kind(spec.reviewer)`
+  ([reviewer/mod.rs:126]) already builds an adapter from a `ReviewerKind`, and the adapters
+  are stateless, so the walk selects `for_kind(spec.reviewer)` for the active entry rather
+  than reusing `App`'s single one. `App` no longer needs a fixed `Arc<dyn Reviewer>`; the
+  `Job` carries the *active* adapter, bin, and spec for the attempt it is running.
+- **Every identity-bearing call takes the active `ReviewerSpec`** (or the fields it needs):
+  `resolve_bin`, `auth_check`, `invocation`, `parse`, the truncation and `spawn_failed`
+  constructors, `failure_for`, and the `reviewer`/`model`/`effort` arguments to
+  `errors::classify`. None may read `self.cfg.reviewer`/`model`/`effort` on the run path.
+  This is a mechanical but wide thread-through, and it is the core of the blast radius.
+- **`ensure_ready` returns the resolved adapter+bin for the active entry**, so the run path
+  uses exactly what preflight validated — no second, possibly-different resolution.
+
+[tools.rs:66]: ../src/tools.rs
+[tools.rs:720]: ../src/tools.rs
+[reviewer/mod.rs:126]: ../src/reviewer/mod.rs
 
 ### The argument grammar
 
@@ -222,16 +249,26 @@ index* and this loop, on a **fresh** review (resume is different — see below):
 ```
 deadline = now + chain_budget          # shared across the whole walk (see Budget below)
 for (i, spec) in chain.iter().enumerate():
-    ensure_ready(spec, cancel, deadline)   # resolve bin + auth for THIS entry, cancellable
-    outcome = run_turn(spec, cancel, deadline)   # spawn child, drain, parse
+    registry.set_active(id, spec)       # publish BEFORE preflight, so a running poll and any
+                                        # terminal failure name the entry actually being tried
+    ready = ensure_ready(spec, cancel, deadline)   # resolve bin + auth for THIS entry, cancellable
+    if ready is Err(f): return f.with_active(spec)  # preflight failure names this entry, not the primary
+    outcome = run_turn(spec, ready.adapter, ready.bin, cancel, deadline)
     match outcome:
-        Ok(review)                  -> active = spec; return review
+        Ok(review)                  -> return review.with_active(spec)
         Err(f) if f.code == RATE_LIMITED:
-            record_attempt(spec, f)     # each attempt is accounted for (see Metrics)
-            if i is last            -> return REVIEWERS_EXHAUSTED (detail: every entry tried)
+            note_attempt(spec, f)       # attempt history for the logical turn (see Metrics)
+            if i is last            -> return reviewers_exhausted(attempts).with_active(spec)
             else                    -> continue            # advance to the next entry
-        Err(f)                      -> return f            # anything else surfaces at once
+        Err(f)                      -> return f.with_active(spec)   # anything else surfaces at once
 ```
+
+The active entry is published to the registry **before** its preflight, and every terminal
+result — success, `REVIEWERS_EXHAUSTED`, *and* a non-rate failure of a fallback entry —
+carries the entry that was actually being tried. This is round-2 finding 5: assigning the
+active entry only in the `Ok` branch would misreport a fallback that failed in preflight or
+with `NOT_AUTHENTICATED`/`TIMEOUT` as the primary, and a running poll during the fallback
+attempt would still show the primary.
 
 - **Only `RATE_LIMITED` advances the chain.** Per the maintainer's choice, confirmed by the
   round-1 reviewer, setup and correctness failures — `NOT_AUTHENTICATED`,
@@ -250,31 +287,48 @@ for (i, spec) in chain.iter().enumerate():
   *into* `auth_check`, so a cancelled or budget-exhausted walk stops during a fallback
   preflight rather than after it.
 
-**Budget across the walk.** Round 1 correctly noted that the advertised collect budget was
-sized for **one** attempt: `Config::max_wait_secs` ([config.rs:575]) is the capture budget
-plus a single `--timeout-seconds` plus grace, while each attempt gets its *own* deadline
-([reviewer/mod.rs:424], invoked at [tools.rs:1253]) — so several rate-limited entries could
-outlive what a `cross_model_review_result` caller was told to expect. The fix is an explicit
-**shared chain deadline**, computed once when the walk starts and passed to every preflight
-and turn, and the collect cap widened to match it. Its size:
+**Budget across the walk.** Round 1 noted the advertised collect budget was sized for **one**
+attempt: `Config::max_wait_secs` ([config.rs:575]) is the capture budget plus a single
+`--timeout-seconds` plus grace, while each attempt gets its *own* deadline
+([reviewer/mod.rs:424], invoked at [tools.rs:1253]). Round 2 then corrected my first fix: a
+rate limit is **not** guaranteed to be detected quickly. A CLI can run almost to its timeout
+and *then* fail in a way `classify` maps to `RATE_LIMITED` — there is no enforced fast path
+for rate-limit classification. So "a rate-limited entry returns fast" cannot be leaned on for
+the bound, and the earlier `capture + N×preflight_cap + timeout + grace` formula was wrong: N
+rate-limited entries can each consume almost a full `--timeout-seconds`.
 
-- A rate/usage refusal returns **fast** — the CLI rejects before doing real work — so an
-  exhausted entry costs roughly a spawn plus its preflight, not a full `--timeout-seconds`.
-  The plan does not *rely* on that for correctness, but it is why the walk is not `N ×
-  timeout` in practice.
-- The bound that matters is the worst case, so the shared deadline is
-  `capture + (N × preflight_cap) + timeout + grace`, where `N` is the chain length and only
-  the one entry that actually reviews consumes the full `--timeout-seconds` (a rate-limited
-  entry cannot, by definition, run to timeout and still be classified `RATE_LIMITED`). The
-  collect cap (`max_wait_secs`) is recomputed from the same formula so the server-side wait
-  and the walk agree. Progress notifications already report elapsed time and liveness across
-  the wait; they simply span the attempts.
+The honest bound budgets **every attempted entry for the worst case**:
+
+```
+chain_budget = capture_budget
+             + N × (preflight_cap + timeout + drain_grace)
+             + finalization_grace
+```
+
+where `N` is the chain length, `preflight_cap` bounds `resolve_bin` + `auth_check` (the
+auth-check timeout at [claude.rs:36]/[codex.rs:27], now cancellable), `timeout` is
+`--timeout-seconds`, and `drain_grace` is the per-invocation output-drain grace that already
+exists per turn ([reviewer/mod.rs:472]) — counted **per entry**, because each attempt is its
+own process with its own drain. This is deliberately generous (a three-entry chain of
+30-minute timeouts advertises a ~90-minute worst case), but it is the operator's own chain
+length, and an honest large bound beats a wrong small one.
+
+- `max_wait_secs`, and the budget shown in the start/running responses and progress text —
+  which today all display `cfg.timeout` ([tools.rs:316], [tools.rs:466]) — are all recomputed
+  from `chain_budget`, so what the caller is told to expect matches what the walk can take.
+  For a single-entry chain, `chain_budget` reduces exactly to today's `max_wait_secs`.
+- An **optional refinement**, not relied on: a separate short cap on an attempt that has
+  already produced rate-limit evidence could shrink the practical walk time. It is noted as a
+  future tightening; the worst-case bound above stands on its own without it.
 
 [tools.rs:276]: ../src/tools.rs
 [tools.rs:59]: ../src/tools.rs
+[tools.rs:316]: ../src/tools.rs
+[tools.rs:466]: ../src/tools.rs
 [tools.rs:1253]: ../src/tools.rs
 [config.rs:575]: ../src/config.rs
 [reviewer/mod.rs:424]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:472]: ../src/reviewer/mod.rs
 [claude.rs:36]: ../src/reviewer/claude.rs
 [codex.rs:27]: ../src/reviewer/codex.rs
 
@@ -289,32 +343,47 @@ under `auto` therefore captures nothing for the primary — and if Codex is rate
 the walk advances to Claude, Claude would receive **no diff and silently review the current
 tree**, which is the exact failure the whole capture feature exists to prevent.
 
-The fix, and the reason it is conservative rather than clever:
+Round 2 sharpened this: the capture *decision* and the capability *rendering* are two
+different things, and only the first can be an aggregate. The prompt tells the reviewer what
+it can do — "you have a shell, run `git diff` yourself" versus "you have no shell, here is the
+diff" — and **one rendered preamble cannot be true for both a Codex and a Claude entry.**
+Perforce is sharper still: self-serve there needs Codex *and* `--sandbox danger-full-access`
+([config.rs:655]), not merely "some entry has a shell". So the two concerns are split:
 
-- **`auto` captures whenever *any* entry in the chain would need the change** — i.e. when any
-  entry lacks a usable shell — not merely when the primary does. Handing a diff to a
-  shell-capable reviewer is already a supported, harmless mode (it is exactly what `--diff
-  HEAD` does), so the cost of over-capturing for a `Codex → Claude` chain is a little
-  redundant work and some extra prompt text for Codex, never a wrong review. Under-capturing,
-  by contrast, produces a confident review of the wrong thing. The asymmetry decides it.
-- This keeps capture a **single start-of-review decision** feeding the prompt, rather than
-  re-capturing mid-walk per active entry — simpler, and it matches the current architecture
-  where the capture is built once into the turn. The `reviewer_capabilities` /
-  `reviewer_has_shell` computation ([config.rs:583]) is generalised from "the one reviewer"
-  to "the chain": has-a-shell becomes *all* entries have a shell; needs-the-diff becomes
-  *any* entry needs it.
-- The reviewer's prompt still describes the capture honestly. A shell-capable entry that
-  receives a diff is told what it was shown, exactly as `--diff HEAD` does today; nothing
-  about the classification-evidence or capture-labelling boundaries changes.
+- **The capture *decision* is an aggregate: `chain_needs_capture()`.** `auto` captures
+  whenever *any* entry would need the change — i.e. any entry lacks a usable shell — not
+  merely when the primary does. Under-capturing produces a confident review of the wrong
+  thing; over-capturing costs a little redundant work and some extra prompt text for a
+  shell-capable entry, which is already the supported, harmless `--diff HEAD` mode. The
+  asymmetry decides it. The capture *data* (the git/p4 output) is gathered **once** at
+  start-of-review and retained.
+- **The capability *rendering* is per active entry.** `reviewer_capabilities`
+  ([config.rs:699]) and the VCS preamble are rendered from the **active** `ReviewerSpec` at
+  turn time, from the retained capture data — so each attempt is told the truth about *its*
+  shell and *its* self-serve ability. A Codex attempt is told it may fetch the diff; if the
+  walk advances to Claude, Claude's attempt is rendered the retained diff with "you have no
+  shell". `reviewer_has_shell` ([config.rs:583]) stays a per-reviewer predicate; what
+  generalises to the chain is only `chain_needs_capture()`.
+- **`mcp.rs` tool descriptions must not advertise the primary as if it were the whole
+  chain.** `tools/list` today describes the single reviewer's shell/capture behaviour
+  ([mcp.rs:636]); with a chain it must describe the chain honestly (the primary, plus that
+  fallbacks exist and may differ) rather than imply one fixed posture. This file was missing
+  from the round-1 blast radius and is added.
+- Nothing about the classification-evidence or capture-labelling boundaries changes; the
+  capture *mechanics* (commands, truncation, labelling) are untouched.
 
 The other `--diff` modes are unaffected in spirit: `none` still supplies nothing, an explicit
-range or `HEAD` still captures regardless of shell. Only `auto`'s "does the reviewer need
-it?" test widens from the primary to the whole chain.
+range or `HEAD` still captures regardless of shell. Only `auto`'s "does anyone need it?" test
+widens from the primary to the whole chain, and only the capability *text* moves from a
+one-shot render to a per-attempt one.
 
 [config.rs:623]: ../src/config.rs
 [config.rs:583]: ../src/config.rs
+[config.rs:655]: ../src/config.rs
+[config.rs:699]: ../src/config.rs
 [vcs/mod.rs:89]: ../src/vcs/mod.rs
 [vcs/git.rs:445]: ../src/vcs/git.rs
+[mcp.rs:636]: ../src/mcp.rs
 
 ### 4. Same family: honoured, not enforced
 
@@ -360,10 +429,25 @@ must change. A re-review resumes the reviewer's own conversation, whose memory l
 specific** reviewer. Therefore:
 
 - **Select the entry first, then preflight only that entry.** Under the session lease, read
-  the record and choose the entry: for a resume, the entry whose full identity matches the
-  record; for a fresh start, entry 0 (then the walk). Preflight is run against the *selected*
-  entry, never unconditionally against the primary. The `INVALID_REVIEWER_CHAIN` guard runs
-  ahead of even this, so an invalid chain is reported before any record is read.
+  the record and choose the entry: for a resume, the entry whose identity matches the record;
+  for a fresh start, entry 0 (then the walk). Preflight is run against the *selected* entry,
+  never unconditionally against the primary. The `INVALID_REVIEWER_CHAIN` guard runs ahead of
+  even this, so an invalid chain is reported before any record is read.
+- **The session record must store enough to identify the entry unambiguously.** Round 2
+  caught that `SessionRecord` holds `reviewer`/`model`/`effort` but **no `bin`**
+  ([session.rs:41]), while this plan allows two entries that differ only by `bin` (different
+  installation or account). Without persisting `bin`, a session created by the second such
+  entry could match the first on resume and run the wrong executable. So `SessionRecord`
+  gains the **resolved binary path**, added with `#[serde(default)]` exactly as
+  `cumulative_usage` was ([session.rs:52]), and the resume match compares the **full
+  operational identity — reviewer, model, effort, and resolved bin** (today's check at
+  [tools.rs:1535] compares only reviewer and model, so effort is added too). A record that
+  matches a chain entry on every field is resumed on that entry.
+- **Legacy and ambiguous records are refused, not guessed.** A record written before the
+  `bin` field existed has no bin to compare; it resumes only if **exactly one** chain entry
+  matches on the fields it does carry. If it matches none, or more than one (e.g. two
+  same-model/different-bin entries), resume is refused with `SESSION_NOT_RESUMABLE` and the
+  caller starts fresh — never silently bound to a guessed executable.
 - **Fallback selection happens only on a fresh review start, never on resume.** A resume runs
   its bound entry only; it does not restart the walk from the top, because silently resuming a
   *different* reviewer would hand it a conversation it never had.
@@ -379,7 +463,9 @@ specific** reviewer. Therefore:
   today's reviewer/model-mismatch check ([tools.rs:1535]). The caller retries with
   `fresh: true`.
 
+[session.rs:41]: ../src/session.rs
 [session.rs:42]: ../src/session.rs
+[session.rs:52]: ../src/session.rs
 [tools.rs:175]: ../src/tools.rs
 [tools.rs:189]: ../src/tools.rs
 [tools.rs:1535]: ../src/tools.rs
@@ -387,33 +473,45 @@ specific** reviewer. Therefore:
 
 ### Metrics, the result interface, status, doctor
 
-- **The result must name the reviewer that actually ran.** Round 1 found this missing: the
-  registry's `Outcome` and `Snapshot` carry no reviewer identity ([registry.rs:150],
-  [registry.rs:637]), and the completed/running responses render `self.cfg.describe_reviewer()`
-  ([tools.rs:474], [tools.rs:511]) — the *chain/primary*, not the entry that reviewed. A
-  successful fallback would be misattributed. The fix threads the active entry's
-  `reviewer`/`model`/`effort` through `Outcome → Review → Snapshot` and renders *that* in the
-  result, so a caller always sees who did the review. This is the registry change the round-1
-  finding requires; the earlier "registry untouched" claim is withdrawn.
-- **Metrics account for every attempt, and claim nothing about billing.** `Record` already
-  carries `reviewer`/`model`/`effort` ([metrics.rs]), so a successful turn attributes cost to
-  the entry that ran with no schema change. Round 1 was right that the earlier "a refused turn
-  bills nothing" was unverified and that a rate-limited primary would otherwise vanish from
-  the log: the worker records usage once after the final outcome ([tools.rs:1038],
-  [tools.rs:1092]). So each **attempt** — including a rate-limited one that the walk handled
-  internally — appends its own `Record` with `status`/`failure_code` set and whatever usage
-  the CLI reported (left as "not reported" when the CLI reported none, which the schema
-  already distinguishes from zero). No claim is made that a refusal is free; the log shows
-  what the CLI actually reported.
+- **The result must name the reviewer that actually ran — at every stage, not just at the
+  end.** The registry's `Outcome` and `Snapshot` carry no reviewer identity
+  ([registry.rs:150], [registry.rs:637]), and the completed *and running* responses render
+  `self.cfg.describe_reviewer()` ([tools.rs:462], [tools.rs:474]) — the *chain/primary*, not
+  the entry that reviewed. Round 2 added that a *running* snapshot must reflect the current
+  attempt too, and that `Outcome` is written only at the end. So the running registry state
+  holds a **mutable active identity** that the walk updates via `set_active` before each
+  attempt's preflight (see the pseudocode above), every `Outcome` carries the
+  attempted-entry identity on success *and* failure, and both the running and completed
+  responses render that identity instead of `describe_reviewer()`. A caller polling mid-walk
+  sees the fallback; a fallback that fails in preflight is reported as the fallback. The
+  earlier "registry untouched" claim is withdrawn.
+- **One logical turn, with an attempt history — turn semantics preserved.** Round 1 wanted a
+  rate-limited primary to stay visible; round 2 warned that appending a second `Record` for
+  the same review would double the metrics' *turn* contract — two turns, two wall-times, two
+  per-session turns ([metrics.rs:304], [metrics.rs:742]). Both are satisfied by keeping
+  **exactly one `Record` per logical turn** (the entry that reviewed, or the terminal
+  outcome), which drives turn count, wall time and token totals exactly as today, plus a new
+  optional `attempts` field on `Record` listing each earlier fallback attempt — its
+  reviewer/model/effort, its `failure_code`, and its attempt-local wall time. The
+  rate-limited primary is therefore visible without inflating any turn statistic.
+- **Failed-attempt token usage is not claimed.** The adapter API returns
+  `Result<Parsed, Failure>` and exposes `Parsed.usage` only on a successful parse
+  ([reviewer/mod.rs:118]); a rate-limit refusal yields a `Failure` with no usage, and the
+  CLI's usage on a refusal is not something this tool has verified it can read. So the
+  `attempts` entries record *that* the attempt happened and how it failed, with usage left
+  unknown — not a fabricated zero, and not an unverified figure. This keeps round 1's "claim
+  nothing about billing" while dropping round 2's double-counting. The adapter API is *not*
+  widened to carry usage on failure; that would be surface for a number we cannot trust.
 - **`--doctor` / `status`** enumerate every entry with its resolved bin and auth, so a human
   sees the whole chain and any per-entry setup problem in one read. A degraded
   (`INVALID_REVIEWER_CHAIN`) config reports the validation failure here too.
 
 [metrics.rs]: ../src/metrics.rs
+[metrics.rs:304]: ../src/metrics.rs
+[metrics.rs:742]: ../src/metrics.rs
+[reviewer/mod.rs:118]: ../src/reviewer/mod.rs
+[tools.rs:462]: ../src/tools.rs
 [tools.rs:474]: ../src/tools.rs
-[tools.rs:511]: ../src/tools.rs
-[tools.rs:1038]: ../src/tools.rs
-[tools.rs:1092]: ../src/tools.rs
 [registry.rs:150]: ../src/registry.rs
 [registry.rs:637]: ../src/registry.rs
 
@@ -456,8 +554,15 @@ when — it is real.
   preflight stays lazy.
 - **Must not outrun its advertised budget.** The walk runs under one shared deadline that the
   collect cap is sized to match; preflight and auth checks are cancellable.
-- **Must not misattribute the review.** The result names the entry that actually ran, and
-  metrics record each attempt.
+- **Must not misattribute the review, at any stage.** The running snapshot and every terminal
+  result — success or a fallback's own failure — name the entry actually being tried, and the
+  metrics log keeps one logical turn plus an attempt history.
+- **Must not tell one entry it has another's capabilities.** The capability preamble is
+  rendered from the active entry, so a mixed chain never claims a shell (or Perforce
+  self-serve) that the running entry lacks.
+- **Must not read the primary's identity on the run path.** Every identity-bearing call —
+  bin resolution, invocation, parse, classification, error construction — follows the active
+  `ReviewerSpec`.
 - **Must not weaken the classification boundary.** The reviewer's prose still never drives
   classification; only its stderr/structured errors do ([errors.rs:558]).
 - **Must not resume a session on a reviewer that did not create it.** Fallback is a
@@ -475,32 +580,44 @@ maintainer as the cost of foundational completeness. Touched:
 - **`config.rs`**: new `ReviewerSpec`; `Config.reviewers: Vec<ReviewerSpec>` replacing the
   four flat fields; per-entry parse loop and binding validation; `validate_chain`;
   `describe_reviewer` renders the chain.
+- **`config.rs`**: `ReviewerSpec`; `Config.reviewers: Vec<ReviewerSpec>`; per-entry parse +
+  binding validation; `validate_chain`; `chain_needs_capture()`; `describe_reviewer` renders
+  the chain; `reviewer_capabilities` renders from an active `ReviewerSpec`; `max_wait_secs`
+  computes the shared `chain_budget`.
 - **`tools.rs`**: `App` holds the chain and a per-entry preflight cache (and, when invalid,
-  the `INVALID_REVIEWER_CHAIN` `Failure`); the worker gains an active-entry index, the
-  fall-through loop, and the shared chain deadline; the `INVALID_REVIEWER_CHAIN` guard and
+  the `INVALID_REVIEWER_CHAIN` `Failure`) and no longer a single fixed adapter; the `Job`
+  carries the *active* adapter+bin+spec; the worker gains the fall-through loop, the shared
+  chain deadline, and `set_active` before each attempt; the `INVALID_REVIEWER_CHAIN` guard and
   entry selection move ahead of preflight (fixing the [tools.rs:175] ordering); `ensure_ready`
-  is keyed per entry and cancellable; `status` enumerates entries; resume matches the record
-  against the chain; the completed/running responses render the active entry rather than
-  `describe_reviewer()`.
-- **`reviewer/mod.rs`, `reviewer/claude.rs`, `reviewer/codex.rs`**: `invocation` and
-  `auth_check` take the active `ReviewerSpec` (or its `model`/`effort`) instead of reading
-  `cfg.model`/`cfg.effort`, and `auth_check` accepts the cancellation token + deadline so a
-  fallback preflight is interruptible.
-- **`registry.rs`**: `Outcome` and `Snapshot` gain the active reviewer/model/effort so the
-  result can name who reviewed. Concurrency, leasing and cancellation are otherwise
-  unchanged.
-- **`vcs/` and `config.rs` capability logic**: the `auto` capture decision and
-  `reviewer_capabilities` / `reviewer_has_shell` generalise from the single reviewer to the
-  chain (capture if *any* entry needs it; "has a shell" only if *all* do). The capture
-  *mechanics* (git/p4 commands, truncation, labelling) are untouched.
+  is keyed per entry, cancellable, and returns the resolved adapter+bin; `status` enumerates
+  entries; resume matches the record's full identity against the chain; running *and*
+  completed responses render the active entry rather than `describe_reviewer()`, and the
+  displayed budget uses `chain_budget` not `cfg.timeout`.
+- **`reviewer/mod.rs`, `reviewer/claude.rs`, `reviewer/codex.rs`**: per-entry adapter via
+  `for_kind(spec.reviewer)`; `resolve_bin`, `auth_check`, `invocation`, `parse`, the
+  truncation/`spawn_failed` constructors and the `classify` identity arguments all take the
+  active `ReviewerSpec` (or its fields) rather than `cfg`; `auth_check` accepts the
+  cancellation token + deadline so a fallback preflight is interruptible.
+- **`registry.rs`**: a **mutable active identity** on the running state (set per attempt), and
+  `Outcome`/`Snapshot` carry the attempted reviewer/model/effort so both running and terminal
+  results name who reviewed. Concurrency, leasing and cancellation otherwise unchanged.
+- **`mcp.rs`**: `tools/list` descriptions ([mcp.rs:636]) describe the chain honestly (primary
+  plus differing fallbacks) instead of advertising the primary's posture as the only one.
+- **`vcs/` and `config.rs` capability logic**: the `auto` capture *decision* generalises to
+  `chain_needs_capture()` (capture if *any* entry needs it); the capability *rendering* is
+  per active entry (git shell text; Perforce self-serve, which needs Codex +
+  `danger-full-access`). The capture *mechanics* (git/p4 commands, truncation, labelling) are
+  untouched.
 - **`errors.rs`**: two constructors — `invalid_reviewer_chain`, `reviewers_exhausted` — with
-  codes, summaries, remediation, and `is_agent_correctable` returning false (both are
-  stop-and-tell-user, like `RATE_LIMITED`); plus a resume-aware `RATE_LIMITED` remediation
-  path that does not disturb the shared `rate_limited` message.
-- **`session.rs`**: resume match generalised from "equals the one reviewer" to "matches some
-  entry in the chain"; the record reflects the active spec.
-- **`metrics.rs`**: no schema change, but the worker now appends a `Record` per attempt, not
-  only for the final outcome.
+  codes, summaries, remediation, and `is_agent_correctable` returning false; a resume-aware
+  `RATE_LIMITED` remediation path that does not disturb the shared `rate_limited` message; and
+  a `.with_active(spec)` helper so a `Failure` can name the entry it came from.
+- **`session.rs`**: `SessionRecord` gains the resolved `bin` (`#[serde(default)]`); resume
+  match compares full identity (reviewer, model, effort, bin) against the chain, refusing
+  legacy-ambiguous matches with `SESSION_NOT_RESUMABLE`.
+- **`metrics.rs`**: `Record` gains an optional `attempts` list (schema addition, additive and
+  `#[serde(default)]`); still exactly one `Record` per logical turn, so turn/wall/token
+  accounting is unchanged.
 - **`main.rs`**: unchanged except that chain-semantic invalidity is now reported by the
   degraded `App`, not `exit(2)`.
 - **Docs/config**: `README.md` (Configuration table + a fallback section), `AGENTS.md` if
@@ -508,8 +625,7 @@ maintainer as the cost of foundational completeness. Touched:
   `examples/` configs, and `smoke.ps1` if a chain path is worth an end-to-end check.
 
 Not touched: the capture *mechanics* in `vcs/` (commands, truncation, labelling), the
-registry's concurrency and leasing, the cancellation *protocol*, the progress protocol, the
-metrics schema.
+registry's concurrency and leasing, the cancellation *protocol*, the progress protocol.
 
 ## Testing
 
@@ -525,23 +641,37 @@ Unit tests (no network, no model call), extending the existing fakes:
   vector is rejected by `validate_chain`.
 - **Fall-through** (fake reviewer scripted to return `RATE_LIMITED` then `Ok`): primary
   limited ⇒ second entry runs and its review is returned; the **result names the second
-  entry** (registry `Outcome`/`Snapshot` carry it); a `Record` is appended for the
-  rate-limited primary *and* the successful fallback.
-- **Cross-family capture**: a `Codex → Claude` chain under `--diff auto` captures the diff
-  (because Claude needs it) even though Codex is primary; asserted at capture-decision level
-  so it does not require a live model.
+  entry** (registry `Outcome`/`Snapshot` carry it); the logical-turn `Record` names the
+  fallback and its `attempts` list contains the rate-limited primary; turn/wall counts do not
+  double.
+- **Running attribution**: a snapshot polled while the walk is on the fallback names the
+  fallback, not the primary; a fallback that fails in preflight (`CLI_NOT_FOUND`) surfaces as
+  the fallback.
+- **Per-entry identity on the run path**: a `Codex → Claude` fall-through invokes the Claude
+  adapter and classifies Claude's output as Claude (asserted with fakes, no live model) — the
+  primary adapter/identity is never used for the fallback.
+- **Cross-family capability**: a `Codex → Claude` chain under `--diff auto` captures the diff
+  (because Claude needs it) even though Codex is primary; the Codex attempt's preamble says it
+  may fetch the diff while the Claude attempt's preamble says it has none — both rendered from
+  the retained capture data. A Perforce mixed chain asserts self-serve is rendered only for a
+  Codex + `danger-full-access` active entry. All at rendering level, no live model.
 - **Non-rate error does not fall through**: primary `NOT_AUTHENTICATED` (or `CLI_NOT_FOUND`)
   ⇒ surfaced immediately, chain not advanced.
 - **Exhaustion**: every entry `RATE_LIMITED` ⇒ `REVIEWERS_EXHAUSTED` whose detail names each
   entry; a single-entry chain ⇒ plain `RATE_LIMITED`.
-- **Budget**: a walk of several rate-limited entries stays within the shared chain deadline,
-  and cancellation during a fallback preflight/auth check stops the walk promptly (assert the
-  cancel token reaches `auth_check`).
+- **Budget**: a walk of several rate-limited entries, each running near its `--timeout-seconds`
+  before being classified, stays within `chain_budget`; the displayed budget equals
+  `chain_budget`, not `cfg.timeout`; cancellation during a fallback preflight/auth check stops
+  the walk promptly (assert the cancel token reaches `auth_check`).
 - **Resume**: a session created on entry *k* resumes on entry *k* only, does not restart the
   walk, preflights only entry *k* (a primary made unavailable *after* the session was created
   does not break the resume — the round-1 regression test), and — when *k* is rate-limited on
   resume — returns a `RATE_LIMITED` failure whose remediation names `fresh: true`; a record
   matching no configured entry ⇒ `SESSION_NOT_RESUMABLE`.
+- **Resume identity**: two same-model/different-bin entries — a session created by the second
+  resumes on the second (full-identity match), and a legacy record with no `bin` that matches
+  both is refused with `SESSION_NOT_RESUMABLE` rather than guessing; a legacy record matching
+  exactly one entry still resumes.
 
 A test seam is required so the worker's per-entry reviewer is injectable (the existing
 CLI-free registry tests are the pattern). `smoke.ps1` may gain a real two-entry round trip;
@@ -586,9 +716,27 @@ now reflects.
   billing was claimed as zero without evidence → record every attempt, claim nothing
   ([Metrics]). All five open questions resolved as above.
 
+- **Round 2 (same session, turn 2) — REQUEST CHANGES.** Six findings, all accepted as
+  second-order consequences of the round-1 fixes. (1) The single `Arc<dyn Reviewer>` and
+  primary-`Config` reads were not threaded to the active entry → per-entry adapter selection
+  and a full identity thread-through ([Per-entry adapter selection]). (2) The aggregate "all
+  have a shell" flag cannot render a truthful preamble for a mixed chain, and `mcp.rs` was
+  missing → split `chain_needs_capture()` from per-active-entry capability rendering, cover
+  Perforce self-serve and `tools/list` ([Capture in a mixed-family chain]). (3) A rate limit
+  is not guaranteed fast, so the deadline formula was not a worst-case bound → budget every
+  attempt for the worst case and drive all displayed budgets from it ([The fall-through,
+  budget]). (4) `SessionRecord` has no `bin`, so full-identity resume was unimplementable →
+  persist bin, compare full identity, refuse legacy-ambiguous matches ([Sessions and resume]).
+  (5) Active attribution was set only on success and could not update a running snapshot →
+  publish the active entry before each attempt and carry it on every outcome ([Metrics, the
+  result interface]). (6) A `Record` per attempt breaks the turn contract and failed-attempt
+  usage is not retrievable → one logical-turn `Record` plus an `attempts` history with usage
+  left unknown ([Metrics]).
+
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
 [The fall-through, budget]: #3-the-fall-through-reactive-and-rate-only
 [Metrics, the result interface]: #metrics-the-result-interface-status-doctor
 [Metrics]: #metrics-the-result-interface-status-doctor
 [Config validation]: #2-config-validation-two-tiers-and-where-each-is-reported
+[Per-entry adapter selection]: #per-entry-adapter-selection--every-identity-read-must-follow-the-active-entry
