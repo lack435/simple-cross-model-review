@@ -353,7 +353,13 @@ COUNTER=2
     $afterText = Get-ToolText $after
     Assert-That 'the poll cancellation left the review running or collectible' `
         (($afterText -match 'status:\s+running') -or ($afterText -match 'status:\s+completed')) $afterText
-    Assert-That 'the poll cancellation did not cancel the review' ($afterText -notmatch 'CANCELLED') $afterText
+    # Match the machine-readable failure code, not the bare word. The prompt above mentions
+    # cancellation, so a fast reviewer can echo "cancelled" in its own answer; a loose
+    # case-insensitive `-match 'CANCELLED'` on the whole response would then read that prose as a
+    # cancelled *review* and fail a run where the server did exactly the right thing. A genuinely
+    # cancelled review renders a `code: CANCELLED` line (errors.rs), which the review body cannot
+    # forge, so anchoring to it distinguishes a cancelled review from one that merely said the word.
+    Assert-That 'the poll cancellation did not cancel the review' ($afterText -notmatch 'code:\s+CANCELLED') $afterText
 
     # Clean up so this review does not keep billing through the rest of the run.
     Send-Rpc -Method 'tools/call' -Params @{
