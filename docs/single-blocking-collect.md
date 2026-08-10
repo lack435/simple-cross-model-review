@@ -560,3 +560,17 @@ the server can wake the agent on its own.
   new introduced. Plan approved for implementation (the reviewer notes the eventual implementation
   still needs its own compile / unit / smoke verification — and, per AGENTS.md, its own pass through
   this gate on the code diff).
+
+- **Round 7** (same session — the *implementation* diff) — APPROVE WITH COMMENTS. All correctness
+  findings resolved (wake race, ownership/pre-attach races, lifecycle sizing, overflow validation,
+  per-process cap, Codex over-cap handling, smoke split, visibility re-export); no security or core
+  concurrency blocker. Three minor doc/test items, all folded in:
+  1. the docs implied a *client-timeout* cancellation returns `status=running`, but a cancellation
+     suppresses the response — only a normal `wait_seconds` expiry returns that. Corrected in the
+     `cross_model_review_result` and `cross_model_review_cancel` tool descriptions, README, and
+     AGENTS.md, and the descriptions now state plainly that a poll cancellation detaches only the
+     wait and that `cross_model_review_cancel` is the resource-freeing operation.
+  2. `smoke.ps1` Review A's "no line arrives" assertion was timing-sensitive (a trivial review can
+     finish inside the 2s window); made tolerant, with suppression left to the unit tests.
+  3. added a `tools/list` test asserting the advertised `wait_seconds.maximum` tracks a non-default
+     `--timeout-seconds`.

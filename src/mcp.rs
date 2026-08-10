@@ -768,13 +768,19 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_result",
             "description": format!(
-                "Wait for and return the review from {reviewer}.\n\n\
-                 This call blocks while the reviewer works, up to wait_seconds. When the MCP \
-                 client supplies a progress token, it emits live phase, elapsed-time, reviewer \
-                 liveness, and output-activity updates during the wait. If it returns \
-                 status=running, that is normal; call it again with the same review_id. In this \
-                 project's usage, reviews commonly take at least five minutes, and complex changes \
-                 can take 20 minutes or longer.\n\n\
+                "Wait for and return the review from {reviewer}. Blocks until the review is done: \
+                 omit wait_seconds to wait to completion in one call, so no poll loop is needed. \
+                 When the MCP client supplies a progress token, it emits live phase, elapsed-time, \
+                 reviewer liveness, and output-activity updates during the wait. In this project's \
+                 usage, reviews commonly take at least five minutes, and complex changes can take \
+                 20 minutes or longer.\n\n\
+                 If the wait_seconds budget elapses before the review finishes it returns \
+                 status=running; that is normal, just call again with the same review_id. \
+                 Abandoning this call does NOT cancel the review: the reviewer keeps running and \
+                 the result stays collectible by review_id, so if your client's own tool timeout \
+                 cuts the call short (you get a client-side timeout rather than a result), simply \
+                 call again with the same review_id. Use cross_model_review_cancel to actually stop \
+                 a reviewer.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),
@@ -801,9 +807,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                              covers a whole review), or pass 0 for an immediate snapshot. Capped at \
                              {max}, which tracks the review budget so a single call can collect a \
                              20-minute review. Progress notifications make the long wait observable. \
-                             If a shorter client tool timeout cuts the call short, it returns \
-                             status=running; call again with the same review_id -- abandoning a \
-                             collect no longer cancels the review.",
+                             If this budget elapses before the review finishes, the call returns \
+                             status=running; call again with the same review_id. (Separately, if \
+                             your client's own tool timeout is shorter and cuts the call short, you \
+                             get a client-side timeout rather than a status=running result -- the \
+                             review keeps running regardless, so just call again with the same \
+                             review_id.)",
                             max = cfg.max_wait_secs()
                         )
                     }
@@ -825,9 +834,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         json!({
             "name": "cross_model_review_cancel",
             "description":
-                "Stop a review that is still running. Use it when the work it was reviewing has \
-                 changed underneath it, or the user has moved on. The review session itself \
-                 survives, so a later cross_model_review with the same session name still resumes.",
+                "Stop a review that is still running, and free the reviewer. This is the only \
+                 operation that stops a running reviewer: abandoning a cross_model_review_result \
+                 poll only detaches the wait and leaves the reviewer running. Use it when the work \
+                 it was reviewing has changed underneath it, or the user has moved on. The review \
+                 session itself survives, so a later cross_model_review with the same session name \
+                 still resumes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -893,6 +905,35 @@ mod tests {
     fn app() -> Arc<App> {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         Arc::new(App::new(cfg))
+    }
+
+    #[test]
+    fn the_wait_seconds_schema_maximum_tracks_a_non_default_timeout() {
+        // The advertised cap must follow --timeout-seconds, so the schema and the runtime clamp in
+        // review_result cannot silently disagree.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--timeout-seconds".into(),
+            "3600".into(),
+        ])
+        .expect("config");
+        let expected = cfg.max_wait_secs();
+        let app = Arc::new(App::new(cfg));
+
+        let tools = tool_definitions(&app);
+        let result_tool = tools
+            .iter()
+            .find(|t| t["name"] == "cross_model_review_result")
+            .expect("cross_model_review_result tool");
+        let maximum = result_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"]
+            .as_u64()
+            .expect("wait_seconds.maximum is an integer");
+        assert_eq!(
+            maximum, expected,
+            "the advertised cap must match the runtime cap"
+        );
+        assert!(maximum > 300, "the cap should exceed the old fixed 300");
     }
 
     #[test]

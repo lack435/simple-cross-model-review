@@ -37,10 +37,13 @@ per-turn hard limit is 30 minutes and can be changed with `--timeout-seconds` (b
 24h). Raising it also lets a wedged reviewer bill and hold its session lease for longer
 before the server stops it, and it widens the collect cap to match.
 
-If a client's own tool timeout is shorter than the review, the collect call returns
-`status=running` and you call it again with the same `review_id` — polling still works as a
-fallback, but it is no longer mandatory and, crucially, no longer destructive: abandoning a
-collect leaves the reviewer running and the result collectible (see
+Two things can end a collect before the review does, and they look different to the caller.
+If the `wait_seconds` budget elapses server-side, the call *returns* `status=running` — call
+again with the same `review_id`. If the client's own tool timeout is shorter and fires first,
+the client sends `notifications/cancelled` and the response is suppressed — the caller sees a
+client-side timeout, not a `status=running` result — so issue a fresh collect with the same
+`review_id`. Either way polling still works as a fallback, and crucially it is no longer
+destructive: abandoning a collect leaves the reviewer running and the result collectible (see
 [A cancelled request](#a-cancelled-request), and `docs/single-blocking-collect.md` for the
 design).
 
