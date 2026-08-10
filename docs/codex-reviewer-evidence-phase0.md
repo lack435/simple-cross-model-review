@@ -81,7 +81,10 @@ and a release build passed after the Phase 0 fixture and control were added.
 - Test forced cancel, timeout, parent crash, and provider-child cleanup. Normal EOF is not a
   substitute for those paths.
 - Exercise both a fresh and resumed probe from the same verified sterile working directory.
-  The final product must perform the empty/outside/non-reparse preflight before every turn.
+  Confirm the CLI leaves the directory empty after each turn and the resumed fixture remains
+  callable. The final product must perform the empty/outside/non-reparse preflight before
+  every turn; an unexpected Codex-created entry is an architecture failure, not an allow-list
+  exception.
 - Replace this temporary fixture with the real capability-bundle handshake and evidence
   dispatcher; do not ship the fixture as the product service.
 

@@ -125,7 +125,10 @@ directory outside the reviewed repository. The parent creates that directory wit
 verifies before every fresh or resumed turn that it is still a directory, contains no
 `.codex` layer or other entries, and is not within the reviewed root, and refuses the review
 if any invariant fails. The directory is stable for the lifetime of a reviewer session so
-resume uses the same working root.
+resume uses the same working root. Empty means empty: if the Codex CLI or anything else
+creates a file there, the next-turn preflight refuses the review. Phase 0 must demonstrate
+that the supported CLI keeps session/history/log state elsewhere on both fresh and resume;
+if it does not, stop and redesign the sterile-root lifecycle rather than weakening the check.
 
 This sterile-root design removes reviewed-project path spelling from the isolation boundary:
 Codex has no reviewed-project `.codex/` layer to discover regardless of how Codex normalizes
@@ -137,6 +140,16 @@ suppress trusted-project config. System/managed policy remains in force. This is
 to the currently shipping Codex reviewer isolation boundary, which today runs in a trusted
 reviewed checkout with only `--ignore-user-config`; it is not conditional on the evidence
 service being used and its README/AGENTS claims must be corrected in the same implementation.
+
+Moving the shelled Codex reviewer out of the repository deliberately changes its repository
+access model. Evidence tools become the complete, primary path for scope, discovery, file
+reads, the configured change, and Git history/revisions. The prompt supplies the canonical
+reviewed root for exceptional absolute-path shell reads, but neither correctness nor change
+delivery may depend on a repo-relative shell command succeeding from the sterile directory.
+README capability text must stop advertising the shell as the normal way Codex obtains
+`git log`, `git show`, a truncated file, or the branch diff. The shell remains available for
+information outside the evidence vocabulary and retains the same OS-enforced no-write
+posture; its reads remain unconfined, as documented today.
 
 The server-owned MCP entry is then added at command-line precedence. Add `--strict-config`
 so an older Codex CLI that does not accept the generated MCP configuration fails before a
@@ -217,6 +230,15 @@ service pages that immutable snapshot. Live file reads include a digest and stat
 if the working tree changes after capture, `repository_scope` and subsequent reads surface
 drift rather than presenting two revisions as one coherent snapshot.
 
+This capture is unconditional for an isolated Codex reviewer, including `--diff auto`.
+Phase 3 must change the existing `reviewer_has_shell && !supplies_change` decision: the shell
+no longer counts as delivery of the selected change merely because it exists. The bundle's
+`repository_change` snapshot is the supplied change for capability text and runtime omission
+accounting. An isolated Codex review must never occupy the old state where no change is
+captured because a repo-relative shell was assumed to provide it. Explicit `--diff off`
+remains an intentional request for no selected change and is reported as such by
+`repository_scope`/`repository_change`, not silently upgraded to `auto`.
+
 ### 4. Invocation and deterministic availability
 
 Do not make a paid review's validity depend on a discretionary model tool call. Before
@@ -283,9 +305,10 @@ command-line precedence over a colliding user config, observing whether the MCP 
 break away from the reviewer job, and testing the lowest supported Codex CLI version. The
 probe that exposed trusted-project loading invalidates the old isolation claim and motivates
 the sterile root; verify the parent-side empty/outside/non-reparse checks and prove fresh and
-resumed Codex turns work from that root with `--skip-git-repo-check`. If any remaining premise
-fails, stop and amend this plan; do not silently fall back to a trust-key spelling guess or
-exec-policy rules.
+resumed Codex turns work from that root with `--skip-git-repo-check`, leave it empty, and can
+obtain the selected `--diff auto` change through `repository_change` without repo-relative
+shell access. If any remaining premise fails, stop and amend this plan; do not silently fall
+back to a trust-key spelling guess, repo-relative shell assumption, or exec-policy rules.
 
 ### Phase 1: evidence core
 
@@ -304,7 +327,9 @@ tests using only the existing `serde` dependencies.
 
 Generate strict per-server MCP overrides for fresh/resume invocations, add the no-model
 handshake, create and clean turn bundles, parse evidence events for observability, classify
-required-server startup failures, update capabilities/preamble, and expose service
+required-server startup failures, make evidence-bundle capture supersede the shelled
+`--diff auto` shortcut, update capabilities/preamble for evidence-first repository access,
+and expose service
 readiness/schema in `cross_model_review_status`.
 
 ### Phase 4: result contract and documentation
