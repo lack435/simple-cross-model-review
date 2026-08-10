@@ -8,7 +8,7 @@ autonomous "re-review until converged" loop stops re-deriving structure the tool
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
-> **Review history.** Twenty-one rounds against this repository's own gate (Codex, gpt-5.6-luna,
+> **Review history.** Twenty-two rounds against this repository's own gate (the 22nd returned APPROVE) (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
 > `major`), round 2 (four `major` + one `minor`), round 3 (four `major` + one `minor`), round 4
 > (five `major` + one `minor`), round 5 (five `major` + one `minor`), round 6 (three `major` +
@@ -1958,11 +1958,11 @@ No open questions remain.
 
 ## Status
 
-Twenty-one rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
-accepted and none disputed. Rounds 11 and 21 were fresh-reviewer holistic passes; the twenty-one
-rounds carried the design from the block schema and ID reconciliation through the
+**APPROVED by the cross-model gate on round 22** (Codex, gpt-5.6-luna, effort=max): "the design is
+now internally consistent," no findings. Twenty-one prior rounds each returned REQUEST CHANGES with
+every finding accepted and none disputed; rounds 11 and 21 were fresh-reviewer holistic passes. The
+twenty-two rounds carried the design from the block schema and ID reconciliation through the
 escalation/rebaseline seam, the five-state coverage machine, `invalid`/`state_corrupt` as pre-model
 refusals, the four over-cap paths, the persistence-first reason rule, and the discriminated
-`outputSchema`. The plan is submitted for a final pass; if it is judged sound, implementation begins
-against the [wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs)
-plan above.
+`outputSchema`. **Implementation may now begin** against the [wiring](#wiring-the-io-edges),
+[tests](#tests), and [module](#new-module--srcfindingsrs) plan above.
