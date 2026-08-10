@@ -54,6 +54,13 @@ pub struct StdoutLimits {
     pub terminate_at_cap: bool,
 }
 
+/// Which armed stdout bound a stream overran, so the failure can name it accurately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCapKind {
+    Bytes,
+    Lines,
+}
+
 impl StdoutLimits {
     /// The historic default: cap retention at `MAX_OUTPUT_BYTES`, no line cap, keep draining past
     /// the cap (do not kill the child). This preserves e.g. Codex finishing its final-message file
@@ -481,6 +488,11 @@ pub struct RunOutcome {
     /// cleanly. The Perforce capture treats this like truncation: an incomplete list or diff must
     /// not be parsed as a whole and seed an elision baseline.
     pub stdout_incomplete: bool,
+    /// Set when an **armed** stdout stream overran its byte or line bound and the reader
+    /// terminated the child at that point (`StdoutLimits::terminate_at_cap`). Names which bound
+    /// tripped so the armed parser can report an accurate `OUTPUT_TRUNCATED`. `None` on every
+    /// non-armed run. See `docs/usage-remaining-gate.md`.
+    pub stdout_cap_hit: Option<StreamCapKind>,
 }
 
 /// Why [`run_observed`] failed. The distinction is a durability boundary, not cosmetic: a `Spawn`
@@ -651,11 +663,12 @@ pub fn run_observed(
     // for Claude, whose review is stdout-only, a completed review became EMPTY_REVIEW.
     let stdout_buf = drain(
         child.stdout.take().expect("stdout was piped"),
-        stdout_limits.max_bytes,
+        stdout_limits,
     );
+    // stderr is never the review, so it keeps the historic retain-and-drain (no early kill).
     let stderr_buf = drain(
         child.stderr.take().expect("stderr was piped"),
-        MAX_OUTPUT_BYTES,
+        StdoutLimits::default_retain(),
     );
 
     let deadline = Instant::now() + timeout;
@@ -674,9 +687,9 @@ pub fn run_observed(
                     });
                     next_activity = now + Duration::from_secs(5);
                 }
-                let over_cap = stdout_limits.terminate_at_cap
-                    && (stdout_buf.len() >= stdout_limits.max_bytes
-                        || stdout_buf.lines() >= stdout_limits.max_lines);
+                // The armed stdout reader stops and flags which bound it overran; kill the child
+                // it left blocked on a full pipe.
+                let over_cap = stdout_buf.cap_hit().is_some();
                 let stop = if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
                     true
@@ -716,6 +729,7 @@ pub fn run_observed(
     }
 
     let drain_by = Instant::now() + DRAIN_GRACE;
+    let stdout_cap_hit = stdout_buf.cap_hit();
     let stdout = collect(&stdout_buf, drain_by);
     let stderr = collect(&stderr_buf, drain_by);
 
@@ -724,6 +738,7 @@ pub fn run_observed(
         stderr_truncated: stderr.truncated,
         stdout_lossy: stdout.lossy,
         stdout_incomplete: stdout.incomplete,
+        stdout_cap_hit,
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
@@ -743,10 +758,10 @@ struct Drain {
     /// mid-stream. Distinct from `truncated` (the deliberate size cap): a consumer that needs a
     /// complete stream (the Perforce capture) must treat this as untrustworthy.
     errored: Arc<AtomicBool>,
-    /// Total newlines seen across the *whole* raw stream, counted even for bytes discarded past
-    /// the retention cap, so the armed line bound reflects the real event count rather than only
-    /// what was retained. See `docs/usage-remaining-gate.md`.
-    lines: Arc<std::sync::atomic::AtomicUsize>,
+    /// For an **armed** stream (`StdoutLimits::terminate_at_cap`), which bound the reader first
+    /// overran — at which point it stops reading, so the child blocks and the poll loop kills it.
+    /// `0` none, `1` bytes, `2` lines. `None` shape via [`Drain::cap_hit`].
+    cap_hit: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Drain {
@@ -754,8 +769,12 @@ impl Drain {
         self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    fn lines(&self) -> usize {
-        self.lines.load(Ordering::SeqCst)
+    fn cap_hit(&self) -> Option<StreamCapKind> {
+        match self.cap_hit.load(Ordering::SeqCst) {
+            1 => Some(StreamCapKind::Bytes),
+            2 => Some(StreamCapKind::Lines),
+            _ => None,
+        }
     }
 }
 
@@ -764,26 +783,31 @@ impl Drain {
 /// Reading incrementally rather than returning at EOF is what makes a partial transcript
 /// recoverable: whatever arrived before the deadline is already in the buffer.
 ///
-/// The buffer is capped, but the *reading* is not. Once the cap is reached the reader
-/// keeps consuming the pipe and throws the bytes away, because a reader that stopped
-/// would fill the pipe and block the child forever -- trading unbounded memory for a
-/// hung review, which is a worse bargain. Reaching the cap is recorded, so a transcript
-/// that lost its middle is reported as truncated rather than as merely short.
-fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Drain {
+/// The buffer is capped at `limits.max_bytes`. For a **non-armed** stream
+/// (`terminate_at_cap == false`) the reader keeps consuming the pipe past the cap and throws the
+/// bytes away, because a reader that stopped would fill the pipe and block the child forever --
+/// trading unbounded memory for a hung review, which is a worse bargain; reaching the cap is
+/// recorded as `truncated`. For an **armed** stream the reader instead **stops at the first
+/// raw-byte or raw-line overrun**, records which bound it was, and returns: the pipe then fills,
+/// the child blocks, and the poll loop terminates it — so raw input is bounded to the cap plus at
+/// most one chunk rather than read to completion (round-2-impl finding f10).
+fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
     let errored = Arc::new(AtomicBool::new(false));
-    let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cap_hit = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
     let writer_errored = Arc::clone(&errored);
-    let writer_lines = Arc::clone(&lines);
+    let writer_cap_hit = Arc::clone(&cap_hit);
     std::thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
+        let mut raw_bytes: usize = 0;
+        let mut raw_lines: usize = 0;
         loop {
+            let mut chunk = [0u8; 8192];
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
                 Err(_) => {
@@ -793,22 +817,31 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Dra
                     break;
                 }
                 Ok(n) => {
-                    // Count newlines across the whole raw stream (retained or discarded), so the
-                    // armed line bound reflects the real event count.
+                    raw_bytes = raw_bytes.saturating_add(n);
                     let newlines = chunk[..n].iter().filter(|&&b| b == b'\n').count();
-                    if newlines > 0 {
-                        writer_lines.fetch_add(newlines, Ordering::SeqCst);
+                    raw_lines = raw_lines.saturating_add(newlines);
+                    {
+                        let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
+                        let room = limits.max_bytes.saturating_sub(buffer.len());
+                        if n > room {
+                            writer_truncated.store(true, Ordering::SeqCst);
+                        }
+                        buffer.extend_from_slice(&chunk[..n.min(room)]);
                     }
-                    let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = max_bytes.saturating_sub(buffer.len());
-                    if room == 0 {
-                        writer_truncated.store(true, Ordering::SeqCst);
-                        continue;
+                    // Armed: stop at the first bound overrun (strictly exceeding the bound, so a
+                    // stream exactly at the bound is allowed), recording which bound it was. The
+                    // poll loop then kills the child. Bytes checked before lines only to pick one
+                    // when a single chunk crosses both.
+                    if limits.terminate_at_cap {
+                        if raw_bytes > limits.max_bytes {
+                            writer_cap_hit.store(1, Ordering::SeqCst);
+                            break;
+                        }
+                        if raw_lines > limits.max_lines {
+                            writer_cap_hit.store(2, Ordering::SeqCst);
+                            break;
+                        }
                     }
-                    if n > room {
-                        writer_truncated.store(true, Ordering::SeqCst);
-                    }
-                    buffer.extend_from_slice(&chunk[..n.min(room)]);
                 }
             }
         }
@@ -820,7 +853,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Dra
         done,
         truncated,
         errored,
-        lines,
+        cap_hit,
     }
 }
 
@@ -1022,7 +1055,7 @@ mod drain_tests {
     use super::*;
 
     fn drained(bytes: Vec<u8>) -> Collected {
-        let drain = drain(std::io::Cursor::new(bytes), MAX_OUTPUT_BYTES);
+        let drain = drain(std::io::Cursor::new(bytes), StdoutLimits::default_retain());
         collect(&drain, Instant::now() + Duration::from_secs(5))
     }
 
@@ -1110,7 +1143,7 @@ mod drain_tests {
                 remaining: source,
                 taken: Arc::clone(&taken),
             },
-            MAX_OUTPUT_BYTES,
+            StdoutLimits::default_retain(),
         );
         let collected = collect(&drain, Instant::now() + Duration::from_secs(10));
 
@@ -1142,6 +1175,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let diagnostics = out.diagnostics();
         assert!(diagnostics.starts_with("[cross-review:"), "{diagnostics}");
@@ -1172,6 +1206,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let failure = truncation_failure(cfg.primary(), &out).expect("a truncation failure");
         assert_eq!(failure.code, "OUTPUT_TRUNCATED");
@@ -1203,6 +1238,7 @@ mod drain_tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
 
         let failure = failure_for(&cfg, cfg.primary(), &out);

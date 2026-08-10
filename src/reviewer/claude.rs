@@ -322,20 +322,36 @@ fn from_result_document(
 /// classification never runs raw stdout through the generic classifier. See
 /// `docs/usage-remaining-gate.md`.
 fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
+    // The armed reader terminated the child the moment a raw byte/line bound was overrun and
+    // recorded which; that is authoritative, so report OUTPUT_TRUNCATED naming the bound before
+    // trusting a possibly-partial stream (round-2-impl finding f10). A byte overrun may still have
+    // let a terminal `result` line through, but the stream is truncated either way.
+    if let Some(kind) = out.stdout_cap_hit {
+        let bound = match kind {
+            super::StreamCapKind::Bytes => {
+                format!("{} MiB", super::MAX_ARMED_STREAM_BYTES / (1024 * 1024))
+            }
+            super::StreamCapKind::Lines => format!("{} event lines", super::MAX_ARMED_STREAM_LINES),
+        };
+        return Err(errors::output_truncated_at(
+            "claude",
+            &bound,
+            out.diagnostics(),
+        ));
+    }
+    // The stream ended before it was fully drained -- a pipe read error or the collect deadline --
+    // so it may be a partial prefix; do not parse it as whole (round-2-impl finding f11).
+    if out.stdout_incomplete {
+        return Err(errors::output_incomplete("claude", out.diagnostics()));
+    }
+
     let mut result_event: Option<Value> = None;
+    // The last CLI-owned failure event (a top-level `error`, or a `result` with `is_error`), kept
+    // so a failure represented only by such an event is classified from its structured fields
+    // rather than becoming a generic REVIEWER_FAILED (round-2-impl finding f3).
+    let mut error_event: Option<Value> = None;
     let mut rate_rejected = false;
-    let mut lines_seen = 0usize;
     for line in out.stdout.lines() {
-        lines_seen += 1;
-        if lines_seen >= super::MAX_ARMED_STREAM_LINES {
-            // Line-count bound tripped: a defined truncation whose message names the line bound
-            // (not bytes), so a line breach is not misreported (round-6 finding f15).
-            return Err(errors::output_truncated_at(
-                "claude",
-                &format!("{} event lines", super::MAX_ARMED_STREAM_LINES),
-                out.diagnostics(),
-            ));
-        }
         let line = line.trim();
         if !line.starts_with('{') {
             continue;
@@ -343,9 +359,21 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        match value.get("type").and_then(Value::as_str) {
+        let ty = value.get("type").and_then(Value::as_str);
+        let is_error = value
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match ty {
             // Keep the last result event: it is the terminal document.
-            Some("result") => result_event = Some(value),
+            Some("result") => {
+                if is_error {
+                    error_event = Some(value.clone());
+                }
+                result_event = Some(value);
+            }
+            // A top-level structured error event.
+            Some("error") => error_event = Some(value),
             Some("rate_limit_event")
                 if value
                     .get("rate_limit_info")
@@ -371,22 +399,17 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
         ));
     }
 
+    // A successful terminal result is the review. `from_result_document` also classifies a result
+    // that carries `is_error`, from its CLI-owned fields.
     if let Some(parsed) = result_event {
         return from_result_document(spec, out, &parsed);
     }
-
-    // No terminal result event and no rejection: a failure. Classify only from CLI-owned signals.
-    if out.stdout_truncated {
-        // The byte bound tripped before a terminal result arrived.
-        let mib = super::MAX_ARMED_STREAM_BYTES / (1024 * 1024);
-        return Err(errors::output_truncated_at(
-            "claude",
-            &format!("{mib} MiB"),
-            out.diagnostics(),
-        ));
+    // No result, but a structured error event: classify it through the same CLI-owned-fields path.
+    if let Some(err) = error_event {
+        return from_result_document(spec, out, &err);
     }
-    // Otherwise it failed without a result and without a rate-limit event: classify from stderr
-    // and the exit code (CLI-owned), never the JSONL body, which can carry model prose.
+    // No result and no structured error event. Classify from stderr and the exit code (CLI-owned),
+    // never the JSONL body, which can carry model prose.
     if out.success {
         return Err(errors::empty_review("claude", out.diagnostics()));
     }
@@ -538,6 +561,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
@@ -678,15 +702,44 @@ mod tests {
     }
 
     #[test]
-    fn armed_line_cap_is_a_defined_truncation_naming_lines() {
-        // A pathological stream of many tiny non-terminal events trips the line bound before any
-        // result: a defined OUTPUT_TRUNCATED whose message names lines, not bytes.
-        let mut s = String::new();
-        for _ in 0..(crate::reviewer::MAX_ARMED_STREAM_LINES + 10) {
-            s.push_str("{\"type\":\"system\"}\n");
-        }
-        let err = parse_stream_json(cfg().primary(), &outcome(&s, true)).unwrap_err();
+    fn armed_cap_hit_is_a_defined_truncation_naming_the_bound() {
+        // The reader (not the parser) detects the overrun and records which bound; the parser
+        // reports OUTPUT_TRUNCATED naming it, before trusting the possibly-partial stream.
+        let mut lines = outcome("{\"type\":\"system\"}\n", true);
+        lines.stdout_cap_hit = Some(crate::reviewer::StreamCapKind::Lines);
+        let err = parse_stream_json(cfg().primary(), &lines).unwrap_err();
         assert_eq!(err.code, "OUTPUT_TRUNCATED", "{err:?}");
+        assert!(err.summary.contains("event lines"), "{err:?}");
+
+        let mut bytes = outcome("{\"type\":\"system\"}\n", true);
+        bytes.stdout_cap_hit = Some(crate::reviewer::StreamCapKind::Bytes);
+        let err = parse_stream_json(cfg().primary(), &bytes).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_TRUNCATED", "{err:?}");
+        assert!(err.summary.contains("MiB"), "{err:?}");
+    }
+
+    #[test]
+    fn armed_incomplete_stream_is_not_parsed_as_whole() {
+        // A pipe error / collect-deadline cut (stdout_incomplete) must not be read as a complete
+        // (possibly empty) review (round-2-impl finding f11).
+        let mut inc = outcome(r#"{"type":"result","is_error":false,"result":"ok"}"#, true);
+        inc.stdout_incomplete = true;
+        let err = parse_stream_json(cfg().primary(), &inc).unwrap_err();
+        assert_eq!(err.code, "OUTPUT_INCOMPLETE", "{err:?}");
+    }
+
+    #[test]
+    fn armed_error_event_without_result_is_classified_not_generic() {
+        // A structured error event (no result) is classified from its CLI-owned fields rather
+        // than falling through to a generic failure (round-2-impl finding f3).
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"result","is_error":true,"subtype":"error_max_turns"}"#,
+        );
+        // A result-with-is_error is a failure; from_result_document classifies it (not EMPTY_REVIEW).
+        let err = parse_stream_json(cfg().primary(), &outcome(stream, false)).unwrap_err();
+        assert_ne!(err.code, "EMPTY_REVIEW", "{err:?}");
     }
 
     #[test]
@@ -846,6 +899,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
@@ -918,6 +972,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let err = ClaudeReviewer
             .parse(&cfg(), cfg().primary(), &out, None)
@@ -955,6 +1010,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         };
         let err = ClaudeReviewer
             .parse(&cfg(), cfg().primary(), &out, None)

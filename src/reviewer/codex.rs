@@ -784,6 +784,7 @@ mod tests {
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
@@ -985,6 +986,7 @@ ordinary diagnostic
             stderr_truncated: false,
             stdout_lossy: false,
             stdout_incomplete: false,
+            stdout_cap_hit: None,
         }
     }
 
