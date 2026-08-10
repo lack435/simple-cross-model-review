@@ -169,7 +169,8 @@ There is no automatic fallback — the chain is only ever what the arguments dec
 reactive trigger is the reviewer actually reporting a limit; a **proactive** trigger is
 available on top of it (see the usage-remaining gate below). Same-family fallbacks
 (`gpt-5.6-luna` → `gpt-5.6-sol`, say) are honoured as written; the only chain the tool
-refuses is one with a *fully identical* entry (same reviewer, model, effort and bin), which
+refuses is one with an *identity-equivalent* entry (same reviewer, model, effort and bin, with
+the bin path compared case- and separator-insensitively, as Windows paths are), which
 could never be a fallback for the one before it. A misconfigured chain does not stop the
 server — it starts and refuses every review with `INVALID_REVIEWER_CHAIN` until fixed.
 

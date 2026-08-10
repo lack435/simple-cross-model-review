@@ -19,6 +19,7 @@ mod errors;
 mod findings;
 mod mcp;
 mod metrics;
+mod pathcmp;
 mod prompt;
 mod registry;
 mod reviewer;

@@ -532,7 +532,7 @@ impl App {
                 let spec = &self.cfg.reviewers[start_index];
                 let bin = reviewer::resolve_bin(spec)?;
                 if let Some(stored) = &record.resolved_bin {
-                    if bin.to_string_lossy() != *stored {
+                    if !crate::pathcmp::resolved_bin_matches(&bin, stored) {
                         return Err(resume_refusal(
                             &session,
                             format!(
@@ -2658,8 +2658,9 @@ fn resume_block(
     }
     let cwd = cfg.cwd.to_string_lossy();
     // Windows paths are case-insensitive, and the state directory is already keyed
-    // case-insensitively, so a case-only difference here is the same root, not a new one.
-    if !record.cwd.eq_ignore_ascii_case(&cwd) {
+    // case-insensitively, so a case-only (or separator-only) difference here is the same root,
+    // not a new one. `pathcmp` folds both, fail-closed -- see docs/path-comparison-plan.md.
+    if !crate::pathcmp::identity_eq_str(&record.cwd, &cwd) {
         return Some(format!(
             "it was created against working root '{}', but this server is now working in '{}'.",
             record.cwd, cwd
@@ -3183,6 +3184,34 @@ mod tests {
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
         assert!(resume_block(&cfg, &ok, &[], now).is_none());
+    }
+
+    #[test]
+    fn a_case_or_separator_only_cwd_difference_still_resumes() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+
+        // Same directory spelled with different case and separators: the same root, so it still
+        // resumes. Before the #55 fix the cwd gate folded case only, and other sites not at all.
+        let mut variant = record_matching(&cfg, 1, now);
+        // ASCII-only uppercase: identity folds ASCII case, so a Unicode `to_uppercase` on a
+        // checkout path with a non-ASCII char would produce a genuinely non-equal variant and
+        // fail spuriously.
+        variant.cwd = cfg
+            .cwd
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .replace('\\', "/");
+        assert!(
+            resume_block(&cfg, &variant, &[], now).is_none(),
+            "a case/separator-only cwd difference should resume"
+        );
+
+        // A genuinely different working root still invalidates.
+        let mut moved = record_matching(&cfg, 1, now);
+        moved.cwd = "C:\\somewhere\\else".to_string();
+        let reason = resume_block(&cfg, &moved, &[], now).expect("a different cwd is refused");
+        assert!(reason.contains("working root"), "{reason}");
     }
 
     #[test]
