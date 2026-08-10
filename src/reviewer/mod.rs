@@ -729,9 +729,13 @@ pub fn run_observed(
     }
 
     let drain_by = Instant::now() + DRAIN_GRACE;
-    let stdout_cap_hit = stdout_buf.cap_hit();
     let stdout = collect(&stdout_buf, drain_by);
     let stderr = collect(&stderr_buf, drain_by);
+    // Read the cap signal *after* `collect` has waited for the reader thread (round-2-impl
+    // finding f10 propagation race): the reader sets `cap_hit` and then `done`, and `collect`
+    // blocks on `done`, so sampling it before could miss an overrun the reader recorded a moment
+    // later — letting a truncated stream through as accepted.
+    let stdout_cap_hit = stdout_buf.cap_hit();
 
     Ok(RunOutcome {
         stdout_truncated: stdout.truncated,
@@ -1064,6 +1068,46 @@ mod drain_tests {
         let collected = drained(b"a normal transcript".to_vec());
         assert_eq!(collected.text, "a normal transcript");
         assert!(!collected.truncated);
+    }
+
+    #[test]
+    fn armed_cap_hit_is_visible_after_collect_even_on_natural_eof() {
+        // Regression for the f10 propagation race: a finite stream (EOF, like a child that exits
+        // right after overrunning) that exceeds the byte bound must have `cap_hit` observable
+        // once `collect` has waited for the reader. `collect` blocks on the reader's `done`, and
+        // the reader sets `cap_hit` before `done`, so reading it after `collect` is race-free.
+        let limits = StdoutLimits {
+            max_bytes: 16,
+            max_lines: usize::MAX,
+            terminate_at_cap: true,
+        };
+        let bytes_drain = drain(std::io::Cursor::new(vec![b'x'; 64]), limits);
+        let _ = collect(&bytes_drain, Instant::now() + Duration::from_secs(5));
+        assert_eq!(bytes_drain.cap_hit(), Some(StreamCapKind::Bytes));
+
+        // The line bound likewise, and a stream exactly at neither bound is not flagged.
+        let line_limits = StdoutLimits {
+            max_bytes: usize::MAX,
+            max_lines: 3,
+            terminate_at_cap: true,
+        };
+        let d = drain(
+            std::io::Cursor::new(b"a\nb\nc\nd\ne\n".to_vec()),
+            line_limits,
+        );
+        let _ = collect(&d, Instant::now() + Duration::from_secs(5));
+        assert_eq!(d.cap_hit(), Some(StreamCapKind::Lines));
+
+        let ok = drain(
+            std::io::Cursor::new(b"a\nb\n".to_vec()),
+            StdoutLimits {
+                max_bytes: 1024,
+                max_lines: 10,
+                terminate_at_cap: true,
+            },
+        );
+        let _ = collect(&ok, Instant::now() + Duration::from_secs(5));
+        assert_eq!(ok.cap_hit(), None);
     }
 
     #[test]
