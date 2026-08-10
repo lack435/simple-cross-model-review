@@ -71,56 +71,108 @@ changing which range is captured.
 
 ### The disposition value
 
-A small, VCS-neutral enum, computed as a by-product of the existing capture decision:
+A small, VCS-neutral enum. The first review of this design conflated two very different
+things under "not a delta" — an intentional non-delta and a *failed* delta — and the
+distinction is the crux of getting the warning channel right (see
+[How the caller sees it](#how-the-caller-sees-it)). So the enum has four states, not three:
 
-- **`Full`** — a fresh review (no prior baseline), or the first turn of a session. Reported
-  as nothing new on a fresh call; see [Only on resume](#only-on-resume).
-- **`Incremental`** — the delta fired. Carries backend detail:
-  - git: the pinned range `<prior>..<HEAD>` and the count of new commits.
-  - Perforce: files re-sent vs files collapsed (`M of K files changed since your last
-    review`), from the counts `baseline.rs` already computes.
-- **`FellBackToFull { reason }`** — a resume that *could* have deltaed but did not, with a
-  specific, enumerated reason:
+- **`Full`** — a fresh review: turn 1, or a resumed turn with no prior baseline to be
+  incremental against. Reported as nothing on a fresh call; see
+  [Only on resume](#only-on-resume).
+- **`FullByDesign { reason }`** — the configuration *never intended* a delta this turn, so
+  its absence is correct and unremarkable, **not** a fall-back and **never** a warning:
   - `Disabled` — `--no-incremental-resume`.
-  - `ModeNotHeadRange` — the mode is not a HEAD-anchored committed range (working-tree,
-    staged, or a fixed window like `HEAD~3..HEAD~1`), so it never deltas by design.
-  - `BranchRewritten` — the prior HEAD is no longer an ancestor of HEAD (rebase, amend,
-    force-push).
-  - `BaseMoved` — the configured base no longer resolves to the baseline's recorded base
-    (`main` advanced, or `--diff` was repointed).
-  - `PriorNotResumable` — the prior turn's capture was truncated / unresolved / did not
-    persist a baseline, so there is nothing safe to delta from.
+  - `ModeNotDeltable` — the mode is not a HEAD-anchored committed range: a working-tree
+    (`auto`/`HEAD`) or staged diff (which carry uncommitted work a commit delta would drop),
+    or a fixed window like `HEAD~3..HEAD~1` (which does not move with HEAD). These are the
+    common, correct cases — warning on a resumed `--diff HEAD` review would be a false alarm
+    that trains callers to ignore the channel.
+- **`Incremental`** — the delta fired. Carries the range `<prior>..<HEAD>` (git, free — the
+  endpoints are already pinned) and optional backend detail; see
+  [What the detail can honestly say](#what-the-detail-can-honestly-say).
+- **`FellBackToFull { reason }`** — an *eligible* delta (a HEAD-anchored range, feature on)
+  that failed a safety guard and re-captured the whole range. This is the state worth a
+  warning, because it is where the delta the caller configured for stopped happening:
+  - `BranchRewritten` — the prior HEAD is a valid commit that is **not** an ancestor of HEAD
+    (rebase, amend, force-push). Distinct from the next one — see
+    [Reasons the code must be refactored to tell apart](#reasons-the-code-must-be-refactored-to-tell-apart).
+  - `BaseMoved` — the configured base still resolves, but to a different commit than the
+    baseline's recorded base (`main` advanced, or `--diff` was repointed).
+  - `NoCompleteBaselineRetained` — the session holds no complete `(head, base)` pair to
+    delta from (the prior turn truncated *and* no earlier complete baseline survived, or HEAD
+    could not be resolved). **Not** simply "the prior capture was truncated" — see finding 3
+    below.
+  - `AncestryUndecidable` — the ancestry check could not be *run* (git error/timeout), as
+    opposed to answering "no". Conservatively a full re-capture, but reported as its own
+    reason rather than mislabelled `BranchRewritten`.
   - Perforce-specific: `IdentityChanged`, `ModeOrShelvedChanged`, `PriorTurnUnpersisted`
-    (the durable-marker cases already handled in `tools.rs`).
+    (the durable-marker cases already decided in `tools.rs`).
 
-Making it an enum — not just a prose sentence — is the point: it is machine-checkable by the
-calling agent, assertable in unit tests, and greppable in the smoke test. The prose the
-caller reads is *rendered from* the enum, single-sourced the way `incomplete()` centralises
-capture-shortfall phrasing and `command_line()` derives from `diff_args()`.
+Making it an enum — not a prose sentence — is the point: machine-checkable by the calling
+agent, assertable in unit tests, greppable in the smoke test. The prose the caller reads is
+*rendered from* the enum, single-sourced the way `incomplete()` centralises capture-shortfall
+phrasing and `command_line()` derives from `diff_args()`.
 
-### Where it comes from
+### Where it comes from, and what has to change to get it right
 
-`incremental_base` in `src/vcs/git.rs` currently returns `Option<String>` — the prior commit
-or nothing — and *throws away the reason* for the `None`. Change it to return the disposition
-(the prior commit on `Some`, the specific `reason` on fall-back). The capture already knows
-every input to that decision at the point it makes it, so no new git calls are added; the
-reason is information already computed and currently discarded.
+The first draft claimed the reason is "information already computed and currently discarded."
+That is only half true, and the reviewer was right to push on it. The decision *inputs* all
+exist at the point the capture decides, but the current functions **collapse distinct
+outcomes into a single `None`/`false`**, so the reason is not recoverable without refactoring
+them to preserve it. Concretely, three call sites lose information today:
 
-Thread the disposition out through `Capture` / `CapturedChange` (which already carry
-`head_sha` / `base_sha`) to `tools.rs`, the same path the baseline pair already travels.
+#### Reasons the code must be refactored to tell apart
+
+- **`effective_base` (`src/vcs/git.rs:643-663`) returns `None` for both "the mode is not a
+  HEAD-anchored range" and "the base ref would not resolve."** The first is `FullByDesign
+  { ModeNotDeltable }`; the second, on a resume that had a baseline, is a genuine fall-back.
+  Split the return so the caller can tell an ineligible mode from a resolution failure.
+- **`is_ancestor` (`src/vcs/git.rs:1012-1018`) returns `false` for both "not an ancestor" and
+  "git errored / timed out."** Labelling every `false` as `BranchRewritten` would be a
+  factual claim the code cannot back. Return a three-way answer (yes / no / undecidable) so
+  the no-case is `BranchRewritten` and the error-case is `AncestryUndecidable`.
+- **The Perforce pending-marker cases are turned into `resume = None` in `tools.rs:805-833`
+  *before* `capture` runs,** so the backend never sees why. The reason has to be captured at
+  that pre-capture decision point and carried into the disposition explicitly, not
+  reconstructed inside the backend.
+
+None of these add a git/p4 call for the *decision* (the ancestry and base-resolve commands
+already run); they change what the existing calls' outcomes are allowed to say. The one place
+a new query would be needed is an optional commit *count* — see below.
+
+Then thread the disposition out through `Capture` (which already carries `head_sha` /
+`base_sha` — note that `CapturedChange` does **not**; the first draft misplaced this) to
+`tools.rs`.
+
+### What the detail can honestly say
+
+- **git range:** `<prior>..<HEAD>` is free — both endpoints are already pinned by the capture.
+- **git commit count:** *not* free. It needs a `git rev-list --count <prior>..<HEAD>`, a
+  bounded extra query. Treat the count as optional: report the range unconditionally, and the
+  count only if we decide the extra call is worth it (open question 4). The first draft
+  asserted "no new git calls" while also promising a count; that was contradictory.
+- **Perforce:** `baseline.rs` stores *evidence entries*, not file counts, and the fingerprint
+  is over **rendered evidence**, not arbitrary file state (`src/vcs/perforce.rs:503-510`). So
+  the honest phrasing is "N of M evidence units re-sent, the rest collapsed as byte-identical
+  to what you were last shown," with the counts computed *during* elision (they are not stored
+  today) — never "M of K files changed," which claims a file-level comparison Perforce does
+  not perform.
 
 ### How the caller sees it
 
 In `tools.rs`, on a **resumed** turn, render the disposition into the caller-facing response.
 Two sub-decisions, both for the reviewer to weigh in on:
 
-- **Channel.** `warnings` is framed as "the captured change was incomplete" — a shortfall.
-  A clean `Incremental` or `Full` turn is *not* a shortfall, and dressing it as a warning
-  would train callers to ignore the channel. Recommend a **distinct caller-facing line**
-  (an informational `disposition:` note in the response, beside `usage:`), reserving
-  `warnings` for the case that genuinely deserves attention: **`FellBackToFull` on a resume
-  where the caller was configured for a delta** is a cost surprise worth a warning, because
-  it means the thing they set up is not happening.
+- **Channel — a typed field, not a warning string.** `warnings` is framed as "the captured
+  change was incomplete" — a shortfall — and it is a `Vec<String>`. A clean `Incremental`,
+  `Full`, or `FullByDesign` turn is not a shortfall, and encoding structured data as prose in
+  the warning list is the wrong shape twice over. So carry a **typed disposition field**
+  through the result path — `Outcome` → `Review` → `Snapshot` in `src/registry.rs`
+  (`:143-155`, `:558-599`), which the first draft omitted from the plumbing entirely — and
+  render it into the response as its own informational `disposition:` line beside `usage:`.
+  Only one state also earns a `warnings` entry: **`FellBackToFull` on a resume**, the cost
+  surprise where the delta the caller configured for silently stopped happening.
+  `FullByDesign` never warns.
 - **Recording.** Record the disposition in the usage/metrics record next to `prompt_bytes`,
   so an after-the-fact audit of a session can see which turns deltaed and which re-billed
   the full range — the attribution point 1 above is missing today.
@@ -143,43 +195,86 @@ call. The disposition line appears only when `resume_id.is_some()`.
 - **It must not introduce a new failure mode.** A disposition that cannot be computed (some
   unexpected `None`) degrades to reporting nothing, never to blocking or mis-capturing the
   review.
-- **It must not claim more than it verified.** The `Incremental` note says what the server
-  *sent*; it must not assert the reviewer still holds the earlier context, which the server
-  cannot know. The wording stays on the server's side of that line.
+- **It must not claim more than it verified.** The new caller-facing `Incremental` line says
+  what the server *sent* — the range, and (for Perforce) which evidence was collapsed as
+  byte-identical to what was last shown. It must not assert the reviewer still holds the
+  earlier context, which the server cannot know.
+
+  One honesty note the first review drew out: the **existing reviewer-facing prompt already**
+  asserts "that conversation is still in your context" (`src/vcs/git.rs:748-759`). That is a
+  pre-existing assumption of the resume model, not something this change introduces or can
+  close, and it is deliberately **out of scope** here — this proposal is about making the
+  disposition legible to the *caller*, not about verifying the *reviewer's* memory. Calling
+  the caller-facing boundary "complete" was overstated: it is complete for the new line only.
+  Whether the reviewer prompt should soften that assertion is a separate question, noted here
+  so it is not silently inherited.
 
 ## Blast radius
 
-Additive to the response and to one enum return type. Touched files:
-`src/vcs/git.rs` (disposition + reason on the git decision), `src/vcs/mod.rs` and
-`src/vcs/shared.rs` (carry it on `Capture` / `CapturedChange`), `src/tools.rs` (surface +
-record on resume), `src/metrics.rs` (record field), plus tests. Per the task framing,
-foundational completeness is preferred over minimising this; the change is cohesive and the
-surface it adds is small.
+Additive to the response and to one enum return type — but wider than the first draft
+admitted. Touched files:
+
+- `src/vcs/git.rs` — the disposition and the reason-preserving refactors of `effective_base`
+  (ineligible-mode vs unresolved-base) and `is_ancestor` (three-way), plus the optional
+  `rev-list --count`.
+- `src/vcs/perforce.rs` — compute the re-sent/collapsed evidence-unit counts during elision
+  (not stored today).
+- `src/vcs/shared.rs` / `src/vcs/mod.rs` — carry the typed disposition on `Capture` (**not**
+  `CapturedChange`, which does not hold the baseline).
+- `src/tools.rs` — capture the Perforce pending-marker reason at its pre-capture decision
+  point (`:805-833`) rather than losing it to `resume = None`, and surface + record the
+  disposition on a resumed turn.
+- `src/registry.rs` — thread the typed field through `Outcome` → `Review` → `Snapshot`
+  (`:143-155`, `:558-599`); this is the plumbing the first draft missed.
+- `src/metrics.rs` — the record field, plus tests throughout.
+
+Per the task framing, foundational completeness is preferred over minimising this. The change
+is cohesive, but it is not a one-liner: getting the *reasons* accurate (findings 2 and 3) is
+most of the work, and doing it wrong — a mislabelled `BranchRewritten`, a false `FellBackToFull`
+warning on an intentional `--diff HEAD` — would be worse than reporting nothing.
 
 ## Testing
 
-- **Unit, git:** each fall-back reason maps to its disposition — `BranchRewritten` (prior
-  HEAD not an ancestor), `BaseMoved` (base ref advanced), `ModeNotHeadRange` (working-tree
-  and non-HEAD range), `Disabled` (`--no-incremental-resume`), `PriorNotResumable` (prior
-  capture truncated). These extend the existing fall-back tests, which today assert only that
-  the *range* fell back, by additionally asserting the *reason* surfaced.
+- **Unit, git — every reason maps correctly, including the ones the code must now tell
+  apart:**
+  - `BranchRewritten` — prior HEAD valid but not an ancestor.
+  - `AncestryUndecidable` — the ancestry check could not run (distinct from the above; test
+    by pointing it at a prior commit git cannot place).
+  - `BaseMoved` — base ref advanced to a different commit.
+  - `FullByDesign { ModeNotDeltable }` — a working-tree (`--diff HEAD`) or non-HEAD range
+    resume, asserting it does **not** produce a warning.
+  - `FullByDesign { Disabled }` — `--no-incremental-resume`.
+  - **`NoCompleteBaselineRetained`, both ways (finding 3):** (a) first-turn truncation, where
+    no baseline ever existed, and (b) truncation *after* an established baseline, which must
+    still delta from the retained older complete `(head, base)` pair
+    (`src/session.rs:197-214`, `src/tools.rs:821-825`) rather than fall back — proving the
+    reason is "no complete baseline retained," not "the last capture truncated."
+
+  These extend the existing fall-back tests, which today assert only that the *range* fell
+  back, by additionally asserting the *reason*.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
-  `Incremental { prior..HEAD, 1 commit }` and that the caller-facing line contains it.
+  `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
 - **Unit, tools:** a resumed turn emits the disposition line; a fresh turn does not; a
-  resume that fell back emits the warning form.
+  `FellBackToFull` resume also emits the warning; a `FullByDesign` resume emits the info line
+  but **no** warning.
 - **`smoke.ps1`:** on a resumed run, assert the disposition line appears in the response
   (real model call — run only when the change touches this path, and note the cost).
 
 ## Open questions for the reviewer
 
-1. **Channel split.** Is the info-line-plus-warning-on-fallback split right, or should every
-   resume disposition go through one channel? The concern driving the split is not diluting
-   `warnings`.
-2. **Perforce depth now vs later.** Implement full git/Perforce parity (per-file counts for
-   Perforce) in this change, or ship git fully plus a coarse `{Full, Incremental,
-   FellBackToFull+reason}` for Perforce and leave the counts as a follow-up? `baseline.rs`
-   already has the counts, so parity is feasible now; the question is scope discipline.
+1. **Channel split.** Is the typed-field-plus-warning-only-on-`FellBackToFull` split right, or
+   should every resume disposition go through one channel? The concern driving the split is
+   not diluting `warnings` with the common, unremarkable `FullByDesign` and `Incremental`
+   turns.
+2. **Perforce depth now vs later.** Ship git fully plus the coarse `{Full, FullByDesign,
+   Incremental, FellBackToFull+reason}` states for Perforce now, and leave the evidence-unit
+   counts as a follow-up? The counts are **not** stored today (`baseline.rs` holds evidence
+   entries, not tallies); computing re-sent-vs-collapsed during elision is a small addition
+   but a real one, so it is a legitimate scope-discipline call rather than free parity.
 3. **Should `FellBackToFull { BaseMoved }` be more than a warning?** A base ref that moves
    every turn defeats the whole feature permanently. Is a one-time warning enough, or should
    the response actively suggest pinning the base (the `--diff <resolved-base>..HEAD`
    remedy)?
+4. **The git commit count — worth an extra `git rev-list --count`?** The range `prior..HEAD`
+   is free and probably sufficient. The count is a nicety that costs one more bounded git call
+   per resumed turn. Include it, or ship the range alone?
