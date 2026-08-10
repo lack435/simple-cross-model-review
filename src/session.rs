@@ -274,6 +274,15 @@ impl SessionStore {
         self.read().sessions.get(name).cloned()
     }
 
+    /// Like [`get`](Self::get), but fail-closed: a corrupt/unreadable store is an `Err`, not a
+    /// silent `Ok(None)`. The review path uses this so a transient read error after the preflight
+    /// `store_state` check cannot make the worker behave as if the session were absent (and then
+    /// overwrite the real record on `record_turn`). `Ok(None)` means genuinely absent.
+    pub fn get_checked(&self, name: &str) -> io::Result<Option<SessionRecord>> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self.read_or_corrupt()?.sessions.get(name).cloned())
+    }
+
     pub fn list(&self) -> Vec<(String, SessionRecord)> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.read().sessions.into_iter().collect()
@@ -506,8 +515,15 @@ impl SessionStore {
     pub fn store_state(&self) -> StoreState {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         match std::fs::read_to_string(&self.path) {
-            Err(_) => StoreState::Absent,
-            Ok(text) if text.trim().is_empty() => StoreState::Absent,
+            // Only a genuinely missing file is `Absent`. Any other read error (a permission or I/O
+            // failure) is fail-closed to `Corrupt` — better to refuse than to proceed as if empty
+            // and later overwrite whatever is really there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => StoreState::Absent,
+            Err(_) => StoreState::Corrupt,
+            // An existing but empty/whitespace-only file is anomalous: `write` only ever produces a
+            // fully-serialized store via temp+rename, so a zero-byte `sessions.json` is corruption
+            // (e.g. an external truncation), not the normal first-run state — treat it as corrupt.
+            Ok(text) if text.trim().is_empty() => StoreState::Corrupt,
             Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
                 Ok(_) => StoreState::Valid,
                 Err(_) => StoreState::Corrupt,
@@ -568,9 +584,19 @@ impl SessionStore {
     /// history it cannot see. Recovery is an explicit operator action.
     fn read_or_corrupt(&self) -> io::Result<StoreFile> {
         match std::fs::read_to_string(&self.path) {
+            // Only a genuinely missing file is an empty store. Any other read error, or an existing
+            // empty/whitespace-only file (never produced by `write`), is fail-closed to an error, so
+            // a mutator refuses rather than overwriting whatever is really there.
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(StoreFile::default()),
             Err(e) => Err(e),
-            Ok(text) if text.trim().is_empty() => Ok(StoreFile::default()),
+            Ok(text) if text.trim().is_empty() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is present but empty; refusing to overwrite it. Move it aside or point \
+                     --state-dir at a clean directory.",
+                    self.path.display()
+                ),
+            )),
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,

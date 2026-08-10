@@ -172,6 +172,17 @@ impl App {
             .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
 
         let session = string_arg(args, "session").unwrap_or_else(|| DEFAULT_SESSION.to_string());
+        // A session name is rendered into the human response and keys on-disk marker files, so it
+        // must be a single line of printable text. Rejecting control characters (newlines above all)
+        // is defence-in-depth: it stops a name from breaking the response layout, and — together
+        // with the marker-line strip applied to the whole rendered body — from smuggling a forged
+        // envelope block into the text channel.
+        if session.chars().any(|c| c.is_control()) {
+            return Err(errors::bad_request(
+                "'session' must be a single line of text: control characters (including newlines) \
+                 are not allowed in a session name.",
+            ));
+        }
         let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
         let context_paths = string_array_arg(args, "context_paths");
 
@@ -240,39 +251,62 @@ impl App {
             ));
         }
 
-        // Decide whether this is a new review or another turn on an existing one.
+        // Decide whether this is a new review or another turn on an existing one. `get_checked` is
+        // fail-closed: a transient read error is refused here rather than silently read as "no
+        // record" (which would then overwrite the real record on `record_turn`).
         let prior = if fresh {
             None
         } else {
-            self.sessions.get(&session)
+            self.sessions.get_checked(&session).map_err(|e| {
+                errors::session_not_resumable(
+                    &session,
+                    format!(
+                        "the session store could not be read ({e}); refusing rather than risk \
+                         overwriting it. Retry, or point --state-dir at a readable directory."
+                    ),
+                )
+            })?
         };
+
+        // The findings write-ahead marker is checked for *every* non-fresh call — with or without a
+        // stored record. A set marker means the previous turn did not durably record its ledger, so
+        // resuming (or continuing under this name) would lose that turn and could converge on
+        // untracked history. Crucially this fires even when no record exists: a fresh turn 1 that
+        // marked, then failed to record, leaves the marker but no record, and the next non-fresh
+        // call must not silently start a clean, convergeable turn 1 over it. Fail-closed: an
+        // unreadable marker refuses too. `fresh: true` (which sets `prior = None` by choice) is the
+        // explicit escape hatch and skips this. See also the Perforce note below.
+        if !fresh
+            && matches!(
+                self.sessions.findings_marker_state(&session),
+                crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
+            )
+        {
+            return Err(errors::session_not_resumable(
+                &session,
+                "the previous turn did not finish durably (its findings write-ahead marker is \
+                 still set), so its findings ledger may be stale or the turn was lost. Start a \
+                 fresh review (fresh: true) carrying any still-open findings into the new \
+                 instructions."
+                    .to_string(),
+            ));
+        }
 
         // A stored session that exists but must not be resumed is refused here, while the
         // lease is held and before anything is spawned or billed, so the caller explicitly
         // chooses to start fresh (fresh=true, or a new session name) rather than being
         // silently handed a review with no memory of the work it asked to continue.
+        //
+        // Perforce contract note: because a failed reviewer turn leaves the findings marker set,
+        // the refusal above now pre-empts the Perforce full-capture fallback for that path — a
+        // failed turn requires an explicit `fresh` rather than a resume-with-full-recapture. This is
+        // intentional: a failed turn means the findings ledger is stale, and `fresh` recaptures in
+        // full anyway, so the fallback's safety goal (never collapse against a stale baseline) is
+        // still met. The Perforce marker's fallback remains reachable for a crash *before* the
+        // findings marker is written (during capture), where the findings ledger did not move.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
                 return Err(errors::session_not_resumable(&session, reason));
-            }
-            // The findings write-ahead marker (distinct from the Perforce baseline marker, which
-            // drives the full-capture fallback and is deliberately left to `run`): a set
-            // findings marker means the previous turn did not durably record its ledger, so the
-            // ledger is stale relative to the reviewer's advanced conversation. Resuming would inject
-            // a stale ledger and risk minting colliding ids, so refuse before the model call — the
-            // safe, over-cautious direction (a stale marker after a durable record costs only an
-            // unnecessary fresh). Fail-closed: an unreadable marker refuses too.
-            if matches!(
-                self.sessions.findings_marker_state(&session),
-                crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
-            ) {
-                return Err(errors::session_not_resumable(
-                    &session,
-                    "the previous turn did not finish durably (its findings write-ahead marker is \
-                     still set), so its findings ledger may be stale. Start a fresh review \
-                     (fresh: true) carrying any still-open findings into the new instructions."
-                        .to_string(),
-                ));
             }
         }
 
@@ -464,48 +498,15 @@ impl App {
     // cross_model_review_result
     // -----------------------------------------------------------------------
 
-    /// Resolve the review a `cross_model_review_result` call targets to a concrete review id, so the
-    /// text and `structuredContent` channels describe the *same* review even if a new review for the
-    /// session starts between rendering them. `review_id` (preferred) is returned as-is; otherwise
-    /// the session's latest review id, if any; otherwise `None` (the caller then reports the proper
-    /// error). Only the resolution — not the wait — happens here.
-    pub fn resolve_result_id(&self, args: &Value) -> Option<String> {
-        if let Some(id) = string_arg(args, "review_id") {
-            return Some(id);
-        }
-        if let Some(name) = string_arg(args, "session") {
-            return self.registry.latest_for_session(&name);
-        }
-        None
-    }
-
-    /// The `structuredContent` value for a `cross_model_review_result` call: the completed
-    /// envelope's value, or the reduced running variant, or `None` when there is nothing structured
-    /// to attach (an error result, or a snapshot that cannot be resolved). Best-effort and
-    /// non-blocking — called after [`review_result`](Self::review_result) has returned, so the
-    /// snapshot is already at its final state for this call. The text channel always carries the
-    /// same envelope in its `_OUT` block, so a missing `structuredContent` never loses information.
-    pub fn result_structured_content(&self, args: &Value) -> Option<Value> {
-        let review_id = string_arg(args, "review_id");
-        let session = string_arg(args, "session");
-        let id = match (&review_id, &session) {
-            (Some(id), _) => id.clone(),
-            (None, Some(name)) => self.registry.latest_for_session(name)?,
-            (None, None) => return None,
-        };
-        let snapshot = self.registry.snapshot(&id)?;
-        match snapshot.status {
-            Status::Completed => snapshot.envelope.as_ref().map(|e| e.to_structured_value()),
-            Status::Running => Some(crate::findings::running_structured_value(
-                &snapshot.session,
-                snapshot.turn,
-                running_progress_of(&snapshot),
-            )),
-            Status::Failed => None,
-        }
-    }
-
-    pub fn review_result(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+    /// Resolve the target review, attach as a waiter, and wait up to the budget — returning the
+    /// single final snapshot (and how long we waited). Both the text and `structuredContent`
+    /// channels render from this *one* snapshot, so they can never describe different reviews or
+    /// different states of the same review.
+    fn collect_snapshot(
+        &self,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<(Snapshot, u64), Failure> {
         let review_id = string_arg(args, "review_id");
         let session = string_arg(args, "session");
 
@@ -600,9 +601,37 @@ impl App {
             }
         };
 
+        Ok((snapshot, wait))
+    }
+
+    /// Collect a review and render just the text channel. Production goes through
+    /// [`review_result_both`](Self::review_result_both) (which also produces `structuredContent`
+    /// from the same snapshot); this text-only entry point is retained for tests that assert on the
+    /// rendered text.
+    #[cfg(test)]
+    pub fn review_result(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        let (snapshot, wait) = self.collect_snapshot(args, request)?;
+        self.render_snapshot(&snapshot, wait)
+    }
+
+    /// Collect a review once and render *both* channels from the same snapshot: the text, plus the
+    /// `structuredContent` envelope value when there is one (a `Failed` result carries neither — it
+    /// is returned as an error). Used by the MCP dispatch so the two channels always agree.
+    pub fn review_result_both(
+        &self,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<(String, Option<Value>), Failure> {
+        let (snapshot, wait) = self.collect_snapshot(args, request)?;
+        let text = self.render_snapshot(&snapshot, wait)?;
+        Ok((text, self.snapshot_structured_content(&snapshot)))
+    }
+
+    /// Render the text channel for a collected snapshot. `Failed` becomes the tool error.
+    fn render_snapshot(&self, snapshot: &Snapshot, wait: u64) -> Result<String, Failure> {
         match snapshot.status {
-            Status::Running => Ok(self.render_running(&snapshot, wait)),
-            Status::Completed => Ok(self.render_completed(&snapshot)),
+            Status::Running => Ok(self.render_running(snapshot, wait)),
+            Status::Completed => Ok(self.render_completed(snapshot)),
             Status::Failed => {
                 // Preserve the active-entry attribution the completed path renders: a failed
                 // review names the entry that ran, not just the reviewer family in the message.
@@ -615,6 +644,21 @@ impl App {
                     .with_active_note(snapshot.active.as_deref());
                 Err(failure)
             }
+        }
+    }
+
+    /// The `structuredContent` value for a collected snapshot: the completed envelope's value, or
+    /// the reduced running variant, or `None` for a failed result (which is an error, not a
+    /// structured payload). The text channel always carries the same envelope in its `_OUT` block.
+    fn snapshot_structured_content(&self, snapshot: &Snapshot) -> Option<Value> {
+        match snapshot.status {
+            Status::Completed => snapshot.envelope.as_ref().map(|e| e.to_structured_value()),
+            Status::Running => Some(crate::findings::running_structured_value(
+                &snapshot.session,
+                snapshot.turn,
+                running_progress_of(snapshot),
+            )),
+            Status::Failed => None,
         }
     }
 
@@ -638,25 +682,14 @@ impl App {
                  the review had come back."
             )
         };
-        // The running variant of the machine envelope on the text channel too, so a text-only
-        // client parses exactly one nonce-bearing `_OUT` block whether the review is running or
-        // done. It carries no convergence/findings group — there is nothing to decide yet — but does
-        // carry the same progress/liveness the text line shows.
-        let out_block = crate::findings::running_out_block(
-            &snapshot.id,
-            &snapshot.session,
-            snapshot.turn,
-            running_progress_of(snapshot),
-        );
-        format!(
+        let body = format!(
             "status:    {}\n\
              review_id: {}\n\
              session:   {} (turn {})\n\
              reviewer:  {}\n\
              elapsed:   {}s of a {}s budget\n\n\
              progress:  {}\n\n\
-             {next}\n\n\
-             {out_block}\n",
+             {next}\n",
             snapshot.status.as_str(),
             snapshot.id,
             snapshot.session,
@@ -672,6 +705,21 @@ impl App {
                 Duration::from_secs(self.cfg.max_wait_secs()),
                 !snapshot.shutting_down,
             ),
+        );
+        // Strip any sentinel marker line from the body (e.g. injected via the session name) before
+        // appending the one canonical running `_OUT` block, so a text-only client parses exactly one
+        // nonce-bearing block whether the review is running or done. The running variant carries no
+        // convergence/findings group — there is nothing to decide yet — but does carry the same
+        // progress/liveness the text line shows.
+        let out_block = crate::findings::running_out_block(
+            &snapshot.id,
+            &snapshot.session,
+            snapshot.turn,
+            running_progress_of(snapshot),
+        );
+        format!(
+            "{}\n{out_block}\n",
+            crate::findings::strip_marker_lines(&body)
         )
     }
 
@@ -797,10 +845,15 @@ impl App {
             ));
         }
 
+        // Neutralise any sentinel marker line anywhere in the assembled body — from the session
+        // name, a warning, a denied-command string, or prose bearing a stale/foreign nonce — before
+        // appending the one canonical `_OUT` block. This is what guarantees a text-only client sees
+        // exactly one parseable envelope block and it is the server's, not attacker-controlled.
+        let mut out = crate::findings::strip_marker_lines(&out);
+
         // The machine-readable envelope on the text channel too, so a client that reads only
         // `content[].text` still gets the structured verdict without a second round trip. Exactly
-        // one server `_OUT` block, bearing this review's nonce; the reviewer's own `_IN` block was
-        // stripped from the prose above.
+        // one server `_OUT` block, bearing this review's nonce, appended after the strip above.
         if let Some(envelope) = &snapshot.envelope {
             out.push('\n');
             out.push_str(&envelope.to_out_block(&snapshot.id));
@@ -1684,6 +1737,12 @@ impl Job {
                 let _ = self
                     .sessions
                     .set_terminal_reason(&self.session, "ledger_too_large");
+                // No reviewer ran, so no marker should be left implying an in-flight turn. The
+                // Perforce `.pending` marker was set by `run` before this check; clear it so the
+                // terminal state (not a stale marker) is what the next call sees.
+                if self.cfg.vcs == crate::config::Vcs::Perforce {
+                    let _ = self.sessions.clear_pending(&self.session);
+                }
                 let envelope =
                     crate::findings::over_budget_on_entry_envelope(&self.session, turn, prior);
                 return Ok(Outcome {
@@ -1814,9 +1873,12 @@ impl Job {
         let terminal_reason_to_persist: Option<String> = turn_eval
             .over_budget
             .then(|| "ledger_too_large".to_string());
-        parsed.text = crate::findings::strip_lookalike_out_markers(
-            &crate::findings::strip_reviewer_block(&parsed.text, &self.id),
-        );
+        // Remove the reviewer's own machine block (exact nonce) from the prose we store, so the
+        // human review keeps its narrative but not the transport block. Any *other* stray marker
+        // line (a wrong-nonce block, or one injected via another field) is neutralised at render
+        // time by `strip_marker_lines` over the whole result body, right before the canonical
+        // `_OUT` block is appended.
+        parsed.text = crate::findings::strip_reviewer_block(&parsed.text, &self.id);
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
@@ -1876,7 +1938,10 @@ impl Job {
         // mapping but never advanced the baseline, so the next turn subtracted against a
         // stale total and double-counted this one.
         let record_under = parsed.session_id.as_deref().or(resume_id);
-        let resumable = match record_under {
+        // Whether this turn was durably recorded. Distinct from `resumable` below: a turn can be
+        // durable yet non-resumable (an over-budget turn persists a terminal state that refuses the
+        // next resume).
+        let durable = match record_under {
             Some(session_id) => {
                 if parsed.session_id.is_none() {
                     eprintln!(
@@ -2049,11 +2114,14 @@ impl Job {
         // (`record_turn` failed, or the reviewer reported no id to record under), the durable
         // outcome is `turn_not_durable` with the pre-turn on-disk coverage — the caller escalates
         // and rebaselines rather than resuming on a ledger that disagrees with the reviewer.
-        let envelope = if resumable {
+        let envelope = if durable {
             turn_eval.envelope
         } else {
             crate::findings::not_durable_envelope(&self.session, turn, prior_snapshot.as_ref())
         };
+        // A durable but over-budget turn has persisted a sticky `terminal_reason`, so the next
+        // resume will be refused: do not invite one. Only a durable, in-budget turn is resumable.
+        let resumable = durable && !turn_eval.over_budget;
 
         Ok(Outcome {
             review: Some(parsed.text),

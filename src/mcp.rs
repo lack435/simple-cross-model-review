@@ -558,21 +558,12 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
         .unwrap_or_else(|| json!({}));
 
     // `cross_model_review_result` is handled on its own: it carries the machine-readable envelope
-    // as `structuredContent` (MCP 2025-06-18) alongside the `_OUT` block already in the text, and it
-    // pins the target review id up front so both channels describe the *same* review even if a new
-    // review for the session starts between rendering them.
+    // as `structuredContent` (MCP 2025-06-18) alongside the `_OUT` block already in the text.
+    // `review_result_both` resolves the target and waits *once*, then renders both channels from the
+    // same final snapshot, so they can never describe different reviews or different states.
     if name == "cross_model_review_result" {
-        let mut call_args = args.clone();
-        if let Some(id) = app.resolve_result_id(&args) {
-            if let Some(obj) = call_args.as_object_mut() {
-                obj.insert("review_id".to_string(), json!(id));
-                obj.remove("session"); // review_id is now authoritative
-            }
-        }
-        return match app.review_result(&call_args, request) {
-            Ok(text) => {
-                text_result_with_structured(text, app.result_structured_content(&call_args))
-            }
+        return match app.review_result_both(&args, request) {
+            Ok((text, structured)) => text_result_with_structured(text, structured),
             Err(failure) => text_result(failure.render_for_agent(), true),
         };
     }
