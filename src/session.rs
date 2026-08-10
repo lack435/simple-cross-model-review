@@ -37,6 +37,21 @@ pub enum MarkerState {
 /// guards a read-modify-write of a small JSON file.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 
+/// A reviewer entry's binary *as configured*, stored so a resume can match the entry that
+/// created a session without resolving (and thus preflighting) any other entry.
+///
+/// The tag is what makes a **new** PATH-backed entry (`PathSearch`) distinguishable from a
+/// **legacy** record that predates the field (`SessionRecord::raw_bin == None`): a bare
+/// `Option<PathBuf>` would collapse both to `None` and misapply the legacy exact-one rule. See
+/// `docs/reviewer-fallback-chain.md`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawBin {
+    /// No `--bin` was given: the CLI is resolved from PATH.
+    PathSearch,
+    /// An explicit `--bin <path>` was configured.
+    Explicit(String),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub reviewer: String,
@@ -108,6 +123,17 @@ pub struct SessionRecord {
     /// inventory can never be eluded against. `None` for git or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perforce_baseline: Option<PerforceBaseline>,
+    /// The reviewer entry's binary *as configured* (raw), used to match the chain entry that
+    /// created this session on resume without resolving any other entry. `None` on a record
+    /// written before the reviewer chain existed — matched leniently (exactly-one) then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bin: Option<RawBin>,
+    /// The path the entry's binary *resolved to* when the session was created. Verified against a
+    /// fresh (uncached) resolution on resume: a mismatch means PATH now points at a different
+    /// executable/account, and the resume is refused rather than continued through the wrong
+    /// binary. `None` on a legacy record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_bin: Option<String>,
 }
 
 /// What a completed turn contributes to its session's record.
@@ -139,6 +165,10 @@ pub struct TurnFacts<'a> {
     pub include_shelved: Option<bool>,
     pub capture_identity: Option<CaptureIdentity>,
     pub perforce_baseline: Option<PerforceBaseline>,
+    /// The active reviewer entry's binary as configured, and the path it resolved to, so a resume
+    /// can match this entry and detect PATH drift.
+    pub raw_bin: RawBin,
+    pub resolved_bin: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -198,6 +228,8 @@ impl SessionStore {
             include_shelved,
             capture_identity,
             perforce_baseline,
+            raw_bin,
+            resolved_bin,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -256,6 +288,8 @@ impl SessionStore {
                 // exactly what the reviewer was last shown, so it is stored directly and never
                 // inherited -- a stale inventory must never be eluded against.
                 perforce_baseline,
+                raw_bin: Some(raw_bin),
+                resolved_bin: Some(resolved_bin),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -275,6 +309,8 @@ impl SessionStore {
                 include_shelved,
                 capture_identity,
                 perforce_baseline,
+                raw_bin: Some(raw_bin),
+                resolved_bin: Some(resolved_bin),
             },
         };
 

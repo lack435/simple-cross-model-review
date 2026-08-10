@@ -91,6 +91,15 @@ pub struct ReviewerSpec {
 }
 
 impl ReviewerSpec {
+    /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
+    /// legacy session record with no stored bin. Persisted on the session for resume matching.
+    pub fn raw_bin(&self) -> crate::session::RawBin {
+        match &self.bin {
+            None => crate::session::RawBin::PathSearch,
+            Some(path) => crate::session::RawBin::Explicit(path.to_string_lossy().into_owned()),
+        }
+    }
+
     /// A short identity label for prompts, errors, and the chain description.
     pub fn describe(&self) -> String {
         format!(
@@ -710,6 +719,35 @@ impl Config {
         // `reviewers` is non-empty by construction (`from_args` requires `--reviewer`, and
         // `validate_chain` rejects an empty vector), so indexing [0] cannot panic.
         &self.reviewers[0]
+    }
+
+    /// The chain index of the entry that matches a stored session's identity, if any.
+    ///
+    /// A resume must run the entry that *created* the session (which may be a fallback), not the
+    /// primary. Matching is on the full raw identity: reviewer, model, effort, and raw bin. A
+    /// legacy record with no stored raw bin (`raw_bin` is `None`) matches on reviewer/model/effort
+    /// alone, and only if *exactly one* entry matches — an ambiguous legacy record is refused
+    /// rather than bound to a guessed executable. See `docs/reviewer-fallback-chain.md`.
+    pub fn resume_entry_index(&self, record: &crate::session::SessionRecord) -> Option<usize> {
+        let base_match = |s: &ReviewerSpec| {
+            s.reviewer.as_str() == record.reviewer
+                && s.model == record.model
+                && s.effort == record.effort
+        };
+        match &record.raw_bin {
+            Some(raw) => self
+                .reviewers
+                .iter()
+                .position(|s| base_match(s) && &s.raw_bin() == raw),
+            None => {
+                // Legacy record: match on the fields it carries, but only if unambiguous.
+                let mut matches = self.reviewers.iter().enumerate().filter(|(_, s)| base_match(s));
+                match (matches.next(), matches.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            }
+        }
     }
 
     /// Validate the reviewer chain's *semantics*, distinct from parse syntax.

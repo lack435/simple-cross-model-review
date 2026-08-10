@@ -50,13 +50,13 @@ struct Preflight {
 
 pub struct App {
     cfg: Arc<Config>,
-    reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
-    /// Successful preflights are cached for the process lifetime; failures are not, so
-    /// a user who runs `codex login` can retry without restarting the agent session.
-    preflight: Mutex<Option<Preflight>>,
+    /// Successful preflights are cached for the process lifetime, keyed by chain-entry index, so
+    /// a chain's entries are each resolved and auth-checked at most once. Failures are not
+    /// cached, so a user who runs `codex login` can retry without restarting the agent session.
+    preflight: Mutex<std::collections::HashMap<usize, Preflight>>,
     /// Set when the reviewer chain is semantically invalid (`Config::validate_chain`). While
     /// present, every review is refused in-band with this `INVALID_REVIEWER_CHAIN` failure
     /// rather than the server exiting — see `docs/reviewer-fallback-chain.md`. Checked before
@@ -68,7 +68,6 @@ impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
         let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
-        let reviewer = reviewer::for_kind(cfg.primary().reviewer);
         // The chain's semantics are validated once, here. On failure the server still starts,
         // but every review is refused in-band with this failure (see `chain_error`).
         let chain_error = Config::validate_chain(&cfg.reviewers)
@@ -78,11 +77,10 @@ impl App {
         let cfg_max_concurrent = cfg.max_concurrent_reviews;
         Self {
             cfg: Arc::new(cfg),
-            reviewer: Arc::from(reviewer),
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
-            preflight: Mutex::new(None),
+            preflight: Mutex::new(std::collections::HashMap::new()),
             chain_error,
         }
     }
@@ -119,18 +117,33 @@ impl App {
     }
 
     fn ensure_ready(&self) -> Result<Preflight, Failure> {
+        self.ensure_ready_for(0)
+    }
+
+    /// Resolve and auth-check a specific chain entry, caching the result by index.
+    ///
+    /// The adapter is selected per entry (`for_kind`), so a mixed-family chain preflights each
+    /// entry with its own CLI. Called for the *selected* entry (entry 0 for a fresh review, the
+    /// resume-matched entry otherwise) before the worker starts; fallback entries are preflighted
+    /// by the walk itself as it reaches them.
+    fn ensure_ready_for(&self, index: usize) -> Result<Preflight, Failure> {
         if let Some(cached) = self
             .preflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .get(&index)
+            .cloned()
         {
             return Ok(cached);
         }
-        let bin = reviewer::resolve_bin(self.cfg.primary())?;
-        let auth = self.reviewer.auth_check(&bin, &self.cfg)?;
+        let spec = &self.cfg.reviewers[index];
+        let bin = reviewer::resolve_bin(spec)?;
+        let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg)?;
         let ready = Preflight { bin, auth };
-        *self.preflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(ready.clone());
+        self.preflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index, ready.clone());
         Ok(ready)
     }
 
@@ -189,8 +202,6 @@ impl App {
         }
         let changes_canonical = crate::changeset::canonical(&changes);
 
-        let ready = self.ensure_ready()?;
-
         // The lease comes first, before the session record is read. Reading first would
         // be a stale-read race: another server process can finish a `fresh` review, or
         // rebind an expired session to a new id, while we are still waiting for the
@@ -228,6 +239,38 @@ impl App {
             None => (None, 1, false),
         };
 
+        // Select the entry to start on, then preflight *only* that entry: for a fresh review the
+        // primary (index 0, then the walk); for a resume the entry that created the session
+        // (matched above by `resume_block`, so `resume_entry_index` is `Some`). This is what keeps
+        // a resume of a fell-back session from dying on the primary's CLI. Preflight runs here,
+        // under the lease and after selection, never unconditionally against the primary.
+        let start_index = match &prior {
+            Some(record) => self.cfg.resume_entry_index(record).unwrap_or(0),
+            None => 0,
+        };
+        let ready = self.ensure_ready_for(start_index)?;
+
+        // PATH-drift guard on resume: the selected entry's binary is re-resolved *uncached* and
+        // compared to what the session was created with. A mismatch means PATH now points at a
+        // different executable (or account), so the conversation must not be resumed through it.
+        if let Some(record) = &prior {
+            if let Some(stored) = &record.resolved_bin {
+                let fresh = reviewer::resolve_bin(&self.cfg.reviewers[start_index])
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if &fresh != stored {
+                    return Err(errors::session_not_resumable(
+                        &session,
+                        format!(
+                            "it was created with the reviewer binary at '{stored}', but that entry \
+                             now resolves to '{fresh}'; PATH or the install changed, so the \
+                             conversation cannot be resumed through a different executable."
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Claiming the session and registering the review are one atomic step, so two
         // concurrent calls cannot both start a review against the same conversation. It
         // can also refuse because the server is going away: this handler may have spent
@@ -256,8 +299,9 @@ impl App {
 
         let job = Job {
             cfg: Arc::clone(&self.cfg),
-            reviewer: Arc::clone(&self.reviewer),
-            spec: self.cfg.primary().clone(),
+            reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
+            spec: self.cfg.reviewers[start_index].clone(),
+            start_index,
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             metrics: Arc::clone(&self.metrics),
@@ -752,9 +796,12 @@ struct Job {
     reviewer: Arc<dyn Reviewer>,
     /// The active chain entry this job runs. Its adapter is `reviewer` and its resolved binary
     /// is `bin`. Every identity-bearing call on the run path reads this, never `cfg.primary()`,
-    /// so a fallback names the reviewer that actually ran. For now this is always the primary;
-    /// the fall-through walk that advances it lands in a later commit.
+    /// so a fallback names the reviewer that actually ran. The walk re-sets it per entry.
     spec: ReviewerSpec,
+    /// The chain index the walk starts on: 0 for a fresh review (it then walks the chain), or the
+    /// resume-matched entry (which runs alone, no fall-through). Its bin is already in `self.bin`,
+    /// preflighted in `start_review`, so the walk does not re-resolve it.
+    start_index: usize,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
@@ -1078,10 +1125,12 @@ impl Job {
         // docs/reviewer-fallback-chain.md.
         let chain = self.cfg.reviewers.clone();
         let n = chain.len();
+        // A fresh review walks from the selected start (0) to the end; a resume runs its single
+        // bound entry alone.
         let walk: Vec<usize> = if resume_id.is_none() {
-            (0..n).collect()
+            (self.start_index..n).collect()
         } else {
-            vec![0]
+            vec![self.start_index]
         };
 
         let mut disposition = disposition;
@@ -1093,11 +1142,11 @@ impl Job {
             // Publish the active entry: every identity-bearing read on the run path follows it.
             self.reviewer = Arc::from(reviewer::for_kind(entry.reviewer));
             self.spec = entry.clone();
-            // Entry 0 was preflighted in `start_review` (its bin is in `self.bin`). A *fallback*
-            // entry is resolved and auth-checked here, lazily -- a fallback whose CLI is missing
-            // or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it stops the
-            // walk) rather than troubling a healthy primary.
-            if i != 0 {
+            // The selected entry was preflighted in `start_review` (its bin is in `self.bin`). A
+            // *fallback* entry is resolved and auth-checked here, lazily -- a fallback whose CLI
+            // is missing or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it
+            // stops the walk) rather than troubling a healthy primary.
+            if i != self.start_index {
                 match reviewer::resolve_bin(&entry) {
                     Ok(bin) => self.bin = bin,
                     Err(f) => {
@@ -1486,6 +1535,10 @@ impl Job {
                             .then_some(self.include_shelved),
                         capture_identity: capture_identity.cloned(),
                         perforce_baseline: perforce_baseline.cloned(),
+                        // The active entry's identity, so a resume can match this exact entry and
+                        // detect PATH drift.
+                        raw_bin: self.spec.raw_bin(),
+                        resolved_bin: self.bin.to_string_lossy().into_owned(),
                     },
                 ) {
                     Ok(_) => {
@@ -1636,18 +1689,16 @@ fn resume_block(
     // created it. A configuration that now points elsewhere cannot resume that conversation
     // at all, so the honest answer is to start over -- explicitly, so the caller learns the
     // earlier context is gone rather than inheriting it silently.
-    if record.reviewer != cfg.primary().reviewer.as_str() {
+    // A session belongs to the reviewer *entry* that created it, which may be a fallback rather
+    // than the primary. It resumes only if some configured entry still matches its full identity
+    // (reviewer, model, effort, raw bin); a chain edited out from under it cannot resume that
+    // conversation, so the honest answer is to start over -- explicitly.
+    if cfg.resume_entry_index(record).is_none() {
         return Some(format!(
-            "it was created by reviewer '{}', but this server is now configured for '{}', and \
-             a conversation cannot move between reviewers.",
-            record.reviewer,
-            cfg.primary().reviewer.as_str()
-        ));
-    }
-    if record.model != cfg.primary().model {
-        return Some(format!(
-            "it was created with model '{}', but this server is now configured for '{}'.",
-            record.model, cfg.primary().model
+            "no reviewer in the configured chain matches this session's reviewer '{}', model \
+             '{}' and effort '{}'; the chain was changed since it was created, and a conversation \
+             cannot move between reviewers.",
+            record.reviewer, record.model, record.effort
         ));
     }
     let cwd = cfg.cwd.to_string_lossy();
