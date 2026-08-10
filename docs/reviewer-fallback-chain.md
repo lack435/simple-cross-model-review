@@ -1,10 +1,10 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1–6.** This document is the plan. Per
+Status: **proposed — revised after cross-review rounds 1–7.** This document is the plan. Per
 this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Rounds 1–6 each returned REQUEST
-CHANGES — seven findings, then six, five, six, six, and two, all accepted; the sections below
-fold each one in, and [Review history](#review-history) records where. It is the plan for
+effort=max) and reach APPROVE before implementation begins. Rounds 1–7 each returned REQUEST
+CHANGES — seven findings, then six, five, six, six, two, and one, all accepted; the sections
+below fold each one in, and [Review history](#review-history) records where. It is the plan for
 [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
@@ -346,11 +346,13 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
   [reviewer/mod.rs:154]) — PATH can be arbitrarily long, so it is **not** a bounded fixed
   term and the plan no longer claims it is. `preflight_cap` sizes the part that *is*
   bounded and cancellable — `auth_check` (the timeout at [claude.rs:36]/[codex.rs:27], now
-  given the cancellation probe below) and its output-drain grace — and the PATH scan is an
-  explicit **uninterruptible residual** that sits outside the deadline, exactly the kind of
-  residual `single-blocking-collect.md` already documents for the drain grace. `drain_grace`
-  is the reviewer turn's own per-invocation drain ([reviewer/mod.rs:472]), counted once per
-  attempt because each attempt is its own process.
+  given the cancellation probe below) — **plus a bounded, non-cancellable drain tail**, since
+  `collect`'s drain loop does not consult the probe (see the probe bullet). Two residuals sit
+  outside what a cancel can shorten, then: that fixed drain tail, and the `resolve_bin` PATH
+  scan, which is additionally unbounded — exactly the kind of residual
+  `single-blocking-collect.md` already documents. `drain_grace` is the reviewer turn's own
+  per-invocation drain ([reviewer/mod.rs:472]), counted once per attempt because each attempt
+  is its own process, and it too is a bounded non-cancellable tail.
 - **The cancellation bridge is a single probe threaded through both phases.** Round 5 rightly
   said "pass the cancel token" was under-defined: today `auth_check` hands `run` a *fresh,
   uncancellable* `AtomicBool` ([reviewer/mod.rs:359]), and the selected entry's preflight runs
@@ -762,7 +764,8 @@ maintainer as the cost of foundational completeness. Touched:
   `for_kind(spec.reviewer)`; `resolve_bin`, `auth_check`, `invocation`, `parse`, the
   truncation/`spawn_failed` constructors and the `classify` identity arguments all take the
   active `ReviewerSpec` (or its fields) rather than `cfg`; `auth_check` accepts the
-  cancellation token + deadline so a fallback preflight is interruptible.
+  cancellation probe + deadline so a fallback preflight's *running child* is interruptible (its
+  bounded drain tail is not).
 - **`registry.rs`**: a **mutable active identity** on the running state, set per attempt via
   `set_active` under the existing `State` mutex ([registry.rs:432]); `Outcome`/`Snapshot` carry
   the attempted reviewer/model/effort/resolved-bin so both running and terminal results name who
@@ -847,14 +850,15 @@ Unit tests (no network, no model call), extending the existing fakes:
   read by both.
 - **Prompt bytes**: after a fall-through, `Record.prompt_bytes` is the final attempt's size and
   each `Attempt.prompt_bytes` is its own.
-- **Budget**: the tests assert the *arithmetic* and the *cancellable deadlines* separately,
+- **Budget**: the tests assert the *arithmetic* and the *cancellable child phase* separately,
   never a hard wall-clock ceiling (round 6: the prose disclaims one, so a test must not
   assert it). Specifically: a single-entry `chain_budget` equals today's `max_wait_secs`
   exactly (the invariant); the multi-entry `chain_budget` equals the formula for given `N`,
   `timeout`, and grace; the displayed budget equals `chain_budget`, not `cfg.timeout`; and
-  cancellation during a fallback auth check stops the walk promptly (assert the probe reaches
-  `auth_check`). The uninterruptible `resolve_bin` PATH-scan residual is explicitly *not*
-  asserted to fit inside the deadline.
+  cancellation during a fallback auth check stops the *running child* promptly (assert the
+  probe reaches `auth_check`). The two residuals a cancel cannot shorten — the bounded drain
+  tail and the unbounded `resolve_bin` PATH scan — are explicitly *not* asserted to fit inside
+  the deadline.
 - **Metrics completeness**: a logical turn whose `attempts` include a rate-limited primary with
   unavailable usage is summarised as **partial/unknown**, not complete, even though the
   successful fallback's own usage is complete; fixtures cover records with and without the
@@ -993,6 +997,13 @@ now reflects.
   residual ([Testing]). (2, minor) The cancellation probe stopped the child but not `collect`'s
   drain loop → the drain grace is documented as a bounded non-cancellable tail, with threading
   the probe into `collect` noted as an optional tightening ([The fall-through, budget]).
+
+- **Round 7 (same session, turn 7) — REQUEST CHANGES.** One minor wording inconsistency: after
+  documenting the drain grace as non-cancellable, `preflight_cap` still described that grace as
+  part of the "cancellable" auth invocation. Fixed by describing `preflight_cap` as the bounded
+  auth invocation *plus a bounded non-cancellable drain tail*, and by rewording the testing and
+  blast-radius text to distinguish the cancellable running-child phase from the drain residual
+  ([The fall-through, budget], [Testing]). No functional change.
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
