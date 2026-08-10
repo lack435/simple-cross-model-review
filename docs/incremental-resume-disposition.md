@@ -242,12 +242,15 @@ Then thread the disposition out through `Capture` (which already carries `head_s
 
 The Perforce full-capture reasons are **decided in two different places**, and each successive
 review found the first drafts under-enumerating them. The taxonomy below is meant to be
-*complete*: every path on which `elision_active` (`src/vcs/perforce.rs:149`) or the pre-capture
-guards return "do not elide" maps to exactly one reason, so a resumed Perforce full capture can
-never come back unclassified or mislabelled. The round-4 review found three such uncovered
-paths — an absent baseline, a `None` persisted binding field, and an *unconfirmed* (not
-*changed*) identity — which the earlier drafts left with no reason or blamed on
-`IdentityChanged`.
+*complete* and *deterministic* — but note precisely what "non-overlapping" means here, because
+the round-6 review rightly pushed on it. The underlying predicates are **not** mutually
+exclusive: a turn can be both `PriorBindingIncomplete` and `PriorBaselineUnusable`, or both
+`IdentityChanged` and `ModeOrShelvedChanged`, at once. What is guaranteed is that **exactly one
+reason is *selected*, by the precedence order below** — "complete" meaning every "do not elide"
+path maps to at least one reason (none comes back unclassified), and "non-overlapping" meaning
+the precedence picks exactly one. The round-4 review found three uncovered paths — an absent
+baseline, a `None` persisted binding field, and an *unconfirmed* (not *changed*) identity —
+which the earlier drafts left with no reason or blamed on `IdentityChanged`.
 
 These reasons are reached **only after the G0 and G1 gates above** — a fresh turn is `Full`
 (never a `PriorBaselineMissing` fall-back) and `--no-incremental-resume` is `FullByDesign
@@ -257,8 +260,11 @@ round-5 review found the marker guards otherwise firing on a disabled run).
 **Decided in `tools.rs`, before capture** (`:805-833`), which forces `resume = None` in these
 cases:
 
-- `PriorBaselineMissing` — a **resumed** session that carries **no** Perforce baseline (the
-  prior turn persisted none, e.g. it recorded `Disabled`). The Perforce analogue of git's
+- `PriorBaselineMissing` — a **resumed** session whose `perforce_baseline` is **`None`**: the
+  prior turn persisted no baseline field at all. Strictly `None`, **not** `Some(Disabled)` — a
+  persisted `Disabled` is a *present* baseline that is unusable, which is `PriorBaselineUnusable`
+  below (the round-6 review drew this line: `tools.rs` passes `Some(Disabled)` to the backend,
+  where `usable_inventory()` rejects it). The Perforce analogue of git's
   `NoCompleteBaselineRetained`. A *fresh* session with no baseline is G0's `Full`, not this.
 - The **marker guards**, decided from a three-valued marker read (present / absent /
   **unreadable**), because `is_pending()` returns `true` on any marker-state I/O error
@@ -298,11 +304,15 @@ durability — the most immediate failure) → `PriorTurnPending` → `MarkerSta
 `PriorBaselineMissing` → `PriorBindingIncomplete` → `IdentityUnconfirmed` → `IdentityChanged` →
 `ModeOrShelvedChanged` → `PriorBaselineUnusable`.
 
-**One case falls outside the disposition entirely:** `MarkerUnwritable` on a **fresh** turn
-(no `resume_id`). The disposition is suppressed there (nothing was resumed), but the failed
-marker write still means the *next* turn cannot safely elide — so it must surface as an
-ordinary **persistence warning**, on its own footing, independent of the disposition machinery,
-exactly as other persistence failures already do.
+**`MarkerUnwritable` always warns, independent of the disposition.** A failed `mark_pending()`
+means the *next* turn cannot safely elide, and that is true whether or not this turn rendered a
+disposition. So whenever a result reaches the caller, `MarkerUnwritable` surfaces as an ordinary
+**persistence warning**, on its own footing — not only on a fresh turn. The round-6 review found
+the gap: a **resumed** turn that sent no change has its disposition suppressed by G0, but if
+`mark_pending()` also failed, the turn is still forced to persist `Disabled` and the next turn
+still cannot elide, so the warning must fire there too. G0 suppresses only the *disposition*
+output, never this persistence warning — the same discipline as the failed-capture warnings
+above.
 
 ### What the detail can honestly say
 
@@ -446,9 +456,16 @@ nothing.
   `MarkerStateUnreadable` (read errored, asserting it is **not** a false `PriorTurnPending`).
   `PriorBindingIncomplete` is tested in all three shapes, including the round-5 case: a
   persisted `identity: Some` whose nested `client_spec_digest` is `None` paired with a usable
-  `Full` inventory (asserting it is **not** left unclassified and **not** `IdentityChanged`). A
-  precedence test exercises `MarkerUnwritable` winning when it and `PriorTurnPending` both hold,
-  and a `Disabled`-plus-marker-failure test asserts G1 wins (info line, **no** warning).
+  `Full` inventory (asserting it is **not** left unclassified and **not** `IdentityChanged`).
+  `PriorBaselineMissing` (`perforce_baseline == None`) is tested distinctly from
+  `PriorBaselineUnusable` (`Some(Disabled)`), per round-6 finding 1. **Precedence** is tested for
+  the combinations where predicates genuinely co-occur (round-6 finding 2), not just one pair:
+  `MarkerUnwritable` over `PriorTurnPending`; G1 `Disabled` over a marker failure (info line,
+  **no** warning); `PriorBindingIncomplete` over `PriorBaselineUnusable`; `IdentityChanged` over
+  `ModeOrShelvedChanged`.
+- **Unit, persistence warning (round-6 finding 3):** a resumed, no-change turn whose
+  `mark_pending()` fails emits **no** disposition (G0) but **does** emit the ordinary
+  `MarkerUnwritable` persistence warning — asserting G0 suppresses only disposition output.
 - **Unit, git round trip:** a two-turn temp repo asserts turn 2's disposition is
   `Incremental` over `prior..HEAD` and that the caller-facing line contains the range.
 - **Unit, tools:** a resumed turn that sent a change emits the disposition line; a fresh turn
