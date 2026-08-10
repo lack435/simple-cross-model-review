@@ -202,6 +202,15 @@ pub fn neutral_dir(cfg: &Config) -> PathBuf {
 ///
 /// Shared with the diff capture, which uses it as a security check rather than a
 /// convenience, so there is deliberately one implementation and not two.
+/// The user's home directory, for locating a CLI's local account/session files. Honours the
+/// platform's usual variables (`USERPROFILE` on Windows, then `HOME`). `None` if neither is set.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
     let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
@@ -239,6 +248,25 @@ pub trait Reviewer: Send + Sync {
         out: &RunOutcome,
         last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure>;
+
+    /// Observe this reviewer's usage-remaining headroom from its own machine output, read on
+    /// **both** the success and failure paths (a rate-limited refusal is exactly the account the
+    /// gate should skip next time). Reads only CLI-owned machine output — Codex's rollout
+    /// `token_count.rate_limits`, Claude's `rate_limit_event` — never the model's prose. Called
+    /// only when the chain is armed (`Config::chain_gates_on_usage`). Default `Unknown`
+    /// (fail-open). See `docs/usage-remaining-gate.md`.
+    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, _out: &RunOutcome) -> Headroom {
+        Headroom::Unknown
+    }
+
+    /// A cheap, *current*, local account identifier for this reviewer — the one the store keys a
+    /// usage observation under, so a snapshot cannot cross an account switch. Read from the CLI's
+    /// own local account file (Codex `$CODEX_HOME/auth.json`, Claude `~/.claude.json`), never via
+    /// a CLI call and never a secret; `None` when it cannot be read (the gate then fails open).
+    /// See `docs/usage-remaining-gate.md`.
+    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
+        None
+    }
 }
 
 pub fn for_kind(kind: ReviewerKind) -> Box<dyn Reviewer> {
@@ -839,6 +867,71 @@ mod session_id_tests {
         assert_eq!(normalize_session_id(Some("\t\n".to_string())), None);
         // Absent stays absent.
         assert_eq!(normalize_session_id(None), None);
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_always_clears() {
+        assert!(Headroom::Unknown.clears(&UsageMinimum::Remaining(90)));
+        assert!(Headroom::Unknown.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+    }
+
+    #[test]
+    fn fraction_clears_at_or_above_the_minimum() {
+        let h = Headroom::Fraction {
+            remaining_pct: 17.0,
+            resets_at: None,
+        };
+        assert!(h.clears(&UsageMinimum::Remaining(10)));
+        assert!(h.clears(&UsageMinimum::Remaining(17)));
+        assert!(!h.clears(&UsageMinimum::Remaining(18)));
+        assert!(h.clears(&UsageMinimum::None));
+    }
+
+    #[test]
+    fn level_ranks_ample_highest_not_by_declaration_order() {
+        // The load-bearing check: an accidental derived Ord would rank Ample lowest.
+        assert!(HeadroomLevel::Ample.rank() > HeadroomLevel::Warning.rank());
+        assert!(HeadroomLevel::Warning.rank() > HeadroomLevel::Exhausted.rank());
+
+        let ample = Headroom::Level {
+            level: HeadroomLevel::Ample,
+            resets_at: None,
+        };
+        let warning = Headroom::Level {
+            level: HeadroomLevel::Warning,
+            resets_at: None,
+        };
+        let rejected = Headroom::Level {
+            level: HeadroomLevel::Exhausted,
+            resets_at: None,
+        };
+        // min=ample: only ample clears.
+        assert!(ample.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        assert!(!warning.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        assert!(!rejected.clears(&UsageMinimum::Status(HeadroomLevel::Ample)));
+        // min=warning: ample and warning clear, rejected does not.
+        assert!(ample.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+        assert!(warning.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+        assert!(!rejected.clears(&UsageMinimum::Status(HeadroomLevel::Warning)));
+    }
+
+    #[test]
+    fn status_strings_map_and_unknown_is_none() {
+        assert_eq!(HeadroomLevel::from_status("allowed"), Some(HeadroomLevel::Ample));
+        assert_eq!(
+            HeadroomLevel::from_status("allowed_warning"),
+            Some(HeadroomLevel::Warning)
+        );
+        assert_eq!(
+            HeadroomLevel::from_status("rejected"),
+            Some(HeadroomLevel::Exhausted)
+        );
+        assert_eq!(HeadroomLevel::from_status("some_new_state"), None);
     }
 }
 
