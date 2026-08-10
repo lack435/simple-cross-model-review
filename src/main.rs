@@ -16,6 +16,7 @@ mod changeset;
 mod config;
 mod digest;
 mod errors;
+mod evidence;
 mod findings;
 mod mcp;
 mod metrics;
@@ -37,6 +38,30 @@ use tools::{version_line, App};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Internal compatibility fixture for the Codex evidence-service work. This is handled
+    // before normal server configuration on purpose: the child must expose only its one
+    // read-only probe tool and must never construct `App` or the review tools. It is not
+    // advertised in --help and is removed once Phase 0 has established the external CLI
+    // contracts and the real `--evidence-server` mode replaces it.
+    if args.first().map(String::as_str) == Some(evidence::PROBE_FLAG) {
+        let nonce = args.get(1).map(String::as_str).unwrap_or("");
+        let approval_control = args.get(2).map(String::as_str) == Some("approval-control");
+        if !(args.len() == 2 || (args.len() == 3 && approval_control))
+            || !evidence::valid_probe_nonce(nonce)
+        {
+            eprintln!(
+                "cross-review: {} requires one 1..=128 character ASCII nonce (letters, digits, '-' or '_') and optional 'approval-control'.",
+                evidence::PROBE_FLAG
+            );
+            std::process::exit(2);
+        }
+        if let Err(e) = evidence::serve_probe_stdio(nonce, approval_control) {
+            eprintln!("cross-review: evidence probe failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
