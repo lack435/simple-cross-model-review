@@ -119,12 +119,24 @@ construction rather than by tool description.
 
 The parent process launches its own absolute executable path as this server through explicit
 `-c mcp_servers.<reserved-name>.*` overrides on `codex exec`. Those overrides are passed on
-fresh and resumed turns. Default isolation passes `--ignore-user-config` and `--ignore-rules`,
-and adds a command-line `projects.<canonical-root>.trust_level="untrusted"` override. The first
-flag skips `$CODEX_HOME/config.toml`, the second skips user/project exec-policy rules, and the
-trust override skips the reviewed repository's `.codex/` config, hooks, rules, agents, and
-other project layer even when the caller has trusted that checkout. `--ignore-user-config`
-alone does **not** suppress trusted-project config. System/managed policy remains in force.
+fresh and resumed turns. Default isolation passes `--ignore-user-config`, `--ignore-rules`,
+and `--skip-git-repo-check`, and runs Codex from a canonical, cross-review-owned empty working
+directory outside the reviewed repository. The parent creates that directory without links,
+verifies before every fresh or resumed turn that it is still a directory, contains no
+`.codex` layer or other entries, and is not within the reviewed root, and refuses the review
+if any invariant fails. The directory is stable for the lifetime of a reviewer session so
+resume uses the same working root.
+
+This sterile-root design removes reviewed-project path spelling from the isolation boundary:
+Codex has no reviewed-project `.codex/` layer to discover regardless of how Codex normalizes
+drive letters, case, trailing separators, short names, junctions, or UNC paths. The first flag
+skips `$CODEX_HOME/config.toml`, the second skips user/project exec-policy rules, and the empty
+working root removes the reviewed repository's config, hooks, agents, and other project layer
+even when the caller has trusted that checkout. `--ignore-user-config` alone does **not**
+suppress trusted-project config. System/managed policy remains in force. This is also a repair
+to the currently shipping Codex reviewer isolation boundary, which today runs in a trusted
+reviewed checkout with only `--ignore-user-config`; it is not conditional on the evidence
+service being used and its README/AGENTS claims must be corrected in the same implementation.
 
 The server-owned MCP entry is then added at command-line precedence. Add `--strict-config`
 so an older Codex CLI that does not accept the generated MCP configuration fails before a
@@ -232,11 +244,12 @@ than a possibly evidence-thinned verdict. Invalid model arguments are not infras
 failure and remain visible as ordinary tool errors. Continue collecting ordinary shell
 policy denials independently.
 
-Non-isolated `--allow-reviewer-config` reviews still receive the server-owned evidence entry
-at command-line precedence. Tests must show that a user entry with the reserved name cannot
-replace its command, args, enabled state, or tool set. If Codex's merge semantics cannot
-guarantee that, reject the name collision visibly rather than running a user-defined server
-under a trusted tool name.
+Non-isolated `--allow-reviewer-config` reviews deliberately keep the reviewed repository as
+Codex's working directory and still receive the server-owned evidence entry at command-line
+precedence. Tests must show that a user entry with the reserved name cannot replace its
+command, args, enabled state, or tool set. If Codex's merge semantics cannot guarantee that,
+reject the name collision visibly rather than running a user-defined server under a trusted
+tool name.
 
 ### 5. Limits, cancellation, and cleanup
 
@@ -267,10 +280,12 @@ tool-call event shape is recorded above. Turn that manual probe into a tiny test
 then complete the compatibility proof by capturing CLI behavior when a required server
 fails, proving the exact per-server approval key leaves a second server untouched, checking
 command-line precedence over a colliding user config, observing whether the MCP child can
-break away from the reviewer job, and testing the lowest supported Codex CLI version. Verify
-the explicit untrusted-project override suppresses a same-named trusted-project MCP entry;
-do not attribute that behavior to `--ignore-user-config`. If any remaining premise fails,
-stop and amend this plan; do not silently fall back to exec-policy rules.
+break away from the reviewer job, and testing the lowest supported Codex CLI version. The
+probe that exposed trusted-project loading invalidates the old isolation claim and motivates
+the sterile root; verify the parent-side empty/outside/non-reparse checks and prove fresh and
+resumed Codex turns work from that root with `--skip-git-repo-check`. If any remaining premise
+fails, stop and amend this plan; do not silently fall back to a trust-key spelling guess or
+exec-policy rules.
 
 ### Phase 1: evidence core
 
@@ -313,7 +328,7 @@ unavoidable, captured as a named smoke artifact:
 | Area | Required proof |
 | --- | --- |
 | Invocation | Fresh and resume argv include the same strict, isolated evidence entry; TOML escaping covers spaces, quotes, backslashes, Unicode, and an unrepresentable executable path fails visibly. |
-| Isolation | User config is skipped, user/project rules are skipped, and the canonical reviewed root is forced untrusted so its `.codex/` layer does not load; a colliding project MCP entry cannot replace the command-line evidence server; the evidence server exposes no review, shell, write, or network tool. |
+| Isolation | User config and rules are skipped, and isolated turns run from a verified empty cross-review-owned root outside the reviewed repository, so its `.codex/` layer is not a candidate for loading; a colliding config entry cannot replace the command-line evidence server; the evidence server exposes no review, shell, write, or network tool. |
 | Availability | Parent handshake and required Codex startup succeed with the correct bundle; missing, replayed, truncated, malformed, collision-replaced, wrong-schema, or dead services fail before a review verdict. A model that simply makes no tool call does not fail. |
 | Paths | Absolute, parent, UNC, device, ADS, case-folding, symlink, junction, deleted/replaced, and root-edge cases cannot escape the canonical root. |
 | Search/list/read | Deterministic pagination, literal matching, UTF-8/binary handling, long lines, large files, empty repos, subdirectory roots, ignored/untracked files, and cap/timeout accounting. |

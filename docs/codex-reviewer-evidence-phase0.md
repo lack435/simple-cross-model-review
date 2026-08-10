@@ -52,6 +52,20 @@ the evidence server leaks to a second server.
   layer. A command-line evidence fixture deliberately named `cross_review` then replaced the
   same-named project MCP server, `repository_scope` succeeded, and
   `cross_model_review_status` was absent from the model's tool list.
+- That trust-key probe establishes the bug and one matching path, but path identity across
+  Windows processes is not a sound fail-closed boundary. The product design therefore no
+  longer depends on a `projects.<path>.trust_level` override. Isolated fresh and resumed
+  turns will use one cross-review-owned empty working directory outside the reviewed root,
+  `--skip-git-repo-check`, `--ignore-user-config`, and `--ignore-rules`. Before every turn the
+  parent must canonicalize that directory, reject reparse points, reject any entry (including
+  `.codex`), and verify it is outside the reviewed root. Failure refuses the review. This
+  makes case, trailing-separator, short-name, junction, and UNC spelling differences
+  irrelevant rather than attempting to predict Codex's project-key normalization.
+- The same observation corrects a live product claim: the shipping Codex invocation uses the
+  reviewed repository as its working directory and passes only `--ignore-user-config`, so a
+  trusted repository's project config and rules are not presently excluded. The sterile-root
+  change and corresponding README/AGENTS correction apply to every isolated Codex review,
+  not only to evidence-enabled turns.
 - The initial supported floor is `codex-cli 0.144.5`, the version these required/approval/
   strict-config/fresh/resume/collision probes exercised. Compatibility is behavior-gated as
   well: a CLI that rejects the strict config or cannot initialize the required server fails
@@ -66,6 +80,8 @@ and a release build passed after the Phase 0 fixture and control were added.
 
 - Test forced cancel, timeout, parent crash, and provider-child cleanup. Normal EOF is not a
   substitute for those paths.
+- Exercise both a fresh and resumed probe from the same verified sterile working directory.
+  The final product must perform the empty/outside/non-reparse preflight before every turn.
 - Replace this temporary fixture with the real capability-bundle handshake and evidence
   dispatcher; do not ship the fixture as the product service.
 
