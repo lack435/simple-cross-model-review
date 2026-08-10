@@ -1,6 +1,6 @@
 # Proactive usage-remaining gate — design
 
-Status: **plan (round 6).** This document is the plan for the piece of [issue #48] that the
+Status: **plan (round 7).** This document is the plan for the piece of [issue #48] that the
 reviewer fallback chain deliberately deferred: the **proactive** gate — "if usage remaining
 is less than 10% then instead of Claude Opus use GPT Luna". [`docs/reviewer-fallback-chain.md`]
 built the *reactive* chain (fall back only after a reviewer fails with `RATE_LIMITED`) and
@@ -293,12 +293,30 @@ observation:
   under 32 MiB). Because the two modes cap different streams, a *pathological* review right at
   the multi-MiB boundary could truncate in one mode and not the other — that residual is
   **documented, not hidden behind a false equivalence claim**, and it is bounded to sizes no
-  real review reaches. Memory is a **separate** concern: the reader retains only the latest
-  `result` and `rate_limit_event` regardless of stream length — an implementation optimisation
-  that does **not** affect the truncation contract (which is decided on bytes *read*, not bytes
-  *retained*). Tests exercise **both boundary cases** of the one contract: a stream just under
-  `MAX_ARMED_STREAM_BYTES`/`_LINES` whose terminal `result` is delivered and parsed, and one
-  just over that fails as a defined `OUTPUT_TRUNCATED`.
+  real review reaches.
+
+  **The contract is enforced by a cap-aware armed *runner*, at read time — not a post-run parse
+  (round-6 finding f15).** The existing collector retains bytes only up to `MAX_OUTPUT_BYTES`
+  but **keeps reading and discarding** past it ([reviewer/mod.rs:572]), so a parser that runs
+  *after* the fact over a `RunOutcome` buffer can neither observe a 32 MiB overrun nor recover
+  the discarded JSONL — the bound has to be enforced *while reading*. So the armed path does
+  **not** reuse the shared post-run collector: it reads the child's stdout through its own
+  reader that, incrementally as bytes arrive, (a) counts **raw bytes** and **event lines**
+  against `MAX_ARMED_STREAM_BYTES`/`MAX_ARMED_STREAM_LINES`, (b) parses each JSONL line and
+  retains only the latest `result`/`rate_limit_event` (the memory optimisation — it does not
+  decide truncation, which is on bytes *read*), and (c) the moment either bound is exceeded
+  **before** a terminal `result`, stops and returns the defined truncation outcome. This is a
+  new armed reader/`RunOutcome` path in `reviewer/mod.rs`, distinct from the disarmed buffered
+  read, and is in the blast radius below.
+
+  **The `OUTPUT_TRUNCATED` failure must name the bound it hit (round-6 finding f15).**
+  `errors::output_truncated` today hardcodes byte-oriented wording ([errors.rs:362]); a
+  *line*-count or *deadline* breach reported with a byte message would misdescribe the cause.
+  So the failure carries which bound tripped — bytes, lines, or the wall-deadline — either by a
+  reason parameter or a per-cause detail, so the remediation is accurate. Tests exercise **both
+  boundary cases** of the one contract: a stream just under both bounds whose terminal `result`
+  is delivered and parsed, and one just over each bound (bytes, and separately lines) that fails
+  as an `OUTPUT_TRUNCATED` whose message names the bound that tripped.
 
 For a turn that completes **within bounds in both modes**, the behaviour-preservation invariant
 is **field-level `Parsed` equivalence** — identical `result` text, `session_id`,
@@ -426,6 +444,7 @@ no attempts. One `Record` per logical turn is unchanged.
   Claude's categorical-only limit is spelled out for a human.
 
 [reviewer/mod.rs:31]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:572]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:138]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:600]: ../src/reviewer/mod.rs
 [reviewer/mod.rs:662]: ../src/reviewer/mod.rs
@@ -440,6 +459,7 @@ no attempts. One `Record` per logical turn is unchanged.
 [session.rs:318]: ../src/session.rs
 [metrics.rs:811]: ../src/metrics.rs
 [errors.rs:225]: ../src/errors.rs
+[errors.rs:362]: ../src/errors.rs
 [errors.rs:558]: ../src/errors.rs
 [README.md:25]: ../README.md
 [reviewer-fallback-chain.md, Sessions and resume]: reviewer-fallback-chain.md
@@ -483,9 +503,11 @@ no attempts. One `Record` per logical turn is unchanged.
   flags; `chain_gates_on_usage()`; exclude the field from the duplicate rule and identity
   rendering; status/doctor rendering.
 - **`reviewer/mod.rs`**: `Headroom` + `HeadroomLevel` (explicit rank) + `clears`; headroom
-  carried out of `attempt`/`run` on both arms (the `AttemptResult` shape); the armed Claude
-  path's JSONL reader with the explicit raw-byte truncation contract
-  (`MAX_ARMED_STREAM_BYTES`/`MAX_ARMED_STREAM_LINES`) and retain-latest-only memory bound.
+  carried out of `attempt`/`run` on both arms (the `AttemptResult` shape); a **new cap-aware
+  armed reader/runner** — distinct from the buffered post-run collector ([reviewer/mod.rs:572])
+  — that counts raw bytes and event lines incrementally at read time against
+  `MAX_ARMED_STREAM_BYTES`/`MAX_ARMED_STREAM_LINES`, retains only the latest
+  `result`/`rate_limit_event`, and emits the truncation outcome the moment a bound is exceeded.
 - **`reviewer/codex.rs`**: armed rollout read (date-scoped, suffix-matched, tailed, fail-open);
   `tokens.account_id` fingerprint read from `$CODEX_HOME/auth.json`. No invocation change.
 - **`reviewer/claude.rs`**: armed invocation (`json`→`stream-json --verbose`, nothing else
@@ -501,7 +523,9 @@ no attempts. One `Record` per logical turn is unchanged.
   when the last entry is gated (no `WORKER_PANICKED`); `observe_headroom`-and-store after every
   attempt (both arms); non-billed gated-skip `Attempt`. Resume path unchanged.
 - **`errors.rs`**: `reviewers_exhausted` parameterised by cause (rate-limited / gated / mixed),
-  preserving the exact existing text for the pure-reactive case; `USAGE_BELOW_MINIMUM` reason.
+  preserving the exact existing text for the pure-reactive case; `USAGE_BELOW_MINIMUM` reason;
+  and `output_truncated` ([errors.rs:362]) generalised so its message names the bound that
+  tripped (bytes / lines / deadline) rather than hardcoding byte wording.
 - **`metrics.rs`**: the billed/non-billed distinction on `Attempt` and the accumulator's
   completeness check; fixtures for all three attempt shapes.
 - **`mcp.rs` / `--doctor`**: the per-entry minimum + last-observed-headroom column and the
@@ -656,3 +680,14 @@ tokens, so it is opt-in and its cost is called out per `AGENTS.md`.
     none between two different byte streams, per f11), the residual boundary divergence is
     documented, and retention is separated out as a memory optimisation that does not decide
     truncation. Both boundary cases are tested (§4).
+
+- **Round 6 (same session, turn 7) — REQUEST CHANGES.** Confirmed the conceptual part of f15
+  resolved (explicit constants, false-equivalence claim removed) and f1–f14, f16–f21 still
+  resolved — one implementation-mechanics gap left, now closed:
+  - **f15** — the existing collector retains only up to `MAX_OUTPUT_BYTES` but keeps
+    reading/discarding past it ([reviewer/mod.rs:572]), so a *post-run* parse could neither
+    enforce the 32 MiB armed bound nor recover discarded JSONL; and `errors::output_truncated`
+    ([errors.rs:362]) hardcodes byte wording, wrong for a line-limit breach. Fixed by specifying
+    a **cap-aware armed reader/runner** that counts raw bytes and lines incrementally at read
+    time (not a post-run parse), and generalising `output_truncated` to name the bound that
+    tripped (bytes / lines / deadline) (§4, blast radius).
