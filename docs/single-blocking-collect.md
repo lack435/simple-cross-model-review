@@ -1,6 +1,8 @@
 # Single blocking collect — design
 
-Status: **plan, under cross-model review** (see [Review history](#review-history)).
+Status: **plan, approved for implementation** — round 4 of cross-model review returned APPROVE
+(see [Review history](#review-history)); the round-4 comments are folded in and a confirming pass
+is pending.
 
 Addresses [#39](../../issues/39): `cross_model_review_result` caps `wait_seconds` at 300, but
 reviews in this project routinely run 5–25 minutes, so every review forces the caller into a
@@ -169,10 +171,15 @@ draft got wrong:
     an over-cap flag; the Codex path uses it and, when the flag is set, surfaces the existing
     `OUTPUT_TRUNCATED` failure — which is exactly the right code, since the README already defines it
     as "the CLI wrote far too much, a retry will do the same again" as opposed to `EMPTY_REVIEW`.
-    The truncation is taken on a UTF-8 character boundary (the shared truncation helper already does
-    this), and an over-limit test asserts the read yields `OUTPUT_TRUNCATED` rather than a partial
-    review presented as complete. This tightens today's behaviour, where an over-8-MiB final message
-    would otherwise have been returned as a valid review.
+    **The over-cap flag is checked *before* any decode.** `read_capped` returns raw `Vec<u8>`
+    (`src/vcs/shared.rs`) and the boundary/decode helpers take `String`; truncating 8 MiB of bytes
+    can land mid-codepoint, so the path must not `from_utf8`/lossy-decode the truncated bytes at all
+    on the over-cap branch — it returns `OUTPUT_TRUNCATED` straight from the flag, and only decodes
+    when the read was within cap. (`src/vcs/shared.rs` is `pub(crate)`, so `reviewer/codex.rs` can
+    call `read_capped` directly; if a text-returning wrapper reads better, add or re-export one
+    rather than widening visibility ad hoc.) An over-limit test asserts the read yields
+    `OUTPUT_TRUNCATED` rather than a partial review presented as complete. This tightens today's
+    behaviour, where an over-8-MiB final message would otherwise have been returned as a valid review.
   - **Session persistence has no wall-clock deadline** (`src/session.rs`), so a stalled disk write
     could in principle push the terminal state past `max_wait()`. This PR does **not** add a
     persistence timeout: the code deliberately treats session-mapping durability as load-bearing (a
@@ -185,7 +192,11 @@ draft got wrong:
     session cannot be re-reviewed and repeated collects keep returning `running`. That is the honest
     worst case of declining the deadline, and it is judged acceptable because a local JSON write that
     never returns is a failed machine, not a normal operating condition, and the blast radius is one
-    session on one process rather than lost review work.
+    session on one process rather than lost review work. One qualification on "never lost work": that
+    holds *while the process stays alive* — a completed review's text is retained in memory and
+    collectible. Restarting the process while a `record_turn` is permanently stalled discards that
+    in-memory result along with everything else the process held, which is the general property that
+    review ids and running reviews do not survive a restart, not a new failure mode of this change.
   - **Why the residual is acceptable here specifically:** because the whole design is now
     non-destructive, a wait that expires one moment before the terminal state simply returns a
     `running` snapshot and the caller polls once more — cheap, and it cannot lose the review. Under
@@ -245,6 +256,18 @@ pending-map removal ordering in `handle_cancellation` is untouched, so response 
 works identically for both attach kinds. Only the *kill decision* becomes conditional on ownership —
 which is what the reviewer confirmed is safe provided all attach, cancel, and response-claim
 operations stay under that one mutex.
+
+**The pre-attach cancellation race must also honour ownership — this is the easiest place to
+reintroduce the core bug.** Today both sites handle a cancellation that arrived *before* the attach:
+the result path at [`tools.rs:387`](../src/tools.rs) does `if request.attach_review(&id) {
+self.registry.cancel(&id); return Err(cancelled()); }`, and the start path at
+[`tools.rs:222`](../src/tools.rs) does the same with `registry.finish(cancelled)`. Renaming
+`attach_review` to `attach_wait` on the result path while leaving the `self.registry.cancel(&id)`
+call would **destroy the review on the pre-attach race** — exactly the behaviour this PR removes,
+just on a narrower window. So the result path's pre-attach branch must return `CANCELLED`
+*without* calling `registry.cancel` (the review stays running and collectible); the start path's
+pre-attach branch keeps finishing the review, because there the id was never delivered. A
+`cancel-before-attach_wait` unit test asserts the review remains `Running`.
 
 ### 2. The parked wait wakes on its own cancellation (`src/registry.rs`, `src/tools.rs`)
 
@@ -385,7 +408,11 @@ of scope.
      fresh collect returns *running-or-completed-and-collectible* (i.e. **not** `CANCELLED`, not
      gone). Then, so the smoke run does not leak a billing reviewer, explicitly
      `cross_model_review_cancel` Review A if it is still running.
-  2. **Review B** — a separate review → `cross_model_review_cancel` ~2s in → assert `CANCELLED`.
+  2. **Review B** — a separate review → `cross_model_review_cancel` ~2s in → assert `CANCELLED`
+     **or** already `completed`. Even a 2s-in cancel of a multi-minute review can, in principle,
+     race a review that finished unusually fast, so the smoke assertion tolerates natural completion
+     rather than asserting `CANCELLED` unconditionally; the deterministic proof that explicit cancel
+     kills a *still-running* review is the unit test, not this timing-dependent e2e check.
   The smoke test proves the wiring end to end; the *guarantee* is the unit tests. `README.md`'s
   smoke summary (the "a cancellation that must leave the request unanswered and the reviewer dead"
   line) is updated to describe the two-review split and that a poll cancellation now leaves the
@@ -486,3 +513,16 @@ the server can wake the agent on its own.
   3. *minor* — the plan wrongly said the schema `maximum` was already built from `cfg`; it uses the
      compile-time `MAX_WAIT_SECS` const. Resolved: corrected to require the schema edit, with a
      non-default-timeout test so schema and runtime cap cannot diverge.
+
+- **Round 4** (same session) — APPROVE WITH COMMENTS: "approved for implementation; all prior
+  blocking findings are resolved." Four minor implementation clarifications, all folded in before
+  coding:
+  1. the *pre-attach* cancellation race on the result path must return `CANCELLED` without calling
+     `registry.cancel`, or a mechanical rename reintroduces the core bug on that narrow window;
+     added a `cancel-before-attach_wait` test requirement.
+  2. `read_capped` returns bytes and the decode/boundary helpers take `String`, so the over-cap flag
+     must be checked *before* any decode (truncated bytes can split a codepoint); module visibility
+     noted.
+  3. smoke Review B tolerates "already completed before cancel"; the deterministic kill proof is the
+     unit test.
+  4. "never lost work" qualified to "while the process stays alive."
