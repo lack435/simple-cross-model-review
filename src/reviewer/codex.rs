@@ -378,6 +378,12 @@ fn rate_limits_to_headroom(rl: &Value) -> Headroom {
         let Some(used) = win.get("used_percent").and_then(Value::as_f64) else {
             continue;
         };
+        // Fail open on a nonsensical value rather than closed: a non-finite or out-of-range
+        // `used_percent` is skipped, so a garbled field cannot clamp to "0% remaining" and gate
+        // an entry that is actually fine (round-1-impl finding f6).
+        if !used.is_finite() || !(0.0..=100.0).contains(&used) {
+            continue;
+        }
         let resets_at = win.get("resets_at").and_then(Value::as_u64);
         // Keep the window with the highest used_percent (least remaining).
         if limiting.map(|(u, _)| used > u).unwrap_or(true) {

@@ -45,6 +45,15 @@ struct Observation {
     observed_at: u64,
 }
 
+/// A stored observation exposed for display: its headroom, when it was recorded, the window
+/// reset it is tied to (if any), and whether it is still actionable now.
+pub struct Observed {
+    pub headroom: Headroom,
+    pub observed_at: u64,
+    pub resets_at: Option<u64>,
+    pub actionable: bool,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct StoreFile {
     /// Keyed by [`entry_key`]. A `BTreeMap` for stable, diffable serialization.
@@ -94,6 +103,21 @@ impl HeadroomStore {
         }
     }
 
+    /// The raw stored observation for `key` — its headroom, when it was observed, and whether it
+    /// is still actionable at `now` — ignoring the actionability filter `get` applies. For the
+    /// `status`/`--doctor` display, which shows the metadata *and* whether it still counts. `None`
+    /// when there is no record or the store cannot be read.
+    pub fn observation(&self, key: &str, now: u64) -> Option<Observed> {
+        let store = self.read_or_corrupt().ok()?;
+        let obs = store.entries.get(key)?;
+        Some(Observed {
+            headroom: obs.headroom,
+            observed_at: obs.observed_at,
+            resets_at: obs.headroom.resets_at(),
+            actionable: is_actionable(obs, now),
+        })
+    }
+
     /// Record `headroom` for `key`, observed at `now`. Best-effort: a lock, read, or write error
     /// is logged and dropped rather than propagated — a lost observation only means the next
     /// review is ungated for this entry, never a wrong gate. Stale-write rejection keeps a
@@ -111,8 +135,11 @@ impl HeadroomStore {
         let _file_lock = ExclusiveLock::acquire(&self.lock_path(), LOCK_WAIT)?;
         let mut store = self.read_or_corrupt()?;
         match store.entries.get(key) {
-            // Stale-write rejection: never regress to an older observation.
-            Some(existing) if existing.observed_at > now => {}
+            // Stale-write rejection: never regress to an older *or equally-timestamped*
+            // observation. Timestamps are second-resolution, so `>` alone would let a delayed
+            // write in the same second overwrite a newer one; `>=` keeps the already-stored
+            // reading on a tie (round-1-impl finding f7).
+            Some(existing) if existing.observed_at >= now => {}
             _ => {
                 store.entries.insert(
                     key.to_string(),

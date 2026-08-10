@@ -42,6 +42,31 @@ pub const MAX_ARMED_STREAM_BYTES: usize = 4 * MAX_OUTPUT_BYTES;
 /// emitting a pathological number of tiny events. Bounds work independently of byte size.
 pub const MAX_ARMED_STREAM_LINES: usize = 500_000;
 
+/// The stdout bounds [`run_observed`] enforces for one reviewer. The default keeps the historic
+/// behaviour — retain up to `max_bytes`, but keep draining past it so the child never blocks on a
+/// full pipe (`terminate_at_cap: false`). The **armed** Claude path sets `terminate_at_cap: true`
+/// so a runaway stream is *killed* at the byte or line bound rather than held until the timeout
+/// (round-1-impl finding f2). See `docs/usage-remaining-gate.md`.
+#[derive(Clone, Copy, Debug)]
+pub struct StdoutLimits {
+    pub max_bytes: usize,
+    pub max_lines: usize,
+    pub terminate_at_cap: bool,
+}
+
+impl StdoutLimits {
+    /// The historic default: cap retention at `MAX_OUTPUT_BYTES`, no line cap, keep draining past
+    /// the cap (do not kill the child). This preserves e.g. Codex finishing its final-message file
+    /// even when its stdout event stream exceeds the cap.
+    pub fn default_retain() -> Self {
+        Self {
+            max_bytes: MAX_OUTPUT_BYTES,
+            max_lines: usize::MAX,
+            terminate_at_cap: false,
+        }
+    }
+}
+
 use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 
@@ -268,13 +293,14 @@ pub trait Reviewer: Send + Sync {
         None
     }
 
-    /// The byte cap the runner applies to this reviewer's retained stdout. Default
-    /// `MAX_OUTPUT_BYTES`; the armed Claude path raises it because `stream-json` carries the
-    /// review text more than once, so a review whose content fits the buffered path produces a
-    /// larger stream. This is the single truncation contract on raw bytes read — overrun before
-    /// the terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
-    fn output_stdout_cap(&self, _cfg: &Config) -> usize {
-        MAX_OUTPUT_BYTES
+    /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
+    /// `MAX_OUTPUT_BYTES`; the armed Claude path raises the byte cap, adds a line cap, and asks
+    /// the runner to *terminate* the child at either bound (because `stream-json` carries the
+    /// review text more than once and a runaway stream must not hold the worker until timeout).
+    /// This is the single truncation contract on raw bytes/lines read — overrun before the
+    /// terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
+    fn output_limits(&self, _cfg: &Config) -> StdoutLimits {
+        StdoutLimits::default_retain()
     }
 }
 
@@ -554,13 +580,13 @@ pub fn run(
     cancel: &AtomicBool,
 ) -> std::io::Result<RunOutcome> {
     // The status/liveness probes that use this wrapper do not need the spawn/observe distinction, so
-    // flatten it back to a plain `io::Error`. They keep the ordinary stdout cap.
+    // flatten it back to a plain `io::Error`. They keep the ordinary retain-and-drain limits.
     run_observed(
         command,
         stdin_data,
         timeout,
         cancel,
-        MAX_OUTPUT_BYTES,
+        StdoutLimits::default_retain(),
         |_| {},
     )
     .map_err(RunError::into_io)
@@ -576,10 +602,10 @@ pub fn run_observed(
     stdin_data: &str,
     timeout: Duration,
     cancel: &AtomicBool,
-    // Byte cap on the retained stdout buffer. Normally MAX_OUTPUT_BYTES; the armed Claude path
-    // raises it to MAX_ARMED_STREAM_BYTES because stream-json carries the review text more than
-    // once (see Reviewer::output_stdout_cap). stderr always uses MAX_OUTPUT_BYTES.
-    stdout_max_bytes: usize,
+    // Bounds on the retained stdout buffer, and whether to kill the child at the bound. The armed
+    // Claude path raises the byte cap and terminates at it; every other path keeps the historic
+    // retain-and-drain (see StdoutLimits). stderr always uses MAX_OUTPUT_BYTES retention.
+    stdout_limits: StdoutLimits,
     mut on_activity: impl FnMut(Activity),
 ) -> Result<RunOutcome, RunError> {
     command
@@ -625,7 +651,7 @@ pub fn run_observed(
     // for Claude, whose review is stdout-only, a completed review became EMPTY_REVIEW.
     let stdout_buf = drain(
         child.stdout.take().expect("stdout was piped"),
-        stdout_max_bytes,
+        stdout_limits.max_bytes,
     );
     let stderr_buf = drain(
         child.stderr.take().expect("stderr was piped"),
@@ -648,11 +674,20 @@ pub fn run_observed(
                     });
                     next_activity = now + Duration::from_secs(5);
                 }
+                let over_cap = stdout_limits.terminate_at_cap
+                    && (stdout_buf.len() >= stdout_limits.max_bytes
+                        || stdout_buf.lines() >= stdout_limits.max_lines);
                 let stop = if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
                     true
                 } else if now >= deadline {
                     timed_out = true;
+                    true
+                } else if over_cap {
+                    // Armed stream ran past its byte or line bound: kill it now rather than hold
+                    // the worker until the timeout (round-1-impl finding f2). `stdout_truncated`
+                    // (byte cap) and the retained line count let the parser name which bound
+                    // tripped and return OUTPUT_TRUNCATED. Not flagged as timed_out/cancelled.
                     true
                 } else {
                     false
@@ -708,11 +743,19 @@ struct Drain {
     /// mid-stream. Distinct from `truncated` (the deliberate size cap): a consumer that needs a
     /// complete stream (the Perforce capture) must treat this as untrustworthy.
     errored: Arc<AtomicBool>,
+    /// Total newlines seen across the *whole* raw stream, counted even for bytes discarded past
+    /// the retention cap, so the armed line bound reflects the real event count rather than only
+    /// what was retained. See `docs/usage-remaining-gate.md`.
+    lines: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drain {
     fn len(&self) -> usize {
         self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    fn lines(&self) -> usize {
+        self.lines.load(Ordering::SeqCst)
     }
 }
 
@@ -731,11 +774,13 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Dra
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
     let errored = Arc::new(AtomicBool::new(false));
+    let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
     let writer_errored = Arc::clone(&errored);
+    let writer_lines = Arc::clone(&lines);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
@@ -748,6 +793,12 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Dra
                     break;
                 }
                 Ok(n) => {
+                    // Count newlines across the whole raw stream (retained or discarded), so the
+                    // armed line bound reflects the real event count.
+                    let newlines = chunk[..n].iter().filter(|&&b| b == b'\n').count();
+                    if newlines > 0 {
+                        writer_lines.fetch_add(newlines, Ordering::SeqCst);
+                    }
                     let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
                     let room = max_bytes.saturating_sub(buffer.len());
                     if room == 0 {
@@ -769,6 +820,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Dra
         done,
         truncated,
         errored,
+        lines,
     }
 }
 
@@ -993,7 +1045,7 @@ mod drain_tests {
             "",
             Duration::from_secs(5),
             &std::sync::atomic::AtomicBool::new(false),
-            MAX_OUTPUT_BYTES,
+            StdoutLimits::default_retain(),
             |_| {},
         );
         match result {

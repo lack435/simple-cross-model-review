@@ -160,13 +160,18 @@ impl Reviewer for ClaudeReviewer {
         from_result_document(spec, out, &parsed)
     }
 
-    /// The armed stdout cap: `stream-json` carries the review text more than once, so a review
-    /// whose content fits the buffered path produces a larger stream. Disarmed keeps the default.
-    fn output_stdout_cap(&self, cfg: &Config) -> usize {
+    /// Armed runs raise the stdout byte cap (`stream-json` carries the review text more than
+    /// once), add a line cap, and terminate the child at either bound. Disarmed keeps the
+    /// historic retain-and-drain default.
+    fn output_limits(&self, cfg: &Config) -> super::StdoutLimits {
         if cfg.chain_gates_on_usage() {
-            super::MAX_ARMED_STREAM_BYTES
+            super::StdoutLimits {
+                max_bytes: super::MAX_ARMED_STREAM_BYTES,
+                max_lines: super::MAX_ARMED_STREAM_LINES,
+                terminate_at_cap: true,
+            }
         } else {
-            super::MAX_OUTPUT_BYTES
+            super::StdoutLimits::default_retain()
         }
     }
 
@@ -233,6 +238,18 @@ fn from_result_document(
             }
             if let Some(status) = parsed.get("api_error_status").filter(|v| !v.is_null()) {
                 evidence = format!("api_error_status: {status}\n{evidence}");
+            }
+            // Other CLI-owned structured fields that can carry an actionable failure reason (a
+            // rate limit surfaced only here, say). Structured metadata, not model prose, so they
+            // are evidence; the review text never is (round-1-impl finding f3).
+            for field in ["stop_reason", "terminal_reason"] {
+                if let Some(v) = parsed
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    evidence = format!("{field}: {v}\n{evidence}");
+                }
             }
 
             // The review text is still shown, just never matched against.
@@ -310,7 +327,7 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     let mut lines_seen = 0usize;
     for line in out.stdout.lines() {
         lines_seen += 1;
-        if lines_seen > super::MAX_ARMED_STREAM_LINES {
+        if lines_seen >= super::MAX_ARMED_STREAM_LINES {
             // Line-count bound tripped: a defined truncation whose message names the line bound
             // (not bytes), so a line breach is not misreported (round-6 finding f15).
             return Err(errors::output_truncated_at(
@@ -342,20 +359,23 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
         }
     }
 
+    // A `rejected` rate-limit event maps to RATE_LIMITED **whether or not** a terminal result
+    // event also appears (round-1-impl finding f1): the plan's contract is that the CLI's own
+    // structured "no capacity" signal drives fall-through, and checking it only on the no-result
+    // path would let a result event mask it and strand the chain. Checked before the result so
+    // the rejection wins; `result` content is still never used as evidence.
+    if rate_rejected {
+        return Err(errors::rate_limited(
+            "claude",
+            "the reviewer reported a usage limit (rate_limit_event status=rejected)",
+        ));
+    }
+
     if let Some(parsed) = result_event {
         return from_result_document(spec, out, &parsed);
     }
 
-    // No terminal result event: a failure. Classify only from CLI-owned signals.
-    if rate_rejected {
-        // The CLI told us, in its own structured event, that the account is out of capacity —
-        // map to RATE_LIMITED so the reactive fall-through / REVIEWERS_EXHAUSTED path fires.
-        return Err(errors::rate_limited(
-            "claude",
-            "the reviewer reported a usage limit (rate_limit_event status=rejected) and produced \
-             no result",
-        ));
-    }
+    // No terminal result event and no rejection: a failure. Classify only from CLI-owned signals.
     if out.stdout_truncated {
         // The byte bound tripped before a terminal result arrived.
         let mib = super::MAX_ARMED_STREAM_BYTES / (1024 * 1024);
@@ -641,6 +661,19 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1}}"#,
         );
         let err = parse_stream_json(cfg().primary(), &outcome(stream, false)).unwrap_err();
+        assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
+    }
+
+    #[test]
+    fn armed_rejected_rate_limit_wins_even_with_a_result_event() {
+        // f1: a rejected rate_limit_event maps to RATE_LIMITED even when a (possibly successful)
+        // result event also appears, so the reactive chain still advances.
+        let stream = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#,
+        );
+        let err = parse_stream_json(cfg().primary(), &outcome(stream, true)).unwrap_err();
         assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
     }
 
