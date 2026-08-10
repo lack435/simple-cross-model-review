@@ -304,8 +304,9 @@ impl App {
         // the fallback reachable, because the marker is not left set: a crash *before* the findings
         // marker is written (during capture), and a reviewer failure that started no child process
         // (`invocation` build error or `Command::spawn` failure), which `attempt` detects and clears
-        // the marker for on a resume. So the refusal covers exactly the stale-ledger case, and the
-        // Perforce full-recapture path survives for the not-stale ones.
+        // the marker for on any non-fresh call (its marker was confirmed absent on entry here). So
+        // the refusal covers exactly the stale-ledger case, and the Perforce full-recapture path
+        // survives for the not-stale ones.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
                 return Err(errors::session_not_resumable(&session, reason));
@@ -450,6 +451,9 @@ impl App {
                     }
                 }
             }),
+            // Non-fresh calls passed the findings gate, so their marker was absent on entry; fresh
+            // calls skipped it. Used to decide whether a pre-launch failure may clear the marker.
+            findings_marker_absent_on_entry: !fresh,
             cancel,
             _lease: Some(lease),
         };
@@ -1114,6 +1118,14 @@ struct Job {
     /// ledger and then mint fresh ids over a real one. `Some` exactly on a resume; `None` on a fresh
     /// review or a new session.
     prior_findings: Option<crate::findings::PriorState>,
+    /// Whether the findings write-ahead marker was confirmed *absent* when this call entered
+    /// `start_review` — true for every non-`fresh` call, because the findings gate refuses a
+    /// non-fresh call whose marker is set. When true, this turn's `mark_findings_pending` is the only
+    /// thing that set the marker, so a pre-launch failure (no child started) may safely clear it. A
+    /// `fresh` call is false: it bypasses the gate and may be sitting on a marker an earlier failed
+    /// turn set, which it must not drop. Note this is *not* the same as `resume_id.is_some()`: a
+    /// non-fresh turn 1 with no record still passed the gate and can clear.
+    findings_marker_absent_on_entry: bool,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -1699,21 +1711,22 @@ impl Job {
     }
 
     /// Clear this turn's findings write-ahead marker after a failure that provably started no child
-    /// process, so a *resumed* reviewer conversation could not have advanced and the ledger is not
-    /// stale. Only for resumes: the resume gate guaranteed the marker was absent on entry, so this
-    /// undoes exactly this turn's mark and lets the next call proceed — keeping the Perforce
-    /// `.pending` full-recapture path reachable rather than turning a benign pre-launch failure into
-    /// a hard resume refusal. A fresh turn does not clear: it bypasses the gate and may be sitting on
-    /// a marker an earlier failed turn set, which it must not silently drop. A failed clear only
-    /// over-refuses the next resume (the safe direction), so it is warned, not fatal.
-    fn clear_findings_marker_after_pre_launch_failure(&self, resuming: bool) {
-        if !resuming {
+    /// process, so no reviewer conversation could have advanced and the ledger is not stale. Guarded
+    /// by `findings_marker_absent_on_entry`: only a call whose marker was confirmed absent at entry
+    /// (every non-`fresh` call — a resume *or* a non-fresh turn 1 with no record) may clear, because
+    /// then this turn's `mark_findings_pending` is the only thing that set it. Undoing it lets the
+    /// next call proceed instead of being wrongly refused, keeping the Perforce `.pending`
+    /// full-recapture path reachable. A `fresh` call does not clear: it bypassed the gate and may be
+    /// sitting on a marker an earlier failed turn set, which it must not silently drop. A failed
+    /// clear only over-refuses the next call (the safe direction), so it is warned, not fatal.
+    fn clear_findings_marker_after_pre_launch_failure(&self) {
+        if !self.findings_marker_absent_on_entry {
             return;
         }
         if let Err(e) = self.sessions.clear_findings_pending(&self.session) {
             eprintln!(
                 "cross-review: warning: could not clear the findings write-ahead marker after a \
-                 pre-launch failure for session '{}': {e}; the next resume may be refused",
+                 pre-launch failure for session '{}': {e}; the next call may be refused",
                 self.session
             );
         }
@@ -1861,11 +1874,12 @@ impl Job {
             Ok(inv) => inv,
             Err(e) => {
                 // Building the invocation failed (e.g. a temp last-message file could not be
-                // created): no child process was ever started, so a resumed reviewer conversation
-                // could not have advanced and this session's findings ledger is not stale. Undo this
-                // turn's findings marker so the next resume is not refused — and, for Perforce, so
-                // Job::run's `.pending` full-recapture fallback stays reachable.
-                self.clear_findings_marker_after_pre_launch_failure(resume_id.is_some());
+                // created): no child process was ever started, so the reviewer conversation could
+                // not have advanced and this session's findings ledger is not stale. Undo this turn's
+                // findings marker (for a non-fresh call, whose marker was absent on entry) so the
+                // next call is not refused — and, for Perforce, so Job::run's `.pending`
+                // full-recapture fallback stays reachable.
+                self.clear_findings_marker_after_pre_launch_failure();
                 return Err(errors::spawn_failed(
                     self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
@@ -1889,12 +1903,12 @@ impl Job {
             Ok(out) => Ok(out),
             Err(e) => {
                 // A `Spawn` failure means the child never started — same reasoning as the invocation
-                // failure above, so clear the resume's findings marker and keep the Perforce
+                // failure above, so clear the (non-fresh) findings marker and keep the Perforce
                 // full-recapture path reachable. An `Observe` failure happened after the child was
                 // already running, so the conversation may have advanced: keep the marker set and
-                // let the findings gate refuse the next resume.
+                // let the findings gate refuse the next call.
                 if e.child_never_started() {
-                    self.clear_findings_marker_after_pre_launch_failure(resume_id.is_some());
+                    self.clear_findings_marker_after_pre_launch_failure();
                 }
                 Err(errors::spawn_failed(
                     self.spec.reviewer.as_str(),

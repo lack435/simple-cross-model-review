@@ -560,9 +560,11 @@ fn reconcile(
         .collect();
 
     // Append new findings with fresh monotonic ids, status Open. The counter is advanced with a
-    // checked add: a ledger loaded through `is_structurally_valid` cannot start at the ceiling, but
-    // a turn minting enough new findings to *reach* it must degrade rather than wrap `seq` back into
-    // the range of ids already issued and mint a duplicate.
+    // checked add, and an advance that would *reach* `u64::MAX` is refused as well as one that would
+    // overflow it: `is_structurally_valid` rejects a stored `next_seq == u64::MAX` (it could not be
+    // advanced again without wrapping), so a turn that advanced the counter to the ceiling would
+    // persist a ledger its own next resume could not load. Degrading here keeps every persisted
+    // `next_seq` strictly below the ceiling and therefore loadable.
     let mut seq = next_seq;
     for nf in &block.new_findings {
         out.push(Finding {
@@ -576,7 +578,10 @@ fn reconcile(
             first_seen_turn: turn,
             last_status_change_turn: turn,
         });
-        seq = seq.checked_add(1).ok_or(ReconcileError::CounterExhausted)?;
+        seq = match seq.checked_add(1) {
+            Some(n) if n != u64::MAX => n,
+            _ => return Err(ReconcileError::CounterExhausted),
+        };
     }
     Ok((out, seq))
 }
@@ -1374,34 +1379,32 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_degrades_when_the_id_counter_would_overflow() {
-        // A ledger that loaded validly (next_seq below the ceiling) but whose next mint reaches
-        // u64::MAX must degrade rather than wrap `seq` back onto an id already in use. Two new
-        // findings from next_seq = MAX-1: the first mints f{MAX-1}, the second would overflow.
-        let b = ReviewerBlock {
+    fn reconcile_degrades_before_the_counter_reaches_the_ceiling() {
+        // A ledger that loaded validly (next_seq = MAX-1, below the ceiling) must not advance the
+        // counter to u64::MAX: a stored MAX is rejected by is_structurally_valid, so that ledger's
+        // own next resume would be poisoned. A single new finding from MAX-1 therefore degrades
+        // rather than persist an unloadable next_seq.
+        let one = ReviewerBlock {
             verdict: VerdictDetail::RequestChanges,
             prior_findings: vec![],
-            new_findings: vec![
-                NewFinding {
-                    severity: Severity::Major,
-                    title: "a".into(),
-                    file: None,
-                    line: None,
-                    detail: "d".into(),
-                },
-                NewFinding {
-                    severity: Severity::Major,
-                    title: "b".into(),
-                    file: None,
-                    line: None,
-                    detail: "d".into(),
-                },
-            ],
+            new_findings: vec![NewFinding {
+                severity: Severity::Major,
+                title: "a".into(),
+                file: None,
+                line: None,
+                detail: "d".into(),
+            }],
         };
         assert_eq!(
-            reconcile(&[], u64::MAX - 1, &b, 1),
+            reconcile(&[], u64::MAX - 1, &one, 1),
             Err(ReconcileError::CounterExhausted)
         );
+        // One step below the boundary is fine: from MAX-2 a single finding advances to MAX-1, which
+        // is a loadable next_seq.
+        let (out, next) = reconcile(&[], u64::MAX - 2, &one, 1).expect("MAX-2 has room for one");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, format!("f{}", u64::MAX - 2));
+        assert_eq!(next, u64::MAX - 1);
     }
 
     #[test]
