@@ -17,8 +17,12 @@ the small self-contained binary is a feature, so do not add crates casually. See
 suggestion. We eat our own dog food: the merge gate for cross-review is cross-review.
 
 - Call `cross_model_review` with a session named for the branch or PR, and collect it with
-  `cross_model_review_result`. Both directions are already wired up in this checkout —
-  Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 4.8 via
+  `cross_model_review_result`. A single collect call blocks until the review is done — omit
+  `wait_seconds` to block to completion — so re-reviews and first passes alike are one call, not
+  a poll loop. If a client tool timeout shorter than the review cuts the call short it returns
+  `status=running`; call again with the same `review_id` (abandoning a collect no longer cancels
+  the review — `cross_model_review_cancel` does). Both directions are already wired up in this
+  checkout — Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 4.8 via
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
 - **Getting the diff in front of the reviewer depends on which direction you are calling.**

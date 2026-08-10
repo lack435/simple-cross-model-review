@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, MAX_WAIT_SECS};
+use crate::config::Config;
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -64,10 +64,12 @@ impl App {
         let sessions = SessionStore::new(&cfg.state_dir);
         let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
         let reviewer = reviewer::for_kind(cfg.reviewer);
+        // Read before `cfg` moves into the Arc below.
+        let cfg_max_concurrent = cfg.max_concurrent_reviews;
         Self {
             cfg: Arc::new(cfg),
             reviewer: Arc::from(reviewer),
-            registry: Arc::new(Registry::new()),
+            registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
             preflight: Mutex::new(None),
@@ -88,6 +90,14 @@ impl App {
     /// way out, so a waiter's remaining budget is time nobody is waiting for.
     pub fn begin_shutdown(&self) {
         self.registry.begin_shutdown();
+    }
+
+    /// Wake parked `cross_model_review_result` waiters so a poll whose request was just cancelled
+    /// returns promptly instead of parking out its budget. The review is left running; only the
+    /// wait ends. Called from `handle_cancellation` on the detach path, after the request's
+    /// cancelled flag is set.
+    pub fn wake_waiters(&self) {
+        self.registry.wake();
     }
 
     /// Register reviews without a reviewer CLI, so the cancellation paths can be tested
@@ -211,15 +221,17 @@ impl App {
             .try_start(&session, turn, resumed)
             .map_err(|refused| match refused {
                 StartRefused::Busy(existing) => errors::session_busy(&session, &existing),
+                StartRefused::TooManyRunning { limit } => errors::too_many_running(limit),
                 StartRefused::ShuttingDown => errors::server_shutting_down(),
             })?;
 
         // Bind the review to the request that created it before the worker starts, so a
         // `notifications/cancelled` arriving mid-setup stops the reviewer instead of
-        // finding nothing to stop. If it already arrived, never spawn the CLI at all --
-        // but still record a terminal state, or the session stays claimed by a review
-        // that no worker will ever finish.
-        if request.attach_review(&id) {
+        // finding nothing to stop. `attach_owned`: this request *owns* the review, because its
+        // review_id has not been delivered, so a cancellation kills it. If it already arrived,
+        // never spawn the CLI at all -- but still record a terminal state, or the session stays
+        // claimed by a review that no worker will ever finish.
+        if request.attach_owned(&id) {
             self.registry
                 .finish(&id, Outcome::failed(errors::cancelled()));
             return Err(errors::cancelled());
@@ -303,10 +315,12 @@ impl App {
         }
         out.push_str(&format!("budget:    {}\n\n", fmt_elapsed(self.cfg.timeout)));
         out.push_str(&format!(
-            "Collect it with cross_model_review_result using review_id \"{id}\". That call waits \
-             for the review and reports progress while it is open when the MCP client supports \
-             progress notifications. Use wait_seconds=300; if it returns status=running, call it \
-             again with the same review_id.\n\n\
+            "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
+             until the review is done -- omit wait_seconds to wait to completion in one call -- and \
+             reports progress while it is open when the MCP client supports progress notifications. \
+             If it still returns status=running (a client tool timeout shorter than the review cut \
+             the call short), just call it again with the same review_id; abandoning a collect no \
+             longer cancels the review.\n\n\
              In this project's usage, reviews commonly take at least five minutes, and complex \
              changes can take 20 minutes or longer. A running status during that window is normal \
              and is not a reason to start over or cancel the review.\n"
@@ -322,11 +336,17 @@ impl App {
         let review_id = string_arg(args, "review_id");
         let session = string_arg(args, "session");
 
+        // An omitted wait_seconds blocks to completion: the default is the full cap, so the
+        // ergonomic no-argument collect is the one blocking call the caller wants. A caller that
+        // only wants a snapshot passes wait_seconds=0. The cap tracks the review budget rather than
+        // a fixed 300, so a single call can cover a whole 20-minute review; see
+        // docs/single-blocking-collect.md.
+        let max_wait = self.cfg.max_wait_secs();
         let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(crate::config::DEFAULT_WAIT_SECS)
-            .min(MAX_WAIT_SECS);
+            .unwrap_or(max_wait)
+            .min(max_wait);
 
         let id = match (&review_id, &session) {
             (Some(id), _) => match self.registry.lookup(id) {
@@ -368,32 +388,34 @@ impl App {
             }
         };
 
-        // Abandoning this call cancels the review it is waiting on. That is a deliberate
-        // trade, and it is the destructive direction: unlike the start call, the caller
-        // does hold the review_id and could have come back for it -- SESSION_BUSY even
-        // tells it to. It is made anyway because a review nobody is waiting on bills
-        // against its whole timeout budget and holds the session lease for just as long,
-        // and because the protocol cannot distinguish a caller that will return from one
-        // that will not. The client-side tool timeout must therefore exceed MAX_WAIT_SECS,
-        // which is why both example configurations pin it and say why.
+        // Abandoning this call detaches the wait; it does NOT stop the review. `attach_wait`
+        // binds this request as a waiter, not an owner, so a `notifications/cancelled` leaves the
+        // reviewer running and the result collectible by review_id -- only the poll stops. This is
+        // the whole point of the change: a client tool-timeout (which the server cannot tell from a
+        // real cancellation) no longer destroys a review that was still coming, which is what lets
+        // the wait cap track the review budget. Explicit destruction goes through
+        // cross_model_review_cancel. See docs/single-blocking-collect.md.
         //
-        // Binding the two here is also what ends this wait when the notification lands
-        // mid-poll: cancelling drives the worker to a terminal state, which wakes the
-        // condvar, so a suppressed response does not park a handler thread.
-        //
-        // The binding is many requests to one review, so cancelling one of two concurrent
-        // polls ends the other as well. Left alone: agents poll a review sequentially, and
-        // the CANCELLED text the second one gets is accurate about what happened to it.
-        if request.attach_review(&id) {
-            self.registry.cancel(&id);
+        // The pre-attach race is handled without killing either: if the cancellation already
+        // arrived, return CANCELLED but leave the review alone. Mechanically calling
+        // `registry.cancel` here would reintroduce the destroy-on-race behaviour on this narrow
+        // window, so it deliberately does not.
+        if request.attach_wait(&id) {
             return Err(errors::cancelled());
         }
 
+        // Ending this wait when the cancellation lands mid-poll is `registry.wake()`'s job (driven
+        // from `handle_cancellation`): the waiter re-checks its own cancelled flag and returns,
+        // leaving the review running. The closure below is that check.
+        //
         // `wait` can return None for an id that was Known a moment ago: a concurrent
         // finish elsewhere sweeps the caps, and this id can be what it drops. Re-checking
         // costs one lock and keeps the distinction the lookup above just drew, instead of
         // collapsing it into an opaque "no longer tracked".
-        let snapshot = match self.registry.wait(&id, Duration::from_secs(wait)) {
+        let snapshot = match self
+            .registry
+            .wait(&id, Duration::from_secs(wait), &|| request.is_cancelled())
+        {
             Some(snapshot) => snapshot,
             None if self.registry.lookup(&id) == IdState::Evicted => {
                 return Err(evicted_error(&id));
@@ -2052,25 +2074,35 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_result_call_stops_the_review_it_was_waiting_on() {
+    fn a_cancelled_result_poll_detaches_without_stopping_the_review() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
         // Registered directly: starting one for real would need a reviewer CLI.
         let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
 
         let request = RequestCancel::new();
-        assert_eq!(request.cancel(), None);
-        // The client cancelled before the poll got as far as naming its review, so the
-        // poll itself must notice and stop it rather than wait out its budget.
+        // Cancelled before the poll named its review: nothing is bound yet, so there is nothing
+        // even to detach here -- the poll itself will notice on attach_wait.
+        assert_eq!(request.cancel(), crate::cancel::CancelAction::Nothing);
+        // The poll returns CANCELLED (the response is suppressed), but it must NOT stop the
+        // reviewer: the caller holds the review_id and can still collect it.
         let err = app
             .review_result(&json!({"review_id": id, "wait_seconds": 300}), &request)
             .unwrap_err();
         assert_eq!(err.code, "CANCELLED");
-        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "abandoning a poll must not cancel the review"
+        );
+        assert_eq!(
+            app.registry.snapshot(&id).expect("still tracked").status,
+            Status::Running,
+            "the review must still be running and collectible after a poll cancellation"
+        );
     }
 
     #[test]
-    fn a_live_result_call_leaves_its_review_alone() {
+    fn a_live_result_call_detaches_rather_than_owns_its_review() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
         let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
@@ -2086,8 +2118,10 @@ mod tests {
         assert!(out.contains("progress:  preparing the review"), "{out}");
         assert!(out.contains("configured budget"), "{out}");
         assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
-        // Bound to the request, so a cancellation arriving now knows what to stop.
-        assert_eq!(request.cancel().as_deref(), Some(id.as_str()));
+        // Bound to the request as a *waiter*, so a cancellation arriving now detaches the poll
+        // rather than killing the review.
+        assert_eq!(request.cancel(), crate::cancel::CancelAction::Detach);
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -2127,15 +2161,48 @@ mod tests {
     }
 
     #[test]
-    fn wait_seconds_is_capped() {
-        // Guards against an agent pinning the server open with wait_seconds=99999.
-        let requested = json!({"wait_seconds": 99_999u64});
-        let wait = requested
+    fn wait_seconds_is_capped_at_the_configured_budget() {
+        // The cap now tracks the review budget rather than a fixed 300, so a single blocking call
+        // can cover a whole review. An over-large request is still clamped so an agent cannot pin
+        // the server open with wait_seconds=99999.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let max = cfg.max_wait_secs();
+        assert!(max > 300, "the cap should now exceed the old fixed 300");
+
+        let clamp = |v: u64| v.min(max);
+        assert_eq!(
+            clamp(99_999),
+            max,
+            "an over-large wait is clamped to the cap"
+        );
+
+        // A non-default --timeout-seconds moves the cap with it, so a 1-hour budget can be waited
+        // out in one call.
+        let cfg2 = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--timeout-seconds".into(),
+            "3600".into(),
+        ])
+        .expect("config");
+        assert!(
+            cfg2.max_wait_secs() > cfg.max_wait_secs(),
+            "the cap must follow --timeout-seconds"
+        );
+    }
+
+    #[test]
+    fn an_omitted_wait_seconds_blocks_to_completion() {
+        // The default is the full cap, so the no-argument collect is one blocking call.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let max = cfg.max_wait_secs();
+        let args = json!({});
+        let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(crate::config::DEFAULT_WAIT_SECS)
-            .min(MAX_WAIT_SECS);
-        assert_eq!(wait, MAX_WAIT_SECS);
+            .unwrap_or(max)
+            .min(max);
+        assert_eq!(wait, max);
     }
 
     #[test]

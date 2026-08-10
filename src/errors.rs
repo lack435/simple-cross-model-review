@@ -510,13 +510,30 @@ pub fn session_busy(session: &str, review_id: &str) -> Failure {
     }
 }
 
+/// Too many reviews are already running in this server process.
+pub fn too_many_running(limit: u32) -> Failure {
+    Failure {
+        code: "TOO_MANY_RUNNING",
+        summary: format!(
+            "This server already has {limit} review(s) running, which is its per-process \
+             --max-concurrent-reviews limit, so it did not start another."
+        ),
+        remediation: "Collect an outstanding review with cross_model_review_result, or cancel one \
+                      with cross_model_review_cancel, then start this one. If several reviews were \
+                      started and left uncollected, that is the situation the limit guards against: \
+                      finish or cancel them rather than starting more."
+            .to_string(),
+        detail: None,
+    }
+}
+
 impl Failure {
     /// True when the failure is the agent's own fault and it should just retry
     /// differently, rather than stopping to involve the user.
     pub fn is_agent_correctable(&self) -> bool {
         matches!(
             self.code,
-            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE"
+            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE" | "TOO_MANY_RUNNING"
         )
     }
 

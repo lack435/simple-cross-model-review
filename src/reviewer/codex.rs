@@ -134,11 +134,33 @@ impl Reviewer for CodexReviewer {
             ));
         }
 
-        // The final-message file is authoritative; the event stream is the fallback.
-        let from_file = last_message_file
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // The final-message file is authoritative; the event stream is the fallback. It is read
+        // capped at the same 8 MiB per-stream cap: the CLI writes it directly rather than through
+        // the pipes we cap, but "not capped by the pipe" is not "unbounded", and a real final
+        // message is kilobytes. An over-cap read is checked *before* any decode -- 8 MiB of bytes
+        // can be cut mid-codepoint -- and becomes OUTPUT_TRUNCATED rather than a truncated verdict
+        // parsed as if complete. This tightens an earlier behaviour where an over-8-MiB final
+        // message would have been returned as a valid review.
+        let from_file = match last_message_file {
+            Some(p) => match crate::vcs::read_capped(p, super::MAX_OUTPUT_BYTES) {
+                Ok((_, true)) => {
+                    let mib = super::MAX_OUTPUT_BYTES / (1024 * 1024);
+                    return Err(errors::output_truncated(
+                        "codex",
+                        mib,
+                        format!("the reviewer's final-message file exceeded {mib} MiB"),
+                    ));
+                }
+                // Within cap: decode only now. Invalid UTF-8 falls back to the event stream, as an
+                // unreadable file did before.
+                Ok((bytes, false)) => String::from_utf8(bytes)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                Err(_) => None,
+            },
+            None => None,
+        };
 
         let text = match from_file {
             // The final-message file is written by the CLI directly, not through the pipes
@@ -169,10 +191,11 @@ impl Reviewer for CodexReviewer {
         // Outside the match, so every surviving-review path reports the cap -- including
         // the one where only stderr was capped and the review came from the event stream.
         //
-        // Note what this does *not* claim. That our cap did not touch the final-message
-        // file is structural: we cap only bytes read from the pipes. Whether the CLI
-        // finished writing that file is a different question, it has not been observed
-        // for a run that produced this much output, and it is not asserted here.
+        // Note what this does *not* claim. A surviving review here came from a final-message file
+        // that read *within* the 8 MiB cap (an over-cap file returned OUTPUT_TRUNCATED above), so
+        // its content is complete as far as the cap can tell. Whether the CLI finished *writing*
+        // that file is a different question, it has not been observed for a run that produced this
+        // much output, and it is not asserted here.
         let mut warnings = Vec::new();
         if out.truncated() {
             warnings.push(
@@ -772,6 +795,29 @@ ordinary diagnostic
             .parse(&cfg(), &truncated, Some(&file))
             .expect("the file is authoritative");
         assert_eq!(parsed.text, "## Verdict\nAPPROVE");
+        std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn an_over_cap_final_message_file_is_output_truncated_not_a_partial_review() {
+        // The final-message file is read capped at the 8 MiB per-stream cap. A file over the cap
+        // must never be parsed as a review: it becomes OUTPUT_TRUNCATED, not a truncated verdict
+        // presented as complete.
+        let dir = std::env::temp_dir().join("cross-review-codex-file-cap-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join(format!("{}-oversized-last.txt", std::process::id()));
+        // One byte over the cap trips read_capped's over-cap flag.
+        let oversized = vec![b'a'; super::super::MAX_OUTPUT_BYTES + 1];
+        std::fs::write(&file, &oversized).expect("write");
+
+        let err = CodexReviewer
+            .parse(
+                &cfg(),
+                &outcome(r#"{"type":"turn.completed"}"#, true),
+                Some(&file),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "OUTPUT_TRUNCATED");
         std::fs::remove_file(&file).ok();
     }
 }

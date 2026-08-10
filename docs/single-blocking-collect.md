@@ -1,7 +1,25 @@
 # Single blocking collect — design
 
-Status: **plan approved for implementation** — round 6 of cross-model review returned a clean
-**APPROVE, no findings** (see [Review history](#review-history)). Implementation follows.
+Status: **implemented; merge gate pending.** The plan went through six rounds of cross-model
+review ending in a clean **APPROVE, no findings** (see [Review history](#review-history)). The
+implementation is built and passes `cargo fmt --check`, clippy `-D warnings`, and the unit tests
+(including the new cancellation, concurrency-cap, wait-cap, and Codex read-cap tests); the
+implementation diff still needs its own pass through this repository's cross-review merge gate.
+
+## Implementation status
+
+Built across `src/cancel.rs` (the `attach_owned`/`attach_wait` ownership split and the
+`CancelAction` enum), `src/registry.rs` (`wake()`, the cancellation-aware `wait()`, the
+per-process `TooManyRunning` cap), `src/config.rs` (`max_wait_secs()`, `--max-concurrent-reviews`,
+the `--timeout-seconds` 24h bound, `FINALIZATION_GRACE_SECS`), `src/reviewer/codex.rs` (the capped
+final-message read → `OUTPUT_TRUNCATED`), `src/errors.rs` (`too_many_running`), `src/tools.rs`
+(default-to-completion wait, the non-destructive result-poll detach, the `TooManyRunning` mapping),
+`src/mcp.rs` (the `cfg`-derived schema cap, the `Detach`/`Kill`/`Nothing` cancellation split), and
+`src/vcs/mod.rs` (the `read_capped`/`CAPTURE_BUDGET` re-exports). Docs and configs updated:
+`README.md`, `AGENTS.md`, both `examples/*` configs and READMEs, `.mcp.json`, `.codex/config.toml`,
+and the `smoke.ps1` step-7 two-review split. The deterministic cancellation contract lives in unit
+tests; `smoke.ps1` is best-effort e2e liveness and has not been run here (it bills a real model and
+needs `dist\` unloaded).
 
 Addresses [#39](../../issues/39): `cross_model_review_result` caps `wait_seconds` at 300, but
 reviews in this project routinely run 5–25 minutes, so every review forces the caller into a

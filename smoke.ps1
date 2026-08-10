@@ -301,12 +301,16 @@ COUNTER=2
     $badMethod = Send-Rpc -Method 'not/a/method' -TimeoutSeconds 30
     Assert-That 'unknown method is a JSON-RPC error' ($badMethod.error.code -eq -32601)
 
-    Write-Host "`n=== 7. notifications/cancelled ===" -ForegroundColor Cyan
-    # A separate session, so cancelling it cannot disturb the turn count checked below.
+    # Cancellation has two contracts now, and they differ. Abandoning a cross_model_review_result
+    # poll must leave the reviewer RUNNING (only the wait detaches); cross_model_review_cancel must
+    # STOP it. These e2e checks are best-effort against real-model timing -- the deterministic proof
+    # lives in the unit tests -- so they tolerate a review that finished unusually fast. Separate
+    # sessions, so cancelling them cannot disturb the turn count checked below.
+    Write-Host "`n=== 7a. a cancelled result poll leaves the review running ===" -ForegroundColor Cyan
     $doomed = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of cancellation. Wait quietly; this will be cancelled.'
+            instructions = 'Smoke test of poll cancellation. Wait quietly; the poll will be cancelled.'
             session      = 'smoke-cancel'
             fresh        = $true
         }
@@ -332,13 +336,55 @@ COUNTER=2
     $stray = Read-Line -TimeoutSeconds 40
     Assert-That 'the cancelled poll is never answered' ($null -eq $stray) "got: $stray"
 
-    # And the reviewer itself must be dead, not still billing out its 600s budget.
+    # The reviewer itself must still be alive and collectible: a poll cancellation detaches, it
+    # does not kill. A fresh collect returns running (or completed if it somehow finished),
+    # never CANCELLED.
     $after = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review_result'
-        arguments = @{ review_id = $doomedId; wait_seconds = 15 }
+        arguments = @{ review_id = $doomedId; wait_seconds = 5 }
     } -TimeoutSeconds 60
     $afterText = Get-ToolText $after
-    Assert-That 'the cancellation stopped the review' ($afterText -match 'CANCELLED') $afterText
+    Assert-That 'the poll cancellation left the review running or collectible' `
+        (($afterText -match 'status:\s+running') -or ($afterText -match 'status:\s+completed')) $afterText
+    Assert-That 'the poll cancellation did not cancel the review' ($afterText -notmatch 'CANCELLED') $afterText
+
+    # Clean up so this review does not keep billing through the rest of the run.
+    Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review_cancel'
+        arguments = @{ review_id = $doomedId }
+    } -TimeoutSeconds 30 | Out-Null
+
+    Write-Host "`n=== 7b. cross_model_review_cancel stops the reviewer ===" -ForegroundColor Cyan
+    $doomedB = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review'
+        arguments = @{
+            instructions = 'Smoke test of explicit cancellation. Wait quietly; this will be cancelled.'
+            session      = 'smoke-cancel-b'
+            fresh        = $true
+        }
+    } -TimeoutSeconds 60
+    $doomedBText = Get-ToolText $doomedB
+    Assert-That 'a second cancellable review started' ($doomedB.result.isError -eq $false) $doomedBText
+    $doomedBId = ([regex]::Match($doomedBText, 'review_id:\s*(\S+)')).Groups[1].Value
+
+    Start-Sleep -Seconds 2
+    $cancelled = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review_cancel'
+        arguments = @{ review_id = $doomedBId }
+    } -TimeoutSeconds 30
+    $cancelledText = Get-ToolText $cancelled
+    # Tolerant of a review that finished before the cancel landed: either it was stopped, or it had
+    # already finished. Both prove the cancel reached a real review.
+    Assert-That 'the explicit cancel stopped the reviewer or it had already finished' `
+        (($cancelledText -match 'was cancelled') -or ($cancelledText -match 'had already finished')) $cancelledText
+
+    # And a subsequent collect must confirm it is not still running.
+    $afterB = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review_result'
+        arguments = @{ review_id = $doomedBId; wait_seconds = 15 }
+    } -TimeoutSeconds 60
+    $afterBText = Get-ToolText $afterB
+    Assert-That 'the cancelled review is not still running' ($afterBText -notmatch 'status:\s+running') $afterBText
 
     $ping = Send-Rpc -Method 'ping' -TimeoutSeconds 30
     Assert-That 'the server is still healthy afterwards' ($null -ne $ping.result) `

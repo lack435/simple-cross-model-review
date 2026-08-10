@@ -16,15 +16,17 @@ The caller is Claude Code; reviews come back from OpenAI Codex.
 2. Copy [`.mcp.json`](.mcp.json) to the root of your project (or merge the
    `cross-review` entry into an existing `.mcp.json`).
 
-   Keep the `"timeout": 600000` — milliseconds, and not optional. A single
-   `cross_model_review_result` poll blocks for up to 300 seconds, and a tool call the
-   client gives up on is not free: the server honours `notifications/cancelled` by
-   stopping the reviewer, so a client timeout shorter than the poll would discard a
-   review that was still coming. Setting it here *overrides* `MCP_TOOL_TIMEOUT` for this
-   server, lowering the hard per-call ceiling from that variable's ~28-hour default to
-   ten minutes — still double the poll cap, and explicit rather than inherited. The
-   30-minute idle window for a stdio server is unaffected: a per-server `timeout` acts as
-   a floor on it, never a cap.
+   Keep the `"timeout": 2400000` — milliseconds, and not optional. A single
+   `cross_model_review_result` call now blocks until the review is done, up to the server's
+   collect cap (capture budget + `--timeout-seconds` + a finalization grace, ~1890s at the
+   defaults), so this must exceed that for one blocking call to complete in a single
+   round-trip. Below the cap is no longer destructive: abandoning a collect only detaches the
+   wait — the reviewer keeps running and the result stays collectible by `review_id` — so a
+   shorter timeout degrades to polling rather than discarding a review that was still coming
+   (`cross_model_review_cancel` is what stops a reviewer). Setting it here *overrides*
+   `MCP_TOOL_TIMEOUT` for this server, making the hard per-call ceiling explicit rather than
+   inherited from that variable's ~28-hour default. The 30-minute idle window for a stdio
+   server is unaffected: a per-server `timeout` acts as a floor on it, never a cap.
 
 3. Restart Claude Code in that directory. It will ask you to approve the new MCP
    server; approve it.
