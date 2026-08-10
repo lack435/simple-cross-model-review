@@ -392,12 +392,15 @@ impl Drop for PendingEntry<'_> {
     }
 }
 
-/// Honour `notifications/cancelled`: stop the work and send no response.
+/// Honour `notifications/cancelled`: send no response, and act on the review per the request's
+/// ownership.
 ///
-/// Suppressing the response is what the spec asks for. Stopping the review is what saves
-/// money: a reviewer nobody is waiting on otherwise runs out its full timeout budget, and
-/// holds the session lease for just as long, so the next review of the same session is
-/// refused as busy until it expires.
+/// Suppressing the response is what the spec asks for, in every case. What happens to the review
+/// is not uniform (see `CancelAction`): a cancelled start call is a `Kill` — its `review_id` was
+/// never delivered, so the reviewer is stopped to save the money a result nobody can collect would
+/// otherwise spend — while a cancelled result poll is a `Detach` — the caller holds the id and can
+/// still collect, so the reviewer is left running and only the parked wait is woken. `Nothing`
+/// covers a request with no review bound or one already answered.
 ///
 /// Runs on the reader thread, which is also the only thread that inserts into the map.
 /// A notification therefore cannot overtake the insert for the request it names.

@@ -318,9 +318,11 @@ impl App {
             "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
              until the review is done -- omit wait_seconds to wait to completion in one call -- and \
              reports progress while it is open when the MCP client supports progress notifications. \
-             If it still returns status=running (a client tool timeout shorter than the review cut \
-             the call short), just call it again with the same review_id; abandoning a collect no \
-             longer cancels the review.\n\n\
+             If the wait_seconds budget elapses first it returns status=running; if your client's \
+             own tool timeout is shorter and fires first you get a client-side timeout instead of a \
+             result. Either way the review keeps running -- abandoning a collect does not cancel it \
+             -- so just call cross_model_review_result again with the same review_id. Use \
+             cross_model_review_cancel to actually stop the reviewer.\n\n\
              In this project's usage, reviews commonly take at least five minutes, and complex \
              changes can take 20 minutes or longer. A running status during that window is normal \
              and is not a reason to start over or cancel the review.\n"
