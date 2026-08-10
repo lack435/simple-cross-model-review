@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerSpec};
+use crate::config::{Config, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -1003,6 +1003,37 @@ impl App {
         out
     }
 
+    /// One `status`/`--doctor` line describing an entry's proactive usage gate: its configured
+    /// minimum and its last-observed headroom. `None` when the chain is not armed (the gate is
+    /// inert, so there is nothing to show). Reads only the store — no additional CLI call beyond
+    /// the auth check `status` already performs. See `docs/usage-remaining-gate.md`.
+    fn usage_gate_status_line(&self, spec: &ReviewerSpec) -> Option<String> {
+        if !self.cfg.chain_gates_on_usage() {
+            return None;
+        }
+        let level_name = |l: crate::reviewer::HeadroomLevel| match l {
+            crate::reviewer::HeadroomLevel::Ample => "ample",
+            crate::reviewer::HeadroomLevel::Warning => "warning",
+            crate::reviewer::HeadroomLevel::Exhausted => "exhausted",
+        };
+        let min = match spec.usage_minimum {
+            UsageMinimum::None => "no gate".to_string(),
+            UsageMinimum::Remaining(p) => format!("skip below {p}% remaining"),
+            UsageMinimum::Status(l) => format!("skip below '{}'", level_name(l)),
+        };
+        let observed = match usage_headroom_key(&self.cfg, spec) {
+            Some(key) => match self.usage.get(&key, now_unix()) {
+                Headroom::Unknown => "unknown (none current)".to_string(),
+                Headroom::Fraction { remaining_pct, .. } => {
+                    format!("{remaining_pct:.0}% remaining")
+                }
+                Headroom::Level { level, .. } => level_name(level).to_string(),
+            },
+            None => "unknown (identity unavailable)".to_string(),
+        };
+        Some(format!("usage gate:    {min}; last observed: {observed}\n"))
+    }
+
     // -----------------------------------------------------------------------
     // cross_model_review_status
     // -----------------------------------------------------------------------
@@ -1054,6 +1085,12 @@ impl App {
                         failure.code, failure.summary
                     ));
                 }
+            }
+            // The proactive usage gate, when the chain is armed: this entry's configured minimum
+            // and its last-observed headroom (a store read, no CLI call beyond the auth check
+            // above). Claude's signal is categorical, Codex's numeric -- shown as reported.
+            if let Some(line) = self.usage_gate_status_line(spec) {
+                out.push_str(&line);
             }
         }
         if multi {
@@ -2786,6 +2823,53 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exhaustion_failure_words_itself_by_cause() {
+        // Pure rate-limited keeps today's exact single-reviewer detail (byte-for-byte contract).
+        let rate_only = exhaustion_failure(&["a".into(), "b".into()], &[]);
+        assert_eq!(rate_only.code, "REVIEWERS_EXHAUSTED");
+        assert!(
+            rate_only
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("rate/usage limit, in order: a; b"),
+            "{rate_only:?}"
+        );
+        assert!(rate_only.summary.contains("rate or usage limit"));
+
+        // All-gated names the usage minimum, not a rate limit.
+        let gated_only = exhaustion_failure(&[], &["x (usage below minimum)".into()]);
+        assert!(
+            gated_only.summary.contains("below its configured minimum"),
+            "{gated_only:?}"
+        );
+
+        // Mixed names both causes.
+        let mixed = exhaustion_failure(&["a".into()], &["x (usage below minimum)".into()]);
+        assert!(
+            mixed.summary.contains("rate-limited or skipped"),
+            "{mixed:?}"
+        );
+        let d = mixed.detail.as_deref().unwrap();
+        assert!(
+            d.contains("a (rate-limited)") && d.contains("usage below minimum"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn a_gated_skip_attempt_is_non_billed() {
+        let spec = Config::from_args(&["--reviewer".into(), "codex".into()])
+            .unwrap()
+            .primary()
+            .clone();
+        let a = gated_skip_attempt(&spec);
+        assert_eq!(a.failure_code, "USAGE_BELOW_MINIMUM");
+        assert!(!a.billed);
+        assert_eq!(a.resolved_bin, None);
+    }
 
     #[test]
     fn resumed_session_id_mismatch_only_fires_on_a_resume_with_a_different_reported_id() {
