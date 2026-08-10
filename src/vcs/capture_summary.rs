@@ -157,7 +157,7 @@ impl CaptureSummary {
     /// partial). `+t` implies `+p`. Lets an after-the-fact audit see which range each turn
     /// reviewed, not only how many bytes it was.
     pub fn tag(&self) -> String {
-        let raw = match self {
+        let (prefix, identity, diff_truncated, complete) = match self {
             CaptureSummary::Git {
                 range,
                 diff_truncated,
@@ -166,28 +166,30 @@ impl CaptureSummary {
             } => {
                 // Strip the "git diff " prefix the range carries for the response, leaving the
                 // endpoints/mode; the range is already hex or `safe_label`-bounded.
-                let core = range.strip_prefix("git diff ").unwrap_or(range);
-                format!(
-                    "git:{core}{}{}",
-                    if *diff_truncated { "+t" } else { "" },
-                    if *complete { "" } else { "+p" }
-                )
+                let core = range.strip_prefix("git diff ").unwrap_or(range).to_string();
+                ("git:", core, *diff_truncated, *complete)
             }
             CaptureSummary::Perforce {
                 changelists,
                 diff_truncated,
                 complete,
                 ..
-            } => {
-                format!(
-                    "p4:{}{}{}",
-                    join_changelists(changelists),
-                    if *diff_truncated { "+t" } else { "" },
-                    if *complete { "" } else { "+p" }
-                )
-            }
+            } => (
+                "p4:",
+                join_changelists(changelists),
+                *diff_truncated,
+                *complete,
+            ),
         };
-        bound(&raw, MAX_TAG_LEN)
+        // Bound the *identity* portion, then append the markers, so a long range or changelist set
+        // can never truncate `+t`/`+p` away and make the log under-report an incomplete capture.
+        let markers = format!(
+            "{}{}",
+            if diff_truncated { "+t" } else { "" },
+            if complete { "" } else { "+p" }
+        );
+        let identity_budget = MAX_TAG_LEN.saturating_sub(prefix.len() + markers.len());
+        format!("{prefix}{}{markers}", bound(&identity, identity_budget))
     }
 }
 
@@ -220,13 +222,16 @@ fn join_changelists(cls: &[u64]) -> String {
     out
 }
 
-/// Cut a tag to `limit` bytes on a char boundary; the range/changelist text may already be a
-/// bounded `safe_label`, but the assembled tag still needs a hard ceiling for the log.
+/// Cut a string to at most `limit` bytes *including* the ellipsis, on a char boundary. The
+/// range/changelist text may already be a bounded `safe_label`, but the assembled tag still needs
+/// a hard ceiling for the log; counting the ellipsis inside `limit` keeps the final tag within
+/// its stated bound rather than three bytes over it.
 fn bound(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_string();
     }
-    let mut end = limit;
+    let ellipsis = '…'.len_utf8();
+    let mut end = limit.saturating_sub(ellipsis);
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -438,9 +443,26 @@ mod tests {
     }
 
     #[test]
-    fn a_long_tag_is_bounded() {
+    fn a_long_perforce_tag_is_bounded_but_keeps_its_markers() {
+        // Many changelists and an incomplete capture: the identity is bounded, but the `+p`
+        // marker must survive so the log does not under-report the shortfall.
         let many: Vec<u64> = (0..200).collect();
-        let s = perforce(many, 0, 0, 1, false, true);
-        assert!(s.tag().len() <= MAX_TAG_LEN + 4, "{}", s.tag());
+        let s = perforce(many, 3, 0, 1, false, false);
+        let tag = s.tag();
+        assert!(tag.len() <= MAX_TAG_LEN, "{tag}");
+        assert!(tag.starts_with("p4:"), "{tag}");
+        assert!(tag.ends_with("+p"), "{tag}");
+    }
+
+    #[test]
+    fn a_long_git_tag_keeps_its_markers() {
+        // A long (sanitised, non-hex) range plus a truncated, partial capture: `+t+p` must
+        // survive the length bound rather than being cut off the end.
+        let long_range = format!("git diff {}", "a".repeat(200));
+        let s = git(&long_range, 1, 1, 1, 0, false, true, true, false);
+        let tag = s.tag();
+        assert!(tag.len() <= MAX_TAG_LEN, "{tag}");
+        assert!(tag.starts_with("git:"), "{tag}");
+        assert!(tag.ends_with("+t+p"), "{tag}");
     }
 }

@@ -579,15 +579,15 @@ pub fn capture(
             }
         };
 
-    // `ls_files_incomplete` is true when the untracked enumeration failed outright (which already
-    // pushes a note) or returned success with a shortened/lossy stream (which pushes its own note
-    // inside `untracked`). It feeds the untracked count floor; the notes feed `complete` and the
-    // caller warnings.
-    let (untracked, omissions, ls_files_incomplete) = if mode.includes_untracked() {
+    // Whether the untracked enumeration was whole. `Failed` already carries a prompt note (and so
+    // a caller warning); `StreamShort` is raised as a caller-only warning below, leaving the prompt
+    // untouched. Either makes the untracked count a floor and the capture partial.
+    let (untracked, omissions, ls_files) = if mode.includes_untracked() {
         git.untracked(&mut notes)
     } else {
-        (Vec::new(), OmissionReport::default(), false)
+        (Vec::new(), OmissionReport::default(), LsFiles::Ok)
     };
+    let ls_files_incomplete = !matches!(ls_files, LsFiles::Ok);
 
     // The gaps go to the reviewer *and* to the caller. The reviewer needs them to qualify
     // its review; the caller needs them to know the review it is reading was made on
@@ -634,6 +634,15 @@ pub fn capture(
         status_stdout_incomplete,
         status_stdout_lossy,
     );
+    // A successful-but-short untracked enumeration is caller-only: the reviewer's prompt is left
+    // unchanged (the `Failed` case's note is pre-existing), so this warning is the only place the
+    // caller hears the untracked set may be short of the whole.
+    if matches!(ls_files, LsFiles::StreamShort) {
+        warnings.push(incomplete(
+            "the untracked-file listing (`git ls-files`) returned a short or undecodable result, \
+             so some new files may be missing from the count and the prompt",
+        ));
+    }
     // A new file shown only as a prefix is a caller-facing gap; the per-file bodies already say so
     // in the prompt, but the caller cannot read the prompt.
     let untracked_bodies_truncated = untracked.iter().filter(|f| f.body.truncated).count();
@@ -979,6 +988,18 @@ fn is_object_name(s: &str) -> bool {
 /// says so in its own words -- see `Capture::warn`.
 fn incomplete(note: &str) -> String {
     format!("The captured change was incomplete: {note}")
+}
+
+/// The wholeness of the untracked *enumeration* (`git ls-files`), as [`Git::untracked`] saw it.
+///
+/// `Failed` (the command did not complete) already carries a prompt note and thus a caller
+/// warning, so it is unchanged. `StreamShort` (a successful run whose stream was cut or decoded
+/// lossily) is new, and is deliberately kept out of the prompt: `capture` raises a caller-only
+/// warning for it. Both make `untracked_files` a floor and the capture partial.
+enum LsFiles {
+    Ok,
+    Failed,
+    StreamShort,
 }
 
 /// Push a caller warning for each distinct stream fault, naming the precise cause. `what` is the
@@ -1406,12 +1427,14 @@ impl<'a> Git<'a> {
     }
 
     /// Untracked, non-ignored files and their contents, plus notes on what was left out.
-    /// The third return is `ls_files_incomplete`: the untracked enumeration did not produce a
-    /// whole result. True when `git ls-files` failed outright (the note below fires) or returned
-    /// success with a shortened/lossy stream (a note fires too). It makes `untracked_files` a
-    /// floor -- a successful-but-short listing silently drops files the count would otherwise
-    /// present as exact.
-    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<NewFile>, OmissionReport, bool) {
+    ///
+    /// The third return reports whether the *enumeration itself* was whole -- see [`LsFiles`]. It
+    /// makes `untracked_files` a floor and the capture partial: a successful-but-short listing
+    /// silently drops files the count would otherwise present as exact. The `Failed` case pushes a
+    /// prompt note (pre-existing behaviour, so the reviewer sees it); the `StreamShort` case does
+    /// **not** touch the prompt -- `capture` raises a caller-only warning for it -- so this change
+    /// adds no new line to the reviewer's prompt.
+    fn untracked(&self, notes: &mut Vec<String>) -> (Vec<NewFile>, OmissionReport, LsFiles) {
         let out = match self.run(&["ls-files", "--others", "--exclude-standard", "-z"]) {
             Some(out) if out.success => out,
             // An absent section reads as "there were none", and the reviewer has no shell
@@ -1423,19 +1446,14 @@ impl<'a> Git<'a> {
                      shows."
                         .to_string(),
                 );
-                return (Vec::new(), OmissionReport::default(), true);
+                return (Vec::new(), OmissionReport::default(), LsFiles::Failed);
             }
         };
         // Success does not mean whole: the stream can end short of the full list or decode
-        // lossily. Either way the enumeration is not to be trusted as complete.
-        let ls_files_incomplete = out.stdout_truncated || out.stdout_incomplete || out.stdout_lossy;
-        if ls_files_incomplete {
-            notes.push(
-                "The untracked-file listing may be incomplete: `git ls-files` output was cut \
-                 short or did not decode cleanly, so some new files may be missing."
-                    .to_string(),
-            );
-        }
+        // lossily. Either way the enumeration is not to be trusted as complete -- but this is a
+        // caller-facing fact, not part of the evidence, so it is signalled out rather than noted
+        // into the prompt.
+        let stream_short = out.stdout_truncated || out.stdout_incomplete || out.stdout_lossy;
         let listing = out.stdout;
 
         // NUL-separated, so a path containing a newline -- legal, and a way to hide a file
@@ -1517,7 +1535,15 @@ impl<'a> Git<'a> {
             });
         }
 
-        (files, omitted.finish(), ls_files_incomplete)
+        (
+            files,
+            omitted.finish(),
+            if stream_short {
+                LsFiles::StreamShort
+            } else {
+                LsFiles::Ok
+            },
+        )
     }
 }
 
