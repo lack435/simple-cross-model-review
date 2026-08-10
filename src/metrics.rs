@@ -39,6 +39,22 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// Skipping is the honest reading, and the count is surfaced so it is never silent.
 pub const RECORD_VERSION: u32 = 1;
 
+/// Schema version for a record that carries fall-through `attempts`. A `v == 1` reader skips
+/// (and counts) it rather than silently ignoring the unknown field and reporting a fallback
+/// turn's usage as complete; the current reader accepts both `1` and `2`. A turn with no
+/// fall-through stays at `RECORD_VERSION` so nothing an old reader could read changes. See
+/// `docs/reviewer-fallback-chain.md`.
+pub const RECORD_VERSION_ATTEMPTS: u32 = 2;
+
+/// The schema version to stamp on a record, given whether it carries fall-through attempts.
+pub fn record_version_for(has_attempts: bool) -> u32 {
+    if has_attempts {
+        RECORD_VERSION_ATTEMPTS
+    } else {
+        RECORD_VERSION
+    }
+}
+
 /// How many distinct sessions the per-session ranking will track.
 ///
 /// Session names are chosen by the calling agent, so the number of distinct ones is
@@ -354,6 +370,18 @@ pub struct Record {
     /// live, kept in the log too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The reviewer binary this turn's *terminal* attempt resolved to. Names the exact
+    /// executable (and so the account) that ran, which `reviewer`/`model`/`effort` cannot when
+    /// two chain entries share a model but differ by `--bin`. Additive; absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_bin: Option<String>,
+    /// Earlier fall-through attempts on this same logical turn — the rate-limited entries the
+    /// walk tried before the one that produced this record. Kept so a rate-limited primary stays
+    /// visible without inflating the turn/wall/token totals (this is still one `Record`). Absent
+    /// (empty) on the overwhelming common case of no fall-through; its presence stamps the record
+    /// at schema version 2. See `docs/reviewer-fallback-chain.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
     /// The capture identity of this turn, as a compact tag (`git:<base12>..<head12>+t+p`,
     /// `p4:43650,43651+p`, ...). Present whenever a change was sent (fresh or resumed), absent on a
     /// no-change turn or a record written before this field existed. Lets an after-the-fact audit
@@ -361,6 +389,24 @@ pub struct Record {
     /// attribution the response's `captured:` line gives live, kept in the log too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured: Option<String>,
+}
+
+/// One fall-through attempt that did not become the turn's outcome (it was rate-limited and the
+/// walk advanced). Recorded for visibility only; its token usage is deliberately **unknown**
+/// (the adapter exposes usage only on a successful parse, and a refusal's usage is not something
+/// this tool has verified it can read), which the accumulator propagates as partial totals.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attempt {
+    pub reviewer: String,
+    pub model: String,
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_bin: Option<String>,
+    /// Why this attempt did not become the outcome (always `RATE_LIMITED` today, since only a
+    /// rate/usage limit falls through).
+    pub failure_code: String,
+    pub wall_secs: u64,
+    pub prompt_bytes: usize,
 }
 
 /// Append-only usage log.
@@ -501,7 +547,11 @@ impl MetricsLog {
                     continue;
                 }
                 match serde_json::from_str::<Record>(&line) {
-                    Ok(record) if record.v == RECORD_VERSION => acc.push(&record),
+                    Ok(record)
+                        if record.v == RECORD_VERSION || record.v == RECORD_VERSION_ATTEMPTS =>
+                    {
+                        acc.push(&record)
+                    }
                     // A record we cannot interpret correctly is skipped, not guessed at.
                     // Counted so the omission is visible rather than silent.
                     Ok(_) => report.unsupported_version += 1,
@@ -539,7 +589,9 @@ impl MetricsLog {
                 Ok(text) => {
                     for line in text.lines().filter(|l| !l.trim().is_empty()) {
                         match serde_json::from_str::<Record>(line) {
-                            Ok(r) if r.v == RECORD_VERSION => records.push(r),
+                            Ok(r) if r.v == RECORD_VERSION || r.v == RECORD_VERSION_ATTEMPTS => {
+                                records.push(r)
+                            }
                             Ok(_) => report.unsupported_version += 1,
                             Err(_) => report.malformed += 1,
                         }
@@ -752,11 +804,16 @@ impl Accumulator {
         // A turn that reported nothing still consumed tokens -- we simply do not know how
         // many. Treating it as complete, as an earlier version did, presents the total as
         // exact when it is a floor.
-        let input_ok = record.usage.input_complete();
-        let output_ok = record.usage.output_tokens.is_some();
-        self.cache_write_complete &= record.usage.cache_creation_tokens.is_some();
-        self.cache_read_complete &= record.usage.cache_read_tokens.is_some();
-        self.fresh_complete &= record.usage.input_tokens.is_some();
+        // A fall-through attempt consumed tokens the CLI did not report back (a rate-limit
+        // refusal exposes no usage), so a turn that fell back is never a complete accounting even
+        // when its terminal attempt reported full usage. Fold that in alongside the per-field
+        // checks, so a total carrying a hidden attempt is presented as a floor, not as exact.
+        let attempt_free = record.attempts.is_empty();
+        let input_ok = record.usage.input_complete() && attempt_free;
+        let output_ok = record.usage.output_tokens.is_some() && attempt_free;
+        self.cache_write_complete &= record.usage.cache_creation_tokens.is_some() && attempt_free;
+        self.cache_read_complete &= record.usage.cache_read_tokens.is_some() && attempt_free;
+        self.fresh_complete &= record.usage.input_tokens.is_some() && attempt_free;
         self.output_complete &= output_ok;
 
         if let Some(calls) = record.usage.api_calls {
@@ -782,7 +839,7 @@ impl Accumulator {
         // already updated, so a turn beyond the cap is still counted -- it only loses its
         // own row, and the report says how many sessions that happened to.
         let room = self.per_session.len() < MAX_RANKED_SESSIONS;
-        let cost_ok = record.usage.cost_usd.is_some();
+        let cost_ok = record.usage.cost_usd.is_some() && attempt_free;
         match self.per_session.get_mut(&record.session) {
             Some(entry) => {
                 entry.turns += 1;
@@ -1112,6 +1169,8 @@ mod tests {
             status: "completed".into(),
             failure_code: None,
             disposition: None,
+            resolved_bin: None,
+            attempts: Vec::new(),
             captured: None,
         }
     }
@@ -1146,6 +1205,29 @@ mod tests {
             api_calls: Some(8),
             api_duration_ms: Some(30_000),
         }
+    }
+
+    #[test]
+    fn a_fall_through_attempt_makes_the_turn_totals_partial() {
+        // A record whose terminal usage is complete but which carries a rate-limited attempt
+        // (usage unknown) must not summarise as a complete accounting: the attempt consumed
+        // tokens the CLI never reported. See docs/reviewer-fallback-chain.md.
+        let mut with_attempt = record("s", 1, None, usage(1_000, 9_000, 500));
+        with_attempt.v = RECORD_VERSION_ATTEMPTS;
+        with_attempt.attempts = vec![Attempt {
+            reviewer: "claude".into(),
+            model: "claude-opus-4-8".into(),
+            effort: "medium".into(),
+            resolved_bin: None,
+            failure_code: "RATE_LIMITED".into(),
+            wall_secs: 3,
+            prompt_bytes: 100,
+        }];
+        assert!(!summarise(&[with_attempt]).input_complete());
+
+        // The same usage with no fall-through is complete.
+        let clean = record("s", 1, None, usage(1_000, 9_000, 500));
+        assert!(summarise(&[clean]).input_complete());
     }
 
     #[test]

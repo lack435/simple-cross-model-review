@@ -614,6 +614,24 @@ fn send(writer: &Writer, message: Value) {
     let _ = out.flush();
 }
 
+/// The distinct reviewer CLI names across the chain, as a human phrase ("codex", "claude", or
+/// "codex and claude"). Order-preserving and deduplicated, so a two-Codex chain still reads
+/// "codex".
+fn distinct_reviewer_clis(cfg: &crate::config::Config) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for spec in &cfg.reviewers {
+        let name = spec.reviewer.as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [first, rest @ ..] => format!("{first} and {}", rest.join(" and ")),
+    }
+}
+
 fn server_instructions(app: &App) -> String {
     let cfg = app.cfg();
     let reviewer = cfg.describe_reviewer();
@@ -654,19 +672,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // "Read-only" is a claim about writes and nothing more. Codex's *reads* are not confined
     // to the project, and no way to confine them was found (`README.md`), so this clause must
     // not grow into one that suggests otherwise.
-    let shell_clause = match cfg.reviewer {
-        crate::config::ReviewerKind::Codex => {
+    // `.first()` rather than `primary()` throughout: a defensively-constructed empty chain (which
+    // `from_args` never produces) must render safe metadata for `tools/list` rather than panic --
+    // its reviews are refused in-band with INVALID_REVIEWER_CHAIN.
+    let shell_clause = match cfg.reviewers.first().map(|s| s.reviewer) {
+        Some(crate::config::ReviewerKind::Codex) => {
             "It has a read-only shell; its non-interactive command policy may refuse some forms"
         }
-        crate::config::ReviewerKind::Claude => {
+        Some(crate::config::ReviewerKind::Claude) => {
             "It has a shell, because one was enabled explicitly -- its allow-list is a soft \
              boundary rather than a read-only guarantee"
         }
+        None => "",
     };
 
     let read_commands = cfg.vcs.read_commands_phrase();
     let cli = cfg.vcs.cli();
-    let access = if cfg.reviewer_has_shell() && !cfg.supplies_change() {
+    let access = if cfg.reviewers.is_empty() {
+        "The reviewer chain is misconfigured, so every review is refused until it is fixed. Run \
+         cross_model_review_status for the specifics."
+            .to_string()
+    } else if cfg.reviewer_has_shell() && !cfg.supplies_change() {
         format!(
             "The reviewer can read and search files in this repository. {shell_clause}, so it \
              can run {read_commands} and inspect the change history itself. You do not need to \
@@ -710,14 +736,40 @@ fn tool_definitions(app: &App) -> Vec<Value> {
              stands, and will say so."
         )
     };
-    let caller_hint = match cfg.reviewer {
-        crate::config::ReviewerKind::Claude => {
+    // The capability text above describes the primary, which is what runs first. When a
+    // fallback chain is configured, say so honestly rather than implying the primary is the
+    // only reviewer: a fallback may be a different model or family with different shell/capture
+    // behaviour. See docs/reviewer-fallback-chain.md.
+    let access = if cfg.reviewers.len() > 1 {
+        let fallbacks: Vec<String> = cfg.reviewers[1..].iter().map(|s| s.describe()).collect();
+        format!(
+            "{access}\n\nIf the primary reviewer reports a rate or usage limit, this server \
+             automatically falls back, in order, to: {}. A fallback may be a different model or \
+             family, so its shell and capture behaviour can differ from what is described above.",
+            fallbacks.join("; ")
+        )
+    } else {
+        access
+    };
+    let caller_hint = match cfg.reviewers.first().map(|s| s.reviewer) {
+        Some(crate::config::ReviewerKind::Claude) => {
             "The reviewer is a Claude model, so this is most useful when you are not one."
         }
-        crate::config::ReviewerKind::Codex => {
+        Some(crate::config::ReviewerKind::Codex) => {
             "The reviewer is an OpenAI model, so this is most useful when you are not one."
         }
+        None => "",
     };
+
+    // Names the whole chain, not just the primary: with a fallback configured the status
+    // reflects every reviewer, so a description naming one CLI would understate what is checked.
+    let status_description = format!(
+        "Check that the review tool is usable: whether the {clis} CLI is installed, whether it is \
+         signed in, which model and effort are pinned (for every entry in the reviewer chain), \
+         and which review sessions exist. Costs nothing and calls no model. Worth calling first \
+         if a review has just failed, or to confirm the setup before relying on it.",
+        clis = distinct_reviewer_clis(cfg)
+    );
 
     let mut tools = vec![
         json!({
@@ -827,13 +879,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "cross_model_review_status",
-            "description": format!(
-                "Check that the review tool is usable: whether the {} CLI is installed, whether \
-                 it is signed in, which model and effort are pinned, and which review sessions \
-                 exist. Costs nothing and calls no model. Worth calling first if a review has \
-                 just failed, or to confirm the setup before relying on it.",
-                cfg.reviewer.as_str()
-            ),
+            "description": status_description,
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({

@@ -9,7 +9,8 @@
 //! working, and keeps costing, for the rest of its timeout budget on behalf of a caller
 //! that has gone away.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What cancelling a request should do to the review it is bound to.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -31,6 +32,10 @@ pub enum CancelAction {
 #[derive(Default)]
 pub struct RequestCancel {
     state: Mutex<State>,
+    /// A lock-free mirror of `state.cancelled`, so setup work that needs an `&AtomicBool` cancel
+    /// probe (a reviewer auth check spawned before the review is registered) can observe a
+    /// cancellation without taking the state lock. Set alongside `state.cancelled` in `cancel`.
+    flag: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -103,6 +108,9 @@ impl RequestCancel {
     /// id and the review must not be taken away. Otherwise an *owned* review is `Kill`ed and a
     /// *waited* one is `Detach`ed; an unbound request reports `Nothing`.
     pub fn cancel(&self) -> CancelAction {
+        // Mirror first, so a preflight probe that reads only the flag never sees the lock's
+        // `cancelled` set while the flag still reads false.
+        self.flag.store(true, Ordering::SeqCst);
         let mut state = self.lock();
         state.cancelled = true;
         if state.responded {
@@ -122,6 +130,13 @@ impl RequestCancel {
     /// reader and prevent cancellation of every other request.
     pub fn is_cancelled(&self) -> bool {
         self.lock().cancelled
+    }
+
+    /// A lock-free cancel probe for setup work that needs an `&AtomicBool` (a reviewer auth check
+    /// run before the review is registered and has a registry cancel of its own). It flips when
+    /// `cancel` is called, so an auth probe handed this stops instead of waiting out its timeout.
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.flag
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

@@ -190,6 +190,52 @@ pub fn rate_limited(reviewer: &str, detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// A rate/usage limit hit while *resuming* a session. Same `RATE_LIMITED` code as the shared
+/// constructor (so single-entry behaviour and classification are unchanged), but the remediation
+/// is resume-aware: a resume runs one bound entry and cannot fall through, so `fresh: true` is the
+/// way to reach another reviewer, at the cost of the prior reviewer's memory.
+pub fn rate_limited_on_resume(reviewer: &str) -> Failure {
+    Failure::new(
+        "RATE_LIMITED",
+        format!("The '{reviewer}' reviewer for this session reported a rate or usage limit."),
+        "This review was resuming an existing session, which runs only the reviewer that created \
+         it -- it does not fall back to another entry, because the reviewer's memory of the earlier \
+         turns lives on that one reviewer.\n\n\
+         Either wait for the limit to reset and call again with the same session, or call again \
+         with fresh: true to start a new review -- which restarts fallback-chain selection from \
+         the top, at the cost of losing this session's context.\n\n\
+         The review has NOT been performed.",
+    )
+}
+
+pub fn invalid_reviewer_chain(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "INVALID_REVIEWER_CHAIN",
+        "The reviewer fallback chain is misconfigured, so every review is refused.",
+        "This server was started with a reviewer fallback chain that cannot function, so it \
+         refuses every review until the configuration is fixed.\n\n\
+         Fix the --reviewer/--model/--effort/--bin arguments in this project's MCP \
+         configuration so the chain is valid, then restart the agent session. See \
+         docs/reviewer-fallback-chain.md for the rules.\n\n\
+         The review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
+pub fn reviewers_exhausted(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWERS_EXHAUSTED",
+        "Every reviewer in the fallback chain reported a rate or usage limit, so the review was \
+         refused.",
+        "The cross-model review could not run because every configured reviewer hit a rate \
+         limit or usage cap in turn.\n\n\
+         Nothing is broken in the setup. Either wait for a limit to reset and retry, or add a \
+         reviewer entry on an account with remaining capacity.\n\n\
+         The review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
 pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failure {
     Failure::new(
         "TIMEOUT",
@@ -529,6 +575,20 @@ pub fn too_many_running(limit: u32) -> Failure {
 }
 
 impl Failure {
+    /// Append which reviewer entry was running when this failure occurred, so a terminal failure
+    /// on a fallback chain names the entry that produced it (not just the reviewer family already
+    /// in the message). No-op when `active` is `None`. See `docs/reviewer-fallback-chain.md`.
+    pub fn with_active_note(mut self, active: Option<&str>) -> Self {
+        if let Some(active) = active {
+            let note = format!("Reviewer that ran: {active}.");
+            self.detail = Some(match self.detail.take() {
+                Some(d) => format!("{d}\n\n{note}"),
+                None => note,
+            });
+        }
+        self
+    }
+
     /// True when the failure is the agent's own fault and it should just retry
     /// differently, rather than stopping to involve the user.
     pub fn is_agent_correctable(&self) -> bool {
@@ -648,4 +708,37 @@ pub fn classify(
     }
 
     reviewer_crashed(reviewer, exit, detail)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_on_resume_keeps_the_code_but_points_at_fresh() {
+        let f = rate_limited_on_resume("codex");
+        assert_eq!(f.code, "RATE_LIMITED");
+        assert!(f.remediation.contains("fresh: true"), "{}", f.remediation);
+        assert!(f.summary.contains("codex"), "{}", f.summary);
+    }
+
+    #[test]
+    fn with_active_note_names_the_entry_and_is_a_noop_when_absent() {
+        let named =
+            rate_limited("codex", "x").with_active_note(Some("OpenAI Codex (codex, model=m)"));
+        assert!(
+            named
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Reviewer that ran:"),
+            "{named:?}"
+        );
+        let plain = rate_limited("codex", "x").with_active_note(None);
+        assert!(!plain
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("Reviewer that ran"));
+    }
 }

@@ -22,7 +22,13 @@ fn config(extra: &[&str]) -> Config {
 /// The full argv as strings, for presence checks.
 fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<String> {
     let inv = reviewer
-        .invocation(cfg, Path::new("C:\\fake\\reviewer.exe"), resume, "tmp-1")
+        .invocation(
+            cfg,
+            cfg.primary(),
+            Path::new("C:\\fake\\reviewer.exe"),
+            resume,
+            "tmp-1",
+        )
         .expect("invocation");
     inv.command
         .get_args()
@@ -32,14 +38,26 @@ fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<Stri
 
 fn program(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
     let inv = reviewer
-        .invocation(cfg, Path::new("C:\\fake\\reviewer.exe"), None, "tmp-1")
+        .invocation(
+            cfg,
+            cfg.primary(),
+            Path::new("C:\\fake\\reviewer.exe"),
+            None,
+            "tmp-1",
+        )
         .expect("invocation");
     PathBuf::from(inv.command.get_program())
 }
 
 fn cwd_of(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
     let inv = reviewer
-        .invocation(cfg, Path::new("C:\\fake\\reviewer.exe"), None, "tmp-1")
+        .invocation(
+            cfg,
+            cfg.primary(),
+            Path::new("C:\\fake\\reviewer.exe"),
+            None,
+            "tmp-1",
+        )
         .expect("invocation");
     inv.command
         .get_current_dir()
@@ -327,7 +345,13 @@ fn codex_argv_respects_a_custom_sandbox() {
 fn codex_writes_its_final_message_to_a_file_it_reports() {
     let cfg = config(&["codex"]);
     let inv = CodexReviewer
-        .invocation(&cfg, Path::new("C:\\fake\\codex.exe"), None, "tmp-1")
+        .invocation(
+            &cfg,
+            cfg.primary(),
+            Path::new("C:\\fake\\codex.exe"),
+            None,
+            "tmp-1",
+        )
         .expect("invocation");
     let path = inv
         .last_message_file

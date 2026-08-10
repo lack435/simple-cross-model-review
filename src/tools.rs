@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::Config;
+use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -48,31 +48,72 @@ struct Preflight {
     auth: String,
 }
 
+/// Per-chain-entry preflight cache, keyed by entry index. Shared (via `Arc`) between `App` and the
+/// worker's fall-through walk, so each entry is resolved and auth-checked at most once across the
+/// selected-entry check, `status`, and the walk.
+type PreflightCache = Arc<Mutex<std::collections::HashMap<usize, Preflight>>>;
+
+/// Resolve and auth-check a chain entry, returning a cached result when present and caching a
+/// fresh one otherwise. Successful preflights are cached for the process lifetime; failures are
+/// not, so a user who runs `codex login` can retry without restarting the agent session. The
+/// adapter is selected per entry (`for_kind`), so a mixed-family chain preflights each entry with
+/// its own CLI.
+fn ensure_entry_ready(
+    cache: &Mutex<std::collections::HashMap<usize, Preflight>>,
+    cfg: &Config,
+    index: usize,
+    cancel: &AtomicBool,
+) -> Result<Preflight, Failure> {
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    let spec = &cfg.reviewers[index];
+    let bin = reviewer::resolve_bin(spec)?;
+    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, cancel)?;
+    let ready = Preflight { bin, auth };
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index, ready.clone());
+    Ok(ready)
+}
+
 pub struct App {
     cfg: Arc<Config>,
-    reviewer: Arc<dyn Reviewer>,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
-    /// Successful preflights are cached for the process lifetime; failures are not, so
-    /// a user who runs `codex login` can retry without restarting the agent session.
-    preflight: Mutex<Option<Preflight>>,
+    preflight: PreflightCache,
+    /// Set when the reviewer chain is semantically invalid (`Config::validate_chain`). While
+    /// present, every review is refused in-band with this `INVALID_REVIEWER_CHAIN` failure
+    /// rather than the server exiting — see `docs/reviewer-fallback-chain.md`. Checked before
+    /// the session lease and before any reviewer preflight, so an invalid chain touches nothing.
+    chain_error: Option<Failure>,
 }
 
 impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
         let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
-        let reviewer = reviewer::for_kind(cfg.reviewer);
+        // The chain's semantics are validated once, here. On failure the server still starts,
+        // but every review is refused in-band with this failure (see `chain_error`).
+        let chain_error = Config::validate_chain(&cfg.reviewers)
+            .err()
+            .map(errors::invalid_reviewer_chain);
         // Read before `cfg` moves into the Arc below.
         let cfg_max_concurrent = cfg.max_concurrent_reviews;
         Self {
             cfg: Arc::new(cfg),
-            reviewer: Arc::from(reviewer),
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
-            preflight: Mutex::new(None),
+            preflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            chain_error,
         }
     }
 
@@ -107,20 +148,13 @@ impl App {
         &self.registry
     }
 
-    fn ensure_ready(&self) -> Result<Preflight, Failure> {
-        if let Some(cached) = self
-            .preflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return Ok(cached);
-        }
-        let bin = reviewer::resolve_bin(&self.cfg)?;
-        let auth = self.reviewer.auth_check(&bin, &self.cfg)?;
-        let ready = Preflight { bin, auth };
-        *self.preflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(ready.clone());
-        Ok(ready)
+    /// Resolve and auth-check a specific chain entry, caching the result by index.
+    ///
+    /// Delegates to the shared [`ensure_entry_ready`], which the worker's fall-through walk uses
+    /// too (via the same `Arc`-shared cache), so each entry is preflighted at most once across the
+    /// selected-entry check here, `status`, and the walk.
+    fn ensure_ready_for(&self, index: usize, cancel: &AtomicBool) -> Result<Preflight, Failure> {
+        ensure_entry_ready(&self.preflight, &self.cfg, index, cancel)
     }
 
     // -----------------------------------------------------------------------
@@ -128,6 +162,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn start_review(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        // An invalid reviewer chain refuses every review, before the session lease and before any
+        // reviewer preflight, so nothing is resolved or billed against a chain known to be broken.
+        if let Some(err) = &self.chain_error {
+            return Err(err.clone());
+        }
+
         let instructions = string_arg(args, "instructions")
             .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
 
@@ -172,8 +212,6 @@ impl App {
         }
         let changes_canonical = crate::changeset::canonical(&changes);
 
-        let ready = self.ensure_ready()?;
-
         // The lease comes first, before the session record is read. Reading first would
         // be a stale-read race: another server process can finish a `fresh` review, or
         // rebind an expired session to a new id, while we are still waiting for the
@@ -211,6 +249,56 @@ impl App {
             None => (None, 1, false),
         };
 
+        // Select the entry to start on, then preflight *only* that entry: for a fresh review the
+        // primary (index 0, then the walk); for a resume the entry that created the session
+        // (matched above by `resume_block`, so `resume_entry_index` is `Some`). This is what keeps
+        // a resume of a fell-back session from dying on the primary's CLI. Preflight runs here,
+        // under the lease and after selection, never unconditionally against the primary.
+        let start_index = match &prior {
+            Some(record) => self.cfg.resume_entry_index(record).unwrap_or(0),
+            None => 0,
+        };
+        // A `notifications/cancelled` that arrived before the review is even registered still
+        // stops setup here; the flag below then interrupts the (bounded) auth check itself.
+        if request.is_cancelled() {
+            return Err(errors::cancelled());
+        }
+        // The review has no registry cancel yet (it is not registered until `try_start`), so the
+        // selected entry's auth check observes the request's own cancel mirror instead.
+        let cancel = request.cancel_flag();
+        let ready = match &prior {
+            // Resume: resolve the selected entry *uncached* and validate its binary against what
+            // the session was created with **before** auth-checking or caching it -- so a PATH
+            // change cannot hide behind a stale cached entry, and a rejected resume never leaves a
+            // rejected binary in the cache for a later fresh review to reuse.
+            Some(record) => {
+                let spec = &self.cfg.reviewers[start_index];
+                let bin = reviewer::resolve_bin(spec)?;
+                if let Some(stored) = &record.resolved_bin {
+                    if bin.to_string_lossy() != *stored {
+                        return Err(errors::session_not_resumable(
+                            &session,
+                            format!(
+                                "it was created with the reviewer binary at '{stored}', but that \
+                                 entry now resolves to '{}'; PATH or the install changed, so the \
+                                 conversation cannot be resumed through a different executable.",
+                                bin.display()
+                            ),
+                        ));
+                    }
+                }
+                // Identity confirmed: now auth-check and cache the validated binary.
+                let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
+                let ready = Preflight { bin, auth };
+                self.preflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(start_index, ready.clone());
+                ready
+            }
+            None => self.ensure_ready_for(start_index, cancel)?,
+        };
+
         // Claiming the session and registering the review are one atomic step, so two
         // concurrent calls cannot both start a review against the same conversation. It
         // can also refuse because the server is going away: this handler may have spent
@@ -239,7 +327,10 @@ impl App {
 
         let job = Job {
             cfg: Arc::clone(&self.cfg),
-            reviewer: Arc::clone(&self.reviewer),
+            reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
+            spec: self.cfg.reviewers[start_index].clone(),
+            start_index,
+            preflight: Arc::clone(&self.preflight),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
             metrics: Arc::clone(&self.metrics),
@@ -279,7 +370,7 @@ impl App {
             self.registry.finish(
                 &id,
                 Outcome::failed(errors::spawn_failed(
-                    self.cfg.reviewer.as_str(),
+                    self.cfg.reviewers[start_index].reviewer.as_str(),
                     "worker thread",
                     e.to_string(),
                 )),
@@ -313,7 +404,10 @@ impl App {
                 }
             ));
         }
-        out.push_str(&format!("budget:    {}\n\n", fmt_elapsed(self.cfg.timeout)));
+        out.push_str(&format!(
+            "budget:    {}\n\n",
+            fmt_elapsed(Duration::from_secs(self.cfg.max_wait_secs()))
+        ));
         out.push_str(&format!(
             "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
              until the review is done -- omit wait_seconds to wait to completion in one call -- and \
@@ -432,10 +526,18 @@ impl App {
         match snapshot.status {
             Status::Running => Ok(self.render_running(&snapshot, wait)),
             Status::Completed => Ok(self.render_completed(&snapshot)),
-            Status::Failed => Err(snapshot
-                .failure
-                .clone()
-                .unwrap_or_else(|| errors::empty_review(self.cfg.reviewer.as_str(), ""))),
+            Status::Failed => {
+                // Preserve the active-entry attribution the completed path renders: a failed
+                // review names the entry that ran, not just the reviewer family in the message.
+                let failure = snapshot
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| {
+                        errors::empty_review(self.cfg.primary().reviewer.as_str(), "")
+                    })
+                    .with_active_note(snapshot.active.as_deref());
+                Err(failure)
+            }
         }
     }
 
@@ -471,10 +573,17 @@ impl App {
             snapshot.id,
             snapshot.session,
             snapshot.turn,
-            self.cfg.describe_reviewer(),
+            snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
             snapshot.elapsed.as_secs(),
-            self.cfg.timeout.as_secs(),
-            render_progress(snapshot, self.cfg.timeout, !snapshot.shutting_down),
+            self.cfg.max_wait_secs(),
+            render_progress(
+                snapshot,
+                Duration::from_secs(self.cfg.max_wait_secs()),
+                !snapshot.shutting_down,
+            ),
         )
     }
 
@@ -488,8 +597,13 @@ impl App {
             string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
         })?;
         let snapshot = self.registry.snapshot(&id)?;
-        (snapshot.status == Status::Running)
-            .then(|| render_progress(&snapshot, self.cfg.timeout, !snapshot.shutting_down))
+        (snapshot.status == Status::Running).then(|| {
+            render_progress(
+                &snapshot,
+                Duration::from_secs(self.cfg.max_wait_secs()),
+                !snapshot.shutting_down,
+            )
+        })
     }
 
     fn render_completed(&self, snapshot: &Snapshot) -> String {
@@ -508,7 +622,10 @@ impl App {
             } else {
                 "turn 1, new review".to_string()
             },
-            self.cfg.describe_reviewer(),
+            snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
             snapshot.elapsed.as_secs(),
         ));
 
@@ -606,22 +723,56 @@ impl App {
             self.cfg.describe_reviewer()
         ));
 
-        match self.ensure_ready() {
-            Ok(ready) => {
-                out.push_str(&format!("cli:           {}\n", ready.bin.display()));
-                out.push_str(&format!(
-                    "auth:          {}\n",
-                    ready.auth.replace('\n', " ")
-                ));
-                out.push_str("ready:         yes\n");
+        // A semantically invalid chain is reported here first: the reviewer CLIs may be fine, but
+        // no review can run until the configuration is fixed.
+        if let Some(err) = &self.chain_error {
+            out.push_str("ready:         NO\n");
+            out.push_str(&format!("problem:       {} - {}\n", err.code, err.summary));
+            if let Some(detail) = &err.detail {
+                out.push_str(&format!("chain:         {detail}\n"));
             }
-            Err(failure) => {
-                out.push_str("ready:         NO\n");
-                out.push_str(&format!(
-                    "problem:       {} - {}\n",
-                    failure.code, failure.summary
-                ));
+            out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
+            return out;
+        }
+
+        // Preflight every entry in the chain, not just the primary: a fallback is only useful if
+        // its CLI is installed and signed in, and a human running --doctor wants to see that now
+        // rather than discover it mid-walk. Each entry uses its own adapter (`for_kind`).
+        let multi = self.cfg.reviewers.len() > 1;
+        let mut all_ready = true;
+        for (i, spec) in self.cfg.reviewers.iter().enumerate() {
+            if multi {
+                let role = if i == 0 { "primary" } else { "fallback" };
+                out.push_str(&format!("\nentry {i} ({role}): {}\n", spec.describe()));
             }
+            match self.ensure_ready_for(i, &AtomicBool::new(false)) {
+                Ok(ready) => {
+                    out.push_str(&format!("cli:           {}\n", ready.bin.display()));
+                    out.push_str(&format!(
+                        "auth:          {}\n",
+                        ready.auth.replace('\n', " ")
+                    ));
+                    out.push_str("ready:         yes\n");
+                }
+                Err(failure) => {
+                    all_ready = false;
+                    out.push_str("ready:         NO\n");
+                    out.push_str(&format!(
+                        "problem:       {} - {}\n",
+                        failure.code, failure.summary
+                    ));
+                }
+            }
+        }
+        if multi {
+            out.push_str(&format!(
+                "\nchain ready:   {}\n",
+                if all_ready {
+                    "yes"
+                } else {
+                    "NO (see entries above)"
+                }
+            ));
         }
 
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
@@ -730,6 +881,17 @@ impl App {
 struct Job {
     cfg: Arc<Config>,
     reviewer: Arc<dyn Reviewer>,
+    /// The active chain entry this job runs. Its adapter is `reviewer` and its resolved binary
+    /// is `bin`. Every identity-bearing call on the run path reads this, never `cfg.primary()`,
+    /// so a fallback names the reviewer that actually ran. The walk re-sets it per entry.
+    spec: ReviewerSpec,
+    /// The chain index the walk starts on: 0 for a fresh review (it then walks the chain), or the
+    /// resume-matched entry (which runs alone, no fall-through). Its bin is already in `self.bin`,
+    /// preflighted in `start_review`, so the walk does not re-resolve it.
+    start_index: usize,
+    /// The `App`'s per-entry preflight cache, shared so the walk's fallback preflights reuse (and
+    /// populate) the same cache the selected-entry check and `status` use.
+    preflight: PreflightCache,
     registry: Arc<Registry>,
     sessions: Arc<SessionStore>,
     metrics: Arc<MetricsLog>,
@@ -906,7 +1068,7 @@ impl Job {
         )
     }
 
-    fn run(self, resume_id: Option<String>) {
+    fn run(mut self, resume_id: Option<String>) {
         let started = std::time::Instant::now();
         let mut guard = FinishGuard {
             registry: &self.registry,
@@ -916,7 +1078,15 @@ impl Job {
 
         // Captured once, before the attempt runs, so the reviewer's prompt and the usage
         // metrics below describe the same diff.
-        if self.cfg.supplies_change() {
+        // Publish the selected entry before capture, so a snapshot taken during the Capturing
+        // phase names the reviewer that will run rather than a default. `self.bin` already holds
+        // the start entry's resolved path (preflighted in `start_review`), so the identity names
+        // the executable that will actually run, not merely the provider configuration.
+        self.registry.set_active(
+            &self.id,
+            self.cfg.reviewers[self.start_index].describe_with_bin(&self.bin),
+        );
+        if self.cfg.chain_needs_capture() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
@@ -1012,7 +1182,7 @@ impl Job {
         // there on a fresh turn too. Its metrics tag is taken from the local now, before the value
         // moves onto a *successful* outcome, so a failed reviewer attempt that still captured and
         // sent a change is logged with what it sent -- the same split as the disposition tag.
-        let capture_summary = capture.change.as_ref().map(|c| c.summary.clone());
+        let mut capture_summary = capture.change.as_ref().map(|c| c.summary.clone());
         let captured_tag = capture_summary.as_ref().map(vcs::CaptureSummary::tag);
 
         // A failed `mark_pending` means the *next* turn cannot safely elide. When the feature is
@@ -1048,52 +1218,172 @@ impl Job {
         // -- otherwise a failed reviewer attempt, which still sent this prompt, would record no
         // disposition even though a change was captured.
         let disposition_tag = disposition.as_ref().map(vcs::Disposition::tag);
-        self.registry.set_phase(&self.id, Phase::Launching);
 
         // What this attempt did, for the usage record.
         let mut facts = AttemptFacts::new(self.turn, resume_id.is_some(), self.gap_secs);
 
-        let outcome = match self.attempt(
-            resume_id.as_deref(),
-            self.turn,
-            self.prior_cumulative,
-            CaptureOutputs {
-                change: change.as_deref(),
-                head_sha: head_sha.as_deref(),
-                base_sha: base_sha.as_deref(),
-                capture_identity: capture_identity.as_ref(),
-                perforce_baseline: perforce_baseline.as_ref(),
-            },
-            &capture_warnings,
-            &mut facts.prompt_bytes,
-        ) {
-            Ok(mut outcome) => {
-                // The disposition and capture summary ride on the successful outcome so the
-                // response can render them. A failed turn keeps `None` (`Outcome::failed`) and
-                // renders as an error, so it shows neither line; the log still gets the tags.
-                outcome.disposition = disposition;
-                outcome.capture_summary = capture_summary;
-                outcome
-            }
-            Err(failure) => {
-                // A resume target the reviewer no longer has is a dead mapping: drop it so a
-                // follow-up call is not billed for the same doomed resume. The failure is
-                // then reported rather than silently retried into a fresh conversation --
-                // the caller is told the session expired and decides whether to start over
-                // (fresh=true), the same explicit contract the pre-flight resume checks use.
-                // Its remediation already says exactly that.
-                if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
-                    self.sessions.forget(&self.session).ok();
-                    eprintln!(
-                        "cross-review: session '{}' could not be resumed (the reviewer no \
-                         longer has it); reporting SESSION_NOT_FOUND rather than silently \
-                         starting a fresh session",
-                        self.session
-                    );
-                }
-                Outcome::failed(failure)
-            }
+        // The fall-through walk. A **fresh** review walks the reviewer chain, advancing to the
+        // next entry only on RATE_LIMITED; a **resume** runs exactly its bound entry (selected by
+        // identity in `start_review`), never falling through, because the reviewer's memory lives
+        // on one specific reviewer. The captured change is reused across attempts -- it was
+        // gathered once above. See docs/reviewer-fallback-chain.md.
+        let chain = self.cfg.reviewers.clone();
+        let n = chain.len();
+        // A fresh review walks from the selected start to the end; a resume runs its single bound
+        // entry alone.
+        let walk: Vec<usize> = if resume_id.is_none() {
+            (self.start_index..n).collect()
+        } else {
+            vec![self.start_index]
         };
+
+        let mut disposition = disposition;
+        // Describe strings of every rate-limited entry, for the REVIEWERS_EXHAUSTED detail.
+        let mut rate_limited_attempts: Vec<String> = Vec::new();
+        // The earlier rate-limited attempts, for the metrics record's `attempts` history (the
+        // terminal attempt is the record itself, so it is not repeated here).
+        let mut metrics_attempts: Vec<metrics::Attempt> = Vec::new();
+        // False once a fallback entry's binary could not be resolved: its path is unverified, so
+        // the record must not attribute the previous entry's binary to it.
+        let mut active_bin_resolved = true;
+        let mut outcome: Option<Outcome> = None;
+
+        for (pos, &i) in walk.iter().enumerate() {
+            let entry = chain[i].clone();
+            // Each iteration starts a fresh attempt: reset the phase to Launching. Set per
+            // iteration rather than once before the loop so a fallback taken after a rate-limited
+            // attempt (which ended in Finalizing) is not still reported as Finalizing while it
+            // preflights and runs.
+            self.registry.set_phase(&self.id, Phase::Launching);
+            // Publish the active entry: every identity-bearing read on the run path follows it,
+            // and a running poll now names this entry. Its resolved binary is not known yet for a
+            // fallback (it is preflighted just below), so name the entry by config here; the
+            // resolved-bin identity is republished once the binary is verified.
+            self.reviewer = Arc::from(reviewer::for_kind(entry.reviewer));
+            self.spec = entry.clone();
+            self.registry.set_active(&self.id, entry.describe());
+            // The selected entry was preflighted in `start_review` (its bin is in `self.bin`). A
+            // *fallback* entry is resolved and auth-checked here, lazily -- a fallback whose CLI
+            // is missing or unauthenticated surfaces that failure (it is not RATE_LIMITED, so it
+            // stops the walk) rather than troubling a healthy primary.
+            if i != self.start_index {
+                // Preflight the fallback through the shared cache (interruptible via the review's
+                // cancel), so a fallback already checked by `status` is not re-resolved.
+                match ensure_entry_ready(&self.preflight, &self.cfg, i, &self.cancel) {
+                    Ok(ready) => self.bin = ready.bin,
+                    Err(f) => {
+                        // Preflight failed (resolution or auth): `self.bin` may still hold the
+                        // previous entry's path, so this attempt has no verified binary to
+                        // attribute in the record.
+                        active_bin_resolved = false;
+                        outcome = Some(Outcome::failed(f));
+                        break;
+                    }
+                }
+            }
+            // The entry's binary is now resolved (the start entry's in `start_review`, a fallback's
+            // just above), so republish the active identity with the resolved path -- a running
+            // poll from here on names the executable that actually runs.
+            self.registry
+                .set_active(&self.id, self.spec.describe_with_bin(&self.bin));
+
+            facts.prompt_bytes = 0;
+            let attempt_started = std::time::Instant::now();
+            match self.attempt(
+                resume_id.as_deref(),
+                self.turn,
+                self.prior_cumulative,
+                CaptureOutputs {
+                    change: change.as_deref(),
+                    head_sha: head_sha.as_deref(),
+                    base_sha: base_sha.as_deref(),
+                    capture_identity: capture_identity.as_ref(),
+                    perforce_baseline: perforce_baseline.as_ref(),
+                },
+                &capture_warnings,
+                &mut facts.prompt_bytes,
+            ) {
+                Ok(mut o) => {
+                    // The disposition and capture summary ride on the successful outcome so the
+                    // response can render them. A failed turn keeps `None` (`Outcome::failed`): it
+                    // sent no reviewable change.
+                    o.disposition = disposition.take();
+                    o.capture_summary = capture_summary.take();
+                    outcome = Some(o);
+                    break;
+                }
+                Err(failure) => {
+                    // A resume target the reviewer no longer has is a dead mapping: drop it so a
+                    // follow-up call is not billed for the same doomed resume. Reported rather
+                    // than silently retried into a fresh conversation -- the caller decides
+                    // whether to start over (fresh=true).
+                    if failure.code == "SESSION_NOT_FOUND" && resume_id.is_some() {
+                        self.sessions.forget(&self.session).ok();
+                        eprintln!(
+                            "cross-review: session '{}' could not be resumed (the reviewer no \
+                             longer has it); reporting SESSION_NOT_FOUND rather than silently \
+                             starting a fresh session",
+                            self.session
+                        );
+                    }
+
+                    // Only a rate/usage limit on a fresh multi-entry walk falls through; every
+                    // other failure surfaces at once, and a single-entry chain returns the plain
+                    // RATE_LIMITED it always did.
+                    let is_last = pos == walk.len() - 1;
+                    if resume_id.is_none() && n > 1 && failure.code == "RATE_LIMITED" {
+                        // This entry ran to a RATE_LIMITED reply, so `self.bin` is its verified
+                        // resolved path: name the executable in the exhausted list, not just the
+                        // provider config.
+                        rate_limited_attempts.push(self.spec.describe_with_bin(&self.bin));
+                        if is_last {
+                            outcome = Some(Outcome::failed(errors::reviewers_exhausted(format!(
+                                "every configured reviewer reported a rate/usage limit, in order: {}",
+                                rate_limited_attempts.join("; ")
+                            ))));
+                            break;
+                        }
+                        // An earlier rate-limited attempt: record it for the metrics history
+                        // (usage unknown -- a refusal exposes none) and advance to the next entry.
+                        metrics_attempts.push(metrics::Attempt {
+                            reviewer: entry.reviewer.as_str().to_string(),
+                            model: entry.model.clone(),
+                            effort: entry.effort.clone(),
+                            resolved_bin: Some(self.bin.to_string_lossy().into_owned()),
+                            failure_code: "RATE_LIMITED".to_string(),
+                            wall_secs: attempt_started.elapsed().as_secs(),
+                            prompt_bytes: facts.prompt_bytes,
+                        });
+                        continue;
+                    }
+                    // A resume runs its bound entry only and never falls through, so a rate limit
+                    // here is terminal -- but the remediation points at `fresh: true`, which does
+                    // restart chain selection (at the cost of the reviewer's memory).
+                    if resume_id.is_some() && failure.code == "RATE_LIMITED" {
+                        outcome = Some(Outcome::failed(errors::rate_limited_on_resume(
+                            self.spec.reviewer.as_str(),
+                        )));
+                        break;
+                    }
+                    outcome = Some(Outcome::failed(failure));
+                    break;
+                }
+            }
+        }
+
+        // The walk always assigns `outcome` (every branch sets it or the loop covers every
+        // index), so this fallback is a safety net rather than an expected path.
+        let mut outcome =
+            outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
+        // Attribute the terminal outcome to the entry that produced it (`self.spec` is the last
+        // entry the walk touched), so the completed response names the reviewer that actually ran.
+        // Name the resolved executable when it was verified; a fallback whose preflight failed left
+        // `self.bin` holding the previous entry's path, so that case falls back to the config form.
+        outcome.active = Some(if active_bin_resolved {
+            self.spec.describe_with_bin(&self.bin)
+        } else {
+            self.spec.describe()
+        });
         // Everything telemetry needs, taken before the outcome moves into the registry. The
         // disposition tag was captured above (from the local, so a failed attempt still records
         // what it sent).
@@ -1109,6 +1399,11 @@ impl Job {
         self.registry.finish(&self.id, outcome);
         guard.armed = false;
 
+        // The terminal entry's resolved binary, but only when it was actually resolved: a
+        // fallback whose resolution failed leaves `self.bin` holding the previous entry's path,
+        // which must not be attributed to it.
+        let resolved_bin = active_bin_resolved.then(|| self.bin.to_string_lossy().into_owned());
+
         self.record_usage(
             usage,
             failure_code,
@@ -1117,6 +1412,8 @@ impl Job {
             capture.change.as_ref(),
             started,
             facts,
+            metrics_attempts,
+            resolved_bin,
         );
     }
 
@@ -1138,6 +1435,8 @@ impl Job {
         change: Option<&vcs::CapturedChange>,
         started: std::time::Instant,
         facts: AttemptFacts,
+        attempts: Vec<metrics::Attempt>,
+        resolved_bin: Option<String>,
     ) {
         let status = if failure_code.is_some() {
             "failed"
@@ -1152,7 +1451,7 @@ impl Job {
 
         eprintln!(
             "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}",
-            self.cfg.reviewer.as_str(),
+            self.spec.reviewer.as_str(),
             facts.turn,
             self.session,
             status,
@@ -1172,16 +1471,18 @@ impl Job {
         );
 
         self.metrics.record(&metrics::Record {
-            v: metrics::RECORD_VERSION,
+            // A record carrying fall-through attempts is stamped v2, so an old reader skips it
+            // rather than reading the terminal usage as a complete accounting of the turn.
+            v: metrics::record_version_for(!attempts.is_empty()),
             ts_unix: now_unix(),
             review_id: self.id.clone(),
             session: self.session.clone(),
             turn: facts.turn,
             resumed: facts.resumed,
             gap_secs: facts.gap_secs,
-            reviewer: self.cfg.reviewer.as_str().to_string(),
-            model: self.cfg.model.clone(),
-            effort: self.cfg.effort.clone(),
+            reviewer: self.spec.reviewer.as_str().to_string(),
+            model: self.spec.model.clone(),
+            effort: self.spec.effort.clone(),
             prompt_bytes: facts.prompt_bytes,
             diff_bytes,
             diff_truncated,
@@ -1195,6 +1496,8 @@ impl Job {
             status: status.to_string(),
             failure_code,
             disposition,
+            resolved_bin,
+            attempts,
             captured,
         });
     }
@@ -1228,7 +1531,11 @@ impl Job {
         //
         // The capability text is told what was actually captured rather than what was
         // configured, so a diff that could not be produced is never announced.
-        let capabilities = self.cfg.reviewer_capabilities(change.is_some());
+        // Rendered for the *active* entry, so a mixed-family fallback is told the truth about its
+        // own shell/self-serve ability rather than the primary's.
+        let capabilities = self
+            .cfg
+            .reviewer_capabilities_of(self.spec.reviewer, change.is_some());
         let capabilities = if self.cfg.no_preamble {
             None
         } else {
@@ -1263,10 +1570,10 @@ impl Job {
 
         let invocation = self
             .reviewer
-            .invocation(&self.cfg, &self.bin, resume_id, &self.id)
+            .invocation(&self.cfg, &self.spec, &self.bin, resume_id, &self.id)
             .map_err(|e| {
                 errors::spawn_failed(
-                    self.cfg.reviewer.as_str(),
+                    self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
                 )
@@ -1286,7 +1593,7 @@ impl Job {
         )
         .map_err(|e| {
             errors::spawn_failed(
-                self.cfg.reviewer.as_str(),
+                self.spec.reviewer.as_str(),
                 &self.bin.display().to_string(),
                 e.to_string(),
             )
@@ -1296,10 +1603,10 @@ impl Job {
         let result = match run {
             Ok(out) => {
                 if out.cancelled || out.timed_out {
-                    Err(reviewer::failure_for(&self.cfg, &out))
+                    Err(reviewer::failure_for(&self.cfg, &self.spec, &out))
                 } else {
                     self.reviewer
-                        .parse(&self.cfg, &out, last_message_file.as_deref())
+                        .parse(&self.cfg, &self.spec, &out, last_message_file.as_deref())
                 }
             }
             Err(failure) => Err(failure),
@@ -1381,10 +1688,10 @@ impl Job {
                 match self.sessions.record_turn(
                     &self.session,
                     session::TurnFacts {
-                        reviewer: self.cfg.reviewer.as_str(),
+                        reviewer: self.spec.reviewer.as_str(),
                         cli_session_id: session_id,
-                        model: &self.cfg.model,
-                        effort: &self.cfg.effort,
+                        model: &self.spec.model,
+                        effort: &self.spec.effort,
                         cwd: &self.cfg.cwd.to_string_lossy(),
                         cumulative_usage: baseline_to_persist,
                         // Bind the session to the changelist set (Perforce only), canonicalised
@@ -1406,6 +1713,10 @@ impl Job {
                             .then_some(self.include_shelved),
                         capture_identity: capture_identity.cloned(),
                         perforce_baseline: perforce_baseline.cloned(),
+                        // The active entry's identity, so a resume can match this exact entry and
+                        // detect PATH drift.
+                        raw_bin: self.spec.raw_bin(),
+                        resolved_bin: self.bin.to_string_lossy().into_owned(),
                     },
                 ) {
                     Ok(_) => {
@@ -1526,13 +1837,15 @@ impl Job {
             denial_count_is_floor: parsed.denial_count_is_floor,
             warnings,
             // Filled in by `run` after `attempt` returns: the disposition is assembled from the
-            // capture plus the fresh-vs-resumed framing only `run` holds.
+            // capture plus the fresh-vs-resumed framing only `run` holds, and `active` from the
+            // entry the walk settled on.
             disposition: None,
             // Likewise filled in by `run`, which holds the capture. Rides the successful outcome
             // for the response; a failed attempt renders as an error and shows no `captured:` line.
             capture_summary: None,
             resumable,
             usage: parsed.usage,
+            active: None,
         })
     }
 }
@@ -1559,18 +1872,16 @@ fn resume_block(
     // created it. A configuration that now points elsewhere cannot resume that conversation
     // at all, so the honest answer is to start over -- explicitly, so the caller learns the
     // earlier context is gone rather than inheriting it silently.
-    if record.reviewer != cfg.reviewer.as_str() {
+    // A session belongs to the reviewer *entry* that created it, which may be a fallback rather
+    // than the primary. It resumes only if some configured entry still matches its full identity
+    // (reviewer, model, effort, raw bin); a chain edited out from under it cannot resume that
+    // conversation, so the honest answer is to start over -- explicitly.
+    if cfg.resume_entry_index(record).is_none() {
         return Some(format!(
-            "it was created by reviewer '{}', but this server is now configured for '{}', and \
-             a conversation cannot move between reviewers.",
-            record.reviewer,
-            cfg.reviewer.as_str()
-        ));
-    }
-    if record.model != cfg.model {
-        return Some(format!(
-            "it was created with model '{}', but this server is now configured for '{}'.",
-            record.model, cfg.model
+            "no reviewer in the configured chain matches this session's reviewer '{}', model \
+             '{}' and effort '{}'; the chain was changed since it was created, and a conversation \
+             cannot move between reviewers.",
+            record.reviewer, record.model, record.effort
         ));
     }
     let cwd = cfg.cwd.to_string_lossy();
@@ -1758,7 +2069,7 @@ fn fmt_elapsed(duration: Duration) -> String {
     }
 }
 
-fn render_progress(snapshot: &Snapshot, turn_budget: Duration, reassure: bool) -> String {
+fn render_progress(snapshot: &Snapshot, review_budget: Duration, reassure: bool) -> String {
     let observed = if snapshot.phase == Phase::Reviewing {
         "reviewer process confirmed alive"
     } else {
@@ -1783,8 +2094,8 @@ fn render_progress(snapshot: &Snapshot, turn_budget: Duration, reassure: bool) -
     if reassure {
         message.push_str(&format!(
             " In this project's usage, long reviews are normal and complex changes can take 20 \
-             minutes or longer. This turn's configured budget is {}.",
-            fmt_elapsed(turn_budget)
+             minutes or longer. This review's configured budget is {}.",
+            fmt_elapsed(review_budget)
         ));
     }
     message
@@ -1932,10 +2243,10 @@ mod tests {
         updated_unix: u64,
     ) -> crate::session::SessionRecord {
         crate::session::SessionRecord {
-            reviewer: cfg.reviewer.as_str().to_string(),
+            reviewer: cfg.primary().reviewer.as_str().to_string(),
             cli_session_id: "sid-1".to_string(),
-            model: cfg.model.clone(),
-            effort: cfg.effort.clone(),
+            model: cfg.primary().model.clone(),
+            effort: cfg.primary().effort.clone(),
             cwd: cfg.cwd.to_string_lossy().to_string(),
             turns,
             created_unix: 0,
@@ -1948,6 +2259,9 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            // Match what `cfg`'s primary entry would record, so the resume identity check binds.
+            raw_bin: Some(cfg.primary().raw_bin()),
+            resolved_bin: None,
         }
     }
 
@@ -2321,6 +2635,7 @@ mod tests {
             capture_summary,
             resumable: true,
             usage: crate::metrics::Usage::default(),
+            active: None,
         }
     }
 

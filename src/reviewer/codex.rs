@@ -8,14 +8,14 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{Invocation, Parsed, Reviewer, RunOutcome};
-use crate::config::Config;
+use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
 
 pub struct CodexReviewer;
 
 impl Reviewer for CodexReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config) -> Result<String, Failure> {
+    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
         // Run outside the project, like `invocation`, so this preflight is not the one
         // invocation that loads the reviewed repository's configuration. `login status`
@@ -23,10 +23,16 @@ impl Reviewer for CodexReviewer {
         // what it is checking.
         cmd.current_dir(super::neutral_dir(cfg));
         cmd.arg("login").arg("status");
-        let out =
-            super::run(cmd, "", Duration::from_secs(30), &AtomicBool::new(false)).map_err(|e| {
-                errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
-            })?;
+        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
+            errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
+        })?;
+
+        // A cancelled probe reports CANCELLED, not a misclassified auth failure: `run` kills the
+        // child on cancellation, leaving `success` false, which the exit-code check below would
+        // otherwise read as "not signed in".
+        if out.cancelled {
+            return Err(errors::cancelled());
+        }
 
         // The exit code is the signal here, not the text: `codex login status` writes
         // "Logged in using ChatGPT" to stderr, and prints nothing at all when its
@@ -48,6 +54,7 @@ impl Reviewer for CodexReviewer {
     fn invocation(
         &self,
         cfg: &Config,
+        spec: &ReviewerSpec,
         bin: &Path,
         resume: Option<&str>,
         tmp_id: &str,
@@ -72,7 +79,7 @@ impl Reviewer for CodexReviewer {
 
         cmd.arg("--json");
         cmd.arg("--skip-git-repo-check");
-        cmd.args(["-m", &cfg.model]);
+        cmd.args(["-m", &spec.model]);
         // Stated on every turn, including resumes, via the config override that `resume`
         // does accept. A resumed session does appear to retain the policy it was created
         // with -- verified: a write attempt on turn 2 of a `-s read-only` session was
@@ -82,7 +89,7 @@ impl Reviewer for CodexReviewer {
         cmd.args(["-c", &format!("sandbox_mode=\"{}\"", cfg.sandbox)]);
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
-        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.effort)]);
+        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", spec.effort)]);
         if cfg.isolate_reviewer {
             // `codex exec` does start configured MCP servers (verified: a marker server
             // ran and left a file), so a reviewer that also has cross-review registered
@@ -102,7 +109,8 @@ impl Reviewer for CodexReviewer {
 
     fn parse(
         &self,
-        cfg: &Config,
+        _cfg: &Config,
+        spec: &ReviewerSpec,
         out: &RunOutcome,
         last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
@@ -126,8 +134,8 @@ impl Reviewer for CodexReviewer {
             // An expired resume target is detected inside `classify`.
             return Err(errors::classify(
                 "codex",
-                &cfg.model,
-                &cfg.effort,
+                &spec.model,
+                &spec.effort,
                 out.exit,
                 &evidence,
                 &detail,
@@ -172,7 +180,7 @@ impl Reviewer for CodexReviewer {
                 // *fit*, so the reviewer's actual conclusion may be among the discarded
                 // bytes, and returning an earlier message as the verdict would be a
                 // silently wrong review rather than a visible failure.
-                if let Some(truncated) = super::truncation_failure(cfg, out) {
+                if let Some(truncated) = super::truncation_failure(spec, out) {
                     return Err(truncated);
                 }
                 events.last_message.clone().unwrap_or_default()
@@ -503,7 +511,7 @@ mod tests {
         // what produced eight rounds of inflated figures.
         let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
         let parsed = CodexReviewer
-            .parse(&cfg(), &outcome(stream, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
             .expect("parse");
         assert!(parsed.usage_is_cumulative);
     }
@@ -514,7 +522,7 @@ mod tests {
         // a claim; `None` is the honest "the CLI did not say".
         let stream = r#"{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}"#;
         let parsed = CodexReviewer
-            .parse(&cfg(), &outcome(stream, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
             .expect("parse");
         assert!(parsed.usage.is_empty());
         assert_eq!(parsed.usage.api_calls, None);
@@ -586,7 +594,7 @@ mod tests {
     #[test]
     fn falls_back_to_event_stream_when_no_output_file() {
         let parsed = CodexReviewer
-            .parse(&cfg(), &outcome(REAL_STREAM, true), None)
+            .parse(&cfg(), cfg().primary(), &outcome(REAL_STREAM, true), None)
             .expect("parse");
         assert_eq!(parsed.text, "## Verdict\nREQUEST CHANGES");
         assert_eq!(
@@ -603,7 +611,12 @@ mod tests {
         std::fs::write(&path, "  authoritative verdict  ").expect("write");
 
         let parsed = CodexReviewer
-            .parse(&cfg(), &outcome(REAL_STREAM, true), Some(&path))
+            .parse(
+                &cfg(),
+                cfg().primary(),
+                &outcome(REAL_STREAM, true),
+                Some(&path),
+            )
             .expect("parse");
         assert_eq!(parsed.text, "authoritative verdict");
         // The thread id still comes from the stream, which is its only source.
@@ -623,7 +636,9 @@ ordinary diagnostic
         .to_string();
 
         assert_eq!(policy_denial_count(&out.stderr), 1);
-        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .expect("parse");
         assert_eq!(parsed.denial_count, 1);
         assert_eq!(
             parsed.denials,
@@ -638,7 +653,9 @@ ordinary diagnostic
         let mut out = outcome(REAL_STREAM, true);
         out.stderr = "router: ERROR=`git ls-files` REJECTED: BLOCKED BY POLICY".to_string();
 
-        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .expect("parse");
         assert_eq!(parsed.denial_count, 1);
         assert_eq!(parsed.denials, vec!["git ls-files"]);
     }
@@ -651,7 +668,9 @@ ordinary diagnostic
         let mut out = outcome(REAL_STREAM, true);
         out.stderr = "router: error=`git grep foo` rejected: blocked by policy".to_string();
 
-        let intact = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        let intact = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .expect("parse");
         assert_eq!(intact.denial_count, 1);
         assert!(
             !intact.denial_count_is_floor,
@@ -659,7 +678,9 @@ ordinary diagnostic
         );
 
         out.stderr_truncated = true;
-        let capped = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        let capped = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .expect("parse");
         assert_eq!(capped.denial_count, 1);
         assert!(
             capped.denial_count_is_floor,
@@ -675,7 +696,9 @@ ordinary diagnostic
             .collect::<Vec<_>>()
             .join("\n");
 
-        let parsed = CodexReviewer.parse(&cfg(), &out, None).expect("parse");
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .expect("parse");
         assert_eq!(parsed.denial_count, 101);
         assert_eq!(parsed.denials.len(), 100);
     }
@@ -688,7 +711,12 @@ ordinary diagnostic
         std::fs::write(&path, "   \n").expect("write");
 
         let parsed = CodexReviewer
-            .parse(&cfg(), &outcome(REAL_STREAM, true), Some(&path))
+            .parse(
+                &cfg(),
+                cfg().primary(),
+                &outcome(REAL_STREAM, true),
+                Some(&path),
+            )
             .expect("parse");
         assert_eq!(parsed.text, "## Verdict\nREQUEST CHANGES");
         std::fs::remove_file(&path).ok();
@@ -725,7 +753,9 @@ ordinary diagnostic
         let out = failure_with_agent_message(
             "`server.rs:429` should return 429 when the quota is exhausted.",
         );
-        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
         assert!(err.detail.unwrap_or_default().contains("429"));
     }
@@ -735,7 +765,9 @@ ordinary diagnostic
         let out = failure_with_agent_message(
             "The error path prints 'session not found' but the session exists.",
         );
-        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "REVIEWER_FAILED", "misclassified as {}", err.code);
     }
 
@@ -746,7 +778,9 @@ ordinary diagnostic
         out.stdout.push_str(
             "{\"type\":\"error\",\"message\":\"stream error: 429 rate limit exceeded\"}\n",
         );
-        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "RATE_LIMITED");
     }
 
@@ -754,7 +788,9 @@ ordinary diagnostic
     fn rate_limit_on_failure_is_classified() {
         let mut out = outcome("", false);
         out.stderr = "Error: 429 Too Many Requests".into();
-        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "RATE_LIMITED");
     }
 
@@ -762,14 +798,21 @@ ordinary diagnostic
     fn missing_resume_target_maps_to_session_not_found() {
         let mut out = outcome("", false);
         out.stderr = "Error: no session found with id abc".into();
-        let err = CodexReviewer.parse(&cfg(), &out, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &out, None)
+            .unwrap_err();
         assert_eq!(err.code, "SESSION_NOT_FOUND");
     }
 
     #[test]
     fn successful_run_with_no_message_anywhere_is_an_empty_review() {
         let err = CodexReviewer
-            .parse(&cfg(), &outcome(r#"{"type":"turn.completed"}"#, true), None)
+            .parse(
+                &cfg(),
+                cfg().primary(),
+                &outcome(r#"{"type":"turn.completed"}"#, true),
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.code, "EMPTY_REVIEW");
     }
@@ -783,7 +826,9 @@ ordinary diagnostic
             stdout_truncated: true,
             ..outcome(r#"{"type":"turn.completed"}"#, true)
         };
-        let err = CodexReviewer.parse(&cfg(), &truncated, None).unwrap_err();
+        let err = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &truncated, None)
+            .unwrap_err();
         assert_eq!(err.code, "OUTPUT_TRUNCATED");
 
         // A truncated stream whose review did survive in the file is a success.
@@ -792,7 +837,7 @@ ordinary diagnostic
         let file = dir.join(format!("{}-last.txt", std::process::id()));
         std::fs::write(&file, "## Verdict\nAPPROVE").expect("write");
         let parsed = CodexReviewer
-            .parse(&cfg(), &truncated, Some(&file))
+            .parse(&cfg(), cfg().primary(), &truncated, Some(&file))
             .expect("the file is authoritative");
         assert_eq!(parsed.text, "## Verdict\nAPPROVE");
         std::fs::remove_file(&file).ok();
@@ -813,6 +858,7 @@ ordinary diagnostic
         let err = CodexReviewer
             .parse(
                 &cfg(),
+                cfg().primary(),
                 &outcome(r#"{"type":"turn.completed"}"#, true),
                 Some(&file),
             )

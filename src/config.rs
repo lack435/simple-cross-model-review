@@ -71,6 +71,145 @@ impl ReviewerKind {
     }
 }
 
+/// One reviewer entry in the fallback chain: the identity of a reviewer the server may run.
+///
+/// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
+/// them (`Config::reviewers`). Only a reviewer's *identity* lives here — the process-global
+/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, `preamble`) stay
+/// on `Config`, because they are already family-scoped in effect: `--sandbox` is read only by
+/// the Codex invocation and `--tools`/`--allow-tools` only by the Claude one, so a global value
+/// applies to whichever entries are of that family and is inert for the others.
+///
+/// See `docs/reviewer-fallback-chain.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerSpec {
+    pub reviewer: ReviewerKind,
+    pub model: String,
+    pub effort: String,
+    /// Explicit path to the reviewer CLI. When absent we resolve it from PATH.
+    pub bin: Option<PathBuf>,
+}
+
+impl ReviewerSpec {
+    /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
+    /// legacy session record with no stored bin. Persisted on the session for resume matching.
+    pub fn raw_bin(&self) -> crate::session::RawBin {
+        match &self.bin {
+            None => crate::session::RawBin::PathSearch,
+            Some(path) => crate::session::RawBin::Explicit(path.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// A short identity label for prompts, errors, and the chain description. Includes the
+    /// explicit `--bin` when one is set, so two same-reviewer/same-model entries that differ only
+    /// by binary (a distinct install or account) are distinguishable wherever this is shown. A
+    /// PATH-resolved entry omits it here because its resolved path is not known from the config
+    /// alone; the run path uses [`describe_with_bin`](Self::describe_with_bin) once it has
+    /// resolved one, so the *rendered* identity still names the executable that actually ran. Two
+    /// PATH entries with the same reviewer/model would be a fully-identical duplicate, which
+    /// `validate_chain` rejects, so this cannot be ambiguous.
+    pub fn describe(&self) -> String {
+        self.describe_bin(self.bin.as_deref())
+    }
+
+    /// Like [`describe`](Self::describe) but pins the *resolved* binary rather than only the
+    /// configured one, so a PATH-resolved entry still names the executable (and thus the account)
+    /// that actually ran. Used on the run path once `self.bin` has been resolved for an entry;
+    /// `describe` is kept for the cases where no resolved path is available yet (the chain
+    /// listing, or a fallback whose preflight failed before a binary was verified).
+    pub fn describe_with_bin(&self, resolved: &Path) -> String {
+        self.describe_bin(Some(resolved))
+    }
+
+    fn describe_bin(&self, bin: Option<&Path>) -> String {
+        let mut out = format!(
+            "{} ({}, model={}, effort={}",
+            self.reviewer.vendor(),
+            self.reviewer.as_str(),
+            self.model,
+            self.effort,
+        );
+        if let Some(bin) = bin {
+            out.push_str(&format!(", bin={}", bin.display()));
+        }
+        out.push(')');
+        out
+    }
+}
+
+/// A chain entry under construction during argument parsing.
+///
+/// Each `--reviewer` starts one; the identity flags bind to the most recent. Setting the same
+/// identity flag twice within one entry is rejected — it is almost always a forgotten
+/// `--reviewer`, and guessing which value wins would hide the mistake.
+struct PendingEntry {
+    reviewer: ReviewerKind,
+    model: Option<String>,
+    effort: Option<String>,
+    bin: Option<PathBuf>,
+}
+
+impl PendingEntry {
+    fn new(reviewer: ReviewerKind) -> Self {
+        Self {
+            reviewer,
+            model: None,
+            effort: None,
+            bin: None,
+        }
+    }
+
+    fn set_model(&mut self, v: String) -> Result<(), String> {
+        if self.model.is_some() {
+            return Err(format!(
+                "--model given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.model = Some(v);
+        Ok(())
+    }
+
+    fn set_effort(&mut self, v: String) -> Result<(), String> {
+        if self.effort.is_some() {
+            return Err(format!(
+                "--effort given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.effort = Some(v);
+        Ok(())
+    }
+
+    fn set_bin(&mut self, v: PathBuf) -> Result<(), String> {
+        if self.bin.is_some() {
+            return Err(format!(
+                "--bin given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.bin = Some(v);
+        Ok(())
+    }
+
+    /// Fill per-entry defaults, mirroring the single-reviewer defaults exactly.
+    fn finalize(self) -> ReviewerSpec {
+        ReviewerSpec {
+            model: self
+                .model
+                .unwrap_or_else(|| self.reviewer.default_model().to_string()),
+            effort: self
+                .effort
+                .unwrap_or_else(|| self.reviewer.default_effort().to_string()),
+            bin: self.bin,
+            reviewer: self.reviewer,
+        }
+    }
+}
+
 /// Which version-control system produced the change under review.
 ///
 /// Selected by `--vcs`, defaulting to `auto`. `auto` is resolved once, at startup, by a
@@ -251,6 +390,15 @@ pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 /// `docs/single-blocking-collect.md` for the two residual terms that are not themselves bounded.
 pub const FINALIZATION_GRACE_SECS: u64 = 30;
 
+/// Sizing for one fallback entry's preflight, folded into the chain's collect-wait cap.
+///
+/// Bounds the cancellable auth invocation (the 30 s `auth_check` timeout in the adapters) plus
+/// its output-drain grace. `resolve_bin` is a fast but uninterruptible PATH scan and is *not*
+/// covered here; it is an acknowledged residual, exactly as `docs/reviewer-fallback-chain.md`
+/// and `docs/single-blocking-collect.md` describe. Only *fallback* entries add this term — the
+/// selected entry is preflighted in `start_review`, before the collect wait begins.
+pub const PREFLIGHT_CAP_SECS: u64 = 40;
+
 /// Default per-process cap on concurrently-running reviews. A backstop against a runaway caller
 /// accumulating full-budget reviews across distinct session names, not a normal limit — a serial
 /// review flow runs one at a time. `0` disables the check. It is per process: N servers sharing a
@@ -273,11 +421,11 @@ pub const DEFAULT_RESUME_MAX_TURNS: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub reviewer: ReviewerKind,
-    pub model: String,
-    pub effort: String,
-    /// Explicit path to the reviewer CLI. When absent we resolve it from PATH.
-    pub bin: Option<PathBuf>,
+    /// The reviewer chain, in fallback order. Always non-empty; `reviewers[0]` is the primary
+    /// and matches the single-reviewer behaviour that predates this field. A fresh review walks
+    /// the chain from the front, advancing only on `RATE_LIMITED`; a single-entry chain behaves
+    /// exactly as one reviewer did before. See `docs/reviewer-fallback-chain.md`.
+    pub reviewers: Vec<ReviewerSpec>,
     /// Working root handed to the reviewer. Defaults to the server's cwd, which is
     /// the project root when a harness launches us from `.mcp.json`.
     pub cwd: PathBuf,
@@ -364,10 +512,10 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let mut reviewer: Option<ReviewerKind> = None;
-        let mut model: Option<String> = None;
-        let mut effort: Option<String> = None;
-        let mut bin: Option<PathBuf> = None;
+        // The chain is built as a list of entries. A repeated `--reviewer` starts a new entry;
+        // the identity flags `--model`/`--effort`/`--bin` bind to the most recent `--reviewer`.
+        // Argument order is fallback order. See `docs/reviewer-fallback-chain.md`.
+        let mut entries: Vec<PendingEntry> = Vec::new();
         let mut cwd: Option<PathBuf> = None;
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
         let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
@@ -409,13 +557,32 @@ impl Config {
             match key {
                 "--reviewer" => {
                     let v = take("--reviewer")?;
-                    reviewer = Some(ReviewerKind::parse(&v).ok_or_else(|| {
+                    let kind = ReviewerKind::parse(&v).ok_or_else(|| {
                         format!("unknown --reviewer '{v}' (expected 'claude' or 'codex')")
-                    })?);
+                    })?;
+                    entries.push(PendingEntry::new(kind));
                 }
-                "--model" => model = Some(take("--model")?),
-                "--effort" => effort = Some(take("--effort")?),
-                "--bin" => bin = Some(PathBuf::from(take("--bin")?)),
+                "--model" => {
+                    let v = take("--model")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--model must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_model(v)?;
+                }
+                "--effort" => {
+                    let v = take("--effort")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--effort must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_effort(v)?;
+                }
+                "--bin" => {
+                    let v = take("--bin")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_bin(PathBuf::from(v))?;
+                }
                 "--cwd" => cwd = Some(PathBuf::from(take("--cwd")?)),
                 "--timeout-seconds" => {
                     let v = take("--timeout-seconds")?;
@@ -472,10 +639,13 @@ impl Config {
             i += 1;
         }
 
-        let reviewer = reviewer.ok_or(
-            "--reviewer is required (use '--reviewer codex' when the caller is Claude Code, \
-             '--reviewer claude' when the caller is Codex)",
-        )?;
+        if entries.is_empty() {
+            return Err(
+                "--reviewer is required (use '--reviewer codex' when the caller is Claude \
+                        Code, '--reviewer claude' when the caller is Codex)"
+                    .to_string(),
+            );
+        }
 
         let cwd = match cwd {
             Some(p) => p,
@@ -510,17 +680,24 @@ impl Config {
             }
         };
 
-        let effort = effort.unwrap_or_else(|| reviewer.default_effort().to_string());
-        if !reviewer.known_efforts().contains(&effort.as_str()) {
-            // Not fatal: new effort levels appear over time and the CLI is the real
-            // authority. A bad value surfaces as MODEL_UNAVAILABLE on first use.
-            eprintln!(
-                "cross-review: warning: effort '{}' is not one of the known levels for {} ({}). \
-                 Passing it through anyway.",
-                effort,
-                reviewer.as_str(),
-                reviewer.known_efforts().join(", ")
-            );
+        // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. The
+        // unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
+        // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer.
+        let reviewers: Vec<ReviewerSpec> = entries.into_iter().map(|e| e.finalize()).collect();
+        for spec in &reviewers {
+            if !spec
+                .reviewer
+                .known_efforts()
+                .contains(&spec.effort.as_str())
+            {
+                eprintln!(
+                    "cross-review: warning: effort '{}' is not one of the known levels for {} \
+                     ({}). Passing it through anyway.",
+                    spec.effort,
+                    spec.reviewer.as_str(),
+                    spec.reviewer.known_efforts().join(", ")
+                );
+            }
         }
 
         let preamble = match preamble_file {
@@ -541,10 +718,7 @@ impl Config {
         let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
 
         Ok(Self {
-            reviewer,
-            model: model.unwrap_or_else(|| reviewer.default_model().to_string()),
-            effort,
-            bin,
+            reviewers,
             state_dir,
             cwd,
             timeout: Duration::from_secs(timeout_secs),
@@ -564,6 +738,84 @@ impl Config {
         })
     }
 
+    /// The primary reviewer: the first entry in the chain, tried before any fallback.
+    ///
+    /// Non-run-path code (config display, caller-facing summaries) reads the primary here.
+    /// Code on the *run* path must instead use the active entry the walk selected, never the
+    /// primary — see `docs/reviewer-fallback-chain.md`.
+    pub fn primary(&self) -> &ReviewerSpec {
+        // `reviewers` is non-empty by construction (`from_args` requires `--reviewer`, and
+        // `validate_chain` rejects an empty vector), so indexing [0] cannot panic.
+        &self.reviewers[0]
+    }
+
+    /// The chain index of the entry that matches a stored session's identity, if any.
+    ///
+    /// A resume must run the entry that *created* the session (which may be a fallback), not the
+    /// primary. Matching is on the full raw identity: reviewer, model, effort, and raw bin. A
+    /// legacy record with no stored raw bin (`raw_bin` is `None`) matches on reviewer/model/effort
+    /// alone, and only if *exactly one* entry matches — an ambiguous legacy record is refused
+    /// rather than bound to a guessed executable. See `docs/reviewer-fallback-chain.md`.
+    pub fn resume_entry_index(&self, record: &crate::session::SessionRecord) -> Option<usize> {
+        let base_match = |s: &ReviewerSpec| {
+            s.reviewer.as_str() == record.reviewer
+                && s.model == record.model
+                && s.effort == record.effort
+        };
+        match &record.raw_bin {
+            Some(raw) => self
+                .reviewers
+                .iter()
+                .position(|s| base_match(s) && &s.raw_bin() == raw),
+            None => {
+                // Legacy record: match on the fields it carries, but only if unambiguous.
+                let mut matches = self
+                    .reviewers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| base_match(s));
+                match (matches.next(), matches.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Validate the reviewer chain's *semantics*, distinct from parse syntax.
+    ///
+    /// Returns `Err` with a caller-facing message when the chain cannot function as a fallback
+    /// chain. `App::new` runs this and, on `Err`, serves every request an `INVALID_REVIEWER_CHAIN`
+    /// failure rather than exiting — so the server is up and rejects requests with a legible
+    /// error, as `docs/reviewer-fallback-chain.md` describes. The rule set is deliberately small:
+    ///
+    /// - **A fully-identical entry is invalid.** Two entries equal in reviewer, model, effort,
+    ///   *and* bin cannot be a fallback for each other. The whole spec is compared, not just
+    ///   `(reviewer, model)`: a distinct `bin` can be a distinct install/account, and model
+    ///   aliases (`opus` vs `claude-opus-4-8`) cannot be canonicalised without asserting a
+    ///   mapping this tool has not verified, so a same-model/different-bin (or different-effort)
+    ///   fallback stays valid.
+    /// - **The empty chain is rejected defensively**, though `from_args` cannot produce one.
+    pub fn validate_chain(reviewers: &[ReviewerSpec]) -> Result<(), String> {
+        if reviewers.is_empty() {
+            return Err("the reviewer chain is empty; at least one --reviewer is required".into());
+        }
+        for (i, a) in reviewers.iter().enumerate() {
+            for b in &reviewers[i + 1..] {
+                if a == b {
+                    return Err(format!(
+                        "reviewer chain has a duplicate entry ({}): a fallback identical to an \
+                         earlier entry in reviewer, model, effort and bin can never help, because \
+                         it shares the same account and model and so the same rate limit. Remove \
+                         it, or change its model/bin to a genuinely different reviewer.",
+                        a.describe()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Longest a single `cross_model_review_result` call will block, in seconds.
     ///
     /// Sized to cover the whole review lifecycle — the capture budget, the reviewer turn, and a
@@ -573,15 +825,33 @@ impl Config {
     /// see `docs/single-blocking-collect.md`), which is acceptable because a boundary miss now costs
     /// one more poll rather than a lost review. Saturating, so no `--timeout-seconds` overflows it.
     pub fn max_wait_secs(&self) -> u64 {
-        crate::vcs::CAPTURE_BUDGET
+        // Today's single-reviewer budget: capture + one turn + finalization. For N == 1 this is
+        // the whole cap, byte-for-byte as before.
+        let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
             .saturating_add(self.timeout.as_secs())
-            .saturating_add(FINALIZATION_GRACE_SECS)
+            .saturating_add(FINALIZATION_GRACE_SECS);
+        // Each *fallback* entry can add its own preflight + turn + drain to the walk, because a
+        // rate-limited attempt is not guaranteed to fail fast. Expressed as "today's budget plus
+        // the fallback terms" so the single-entry invariant holds by construction. This is a
+        // practical sizing, not a proven ceiling (the resolve_bin residual is uninterruptible);
+        // see docs/reviewer-fallback-chain.md.
+        let fallbacks = (self.reviewers.len() as u64).saturating_sub(1);
+        let per_fallback = PREFLIGHT_CAP_SECS
+            .saturating_add(self.timeout.as_secs())
+            .saturating_add(crate::reviewer::DRAIN_GRACE.as_secs());
+        single.saturating_add(fallbacks.saturating_mul(per_fallback))
     }
 
     /// True when the reviewer has any shell at all.
     pub fn reviewer_has_shell(&self) -> bool {
-        match self.reviewer {
+        self.reviewer_has_shell_of(self.primary().reviewer)
+    }
+
+    /// `reviewer_has_shell`, evaluated for a specific chain entry rather than the primary. The
+    /// tool/allow-list inputs it consults are process-global, so only the reviewer kind varies.
+    pub fn reviewer_has_shell_of(&self, reviewer: ReviewerKind) -> bool {
+        match reviewer {
             // Codex runs under a sandbox policy rather than a tool allow-list, so its
             // shell is always present and always write-denied.
             ReviewerKind::Codex => true,
@@ -621,12 +891,20 @@ impl Config {
     /// always to supply -- whether a change actually arrives depends on the capture, which is
     /// the runtime question this caller-facing intent does not promise.
     pub fn supplies_change(&self) -> bool {
+        self.supplies_change_of(self.primary().reviewer)
+    }
+
+    /// `supplies_change`, evaluated for a specific chain entry rather than the primary.
+    ///
+    /// Under `--diff auto` the answer is per-reviewer (a shell-less entry needs the diff, a
+    /// shelled one does not), which is why `chain_needs_capture` folds it across every entry.
+    pub fn supplies_change_of(&self, reviewer: ReviewerKind) -> bool {
         // Each backend matches exhaustively: a new mode or backend states its answer here
         // rather than opting itself in by falling through a wildcard.
         match self.vcs {
             Vcs::Git => match self.diff {
                 DiffMode::None => false,
-                DiffMode::Auto => !self.reviewer_has_shell(),
+                DiffMode::Auto => !self.reviewer_has_shell_of(reviewer),
                 DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
             },
             // The `change` argument is required for a Perforce review (enforced in `tools.rs`
@@ -634,6 +912,19 @@ impl Config {
             // change.
             Vcs::Perforce => true,
         }
+    }
+
+    /// Whether the capture must be gathered at all, folded across the whole chain.
+    ///
+    /// The change is captured whenever *any* entry the walk might reach would need it — not
+    /// merely the primary — because a `Codex → Claude` chain must have the diff ready for the
+    /// shell-less Claude fallback even though the Codex primary would fetch its own. A shelled
+    /// entry handed the captured change is the harmless `--diff HEAD` case. See
+    /// `docs/reviewer-fallback-chain.md`.
+    pub fn chain_needs_capture(&self) -> bool {
+        self.reviewers
+            .iter()
+            .any(|spec| self.supplies_change_of(spec.reviewer))
     }
 
     /// Whether the reviewer can fetch the change/history itself with its own tools.
@@ -650,11 +941,19 @@ impl Config {
     /// does not), cannot be reliably inspected for it, and would be client-less here anyway.
     /// So p4 self-serve is promised to no Claude reviewer and only to a networked Codex one --
     /// erring toward "rely on the captured change", which is always the safe direction.
+    /// Primary-entry convenience used by the config tests; the run path uses the `_of` variant
+    /// with the active entry.
+    #[cfg(test)]
     pub fn reviewer_can_self_serve_change(&self) -> bool {
+        self.reviewer_can_self_serve_change_of(self.primary().reviewer)
+    }
+
+    /// `reviewer_can_self_serve_change`, evaluated for a specific chain entry.
+    pub fn reviewer_can_self_serve_change_of(&self, reviewer: ReviewerKind) -> bool {
         match self.vcs {
-            Vcs::Git => self.reviewer_has_shell(),
+            Vcs::Git => self.reviewer_has_shell_of(reviewer),
             Vcs::Perforce => {
-                matches!(self.reviewer, ReviewerKind::Codex)
+                matches!(reviewer, ReviewerKind::Codex)
                     && self.sandbox.trim() == "danger-full-access"
             }
         }
@@ -696,10 +995,22 @@ impl Config {
     /// `diff_supplied` is the *runtime* answer, not `supplies_change()`: a configured change
     /// that could not be captured (no git/p4, not a repository) must not be announced, or the
     /// reviewer goes looking below for a section that is not there.
+    /// Primary-entry convenience used by the config tests; the run path uses the `_of` variant
+    /// with the active entry.
+    #[cfg(test)]
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
+        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied)
+    }
+
+    /// `reviewer_capabilities`, rendered for a specific chain entry.
+    ///
+    /// This is rendered per *active* entry at turn time, from the captured change, so a
+    /// mixed-family fallback is told the truth about *its* shell and self-serve ability — the
+    /// captured block itself is capability-neutral. See `docs/reviewer-fallback-chain.md`.
+    pub fn reviewer_capabilities_of(&self, reviewer: ReviewerKind, diff_supplied: bool) -> String {
         let mut out = String::new();
-        match self.reviewer {
-            ReviewerKind::Codex if self.reviewer_can_self_serve_change() => {
+        match reviewer {
+            ReviewerKind::Codex if self.reviewer_can_self_serve_change_of(reviewer) => {
                 out.push_str(&format!(
                     "You can read any file in this project and inspect the change history \
                      yourself, but only through simple, single read commands: {}, ripgrep \
@@ -740,7 +1051,7 @@ impl Config {
                     self.vcs.name(),
                 ));
             }
-            ReviewerKind::Claude if self.reviewer_has_shell() => {
+            ReviewerKind::Claude if self.reviewer_has_shell_of(reviewer) => {
                 // Not "read-only", unlike the Codex arm above. That one is a sandbox
                 // policy; this one is a prefix allow-list, which this file's own
                 // `DEFAULT_CLAUDE_TOOLS` documents cannot express read-only -- verified,
@@ -774,7 +1085,7 @@ impl Config {
                  changed. If judging it needs history the section does not include, say so under \
                  \"What I could not check\".",
             );
-        } else if !self.reviewer_can_self_serve_change() {
+        } else if !self.reviewer_can_self_serve_change_of(reviewer) {
             // Not merely `!reviewer_has_shell()`: a Codex reviewer under a no-network sandbox
             // has a shell but still cannot reach Perforce, so with no captured change it is in
             // the same position as a shell-less reviewer and needs the same guidance.
@@ -788,13 +1099,25 @@ impl Config {
         out
     }
 
+    /// Describe the reviewer chain for callers and tool descriptions.
+    ///
+    /// A single-entry chain reads exactly as one reviewer did before. A multi-entry chain names
+    /// the primary and then each fallback in order, so `tools/list`, `status`, and the config
+    /// display advertise the chain honestly rather than implying the primary is the only one.
     pub fn describe_reviewer(&self) -> String {
+        // Defensive: `from_args` never produces an empty chain, but a degraded `App` built from an
+        // invalid config must not panic here if something renders it before the chain-error guard.
+        let Some(first) = self.reviewers.first() else {
+            return "(no reviewer configured)".to_string();
+        };
+        let primary = first.describe();
+        if self.reviewers.len() == 1 {
+            return primary;
+        }
+        let fallbacks: Vec<String> = self.reviewers[1..].iter().map(|s| s.describe()).collect();
         format!(
-            "{} ({}, model={}, effort={})",
-            self.reviewer.vendor(),
-            self.reviewer.as_str(),
-            self.model,
-            self.effort
+            "{primary}, falling back on a rate/usage limit to: {}",
+            fallbacks.join(", ")
         )
     }
 
@@ -982,19 +1305,27 @@ mod tests {
 
     #[test]
     fn reviewer_is_required() {
+        let err = Config::from_args(&args(&[])).unwrap_err();
+        assert!(err.contains("--reviewer is required"), "{err}");
+    }
+
+    #[test]
+    fn identity_flag_before_any_reviewer_is_rejected() {
+        // `--model` binds to the most recent `--reviewer`; with none before it, that is almost
+        // always a forgotten `--reviewer`, so it is a parse error rather than a silent bind.
         let err = Config::from_args(&args(&["--model", "x"])).unwrap_err();
-        assert!(err.contains("--reviewer is required"));
+        assert!(err.contains("--model must follow a --reviewer"), "{err}");
     }
 
     #[test]
     fn defaults_are_pinned_per_reviewer() {
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert_eq!(claude.model, "claude-opus-4-8");
-        assert_eq!(claude.effort, "medium");
+        assert_eq!(claude.primary().model, "claude-opus-4-8");
+        assert_eq!(claude.primary().effort, "medium");
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert_eq!(codex.model, "gpt-5.6-luna");
-        assert_eq!(codex.effort, "max");
+        assert_eq!(codex.primary().model, "gpt-5.6-luna");
+        assert_eq!(codex.primary().effort, "max");
     }
 
     #[test]
@@ -1008,8 +1339,251 @@ mod tests {
             "ultra",
         ]))
         .expect("config");
-        assert_eq!(cfg.model, "gpt-5.6-sol");
-        assert_eq!(cfg.effort, "ultra");
+        assert_eq!(cfg.primary().model, "gpt-5.6-sol");
+        assert_eq!(cfg.primary().effort, "ultra");
+    }
+
+    // ---- reviewer fallback chain (issue #48) ----
+
+    #[test]
+    fn single_reviewer_is_a_one_entry_chain() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.reviewers.len(), 1);
+        assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex);
+        // Byte-for-byte the same budget as before the chain existed: capture + timeout + grace.
+        let single =
+            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        assert_eq!(cfg.max_wait_secs(), single);
+    }
+
+    #[test]
+    fn a_repeated_reviewer_starts_a_new_chain_entry_in_order() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "medium",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.reviewers.len(), 2);
+        assert_eq!(cfg.reviewers[0].reviewer, ReviewerKind::Claude);
+        assert_eq!(cfg.reviewers[0].model, "claude-opus-4-8");
+        assert_eq!(cfg.reviewers[1].reviewer, ReviewerKind::Codex);
+        assert_eq!(cfg.reviewers[1].model, "gpt-5.6-luna");
+        // Each entry takes its own per-reviewer defaults when unspecified.
+        let defaulted = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
+            .expect("config");
+        assert_eq!(defaulted.reviewers[0].model, "claude-opus-4-8");
+        assert_eq!(defaulted.reviewers[1].model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn a_doubled_identity_flag_in_one_entry_is_rejected() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "a",
+            "--model",
+            "b",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--model given twice"), "{err}");
+    }
+
+    #[test]
+    fn a_multi_entry_budget_adds_a_term_per_fallback() {
+        let cfg = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
+            .expect("config");
+        let single =
+            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        let per_fallback =
+            PREFLIGHT_CAP_SECS + cfg.timeout.as_secs() + crate::reviewer::DRAIN_GRACE.as_secs();
+        assert_eq!(cfg.max_wait_secs(), single + per_fallback);
+    }
+
+    #[test]
+    fn validate_chain_rejects_a_fully_identical_entry_but_allows_a_different_one() {
+        let dup = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "codex"]))
+            .expect("config");
+        assert!(Config::validate_chain(&dup.reviewers).is_err());
+
+        // Same reviewer, different model: a legitimate same-family fallback, honoured.
+        let same_family = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+        ]))
+        .expect("config");
+        assert!(Config::validate_chain(&same_family.reviewers).is_ok());
+
+        assert!(Config::validate_chain(&[]).is_err());
+    }
+
+    #[test]
+    fn chain_needs_capture_folds_across_entries() {
+        // Codex has a shell and needs no diff; Claude has none and does. A Codex->Claude chain
+        // under --diff auto must still capture, for the Claude fallback.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
+            .expect("config");
+        assert!(!cfg.supplies_change_of(ReviewerKind::Codex));
+        assert!(cfg.supplies_change_of(ReviewerKind::Claude));
+        assert!(cfg.chain_needs_capture());
+    }
+
+    #[test]
+    fn describe_reviewer_names_the_whole_chain() {
+        let one = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(!one.describe_reviewer().contains("falling back"));
+
+        let two = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
+            .expect("config");
+        let desc = two.describe_reviewer();
+        assert!(desc.contains("falling back"), "{desc}");
+        assert!(desc.contains("claude"), "{desc}");
+    }
+
+    #[test]
+    fn describe_with_bin_names_the_resolved_executable_even_for_a_path_entry() {
+        // A PATH-resolved entry omits the bin from `describe` (its resolved path is unknown from
+        // config alone), but once the run path has resolved one, `describe_with_bin` names it so
+        // the rendered identity tells the caller which executable -- and thus which account --
+        // actually ran, as docs/reviewer-fallback-chain.md promises.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        let spec = &cfg.reviewers[0];
+        assert!(spec.bin.is_none(), "the test relies on a PATH entry");
+        assert!(!spec.describe().contains("bin="), "{}", spec.describe());
+
+        let resolved = spec.describe_with_bin(Path::new("C:/tools/codex.exe"));
+        assert!(resolved.contains("bin=C:/tools/codex.exe"), "{resolved}");
+        // Still the same entry, just with the executable pinned.
+        assert!(resolved.contains("model="), "{resolved}");
+
+        // An explicit --bin already shows in `describe`, and `describe_with_bin` pins the
+        // resolved path it was actually launched from (they usually coincide).
+        let explicit = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--bin",
+            "C:/configured/codex.exe",
+        ]))
+        .expect("config");
+        assert!(
+            explicit.reviewers[0]
+                .describe()
+                .contains("bin=C:/configured/codex.exe"),
+            "{}",
+            explicit.reviewers[0].describe()
+        );
+    }
+
+    #[test]
+    fn resume_entry_index_matches_the_creating_entry() {
+        use crate::session::{RawBin, SessionRecord};
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "medium",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+        ]))
+        .expect("config");
+        let mut rec = SessionRecord {
+            reviewer: "codex".into(),
+            cli_session_id: "t".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::PathSearch),
+            resolved_bin: None,
+        };
+        // Matches the fallback entry (index 1), not the primary.
+        assert_eq!(cfg.resume_entry_index(&rec), Some(1));
+        // A model the chain no longer has: no match.
+        rec.model = "gpt-5.6-sol".into();
+        assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn a_legacy_record_matches_only_when_unambiguous() {
+        use crate::session::SessionRecord;
+        let mk = |reviewer: &str, model: &str| SessionRecord {
+            reviewer: reviewer.into(),
+            cli_session_id: "t".into(),
+            model: model.into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: None, // legacy: no stored bin
+            resolved_bin: None,
+        };
+        // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
+        let ambiguous = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--bin",
+            "C:\\a\\codex.exe",
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--bin",
+            "C:\\b\\codex.exe",
+        ]))
+        .expect("config");
+        assert_eq!(
+            ambiguous.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            None
+        );
+        // Exactly one match: resumes.
+        let single = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(
+            single.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1017,19 +1591,23 @@ mod tests {
         // MCP config files vary in how they split args, so both forms must work.
         let cfg =
             Config::from_args(&args(&["--reviewer=claude", "--effort=xhigh"])).expect("config");
-        assert_eq!(cfg.reviewer, ReviewerKind::Claude);
-        assert_eq!(cfg.effort, "xhigh");
+        assert_eq!(cfg.primary().reviewer, ReviewerKind::Claude);
+        assert_eq!(cfg.primary().effort, "xhigh");
     }
 
     #[test]
     fn reviewer_aliases_resolve() {
         for alias in ["codex", "chatgpt", "openai", "gpt", "CODEX"] {
             let cfg = Config::from_args(&args(&["--reviewer", alias])).expect("config");
-            assert_eq!(cfg.reviewer, ReviewerKind::Codex, "alias {alias}");
+            assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex, "alias {alias}");
         }
         for alias in ["claude", "claude-code", "anthropic"] {
             let cfg = Config::from_args(&args(&["--reviewer", alias])).expect("config");
-            assert_eq!(cfg.reviewer, ReviewerKind::Claude, "alias {alias}");
+            assert_eq!(
+                cfg.primary().reviewer,
+                ReviewerKind::Claude,
+                "alias {alias}"
+            );
         }
     }
 
@@ -1596,7 +2174,7 @@ mod tests {
         // rebuild of this tool.
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--effort", "hyper"]))
             .expect("unusual effort should warn, not fail");
-        assert_eq!(cfg.effort, "hyper");
+        assert_eq!(cfg.primary().effort, "hyper");
     }
 
     #[test]

@@ -136,6 +136,11 @@ pub struct Review {
     /// What the turn cost, once it has finished. Zero while it is running: the CLIs
     /// report usage on completion, so there is nothing honest to show before then.
     pub usage: Usage,
+    /// The reviewer entry currently (or last) running this review, as a describe string. Set by
+    /// `set_active` before capture and before each fall-through attempt, so a running poll and the
+    /// terminal result name the entry that actually ran rather than the whole chain. `None` until
+    /// the first `set_active`. See `docs/reviewer-fallback-chain.md`.
+    pub active: Option<String>,
     pub cancel: Arc<AtomicBool>,
     /// Order in which this process finished the review, or 0 while it is still running.
     /// Assigned under the registry lock; see `State::finishes`.
@@ -166,6 +171,10 @@ pub struct Outcome {
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
     pub usage: Usage,
+    /// The reviewer entry that actually produced this outcome, as a describe string, so the
+    /// terminal result names the entry that ran (a fallback, when the walk fell through) rather
+    /// than the whole chain. `None` leaves the response to fall back to the chain description.
+    pub active: Option<String>,
 }
 
 impl Outcome {
@@ -181,6 +190,7 @@ impl Outcome {
             capture_summary: None,
             resumable: false,
             usage: Usage::default(),
+            active: None,
         }
     }
 
@@ -197,6 +207,7 @@ impl Outcome {
             capture_summary: None,
             resumable: true,
             usage: Usage::default(),
+            active: None,
         }
     }
 }
@@ -381,6 +392,7 @@ impl Registry {
                 last_activity: now,
                 output_bytes: 0,
                 usage: Usage::default(),
+                active: None,
                 cancel: Arc::clone(&cancel),
                 finish_seq: 0,
             },
@@ -388,6 +400,20 @@ impl Registry {
         drop(guard);
         self.changed.notify_all();
         Ok((id, cancel))
+    }
+
+    /// Record which reviewer entry a running review is now on, so a running poll and the terminal
+    /// result attribute to the entry that actually ran. Uses the same `State` lock as `finish`
+    /// and the snapshot path: an owned clone stored under the lock, updated only while the review
+    /// is `Running`, and copied out by snapshots under the same lock. See
+    /// `docs/reviewer-fallback-chain.md`.
+    pub fn set_active(&self, id: &str, active: String) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(review) = guard.reviews.get_mut(id) {
+            if review.status == Status::Running {
+                review.active = Some(active);
+            }
+        }
     }
 
     /// Move a running review into another observable phase.
@@ -453,6 +479,9 @@ impl Registry {
                 review.capture_summary = outcome.capture_summary;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
+                if outcome.active.is_some() {
+                    review.active = outcome.active;
+                }
                 match outcome.failure {
                     Some(failure) => {
                         review.status = Status::Failed;
@@ -668,6 +697,8 @@ pub struct Snapshot {
     pub activity_age: Duration,
     pub output_bytes: usize,
     pub usage: Usage,
+    /// The reviewer entry currently (or last) running this review; see [`Review::active`].
+    pub active: Option<String>,
     /// The server had begun shutting down when this was taken. A `Running` snapshot with
     /// this set means the wait was cut short, not that the caller's budget ran out — and
     /// that no later call can collect the review, because the process is exiting.
@@ -697,6 +728,7 @@ impl Snapshot {
             activity_age: review.last_activity.elapsed(),
             output_bytes: review.output_bytes,
             usage: review.usage,
+            active: review.active.clone(),
             shutting_down,
         }
     }
