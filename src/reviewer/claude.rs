@@ -81,7 +81,19 @@ impl Reviewer for ClaudeReviewer {
         _tmp_id: &str,
     ) -> std::io::Result<Invocation> {
         let mut cmd = Command::new(bin);
-        cmd.current_dir(&cfg.cwd);
+        // Run from a neutral, non-git directory when it is safe and beneficial to (see
+        // `claude_neutral_target` and `docs/resume-cache-cwd-invalidation.md`): Claude Code
+        // derives a per-invocation git context from its cwd, which the parent agent's
+        // between-turn commits change, invalidating the reviewer's cached conversation. Running
+        // outside the repo removes that context so a resume stays cache-read-cheap. When it
+        // switches, the read scope moves from the relative `./**` (which would now point at the
+        // neutral dir) to absolute rules pinned to `cfg.cwd`.
+        let neutral = super::claude_neutral_target(cfg, spec.reviewer);
+        let (cwd, allowed_tools): (&Path, &[String]) = match &neutral {
+            Some((dir, rules)) => (dir.as_path(), rules),
+            None => (cfg.cwd.as_path(), &cfg.allowed_tools),
+        };
+        cmd.current_dir(cwd);
         cmd.arg("-p");
         cmd.args(["--output-format", "json"]);
         cmd.args(["--model", &spec.model]);
@@ -93,7 +105,7 @@ impl Reviewer for ClaudeReviewer {
         // One argument per rule: a project path containing a space or comma would
         // otherwise be split into fragments by the CLI's list parsing.
         cmd.arg("--allowed-tools");
-        for rule in &cfg.allowed_tools {
+        for rule in allowed_tools {
             cmd.arg(rule);
         }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);

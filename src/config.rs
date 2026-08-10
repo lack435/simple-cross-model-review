@@ -337,6 +337,58 @@ pub fn scoped_claude_rules() -> Vec<String> {
         .collect()
 }
 
+/// The absolute-path analogue of [`scoped_claude_rules`], for when the Claude reviewer runs
+/// from a neutral working directory and so cannot rely on `.` resolving to the working root
+/// (see `docs/resume-cache-cwd-invalidation.md`).
+///
+/// Returns `None` -- fail closed -- for any `root` we cannot turn into a safe, literal glob
+/// prefix, so a caller that gets `None` keeps the reviewer at `cfg.cwd` with the relative
+/// rules rather than emit a rule that might mis-scope. Refused: a non-Unicode path, a UNC or
+/// verbatim (`\\?\`) path, anything that is not a drive-letter absolute path, any path with a
+/// non-normal `.`/`..` segment (which `normalize_dir` can leave in place when canonicalisation
+/// fails, and which the matcher might resolve outside the root), and any path
+/// containing a glob metacharacter (`* ? [ ] { }`) -- the exact hazard that made the relative
+/// rule deliberately relative.
+///
+/// The emitted shape was verified empirically against the reviewer CLI: forward slashes, a
+/// drive letter, no leading `//`, and a trailing `/**` -- e.g. `Read(C:/dev/repo/**)`. (The
+/// `//`-prefixed form a naive interpolation would produce matches nothing, so it is not used.)
+///
+/// The matcher's boundary was probed directly from a neutral cwd with this rule (results
+/// recorded here because `cargo test` makes no CLI calls, so the unit tests below can only check
+/// the emitted string): a file under the root reads OK; a path outside the root, a *same-prefix
+/// sibling* (`.../repo-sibling/...`, kept out by the trailing `/**`), and a `..` traversal out of
+/// the root are each **denied**; a case-variant of an in-root path reads OK (Windows paths are
+/// case-insensitive). So the rule scopes to exactly the root and no broader.
+pub fn absolute_scoped_rules(root: &std::path::Path) -> Option<Vec<String>> {
+    let forward = root.to_str()?.replace('\\', "/");
+    let trimmed = forward.trim_end_matches('/');
+    // Reject non-normal `.`/`..` segments: after the matcher resolves them the real scope could
+    // fall outside the intended root. Checked on the literal segments rather than via
+    // `Path::components`, which normalises a mid-path `.` away and so would miss `a/./b`.
+    if trimmed.split('/').any(|seg| seg == "." || seg == "..") {
+        return None;
+    }
+    // Drive-letter absolute only (`X:/...`). Excludes UNC (`//server`), verbatim (`//?/...`),
+    // rooted-without-drive, and relative -- none of which we will represent.
+    let b = trimmed.as_bytes();
+    let drive_absolute = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/';
+    if !drive_absolute {
+        return None;
+    }
+    // A glob metacharacter left literal would change the pattern's meaning, granting or denying
+    // the wrong paths. This is the case the relative rule was written to avoid; fail closed.
+    if trimmed.contains(['*', '?', '[', ']', '{', '}']) {
+        return None;
+    }
+    Some(
+        ["Read", "Grep", "Glob"]
+            .iter()
+            .map(|tool| format!("{tool}({trimmed}/**)"))
+            .collect(),
+    )
+}
+
 /// Whether one `--allow-tools` value grants Bash.
 ///
 /// Three shapes have to work. Our defaults arrive as separate scoped entries; a
@@ -841,6 +893,15 @@ impl Config {
             .saturating_add(self.timeout.as_secs())
             .saturating_add(crate::reviewer::DRAIN_GRACE.as_secs());
         single.saturating_add(fallbacks.saturating_mul(per_fallback))
+    }
+
+    /// Whether the reviewer's read allow-list is exactly the built-in scoped default -- i.e. the
+    /// caller did not override it with `--allow-tools`. Only the default set can be safely
+    /// translated to absolute form for a neutral working directory; a caller-supplied *relative*
+    /// rule would silently lose access there, so its presence keeps the reviewer at `cfg.cwd`.
+    /// See `docs/resume-cache-cwd-invalidation.md`.
+    pub fn allowed_tools_are_default(&self) -> bool {
+        self.allowed_tools == scoped_claude_rules()
     }
 
     /// True when the reviewer has any shell at all.
@@ -1529,6 +1590,7 @@ mod tests {
             resolved_bin: None,
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: None,
         };
         // Matches the fallback entry (index 1), not the primary.
         assert_eq!(cfg.resume_entry_index(&rec), Some(1));
@@ -1561,6 +1623,7 @@ mod tests {
             resolved_bin: None,
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
         let ambiguous = Config::from_args(&args(&[
@@ -2064,6 +2127,45 @@ mod tests {
         let err = Config::from_args(&args(&["--reviewer", "claude", "--diff", "--output=x"]))
             .unwrap_err();
         assert!(err.contains("git option"), "{err}");
+    }
+
+    #[test]
+    fn absolute_scoped_rules_pin_a_normal_drive_path_and_fail_closed_otherwise() {
+        // A normal drive path becomes forward-slashed, drive-lettered, `/**`-suffixed rules --
+        // the shape verified to permit reads under the root and deny outside it.
+        let rules = absolute_scoped_rules(std::path::Path::new("C:\\dev\\repo")).expect("rules");
+        assert_eq!(
+            rules,
+            vec![
+                "Read(C:/dev/repo/**)",
+                "Grep(C:/dev/repo/**)",
+                "Glob(C:/dev/repo/**)"
+            ]
+        );
+        // A trailing separator is trimmed rather than doubling the slash.
+        assert_eq!(
+            absolute_scoped_rules(std::path::Path::new("C:\\dev\\repo\\")).unwrap()[0],
+            "Read(C:/dev/repo/**)"
+        );
+
+        // Fail closed (None) for everything we cannot represent as a safe literal prefix.
+        for hostile in [
+            "C:\\work\\[ab]",       // glob character class -- the documented hazard
+            "C:\\a*b",              // star
+            "C:\\a?b",              // question mark
+            "C:\\a{b}",             // brace
+            "\\\\server\\share",    // UNC
+            "\\\\?\\C:\\dev\\repo", // verbatim prefix
+            "relative\\path",       // not absolute
+            "/rooted/no/drive",     // rooted without a drive letter
+            "C:\\dev\\..\\repo",    // parent-dir component
+            "C:\\dev\\.\\x\\repo",  // current-dir component
+        ] {
+            assert!(
+                absolute_scoped_rules(std::path::Path::new(hostile)).is_none(),
+                "must fail closed on {hostile:?}"
+            );
+        }
     }
 
     #[test]

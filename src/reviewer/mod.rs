@@ -112,6 +112,108 @@ pub fn is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
 }
 
+/// The two working-directory modes the Claude reviewer can run in, stamped on a session so a
+/// resume can tell whether the mode changed under it (which the conversation cannot survive).
+pub const CWD_MODE_PROJECT: &str = "project";
+pub const CWD_MODE_NEUTRAL: &str = "neutral";
+
+/// Decide whether the Claude reviewer should run this turn from a neutral (non-git) working
+/// directory, and if so with which absolute read-scope rules. `Some((dir, rules))` means run
+/// the child there with `rules`; `None` means keep `cfg.cwd` and the configured (relative)
+/// rules. Every condition must hold, and each failing one fails *closed* to `None`.
+///
+/// The point is to keep the reviewer's prompt cache stable across turns: Claude Code derives a
+/// per-invocation git context from its cwd, so when the parent agent commits between turns that
+/// context changes and invalidates the replayed conversation. Running outside the repo removes
+/// the git context at the source. See `docs/resume-cache-cwd-invalidation.md` for the full
+/// investigation and why each gate exists.
+pub fn claude_neutral_target(
+    cfg: &Config,
+    reviewer: ReviewerKind,
+) -> Option<(PathBuf, Vec<String>)> {
+    // Claude only: Codex uses a read-only shell and a different capture path entirely.
+    if reviewer != ReviewerKind::Claude {
+        return None;
+    }
+    // Git backend only. The cache churn we are fixing comes from Claude Code's git context, and
+    // the neutral-cwd path listings assume git-shaped output. A Perforce review whose workspace
+    // happens to sit inside a git repo (so `is_git_toplevel` would be true) emits working-root-
+    // relative Perforce paths, not git `a/`/`b/` diffs, so it must stay in project-cwd mode.
+    if cfg.vcs != crate::config::Vcs::Git {
+        return None;
+    }
+    // Isolation must be on. `--allow-reviewer-config` opts into loading project/user config,
+    // which needs the project as cwd.
+    if !cfg.isolate_reviewer {
+        return None;
+    }
+    // Shell-less only: a shell reviewer is expected to run git itself, and `--diff auto`
+    // withholds the captured diff on that basis -- both need the project as cwd. Use the
+    // active entry's predicate, not the primary's, so a Codex->shell-less-Claude fallback is
+    // judged on Claude.
+    if cfg.reviewer_has_shell_of(reviewer) {
+        return None;
+    }
+    // Only the default read rules can be translated to absolute form safely; a caller-supplied
+    // relative rule would lose access from a neutral cwd.
+    if !cfg.allowed_tools_are_default() {
+        return None;
+    }
+    // Only when `cfg.cwd` is the git top-level. Then the working root is the repository root, so
+    // every captured path (git-status is repo-root-relative, diff/untracked are working-root-
+    // relative) shares one origin -- the absolute root we hand the reviewer -- and there is no
+    // sub-directory ambiguity to resolve. It is also the only case where a git context that our
+    // move would remove actually exists here.
+    if !is_git_toplevel(&cfg.cwd) {
+        return None;
+    }
+    // The path must be representable as a safe absolute glob prefix.
+    let rules = crate::config::absolute_scoped_rules(&cfg.cwd)?;
+    // The neutral directory must be verified to have no `.git` ancestor, or we would just move
+    // the problem into a different repository. Fail closed if it cannot be confirmed.
+    let dir = neutral_dir(cfg);
+    if !verified_non_git_dir(&dir) {
+        return None;
+    }
+    Some((dir, rules))
+}
+
+/// The [`CWD_MODE_NEUTRAL`]/[`CWD_MODE_PROJECT`] tag for the reviewer that would run this turn,
+/// recorded on the session and compared on resume.
+pub fn claude_cwd_mode(cfg: &Config, reviewer: ReviewerKind) -> &'static str {
+    if claude_neutral_target(cfg, reviewer).is_some() {
+        CWD_MODE_NEUTRAL
+    } else {
+        CWD_MODE_PROJECT
+    }
+}
+
+/// Whether `dir` is a git top-level -- it has a `.git` entry directly in it (a directory for a
+/// normal clone, a file for a worktree or submodule). Errors read as "no", which is the
+/// fail-closed direction: we only *enable* the optimisation when this is true.
+fn is_git_toplevel(dir: &Path) -> bool {
+    dir.join(".git").try_exists().unwrap_or(false)
+}
+
+/// Whether `dir` can be confirmed to sit outside any git repository. Canonicalised first so a
+/// `..` segment or a junction/symlink cannot present a path that is textually outside the repo
+/// while physically inside it, then every ancestor is checked for a `.git` entry. Any error --
+/// a failed canonicalisation, an unreadable ancestor -- returns `false` (fail closed): an
+/// unverifiable directory is treated as unsafe.
+fn verified_non_git_dir(dir: &Path) -> bool {
+    let Ok(canon) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    for ancestor in canon.ancestors() {
+        match ancestor.join(".git").try_exists() {
+            Ok(true) => return false,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 pub trait Reviewer: Send + Sync {
     /// Cheap check that the CLI exists and is signed in. Runs before we spend a
     /// model call, so an unconfigured machine fails fast and legibly.

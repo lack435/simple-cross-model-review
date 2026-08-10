@@ -146,6 +146,14 @@ pub struct SessionRecord {
     /// `None` for a healthy session or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// Which working-directory mode the Claude reviewer ran in when this turn was recorded
+    /// (`crate::reviewer::CWD_MODE_PROJECT` / `CWD_MODE_NEUTRAL`). A resume whose current mode
+    /// differs cannot reuse the conversation -- it lives under the other process cwd -- so the
+    /// resume is rebound to a fresh turn instead of failing. `None` on a record written before
+    /// this field existed, which is treated as "project" (the only mode that existed then). See
+    /// `docs/resume-cache-cwd-invalidation.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_cwd_mode: Option<String>,
 }
 
 /// The tri-state result of loading a session's findings ledger. A single record whose ledger is
@@ -236,6 +244,9 @@ pub struct TurnFacts<'a> {
     /// The sticky terminal state this turn resolves to (`Some("ledger_too_large")` when the turn is
     /// over budget), or `None`. Set on the record so a later resume is refused.
     pub terminal_reason: Option<String>,
+    /// The working-directory mode the reviewer ran in this turn (`CWD_MODE_PROJECT` /
+    /// `CWD_MODE_NEUTRAL`), stored so a later resume can detect a mode change it cannot survive.
+    pub reviewer_cwd_mode: &'a str,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -314,6 +325,7 @@ impl SessionStore {
             resolved_bin,
             findings_ledger,
             terminal_reason,
+            reviewer_cwd_mode,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -379,6 +391,7 @@ impl SessionStore {
                 // turn (sticky terminal states are re-supplied by the caller from the prior record).
                 findings_ledger,
                 terminal_reason,
+                reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -402,6 +415,7 @@ impl SessionStore {
                 resolved_bin: Some(resolved_bin),
                 findings_ledger,
                 terminal_reason,
+                reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
             },
         };
 
@@ -801,6 +815,7 @@ mod tests {
                     resolved_bin: String::new(),
                     findings_ledger: None,
                     terminal_reason: None,
+                    reviewer_cwd_mode: "project",
                 },
             )
             .expect("record turn")
@@ -870,6 +885,21 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_cwd_mode_is_recorded_and_a_legacy_record_reads_as_none() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let rec = record(&store, "default", "thread-1");
+        assert_eq!(rec.reviewer_cwd_mode.as_deref(), Some("project"));
+        // A record written before the field existed omits it and must deserialise as `None`,
+        // which the resume-migration check treats as "project" (the only mode that existed then).
+        let json = serde_json::to_string(&rec).expect("serialize");
+        let legacy = json.replace(",\"reviewer_cwd_mode\":\"project\"", "");
+        assert_ne!(json, legacy, "the field must have been present to remove");
+        let back: SessionRecord = serde_json::from_str(&legacy).expect("legacy deserialize");
+        assert_eq!(back.reviewer_cwd_mode, None);
+    }
+
+    #[test]
     fn turns_accumulate_on_the_same_reviewer_session() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
@@ -914,6 +944,7 @@ mod tests {
             resolved_bin: String::new(),
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: "project",
         };
         store
             .record_turn("default", facts(turn_one))
@@ -960,6 +991,7 @@ mod tests {
             resolved_bin: String::new(),
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: "project",
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -1014,6 +1046,7 @@ mod tests {
             resolved_bin: String::new(),
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: "project",
         };
         // The old conversation establishes a complete baseline.
         store
@@ -1053,6 +1086,7 @@ mod tests {
             resolved_bin: String::new(),
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: "project",
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -1091,6 +1125,7 @@ mod tests {
             resolved_bin: String::new(),
             findings_ledger: None,
             terminal_reason: None,
+            reviewer_cwd_mode: "project",
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,
@@ -1276,6 +1311,7 @@ mod tests {
                     resolved_bin: String::new(),
                     findings_ledger: None,
                     terminal_reason: None,
+                    reviewer_cwd_mode: "project",
                 },
             )
             .expect_err("record_turn must refuse a corrupt store");
