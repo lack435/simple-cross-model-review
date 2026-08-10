@@ -1250,6 +1250,71 @@ mod tests {
     }
 
     #[test]
+    fn a_disposition_survives_to_the_snapshot() {
+        // The typed disposition must ride the full Outcome -> Review -> Snapshot path so the
+        // blocking collect can render its line. This pins the plumbing PR #43 restructured under
+        // the feature -- a rebase that dropped the field would compile and pass every other test.
+        use crate::vcs::disposition::{Disposition, FellBack, FullByDesign, Incremental};
+        let registry = Registry::new();
+
+        // An incremental delta carries through with its detail intact.
+        let (id, _c) = registry.try_start("default", 2, true).expect("start");
+        registry.finish(
+            &id,
+            Outcome {
+                disposition: Some(Disposition::Incremental(Incremental::GitRange {
+                    prior: "aaaa".into(),
+                    head: "bbbb".into(),
+                    commits: Some(2),
+                })),
+                ..Outcome::completed("ok")
+            },
+        );
+        let snapshot = registry
+            .wait(&id, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert!(
+            matches!(
+                snapshot.disposition,
+                Some(Disposition::Incremental(Incremental::GitRange {
+                    commits: Some(2),
+                    ..
+                }))
+            ),
+            "the incremental disposition and its count must reach the snapshot: {:?}",
+            snapshot.disposition
+        );
+
+        // A by-design full capture carries through and does not warn.
+        let (id2, _c2) = registry.try_start("other", 2, true).expect("start");
+        registry.finish(
+            &id2,
+            Outcome {
+                disposition: Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+                ..Outcome::completed("ok")
+            },
+        );
+        let snap2 = registry
+            .wait(&id2, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert_eq!(
+            snap2.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable))
+        );
+        assert!(!snap2.disposition.unwrap().warns());
+
+        // A failed turn carries no disposition (it sent no reviewable change).
+        let (id3, _c3) = registry.try_start("third", 2, true).expect("start");
+        registry.finish(&id3, Outcome::failed(crate::errors::cancelled()));
+        let snap3 = registry
+            .wait(&id3, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert!(snap3.disposition.is_none());
+        // Sanity: FellBack is the warning-bearing variant, distinct from the above.
+        assert!(Disposition::FellBackToFull(FellBack::BaseMoved).warns());
+    }
+
+    #[test]
     fn denial_count_survives_to_the_snapshot_separately_from_examples() {
         let registry = Registry::new();
         let (id, _c) = registry.try_start("default", 1, false).expect("start");
