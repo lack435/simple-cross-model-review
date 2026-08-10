@@ -2075,6 +2075,9 @@ impl Job {
             &text,
             self.cfg.timeout,
             &self.cancel,
+            // The armed Claude path raises the stdout cap (stream-json is larger than the buffered
+            // document); every other path keeps MAX_OUTPUT_BYTES. See docs/usage-remaining-gate.md.
+            self.reviewer.output_stdout_cap(&self.cfg),
             |activity| {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);

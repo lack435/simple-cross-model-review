@@ -267,6 +267,15 @@ pub trait Reviewer: Send + Sync {
     fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
         None
     }
+
+    /// The byte cap the runner applies to this reviewer's retained stdout. Default
+    /// `MAX_OUTPUT_BYTES`; the armed Claude path raises it because `stream-json` carries the
+    /// review text more than once, so a review whose content fits the buffered path produces a
+    /// larger stream. This is the single truncation contract on raw bytes read — overrun before
+    /// the terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
+    fn output_stdout_cap(&self, _cfg: &Config) -> usize {
+        MAX_OUTPUT_BYTES
+    }
 }
 
 pub fn for_kind(kind: ReviewerKind) -> Box<dyn Reviewer> {
@@ -545,8 +554,16 @@ pub fn run(
     cancel: &AtomicBool,
 ) -> std::io::Result<RunOutcome> {
     // The status/liveness probes that use this wrapper do not need the spawn/observe distinction, so
-    // flatten it back to a plain `io::Error`.
-    run_observed(command, stdin_data, timeout, cancel, |_| {}).map_err(RunError::into_io)
+    // flatten it back to a plain `io::Error`. They keep the ordinary stdout cap.
+    run_observed(
+        command,
+        stdin_data,
+        timeout,
+        cancel,
+        MAX_OUTPUT_BYTES,
+        |_| {},
+    )
+    .map_err(RunError::into_io)
 }
 
 /// Run a reviewer child and periodically report that it was observed alive.
@@ -559,6 +576,10 @@ pub fn run_observed(
     stdin_data: &str,
     timeout: Duration,
     cancel: &AtomicBool,
+    // Byte cap on the retained stdout buffer. Normally MAX_OUTPUT_BYTES; the armed Claude path
+    // raises it to MAX_ARMED_STREAM_BYTES because stream-json carries the review text more than
+    // once (see Reviewer::output_stdout_cap). stderr always uses MAX_OUTPUT_BYTES.
+    stdout_max_bytes: usize,
     mut on_activity: impl FnMut(Activity),
 ) -> Result<RunOutcome, RunError> {
     command
@@ -602,8 +623,14 @@ pub fn run_observed(
     // holds a pipe open past the drain deadline we still get everything that arrived --
     // returning at EOF meant abandoning the channel discarded the whole transcript, and
     // for Claude, whose review is stdout-only, a completed review became EMPTY_REVIEW.
-    let stdout_buf = drain(child.stdout.take().expect("stdout was piped"));
-    let stderr_buf = drain(child.stderr.take().expect("stderr was piped"));
+    let stdout_buf = drain(
+        child.stdout.take().expect("stdout was piped"),
+        stdout_max_bytes,
+    );
+    let stderr_buf = drain(
+        child.stderr.take().expect("stderr was piped"),
+        MAX_OUTPUT_BYTES,
+    );
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -699,7 +726,7 @@ impl Drain {
 /// would fill the pipe and block the child forever -- trading unbounded memory for a
 /// hung review, which is a worse bargain. Reaching the cap is recorded, so a transcript
 /// that lost its middle is reported as truncated rather than as merely short.
-fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
+fn drain(mut pipe: impl std::io::Read + Send + 'static, max_bytes: usize) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
@@ -722,7 +749,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> Drain {
                 }
                 Ok(n) => {
                     let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = MAX_OUTPUT_BYTES.saturating_sub(buffer.len());
+                    let room = max_bytes.saturating_sub(buffer.len());
                     if room == 0 {
                         writer_truncated.store(true, Ordering::SeqCst);
                         continue;
@@ -943,7 +970,7 @@ mod drain_tests {
     use super::*;
 
     fn drained(bytes: Vec<u8>) -> Collected {
-        let drain = drain(std::io::Cursor::new(bytes));
+        let drain = drain(std::io::Cursor::new(bytes), MAX_OUTPUT_BYTES);
         collect(&drain, Instant::now() + Duration::from_secs(5))
     }
 
@@ -966,6 +993,7 @@ mod drain_tests {
             "",
             Duration::from_secs(5),
             &std::sync::atomic::AtomicBool::new(false),
+            MAX_OUTPUT_BYTES,
             |_| {},
         );
         match result {
@@ -1025,10 +1053,13 @@ mod drain_tests {
         // therefore have passed.
         let source = MAX_OUTPUT_BYTES * 2;
         let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let drain = drain(Counting {
-            remaining: source,
-            taken: Arc::clone(&taken),
-        });
+        let drain = drain(
+            Counting {
+                remaining: source,
+                taken: Arc::clone(&taken),
+            },
+            MAX_OUTPUT_BYTES,
+        );
         let collected = collect(&drain, Instant::now() + Duration::from_secs(10));
 
         assert!(collected.truncated);
