@@ -351,15 +351,20 @@ COUNTER=2
         arguments = @{ review_id = $doomedId; wait_seconds = 5 }
     } -TimeoutSeconds 60
     $afterText = Get-ToolText $after
+    # Anchor to the start of the response envelope. A running or completed collect begins with its
+    # `status:` line; the reviewer body it may also contain (a completed review echoes the answer)
+    # comes later, so `\A` keeps a body that happens to print "status: running" from being read as
+    # the review's own status.
     Assert-That 'the poll cancellation left the review running or collectible' `
-        (($afterText -match 'status:\s+running') -or ($afterText -match 'status:\s+completed')) $afterText
-    # Match the machine-readable failure code, not the bare word. The prompt above mentions
-    # cancellation, so a fast reviewer can echo "cancelled" in its own answer; a loose
-    # case-insensitive `-match 'CANCELLED'` on the whole response would then read that prose as a
-    # cancelled *review* and fail a run where the server did exactly the right thing. A genuinely
-    # cancelled review renders a `code: CANCELLED` line (errors.rs), which the review body cannot
-    # forge, so anchoring to it distinguishes a cancelled review from one that merely said the word.
-    Assert-That 'the poll cancellation did not cancel the review' ($afterText -notmatch 'code:\s+CANCELLED') $afterText
+        (($afterText -match '\Astatus:\s+running') -or ($afterText -match '\Astatus:\s+completed')) $afterText
+    # Whether the review was cancelled is decided by the response *envelope*, not by any word in it.
+    # A genuinely cancelled review comes back as an isError failure carrying a `code: CANCELLED` line
+    # (errors.rs); a running or completed review is not an isError, and its body -- which a completed
+    # review appends verbatim and which could say anything, even "code: CANCELLED" -- cannot forge
+    # that. The prompt above tells the reviewer the poll "will be cancelled", so a fast reviewer
+    # echoes the word; guarding on isError is what stops that prose from failing a correct run.
+    $afterCancelled = ($after.result.isError -eq $true) -and ($afterText -match 'code:\s+CANCELLED')
+    Assert-That 'the poll cancellation did not cancel the review' (-not $afterCancelled) $afterText
 
     # Clean up so this review does not keep billing through the rest of the run.
     Send-Rpc -Method 'tools/call' -Params @{
@@ -397,7 +402,10 @@ COUNTER=2
         arguments = @{ review_id = $doomedBId; wait_seconds = 15 }
     } -TimeoutSeconds 60
     $afterBText = Get-ToolText $afterB
-    Assert-That 'the cancelled review is not still running' ($afterBText -notmatch 'status:\s+running') $afterBText
+    # Anchored to the start of the response: a still-running collect begins with `status: running`,
+    # whereas a completed review that merely echoes "status: running" in its body would not, so the
+    # anchor keeps reviewer prose from masking a review that really was still running.
+    Assert-That 'the cancelled review is not still running' ($afterBText -notmatch '\Astatus:\s+running') $afterBText
 
     $ping = Send-Rpc -Method 'ping' -TimeoutSeconds 30
     Assert-That 'the server is still healthy afterwards' ($null -ne $ping.result) `
