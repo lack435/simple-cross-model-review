@@ -255,20 +255,22 @@ impl App {
             if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
                 return Err(errors::session_not_resumable(&session, reason));
             }
-            // The findings write-ahead: a `.pending` sidecar still set means the previous turn did
-            // not durably record (it crashed or failed to persist), so its ledger is stale relative
-            // to what the reviewer already saw. Resuming would inject a stale ledger and risk
-            // minting colliding ids, so refuse before the model call — the safe, over-cautious
-            // direction (a stale marker after a durable record costs only an unnecessary fresh).
+            // The findings write-ahead marker (distinct from the Perforce baseline marker, which
+            // drives the full-capture fallback and is deliberately left to `run`): a set
+            // findings marker means the previous turn did not durably record its ledger, so the
+            // ledger is stale relative to the reviewer's advanced conversation. Resuming would inject
+            // a stale ledger and risk minting colliding ids, so refuse before the model call — the
+            // safe, over-cautious direction (a stale marker after a durable record costs only an
+            // unnecessary fresh). Fail-closed: an unreadable marker refuses too.
             if matches!(
-                self.sessions.marker_state(&session),
+                self.sessions.findings_marker_state(&session),
                 crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
             ) {
                 return Err(errors::session_not_resumable(
                     &session,
-                    "the previous turn did not finish durably (its in-progress marker is still \
-                     set), so its findings ledger may be stale. Start a fresh review (fresh: true) \
-                     carrying any still-open findings into the new instructions."
+                    "the previous turn did not finish durably (its findings write-ahead marker is \
+                     still set), so its findings ledger may be stale. Start a fresh review \
+                     (fresh: true) carrying any still-open findings into the new instructions."
                         .to_string(),
                 ));
             }
@@ -462,6 +464,21 @@ impl App {
     // cross_model_review_result
     // -----------------------------------------------------------------------
 
+    /// Resolve the review a `cross_model_review_result` call targets to a concrete review id, so the
+    /// text and `structuredContent` channels describe the *same* review even if a new review for the
+    /// session starts between rendering them. `review_id` (preferred) is returned as-is; otherwise
+    /// the session's latest review id, if any; otherwise `None` (the caller then reports the proper
+    /// error). Only the resolution — not the wait — happens here.
+    pub fn resolve_result_id(&self, args: &Value) -> Option<String> {
+        if let Some(id) = string_arg(args, "review_id") {
+            return Some(id);
+        }
+        if let Some(name) = string_arg(args, "session") {
+            return self.registry.latest_for_session(&name);
+        }
+        None
+    }
+
     /// The `structuredContent` value for a `cross_model_review_result` call: the completed
     /// envelope's value, or the reduced running variant, or `None` when there is nothing structured
     /// to attach (an error result, or a snapshot that cannot be resolved). Best-effort and
@@ -482,7 +499,7 @@ impl App {
             Status::Running => Some(crate::findings::running_structured_value(
                 &snapshot.session,
                 snapshot.turn,
-                snapshot.elapsed.as_secs(),
+                running_progress_of(&snapshot),
             )),
             Status::Failed => None,
         }
@@ -623,12 +640,13 @@ impl App {
         };
         // The running variant of the machine envelope on the text channel too, so a text-only
         // client parses exactly one nonce-bearing `_OUT` block whether the review is running or
-        // done. It carries no convergence/findings group — there is nothing to decide yet.
+        // done. It carries no convergence/findings group — there is nothing to decide yet — but does
+        // carry the same progress/liveness the text line shows.
         let out_block = crate::findings::running_out_block(
             &snapshot.id,
             &snapshot.session,
             snapshot.turn,
-            snapshot.elapsed.as_secs(),
+            running_progress_of(snapshot),
         );
         format!(
             "status:    {}\n\
@@ -1183,26 +1201,13 @@ impl Job {
             marker_state,
             Some(crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable)
         );
-        // Mark this turn in progress on the shared `.pending` sidecar — for *every* turn now, not
-        // just Perforce: it is also the findings write-ahead marker (Decision 5). Written before the
-        // reviewer is invoked and cleared only once the turn is durably recorded, so a failure
-        // anywhere below leaves it set for the next resume to refuse. If it cannot be written, a
-        // later crash could not be detected: a resumed turn must not proceed (its ledger could go
-        // stale undetectably), so abort before the model call; a fresh turn 1 has no prior
-        // conversation to strand, so it proceeds and at worst is non-resumable.
-        let pending_marked = self.sessions.mark_pending(&self.session).is_ok();
-        if resume_id.is_some() && !pending_marked {
-            let failure = errors::session_not_resumable(
-                &self.session,
-                "the turn's write-ahead marker could not be written, so a crash could not be \
-                 detected and the findings ledger could go stale undetectably; the turn was not \
-                 started. Retry, or start fresh."
-                    .to_string(),
-            );
-            self.registry.finish(&self.id, Outcome::failed(failure));
-            guard.armed = false;
-            return;
-        }
+        // Mark this Perforce turn in progress; cleared only once it is durably recorded, so a
+        // failure anywhere below leaves the marker set for the next resume to see. If the marker
+        // cannot be written, a later crash could not be detected, so this turn must not produce a
+        // resumable baseline at all (forced to `Disabled` below). This is the *Perforce* baseline
+        // marker; the findings write-ahead is a separate marker written in `attempt`.
+        let pending_marked = self.cfg.vcs == crate::config::Vcs::Perforce
+            && self.sessions.mark_pending(&self.session).is_ok();
 
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
         // needs both HEAD and base; Perforce needs its stored inventory. The backend decides from
@@ -1668,18 +1673,17 @@ impl Job {
         } else {
             None
         };
-        // Before-call bounded-growth check: if the prior ledger is *already* over budget on entry
-        // (a budget lowered between runs, or an older ledger under a tighter cap), do not invoke the
-        // reviewer at all — nothing is billed and no turn is advanced. Persist the sticky terminal
-        // state so the next resume is refused, clear this turn's write-ahead marker (no reviewer ran,
-        // nothing to strand), and return a completed `ledger_too_large` envelope for the human to
-        // rebaseline from.
+        // Before-call bounded-growth check, done *before* the findings write-ahead marker so this
+        // path involves no marker at all: if the prior ledger is already over budget on entry (a
+        // budget lowered between runs, or an older ledger under a tighter cap), do not invoke the
+        // reviewer — nothing is billed and no turn is advanced. Persist the sticky terminal state so
+        // the next resume is refused, and return a completed `ledger_too_large` envelope for the
+        // human to rebaseline from.
         if let Some(prior) = &prior_state {
             if crate::findings::prior_over_budget(prior, crate::findings::Budget::default()) {
                 let _ = self
                     .sessions
                     .set_terminal_reason(&self.session, "ledger_too_large");
-                let _ = self.sessions.clear_pending(&self.session);
                 let envelope =
                     crate::findings::over_budget_on_entry_envelope(&self.session, turn, prior);
                 return Ok(Outcome {
@@ -1697,6 +1701,24 @@ impl Job {
                 });
             }
         }
+
+        // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
+        // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
+        // detected and the ledger could go stale relative to the reviewer's advanced conversation,
+        // so abort before the model call — on *every* turn, so a `fresh: true` that overwrites an
+        // existing record cannot advance the conversation marker-less and then strand the old record
+        // resumable. A genuinely-new session has nothing to strand, but aborting there too is
+        // harmless (just retry), so the rule is simply "mark, or abort".
+        if self.sessions.mark_findings_pending(&self.session).is_err() {
+            return Err(errors::session_not_resumable(
+                &self.session,
+                "the findings write-ahead marker could not be written, so a crash could not be \
+                 detected and the ledger could go stale; the turn was not started. Retry, or start \
+                 a fresh review."
+                    .to_string(),
+            ));
+        }
+
         let prior_findings_digest: Option<String> = prior_state
             .as_ref()
             .map(|p| crate::findings::render_digest(&p.findings));
@@ -1776,7 +1798,9 @@ impl Job {
         // review's id, matching what the prompt told the reviewer to emit. Then strip the reviewer's
         // raw block (and any lookalike output marker) from the prose we render and store, so the
         // human review keeps its narrative but not the transport block.
-        let prior_coverage = prior_state.as_ref().map(|p| p.coverage);
+        // Keep a copy of the pre-turn state for the not-durable envelope, which must report the
+        // pre-turn on-disk coverage and preserve the prior findings (evaluate_turn consumes it).
+        let prior_snapshot = prior_state.clone();
         let turn_eval = crate::findings::evaluate_turn(
             &self.session,
             turn,
@@ -1900,17 +1924,28 @@ impl Job {
                     },
                 ) {
                     Ok(_) => {
-                        // Durably recorded: clear the in-progress marker so the next resume trusts
-                        // this turn (its baseline and its findings ledger). Only reached after
-                        // `record_turn` returned `Ok`, and now for *every* backend since the marker
-                        // is also the findings write-ahead. A failed delete leaves a stale marker,
-                        // which over-refuses the next resume toward `fresh` (the safe direction) —
-                        // and, for Perforce, disables the next incremental capture — so say so.
-                        if let Err(e) = self.sessions.clear_pending(&self.session) {
+                        // Durably recorded: clear the Perforce in-progress marker so the next resume
+                        // trusts this turn's baseline. Only reached after `record_turn` returned
+                        // `Ok`. If the delete fails the marker may survive and wrongly disable the
+                        // *next* incremental review, so say so rather than letting it silently
+                        // persist.
+                        if self.cfg.vcs == crate::config::Vcs::Perforce {
+                            if let Err(e) = self.sessions.clear_pending(&self.session) {
+                                warnings.push(format!(
+                                    "This turn was saved, but the session's in-progress marker \
+                                     could not be cleared ({e}); the next review of session '{}' \
+                                     may re-send the whole change instead of only what changed.",
+                                    self.session
+                                ));
+                            }
+                        }
+                        // Clear the findings write-ahead marker too (all backends). A failed delete
+                        // over-refuses the next resume toward `fresh` — the safe direction.
+                        if let Err(e) = self.sessions.clear_findings_pending(&self.session) {
                             warnings.push(format!(
-                                "This turn was saved, but the session's in-progress marker could \
-                                 not be cleared ({e}); the next review of session '{}' will be \
-                                 refused a resume and must be restarted fresh.",
+                                "This turn was saved, but the findings write-ahead marker could not \
+                                 be cleared ({e}); the next review of session '{}' will be refused a \
+                                 resume and must be restarted fresh.",
                                 self.session
                             ));
                         }
@@ -2017,7 +2052,7 @@ impl Job {
         let envelope = if resumable {
             turn_eval.envelope
         } else {
-            crate::findings::turn_not_durable_envelope(&self.session, turn, prior_coverage)
+            crate::findings::not_durable_envelope(&self.session, turn, prior_snapshot.as_ref())
         };
 
         Ok(Outcome {
@@ -2281,6 +2316,18 @@ fn fmt_elapsed(duration: Duration) -> String {
             (secs % 3600) / 60,
             secs % 60
         ),
+    }
+}
+
+/// The progress/liveness fields for the structured running variant, taken from a snapshot — the
+/// same signals the text progress line shows, so the structured channel is not strictly poorer.
+fn running_progress_of(snapshot: &Snapshot) -> crate::findings::RunningProgress<'static> {
+    crate::findings::RunningProgress {
+        elapsed_seconds: snapshot.elapsed.as_secs(),
+        phase: snapshot.phase.as_str(),
+        phase_elapsed_seconds: snapshot.phase_elapsed.as_secs(),
+        activity_age_seconds: snapshot.activity_age.as_secs(),
+        output_bytes: snapshot.output_bytes as u64,
     }
 }
 

@@ -236,6 +236,34 @@ impl Ledger {
             .map(|v| v.len())
             .unwrap_or(usize::MAX)
     }
+
+    /// Whether the ledger is *structurally* sound, beyond merely deserializing at a compatible
+    /// version. A loader must reject a ledger that fails this: exact-set reconciliation and
+    /// monotonic id assignment both assume it, so a persisted ledger with duplicate ids, or a
+    /// `next_seq` that is not strictly greater than every existing `f<n>`, could mint a colliding id
+    /// and eventually let a bad turn converge. Also rejects a stored `invalid` coverage, which is a
+    /// resume-refusal poison and must never load as a usable ledger. Fail-closed: any doubt is
+    /// invalid.
+    pub fn is_structurally_valid(&self) -> bool {
+        if self.coverage == LedgerCoverage::Invalid {
+            return false;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut max_seq: u64 = 0;
+        for f in &self.findings {
+            if !seen.insert(f.id.as_str()) {
+                return false; // duplicate id
+            }
+            // Ids are minted as `f<n>`; anything else, or a seq >= next_seq, is inconsistent.
+            match f.id.strip_prefix('f').and_then(|n| n.parse::<u64>().ok()) {
+                Some(n) => max_seq = max_seq.max(n),
+                None => return false,
+            }
+        }
+        // The next id to mint must be strictly greater than every id already present, so a new
+        // finding can never collide with an existing one.
+        self.next_seq > max_seq
+    }
 }
 
 /// The bounded-growth budget: finite and non-disableable. Serialized digest bytes are the primary
@@ -435,18 +463,25 @@ pub fn strip_lookalike_out_markers(prose: &str) -> String {
         .join("\n")
 }
 
-/// Drop everything from a begin marker line through its matching end marker line (inclusive). If
-/// there is no matching pair the text is returned unchanged.
+/// Drop everything from a begin marker line through its matching end marker line (inclusive). An
+/// **unterminated** block — a begin marker with no matching end — is also removed, from the begin
+/// line to end-of-text: a malformed or truncated block still degrades the turn, and leaving its raw
+/// marker and payload in the rendered prose would expose exactly the transport block this strips (a
+/// begin line with no end has no legitimate content after it that we would want to keep).
 fn strip_between(text: &str, (begin, end): &(String, String)) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         if lines[i].trim() == begin {
-            // Find the matching end; if none, keep the begin line and move on (do not eat the rest).
-            if let Some(j) = (i + 1..lines.len()).find(|&j| lines[j].trim() == *end) {
-                i = j + 1;
-                continue;
+            match (i + 1..lines.len()).find(|&j| lines[j].trim() == *end) {
+                // Matched pair: skip through the end marker.
+                Some(j) => {
+                    i = j + 1;
+                    continue;
+                }
+                // Unterminated: drop from the begin marker to end-of-text.
+                None => break,
             }
         }
         out.push(lines[i]);
@@ -731,16 +766,34 @@ fn reason_value(reason: Option<NonConvergenceReason>) -> Value {
     }
 }
 
-/// The `structuredContent` value for a *running* result: no convergence/findings group at all,
-/// only identity and progress. The discriminated `outputSchema` requires those keys absent (not
-/// null) on this variant.
-pub fn running_structured_value(session: &str, turn: u32, elapsed_seconds: u64) -> Value {
+/// The progress/liveness fields carried by a *running* result, mirroring the text progress line so
+/// the structured channel is not strictly poorer than the text one (round-13 impl review).
+#[derive(Clone, Copy, Debug)]
+pub struct RunningProgress<'a> {
+    pub elapsed_seconds: u64,
+    /// A short human-readable phase label (e.g. "reviewer process running").
+    pub phase: &'a str,
+    pub phase_elapsed_seconds: u64,
+    /// Seconds since the worker last confirmed activity — liveness, not forward progress.
+    pub activity_age_seconds: u64,
+    /// Bytes seen on the reviewer's output pipes so far.
+    pub output_bytes: u64,
+}
+
+/// The `structuredContent` value for a *running* result: no convergence/findings group at all, only
+/// identity and progress/liveness. The discriminated `outputSchema` requires the convergence keys
+/// absent (not null) on this variant.
+pub fn running_structured_value(session: &str, turn: u32, progress: RunningProgress) -> Value {
     json!({
         "schema_version": SCHEMA_VERSION,
         "session": session,
         "turn": turn,
         "result_status": "running",
-        "elapsed_seconds": elapsed_seconds,
+        "elapsed_seconds": progress.elapsed_seconds,
+        "phase": progress.phase,
+        "phase_elapsed_seconds": progress.phase_elapsed_seconds,
+        "activity_age_seconds": progress.activity_age_seconds,
+        "output_bytes": progress.output_bytes,
     })
 }
 
@@ -798,7 +851,11 @@ pub fn output_schema() -> Value {
             "session": {"type": "string"},
             "turn": {"type": "integer"},
             "result_status": {"const": "running"},
-            "elapsed_seconds": {"type": "integer"}
+            "elapsed_seconds": {"type": "integer"},
+            "phase": {"type": "string"},
+            "phase_elapsed_seconds": {"type": "integer"},
+            "activity_age_seconds": {"type": "integer"},
+            "output_bytes": {"type": "integer"}
         },
         "required": ["schema_version", "session", "turn", "result_status"],
         "additionalProperties": false
@@ -809,11 +866,15 @@ pub fn output_schema() -> Value {
 /// The `_OUT` text block for a *running* result, bearing `nonce`. The same shared-renderer output
 /// as a completed result, but carrying the reduced running variant — so a text-only client parses
 /// exactly one nonce-bearing `_OUT` block whether the review is running or done.
-pub fn running_out_block(nonce: &str, session: &str, turn: u32, elapsed_seconds: u64) -> String {
+pub fn running_out_block(
+    nonce: &str,
+    session: &str,
+    turn: u32,
+    progress: RunningProgress,
+) -> String {
     let (begin, end) = markers(OUT_TAG, nonce);
-    let body =
-        serde_json::to_string_pretty(&running_structured_value(session, turn, elapsed_seconds))
-            .unwrap_or_else(|_| "{}".to_string());
+    let body = serde_json::to_string_pretty(&running_structured_value(session, turn, progress))
+        .unwrap_or_else(|_| "{}".to_string());
     format!("{begin}\n{body}\n{end}")
 }
 
@@ -993,7 +1054,6 @@ fn degraded_envelope(
 /// a human-escalation outcome. The prior findings are shown (the ledger is intact) so the human can
 /// rebaseline. The caller persists `terminal_reason` and does not advance a turn.
 pub fn over_budget_on_entry_envelope(session: &str, turn: u32, prior: &PriorState) -> Envelope {
-    let open = prior.findings.iter().filter(|f| f.status.is_open()).count() as u64;
     Envelope {
         schema_version: SCHEMA_VERSION,
         session: session.to_string(),
@@ -1006,8 +1066,10 @@ pub fn over_budget_on_entry_envelope(session: &str, turn: u32, prior: &PriorStat
         verdict_detail: None,
         ledger_coverage: prior.coverage,
         findings_trusted: prior.coverage.findings_trusted(),
-        open_count: Some(open),
-        total_count: Some(prior.findings.len() as u64),
+        // No turn ran, so this is `structured: false` — counts are null, not a number (the
+        // round-1 contract). The prior findings are still listed so a human can rebaseline.
+        open_count: None,
+        total_count: None,
         findings: prior.findings.clone(),
         warnings: vec![
             "this session's findings ledger has outgrown the bounded budget; no review was run. \
@@ -1028,33 +1090,57 @@ pub fn prior_over_budget(prior: &PriorState, budget: Budget) -> bool {
     budget.is_over(&ledger)
 }
 
-/// Rewrite a degraded envelope's reason/coverage for the case where *this turn's own* coverage-break
-/// write failed to persist. Reported as `turn_not_durable` with the pre-turn on-disk coverage
-/// (`whole_conversation` if a prior record existed, else `unestablished`). The caller uses this when
-/// `record_turn` fails on a degraded turn whose prior coverage was not already broken.
-pub fn turn_not_durable_envelope(
-    session: &str,
-    turn: u32,
-    prior_coverage: Option<LedgerCoverage>,
-) -> Envelope {
-    let coverage = prior_coverage.unwrap_or(LedgerCoverage::Unestablished);
+/// The envelope for a turn that was **not durably recorded** (`record_turn` failed, or the reviewer
+/// reported no id to record under). Persistence-first: the reported reason depends on the *pre-turn
+/// on-disk* coverage, which is unchanged because the write did not land.
+///
+/// - No prior record (a fresh turn 1) → `unestablished`, `turn_not_durable`, no findings.
+/// - Prior `whole_conversation` → still `whole_conversation`, `turn_not_durable`; the prior ledger
+///   is intact, so its findings are preserved (only this turn's un-persisted increment is lost).
+/// - Prior already broken (`legacy_uncovered` / `needs_rebaseline`) → that coverage,
+///   `ledger_unavailable` (the break was already on disk; precedence keeps it over `turn_not_durable`),
+///   findings preserved.
+///
+/// Either way the caller escalates and rebaselines; the preserved findings are what a human carries
+/// into the fresh session.
+pub fn not_durable_envelope(session: &str, turn: u32, prior: Option<&PriorState>) -> Envelope {
+    let (coverage, prior_findings) = match prior {
+        None => (LedgerCoverage::Unestablished, Vec::new()),
+        Some(p) => (p.coverage, p.findings.clone()),
+    };
+    let reason = match coverage {
+        // The on-disk break was already there before this turn, so it, not the failed write, is what
+        // the caller must act on.
+        LedgerCoverage::LegacyUncovered
+        | LedgerCoverage::NeedsRebaseline
+        | LedgerCoverage::Invalid => NonConvergenceReason::LedgerUnavailable,
+        // Coverage was intact (or unestablished) on entry; the break is only this turn's failed
+        // write, which the sidecar enforces.
+        LedgerCoverage::WholeConversation | LedgerCoverage::Unestablished => {
+            NonConvergenceReason::TurnNotDurable
+        }
+    };
+    let trusted = coverage.findings_trusted();
     Envelope {
         schema_version: SCHEMA_VERSION,
         session: session.to_string(),
         turn,
         structured: false,
         converged: false,
-        non_convergence_reason: Some(NonConvergenceReason::TurnNotDurable),
+        non_convergence_reason: Some(reason),
         verdict: MachineVerdict::Unknown,
         verdict_source: VerdictSource::None,
         verdict_detail: None,
         ledger_coverage: coverage,
-        findings_trusted: coverage.findings_trusted(),
+        findings_trusted: trusted,
         open_count: None,
         total_count: None,
-        findings: Vec::new(),
+        // Preserve the prior durable findings where the coverage is trusted, so a human can
+        // rebaseline from them; empty (and untrusted) for `unestablished`/`invalid`.
+        findings: if trusted { prior_findings } else { Vec::new() },
         warnings: vec![
-            "this turn's ledger could not be persisted; the session must be rebaselined"
+            "this turn was not durably recorded; the session must be rebaselined into a fresh \
+             review carrying the still-open findings"
                 .to_string(),
         ],
     }
@@ -1192,6 +1278,61 @@ mod tests {
         let stripped = strip_reviewer_block(&text, "rv-1-1");
         assert!(stripped.contains("prose before") && stripped.contains("prose after"));
         assert!(!stripped.contains("CROSS_REVIEW_FINDINGS_IN"));
+    }
+
+    #[test]
+    fn strips_an_unterminated_in_block_to_end_of_text() {
+        // A begin marker with no matching end still degrades the turn; its raw payload must not
+        // survive into the rendered prose.
+        let (b, _e) = markers(IN_TAG, "rv-1-1");
+        let text = format!("keep me\n{b}\n{{\"verdict\":\"approve\" (truncated...");
+        let stripped = strip_reviewer_block(&text, "rv-1-1");
+        assert!(stripped.contains("keep me"));
+        assert!(!stripped.contains("CROSS_REVIEW_FINDINGS_IN"));
+        assert!(!stripped.contains("truncated"));
+    }
+
+    #[test]
+    fn structural_validation_rejects_duplicate_ids_and_bad_next_seq() {
+        // A well-formed but inconsistent persisted ledger must not load as usable — it could mint a
+        // colliding id. Duplicate id:
+        let dup = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 3,
+            findings: vec![
+                finding("f1", Status::Open, 1, 1),
+                finding("f1", Status::Open, 1, 1),
+            ],
+        };
+        assert!(!dup.is_structurally_valid());
+        // next_seq not greater than an existing id:
+        let bad_seq = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 2,
+            findings: vec![finding("f2", Status::Open, 1, 1)],
+        };
+        assert!(!bad_seq.is_structurally_valid());
+        // A stored `invalid` coverage never loads as usable.
+        let poisoned = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::Invalid,
+            next_seq: 1,
+            findings: vec![],
+        };
+        assert!(!poisoned.is_structurally_valid());
+        // A sound ledger passes.
+        let ok = Ledger {
+            schema_version: SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 3,
+            findings: vec![
+                finding("f1", Status::Resolved, 1, 2),
+                finding("f2", Status::Open, 2, 2),
+            ],
+        };
+        assert!(ok.is_structurally_valid());
     }
 
     #[test]
@@ -1604,10 +1745,22 @@ mod tests {
         assert_eq!(v["open_count"], json!(0));
     }
 
+    fn sample_progress() -> RunningProgress<'static> {
+        RunningProgress {
+            elapsed_seconds: 42,
+            phase: "reviewer process running",
+            phase_elapsed_seconds: 10,
+            activity_age_seconds: 2,
+            output_bytes: 1234,
+        }
+    }
+
     #[test]
     fn running_value_omits_the_convergence_group() {
-        let v = running_structured_value("s", 3, 42);
+        let v = running_structured_value("s", 3, sample_progress());
         assert_eq!(v["result_status"], json!("running"));
+        assert_eq!(v["phase"], json!("reviewer process running"));
+        assert_eq!(v["output_bytes"], json!(1234));
         assert!(v.get("converged").is_none());
         assert!(v.get("findings").is_none());
         assert!(v.get("non_convergence_reason").is_none());
@@ -1684,7 +1837,7 @@ mod tests {
             );
         }
         // The running value likewise stays within its variant's allowed keys.
-        let running = running_structured_value("s", 2, 10);
+        let running = running_structured_value("s", 2, sample_progress());
         let allowed_running: std::collections::BTreeSet<&str> = schema["oneOf"][1]["properties"]
             .as_object()
             .unwrap()
@@ -1700,18 +1853,45 @@ mod tests {
     }
 
     #[test]
-    fn turn_not_durable_envelope_reports_pre_turn_coverage() {
-        // A fresh turn 1 whose write failed → unestablished, untrusted, empty findings.
-        let e1 = turn_not_durable_envelope("s", 1, None);
+    fn not_durable_envelope_classifies_by_pre_turn_coverage_and_preserves_findings() {
+        // A fresh turn 1 whose write failed → unestablished, untrusted, empty findings, turn_not_durable.
+        let e1 = not_durable_envelope("s", 1, None);
         assert_eq!(e1.ledger_coverage, LedgerCoverage::Unestablished);
         assert!(!e1.findings_trusted);
+        assert!(e1.findings.is_empty());
         assert_eq!(
             e1.non_convergence_reason,
             Some(NonConvergenceReason::TurnNotDurable)
         );
-        // A whole_conversation turn whose write failed → prior coverage, trusted.
-        let e2 = turn_not_durable_envelope("s", 4, Some(LedgerCoverage::WholeConversation));
+
+        // A whole_conversation prior whose write failed → coverage unchanged, trusted, findings
+        // PRESERVED (only this turn's increment is lost), reason turn_not_durable.
+        let prior_whole = PriorState {
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 2,
+            findings: vec![finding("f1", Status::Open, 1, 1)],
+        };
+        let e2 = not_durable_envelope("s", 4, Some(&prior_whole));
         assert_eq!(e2.ledger_coverage, LedgerCoverage::WholeConversation);
         assert!(e2.findings_trusted);
+        assert_eq!(e2.findings.len(), 1, "prior findings must be preserved");
+        assert_eq!(
+            e2.non_convergence_reason,
+            Some(NonConvergenceReason::TurnNotDurable)
+        );
+
+        // An already-broken prior (needs_rebaseline) whose write failed → reason ledger_unavailable
+        // (the break was already on disk), findings preserved.
+        let prior_broken = PriorState {
+            coverage: LedgerCoverage::NeedsRebaseline,
+            next_seq: 2,
+            findings: vec![finding("f1", Status::Open, 1, 1)],
+        };
+        let e3 = not_durable_envelope("s", 5, Some(&prior_broken));
+        assert_eq!(
+            e3.non_convergence_reason,
+            Some(NonConvergenceReason::LedgerUnavailable)
+        );
+        assert_eq!(e3.findings.len(), 1);
     }
 }

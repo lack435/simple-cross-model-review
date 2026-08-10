@@ -557,9 +557,28 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // `cross_model_review_result` is handled on its own: it carries the machine-readable envelope
+    // as `structuredContent` (MCP 2025-06-18) alongside the `_OUT` block already in the text, and it
+    // pins the target review id up front so both channels describe the *same* review even if a new
+    // review for the session starts between rendering them.
+    if name == "cross_model_review_result" {
+        let mut call_args = args.clone();
+        if let Some(id) = app.resolve_result_id(&args) {
+            if let Some(obj) = call_args.as_object_mut() {
+                obj.insert("review_id".to_string(), json!(id));
+                obj.remove("session"); // review_id is now authoritative
+            }
+        }
+        return match app.review_result(&call_args, request) {
+            Ok(text) => {
+                text_result_with_structured(text, app.result_structured_content(&call_args))
+            }
+            Err(failure) => text_result(failure.render_for_agent(), true),
+        };
+    }
+
     let outcome = match name {
         "cross_model_review" => app.start_review(&args, request),
-        "cross_model_review_result" => app.review_result(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
         other => {
@@ -575,12 +594,6 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
     };
 
     match outcome {
-        // `cross_model_review_result` also carries the machine-readable envelope as
-        // `structuredContent` (MCP 2025-06-18), alongside the `_OUT` block already in the text. The
-        // other tools have nothing structured to attach.
-        Ok(text) if name == "cross_model_review_result" => {
-            text_result_with_structured(text, app.result_structured_content(&args))
-        }
         Ok(text) => text_result(text, false),
         Err(failure) => text_result(failure.render_for_agent(), true),
     }
