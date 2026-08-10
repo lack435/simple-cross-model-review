@@ -1,9 +1,11 @@
 # Incremental-resume disposition, surfaced to the caller — design
 
-Status: **proposal only — no implementation yet.** Intended as the artifact for a
-cross-model review to work out the details before any code is written. Filed against
-issue #41 ("Incremental re-review: send the reviewer only the delta since its last turn"),
-but deliberately *not* a re-implementation of it — see [What #41 already got](#what-41-already-got).
+Status: **plan approved by the cross-review gate — implementation pending.** This document was
+the plan; it went through eight rounds of this repository's own `cross-review` gate (Codex,
+gpt-5.6-luna, effort=max), ending in APPROVE — "internally consistent and ready to guide
+implementation." Filed against issue #41 ("Incremental re-review: send the reviewer only the
+delta since its last turn"), but deliberately *not* a re-implementation of it — see
+[What #41 already got](#what-41-already-got).
 
 ## What #41 already got
 
