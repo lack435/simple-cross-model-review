@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Invocation, Parsed, Reviewer, RunOutcome};
+use super::{Headroom, HeadroomLevel, Invocation, Parsed, Reviewer, RunOutcome};
 use crate::config::{Config, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::metrics::Usage;
@@ -243,6 +243,82 @@ impl Reviewer for ClaudeReviewer {
             usage_is_cumulative: false,
         })
     }
+
+    /// Claude reports headroom as a `rate_limit_event` in its `stream-json` output. When the
+    /// chain is armed the invocation uses `stream-json` (so the event is present); otherwise the
+    /// buffered `json` document carries none and this yields `Unknown`. Reads only the CLI-owned
+    /// event fields, never model prose. See `docs/usage-remaining-gate.md`.
+    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, out: &RunOutcome) -> Headroom {
+        last_rate_limit_event(&out.stdout)
+            .map(headroom_from_rate_limit_event)
+            .unwrap_or(Headroom::Unknown)
+    }
+
+    /// The logged-in account, read from the CLI's local account file `~/.claude.json`
+    /// (`oauthAccount.accountUuid`, with the org uuid to disambiguate) — a local file, the
+    /// account *identifier* only, never the credentials in `~/.claude/.credentials.json`.
+    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
+        claude_account_id(&claude_config_path()?)
+    }
+}
+
+/// Path to Claude Code's account file: `$CLAUDE_CONFIG_DIR/.claude.json` when set, else
+/// `~/.claude.json` — the same resolution the CLI uses.
+fn claude_config_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+    }
+    super::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// Read a stable account identifier from `~/.claude.json`: the OAuth account uuid, combined with
+/// the organization uuid so two accounts in different orgs never collide. `None` on any miss so
+/// the gate fails open.
+fn claude_account_id(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let acct = v.get("oauthAccount")?;
+    let uuid = acct.get("accountUuid").and_then(Value::as_str)?;
+    let org = acct
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(format!("{org}/{uuid}"))
+}
+
+/// The last `rate_limit_event.rate_limit_info` object in a `stream-json` stream, if any. Scans
+/// JSONL lines and keeps the last match (the freshest reading). Non-JSON and other event types
+/// are skipped.
+fn last_rate_limit_event(stdout: &str) -> Option<Value> {
+    let mut last = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') || !line.contains("rate_limit_event") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
+            if let Some(info) = value.get("rate_limit_info") {
+                last = Some(info.clone());
+            }
+        }
+    }
+    last
+}
+
+/// Map a `rate_limit_info` object to `Headroom`. An unrecognised `status` yields `Unknown` so an
+/// unlisted future value cannot mis-gate.
+fn headroom_from_rate_limit_event(info: Value) -> Headroom {
+    let status = info.get("status").and_then(Value::as_str).unwrap_or("");
+    match HeadroomLevel::from_status(status) {
+        Some(level) => Headroom::Level {
+            level,
+            resets_at: info.get("resetsAt").and_then(Value::as_u64),
+        },
+        None => Headroom::Unknown,
+    }
 }
 
 /// Pull the turn's token accounting out of the result document.
@@ -322,6 +398,55 @@ mod tests {
             stdout_lossy: false,
             stdout_incomplete: false,
         }
+    }
+
+    #[test]
+    fn rate_limit_event_maps_status_to_level() {
+        let stream = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1786393200}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok"}"#,
+        );
+        match ClaudeReviewer.observe_headroom(&cfg(), cfg().primary(), &outcome(stream, true)) {
+            Headroom::Level { level, resets_at } => {
+                assert_eq!(level, HeadroomLevel::Warning);
+                assert_eq!(resets_at, Some(1786393200));
+            }
+            other => panic!("expected Level, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffered_json_has_no_rate_limit_event_so_headroom_is_unknown() {
+        // The disarmed default: a single buffered result document carries no rate_limit_event.
+        let json = r#"{"type":"result","is_error":false,"result":"ok","session_id":"s"}"#;
+        assert_eq!(
+            ClaudeReviewer.observe_headroom(&cfg(), cfg().primary(), &outcome(json, true)),
+            Headroom::Unknown
+        );
+    }
+
+    #[test]
+    fn unrecognised_status_is_unknown_not_mis_gated() {
+        let info: Value = serde_json::from_str(r#"{"status":"some_future_state"}"#).unwrap();
+        assert_eq!(headroom_from_rate_limit_event(info), Headroom::Unknown);
+    }
+
+    #[test]
+    fn claude_account_id_combines_org_and_account_uuid() {
+        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".claude.json");
+        std::fs::write(
+            &path,
+            r#"{"userID":"u","oauthAccount":{"accountUuid":"acc-9","emailAddress":"x@y.z","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_account_id(&path), Some("org-1/acc-9".to_string()));
+        assert_eq!(claude_account_id(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
