@@ -190,6 +190,42 @@ pub fn rate_limited(reviewer: &str, detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+pub fn invalid_reviewer_chain(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "INVALID_REVIEWER_CHAIN",
+        "The reviewer fallback chain is misconfigured, so every review is refused.".to_string(),
+        format!(
+            "This server was started with a reviewer fallback chain that cannot function, so it \
+             refuses every review until the configuration is fixed.\n\n\
+             Fix the --reviewer/--model/--effort/--bin arguments in this project's MCP \
+             configuration so the chain is valid, then restart the agent session. See \
+             docs/reviewer-fallback-chain.md for the rules.\n\n\
+             The review has NOT been performed."
+        ),
+    )
+    .with_detail(detail)
+}
+
+// Wired into the fall-through walk (the multi-entry exhaustion outcome); the walk lands in a
+// later commit of the reviewer-fallback-chain implementation.
+#[allow(dead_code)]
+pub fn reviewers_exhausted(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWERS_EXHAUSTED",
+        "Every reviewer in the fallback chain reported a rate or usage limit, so the review was \
+         refused."
+            .to_string(),
+        format!(
+            "The cross-model review could not run because every configured reviewer hit a rate \
+             limit or usage cap in turn.\n\n\
+             Nothing is broken in the setup. Either wait for a limit to reset and retry, or add a \
+             reviewer entry on an account with remaining capacity.\n\n\
+             The review has NOT been performed."
+        ),
+    )
+    .with_detail(detail)
+}
+
 pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failure {
     Failure::new(
         "TIMEOUT",

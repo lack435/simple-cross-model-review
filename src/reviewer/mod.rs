@@ -140,16 +140,16 @@ pub fn for_kind(kind: ReviewerKind) -> Box<dyn Reviewer> {
 pub fn resolve_bin(cfg: &Config) -> Result<PathBuf, Failure> {
     let mut tried: Vec<String> = Vec::new();
 
-    if let Some(explicit) = &cfg.bin {
+    if let Some(explicit) = &cfg.primary().bin {
         if explicit.is_file() {
             return Ok(explicit.clone());
         }
         tried.push(format!("{} (from --bin)", explicit.display()));
-        return Err(errors::cli_not_found(cfg.reviewer.as_str(), &tried));
+        return Err(errors::cli_not_found(cfg.primary().reviewer.as_str(), &tried));
     }
 
     let exts = path_exts();
-    let stems = cfg.reviewer.bin_stems();
+    let stems = cfg.primary().reviewer.bin_stems();
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -177,14 +177,14 @@ pub fn resolve_bin(cfg: &Config) -> Result<PathBuf, Failure> {
         tried.push("PATH is not set".to_string());
     }
 
-    for candidate in fallback_locations(cfg.reviewer) {
+    for candidate in fallback_locations(cfg.primary().reviewer) {
         if candidate.is_file() {
             return Ok(candidate);
         }
         tried.push(candidate.display().to_string());
     }
 
-    Err(errors::cli_not_found(cfg.reviewer.as_str(), &tried))
+    Err(errors::cli_not_found(cfg.primary().reviewer.as_str(), &tried))
 }
 
 /// Locate `stem` on PATH, and nowhere else.
@@ -609,7 +609,7 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
     // fallback would otherwise return an earlier agent message as the review.
     if out.stdout_truncated {
         Some(errors::output_truncated(
-            cfg.reviewer.as_str(),
+            cfg.primary().reviewer.as_str(),
             MAX_OUTPUT_BYTES / (1024 * 1024),
             out.diagnostics(),
         ))
@@ -617,7 +617,7 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
         // A partial prefix that did not hit the size cap: a distinct diagnostic, since the
         // truncation message would wrongly claim the CLI exceeded the cap.
         Some(errors::output_incomplete(
-            cfg.reviewer.as_str(),
+            cfg.primary().reviewer.as_str(),
             out.diagnostics(),
         ))
     } else {
@@ -627,12 +627,12 @@ pub fn truncation_failure(cfg: &Config, out: &RunOutcome) -> Option<Failure> {
 
 /// Turn a non-success run into the right `Failure`.
 pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
-    let reviewer = cfg.reviewer.as_str();
+    let reviewer = cfg.primary().reviewer.as_str();
     if out.cancelled {
         return errors::cancelled();
     }
     if out.timed_out {
-        if cfg.reviewer == ReviewerKind::Codex {
+        if cfg.primary().reviewer == ReviewerKind::Codex {
             let policy_denials = codex::policy_denial_count(&out.stderr);
             if policy_denials > 0 {
                 return errors::timed_out_after_policy_denials(
@@ -649,8 +649,8 @@ pub fn failure_for(cfg: &Config, out: &RunOutcome) -> Failure {
     }
     errors::classify(
         reviewer,
-        &cfg.model,
-        &cfg.effort,
+        &cfg.primary().model,
+        &cfg.primary().effort,
         out.exit,
         &out.diagnostics(),
         &out.diagnostics(),

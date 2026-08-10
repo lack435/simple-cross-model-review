@@ -77,8 +77,8 @@ impl Reviewer for ClaudeReviewer {
         cmd.current_dir(&cfg.cwd);
         cmd.arg("-p");
         cmd.args(["--output-format", "json"]);
-        cmd.args(["--model", &cfg.model]);
-        cmd.args(["--effort", &cfg.effort]);
+        cmd.args(["--model", &cfg.primary().model]);
+        cmd.args(["--effort", &cfg.primary().effort]);
         // dontAsk denies anything outside the allow-list instead of prompting, so a
         // non-interactive run can neither hang nor escalate.
         cmd.args(["--permission-mode", "dontAsk"]);
@@ -180,8 +180,8 @@ impl Reviewer for ClaudeReviewer {
             // path reaches -- including the one where stdout never parses.
             return Err(errors::classify(
                 "claude",
-                &cfg.model,
-                &cfg.effort,
+                &cfg.primary().model,
+                &cfg.primary().effort,
                 out.exit,
                 &evidence,
                 &detail,

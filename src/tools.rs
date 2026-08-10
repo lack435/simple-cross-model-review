@@ -57,13 +57,23 @@ pub struct App {
     /// Successful preflights are cached for the process lifetime; failures are not, so
     /// a user who runs `codex login` can retry without restarting the agent session.
     preflight: Mutex<Option<Preflight>>,
+    /// Set when the reviewer chain is semantically invalid (`Config::validate_chain`). While
+    /// present, every review is refused in-band with this `INVALID_REVIEWER_CHAIN` failure
+    /// rather than the server exiting — see `docs/reviewer-fallback-chain.md`. Checked before
+    /// the session lease and before any reviewer preflight, so an invalid chain touches nothing.
+    chain_error: Option<Failure>,
 }
 
 impl App {
     pub fn new(cfg: Config) -> Self {
         let sessions = SessionStore::new(&cfg.state_dir);
         let metrics = MetricsLog::new(&cfg.state_dir, cfg.metrics);
-        let reviewer = reviewer::for_kind(cfg.reviewer);
+        let reviewer = reviewer::for_kind(cfg.primary().reviewer);
+        // The chain's semantics are validated once, here. On failure the server still starts,
+        // but every review is refused in-band with this failure (see `chain_error`).
+        let chain_error = Config::validate_chain(&cfg.reviewers)
+            .err()
+            .map(errors::invalid_reviewer_chain);
         // Read before `cfg` moves into the Arc below.
         let cfg_max_concurrent = cfg.max_concurrent_reviews;
         Self {
@@ -73,6 +83,7 @@ impl App {
             sessions: Arc::new(sessions),
             metrics: Arc::new(metrics),
             preflight: Mutex::new(None),
+            chain_error,
         }
     }
 
@@ -128,6 +139,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn start_review(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        // An invalid reviewer chain refuses every review, before the session lease and before any
+        // reviewer preflight, so nothing is resolved or billed against a chain known to be broken.
+        if let Some(err) = &self.chain_error {
+            return Err(err.clone());
+        }
+
         let instructions = string_arg(args, "instructions")
             .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
 
@@ -279,7 +296,7 @@ impl App {
             self.registry.finish(
                 &id,
                 Outcome::failed(errors::spawn_failed(
-                    self.cfg.reviewer.as_str(),
+                    self.cfg.primary().reviewer.as_str(),
                     "worker thread",
                     e.to_string(),
                 )),
@@ -435,7 +452,7 @@ impl App {
             Status::Failed => Err(snapshot
                 .failure
                 .clone()
-                .unwrap_or_else(|| errors::empty_review(self.cfg.reviewer.as_str(), ""))),
+                .unwrap_or_else(|| errors::empty_review(self.cfg.primary().reviewer.as_str(), ""))),
         }
     }
 
@@ -595,6 +612,18 @@ impl App {
             "reviewer:      {}\n",
             self.cfg.describe_reviewer()
         ));
+
+        // A semantically invalid chain is reported here first: the reviewer CLIs may be fine, but
+        // no review can run until the configuration is fixed.
+        if let Some(err) = &self.chain_error {
+            out.push_str("ready:         NO\n");
+            out.push_str(&format!("problem:       {} - {}\n", err.code, err.summary));
+            if let Some(detail) = &err.detail {
+                out.push_str(&format!("chain:         {detail}\n"));
+            }
+            out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
+            return out;
+        }
 
         match self.ensure_ready() {
             Ok(ready) => {
@@ -1129,7 +1158,7 @@ impl Job {
 
         eprintln!(
             "cross-review: {} turn {} of session '{}' {} in {}s{} -- {}",
-            self.cfg.reviewer.as_str(),
+            self.cfg.primary().reviewer.as_str(),
             facts.turn,
             self.session,
             status,
@@ -1156,9 +1185,9 @@ impl Job {
             turn: facts.turn,
             resumed: facts.resumed,
             gap_secs: facts.gap_secs,
-            reviewer: self.cfg.reviewer.as_str().to_string(),
-            model: self.cfg.model.clone(),
-            effort: self.cfg.effort.clone(),
+            reviewer: self.cfg.primary().reviewer.as_str().to_string(),
+            model: self.cfg.primary().model.clone(),
+            effort: self.cfg.primary().effort.clone(),
             prompt_bytes: facts.prompt_bytes,
             diff_bytes,
             diff_truncated,
@@ -1242,7 +1271,7 @@ impl Job {
             .invocation(&self.cfg, &self.bin, resume_id, &self.id)
             .map_err(|e| {
                 errors::spawn_failed(
-                    self.cfg.reviewer.as_str(),
+                    self.cfg.primary().reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
                 )
@@ -1262,7 +1291,7 @@ impl Job {
         )
         .map_err(|e| {
             errors::spawn_failed(
-                self.cfg.reviewer.as_str(),
+                self.cfg.primary().reviewer.as_str(),
                 &self.bin.display().to_string(),
                 e.to_string(),
             )
@@ -1357,10 +1386,10 @@ impl Job {
                 match self.sessions.record_turn(
                     &self.session,
                     session::TurnFacts {
-                        reviewer: self.cfg.reviewer.as_str(),
+                        reviewer: self.cfg.primary().reviewer.as_str(),
                         cli_session_id: session_id,
-                        model: &self.cfg.model,
-                        effort: &self.cfg.effort,
+                        model: &self.cfg.primary().model,
+                        effort: &self.cfg.primary().effort,
                         cwd: &self.cfg.cwd.to_string_lossy(),
                         cumulative_usage: baseline_to_persist,
                         // Bind the session to the changelist set (Perforce only), canonicalised
@@ -1532,18 +1561,18 @@ fn resume_block(
     // created it. A configuration that now points elsewhere cannot resume that conversation
     // at all, so the honest answer is to start over -- explicitly, so the caller learns the
     // earlier context is gone rather than inheriting it silently.
-    if record.reviewer != cfg.reviewer.as_str() {
+    if record.reviewer != cfg.primary().reviewer.as_str() {
         return Some(format!(
             "it was created by reviewer '{}', but this server is now configured for '{}', and \
              a conversation cannot move between reviewers.",
             record.reviewer,
-            cfg.reviewer.as_str()
+            cfg.primary().reviewer.as_str()
         ));
     }
-    if record.model != cfg.model {
+    if record.model != cfg.primary().model {
         return Some(format!(
             "it was created with model '{}', but this server is now configured for '{}'.",
-            record.model, cfg.model
+            record.model, cfg.primary().model
         ));
     }
     let cwd = cfg.cwd.to_string_lossy();
@@ -1905,10 +1934,10 @@ mod tests {
         updated_unix: u64,
     ) -> crate::session::SessionRecord {
         crate::session::SessionRecord {
-            reviewer: cfg.reviewer.as_str().to_string(),
+            reviewer: cfg.primary().reviewer.as_str().to_string(),
             cli_session_id: "sid-1".to_string(),
-            model: cfg.model.clone(),
-            effort: cfg.effort.clone(),
+            model: cfg.primary().model.clone(),
+            effort: cfg.primary().effort.clone(),
             cwd: cfg.cwd.to_string_lossy().to_string(),
             turns,
             created_unix: 0,

@@ -652,7 +652,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // "Read-only" is a claim about writes and nothing more. Codex's *reads* are not confined
     // to the project, and no way to confine them was found (`README.md`), so this clause must
     // not grow into one that suggests otherwise.
-    let shell_clause = match cfg.reviewer {
+    let shell_clause = match cfg.primary().reviewer {
         crate::config::ReviewerKind::Codex => {
             "It has a read-only shell; its non-interactive command policy may refuse some forms"
         }
@@ -708,7 +708,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
              stands, and will say so."
         )
     };
-    let caller_hint = match cfg.reviewer {
+    let caller_hint = match cfg.primary().reviewer {
         crate::config::ReviewerKind::Claude => {
             "The reviewer is a Claude model, so this is most useful when you are not one."
         }
@@ -830,7 +830,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  it is signed in, which model and effort are pinned, and which review sessions \
                  exist. Costs nothing and calls no model. Worth calling first if a review has \
                  just failed, or to confirm the setup before relying on it.",
-                cfg.reviewer.as_str()
+                cfg.primary().reviewer.as_str()
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),

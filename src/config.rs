@@ -71,6 +71,111 @@ impl ReviewerKind {
     }
 }
 
+/// One reviewer entry in the fallback chain: the identity of a reviewer the server may run.
+///
+/// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
+/// them (`Config::reviewers`). Only a reviewer's *identity* lives here — the process-global
+/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, `preamble`) stay
+/// on `Config`, because they are already family-scoped in effect: `--sandbox` is read only by
+/// the Codex invocation and `--tools`/`--allow-tools` only by the Claude one, so a global value
+/// applies to whichever entries are of that family and is inert for the others.
+///
+/// See `docs/reviewer-fallback-chain.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerSpec {
+    pub reviewer: ReviewerKind,
+    pub model: String,
+    pub effort: String,
+    /// Explicit path to the reviewer CLI. When absent we resolve it from PATH.
+    pub bin: Option<PathBuf>,
+}
+
+impl ReviewerSpec {
+    /// A short identity label for prompts, errors, and the chain description.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} ({}, model={}, effort={})",
+            self.reviewer.vendor(),
+            self.reviewer.as_str(),
+            self.model,
+            self.effort,
+        )
+    }
+}
+
+/// A chain entry under construction during argument parsing.
+///
+/// Each `--reviewer` starts one; the identity flags bind to the most recent. Setting the same
+/// identity flag twice within one entry is rejected — it is almost always a forgotten
+/// `--reviewer`, and guessing which value wins would hide the mistake.
+struct PendingEntry {
+    reviewer: ReviewerKind,
+    model: Option<String>,
+    effort: Option<String>,
+    bin: Option<PathBuf>,
+}
+
+impl PendingEntry {
+    fn new(reviewer: ReviewerKind) -> Self {
+        Self {
+            reviewer,
+            model: None,
+            effort: None,
+            bin: None,
+        }
+    }
+
+    fn set_model(&mut self, v: String) -> Result<(), String> {
+        if self.model.is_some() {
+            return Err(format!(
+                "--model given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.model = Some(v);
+        Ok(())
+    }
+
+    fn set_effort(&mut self, v: String) -> Result<(), String> {
+        if self.effort.is_some() {
+            return Err(format!(
+                "--effort given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.effort = Some(v);
+        Ok(())
+    }
+
+    fn set_bin(&mut self, v: PathBuf) -> Result<(), String> {
+        if self.bin.is_some() {
+            return Err(format!(
+                "--bin given twice for the same --reviewer '{}' (did you forget a --reviewer \
+                 before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.bin = Some(v);
+        Ok(())
+    }
+
+    /// Fill per-entry defaults, mirroring the single-reviewer defaults exactly.
+    fn finalize(self) -> ReviewerSpec {
+        ReviewerSpec {
+            model: self
+                .model
+                .unwrap_or_else(|| self.reviewer.default_model().to_string()),
+            effort: self
+                .effort
+                .unwrap_or_else(|| self.reviewer.default_effort().to_string()),
+            bin: self.bin,
+            reviewer: self.reviewer,
+        }
+    }
+}
+
 /// Which version-control system produced the change under review.
 ///
 /// Selected by `--vcs`, defaulting to `auto`. `auto` is resolved once, at startup, by a
@@ -273,11 +378,11 @@ pub const DEFAULT_RESUME_MAX_TURNS: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub reviewer: ReviewerKind,
-    pub model: String,
-    pub effort: String,
-    /// Explicit path to the reviewer CLI. When absent we resolve it from PATH.
-    pub bin: Option<PathBuf>,
+    /// The reviewer chain, in fallback order. Always non-empty; `reviewers[0]` is the primary
+    /// and matches the single-reviewer behaviour that predates this field. A fresh review walks
+    /// the chain from the front, advancing only on `RATE_LIMITED`; a single-entry chain behaves
+    /// exactly as one reviewer did before. See `docs/reviewer-fallback-chain.md`.
+    pub reviewers: Vec<ReviewerSpec>,
     /// Working root handed to the reviewer. Defaults to the server's cwd, which is
     /// the project root when a harness launches us from `.mcp.json`.
     pub cwd: PathBuf,
@@ -364,10 +469,10 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let mut reviewer: Option<ReviewerKind> = None;
-        let mut model: Option<String> = None;
-        let mut effort: Option<String> = None;
-        let mut bin: Option<PathBuf> = None;
+        // The chain is built as a list of entries. A repeated `--reviewer` starts a new entry;
+        // the identity flags `--model`/`--effort`/`--bin` bind to the most recent `--reviewer`.
+        // Argument order is fallback order. See `docs/reviewer-fallback-chain.md`.
+        let mut entries: Vec<PendingEntry> = Vec::new();
         let mut cwd: Option<PathBuf> = None;
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
         let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
@@ -409,13 +514,32 @@ impl Config {
             match key {
                 "--reviewer" => {
                     let v = take("--reviewer")?;
-                    reviewer = Some(ReviewerKind::parse(&v).ok_or_else(|| {
+                    let kind = ReviewerKind::parse(&v).ok_or_else(|| {
                         format!("unknown --reviewer '{v}' (expected 'claude' or 'codex')")
-                    })?);
+                    })?;
+                    entries.push(PendingEntry::new(kind));
                 }
-                "--model" => model = Some(take("--model")?),
-                "--effort" => effort = Some(take("--effort")?),
-                "--bin" => bin = Some(PathBuf::from(take("--bin")?)),
+                "--model" => {
+                    let v = take("--model")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--model must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_model(v)?;
+                }
+                "--effort" => {
+                    let v = take("--effort")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--effort must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_effort(v)?;
+                }
+                "--bin" => {
+                    let v = take("--bin")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_bin(PathBuf::from(v))?;
+                }
                 "--cwd" => cwd = Some(PathBuf::from(take("--cwd")?)),
                 "--timeout-seconds" => {
                     let v = take("--timeout-seconds")?;
@@ -472,10 +596,11 @@ impl Config {
             i += 1;
         }
 
-        let reviewer = reviewer.ok_or(
-            "--reviewer is required (use '--reviewer codex' when the caller is Claude Code, \
-             '--reviewer claude' when the caller is Codex)",
-        )?;
+        if entries.is_empty() {
+            return Err("--reviewer is required (use '--reviewer codex' when the caller is Claude \
+                        Code, '--reviewer claude' when the caller is Codex)"
+                .to_string());
+        }
 
         let cwd = match cwd {
             Some(p) => p,
@@ -510,17 +635,23 @@ impl Config {
             }
         };
 
-        let effort = effort.unwrap_or_else(|| reviewer.default_effort().to_string());
-        if !reviewer.known_efforts().contains(&effort.as_str()) {
-            // Not fatal: new effort levels appear over time and the CLI is the real
-            // authority. A bad value surfaces as MODEL_UNAVAILABLE on first use.
-            eprintln!(
-                "cross-review: warning: effort '{}' is not one of the known levels for {} ({}). \
-                 Passing it through anyway.",
-                effort,
-                reviewer.as_str(),
-                reviewer.known_efforts().join(", ")
-            );
+        // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. The
+        // unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
+        // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer.
+        let reviewers: Vec<ReviewerSpec> = entries
+            .into_iter()
+            .map(|e| e.finalize())
+            .collect();
+        for spec in &reviewers {
+            if !spec.reviewer.known_efforts().contains(&spec.effort.as_str()) {
+                eprintln!(
+                    "cross-review: warning: effort '{}' is not one of the known levels for {} \
+                     ({}). Passing it through anyway.",
+                    spec.effort,
+                    spec.reviewer.as_str(),
+                    spec.reviewer.known_efforts().join(", ")
+                );
+            }
         }
 
         let preamble = match preamble_file {
@@ -541,10 +672,7 @@ impl Config {
         let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
 
         Ok(Self {
-            reviewer,
-            model: model.unwrap_or_else(|| reviewer.default_model().to_string()),
-            effort,
-            bin,
+            reviewers,
             state_dir,
             cwd,
             timeout: Duration::from_secs(timeout_secs),
@@ -564,6 +692,51 @@ impl Config {
         })
     }
 
+    /// The primary reviewer: the first entry in the chain, tried before any fallback.
+    ///
+    /// Non-run-path code (config display, caller-facing summaries) reads the primary here.
+    /// Code on the *run* path must instead use the active entry the walk selected, never the
+    /// primary — see `docs/reviewer-fallback-chain.md`.
+    pub fn primary(&self) -> &ReviewerSpec {
+        // `reviewers` is non-empty by construction (`from_args` requires `--reviewer`, and
+        // `validate_chain` rejects an empty vector), so indexing [0] cannot panic.
+        &self.reviewers[0]
+    }
+
+    /// Validate the reviewer chain's *semantics*, distinct from parse syntax.
+    ///
+    /// Returns `Err` with a caller-facing message when the chain cannot function as a fallback
+    /// chain. `App::new` runs this and, on `Err`, serves every request an `INVALID_REVIEWER_CHAIN`
+    /// failure rather than exiting — so the server is up and rejects requests with a legible
+    /// error, as `docs/reviewer-fallback-chain.md` describes. The rule set is deliberately small:
+    ///
+    /// - **A fully-identical entry is invalid.** Two entries equal in reviewer, model, effort,
+    ///   *and* bin cannot be a fallback for each other. The whole spec is compared, not just
+    ///   `(reviewer, model)`: a distinct `bin` can be a distinct install/account, and model
+    ///   aliases (`opus` vs `claude-opus-4-8`) cannot be canonicalised without asserting a
+    ///   mapping this tool has not verified, so a same-model/different-bin (or different-effort)
+    ///   fallback stays valid.
+    /// - **The empty chain is rejected defensively**, though `from_args` cannot produce one.
+    pub fn validate_chain(reviewers: &[ReviewerSpec]) -> Result<(), String> {
+        if reviewers.is_empty() {
+            return Err("the reviewer chain is empty; at least one --reviewer is required".into());
+        }
+        for (i, a) in reviewers.iter().enumerate() {
+            for b in &reviewers[i + 1..] {
+                if a == b {
+                    return Err(format!(
+                        "reviewer chain has a duplicate entry ({}): a fallback identical to an \
+                         earlier entry in reviewer, model, effort and bin can never help, because \
+                         it shares the same account and model and so the same rate limit. Remove \
+                         it, or change its model/bin to a genuinely different reviewer.",
+                        a.describe()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Longest a single `cross_model_review_result` call will block, in seconds.
     ///
     /// Sized to cover the whole review lifecycle — the capture budget, the reviewer turn, and a
@@ -581,7 +754,7 @@ impl Config {
 
     /// True when the reviewer has any shell at all.
     pub fn reviewer_has_shell(&self) -> bool {
-        match self.reviewer {
+        match self.primary().reviewer {
             // Codex runs under a sandbox policy rather than a tool allow-list, so its
             // shell is always present and always write-denied.
             ReviewerKind::Codex => true,
@@ -654,7 +827,7 @@ impl Config {
         match self.vcs {
             Vcs::Git => self.reviewer_has_shell(),
             Vcs::Perforce => {
-                matches!(self.reviewer, ReviewerKind::Codex)
+                matches!(self.primary().reviewer, ReviewerKind::Codex)
                     && self.sandbox.trim() == "danger-full-access"
             }
         }
@@ -698,7 +871,7 @@ impl Config {
     /// reviewer goes looking below for a section that is not there.
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
         let mut out = String::new();
-        match self.reviewer {
+        match self.primary().reviewer {
             ReviewerKind::Codex if self.reviewer_can_self_serve_change() => {
                 out.push_str(&format!(
                     "You can read any file in this project and inspect the change history \
@@ -788,13 +961,20 @@ impl Config {
         out
     }
 
+    /// Describe the reviewer chain for callers and tool descriptions.
+    ///
+    /// A single-entry chain reads exactly as one reviewer did before. A multi-entry chain names
+    /// the primary and then each fallback in order, so `tools/list`, `status`, and the config
+    /// display advertise the chain honestly rather than implying the primary is the only one.
     pub fn describe_reviewer(&self) -> String {
+        let primary = self.primary().describe();
+        if self.reviewers.len() == 1 {
+            return primary;
+        }
+        let fallbacks: Vec<String> = self.reviewers[1..].iter().map(|s| s.describe()).collect();
         format!(
-            "{} ({}, model={}, effort={})",
-            self.reviewer.vendor(),
-            self.reviewer.as_str(),
-            self.model,
-            self.effort
+            "{primary}, falling back on a rate/usage limit to: {}",
+            fallbacks.join(", ")
         )
     }
 

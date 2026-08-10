@@ -72,7 +72,7 @@ impl Reviewer for CodexReviewer {
 
         cmd.arg("--json");
         cmd.arg("--skip-git-repo-check");
-        cmd.args(["-m", &cfg.model]);
+        cmd.args(["-m", &cfg.primary().model]);
         // Stated on every turn, including resumes, via the config override that `resume`
         // does accept. A resumed session does appear to retain the policy it was created
         // with -- verified: a write attempt on turn 2 of a `-s read-only` session was
@@ -82,7 +82,7 @@ impl Reviewer for CodexReviewer {
         cmd.args(["-c", &format!("sandbox_mode=\"{}\"", cfg.sandbox)]);
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
-        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.effort)]);
+        cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", cfg.primary().effort)]);
         if cfg.isolate_reviewer {
             // `codex exec` does start configured MCP servers (verified: a marker server
             // ran and left a file), so a reviewer that also has cross-review registered
@@ -126,8 +126,8 @@ impl Reviewer for CodexReviewer {
             // An expired resume target is detected inside `classify`.
             return Err(errors::classify(
                 "codex",
-                &cfg.model,
-                &cfg.effort,
+                &cfg.primary().model,
+                &cfg.primary().effort,
                 out.exit,
                 &evidence,
                 &detail,
