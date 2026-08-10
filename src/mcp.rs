@@ -670,19 +670,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     // "Read-only" is a claim about writes and nothing more. Codex's *reads* are not confined
     // to the project, and no way to confine them was found (`README.md`), so this clause must
     // not grow into one that suggests otherwise.
-    let shell_clause = match cfg.primary().reviewer {
-        crate::config::ReviewerKind::Codex => {
+    // `.first()` rather than `primary()` throughout: a defensively-constructed empty chain (which
+    // `from_args` never produces) must render safe metadata for `tools/list` rather than panic --
+    // its reviews are refused in-band with INVALID_REVIEWER_CHAIN.
+    let shell_clause = match cfg.reviewers.first().map(|s| s.reviewer) {
+        Some(crate::config::ReviewerKind::Codex) => {
             "It has a read-only shell; its non-interactive command policy may refuse some forms"
         }
-        crate::config::ReviewerKind::Claude => {
+        Some(crate::config::ReviewerKind::Claude) => {
             "It has a shell, because one was enabled explicitly -- its allow-list is a soft \
              boundary rather than a read-only guarantee"
         }
+        None => "",
     };
 
     let read_commands = cfg.vcs.read_commands_phrase();
     let cli = cfg.vcs.cli();
-    let access = if cfg.reviewer_has_shell() && !cfg.supplies_change() {
+    let access = if cfg.reviewers.is_empty() {
+        "The reviewer chain is misconfigured, so every review is refused until it is fixed. Run \
+         cross_model_review_status for the specifics."
+            .to_string()
+    } else if cfg.reviewer_has_shell() && !cfg.supplies_change() {
         format!(
             "The reviewer can read and search files in this repository. {shell_clause}, so it \
              can run {read_commands} and inspect the change history itself. You do not need to \
@@ -741,13 +749,14 @@ fn tool_definitions(app: &App) -> Vec<Value> {
     } else {
         access
     };
-    let caller_hint = match cfg.primary().reviewer {
-        crate::config::ReviewerKind::Claude => {
+    let caller_hint = match cfg.reviewers.first().map(|s| s.reviewer) {
+        Some(crate::config::ReviewerKind::Claude) => {
             "The reviewer is a Claude model, so this is most useful when you are not one."
         }
-        crate::config::ReviewerKind::Codex => {
+        Some(crate::config::ReviewerKind::Codex) => {
             "The reviewer is an OpenAI model, so this is most useful when you are not one."
         }
+        None => "",
     };
 
     // Names the whole chain, not just the primary: with a fallback configured the status

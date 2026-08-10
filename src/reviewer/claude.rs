@@ -36,6 +36,13 @@ impl Reviewer for ClaudeReviewer {
             errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
         })?;
 
+        // A cancelled probe reports CANCELLED, not a misclassified auth failure: `run` kills the
+        // child on cancellation, leaving `success` false and the output partial, which the checks
+        // below would otherwise read as "not signed in".
+        if out.cancelled {
+            return Err(errors::cancelled());
+        }
+
         // `claude auth status` prints JSON on success.
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(out.stdout.trim()) {
             let logged_in = map

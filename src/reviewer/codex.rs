@@ -27,6 +27,13 @@ impl Reviewer for CodexReviewer {
             errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
         })?;
 
+        // A cancelled probe reports CANCELLED, not a misclassified auth failure: `run` kills the
+        // child on cancellation, leaving `success` false, which the exit-code check below would
+        // otherwise read as "not signed in".
+        if out.cancelled {
+            return Err(errors::cancelled());
+        }
+
         // The exit code is the signal here, not the text: `codex login status` writes
         // "Logged in using ChatGPT" to stderr, and prints nothing at all when its
         // streams are redirected (verified). Matching on stdout would report a
