@@ -1079,9 +1079,13 @@ impl Job {
         // Captured once, before the attempt runs, so the reviewer's prompt and the usage
         // metrics below describe the same diff.
         // Publish the selected entry before capture, so a snapshot taken during the Capturing
-        // phase names the reviewer that will run rather than a default.
-        self.registry
-            .set_active(&self.id, self.cfg.reviewers[self.start_index].describe());
+        // phase names the reviewer that will run rather than a default. `self.bin` already holds
+        // the start entry's resolved path (preflighted in `start_review`), so the identity names
+        // the executable that will actually run, not merely the provider configuration.
+        self.registry.set_active(
+            &self.id,
+            self.cfg.reviewers[self.start_index].describe_with_bin(&self.bin),
+        );
         if self.cfg.chain_needs_capture() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
@@ -1214,7 +1218,6 @@ impl Job {
         // -- otherwise a failed reviewer attempt, which still sent this prompt, would record no
         // disposition even though a change was captured.
         let disposition_tag = disposition.as_ref().map(vcs::Disposition::tag);
-        self.registry.set_phase(&self.id, Phase::Launching);
 
         // What this attempt did, for the usage record.
         let mut facts = AttemptFacts::new(self.turn, resume_id.is_some(), self.gap_secs);
@@ -1247,8 +1250,15 @@ impl Job {
 
         for (pos, &i) in walk.iter().enumerate() {
             let entry = chain[i].clone();
+            // Each iteration starts a fresh attempt: reset the phase to Launching. Set per
+            // iteration rather than once before the loop so a fallback taken after a rate-limited
+            // attempt (which ended in Finalizing) is not still reported as Finalizing while it
+            // preflights and runs.
+            self.registry.set_phase(&self.id, Phase::Launching);
             // Publish the active entry: every identity-bearing read on the run path follows it,
-            // and a running poll now names this entry.
+            // and a running poll now names this entry. Its resolved binary is not known yet for a
+            // fallback (it is preflighted just below), so name the entry by config here; the
+            // resolved-bin identity is republished once the binary is verified.
             self.reviewer = Arc::from(reviewer::for_kind(entry.reviewer));
             self.spec = entry.clone();
             self.registry.set_active(&self.id, entry.describe());
@@ -1271,6 +1281,11 @@ impl Job {
                     }
                 }
             }
+            // The entry's binary is now resolved (the start entry's in `start_review`, a fallback's
+            // just above), so republish the active identity with the resolved path -- a running
+            // poll from here on names the executable that actually runs.
+            self.registry
+                .set_active(&self.id, self.spec.describe_with_bin(&self.bin));
 
             facts.prompt_bytes = 0;
             let attempt_started = std::time::Instant::now();
@@ -1317,7 +1332,10 @@ impl Job {
                     // RATE_LIMITED it always did.
                     let is_last = pos == walk.len() - 1;
                     if resume_id.is_none() && n > 1 && failure.code == "RATE_LIMITED" {
-                        rate_limited_attempts.push(entry.describe());
+                        // This entry ran to a RATE_LIMITED reply, so `self.bin` is its verified
+                        // resolved path: name the executable in the exhausted list, not just the
+                        // provider config.
+                        rate_limited_attempts.push(self.spec.describe_with_bin(&self.bin));
                         if is_last {
                             outcome = Some(Outcome::failed(errors::reviewers_exhausted(format!(
                                 "every configured reviewer reported a rate/usage limit, in order: {}",
@@ -1359,7 +1377,13 @@ impl Job {
             outcome.unwrap_or_else(|| Outcome::failed(errors::worker_panicked(&self.id)));
         // Attribute the terminal outcome to the entry that produced it (`self.spec` is the last
         // entry the walk touched), so the completed response names the reviewer that actually ran.
-        outcome.active = Some(self.spec.describe());
+        // Name the resolved executable when it was verified; a fallback whose preflight failed left
+        // `self.bin` holding the previous entry's path, so that case falls back to the config form.
+        outcome.active = Some(if active_bin_resolved {
+            self.spec.describe_with_bin(&self.bin)
+        } else {
+            self.spec.describe()
+        });
         // Everything telemetry needs, taken before the outcome moves into the registry. The
         // disposition tag was captured above (from the local, so a failed attempt still records
         // what it sent).

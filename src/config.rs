@@ -103,9 +103,25 @@ impl ReviewerSpec {
     /// A short identity label for prompts, errors, and the chain description. Includes the
     /// explicit `--bin` when one is set, so two same-reviewer/same-model entries that differ only
     /// by binary (a distinct install or account) are distinguishable wherever this is shown. A
-    /// PATH-resolved entry omits it; two PATH entries with the same reviewer/model would be a
-    /// fully-identical duplicate, which `validate_chain` rejects, so this cannot be ambiguous.
+    /// PATH-resolved entry omits it here because its resolved path is not known from the config
+    /// alone; the run path uses [`describe_with_bin`](Self::describe_with_bin) once it has
+    /// resolved one, so the *rendered* identity still names the executable that actually ran. Two
+    /// PATH entries with the same reviewer/model would be a fully-identical duplicate, which
+    /// `validate_chain` rejects, so this cannot be ambiguous.
     pub fn describe(&self) -> String {
+        self.describe_bin(self.bin.as_deref())
+    }
+
+    /// Like [`describe`](Self::describe) but pins the *resolved* binary rather than only the
+    /// configured one, so a PATH-resolved entry still names the executable (and thus the account)
+    /// that actually ran. Used on the run path once `self.bin` has been resolved for an entry;
+    /// `describe` is kept for the cases where no resolved path is available yet (the chain
+    /// listing, or a fallback whose preflight failed before a binary was verified).
+    pub fn describe_with_bin(&self, resolved: &Path) -> String {
+        self.describe_bin(Some(resolved))
+    }
+
+    fn describe_bin(&self, bin: Option<&Path>) -> String {
         let mut out = format!(
             "{} ({}, model={}, effort={}",
             self.reviewer.vendor(),
@@ -113,7 +129,7 @@ impl ReviewerSpec {
             self.model,
             self.effort,
         );
-        if let Some(bin) = &self.bin {
+        if let Some(bin) = bin {
             out.push_str(&format!(", bin={}", bin.display()));
         }
         out.push(')');
@@ -1438,6 +1454,40 @@ mod tests {
         let desc = two.describe_reviewer();
         assert!(desc.contains("falling back"), "{desc}");
         assert!(desc.contains("claude"), "{desc}");
+    }
+
+    #[test]
+    fn describe_with_bin_names_the_resolved_executable_even_for_a_path_entry() {
+        // A PATH-resolved entry omits the bin from `describe` (its resolved path is unknown from
+        // config alone), but once the run path has resolved one, `describe_with_bin` names it so
+        // the rendered identity tells the caller which executable -- and thus which account --
+        // actually ran, as docs/reviewer-fallback-chain.md promises.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        let spec = &cfg.reviewers[0];
+        assert!(spec.bin.is_none(), "the test relies on a PATH entry");
+        assert!(!spec.describe().contains("bin="), "{}", spec.describe());
+
+        let resolved = spec.describe_with_bin(Path::new("C:/tools/codex.exe"));
+        assert!(resolved.contains("bin=C:/tools/codex.exe"), "{resolved}");
+        // Still the same entry, just with the executable pinned.
+        assert!(resolved.contains("model="), "{resolved}");
+
+        // An explicit --bin already shows in `describe`, and `describe_with_bin` pins the
+        // resolved path it was actually launched from (they usually coincide).
+        let explicit = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--bin",
+            "C:/configured/codex.exe",
+        ]))
+        .expect("config");
+        assert!(
+            explicit.reviewers[0]
+                .describe()
+                .contains("bin=C:/configured/codex.exe"),
+            "{}",
+            explicit.reviewers[0].describe()
+        );
     }
 
     #[test]
