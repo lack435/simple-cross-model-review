@@ -110,6 +110,10 @@ pub struct Review {
     pub denial_count_is_floor: bool,
     /// Problems that did not invalidate the review but that the caller must know about.
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn: whether the reviewer was sent only the delta, a
+    /// full change by design, or a full change because an intended delta fell back -- and why.
+    /// `None` on a fresh turn or a turn that sent no change, which render no disposition line.
+    pub disposition: Option<crate::vcs::Disposition>,
     /// Whether a follow-up call on this session name will actually reach the same
     /// reviewer conversation. Tracked rather than assumed, so the response never invites
     /// a resume that would silently start over.
@@ -152,6 +156,8 @@ pub struct Outcome {
     /// Whether `denial_count` is a lower bound (the source output was capped).
     pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn; see [`Review::disposition`].
+    pub disposition: Option<crate::vcs::Disposition>,
     pub resumable: bool,
     /// What this turn cost, as the reviewer CLI reported it.
     pub usage: Usage,
@@ -166,6 +172,7 @@ impl Outcome {
             denial_count: 0,
             denial_count_is_floor: false,
             warnings: Vec::new(),
+            disposition: None,
             resumable: false,
             usage: Usage::default(),
         }
@@ -180,6 +187,7 @@ impl Outcome {
             denial_count: 0,
             denial_count_is_floor: false,
             warnings: Vec::new(),
+            disposition: None,
             resumable: true,
             usage: Usage::default(),
         }
@@ -356,6 +364,7 @@ impl Registry {
                 denial_count: 0,
                 denial_count_is_floor: false,
                 warnings: Vec::new(),
+                disposition: None,
                 resumable: false,
                 started: now,
                 finished: None,
@@ -432,6 +441,7 @@ impl Registry {
                 review.denial_count = outcome.denial_count;
                 review.denial_count_is_floor = outcome.denial_count_is_floor;
                 review.warnings = outcome.warnings;
+                review.disposition = outcome.disposition;
                 review.resumable = outcome.resumable;
                 review.usage = outcome.usage;
                 match outcome.failure {
@@ -638,6 +648,8 @@ pub struct Snapshot {
     /// Whether `denial_count` is a lower bound (the source output was capped).
     pub denial_count_is_floor: bool,
     pub warnings: Vec<String>,
+    /// The resume disposition of this turn; see [`Review::disposition`].
+    pub disposition: Option<crate::vcs::Disposition>,
     pub resumable: bool,
     pub elapsed: Duration,
     pub phase: Phase,
@@ -665,6 +677,7 @@ impl Snapshot {
             denial_count: review.denial_count,
             denial_count_is_floor: review.denial_count_is_floor,
             warnings: review.warnings.clone(),
+            disposition: review.disposition.clone(),
             resumable: review.resumable,
             elapsed: review.elapsed(),
             phase: review.phase,
@@ -1234,6 +1247,71 @@ mod tests {
         );
         // A review that could not be persisted must not be advertised as resumable.
         assert!(!snapshot.resumable);
+    }
+
+    #[test]
+    fn a_disposition_survives_to_the_snapshot() {
+        // The typed disposition must ride the full Outcome -> Review -> Snapshot path so the
+        // blocking collect can render its line. This pins the plumbing PR #43 restructured under
+        // the feature -- a rebase that dropped the field would compile and pass every other test.
+        use crate::vcs::disposition::{Disposition, FellBack, FullByDesign, Incremental};
+        let registry = Registry::new();
+
+        // An incremental delta carries through with its detail intact.
+        let (id, _c) = registry.try_start("default", 2, true).expect("start");
+        registry.finish(
+            &id,
+            Outcome {
+                disposition: Some(Disposition::Incremental(Incremental::GitRange {
+                    prior: "aaaa".into(),
+                    head: "bbbb".into(),
+                    commits: Some(2),
+                })),
+                ..Outcome::completed("ok")
+            },
+        );
+        let snapshot = registry
+            .wait(&id, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert!(
+            matches!(
+                snapshot.disposition,
+                Some(Disposition::Incremental(Incremental::GitRange {
+                    commits: Some(2),
+                    ..
+                }))
+            ),
+            "the incremental disposition and its count must reach the snapshot: {:?}",
+            snapshot.disposition
+        );
+
+        // A by-design full capture carries through and does not warn.
+        let (id2, _c2) = registry.try_start("other", 2, true).expect("start");
+        registry.finish(
+            &id2,
+            Outcome {
+                disposition: Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+                ..Outcome::completed("ok")
+            },
+        );
+        let snap2 = registry
+            .wait(&id2, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert_eq!(
+            snap2.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable))
+        );
+        assert!(!snap2.disposition.unwrap().warns());
+
+        // A failed turn carries no disposition (it sent no reviewable change).
+        let (id3, _c3) = registry.try_start("third", 2, true).expect("start");
+        registry.finish(&id3, Outcome::failed(crate::errors::cancelled()));
+        let snap3 = registry
+            .wait(&id3, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert!(snap3.disposition.is_none());
+        // Sanity: FellBack is the warning-bearing variant, distinct from the above.
+        assert!(Disposition::FellBackToFull(FellBack::BaseMoved).warns());
     }
 
     #[test]

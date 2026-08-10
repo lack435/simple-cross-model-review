@@ -12,6 +12,7 @@
 //! live in [`shared`], single-sourced so a second backend cannot fork the security logic.
 
 pub mod baseline;
+pub mod disposition;
 pub mod git;
 pub mod perforce;
 mod shared;
@@ -19,6 +20,7 @@ mod shared;
 use std::sync::atomic::AtomicBool;
 
 use crate::config::{Config, Vcs};
+pub use disposition::Disposition;
 pub use git::{DiffMode, GitResumeBaseline};
 pub use shared::{Capture, CapturedChange};
 // `mod shared` is private, so these crate-visible items are not otherwise nameable from outside
@@ -94,6 +96,9 @@ fn git_capture(
         // The Perforce delta baseline and capture identity are git-irrelevant.
         capture_identity: None,
         perforce_baseline: None,
+        // The git decision's disposition (`None` when this turn did not resume, which `tools.rs`
+        // resolves into fresh vs resumed-with-no-baseline).
+        disposition: captured.disposition,
     }
 }
 

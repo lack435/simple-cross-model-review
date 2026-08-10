@@ -22,6 +22,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use super::disposition::{Disposition, FellBack, FullByDesign, Incremental};
 use super::shared::{
     first_line, push_fenced, read_cap, read_capped, safe_label, truncate, NewFile, OmissionReport,
     Omissions, Section, CAPTURE_BUDGET, MAX_DIFF_BYTES, MAX_UNTRACKED_EXAMINED,
@@ -408,6 +409,12 @@ pub struct Capture {
     /// delta from it would never re-show the omitted part, and it must not become a baseline.
     pub head_sha: Option<String>,
     pub base_sha: Option<String>,
+    /// The caller-facing resume disposition of this turn, for the git decisions the backend can
+    /// make on its own (`Incremental`, `FullByDesign`, and the git `FellBackToFull` reasons).
+    /// `None` when this turn did not resume (the backend receives only `Option<GitResumeBaseline>`
+    /// and cannot tell a fresh turn from a resumed one whose session held no baseline), when the
+    /// capture failed, or when no change was sent -- `tools.rs` fills those cases.
+    pub disposition: Option<Disposition>,
 }
 
 impl Capture {
@@ -417,6 +424,7 @@ impl Capture {
             warnings: vec![warning],
             head_sha: None,
             base_sha: None,
+            disposition: None,
         }
     }
 }
@@ -471,15 +479,17 @@ pub fn capture(
     // captured. Alongside it, the effective base of the configured range, computed only for a
     // HEAD-anchored range: the identity the next turn checks its own base against.
     let head_sha = git.rev_parse_head();
-    let base_sha = effective_base(&git, &cfg.diff, head_sha.as_deref());
 
-    // On a resumed turn whose configured mode is a committed range ending at HEAD, review
-    // only the commits added since the previously reviewed one. The earlier full diff is still
-    // in the reviewer's resumed conversation, so re-sending the whole range just re-caches a
-    // near-duplicate every turn. `incremental_base` is the prior commit when that applies and
-    // `None` otherwise -- see it for every condition that has to hold.
-    let incremental_base =
-        incremental_base(cfg, resume, head_sha.as_deref(), base_sha.as_deref(), &git);
+    // On a resumed turn whose configured mode is a committed range ending at HEAD, review only
+    // the commits added since the previously reviewed one. The earlier full diff is still in the
+    // reviewer's resumed conversation, so re-sending the whole range just re-caches a
+    // near-duplicate every turn. `decide_incremental` returns the prior commit to delta from
+    // when that applies, the resolved effective base (for pinning and for the next turn's
+    // baseline), and the caller-facing disposition naming *why* -- see it for every condition
+    // that has to hold, and `docs/incremental-resume-disposition.md` for the decision order.
+    let decision = decide_incremental(cfg, resume, head_sha.as_deref(), &git);
+    let base_sha = decision.base.clone();
+    let incremental_base = decision.delta_from.clone();
     // Pin the capture to concrete commits resolved above. A symbolic ref in the diff --
     // `HEAD`, but also a left endpoint like `HEAD~3` or a branch such as `main` -- is
     // re-resolved by git when the diff runs, so a commit landing mid-capture would make the
@@ -596,6 +606,22 @@ pub fn capture(
         (head_sha, base_sha)
     };
 
+    // Fill in the incremental commit count now -- *after* every mandatory capture (diff, status,
+    // untracked) has run -- so this extra `rev-list --count` can only ever spend budget the
+    // required work already survived. If the budget is gone it returns `None`, and the count is a
+    // nicety, so its absence changes nothing. The count runs on the pinned `<prior>..<head>`.
+    let disposition = match decision.disposition {
+        Some(Disposition::Incremental(Incremental::GitRange { prior, head, .. })) => {
+            let commits = git.count_commits(&prior, &head);
+            Some(Disposition::Incremental(Incremental::GitRange {
+                prior,
+                head,
+                commits,
+            }))
+        }
+        other => other,
+    };
+
     Capture {
         change: Some(Change {
             command: mode.command_line(),
@@ -616,6 +642,11 @@ pub fn capture(
         warnings,
         head_sha: baseline_head,
         base_sha: baseline_base,
+        // The change was produced (this arm is the `change.is_some()` path), so the disposition
+        // the decision computed -- with the commit count filled in above -- is carried to the
+        // caller. `None` here means this turn did not resume: `tools.rs` then decides fresh (no
+        // line) versus resumed-with-no-baseline.
+        disposition,
     }
 }
 
@@ -632,77 +663,208 @@ pub struct GitResumeBaseline<'a> {
     pub base: &'a str,
 }
 
-/// The resolved commit git diffs *from* for a HEAD-anchored range, or `None`.
-///
-/// This is the range's identity across turns. For `A..HEAD` it is `A` resolved; for
-/// `A...HEAD` it is `merge-base(A, HEAD)`, which is what the three-dot form actually diffs
-/// against. `None` for any mode that is not a range ending at HEAD (nothing to anchor), or
-/// when the base cannot be resolved -- either way the turn is not eligible to be, or delta
-/// against, a baseline. The left endpoint comes from `--diff` config, which `parse` has
-/// already refused to let start with `-`.
-fn effective_base(git: &Git, diff: &DiffMode, head: Option<&str>) -> Option<String> {
+/// Why the configured range's effective base did or did not resolve. The single `None` the old
+/// `effective_base` returned stood in for five different facts (a non-HEAD mode, an unavailable
+/// HEAD, an unresolvable left ref, a missing merge-base, a merge-base failure); the disposition
+/// has to tell an intentional non-delta (`ModeNotDeltable`) from a genuine fall-back
+/// (`CurrentHeadUnavailable`, `CurrentBaseUnresolvable`), so the reason is preserved here.
+enum BaseResolution {
+    /// The mode is not a HEAD-anchored committed range -- nothing to anchor a delta on.
+    NotDeltableMode,
+    /// The mode *is* a HEAD-anchored range, but this turn's HEAD would not resolve, so there is
+    /// no right endpoint. Decided here (not only in the three-dot merge-base) because the delta
+    /// and the range-pinning both need HEAD regardless of two-dot vs three-dot.
+    HeadUnavailable,
+    /// The base is unknown: the left ref will not resolve, or a three-dot merge-base could not
+    /// be computed. `BaseMoved` cannot be evaluated without it.
+    Unresolvable,
+    /// The effective base the range diffs from. For `A..HEAD` it is `A` resolved; for `A...HEAD`
+    /// it is `merge-base(A, HEAD)`, which is what the three-dot form actually diffs against.
+    Resolved(String),
+}
+
+/// Resolve the configured range's effective base, preserving *why* it could not be. The left
+/// endpoint comes from `--diff` config, which `parse` has already refused to let start with `-`.
+fn resolve_base(git: &Git, diff: &DiffMode, head: Option<&str>) -> BaseResolution {
     let DiffMode::Rev(spec) = diff else {
-        return None;
+        return BaseResolution::NotDeltableMode;
     };
-    let (left, right, three_dot) = range_endpoints(spec)?;
+    let Some((left, right, three_dot)) = range_endpoints(spec) else {
+        return BaseResolution::NotDeltableMode;
+    };
     if right != "HEAD" {
-        return None;
+        return BaseResolution::NotDeltableMode;
     }
+    // HEAD is needed for the delta range and the pinned full range whether the range is two-dot
+    // or three-dot, so its absence is `HeadUnavailable` here rather than a silent `None` only on
+    // the three-dot path.
+    let Some(head) = head else {
+        return BaseResolution::HeadUnavailable;
+    };
     // Resolve the left endpoint to a validated object id first. That is the two-dot base
     // directly, and for three-dot it makes both `merge-base` arguments plain hex, so that call
     // needs no `--end-of-options` -- an option `git rev-parse` documents but `git merge-base`
     // does not, and older git would reject, which would silently disable the delta for the
     // production `main...HEAD` mode.
-    let left_sha = git.rev_parse(left)?;
+    let Some(left_sha) = git.rev_parse(left) else {
+        return BaseResolution::Unresolvable;
+    };
     if three_dot {
-        // The three-dot base is the merge-base with HEAD, so a HEAD we could not resolve
-        // leaves it unknowable rather than guessed.
-        git.merge_base(&left_sha, head?)
+        match git.merge_base(&left_sha, head) {
+            Some(mb) => BaseResolution::Resolved(mb),
+            None => BaseResolution::Unresolvable,
+        }
     } else {
-        Some(left_sha)
+        BaseResolution::Resolved(left_sha)
     }
 }
 
-/// The commit a resumed turn should review changes *since*, or `None` for a full capture.
+/// The git backend's incremental decision: what range to capture, the base to pin and store, and
+/// the caller-facing disposition.
+struct GitDecision {
+    /// The prior head to delta from when the delta fired; `None` for a full capture.
+    delta_from: Option<String>,
+    /// The resolved effective base of the configured range, for pinning the full range and for
+    /// storing as the next turn's baseline. `None` when the mode is not a HEAD-anchored range or
+    /// the base could not be resolved.
+    base: Option<String>,
+    /// The caller-facing disposition for the decisions the backend owns. `None` when this turn
+    /// did not resume -- the backend receives only `Option<GitResumeBaseline>` and cannot tell a
+    /// fresh turn from a resumed one whose session held no baseline, so `tools.rs` fills that.
+    disposition: Option<Disposition>,
+}
+
+/// Decide the git incremental resume, preserving the reason at every fall-back.
 ///
-/// Returns the prior turn's HEAD only when reviewing just `<prior>..HEAD` is both equivalent
-/// to the configured range and safe. Every condition has to hold:
-///
-/// - the feature is enabled;
-/// - the configured mode is a committed range **ending at HEAD**, so `<prior>..HEAD`
-///   reproduces it (a working-tree or staged diff carries uncommitted work a commit delta
-///   would drop; a fixed window like `HEAD~3..HEAD~1` does not move with HEAD) -- this is
-///   exactly when `base_sha` is `Some`;
-/// - the range resolves to the **same** effective base the baseline was captured under, so a
-///   moved base ref re-captures in full rather than unioning against a diff the reviewer never
-///   saw;
-/// - both commits are valid object ids;
-/// - and the prior commit is an ancestor of the current one, which is what makes a rewritten
-///   branch (rebased, amended, force-pushed) fall back to the full range instead of a
-///   meaningless `<orphaned-commit>..HEAD`.
-///
-/// `git merge-base --is-ancestor X X` is true, so a resume with no new commits yields an
-/// (empty) delta, which the render reports as "no new commits" rather than as an empty change.
-fn incremental_base(
+/// The order is the precedence documented in `docs/incremental-resume-disposition.md`. The two
+/// absolute gates (G0 fresh/no-change, and the `NoCompleteBaselineRetained` half of the
+/// no-baseline case) are `tools.rs`'s to apply because they need the fresh-vs-resumed knowledge
+/// the backend lacks; everything here is a decision the backend can make from `cfg`, the resume
+/// baseline, HEAD, and git. `git merge-base --is-ancestor X X` is true, so a resume with no new
+/// commits yields an (empty) delta, which the render reports as "no new commits".
+fn decide_incremental(
     cfg: &Config,
     resume: Option<GitResumeBaseline<'_>>,
-    head_sha: Option<&str>,
-    base_sha: Option<&str>,
+    head: Option<&str>,
     git: &Git,
-) -> Option<String> {
+) -> GitDecision {
+    let base_res = resolve_base(git, &cfg.diff, head);
+    let resolved_base = match &base_res {
+        BaseResolution::Resolved(b) => Some(b.clone()),
+        _ => None,
+    };
+    // A helper for the full-capture arms: the base to pin/store, plus the disposition.
+    let full = |base: Option<String>, disposition: Option<Disposition>| GitDecision {
+        delta_from: None,
+        base,
+        disposition,
+    };
+
+    // G1 and step 1 (`ModeNotDeltable`) are decided from `cfg` and the mode alone -- neither needs
+    // a baseline -- so they are settled *before* the fresh-vs-resumed split. This is the fix for a
+    // real bug: a resumed working-tree / staged / non-HEAD-range turn has no stored baseline, so
+    // it used to fall out of the `resume = None` return below with no disposition, which `tools.rs`
+    // then mislabelled `NoCompleteBaselineRetained` -- a warning -- when the mode simply never
+    // deltas. `tools.rs`'s G0 still suppresses these on a *fresh* turn. `Disabled` outranks
+    // `ModeNotDeltable` (the G1 gate sits above the tree).
     if !cfg.resume_incremental_diff {
-        return None;
+        return full(
+            resolved_base,
+            Some(Disposition::FullByDesign(FullByDesign::Disabled)),
+        );
     }
-    let resume = resume?;
-    // `base_sha` is `Some` only for a HEAD-anchored range, so this single check also enforces
-    // eligibility: a working-tree mode or a non-HEAD range never resolves a base to match.
-    let base = base_sha?;
-    if resume.base != base {
-        return None;
+    if matches!(&base_res, BaseResolution::NotDeltableMode) {
+        return full(
+            None,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+        );
     }
-    let prior = Some(resume.head).filter(|s| is_object_name(s))?;
-    let head = head_sha.filter(|s| is_object_name(s))?;
-    git.is_ancestor(prior, head).then(|| prior.to_string())
+
+    // The mode is a HEAD-anchored range. From here a baseline is required, and fresh vs
+    // resumed-with-no-baseline is invisible here (both arrive as `None`), so report no disposition
+    // and let `tools.rs`, which knows `resume_id`, assign `NoCompleteBaselineRetained` (or suppress
+    // it on a fresh turn). The base is still resolved, for the full range and the stored baseline.
+    let Some(resume) = resume else {
+        return full(resolved_base, None);
+    };
+
+    // Steps 3-4: HEAD or the base could not be resolved this turn (`NotDeltableMode` is handled).
+    let resolved_base = match base_res {
+        BaseResolution::NotDeltableMode => unreachable!("handled before the resume split above"),
+        BaseResolution::HeadUnavailable => {
+            return full(
+                None,
+                Some(Disposition::FellBackToFull(
+                    FellBack::CurrentHeadUnavailable,
+                )),
+            )
+        }
+        BaseResolution::Unresolvable => {
+            return full(
+                None,
+                Some(Disposition::FellBackToFull(
+                    FellBack::CurrentBaseUnresolvable,
+                )),
+            )
+        }
+        BaseResolution::Resolved(b) => b,
+    };
+    // `HeadUnavailable` is ruled out above, so a resolved base implies a resolved HEAD.
+    let Some(head) = head else {
+        return full(
+            Some(resolved_base),
+            Some(Disposition::FellBackToFull(
+                FellBack::CurrentHeadUnavailable,
+            )),
+        );
+    };
+
+    // Step 5: validate *both* stored fields before either is used -- the base before the
+    // `BaseMoved` comparison, the head before the ancestry check -- so a corrupt or truncated
+    // session record is `PriorBaselineInvalid`, never miscompared or fed to git.
+    if !is_object_name(resume.head) || !is_object_name(resume.base) {
+        return full(
+            Some(resolved_base),
+            Some(Disposition::FellBackToFull(FellBack::PriorBaselineInvalid)),
+        );
+    }
+
+    // Step 6: the recorded base differs from this turn's -- a moved `main` or a repointed
+    // `--diff`. Only reachable now that both bases are known-valid.
+    if resume.base != resolved_base {
+        return full(
+            Some(resolved_base),
+            Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+        );
+    }
+
+    // Steps 7-8: the ancestry check is three-way. An error/timeout is `AncestryUndecidable`, a
+    // definite "no" is `BranchRewritten`; only "yes" deltas.
+    match git.is_ancestor(resume.head, head) {
+        Ancestry::Undecidable => full(
+            Some(resolved_base),
+            Some(Disposition::FellBackToFull(FellBack::AncestryUndecidable)),
+        ),
+        Ancestry::No => full(
+            Some(resolved_base),
+            Some(Disposition::FellBackToFull(FellBack::BranchRewritten)),
+        ),
+        Ancestry::Yes => {
+            // Step 9: the delta fires. The commit count is the one piece of detail that is not
+            // free -- an extra `rev-list --count` -- so it is deliberately left `None` here and
+            // filled in by `capture` *after* the mandatory diff, where it can spend leftover
+            // budget without ever starving the diff that must run. See the count call there.
+            GitDecision {
+                delta_from: Some(resume.head.to_string()),
+                base: Some(resolved_base),
+                disposition: Some(Disposition::Incremental(Incremental::GitRange {
+                    prior: resume.head.to_string(),
+                    head: head.to_string(),
+                    commits: None,
+                })),
+            }
+        }
+    }
 }
 
 /// Whether a string is safe to pass to git as a commit name: a non-empty hex object id. Both
@@ -895,6 +1057,14 @@ pub fn render(change: &Change, cwd: &Path, has_shell: bool) -> String {
 // git plumbing
 // ---------------------------------------------------------------------------
 
+/// The three outcomes of an ancestry check. Kept distinct so the disposition can tell a
+/// rewritten branch (a definite "no") from a check that could not be run (an error/timeout).
+enum Ancestry {
+    Yes,
+    No,
+    Undecidable,
+}
+
 /// A resolved git, bound to one working root and one time budget.
 struct Git<'a> {
     bin: PathBuf,
@@ -990,9 +1160,11 @@ impl<'a> Git<'a> {
     }
 
     /// The current commit, or `None` when there is not one to name (an unborn HEAD on a fresh
-    /// repository, a detached or unreadable HEAD, or git not completing). The output is
-    /// validated as an object id rather than trusted: a surprise like an echoed `HEAD` must
-    /// not become a commit name later handed back to git.
+    /// repository, or git not completing). A *detached* HEAD is **not** `None`: `git rev-parse
+    /// HEAD` resolves it to its commit SHA like any other -- which is why the disposition treats
+    /// detached HEAD as ordinary and only an unborn/failed HEAD as `CurrentHeadUnavailable`. The
+    /// output is validated as an object id rather than trusted: a surprise like an echoed `HEAD`
+    /// must not become a commit name later handed back to git.
     fn rev_parse_head(&self) -> Option<String> {
         let out = self.run(&["rev-parse", "HEAD"])?;
         if !out.success {
@@ -1004,16 +1176,34 @@ impl<'a> Git<'a> {
 
     /// Whether `ancestor` is an ancestor of `descendant` (a commit is its own ancestor).
     ///
-    /// `git merge-base --is-ancestor` exits 0 for yes, 1 for no, and 128 for an error such as
-    /// an unknown commit -- which is exactly what a rewritten, garbage-collected prior commit
-    /// looks like. Only exit 0 is "yes"; every other outcome, error included, is "no", so the
-    /// caller falls back to the full range rather than trusting a delta against a commit git
-    /// can no longer place.
-    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+    /// `git merge-base --is-ancestor` exits 0 for yes, 1 for no, and 128 for an error such as an
+    /// unknown commit -- which is exactly what a rewritten, garbage-collected prior commit looks
+    /// like. The three outcomes are kept distinct: a definite "no" is a rewritten branch, but an
+    /// error or a run that did not complete is *undecidable*, and reporting it as `BranchRewritten`
+    /// would be a factual claim the exit code does not support. Both non-"yes" outcomes still fall
+    /// back to the full range; they just carry different reasons to the caller.
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Ancestry {
         match self.run(&["merge-base", "--is-ancestor", ancestor, descendant]) {
-            Some(out) => out.success,
-            None => false,
+            Some(out) if out.success => Ancestry::Yes,
+            // Exit 1 is git's definite "no". Any other code (128 for a bad commit), or a run that
+            // did not produce one, is undecidable rather than a "no".
+            Some(out) if out.exit == Some(1) => Ancestry::No,
+            _ => Ancestry::Undecidable,
         }
+    }
+
+    /// The number of commits in `<prior>..<head>`, best-effort, for the caller-facing disposition
+    /// line. `None` on any failure -- the count is a nicety, never a gate, so it never fails a
+    /// capture. Both arguments are already-validated object ids (checked before the delta fires),
+    /// so `<prior>..<head>` cannot be read as an option; `--end-of-options` is belt-and-suspenders.
+    fn count_commits(&self, prior: &str, head: &str) -> Option<u64> {
+        debug_assert!(is_object_name(prior) && is_object_name(head));
+        let range = format!("{prior}..{head}");
+        let out = self.run(&["rev-list", "--count", "--end-of-options", &range])?;
+        if !out.success {
+            return None;
+        }
+        out.stdout.trim().parse().ok()
     }
 
     /// Resolve a revision to its commit object id, or `None` if it does not resolve to exactly
@@ -2457,5 +2647,249 @@ mod tests {
         // No top-level operator: a single revision or a leading search is not a range.
         assert_eq!(range_endpoints("HEAD~3"), None);
         assert_eq!(range_endpoints(":/fix"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume disposition: every git decision maps to its reason. These extend the fall-back
+    // tests above, which assert the *range* fell back, by additionally asserting the disposition
+    // the caller is shown. See `docs/incremental-resume-disposition.md`.
+    // -----------------------------------------------------------------------
+
+    use super::super::disposition::{Disposition, FellBack, FullByDesign, Incremental};
+
+    /// Assert the capture's disposition is the expected fall-back reason.
+    fn assert_fell_back(cap: &Capture, reason: FellBack) {
+        assert_eq!(
+            cap.disposition,
+            Some(Disposition::FellBackToFull(reason)),
+            "disposition mismatch"
+        );
+    }
+
+    #[test]
+    fn a_resumed_delta_reports_an_incremental_disposition_with_the_range() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        // A fresh turn reports no disposition -- the backend cannot tell fresh from
+        // resumed-with-no-baseline, so that framing is left to tools.rs.
+        assert!(capture(&cfg, None, &cancel).disposition.is_none());
+
+        let git = Git::new(&dir, &cancel).expect("git");
+        std::fs::write(dir.join("feature2.txt"), "two\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "-m", "feature2"])
+                .expect("commit")
+                .success
+        );
+        let head2 = git.rev_parse_head().expect("head2");
+
+        let cap = capture(&cfg, Some(baseline(&head1, &base)), &cancel);
+        match cap.disposition {
+            Some(Disposition::Incremental(Incremental::GitRange {
+                prior,
+                head,
+                commits,
+            })) => {
+                assert_eq!(prior, head1);
+                assert_eq!(head, head2);
+                assert_eq!(commits, Some(1), "one commit added since the prior head");
+            }
+            other => panic!("expected an incremental git range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_disabled_resume_is_full_by_design_and_never_warns() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let mut cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        cfg.resume_incremental_diff = false;
+        let cap = capture(&cfg, Some(baseline(&head1, &base)), &cancel);
+        assert_eq!(
+            cap.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::Disabled))
+        );
+        assert!(!cap.disposition.unwrap().warns(), "disabled must not warn");
+    }
+
+    #[test]
+    fn a_working_tree_resume_is_full_by_design_mode_not_deltable() {
+        let Some((dir, _base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        // `--diff HEAD` is a working-tree mode: it never deltas, and that is by design.
+        let cfg = config_for(&dir, DiffMode::Head);
+        // With a baseline present.
+        let cap = capture(&cfg, Some(baseline(&head1, &head1)), &cancel);
+        assert_eq!(
+            cap.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable))
+        );
+        assert!(!cap.disposition.unwrap().warns());
+        // And -- the regression the impl review caught -- with *no* baseline, which is what
+        // `tools.rs` actually passes for a working-tree session (it stores no `base_sha`). The
+        // mode is not deltable regardless of the baseline, so the reason must still be
+        // `ModeNotDeltable` (never a warning), not a `None` that `tools.rs` would mislabel as a
+        // `NoCompleteBaselineRetained` fall-back that *does* warn.
+        let cap = capture(&cfg, None, &cancel);
+        assert_eq!(
+            cap.disposition,
+            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+            "a working-tree mode is FullByDesign even with no baseline"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_branch_reports_branch_rewritten() {
+        // A prior head that is a real commit but not an ancestor of HEAD -- the classic
+        // rebase/amend. Build a divergent commit off `base` to stand in for the orphaned prior.
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+        assert!(
+            git.run(&["checkout", "--quiet", &base])
+                .expect("co")
+                .success
+        );
+        std::fs::write(dir.join("divergent.txt"), "d\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "-m", "divergent"])
+                .expect("commit")
+                .success
+        );
+        let orphan = git.rev_parse_head().expect("orphan");
+        assert!(
+            git.run(&["checkout", "--quiet", &head1])
+                .expect("co")
+                .success
+        );
+
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        // The orphan is a valid, available commit that is not an ancestor of head1.
+        let cap = capture(&cfg, Some(baseline(&orphan, &base)), &cancel);
+        assert_fell_back(&cap, FellBack::BranchRewritten);
+    }
+
+    #[test]
+    fn an_unavailable_prior_head_is_undecidable_not_rewritten() {
+        // A syntactically valid but *unavailable* object id: git cannot place it, so the ancestry
+        // check errors rather than answering "no". That is `AncestryUndecidable`, not
+        // `BranchRewritten` -- the distinction the three-way `is_ancestor` exists to make. A
+        // plausible 40-hex sha that is not in the repo triggers exit 128.
+        let Some((dir, base, _head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let cap = capture(&cfg, Some(baseline(absent, &base)), &cancel);
+        assert_fell_back(&cap, FellBack::AncestryUndecidable);
+    }
+
+    #[test]
+    fn a_corrupt_stored_baseline_is_prior_baseline_invalid() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        // A non-hex stored head is not a usable object id -- caught before the ancestry command.
+        let cap = capture(&cfg, Some(baseline("not-a-sha", &base)), &cancel);
+        assert_fell_back(&cap, FellBack::PriorBaselineInvalid);
+        // And a corrupt stored *base* is caught before the `BaseMoved` comparison, so it is not
+        // miscompared as a moved base.
+        let cap = capture(&cfg, Some(baseline(&head1, "not-a-sha")), &cancel);
+        assert_fell_back(&cap, FellBack::PriorBaselineInvalid);
+    }
+
+    #[test]
+    fn a_moved_base_reports_base_moved() {
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        // The recorded base differs from this turn's resolved base (`base`): a real, valid commit
+        // that simply is not the current one. `head1` stands in as a different valid commit id.
+        let cap = capture(&cfg, Some(baseline(&base, &head1)), &cancel);
+        assert_fell_back(&cap, FellBack::BaseMoved);
+    }
+
+    #[test]
+    fn an_unresolvable_base_is_never_mislabelled_base_moved() {
+        let Some((dir, _base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        // A left ref that does not resolve. The base is unknown, so `BaseMoved` -- which compares
+        // a *resolved* base -- must never be reported. In practice the full-range diff fails on
+        // the same bad ref, so the caller gets an honest capture warning and no disposition
+        // (a disposition is only reported when a change was sent); when the diff does run, the
+        // reason is `CurrentBaseUnresolvable`. Either way it is never `BaseMoved`.
+        let cfg = config_for(&dir, DiffMode::Rev("no-such-ref..HEAD".into()));
+        let cap = capture(&cfg, Some(baseline(&head1, &head1)), &cancel);
+        assert_ne!(
+            cap.disposition,
+            Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+            "an unresolved base must not be reported as a moved base"
+        );
+        assert!(
+            cap.change.is_none()
+                || matches!(
+                    cap.disposition,
+                    Some(Disposition::FellBackToFull(FellBack::CurrentBaseUnresolvable))
+                ),
+            "unresolvable base: the capture warns (no change), or reports CurrentBaseUnresolvable; \
+             got change={} disposition={:?}",
+            cap.change.is_some(),
+            cap.disposition
+        );
+    }
+
+    #[test]
+    fn a_detached_but_committed_head_still_deltas() {
+        // `git rev-parse HEAD` resolves a detached HEAD to its commit sha, so a detached HEAD is
+        // ordinary here -- it is *not* `CurrentHeadUnavailable`, and the delta still fires.
+        let Some((dir, base, head1)) = repo_with_committed_history() else {
+            return;
+        };
+        let cancel = idle();
+        let git = Git::new(&dir, &cancel).expect("git");
+        // Detach HEAD at the current commit.
+        assert!(
+            git.run(&["checkout", "--quiet", &head1])
+                .expect("co")
+                .success
+        );
+        std::fs::write(dir.join("feature2.txt"), "two\n").expect("write");
+        assert!(git.run(&["add", "-A"]).expect("add").success);
+        assert!(
+            git.run(&["commit", "--quiet", "-m", "feature2"])
+                .expect("commit")
+                .success
+        );
+        let head2 = git.rev_parse_head().expect("head2");
+        assert!(head2 != head1, "a new commit while detached");
+
+        let cfg = config_for(&dir, DiffMode::Rev(format!("{base}..HEAD")));
+        let cap = capture(&cfg, Some(baseline(&head1, &base)), &cancel);
+        assert!(
+            matches!(
+                cap.disposition,
+                Some(Disposition::Incremental(Incremental::GitRange { .. }))
+            ),
+            "a detached committed HEAD must still delta, got {:?}",
+            cap.disposition
+        );
     }
 }
