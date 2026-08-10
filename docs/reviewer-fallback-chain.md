@@ -1,10 +1,10 @@
 # Reviewer fallback chain — design
 
-Status: **proposed — revised after cross-review rounds 1–3.** This document is the plan. Per
+Status: **proposed — revised after cross-review rounds 1–4.** This document is the plan. Per
 this repository's own rule it must go through the `cross-review` gate (Codex, gpt-5.6-luna,
-effort=max) and reach APPROVE before implementation begins. Rounds 1–3 each returned REQUEST
-CHANGES — seven findings, then six, then five, all accepted; the sections below fold each one
-in, and [Review history](#review-history) records where. It is the plan for [issue #48].
+effort=max) and reach APPROVE before implementation begins. Rounds 1–4 each returned REQUEST
+CHANGES — seven findings, then six, five, and six, all accepted; the sections below fold each
+one in, and [Review history](#review-history) records where. It is the plan for [issue #48].
 
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
@@ -243,32 +243,49 @@ fail fast at startup for chain-semantic errors too — is resolved against in
 ### 3. The fall-through, reactive and rate-only
 
 The turn already runs on a **background worker thread** ([tools.rs:276]); the fall-through
-lives there, so one `review_id` spans the whole walk. The worker gains an *active entry
-index* and this loop, on a **fresh** review (resume is different — see below):
+lives there, so one `review_id` spans the whole walk. A **resume runs exactly one entry** (the
+one bound to the session) with no fall-through — so this loop is the **fresh-review** path:
 
 ```
-deadline = now + chain_budget          # shared across the whole walk (see Budget below)
-for (i, spec) in chain.iter().enumerate():
-    registry.set_active(id, spec)       # publish BEFORE preflight, so a running poll and any
-                                        # terminal failure name the entry actually being tried
-    ready = ensure_ready(spec, cancel, deadline)   # resolve bin + auth for THIS entry, cancellable
-    if ready is Err(f): return f.with_active(spec)  # preflight failure names this entry, not the primary
-    outcome = run_turn(spec, ready.adapter, ready.bin, cancel, deadline)
+deadline = walk_start + chain_budget          # shared across the walk (see Budget below)
+registry.set_active(id, chain[0])             # BEFORE capture, so a Capturing snapshot names it
+capture = capture_change_if(chain_needs_capture())   # gathered once, capability-neutral
+for i in 0 .. N:                              # N = chain length
+    if i != 0: registry.set_active(id, chain[i])     # entry 0 already published above
+    ready = ensure_ready(chain[i], cancel, deadline) # entry 0 -> shared-cache hit (preflighted
+                                                     #   in start_review); fallbacks resolve here
+    if ready is Err(f): return f.with_active(chain[i])   # preflight failure names THIS entry
+    outcome = run_turn(chain[i], ready.adapter, ready.bin, capture, cancel, deadline)
     match outcome:
-        Ok(review)                  -> return review.with_active(spec)
+        Ok(review)                  -> return review.with_active(chain[i])
         Err(f) if f.code == RATE_LIMITED:
-            note_attempt(spec, f)       # attempt history for the logical turn (see Metrics)
-            if i is last            -> return reviewers_exhausted(attempts).with_active(spec)
-            else                    -> continue            # advance to the next entry
-        Err(f)                      -> return f.with_active(spec)   # anything else surfaces at once
+            if N == 1               -> return f          # single entry: plain RATE_LIMITED, no history
+            note_attempt(chain[i], f)                    # attempt history for the logical turn
+            if i == N - 1           -> return reviewers_exhausted(attempts).with_active(chain[i])
+            else                    -> continue          # advance to the next entry
+        Err(f)                      -> return f.with_active(chain[i])   # anything else surfaces at once
 ```
 
-The active entry is published to the registry **before** its preflight, and every terminal
-result — success, `REVIEWERS_EXHAUSTED`, *and* a non-rate failure of a fallback entry —
-carries the entry that was actually being tried. This is round-2 finding 5: assigning the
-active entry only in the `Ok` branch would misreport a fallback that failed in preflight or
-with `NOT_AUTHENTICATED`/`TIMEOUT` as the primary, and a running poll during the fallback
-attempt would still show the primary.
+Two round-4 corrections are in this loop. **`N == 1` returns the existing plain
+`RATE_LIMITED`** with no attempt history — `REVIEWERS_EXHAUSTED` is only ever a *multi-entry*
+outcome, preserving single-reviewer behaviour exactly (the earlier pseudocode returned
+`REVIEWERS_EXHAUSTED` for a one-entry chain, contradicting that rule). And **the selected
+entry is published *before capture***, not merely before the first attempt, so a snapshot
+polled during the `Capturing` phase ([tools.rs:907]) names the selected reviewer rather than a
+default.
+
+The active entry is published to the registry before its work, and every terminal result —
+success, `REVIEWERS_EXHAUSTED`, *and* a non-rate failure of a fallback entry — carries the
+entry that was actually being tried, so a fallback that fails in preflight or with
+`NOT_AUTHENTICATED`/`TIMEOUT` is never misreported as the primary.
+
+**No double preflight.** The per-entry preflight cache lives on `App` (shared between the
+request thread and the worker), so entry 0 — preflighted in `start_review` before the worker,
+as the single reviewer is today — is a cache hit when the loop calls `ensure_ready(chain[0])`.
+Only *fallback* entries resolve inside the walk, which is exactly what the budget's `(N-1)`
+term accounts for.
+
+[tools.rs:907]: ../src/tools.rs
 
 - **Only `RATE_LIMITED` advances the chain.** Per the maintainer's choice, confirmed by the
   round-1 reviewer, setup and correctness failures — `NOT_AUTHENTICATED`,
@@ -320,11 +337,20 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
   capture + the selected entry's turn + every fallback's preflight-and-turn. Only *fallback*
   entries (1…N-1 of them) are preflighted inside the walk, which is why only they add a
   `preflight_cap` term.
-- **`preflight_cap` bounds the whole auth invocation including its own drain** —
-  `resolve_bin` plus `auth_check` (the cancellable timeout at [claude.rs:36]/[codex.rs:27])
-  plus that process's output-drain grace — so no drain sits outside the bound. `drain_grace`
-  is the reviewer turn's own per-invocation drain ([reviewer/mod.rs:472]), counted once per
-  attempt because each attempt is its own process.
+- **`preflight_cap` = a short bounded `resolve_bin` term + the cancellable auth invocation.**
+  Round 4 caught that `resolve_bin` is a synchronous PATH scan with no cancellation or deadline
+  ([reviewer/mod.rs:140]); it is bounded and fast (a fixed set of directories × stems ×
+  extensions, `is_file` each), so it contributes a small **fixed** term, but the plan does not
+  claim it is interruptible. What *is* cancellable is `auth_check` (the timeout at
+  [claude.rs:36]/[codex.rs:27], now given the cancel token + deadline) and its output-drain
+  grace. So a cancel or budget exhaustion during a fallback preflight lands on the auth
+  subprocess or the turn, not mid-scan — an honest, narrower claim than "the whole preflight is
+  cancellable". `drain_grace` is the reviewer turn's own per-invocation drain
+  ([reviewer/mod.rs:472]), counted once per attempt because each attempt is its own process.
+- **The selected entry's `start_review` preflight observes `RequestCancel` too.** It runs the
+  same `resolve_bin` (bounded) then `auth_check` with the request's cancel token, so a
+  `notifications/cancelled` arriving during setup stops before spawning the review, as it does
+  for the single reviewer today.
 - `max_wait_secs`, and the budget shown in the start/running responses and progress text —
   which today all display `cfg.timeout` ([tools.rs:316], [tools.rs:466]) — are all recomputed
   from `chain_budget`. This is deliberately generous (three entries at a 30-minute timeout
@@ -468,20 +494,32 @@ specific** reviewer. Therefore:
   which is preflighting the very entries the walk must not touch, and a resolved path cannot
   tell a `bin=None` entry from an explicit `--bin` entry that happens to resolve to the same
   executable (both allowed to coexist). So the record persists the **raw configured
-  identity**: `reviewer`, `model`, `effort`, and the **raw `bin` as configured** (the literal
-  `--bin` value, or a marker for "resolved from PATH"), added with `#[serde(default)]` exactly
-  as `cumulative_usage` was ([session.rs:52]). Resume matches this raw identity **against the
-  configured chain's raw specs — a pure comparison, resolving nothing** — so no unselected
-  entry is touched. Today's check compares only reviewer and model ([tools.rs:1535]); it now
-  compares the full raw identity, effort included.
+  identity**: `reviewer`, `model`, `effort`, and the raw `bin`. Resume matches this raw
+  identity **against the configured chain's raw specs — a pure comparison, resolving
+  nothing** — so no unselected entry is touched. Today's check compares only reviewer and model
+  ([tools.rs:1535]); it now compares the full raw identity, effort included.
+- **The raw-bin field is *tagged* so a new PATH entry is not mistaken for a legacy record.**
+  Round 4 caught that a bare `Option<PathBuf>` with `#[serde(default)]` conflates "configured to
+  resolve from PATH" (`bin=None`) with "field absent because the record predates it" — both
+  deserialize to `None`, and the legacy rule below would then wrongly apply to a new
+  PATH-backed session. So the field is a tagged `Option<RawBin>` where `RawBin` is
+  `PathSearch | Explicit(PathBuf)`: a **new** record always writes `Some(PathSearch)` or
+  `Some(Explicit(..))`, and only a **legacy** record deserializes to `None`. `#[serde(default)]`
+  still gives the legacy `None`, but new records are never `None`.
+- **The resolved path is also persisted and verified after selection.** Alongside the raw
+  identity, the record stores the path the selected entry *resolved to*. After the raw match
+  picks the entry and it is preflighted, the freshly resolved path is compared to the stored
+  one; a mismatch (PATH changed under the session, so the same raw `PathSearch` now points at a
+  different executable/account) is refused with `SESSION_NOT_RESUMABLE` rather than resuming the
+  conversation through a different binary.
 - **The selected entry is then preflighted, and only it.** After the raw-identity match picks
-  the entry, that one entry is preflighted (its `bin` resolved, auth checked); the resolved
-  path can be re-verified there if desired, but selection never depended on it.
-- **Legacy and ambiguous records are refused, not guessed.** A record written before the raw
-  `bin` field existed has no bin to compare; it resumes only if **exactly one** chain entry
-  matches on the fields it does carry. If it matches none, or more than one (e.g. two
-  same-model/different-bin entries), resume is refused with `SESSION_NOT_RESUMABLE` and the
-  caller starts fresh — never silently bound to a guessed executable.
+  the entry, that one entry is preflighted (its `bin` resolved, auth checked); selection never
+  depended on resolving anything.
+- **Legacy and ambiguous records are refused, not guessed.** A `None` (legacy) record has no
+  raw bin to compare; it resumes only if **exactly one** chain entry matches on the fields it
+  does carry. If it matches none, or more than one (e.g. two same-model/different-bin entries),
+  resume is refused with `SESSION_NOT_RESUMABLE` and the caller starts fresh — never silently
+  bound to a guessed executable.
 - **Fallback selection happens only on a fresh review start, never on resume.** A resume runs
   its bound entry only; it does not restart the walk from the top, because silently resuming a
   *different* reviewer would hand it a conversation it never had.
@@ -513,8 +551,10 @@ specific** reviewer. Therefore:
   `self.cfg.describe_reviewer()` ([tools.rs:462], [tools.rs:474]) — the *chain/primary*, not
   the entry that reviewed. Round 2 added that a *running* snapshot must reflect the current
   attempt too, and that `Outcome` is written only at the end. So the running registry state
-  holds a **mutable active identity** that the walk updates via `set_active` before each
-  attempt's preflight (see the pseudocode above), every `Outcome` carries the
+  holds a **mutable active identity** that the walk sets via `set_active` for the selected
+  entry **before capture** and updates before each fallback attempt (see the pseudocode
+  above) — round-4 finding 5: capture runs first in the worker ([tools.rs:907]), so a snapshot
+  during `Capturing` would otherwise carry a default identity. Every `Outcome` carries the
   attempted-entry identity on success *and* failure, and both the running and completed
   responses render that identity instead of `describe_reviewer()`. A caller polling mid-walk
   sees the fallback; a fallback that fails in preflight is reported as the fallback. The
@@ -534,9 +574,16 @@ specific** reviewer. Therefore:
   per-session turns ([metrics.rs:304], [metrics.rs:742]). Both are satisfied by keeping
   **exactly one `Record` per logical turn** (the entry that reviewed, or the terminal
   outcome), which drives turn count, wall time and token totals exactly as today, plus a new
-  optional `attempts` field on `Record` listing each earlier fallback attempt — its
-  reviewer/model/effort, its `failure_code`, and its attempt-local wall time. The
-  rate-limited primary is therefore visible without inflating any turn statistic.
+  optional `attempts` field on `Record`. Each `Attempt` carries the full identity — reviewer,
+  model, effort, **and resolved bin** (round-4 finding 6: without bin, same-model/different-bin
+  attempts are ambiguous in the log too) — its `failure_code`, its attempt-local wall time, and
+  its own `prompt_bytes`. The rate-limited primary is therefore visible without inflating any
+  turn statistic.
+- **Prompt-byte accounting is defined, not left to chance.** Today `AttemptFacts` holds one
+  prompt size ([tools.rs:775]); a fall-through sends several prompts. `Record.prompt_bytes`
+  keeps its current meaning — the **final (terminal) attempt's** prompt size — and each
+  `Attempt` carries its own `prompt_bytes`, so the per-attempt sizes are recoverable without
+  redefining the top-level field.
 - **Failed-attempt token usage is not claimed — and its absence propagates to completeness.**
   The adapter API returns `Result<Parsed, Failure>` and exposes `Parsed.usage` only on a
   successful parse ([reviewer/mod.rs:118]); a rate-limit refusal yields a `Failure` with no
@@ -554,18 +601,32 @@ specific** reviewer. Therefore:
   report — the same "not complete" signal the summary already uses for a reviewer that omits a
   field. One `Record` per turn stays; what changes is that the accumulator reads its
   `attempts`. Backward-compatibility fixtures cover records both with and without `attempts`.
+- **The record schema version is bumped for attempt-bearing records.** Round 4 caught that
+  leaving the version at `1` is unsafe: an *older* binary accepts `v == 1` and Serde silently
+  ignores the unknown `attempts` field ([metrics.rs:33], [metrics.rs:496]), so it would read a
+  fallback turn's usage as complete — defeating the partial/unknown semantics. Because the
+  reader **skips and counts** any record whose version it does not recognise (it never guesses,
+  [metrics.rs:497]), a record that carries `attempts` is stamped `RECORD_VERSION = 2`: an old
+  reader skips it (under-counts visibly rather than misreporting), and the **new reader accepts
+  both `1` and `2`**. A plain single-entry turn with no fallback stays at `v1`, so nothing an
+  old reader could correctly read changes. This is a deliberate compatibility decision, stated
+  so it is not a silent break.
 - **`--doctor` / `status`** enumerate every entry with its resolved bin and auth, so a human
   sees the whole chain and any per-entry setup problem in one read. A degraded
   (`INVALID_REVIEWER_CHAIN`) config reports the validation failure here too.
 
 [metrics.rs]: ../src/metrics.rs
+[metrics.rs:33]: ../src/metrics.rs
 [metrics.rs:304]: ../src/metrics.rs
+[metrics.rs:496]: ../src/metrics.rs
 [metrics.rs:631]: ../src/metrics.rs
 [metrics.rs:734]: ../src/metrics.rs
 [metrics.rs:742]: ../src/metrics.rs
 [reviewer/mod.rs:118]: ../src/reviewer/mod.rs
+[reviewer/mod.rs:140]: ../src/reviewer/mod.rs
 [tools.rs:462]: ../src/tools.rs
 [tools.rs:474]: ../src/tools.rs
+[tools.rs:775]: ../src/tools.rs
 [registry.rs:150]: ../src/registry.rs
 [registry.rs:432]: ../src/registry.rs
 [registry.rs:637]: ../src/registry.rs
@@ -668,14 +729,19 @@ maintainer as the cost of foundational completeness. Touched:
   codes, summaries, remediation, and `is_agent_correctable` returning false; a resume-aware
   `RATE_LIMITED` remediation path that does not disturb the shared `rate_limited` message; and
   a `.with_active(spec)` helper so a `Failure` can name the entry it came from.
-- **`session.rs`**: `SessionRecord` gains the **raw configured `bin`** (`#[serde(default)]`),
-  not the resolved path; resume match compares the full *raw* identity (reviewer, model,
-  effort, raw bin) against the chain **without resolving/preflighting other entries**, refusing
-  legacy-ambiguous matches with `SESSION_NOT_RESUMABLE`.
-- **`metrics.rs`**: `Record` gains an optional `attempts` list (additive, `#[serde(default)]`);
-  still exactly one `Record` per logical turn, but `Accumulator::push` now reads `attempts` and
-  marks totals partial/unknown when an attempt's usage is unavailable ([metrics.rs:631],
-  [metrics.rs:734]).
+- **`session.rs`**: `SessionRecord` gains a **tagged raw `bin`** (`Option<RawBin>` =
+  `None` legacy / `Some(PathSearch)` / `Some(Explicit(..))`, `#[serde(default)]`) **and** the
+  selected entry's **resolved path**; resume matches the full *raw* identity (reviewer, model,
+  effort, raw bin) against the chain **without resolving/preflighting other entries**, then
+  verifies the freshly resolved path against the stored one, refusing legacy-ambiguous or
+  PATH-drifted matches with `SESSION_NOT_RESUMABLE`.
+- **`metrics.rs`**: `Record` gains an optional `attempts` list of `Attempt`
+  (reviewer/model/effort/resolved-bin, `failure_code`, wall, `prompt_bytes`; additive,
+  `#[serde(default)]`); `RECORD_VERSION` bumps to `2` for attempt-bearing records with the new
+  reader accepting `1` and `2` ([metrics.rs:33], [metrics.rs:496]); still one `Record` per
+  logical turn, but `Accumulator::push` reads `attempts` and marks totals partial/unknown when
+  an attempt's usage is unavailable ([metrics.rs:631], [metrics.rs:734]). `Record.prompt_bytes`
+  keeps its meaning (final attempt).
 - **`main.rs`**: unchanged except that chain-semantic invalidity is now reported by the
   degraded `App`, not `exit(2)`.
 - **Docs/config**: `README.md` (Configuration table + a fallback section), `AGENTS.md` if
@@ -718,7 +784,15 @@ Unit tests (no network, no model call), extending the existing fakes:
 - **Non-rate error does not fall through**: primary `NOT_AUTHENTICATED` (or `CLI_NOT_FOUND`)
   ⇒ surfaced immediately, chain not advanced.
 - **Exhaustion**: every entry `RATE_LIMITED` ⇒ `REVIEWERS_EXHAUSTED` whose detail names each
-  entry; a single-entry chain ⇒ plain `RATE_LIMITED`.
+  entry; a single-entry chain ⇒ plain `RATE_LIMITED` with **no** `attempts` history and a `v1`
+  record (the single-entry contract).
+- **Capture-phase attribution**: a snapshot polled while the worker is in `Capturing` names the
+  selected entry, not a default (set_active precedes capture).
+- **Schema compatibility**: an attempt-bearing `v2` record is skipped-and-counted by a reader
+  that only knows `v1` (fixture-simulated), and read fully by the new reader; a `v1` record is
+  read by both.
+- **Prompt bytes**: after a fall-through, `Record.prompt_bytes` is the final attempt's size and
+  each `Attempt.prompt_bytes` is its own.
 - **Budget**: a single-entry `chain_budget` equals today's `max_wait_secs` exactly (the
   invariant); a multi-entry walk of rate-limited entries, each running near its
   `--timeout-seconds` before being classified, stays within `chain_budget`; the displayed
@@ -734,9 +808,10 @@ Unit tests (no network, no model call), extending the existing fakes:
   resume — returns a `RATE_LIMITED` failure whose remediation names `fresh: true`; a record
   matching no configured entry ⇒ `SESSION_NOT_RESUMABLE`.
 - **Resume identity**: two same-model/different-bin entries — a session created by the second
-  resumes on the second (full-identity match), and a legacy record with no `bin` that matches
-  both is refused with `SESSION_NOT_RESUMABLE` rather than guessing; a legacy record matching
-  exactly one entry still resumes.
+  resumes on the second (raw-identity match, no other entry preflighted); a legacy (`None`)
+  record matching both is refused with `SESSION_NOT_RESUMABLE`, one matching exactly one entry
+  still resumes; a `Some(PathSearch)` record is *not* treated as legacy; and a resume whose
+  selected entry now resolves to a different path than stored is refused (PATH drift).
 
 A test seam is required so the worker's per-entry reviewer is injectable (the existing
 CLI-free registry tests are the pattern). `smoke.ps1` may gain a real two-entry round trip;
@@ -813,6 +888,23 @@ now reflects.
   totals partial when an attempt's usage is unknown ([Metrics]). Minor: (5) result/attempt
   identity omitted the bin → include the resolved bin. Plus a note adopted: `set_active` uses
   the existing `State` mutex ([Metrics, the result interface]).
+
+- **Round 4 (same session, turn 4) — REQUEST CHANGES.** Four major + two minor, each a detail a
+  round-3 fix had not carried fully to the code (the reviewer confirmed VCS rendering, registry
+  locking, and per-entry adapter selection resolved, and found no missing adapter call site).
+  (1) The pseudocode returned `REVIEWERS_EXHAUSTED` for a one-entry chain, contradicting the
+  single-entry `RATE_LIMITED` rule → `N == 1` returns the plain failure with no history ([The
+  fall-through, budget]). (2) The lifecycle and loop disagreed (double preflight) and
+  `resolve_bin` is an uninterruptible PATH scan → shared `App` preflight cache makes entry 0 a
+  cache hit, and the budget claim is narrowed to the cancellable auth invocation ([The
+  fall-through, budget]). (3) A bare `Option<PathBuf>` conflated a new PATH entry with a legacy
+  absent field → tagged `Option<RawBin>`, plus persist-and-verify the resolved path against PATH
+  drift ([Sessions and resume]). (4) `attempts` at schema `v1` would be silently dropped by old
+  readers → bump attempt-bearing records to `v2`, new reader accepts both ([Metrics]).
+  (5) Attribution was unset during the `Capturing` phase → `set_active` before capture
+  ([Metrics, the result interface]). (6) The attempt schema omitted bin and left prompt-byte
+  accounting undefined → `Attempt` carries resolved bin and its own `prompt_bytes`; the
+  top-level field stays the final attempt's ([Metrics]).
 
 [Capture in a mixed-family chain]: #capture-in-a-mixed-family-chain--the-change-must-reach-whoever-runs
 [Sessions and resume]: #sessions-and-resume--the-one-correctness-trap
