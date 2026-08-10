@@ -8,7 +8,7 @@ autonomous "re-review until converged" loop stops re-deriving structure the tool
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
 session, and per-finding status (resolved / open / regressed) on a re-review.
 
-> **Review history.** Eighteen rounds against this repository's own gate (Codex, gpt-5.6-luna,
+> **Review history.** Nineteen rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
 > `major`), round 2 (four `major` + one `minor`), round 3 (four `major` + one `minor`), round 4
 > (five `major` + one `minor`), round 5 (five `major` + one `minor`), round 6 (three `major` +
@@ -20,9 +20,10 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > (two `major` + two `minor`, the `unestablished` edge), round 14 (two `major` + two `minor`, stale
 > four-state summaries), round 15 (two `major` + one `minor`, precedence + last blind-fresh strings), round 16 (one `major`,
 > a stale re-report, tightened further), round 17 (one `major` + one `minor`, the `invalid`
-> resume-refusal split), round 18 (one `major`, propagating that split to Decision 3 and the tables).
-> Rounds 1–17 confirmed resolved; round 18 now closed. Recorded in the
-> [Round 1](#round-1-response) … [Round 18](#round-18-response) responses. The sections they touched —
+> resume-refusal split), round 18 (one `major`, propagating that split to Decision 3 and the tables),
+> round 19 (one `minor`, qualifying persistence-failure reasons against already-broken coverage).
+> Rounds 1–18 confirmed resolved; round 19 now closed. Recorded in the
+> [Round 1](#round-1-response) … [Round 19](#round-19-response) responses. The sections they touched —
 > the block schema, ID reconciliation (total-accounting), degradation and the `converged` signal
 > (now including the budget/terminal condition), extraction (nonce-marked, dual-namespace, `_OUT`
 > nonce), durability (a write-ahead marker that must succeed or abort, fail-closed poison-writes,
@@ -118,7 +119,7 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `reviewer_withheld_approve` | `open_count == 0` but `verdict_detail` is `approve_with_comments`. | The reviewer left only comments and declined a clean approve. Do **not** auto-stop; surface to a human. |
 | `reviewer_blocked` | `verdict_detail` is `blocked` (the reviewer reports it cannot complete a clean review), at any `open_count`. | **Escalate to a human**; a blocked reviewer is not a re-review-and-hope state. |
 | `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
-| `ledger_unavailable` | Completed-envelope coverage is a *readable* but broken state — `legacy_uncovered` or `needs_rebaseline` — **including a degraded turn whose coverage-break write persisted**. (A degraded turn whose *own* break-write failed reports `turn_not_durable`; an *unreadable* ledger — `invalid` — never reaches a completed envelope, it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
+| `ledger_unavailable` | On-disk coverage is a *readable* persisted break — `legacy_uncovered` or `needs_rebaseline` — whether from **this turn's coverage-break write persisting** *or* the **session already being broken on entry**. (A degraded turn whose *own* break-write failed reports `turn_not_durable` **only** when it entered `whole_conversation`/`unestablished`; on an already-broken session `ledger_unavailable` holds regardless — precedence. An *unreadable* ledger — `invalid` — never reaches a completed envelope; it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
 | `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
 | `state_corrupt` | The session store itself did not parse; this name's history cannot be trusted. | **Escalate to a human**; do not silently start fresh (below). |
 | `ledger_too_large` | The ledger/digest exceeded the bounded budget, before *or* after this turn ran. | **Escalate to a human**; the session cannot keep growing (below). |
@@ -126,8 +127,10 @@ to act differently on the two. The envelope carries one machine-readable reason 
 `unstructured` is **not** a value of `non_convergence_reason` (round 8). "No valid block this turn"
 (missing/duplicate/extra id, malformed block, wrong nonce, …) is carried by `structured: false` and
 the warning detail; the *top-level reason* is never `unstructured`, because a degraded turn breaks
-coverage and reports **`ledger_unavailable` when that coverage-break write persists, or
-`turn_not_durable` when it does not** (the persistence-first rule) — never `unstructured`. Keeping
+coverage and reports **`ledger_unavailable` when the on-disk coverage ends up a persisted break
+(this turn's break persisted, or the session was already `legacy_uncovered`/`needs_rebaseline`), or
+`turn_not_durable` only when it entered `whole_conversation`/`unestablished` and its own write
+failed** (the persistence-first rule) — never `unstructured`. Keeping
 `unstructured` out of the reason enum is what stops a loop being told to "re-review" a session that
 a rebaseline must repair.
 
@@ -303,8 +306,9 @@ unreachable for anything already resolved. After the review, the server reconcil
 - **`new_findings`** get fresh monotonic ids, `status: open`, and are appended.
 - **Fail-closed conditions that degrade the *entire* turn** (→ `structured: false`, and — being a
   degraded turn — a coverage break to `needs_rebaseline`/`legacy_uncovered` reported as
-  `non_convergence_reason: ledger_unavailable` **when that coverage-break write persists, else
-  `turn_not_durable`** — see Decision 3, the coverage rule, and the persistence-first rule): the set of
+  `non_convergence_reason: ledger_unavailable` **when the on-disk break is persisted (this turn's, or
+  an already-broken session), else `turn_not_durable`** — see Decision 3, the coverage rule, and the
+  persistence-first rule): the set of
   ids in `prior_findings` is not *exactly* the ledger's id set (a missing id, an extra/unknown id,
   or any duplicate); a `prior_findings` object carrying any field other than `id`/`status`; a
   `new_findings` object carrying a `status`; any enum out of range. The block is trusted as a whole
@@ -1196,7 +1200,7 @@ structured contract**, and is not overclaimed beyond it.
 
 | Situation | Handling |
 | --- | --- |
-| Reviewer emits no block | `structured:false`, `open_count:null`, `converged:false`, verdict `unknown` + warning; prose returned in full. Being a degraded turn it breaks coverage → top-level reason `ledger_unavailable` when that coverage-break write persists, else `turn_not_durable` (persistence-first rule); both escalate → rebaseline (below). |
+| Reviewer emits no block | `structured:false`, `open_count:null`, `converged:false`, verdict `unknown` + warning; prose returned in full. Being a degraded turn it breaks coverage → `ledger_unavailable` when the on-disk break is persisted (this turn's, or already-broken session); `turn_not_durable` only if it entered `whole_conversation`/`unestablished` and its own write failed (persistence-first rule); both escalate → rebaseline (below). |
 | Reviewer emits more than one block | Fail-closed ambiguity → degrade as above; the server does not pick one. |
 | Block present but invalid JSON / wrong schema / over size cap | Degrade as above; the block is not partially trusted. |
 | `prior_findings` names an id the ledger never issued | Whole-turn degrade + warning; the reviewer cannot mint identity. |
@@ -1205,7 +1209,7 @@ structured contract**, and is not overclaimed beyond it.
 | Reviewer says `approve` but ledger has open findings | Machine verdict `changes`, `converged:false`, warning names the disagreement. |
 | Reviewer says `request_changes` with zero open | Machine verdict `changes`, `converged:false`, `verdict_contradiction`; uncertainty never converges. |
 | Reviewer says `blocked` (any open count) | Machine verdict `changes`, `converged:false`, `reviewer_blocked` — a **human-escalation** outcome, not re-review-and-hope. |
-| Prior id the reviewer failed to account for | Whole-turn degrade; every prior id must appear exactly once — silence on any id is never an implied status. Being a degraded turn it also breaks coverage → reported `ledger_unavailable` (or `turn_not_durable` if that coverage-break write fails; persistence-first rule). |
+| Prior id the reviewer failed to account for | Whole-turn degrade; every prior id must appear exactly once — silence on any id is never an implied status. Being a degraded turn it also breaks coverage → `ledger_unavailable` when the on-disk break is persisted (this turn's, or already-broken session); `turn_not_durable` only if it entered `whole_conversation`/`unestablished` and its own write fails (persistence-first rule). |
 | Regression of a previously resolved finding | Reviewer sends `f1: regressed` (resolved findings are in the injected digest, which lists every prior id); `f1` reopens, no new id. |
 | One ledger *record* incompatible/undeserializable, store otherwise valid | Field-level tolerant load keeps the store and other sessions intact, but *this* session's ledger is unreadable → it is `invalid` → a **`SESSION_NOT_RESUMABLE` resume refusal** (pre-model, carrying `ledger_unavailable` as detail), **not** a completed envelope; record preserved, **not** reset to a fresh zero-open ledger (round 17). |
 | The whole `sessions.json` store fails to parse | Tri-state load returns `invalid`, **not** empty: resume refused, any review non-convergent (`state_corrupt`), corrupt file preserved, operator told — never silently a clean fresh conversation. |
@@ -1227,9 +1231,10 @@ structured contract**, and is not overclaimed beyond it.
 
 Every "whole-turn degrade" row above is a *degraded turn*, so it also breaks coverage
 (`needs_rebaseline` on a resume, `legacy_uncovered` on turn 1) and its **top-level
-`non_convergence_reason` is `ledger_unavailable`** when that coverage-break write persisted (round
-8) — or **`turn_not_durable`** if this turn's own write failed and coverage was `whole_conversation`
-on entry (the persistence-first rule). `unstructured` is never a top-level reason, only the internal
+`non_convergence_reason` is `ledger_unavailable`** when the on-disk break is persisted — this turn's
+write landed, *or* the session was already `legacy_uncovered`/`needs_rebaseline` (round 8) — or
+**`turn_not_durable`** only if this turn entered `whole_conversation`/`unestablished` and its own
+write failed (the persistence-first rule). `unstructured` is never a top-level reason, only the internal
 cause in the warning detail. Both `ledger_unavailable` and `turn_not_durable` **escalate to a human
 rebaseline** (round-11 major #4), never an autonomous `fresh`.
 
@@ -1263,8 +1268,9 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   approve-with-comments + zero open → `reviewer_withheld_approve`, not converged; **`blocked` →
   `reviewer_blocked` at any open count** (round-5 major #4); unstructured →
   `converged:false`, `open_count:null`, and — being a degraded turn — `non_convergence_reason:
-  ledger_unavailable` **when the coverage-break write persists, else `turn_not_durable`** (both
-  tested; never `unstructured`, which is internal-only, round-8 major / round-15 minor)); **`open_count`
+  ledger_unavailable` **when the on-disk break is persisted (this turn's, or an already-broken
+  session), else `turn_not_durable`** (entered `whole_conversation`/`unestablished`, own write
+  failed — both tested; never `unstructured`, internal-only, round-8/round-15/round-19)); **`open_count`
   counts a `regressed` finding** (`count(status != resolved)`, round-4 minor); **reason precedence**
   (a `legacy_uncovered` session with open findings reports `ledger_unavailable`, not
   `open_findings`; `reviewer_blocked` outranks `verdict_contradiction`); **a zero-open but
@@ -1872,14 +1878,28 @@ none disputed. The remaining `invalid`-as-completed-envelope remnants are now re
 
 `invalid` is now uniformly a resume refusal everywhere active. No open questions remain.
 
+## Round 19 response
+
+Codex (gpt-5.6-luna, effort=max, resumed) confirmed the `invalid`-as-resume-refusal propagation
+complete and no blind-`fresh`/invalid-envelope contradiction remaining, and flagged one **minor**: a
+few "else `turn_not_durable`" statements didn't carry the qualifier that an *already*-broken
+(`legacy_uncovered`/`needs_rebaseline`) session always reports `ledger_unavailable` regardless of the
+current turn's write (precedence wins). Accepted; not disputed. Qualified everywhere — the reason
+table `ledger_unavailable`/`turn_not_durable` rows, the `unstructured`-not-a-reason note, Decision
+2's fail-closed conditions, the failure-table degrade rows and summary note, and the convergence
+test — so `turn_not_durable` is stated as the reason **only** when this turn entered
+`whole_conversation`/`unestablished` and its own write failed; a pre-existing persisted break is
+always `ledger_unavailable`.
+
+No open questions remain.
+
 ## Status
 
-Eighteen rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
+Nineteen rounds of this repository's own cross-review gate, each REQUEST CHANGES, every finding
 accepted and none disputed. Round 11 (a fresh-reviewer holistic pass) opened the
-escalation/rebaseline seam and the coverage discriminator; rounds 12–18 carried it fully through the
-example, reason contract, precedence, Decision 3 scope, state machine, schema, failure table, and
-tests, closed the `unestablished` edge, and made `invalid` uniformly a pre-model resume refusal
-(never a completed envelope) with every active recovery path an explicit escalate → human-directed
-rebaseline. The plan is submitted for a final pass; if it is judged sound, implementation begins
-against the [wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs)
-plan above.
+escalation/rebaseline seam and the coverage discriminator; rounds 12–19 carried it fully through the
+example, reason contract, precedence with persistence-first, Decision 3 scope, state machine, schema,
+failure table, and tests, closed the `unestablished` edge, made `invalid` uniformly a pre-model
+resume refusal, and qualified every persistence-failure reason against already-broken coverage. The
+plan is submitted for a final pass; if it is judged sound, implementation begins against the
+[wiring](#wiring-the-io-edges), [tests](#tests), and [module](#new-module--srcfindingsrs) plan above.
