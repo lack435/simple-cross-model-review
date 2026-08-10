@@ -432,7 +432,14 @@ pub fn resolve_bin(spec: &ReviewerSpec) -> Result<PathBuf, Failure> {
 
     if let Some(explicit) = &spec.bin {
         if explicit.is_file() {
-            return Ok(explicit.clone());
+            if let Some(abs) = absolutize(explicit) {
+                return Ok(abs);
+            }
+            tried.push(format!(
+                "{} (from --bin; exists but could not be resolved to an absolute path)",
+                explicit.display()
+            ));
+            return Err(errors::cli_not_found(spec.reviewer.as_str(), &tried));
         }
         tried.push(format!("{} (from --bin)", explicit.display()));
         return Err(errors::cli_not_found(spec.reviewer.as_str(), &tried));
@@ -450,7 +457,11 @@ pub fn resolve_bin(spec: &ReviewerSpec) -> Result<PathBuf, Failure> {
                 for ext in &exts {
                     let candidate = dir.join(format!("{stem}{ext}"));
                     if candidate.is_file() {
-                        return Ok(candidate);
+                        if let Some(abs) = absolutize(&candidate) {
+                            return Ok(abs);
+                        }
+                        // Existed a moment ago but no longer resolves: keep searching rather than
+                        // return a non-absolute path.
                     }
                 }
             }
@@ -469,12 +480,32 @@ pub fn resolve_bin(spec: &ReviewerSpec) -> Result<PathBuf, Failure> {
 
     for candidate in fallback_locations(spec.reviewer) {
         if candidate.is_file() {
-            return Ok(candidate);
+            if let Some(abs) = absolutize(&candidate) {
+                return Ok(abs);
+            }
         }
         tried.push(candidate.display().to_string());
     }
 
     Err(errors::cli_not_found(spec.reviewer.as_str(), &tried))
+}
+
+/// Absolute form of a resolved bin path, so its stored, compared, and spawned forms do not depend
+/// on the process working directory -- a relative `--bin` or relative PATH entry would otherwise
+/// resolve to a different executable after a cwd change, which `resolved_bin_matches` could not
+/// detect from the stored string alone.
+///
+/// `std::path::absolute` is a *lexical* full-path (GetFullPathName semantics): it resolves every
+/// Windows form to an absolute path -- including a *drive-relative* `C:foo.exe`, which
+/// `current_dir().join` would mishandle -- **without touching the filesystem**. Not resolving
+/// symlinks matters here: the reviewer CLI is often a stable shim pointing at a versioned release
+/// dir (e.g. codex's `...\releases\<ver>\...`), so canonicalizing would make the resolved bin
+/// change on every CLI update and needlessly refuse resumes for the same install. It also adds no
+/// `\\?\` prefix. Returns `None` only if absolutization fails (empty path, or the cwd cannot be
+/// read); callers then treat the entry as unresolved rather than keeping a non-absolute path --
+/// there is deliberately no silent fallback. (Needs Rust 1.79, hence this crate's MSRV.)
+fn absolutize(path: &Path) -> Option<PathBuf> {
+    std::path::absolute(path).ok()
 }
 
 /// Locate `stem` on PATH, and nowhere else.

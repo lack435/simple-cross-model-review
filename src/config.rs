@@ -123,15 +123,18 @@ pub struct ReviewerSpec {
 }
 
 impl ReviewerSpec {
-    /// Identity for the fully-identical-duplicate rule: reviewer, model, effort, and bin —
-    /// **not** `usage_minimum`, which is a gating policy, not identity. `validate_chain` uses
-    /// this rather than `==` so two entries differing only by minimum are still caught as
-    /// duplicates. See `docs/usage-remaining-gate.md`.
+    /// Identity for the duplicate rule: reviewer, model, effort, and bin -- **not**
+    /// `usage_minimum`, which is a gating policy, not identity. `validate_chain` uses this rather
+    /// than `==` so two entries differing only by minimum are still caught as duplicates. The bin
+    /// is compared by **path identity** (Windows-case- and separator-insensitive, via
+    /// `RawBin::identity_matches`), not byte-exactly, so two spellings of the same executable are
+    /// one duplicate -- the same rule `resume_entry_index` uses to bind a resume to its creating
+    /// entry (#55). See `docs/usage-remaining-gate.md` and `docs/path-comparison-plan.md`.
     pub fn same_reviewer_identity(&self, other: &ReviewerSpec) -> bool {
         self.reviewer == other.reviewer
             && self.model == other.model
             && self.effort == other.effort
-            && self.bin == other.bin
+            && self.raw_bin().identity_matches(&other.raw_bin())
     }
     /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
     /// legacy session record with no stored bin. Persisted on the session for resume matching.
@@ -950,7 +953,7 @@ impl Config {
             Some(raw) => self
                 .reviewers
                 .iter()
-                .position(|s| base_match(s) && &s.raw_bin() == raw),
+                .position(|s| base_match(s) && s.raw_bin().identity_matches(raw)),
             None => {
                 // Legacy record: match on the fields it carries, but only if unambiguous.
                 let mut matches = self
@@ -973,12 +976,15 @@ impl Config {
     /// failure rather than exiting — so the server is up and rejects requests with a legible
     /// error, as `docs/reviewer-fallback-chain.md` describes. The rule set is deliberately small:
     ///
-    /// - **A fully-identical entry is invalid.** Two entries equal in reviewer, model, effort,
-    ///   *and* bin cannot be a fallback for each other. The whole spec is compared, not just
-    ///   `(reviewer, model)`: a distinct `bin` can be a distinct install/account, and model
+    /// - **An identity-equivalent entry is invalid.** Two entries equal in reviewer, model,
+    ///   effort, *and* bin cannot be a fallback for each other. The whole spec is compared, not
+    ///   just `(reviewer, model)`: a distinct `bin` can be a distinct install/account, and model
     ///   aliases (`opus` vs `claude-opus-4-8`) cannot be canonicalised without asserting a
     ///   mapping this tool has not verified, so a same-model/different-bin (or different-effort)
-    ///   fallback stays valid.
+    ///   fallback stays valid. The bin is compared by path identity (Windows-case- and
+    ///   separator-insensitive, via `ReviewerSpec::same_reviewer_identity`), not byte-exactly, so
+    ///   two spellings of the same executable are still one duplicate -- matching the rule
+    ///   `resume_entry_index` uses to bind a resume to its creating entry.
     /// - **The empty chain is rejected defensively**, though `from_args` cannot produce one.
     pub fn validate_chain(reviewers: &[ReviewerSpec]) -> Result<(), String> {
         if reviewers.is_empty() {
@@ -987,13 +993,15 @@ impl Config {
         for (i, a) in reviewers.iter().enumerate() {
             for b in &reviewers[i + 1..] {
                 // Identity excludes `usage_minimum` (a gating policy, not identity), so two
-                // entries differing only by minimum are still rejected as duplicates.
+                // entries differing only by minimum are still rejected as duplicates. The bin is
+                // compared by path identity (case/separator-insensitive) inside the method (#55).
                 if a.same_reviewer_identity(b) {
                     return Err(format!(
-                        "reviewer chain has a duplicate entry ({}): a fallback identical to an \
-                         earlier entry in reviewer, model, effort and bin can never help, because \
-                         it shares the same account and model and so the same rate limit. Remove \
-                         it, or change its model/bin to a genuinely different reviewer.",
+                        "reviewer chain has a duplicate entry ({}): a fallback with the same \
+                         reviewer, model, effort and bin (comparing the bin path case- and \
+                         separator-insensitively) as an earlier entry can never help, because it \
+                         shares the same account and model and so the same rate limit. Remove it, \
+                         or change its model/bin to a genuinely different reviewer.",
                         a.describe()
                     ));
                 }
@@ -1353,6 +1361,11 @@ fn default_state_dir(cwd: &Path) -> PathBuf {
         })
         .take(40)
         .collect();
+    // FROZEN persistence key -- not a comparison. This `to_lowercase` fold is baked into a
+    // durable directory name under %LOCALAPPDATA%\cross-review\, so changing it (e.g. to
+    // `pathcmp`'s ASCII fold for "consistency") would relocate the default state dir and orphan
+    // in-flight sessions for users whose cwd has a case-bearing non-ASCII character. Do NOT unify
+    // it with `pathcmp` without a migration. See docs/path-comparison-plan.md (Family C).
     let key = format!(
         "{}-{:016x}",
         leaf,
@@ -1768,6 +1781,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_chain_rejects_a_case_or_separator_only_bin_duplicate() {
+        // Two entries whose only difference is the case (and separator style) of the --bin path
+        // are the same install -- same account, same rate limit -- so the chain must reject them
+        // as a duplicate, matching the identity rule resume_entry_index uses.
+        let dup = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--bin",
+            "C:\\Tools\\codex.exe",
+            "--reviewer",
+            "codex",
+            "--bin",
+            "c:/tools/codex.exe",
+        ]))
+        .expect("config");
+        assert!(Config::validate_chain(&dup.reviewers).is_err());
+
+        // A genuinely different bin (different install) is a valid fallback.
+        let distinct = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--bin",
+            "C:\\Tools\\codex.exe",
+            "--reviewer",
+            "codex",
+            "--bin",
+            "C:\\Other\\codex.exe",
+        ]))
+        .expect("config");
+        assert!(Config::validate_chain(&distinct.reviewers).is_ok());
+    }
+
+    #[test]
     fn chain_needs_capture_folds_across_entries() {
         // Codex has a shell and needs no diff; Claude has none and does. A Codex->Claude chain
         // under --diff auto must still capture, for the Claude fallback.
@@ -1870,6 +1916,73 @@ mod tests {
         // A model the chain no longer has: no match.
         rec.model = "gpt-5.6-sol".into();
         assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn resume_entry_index_matches_a_case_or_separator_only_bin_difference() {
+        use crate::session::{RawBin, SessionRecord};
+        // The chain entry configured one spelling of the bin; the stored record has a case- and
+        // separator-only variant. It is the same install, so the resume must still bind to it
+        // (this is the #55 fix -- an exact-string compare wrongly refused here).
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+            "--bin",
+            "C:\\Tools\\codex.exe",
+        ]))
+        .expect("config");
+        let rec = SessionRecord {
+            reviewer: "codex".into(),
+            cli_session_id: "t".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::Explicit("c:/tools/codex.exe".into())),
+            resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: None,
+        };
+        assert_eq!(cfg.resume_entry_index(&rec), Some(0));
+
+        // A genuinely different bin still does not match.
+        let other = SessionRecord {
+            raw_bin: Some(RawBin::Explicit("C:\\Other\\codex.exe".into())),
+            ..rec
+        };
+        assert_eq!(cfg.resume_entry_index(&other), None);
+    }
+
+    #[test]
+    fn resolve_bin_absolutizes_a_relative_explicit_bin() {
+        // A relative --bin must resolve to an absolute path, so the stored/compared/run form does
+        // not depend on the process cwd (a relative path could otherwise resolve to a different
+        // executable after a cwd change, which the resume gate could not detect). `Cargo.toml`
+        // exists relative to the crate root, which is the cwd under `cargo test`; resolve_bin only
+        // checks is_file(), so it stands in for a relative executable here.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--bin", "Cargo.toml"]))
+            .expect("config");
+        let resolved = crate::reviewer::resolve_bin(&cfg.reviewers[0]).expect("resolve");
+        assert!(
+            resolved.is_absolute(),
+            "resolved bin should be absolute: {resolved:?}"
+        );
+        assert!(resolved.ends_with("Cargo.toml"), "{resolved:?}");
     }
 
     #[test]
@@ -2514,6 +2627,20 @@ mod tests {
                 .split('-')
                 .next_back()
         );
+    }
+
+    #[test]
+    fn state_dir_key_is_a_frozen_golden_for_a_unicode_cwd() {
+        // Family C freeze guard. The hash folds its input with `to_lowercase` (full Unicode), and
+        // that fold is a DURABLE key: changing it (e.g. to pathcmp's ASCII fold) would relocate
+        // this directory and orphan existing sessions. A plain "two calls agree" check would not
+        // catch a fold swap on an ASCII input (to_lowercase and to_ascii_lowercase agree there),
+        // nor a change of hash algorithm -- so this pins the exact expected file name for a
+        // Unicode-sensitive input (uppercase E-acute, which the two folds treat differently). If
+        // it fails, the persistence key moved: do not "fix" the test, understand the migration.
+        let dir = default_state_dir(Path::new("C:\\dev\\caf\u{00c9}"));
+        let name = dir.file_name().unwrap().to_string_lossy();
+        assert_eq!(name, "caf\u{00c9}-855ad2df5623c351");
     }
 
     #[test]

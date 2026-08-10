@@ -215,13 +215,15 @@ returns false — the caller cannot fix a server's command line). `--doctor` and
 The chain-semantic rule set (the deliberately small, defensible core — narrowed after
 round 1):
 
-- **A fully-identical entry is invalid.** Round 1 was right that `(reviewer, model)` is
+- **An identity-equivalent entry is invalid.** Round 1 was right that `(reviewer, model)` is
   neither a complete nor a verifiable identity: `ReviewerSpec` also carries `bin`
   ([config.rs:275]), a distinct binary can be a distinct installation or account, and the
   CLI accepts model *aliases* (`opus` and `claude-opus-4-8` both resolve, [README.md:138])
   that this tool cannot canonicalise without asserting a mapping it has not verified. So the
   rule rejects only a duplicate of the **entire spec** — same `reviewer`, `model`, `effort`,
-  *and* `bin`. That entry is unambiguously not a fallback for the one before it, whatever the
+  *and* `bin` (the `bin` compared case- and separator-insensitively as a path, not byte-exactly,
+  so two spellings of one executable are a single duplicate). That entry is unambiguously not a
+  fallback for the one before it, whatever the
   provider's rate buckets turn out to be, and no valid same-model-different-bin (or
   different-effort) fallback is caught by mistake. The tool deliberately does **not** try to
   detect alias-vs-canonical duplicates: it would have to claim the alias mapping, which the
@@ -481,8 +483,9 @@ they own picking the single reviewer today. Consequently:
 
 - A same-family entry (`claude-opus-4-8` → `claude-sonnet-…`, or one Codex model → another)
   is accepted and used as written. No flag gates it.
-- The only composition the tool refuses is the *fully-identical* entry above (same reviewer,
-  model, effort, and bin), because that one is not a fallback at all.
+- The only composition the tool refuses is the *identity-equivalent* entry above (same reviewer,
+  model, effort, and bin -- the bin compared case- and separator-insensitively as a path),
+  because that one is not a fallback at all.
 
 This is a deliberate narrowing of the issue's "explicitly allow same family reviews if
 configured as such": there is nothing to *explicitly allow*, because nothing forbids it —
@@ -827,7 +830,7 @@ Unit tests (no network, no model call), extending the existing fakes:
 - **Parsing**: single `--reviewer` ⇒ one-entry chain (regression guard on today's
   behaviour); a two-entry chain preserves order; an identity flag before any `--reviewer`
   errors; a doubled `--model` within one entry errors; per-entry defaults fill in per entry.
-- **Chain validation**: a fully-identical entry (reviewer, model, effort, bin all equal) ⇒
+- **Chain validation**: an identity-equivalent entry (reviewer, model, effort equal; bin equal as a case- and separator-insensitive path) ⇒
   `INVALID_REVIEWER_CHAIN`, and a degraded `App` returns it from `start_review` and `status`
   **before any preflight** (assert no bin resolution / auth check happened); a same-family,
   different-model chain is accepted; a same-model, different-bin chain is accepted; an empty
@@ -906,11 +909,13 @@ now reflects.
    chain errors as a per-request `INVALID_REVIEWER_CHAIN`, matching the issue wording and the
    project's runtime-setup-failure style — provided the invalid state is checked *before*
    reviewer preflight and stays non-agent-correctable. Both conditions are now in the plan.
-2. **The invalidity rule set.** *Resolved: narrowed to a fully-identical spec.*
+2. **The invalidity rule set.** *Resolved: narrowed to an identity-equivalent spec.*
    `(reviewer, model)` was under-specified and alias-fragile; the rule now rejects only an
-   entry identical in reviewer, model, effort, *and* bin, and the empty vector defensively.
-   Same-family/different-model and same-model/different-bin stay valid; alias-vs-canonical
-   duplicates are deliberately not detected (unverifiable mapping).
+   entry identical in reviewer, model, effort, *and* bin, and the empty vector defensively. The
+   bin is compared as a path (case- and separator-insensitive, as Windows paths are), so two
+   spellings of one executable are a single duplicate. Same-family/different-model and
+   same-model/genuinely-different-bin stay valid; alias-vs-canonical duplicates are deliberately
+   not detected (unverifiable mapping).
 3. **Grammar.** *Resolved: repeated `--reviewer` is adequate*; an explicit `--fallback` opener
    adds little. Kept.
 4. **Per-entry behaviour overrides.** *Resolved: global for now* — the family-scoped

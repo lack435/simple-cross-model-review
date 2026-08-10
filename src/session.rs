@@ -52,6 +52,23 @@ pub enum RawBin {
     Explicit(String),
 }
 
+impl RawBin {
+    /// Whether two configured bins name the same install for resume/duplicate purposes.
+    ///
+    /// The tags must agree (`PathSearch` never matches an `Explicit`), and two `Explicit`
+    /// payloads are compared as paths (Windows-case- and separator-insensitive) via
+    /// `pathcmp`, not as raw strings -- so a case- or separator-only difference in a `--bin`
+    /// path is the same bin. Distinct from the derived `PartialEq`, which stays byte-exact for
+    /// serialization and any caller that wants literal equality.
+    pub fn identity_matches(&self, other: &RawBin) -> bool {
+        match (self, other) {
+            (RawBin::PathSearch, RawBin::PathSearch) => true,
+            (RawBin::Explicit(a), RawBin::Explicit(b)) => crate::pathcmp::identity_eq_str(a, b),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub reviewer: String,
