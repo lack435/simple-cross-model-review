@@ -1,8 +1,7 @@
 # Single blocking collect — design
 
-Status: **plan, approved for implementation** — cross-model review returned APPROVE in rounds 4 and
-5 with no correctness or security blocker (see [Review history](#review-history)); the shrinking
-minor comments from each have been folded in.
+Status: **plan approved for implementation** — round 6 of cross-model review returned a clean
+**APPROVE, no findings** (see [Review history](#review-history)). Implementation follows.
 
 Addresses [#39](../../issues/39): `cross_model_review_result` caps `wait_seconds` at 300, but
 reviews in this project routinely run 5–25 minutes, so every review forces the caller into a
@@ -537,3 +536,9 @@ the server can wake the agent on its own.
   `vcs/mod.rs`, so `pub(crate)` items in it are not nameable from `reviewer/codex.rs`/`config.rs`.
   Folded in: the PR adds explicit `pub(crate)` re-exports of `read_capped` and `CAPTURE_BUDGET` from
   `vcs/mod.rs`. No behavioural change.
+
+- **Round 6** (same session) — **APPROVE, no findings.** The reviewer confirmed the round-5
+  visibility plumbing is resolved and every earlier finding is resolved or honestly scoped; nothing
+  new introduced. Plan approved for implementation (the reviewer notes the eventual implementation
+  still needs its own compile / unit / smoke verification — and, per AGENTS.md, its own pass through
+  this gate on the code diff).
