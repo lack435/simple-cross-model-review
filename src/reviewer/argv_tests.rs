@@ -11,7 +11,18 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::reviewer::{claude::ClaudeReviewer, codex::CodexReviewer, Reviewer};
+use crate::reviewer::{claude::ClaudeReviewer, codex::CodexReviewer, EvidenceInvocation, Reviewer};
+
+fn test_evidence<'a>(cfg: &'a Config) -> EvidenceInvocation<'a> {
+    EvidenceInvocation {
+        executable: Path::new("C:\\fake\\cross-review.exe"),
+        bundle_file: Path::new("C:\\fake\\bundle.json"),
+        nonce: "test-nonce",
+        sterile_dir: cfg
+            .isolate_reviewer
+            .then_some(Path::new("C:\\fake\\sterile-codex-cwd")),
+    }
+}
 
 fn config(extra: &[&str]) -> Config {
     let mut args: Vec<String> = vec!["--reviewer".into()];
@@ -36,6 +47,7 @@ fn config_at(cwd: &Path, state: Option<&Path>, extra: &[&str]) -> Config {
 
 /// The full argv as strings, for presence checks.
 fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<String> {
+    let evidence = test_evidence(cfg);
     let inv = reviewer
         .invocation(
             cfg,
@@ -43,6 +55,7 @@ fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<Stri
             Path::new("C:\\fake\\reviewer.exe"),
             resume,
             "tmp-1",
+            Some(&evidence),
         )
         .expect("invocation");
     inv.command
@@ -52,6 +65,7 @@ fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<Stri
 }
 
 fn program(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
+    let evidence = test_evidence(cfg);
     let inv = reviewer
         .invocation(
             cfg,
@@ -59,12 +73,14 @@ fn program(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
             Path::new("C:\\fake\\reviewer.exe"),
             None,
             "tmp-1",
+            Some(&evidence),
         )
         .expect("invocation");
     PathBuf::from(inv.command.get_program())
 }
 
 fn cwd_of(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
+    let evidence = test_evidence(cfg);
     let inv = reviewer
         .invocation(
             cfg,
@@ -72,6 +88,7 @@ fn cwd_of(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
             Path::new("C:\\fake\\reviewer.exe"),
             None,
             "tmp-1",
+            Some(&evidence),
         )
         .expect("invocation");
     inv.command
@@ -332,14 +349,60 @@ fn the_auth_preflight_never_runs_inside_the_reviewed_project() {
     std::fs::remove_dir_all(&inside).ok();
 }
 
+#[test]
+fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
+    let root = crate::testutil::temp_dir("codex-sterile-root");
+    let state = crate::testutil::temp_dir("codex-sterile-state");
+    let cfg = config_at(root.as_path(), Some(state.as_path()), &["codex"]);
+    let first = crate::reviewer::codex_sterile_dir(&cfg, "session-a").expect("sterile");
+    let path = first.path().to_path_buf();
+    assert!(!crate::reviewer::is_within(&path, &cfg.cwd));
+    assert!(std::fs::read_dir(&path).unwrap().next().is_none());
+    drop(first);
+    assert!(!path.exists());
+
+    let resumed = crate::reviewer::codex_sterile_dir(&cfg, "session-a").expect("resume sterile");
+    assert_eq!(resumed.path(), path);
+}
+
+#[test]
+fn codex_sterile_directory_refuses_any_existing_entry() {
+    let root = crate::testutil::temp_dir("codex-sterile-dirty-root");
+    let state = crate::testutil::temp_dir("codex-sterile-dirty-state");
+    let cfg = config_at(root.as_path(), Some(state.as_path()), &["codex"]);
+    let guard = crate::reviewer::codex_sterile_dir(&cfg, "session-dirty").expect("sterile");
+    let path = guard.path().to_path_buf();
+    std::mem::forget(guard);
+    std::fs::write(path.join("unexpected"), "x").unwrap();
+    assert!(crate::reviewer::codex_sterile_dir(&cfg, "session-dirty").is_err());
+    std::fs::remove_dir_all(path).ok();
+}
+
+#[test]
+fn codex_session_mode_separates_sterile_evidence_from_project_cwd() {
+    let isolated = config(&["codex"]);
+    assert_eq!(
+        crate::reviewer::reviewer_cwd_mode(&isolated, crate::config::ReviewerKind::Codex),
+        crate::reviewer::CWD_MODE_CODEX_EVIDENCE
+    );
+    let opted_out = config(&["codex", "--allow-reviewer-config"]);
+    assert_eq!(
+        crate::reviewer::reviewer_cwd_mode(&opted_out, crate::config::ReviewerKind::Codex),
+        crate::reviewer::CWD_MODE_PROJECT
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Codex
 // ---------------------------------------------------------------------------
 
 #[test]
-fn codex_runs_in_the_project_and_reads_the_prompt_from_stdin() {
+fn codex_runs_from_the_sterile_root_and_reads_the_prompt_from_stdin() {
     let cfg = config(&["codex"]);
-    assert_eq!(cwd_of(&CodexReviewer, &cfg), cfg.cwd);
+    assert_eq!(
+        cwd_of(&CodexReviewer, &cfg),
+        PathBuf::from("C:\\fake\\sterile-codex-cwd")
+    );
     let args = argv(&CodexReviewer, &cfg, None);
     assert_eq!(args.first().map(String::as_str), Some("exec"));
     // `-` is what makes codex read the prompt from stdin rather than argv, which keeps a
@@ -412,6 +475,37 @@ fn codex_argv_isolates_user_configuration_by_default() {
         // codex exec does start configured MCP servers, so without this a reviewer with
         // cross-review registered could recurse into it.
         assert!(args.iter().any(|a| a == "--ignore-user-config"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-config"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--skip-git-repo-check"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.contains("mcp_servers.cross_review_evidence.command=")),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "mcp_servers.cross_review_evidence.required=true"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "mcp_servers.cross_review_evidence.enabled=true"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.contains("mcp_servers.cross_review_evidence.enabled_tools=")),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a
+                == "mcp_servers.cross_review_evidence.default_tools_approval_mode=\"approve\""),
+            "{args:?}"
+        );
     }
 
     let permissive = config(&["codex", "--allow-reviewer-config"]);
@@ -419,6 +513,13 @@ fn codex_argv_isolates_user_configuration_by_default() {
         let args = argv(&CodexReviewer, &permissive, resume);
         assert!(
             !args.iter().any(|a| a == "--ignore-user-config"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--ignore-rules"), "{args:?}");
+        assert_eq!(cwd_of(&CodexReviewer, &permissive), permissive.cwd);
+        assert!(
+            args.iter()
+                .any(|a| a == "mcp_servers.cross_review_evidence.required=true"),
             "{args:?}"
         );
     }
@@ -438,6 +539,7 @@ fn codex_argv_respects_a_custom_sandbox() {
 #[test]
 fn codex_writes_its_final_message_to_a_file_it_reports() {
     let cfg = config(&["codex"]);
+    let evidence = test_evidence(&cfg);
     let inv = CodexReviewer
         .invocation(
             &cfg,
@@ -445,6 +547,7 @@ fn codex_writes_its_final_message_to_a_file_it_reports() {
             Path::new("C:\\fake\\codex.exe"),
             None,
             "tmp-1",
+            Some(&evidence),
         )
         .expect("invocation");
     let path = inv

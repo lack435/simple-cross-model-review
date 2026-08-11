@@ -26,13 +26,12 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   checkout — Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 4.8 via
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
-- **Getting the diff in front of the reviewer depends on which direction you are calling.**
-  The Codex reviewer has a read-only shell, so give it the branch and base and let it run
-  `git diff` itself. Its non-interactive command policy may refuse other shell forms; a
-  refusal is final, so do not retry variants. The Claude reviewer still has no shell, but no
-  longer needs one: the server captures the change and hands it over with the request. Do not paste a diff into
-  `instructions` in either direction — describe the intent and what you want scrutinised,
-  and let the reviewer or the server fetch the code.
+- **Do not paste a diff into `instructions` in either direction.** The isolated Codex reviewer
+  receives the selected change through `repository_change` and reads/searches the tree through
+  the other bounded evidence tools; its shell runs from a sterile non-repository directory and
+  is not the normal repository interface. The Claude reviewer receives the server capture in
+  its prompt. Describe the intent and what you want scrutinised, and let the configured capture
+  plus reviewer evidence do the rest.
 - **For the Claude direction, the gate reviews what is committed.** What gets captured is
   fixed by `--diff` on the server entry, not chosen per call, and
   [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
@@ -79,9 +78,10 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
     dirty the tree the bullet above requires to be clean or land a config change inside the
     PR being gated.
   - For mid-development review of work that is not committed yet, open a Claude Code session
-    against this checkout and call from there — that direction gets the Codex reviewer, which
-    has a shell and can see the working tree. A Codex session cannot reach it by changing
-    arguments; it is a different server entry.
+    against this checkout and call from there — that direction gets the Codex reviewer, whose
+    default `--diff auto` capture is exposed through `repository_change` alongside bounded live
+    tree evidence. A Codex session cannot reach it by changing arguments; it is a different
+    server entry.
 - Say what changed and why, and point the reviewer at this file and `README.md`. It runs
   configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
   when told to.
@@ -173,7 +173,8 @@ shipping a stale binary.
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **The reviewer's isolation and read-only posture are security boundaries.** The tool
-  policy, `--safe-mode` / `--ignore-user-config`, the path-scoped
+  policy, `--safe-mode`, the Codex sterile-root/evidence service plus
+  `--ignore-user-config` / `--ignore-rules`, the path-scoped
   `Read(./**)` grants, and the job-object process reaping all exist for reasons documented
   in the README with verified evidence. Do not relax any of them without saying plainly
   what boundary moves.

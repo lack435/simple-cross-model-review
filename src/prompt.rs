@@ -125,7 +125,7 @@ pub fn build(parts: &PromptParts) -> String {
 
     if !parts.resumed {
         out.push_str(&format!(
-            "\n## Working directory\n\n{}\n",
+            "\n## Reviewed repository root\n\n{}\n",
             parts.cwd.display()
         ));
         // When the reviewer runs outside the project, relative paths resolve against the wrong
@@ -135,10 +135,11 @@ pub fn build(parts: &PromptParts) -> String {
         // change/status listings is relative to it -- one rule for all of them.
         if let Some(root) = parts.neutral_root {
             out.push_str(&format!(
-                "\n## Reading files\n\nYour tools run from a different working directory than the \
-                 project, so relative paths will not resolve. To read any file, work out its real \
-                 path relative to the project and join that to the working directory above \
-                 ({root}) to form an absolute path. Paths in the listings below are often \
+                "\n## Reading files\n\nYour reviewer process runs from a different working directory \
+                 than the project. Prefer the repository evidence tools when present; their path \
+                 arguments are relative to the reviewed repository root above. For a direct file \
+                 or exceptional shell read, relative paths will not resolve: join the real \
+                 project-relative path to ({root}) to form an absolute path. Paths in listings are often \
                  decorated rather than plain: a git diff shows `a/` and `b/` prefixes, \
                  `rename from`/`rename to` and `Binary files ...` lines, and `diff --git`/`---`/\
                  `+++`/`@@` markers that are not paths at all -- use the underlying \

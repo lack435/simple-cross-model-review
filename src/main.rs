@@ -16,6 +16,7 @@ mod changeset;
 mod config;
 mod digest;
 mod errors;
+mod evidence;
 mod findings;
 mod mcp;
 mod metrics;
@@ -38,6 +39,24 @@ use tools::{version_line, App};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Internal evidence mode is handled before normal configuration by construction. The child
+    // therefore cannot load reviewer credentials, create review state, or expose an App/MCP review
+    // tool recursively; its entire surface lives in `evidence`.
+    if args.first().map(String::as_str) == Some(evidence::SERVER_FLAG) {
+        if args.len() != 3 {
+            eprintln!(
+                "cross-review: {} requires a capability-bundle path and turn nonce",
+                evidence::SERVER_FLAG
+            );
+            std::process::exit(2);
+        }
+        if let Err(e) = evidence::serve_stdio(std::path::Path::new(&args[1]), &args[2]) {
+            eprintln!("cross-review: evidence server failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
