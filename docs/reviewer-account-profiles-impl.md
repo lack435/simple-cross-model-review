@@ -13,9 +13,9 @@ Three PRs, each independently gate-reviewed. The ordering carries one safety inv
 inert and un-exploitable, and Phases 1–2 can merge before the security surface is built.
 
 - **Phase 1 — Routing core (inert):** flags, safe-name validation, effective-home resolution,
-  `Config` threading through every read site, per-`Command` env + provider-var scrub, the exact
-  resolved-account assertion. A profile *request* is parsed and validated but *refused at use* (no
-  authorization yet).
+  `Config` threading through every read site, a per-`Command` controlled environment (`env_clear` +
+  vetted allowlist), the exact pre-spawn resolved-account assertion. A profile *request* is parsed and
+  validated but *refused at use* (no authorization yet).
 - **Phase 2 — Session identity:** tagged profile identity persisted on `SessionRecord`, compared on
   resume, legacy records fail closed.
 - **Phase 3 — Authorization + provisioning + setup:** profile-dir creation with per-user ACL, the
@@ -230,7 +230,10 @@ use). A fresh resolution here mirrors the `resolved_bin` re-resolution already d
 ### Phase 2 tests
 
 - serde round-trip of each `ProfileIdentity` variant.
-- ambient-new (`Some(Ambient)`) resumes; legacy (`None`) is refused.
+- ambient-new with a captured fingerprint resumes; legacy (`profile_identity: None`) is refused.
+- **[f25]** a new ambient record whose `account_fingerprint` is `None` is **non-resumable** (proves the
+  uniform fail-closed rule — no unbound ambient resume).
+- ambient resume is refused when the stored and current fingerprints are both present and differ.
 - resume refused when the effective home changes (same name, different `%CROSS_REVIEW_HOME%`) and
   when the account fingerprint changes.
 - selector is part of `resume_entry_index` identity (a profile-differing entry does not match).
@@ -242,8 +245,23 @@ use). A fresh resolution here mirrors the `resolved_bin` re-resolution already d
 ### Allowlist store
 
 A per-machine store under `%CROSS_REVIEW_HOME%` / `%LOCALAPPDATA%\cross-review` — **[decided]** a
-fixed, ACL-protected location the repo cannot point at (never `--state-dir`). Entries bind
-`(immutable root) → (canonical effective home + reviewer family)`.
+fixed, ACL-protected location the repo cannot point at (never `--state-dir`).
+
+**[f19] One entry schema, used everywhere:** an entry binds `(launch_root) → (canonical effective_home
++ reviewer_family + account_fingerprint)`. Authorization matching compares **all four** — so a review
+is authorized only when the launch root, the resolved home, the family, *and* the account currently in
+that home all match a stored entry. If the account in the home changes (a re-login to a different
+account under the same profile home), the fingerprint no longer matches and the review is refused as
+`PROFILE_NOT_AUTHORIZED` until reauthorized. This is the single contract; setup, resume, and
+authorization all reference this exact tuple.
+
+**[f22] The store is the authorization boundary and gets its own security contract.** The store file
+**and its parent directory** are created and verified with the same restrictive DACL as a profile home
+(current-user/SYSTEM/Administrators only, inheritance removed, handle-based set + verify, no-follow
+open — see the ACL section), because an attacker who can write the store can authorize themselves.
+Reads verify the DACL and reject a reparse; writes are **atomic** (write-temp + rename) under an
+**exclusive lock**, so a concurrent writer cannot interleave or a reader observe a half-written store.
+On any ACL/verification failure the store is treated as untrusted and every profile use fails closed.
 
 **[f7, resolved] Capture the immutable launch root now, at process start.** The reviewer confirmed
 the process-start CWD *is* available independently of `--cwd` — `--cwd` only sets `Config::cwd`. So
@@ -265,13 +283,24 @@ process token via `OpenProcessToken`/`GetTokenInformation(TokenUser)`), applied 
 so this is new, not a reuse); **no `icacls`/shell fallback**. **Verify** the resulting DACL after
 setting it and **fail closed** (refuse to write any credential) on any error.
 
-**[f15] Do it all through ONE handle — never reopen by path.** The `secure_profile_dir` helper
-creates/opens the directory with a handle (no-follow); the ACL is applied and verified on **that same
-handle** via `SetSecurityInfo` / `GetSecurityInfo` (the `HANDLE` forms), **not** `SetNamedSecurityInfo`
-(the path form), and the credential-file writes happen relative to the same handle/identity. Reopening
-by path between create, ACL-set, verify, and write reintroduces exactly the reparse/replacement TOCTOU
-`secure_profile_dir` closed — a swapped path could receive the DACL meant for the verified object. One
-handle from creation through write, or fail closed.
+**[f15] Create, ACL, and verify through ONE handle — never reopen by path.** The `secure_profile_dir`
+helper creates/opens the directory with a handle (no-follow); the ACL is applied and verified on **that
+same handle** via `SetSecurityInfo` / `GetSecurityInfo` (the `HANDLE` forms), **not**
+`SetNamedSecurityInfo` (the path form). Reopening by path between create, ACL-set, and verify
+reintroduces exactly the reparse/replacement TOCTOU `secure_profile_dir` closed — a swapped path could
+receive the DACL meant for the verified object.
+
+**[f20] Our handle governs *our* dir; the vendor child writes by path — bridge the gap explicitly.**
+The separately-spawned vendor login is a different process; it only receives `CODEX_HOME` /
+`CLAUDE_CONFIG_DIR` as **paths** and writes relative to them, so it cannot inherit our `HANDLE`. To
+keep the directory it writes into the one we verified: (a) hold the directory handle open across the
+child's lifetime so the verified object cannot be deleted/replaced underneath it; (b) where available,
+open with share modes / `FILE_FLAG_OPEN_REPARSE_POINT` semantics that block a rename-over; and (c)
+**after** the child exits, **re-verify** by *handle identity* (open no-follow, compare the file id /
+`BY_HANDLE_FILE_INFORMATION` to the handle we held) that the credential file sits inside the same
+verified directory with the expected DACL, and **fail closed** (discard the login, do not commit the
+allowlist) on any mismatch. The handle bounds our operations; the post-write identity re-verification
+bounds the child's.
 
 ### Wire authorization + the guardrail
 
@@ -293,9 +322,23 @@ handle from creation through write, or fail closed.
 - **[f18] Approval authorizes the *intent*; the allowlist commits only after login + identity
   confirmation.** Human approval does **not** itself write the allowlist entry — it moves the profile
   into a **provisional/in-setup** state and lets login proceed. The `(launch_root → effective_home +
-  fingerprint)` entry is committed only after the vendor login succeeds *and* the pre-spawn identity
-  probe confirms the account. A profile still in setup is **refused by `resolve_authorized_home`**
-  (in-setup ≠ authorized), so a half-finished setup can never route a review.
+  reviewer_family + fingerprint)` entry is committed only after the vendor login succeeds *and* the
+  identity probe confirms the account. A profile still in setup is **refused by
+  `resolve_authorized_home`** (in-setup ≠ authorized), so a half-finished setup can never route a
+  review.
+- **[f21] The setup identity confirmation runs through the provisioning path, not the review path.**
+  Confirming the just-logged-in account cannot call `resolve_authorized_home` (it would reject the
+  as-yet-unauthorized profile) and must not bypass the choke point ad hoc. Factor the probe into a
+  shared helper (`assert_resolved_identity(home)` — the same `env_clear` + allowlist + UUID/method
+  probe from Phase 1) that the **provisioning** flow invokes against `resolve_provisioning_target`'s
+  home under the human gate, and the **review** flow invokes against `resolve_authorized_home`'s home.
+  One probe implementation, two gated entry points; neither weakens the authorization invariant.
+- **[f23] Serialize and make setup recoverable.** A per-profile **exclusive lock** (keyed by the
+  effective home) prevents two concurrent setups racing on one credential directory — a second setup
+  for the same profile waits or is refused. The provisional state carries an **expiry**; on
+  cancellation, timeout, login failure, or identity-mismatch the flow **rolls back** — remove the
+  provisional marker and the partially-created dir, release the lock, commit nothing — so a failed or
+  abandoned setup never strands the profile in a half-state or leaves an orphaned credential dir.
 - **[f9] The localhost human-authorization page is an attack surface; specify its invariants.** Bind
   the listener to **loopback only** (`127.0.0.1`, ephemeral port). The approval URL carries an
   **unguessable one-time capability token** with a **short expiry**; the server **validates every

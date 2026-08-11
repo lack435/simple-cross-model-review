@@ -251,15 +251,16 @@ the reviewer and the setup tool run as the same OS user as everything else.
 
 These are the traps that will make an implementation subtly wrong if skipped:
 
-1. **Scrub or reject conflicting auth-provider variables on the child, then verify the resolved
+1. **Give the child a controlled environment (not the inherited one), then verify the resolved
    method.** **[verified]** Claude's auth precedence puts `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
    and `CLAUDE_CODE_OAUTH_TOKEN` *ahead* of the subscription OAuth credentials in `CLAUDE_CONFIG_DIR`
    (per its authentication docs). So pointing `CLAUDE_CONFIG_DIR` at the work profile is defeated if
    any of those is present in the inherited environment — the review silently uses the wrong
    credential. Codex has analogous variables — **[assumed]** at least `OPENAI_API_KEY`,
-   `CODEX_API_KEY`, and `CODEX_ACCESS_TOKEN`. The child `Command` must therefore start from a
-   controlled environment for these variables (remove/override the provider keys so the profile OAuth
-   wins).
+   `CODEX_API_KEY`, and `CODEX_ACCESS_TOKEN`. The child `Command` must therefore run in a **controlled
+   environment** — cleared and rebuilt from a vetted allowlist (OS essentials + the profile home var)
+   so no inherited provider key is present to win over the profile OAuth. (Exact allowlist in the
+   implementation plan.)
 
    The enumerated scrub list is **version-pinned and cannot be trusted as complete** — a future
    reviewer release could add a provider variable this list misses. So the enumeration is the first
