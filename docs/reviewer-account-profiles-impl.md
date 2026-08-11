@@ -294,19 +294,23 @@ receive the DACL meant for the verified object.
 The separately-spawned vendor login is a different process; it only receives `CODEX_HOME` /
 `CLAUDE_CONFIG_DIR` as **paths** and writes relative to them, so it cannot inherit our `HANDLE`. To
 keep the directory it writes into the one we verified: (a) hold the directory handle open across the
-child's lifetime so the verified object cannot be deleted/replaced underneath it; (b) where available,
-open with share modes / `FILE_FLAG_OPEN_REPARSE_POINT` semantics that block a rename-over; and (c)
-**after** the child exits, **re-verify** by *handle identity* (open no-follow, compare the file id /
-`BY_HANDLE_FILE_INFORMATION` to the handle we held) that the credential file sits inside the same
-verified directory with the expected DACL, and **fail closed** (discard the login, do not commit the
-allowlist) on any mismatch. The handle bounds our operations; the post-write identity re-verification
-bounds the child's.
+child's lifetime, opened with `CreateFile`/`FILE_FLAG_BACKUP_SEMANTICS` and a **share mode that omits
+`FILE_SHARE_DELETE`** — a directory open without delete-sharing cannot be renamed or deleted while the
+handle is held, which concretely blocks the rename-over (the DACL already denies other users write
+access, so the same-user hold is the remaining lever); (b) after the child exits, **re-verify by
+handle identity** — open the credential file no-follow and confirm via `BY_HANDLE_FILE_INFORMATION`
+(volume + file id) that it resolves inside the directory object we held, and re-read its DACL; (c)
+**fail closed** (discard the login, do not commit the allowlist) on any mismatch. The held handle
+prevents replacement of the verified directory; the post-write identity re-check bounds what the
+child left behind.
 
 ### Wire authorization + the guardrail
 
 - `resolve_authorized_home` (the Phase 1 choke point) now consults the store: a non-`Ambient` selector
-  is allowed only with a matching `(launch_root → effective home)` entry; otherwise
-  `PROFILE_NOT_AUTHORIZED` with a remediation pointing at the setup tool.
+  is allowed only with an entry matching the **full [f19] tuple** — `(launch_root → effective_home +
+  reviewer_family + account_fingerprint)`, the current account in the home included; otherwise
+  `PROFILE_NOT_AUTHORIZED` with a remediation pointing at the setup tool. (A fingerprint that no longer
+  matches — the account in the home changed — is refused as unauthorized until reauthorized.)
 - **[f4] The guardrail needs an explicit *expected* identity captured at start.** Detecting an
   A→B mid-review switch requires comparing the *final* fingerprint against the account asserted **at
   spawn** (A), not against a fresh reread of the profile file — a reread would compare B with itself
@@ -333,12 +337,16 @@ bounds the child's.
   probe from Phase 1) that the **provisioning** flow invokes against `resolve_provisioning_target`'s
   home under the human gate, and the **review** flow invokes against `resolve_authorized_home`'s home.
   One probe implementation, two gated entry points; neither weakens the authorization invariant.
-- **[f23] Serialize and make setup recoverable.** A per-profile **exclusive lock** (keyed by the
-  effective home) prevents two concurrent setups racing on one credential directory — a second setup
-  for the same profile waits or is refused. The provisional state carries an **expiry**; on
-  cancellation, timeout, login failure, or identity-mismatch the flow **rolls back** — remove the
-  provisional marker and the partially-created dir, release the lock, commit nothing — so a failed or
-  abandoned setup never strands the profile in a half-state or leaves an orphaned credential dir.
+- **[f23] Serialize and make setup recoverable, across processes.** Setup can be invoked from
+  concurrent MCP tool calls in one server *and* from separate server instances, so the lock must be an
+  **OS-level, cross-process** primitive keyed by the effective home — a named mutex, or an exclusively
+  opened lockfile beside the provisional marker (same locking discipline as the allowlist store, f22) —
+  not an in-process `Mutex`. A second setup for the same profile that cannot take the lock waits or is
+  refused. The provisional marker records a **holder + expiry**; if the holding process dies, the
+  marker's expiry lets the next setup **reclaim** it rather than deadlock. On cancellation, timeout,
+  login failure, or identity-mismatch the flow **rolls back** — remove the provisional marker and the
+  partially-created dir, release the lock, commit nothing — so a failed or abandoned setup never
+  strands the profile in a half-state or leaves an orphaned credential dir.
 - **[f9] The localhost human-authorization page is an attack surface; specify its invariants.** Bind
   the listener to **loopback only** (`127.0.0.1`, ephemeral port). The approval URL carries an
   **unguessable one-time capability token** with a **short expiry**; the server **validates every
@@ -376,8 +384,8 @@ bounds the child's.
   reuse — `winjob` is job objects, not ACLs); keep the serde-only footprint.
 - **Claim discipline:** the remaining `[assumed]` items — the Codex provider-var list and the exact
   UUID/method probe surface each CLI exposes — are the two things to verify while building; each fails
-  closed if the assumption is wrong, and the controlled-allowlist child environment means an unknown
-  provider var is absent rather than merely un-scrubbed.
+  closed if the assumption is wrong, and the cleared-plus-allowlist child environment means an unknown
+  provider var is simply absent rather than relied upon to have been removed.
 
 ## Resolved questions (from review)
 

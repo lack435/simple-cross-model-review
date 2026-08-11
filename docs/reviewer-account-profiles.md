@@ -262,17 +262,19 @@ These are the traps that will make an implementation subtly wrong if skipped:
    so no inherited provider key is present to win over the profile OAuth. (Exact allowlist in the
    implementation plan.)
 
-   The enumerated scrub list is **version-pinned and cannot be trusted as complete** — a future
-   reviewer release could add a provider variable this list misses. So the enumeration is the first
-   line, not the guarantee: **the guarantee is a pre-spawn identity assertion.** Before the review
-   invocation, the preflight must **assert the resolved auth method and account match the profile**,
-   failing closed on a mismatch — which catches any provider variable the scrub list missed, because a
-   bypass shows up as a resolved account that is not the profile's. It runs *before* the child spawns,
+   The controlled environment is the first line, not the guarantee — the enumerated provider-variable
+   names are **version-pinned and cannot be trusted as complete** (a future reviewer release could add
+   one). Because the child starts from a cleared environment plus a vetted allowlist, an unknown
+   provider variable is simply absent; and **the guarantee is a pre-spawn identity assertion.** Before
+   the review invocation, the preflight must **assert the resolved auth method and account match the
+   profile**, failing closed on a mismatch — which catches any provider variable that ever did slip
+   through, because a bypass shows up as a resolved account that is not the profile's. It runs *before*
+   the child spawns,
    so the first request cannot go out under the wrong account; a separate post-review check is only
-   the residual mid-run *switch* guard, not this assertion. The list must be pinned to the supported
-   reviewer version and each provider-auth path tested; the assertion is what makes an incomplete list
-   safe rather than silently wrong. (Probe mechanics — UUID-level identity, fail-closed on unknown
-   output — are specified in the implementation plan.)
+   the residual mid-run *switch* guard, not this assertion. The provider-variable list must be pinned
+   to the supported reviewer version and each provider-auth path tested; the assertion is what makes an
+   incomplete list safe rather than silently wrong. (Probe mechanics — UUID-level identity, fail-closed
+   on unknown output — are specified in the implementation plan.)
 
    **The assertion must be an *exact identity probe*, run per spawn.** [f2] Today's preflight is too
    weak to serve as that assertion: `claude auth status` reports the account *email / org name* while
