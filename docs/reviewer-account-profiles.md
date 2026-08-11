@@ -206,6 +206,14 @@ the reviewer and the setup tool run as the same OS user as everything else.
    config was applied — or require explicit confirmation whenever `--cwd` is supplied — and keep the
    authorization store itself under a fixed, ACL-protected location, not one the repo can point at.
 
+   [f9] Symmetrically, an allowlist entry authorizes a **resolved target, not a name**. `Profile(name)`
+   resolves through `%CROSS_REVIEW_HOME%`, so approving the *name* for a root would let a later base
+   change point the same approved name at a different canonical home/account on a *fresh* review — the
+   selection path that f7's resume-identity binding does not cover. So an entry binds
+   `(immutable root) → (canonical effective home + reviewer family)` — or a stable profile id anchored
+   to a trusted root — and a change to that mapping forces reauthorization rather than silently
+   inheriting the old approval.
+
 2. **The reviewer can read the profile credential store; ACLs do not stop it.** [f4] The Codex
    reviewer runs as the same user, and — per the README — its read-only posture confines *writes*,
    not *reads*; no CLI surface was found that confines its reads. So a prompt-injected review of a
@@ -331,7 +339,10 @@ refuse) is an open decision below.
    or scope the reviewer's reads away from the credential homes. This is the load-bearing security
    decision — it bounds where profiles may be used at all.
 2. **Profile-use authorization** ([Trust boundaries](#trust-boundaries) point 1): a per-machine
-   allowlist keyed by working root, a first-use confirmation, or both.
+   allowlist, a first-use confirmation, or both. Whichever form, the invariant is fixed, not open:
+   the key is the immutable launch/repository root (never a repo-settable `--cwd`), and the authorized
+   target is the canonical effective home + reviewer family (never a bare name), reauthorized when
+   that mapping changes.
 3. **Setup surface:** MCP tool only to start, or ship the localhost manager page in the first cut.
    (Leaning tool-only first — gated on the login protocol and the human-authorization gate being
    specified and tested.)
