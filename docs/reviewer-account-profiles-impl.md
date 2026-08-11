@@ -135,15 +135,19 @@ sites to convert:
   resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
   fingerprint-keyed cache would still miss a same-account auth-*method* change or a newly-introduced
   provider var, so the assertion is not cacheable at all.
-- **[f4] The assertion must be atomic with the invocation it guards.** The probe runs in a child
-  before the review child; a concurrent re-login (a setup, or an external `codex login`) could swap the
-  home's account from A to B *between* the probe and the review spawn, so the first request goes out
-  under B and is only caught post-hoc by the switch guard (after billing). Close the window: take the
-  **per-home lock in shared/read mode across probe → review-child launch** (the same OS lock setup
-  takes exclusively, §Phase 3), so an account-changing operation cannot interleave; equivalently, bind
-  a **generation token** read with the probe (e.g. the credential file's identity + mtime) and
-  re-verify it is unchanged immediately before spawn, failing closed on any change. The probe's
-  asserted identity is the one carried to the post-review switch guard [f4-Phase-3].
+- **[f4/f5] Authorization, probe, and spawn are one atomic critical section under the per-home lock.**
+  The probe runs in a child before the review child; a concurrent re-login (a setup, or an external
+  `codex login`) could swap the home's account from A to B, so the first request goes out under B and
+  is only caught post-hoc by the switch guard (after billing). [f5] It is not enough to lock only
+  probe→spawn: if authorization (the allowlist tuple/fingerprint check) runs *before* the lock, a
+  re-login can change A→B in the gap, and the later probe then compares B against the current file
+  (also B) and passes — launching without ever rechecking that B matches the stored-A tuple. So the
+  order is: **acquire the per-home lock (shared/read) → check the full allowlist tuple including the
+  account fingerprint → probe identity+method → launch the review child, all while holding the lock**;
+  the exclusive setup lock cannot interleave. Equivalently, carry a **generation token** read at the
+  authorization check (credential-file identity + mtime) and re-verify it is unchanged at both probe
+  and spawn, failing closed on any change. The identity asserted here is the one carried to the
+  post-review switch guard.
 
 ### Phase 1 authorization at the resolution choke point
 
@@ -344,8 +348,8 @@ credential file is genuinely inside it.
   home:
   - **Authorize-only** (home exists, already logged in, just needs this repo authorized): the common
     "add this repo to my existing `work` profile" case. It **touches neither the credential home nor
-    the login** — it runs the identity probe read-only and commits the allowlist entry. No dir
-    creation, so nothing to roll back.
+    the login** — its commit prerequisite is a **successful read-only identity probe** (no vendor
+    login), then it commits the allowlist entry. No dir creation, so nothing to roll back. [f6]
   - **First provision** (no home yet): create the dir, login, confirm, commit. Rollback deletes the
     dir **because this run created it**.
   - **Re-login existing** (home exists, re-authenticating / switching account): use **staged
@@ -356,13 +360,14 @@ credential file is genuinely inside it.
 - New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine: classify the operation
   (above) → validate the name → **human approval** (below) → [provision/stage as needed] → confirm the
   resolved account → **only then commit the allowlist entry**.
-- **[f18] Approval authorizes the *intent*; the allowlist commits only after login + identity
-  confirmation.** Human approval does **not** itself write the allowlist entry — it moves the profile
-  into a **provisional/in-setup** state and lets login proceed. The `(launch_root → effective_home +
-  reviewer_family + fingerprint)` entry is committed only after the vendor login succeeds *and* the
-  identity probe confirms the account. A profile still in setup is **refused by
-  `resolve_authorized_home`** (in-setup ≠ authorized), so a half-finished setup can never route a
-  review.
+- **[f18/f6] Approval authorizes the *intent*; the commit prerequisite depends on the operation.**
+  Human approval does **not** itself write the allowlist entry — it moves the profile into a
+  **provisional/in-setup** state. For **first-provision** and **re-login**, the `(launch_root →
+  effective_home + reviewer_family + fingerprint)` entry commits only after the vendor login succeeds
+  *and* the identity probe confirms the account; for **authorize-only**, there is no login step, so the
+  prerequisite is the read-only identity probe alone [f6]. In every case a profile still in setup is
+  **refused by `resolve_authorized_home`** (in-setup ≠ authorized), so a half-finished setup can never
+  route a review.
 - **[f21] The setup identity confirmation runs through the provisioning path, not the review path.**
   Confirming the just-logged-in account cannot call `resolve_authorized_home` (it would reject the
   as-yet-unauthorized profile) and must not bypass the choke point ad hoc. Factor the probe into a
