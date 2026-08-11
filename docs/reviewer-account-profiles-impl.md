@@ -54,13 +54,20 @@ identity is the counter-example to follow in reverse: the profile *is* identity,
   authorization (that is Phase 3).
 - **Effective-home resolution** (new `fn effective_home(base, reviewer, &ProfileSelector) ->
   Result<Option<PathBuf>>`): `Ambient` → `None` (inherit). `Named(n)` →
-  `{base}\profiles\{reviewer}\{n}`, then the same hardening `codex_sterile_dir` already applies
-  (`src/reviewer/mod.rs` ~428): canonicalize, **reject reparse points** (`file_attributes() &
-  0x400`), **canonical containment** under the profile root via `is_within`. `ExplicitHome(p)` →
-  canonicalize + reparse-reject, no containment (it is deliberately outside the root) but
-  local/trusted-only (Phase 3 gates it). `base` = `%CROSS_REVIEW_HOME%`, else
-  `%LOCALAPPDATA%\cross-review` — **[decided]** deliberately *not* `--state-dir`, which is
-  user/repo-settable and must never determine a credential home.
+  `{base}\profiles\{reviewer}\{n}`. `ExplicitHome(p)` → its own canonical form; no containment (it is
+  deliberately outside the root) but local/trusted-only (Phase 3 gates it). `base` =
+  `%CROSS_REVIEW_HOME%`, else `%LOCALAPPDATA%\cross-review` — **[decided]** deliberately *not*
+  `--state-dir`, which is user/repo-settable and must never determine a credential home.
+- **[f5] Do NOT reuse `codex_sterile_dir` unchanged.** That function
+  (`src/reviewer/mod.rs` ~487) canonicalizes *before* testing the reparse attribute and checks
+  containment against `cfg.cwd` — safe for its own use (a temp-parented dir it owns), wrong for a
+  credential home. The profile check must instead: **reject a reparse point on each *original* path
+  component** before canonicalization (a junction at the pre-canonical path resolves to an ordinary
+  directory and would pass a post-canonical test), enforce **containment under the profile root**
+  (not `cfg.cwd`), and close the create/check TOCTOU with **handle-based / no-follow Windows APIs**
+  (open with `FILE_FLAG_OPEN_REPARSE_POINT` and inspect, rather than path-check-then-create). Write
+  this as a dedicated `secure_profile_dir` helper with its own tests; note in passing that
+  `codex_sterile_dir`'s ordering is worth a separate look but is out of scope for this PR.
 - **`Config::reviewer_home(spec) -> Option<PathBuf>`**: the resolved effective home for an entry, or
   `None` for `Ambient`. Single source of truth for the read sites below.
 
@@ -88,37 +95,54 @@ env only for `Ambient`. Call sites to convert:
 - **Set the home per-`Command`** ([design requirement 4], never `std::env::set_var`): in `invocation`
   *and* `auth_check`, when `reviewer_home(spec)` is `Some(home)`, `cmd.env("CODEX_HOME"/
   "CLAUDE_CONFIG_DIR", home)`. `Ambient` sets nothing (byte-for-byte today's behaviour).
-- **Scrub conflicting provider vars** ([design requirement 1]) via `cmd.env_remove(...)` on the child:
-  Claude `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`; Codex **[assumed]**
-  `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`. The list is version-pinned and treated as
-  possibly-incomplete — the assertion below is the guarantee.
-- **Exact resolved-account assertion** ([design requirements 1, f2]): after `auth_check`, compare the
-  account the CLI reports it is authenticated as against the account in the profile home's credential
-  file (`account_fingerprint`). Two sub-parts, both **deferred-to-impl to verify exact fields**:
-  (a) the CLI-reported identity must be extracted at a granularity that is *comparable* to the file
-  fingerprint — `claude auth status` reports email/org *name* while the fingerprint is the UUID
-  (`src/reviewer/claude.rs` ~454), so the probe compares on a common field (email+org) or obtains the
-  UUID, pinned to a known output shape and failing closed on anything unrecognised; (b) it asserts
-  the auth *method* is the subscription OAuth, not an API key that slipped the scrub. Only `Ambient`
-  skips the assertion.
-- **Run the assertion per spawn, not from a stale cache** ([f3]): the preflight cache
-  (`ensure_entry_ready`, `src/tools.rs` ~52, keyed by entry index, cached for process lifetime) must
-  not let a review reuse a success after a profile was re-authenticated under the running server.
-  **[decided]** the cache key (or the cached `Preflight`) includes the current account fingerprint,
-  revalidated cheaply before reuse; a fingerprint change misses the cache and re-runs auth+assertion.
+- **[f2/f3] Controlled child environment, not a denylist scrub.** Because the provider-var list is
+  admittedly incomplete, removing known names is not enough. For a non-`Ambient` child, build the
+  environment from a **vetted allowlist** — carry the OS essentials the CLI needs to run on Windows
+  (`SystemRoot`, `windir`, `PATH`, `TEMP`/`TMP`, `USERPROFILE`, `APPDATA`/`LOCALAPPDATA`,
+  `PATHEXT`, `NUMBER_OF_PROCESSORS`, etc.) plus the profile home var, and let **no** provider-auth
+  variable through. The known set (Claude `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN`; Codex `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`) is
+  belt-and-braces on top. The allowlist is the primary guarantee: an unknown future provider var
+  simply is not present to override the home.
+- **[f3] Exact, typed, per-spawn identity + method assertion — and it is a hard prerequisite for
+  enabling named profiles.** `auth_check`'s current probes cannot establish identity: Claude reports
+  email/org *display* fields and accepts any `authMethod` and even unrecognised-but-successful output
+  (`src/reviewer/claude.rs` ~47-72); `codex login status` is exit-status-only with no account id
+  (`src/reviewer/codex.rs` ~37-51); the fingerprint is UUID-level (`accountUuid`/`organizationUuid`,
+  `tokens.account_id`). So define a **typed `ResolvedIdentity { account, method }`** obtained at
+  **UUID granularity** from the CLI's own machine output, **version-pinned**, that **fails closed**
+  when the output is unrecognised or the method is not the subscription OAuth. Assert
+  `resolved.account == account_fingerprint(profile_home)` and `resolved.method == subscription`
+  before the review is delivered. **[deferred-to-impl, prerequisite]** the exact UUID/method surface
+  each CLI exposes must be found while building (candidate: a JSON auth-status mode, or the account
+  id echoed in the run's own result/rollout); if none exists, named profiles cannot be safely
+  enabled and the phase stops there rather than shipping a display-name approximation.
+- **[f2/f3] Never cache the assertion.** The preflight cache (`ensure_entry_ready`, `src/tools.rs`
+  ~52, keyed by entry index, cached for process lifetime) may cache **only resolution data** (the
+  resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
+  fingerprint-keyed cache would still miss a same-account auth-*method* change or a newly-introduced
+  provider var, so the assertion is not cacheable at all.
 
-### Phase 1 authorization stub
+### Phase 1 authorization at the resolution choke point
 
-`fn profile_authorized(cfg, spec) -> bool` returns `false` whenever the selector is non-`Ambient`
-(no store yet). The routing path refuses a profile use with an actionable failure (`PROFILE_NOT_
-AUTHORIZED`, pointing at the not-yet-shipped setup). `Ambient` is always allowed. Phase 3 replaces
-the body.
+**[f1] Authorization is enforced where the home is resolved, so it covers every profile-dependent
+path — not bolted onto one "routing" call.** Introduce `resolve_authorized_home(cfg, spec) ->
+Result<Option<PathBuf>, Failure>` as the *only* way any code obtains a profile home:
+`Ambient` → `Ok(None)`; a non-`Ambient` selector → resolve the effective home, then check
+authorization and return `Err(PROFILE_NOT_AUTHORIZED)` (actionable, pointing at the not-yet-shipped
+setup) unless approved. In Phase 1 the check is a deny-all stub for non-`Ambient`; Phase 3 fills it.
+Every profile-dependent site must obtain the home through this function *before* reading it or
+letting it influence a decision, and the authorization check must precede the preflight-cache
+lookup. Enumerated sites to route through it: **fresh selection / the usage gate
+(`gate`/`usage_headroom_key`), `status`, the resume `auth_check` path, fallback-entry execution, and
+every read site from the section above.** No path may read a profile home it has not authorized.
 
 ### Phase 1 tests (`cargo test`, no network)
 
 - `validate_profile_name`: accept/reject table (`.`, `..`, `a/b`, `..\\x`, `C:x`, empty, valid).
-- `effective_home`: containment holds; a traversal name, a rooted/drive name, and a reparse point
-  are refused; `%CROSS_REVIEW_HOME%` override honoured; `Ambient` → `None`.
+- `effective_home` / `secure_profile_dir`: containment holds; a traversal name, a rooted/drive name,
+  and a reparse point **on an original (pre-canonical) component** are refused; `%CROSS_REVIEW_HOME%`
+  override honoured; `Ambient` → `None`.
 - argv/env inspection (extend `src/reviewer/argv_tests.rs`): `CODEX_HOME`/`CLAUDE_CONFIG_DIR` set on
   the child for a named profile; the provider vars are `env_remove`d; **`Ambient` sets and removes
   nothing** (regression guard).
@@ -138,8 +162,8 @@ where **`None` means a legacy record** (`raw_bin`/`resolved_bin` are the exact p
 ```
 struct ProfileIdentity {          // serialized tagged
     selector: ProfileSelectorId,  // Ambient | Named(name) | ExplicitHome
-    effective_home: Option<String>,   // canonical resolved home; None only for Ambient
-    account_fingerprint: String,      // the account that actually ran
+    effective_home: Option<String>,       // canonical resolved home; None only for Ambient
+    account_fingerprint: Option<String>,  // the account that ran; see per-variant contract below
 }
 ...
 #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +173,16 @@ pub profile_identity: Option<ProfileIdentity>,
 [f1] The tag is what separates a **new `Ambient`** session (persists `Some(ProfileIdentity{ selector:
 Ambient, .. })`, resumes normally) from a **legacy** record (`profile_identity: None`, fail-closed
 non-resumable). Reserving `None` for legacy is the whole point — do not represent ambient as absence.
+
+[f8] **`account_fingerprint` is `Option` because the existing `account_fingerprint()` API returns
+`Option<String>` and usage accounting treats absence as normal — but the *session contract is
+per-variant*, and a missing value is never a wildcard:**
+- `Ambient`: no account binding (there is no profile). Resume matches on the `Ambient` tag alone,
+  exactly today's no-profile behaviour; `effective_home`/`account_fingerprint` are `None` and are not
+  compared.
+- `Named` / `ExplicitHome`: the fingerprint is **required**. If it could not be read at record time,
+  or is absent/unreadable at resume, the resume **fails closed** (`SESSION_NOT_RESUMABLE`) — a named
+  profile whose identity cannot be established is refused, never resumed under an assumed account.
 
 [f7] `effective_home` is the *canonical resolved home*, not the name: the same `Named(work)` resolves
 to different homes under different `%CROSS_REVIEW_HOME%`, and the account fingerprint alone catches a
@@ -179,26 +213,42 @@ use). A fresh resolution here mirrors the `resolved_bin` re-resolution already d
 
 A per-machine store under `%CROSS_REVIEW_HOME%` / `%LOCALAPPDATA%\cross-review` — **[decided]** a
 fixed, ACL-protected location the repo cannot point at (never `--state-dir`). Entries bind
-**[f8/f9]** `(immutable root) → (canonical effective home + reviewer family)`. **[assumed / design
-point for the reviewer]** the *immutable root* is the server's own launch cwd captured at process
-start, before any repo-supplied `--cwd` is applied (`src/config.rs` ~765/829 read `--cwd`); if the
-launch cwd cannot be established independently of repo config, fall back to requiring an explicit
-confirmation whenever `--cwd` is supplied. A change to the mapping forces reauthorization.
+`(immutable root) → (canonical effective home + reviewer family)`.
+
+**[f7, resolved] Capture the immutable launch root now, at process start.** The reviewer confirmed
+the process-start CWD *is* available independently of `--cwd` — `--cwd` only sets `Config::cwd`. So
+`main.rs` reads and canonicalizes `std::env::current_dir()` **before** `Config::from_args`, and stores
+it explicitly (e.g. `Config::launch_root`). The allowlist keys on `launch_root`, **never**
+`Config::cwd`. **[decided]** define `--cwd`'s effect: when `--cwd` is supplied (the review root
+differs from the launch root), that is an out-of-band redirection and requires its own explicit
+confirmation rather than silently inheriting the launch root's authorization. A change to the
+`launch_root → effective_home` mapping forces reauthorization.
 
 ### Profile-dir provisioning + ACL
 
-Create the profile home with an ACL restricted to the current user. **[decided]** reuse the FFI
-approach `src/winjob.rs` already uses for job objects rather than adding a crate; if a direct
-`SetNamedSecurityInfo`/`icacls` path is simpler and dependency-free, note it. Apply the same
-canonicalize + reparse-reject + containment checks as `effective_home`.
+**[f6] Specify the ACL fully; this dir will hold credentials.** Create the profile home and set a
+DACL that grants only the current-user SID (plus SYSTEM and Administrators per Windows norms) and
+**removes inheritance** — `SetNamedSecurityInfo` with `DACL_SECURITY_INFORMATION |
+PROTECTED_DACL_SECURITY_INFORMATION`, an ACL built with `InitializeAcl` + explicit
+`AddAccessAllowedAce` for each SID (current user from the process token via
+`OpenProcessToken`/`GetTokenInformation(TokenUser)`). **[decided]** implement via direct
+`windows`/`windows-sys` FFI in the style of `src/winjob.rs` (which is job-object FFI, *not* ACL code —
+so this is new, not a reuse); **no `icacls`/shell fallback** (unspecified shell-outs are the thing to
+avoid). **Verify** the resulting DACL after setting it and **fail closed** (refuse to write any
+credential) on any error. Use the `secure_profile_dir` reparse/containment/TOCTOU helper from Phase 1,
+not `codex_sterile_dir`.
 
 ### Wire authorization + the guardrail
 
-- `profile_authorized` (the Phase 1 stub) now consults the store: a non-`Ambient` selector is allowed
-  only with a matching `(immutable root → effective home)` entry; otherwise `PROFILE_NOT_AUTHORIZED`
-  with a remediation pointing at the setup tool.
-- Guardrail ([design "refuse on mismatch"]): the post-review `account_fingerprint` re-check refuses
-  (does not deliver) on a mid-review account switch.
+- `resolve_authorized_home` (the Phase 1 choke point) now consults the store: a non-`Ambient` selector
+  is allowed only with a matching `(launch_root → effective home)` entry; otherwise
+  `PROFILE_NOT_AUTHORIZED` with a remediation pointing at the setup tool.
+- **[f4] The guardrail needs an explicit *expected* identity captured at start.** Detecting an
+  A→B mid-review switch requires comparing the *final* fingerprint against the account asserted **at
+  spawn** (A), not against a fresh reread of the profile file — a reread would compare B with itself
+  and pass. So the start fingerprint asserted in Phase 1 is carried through the run (on the
+  `Preflight`/job context) and the post-review check compares final-vs-start, **rejecting before the
+  review is recorded or delivered**. Test the explicit switch case.
 
 ### Setup MCP tool + one-off localhost confirmation page
 
@@ -206,10 +256,14 @@ canonicalize + reparse-reject + containment checks as `effective_home`.
   (below), creates the ACL'd dir, spawns the vendor login with the home env set (`codex login` /
   `claude` sign-in) which opens the browser OAuth, polls the credential file, confirms the resolved
   account, and writes the allowlist entry.
-- **Human-authorization gate** ([design point 3, f6]): a tiny `std::net` localhost listener serves a
-  single-purpose approve page ("authorize root X → profile `work`? [approve]"), opened with
-  `ShellExecute`/`start`; approval writes the allowlist entry / proceeds with login. No GUI crate; no
-  credential field of our own — sign-in is always the vendor page.
+- **[f9] The localhost human-authorization page is an attack surface; specify its invariants.** Bind
+  the listener to **loopback only** (`127.0.0.1`, ephemeral port). The approval URL carries an
+  **unguessable one-time capability token** with a **short expiry**; the server **validates every
+  request** (method, path, token, single-use) and matches the `(root, profile)` **server-side** from
+  state it holds, never trusting page/query parameters. All interpolated values are **HTML/URL
+  escaped**. The page is opened with `ShellExecute`/`start`; approval consumes the token and writes
+  the allowlist entry. No GUI crate; no credential field of our own — sign-in is always the vendor
+  page.
 - **Redaction:** the login subprocess's stdout/stderr may echo tokens/URLs; captured for
   liveness/timeout only, never logged or returned.
 - **[deferred-to-impl, from the design]** exact login command per reviewer, non-TTY browser callback
@@ -222,7 +276,10 @@ canonicalize + reparse-reject + containment checks as `effective_home`.
 - `profile_authorized` denies without an entry, allows with one; `ExplicitHome` gated the same way.
 - ACL applied to a created dir (best-effort / permissions-visible assertion).
 - setup tool state machine with a mocked login (no real OAuth in unit tests).
-- guardrail refuses on a simulated fingerprint switch.
+- guardrail refuses on a simulated start→final fingerprint switch (compares against the captured
+  start identity, not a reread).
+- localhost approval: a request with a missing/expired/reused token is rejected; the `(root, profile)`
+  is matched server-side, not from query params.
 - **`smoke.ps1`** end-to-end once, since Phase 3 touches spawning and the MCP surface (real login,
   costs tokens — flagged to the user).
 
@@ -232,19 +289,21 @@ canonicalize + reparse-reject + containment checks as `effective_home`.
 
 - **Build/test discipline:** `.\build.ps1` (fmt, clippy `-D warnings`, tests, release) before handing
   each phase back; `smoke.ps1` only for Phase 3. Never commit `dist\cross-review.exe`.
-- **Ethos:** no new crate unless unavoidable; ACL/FFI reuses `winjob`'s approach; keep the
-  serde-only footprint.
-- **Claim discipline:** the `[assumed]` items — the Codex provider-var list, the exact-identity probe
-  fields, and the immutable-launch-root mechanism — are the three things to verify while building,
-  and each fails closed if the assumption is wrong.
+- **Ethos:** no new crate unless unavoidable; the ACL work is new FFI in `winjob`'s *style* (not a
+  reuse — `winjob` is job objects, not ACLs); keep the serde-only footprint.
+- **Claim discipline:** the remaining `[assumed]` items — the Codex provider-var list and the exact
+  UUID/method probe surface each CLI exposes — are the two things to verify while building; each fails
+  closed if the assumption is wrong, and the controlled-allowlist child environment means an unknown
+  provider var is absent rather than merely un-scrubbed.
 
-## Open questions for the reviewer
+## Resolved questions (from review)
 
-1. **Immutable launch root:** is the server's process-start cwd reliably knowable independently of a
-   repo-supplied `--cwd`, so the allowlist can key on it? If not, is confirm-on-`--cwd` an acceptable
-   substitute, or is there a better host-provided root?
-2. **Assertion granularity:** is comparing Claude's `auth status` email/org against the profile
-   file's account acceptable, or must the probe obtain the UUID-level identity to match
-   `account_fingerprint` exactly?
-3. **Phase boundaries:** is folding Phase 2 into Phase 1 preferable (identity is cheap once the home
-   is threaded), or is the smaller first diff worth the extra round?
+1. **Immutable launch root — resolved:** the process-start cwd *is* available before `--cwd` parsing;
+   capture and canonicalize it in `main.rs` before `Config::from_args`, key the allowlist on it, and
+   require explicit confirmation when `--cwd` is supplied. (Phase 3.)
+2. **Assertion granularity — resolved:** email/org display comparison is **not** sufficient; a typed,
+   version-pinned **UUID-level** identity + OAuth-method probe that fails closed when unavailable is
+   required, and is a prerequisite for enabling named profiles. (Phase 1.)
+3. **Phase boundaries — decided:** keep Phase 2 (session identity) separate from Phase 1. Given the
+   depth the identity/fail-closed contract turned out to need (`f8`), the smaller first diff is worth
+   the extra gate round rather than bundling it into an already-large routing-core PR.
