@@ -151,11 +151,18 @@ Requirements on our handling of those files:
   (`codex_account_id`, `src/reviewer/codex.rs` ~374-383; `claude_account_id`,
   `src/reviewer/claude.rs` ~454-463) and extracts a single id field. Keep that: read only the
   account-identifier field, never surface token fields, never echo the file.
-- **Minimize parsing** and treat a malformed file as "unknown account" (fail-open on identity read,
-  as today), never as a hard error that leaks the offending contents.
+- **Minimize parsing**, and never turn a malformed file into a hard error that leaks the offending
+  contents. But the *failure direction of an unreadable identity depends on what it is for*, and the
+  two must not be conflated:
+  - **Usage accounting fails open.** An unknown account for the usage-log key degrades to `Unknown`,
+    exactly as today (`Headroom::Unknown` never gates) — a missing identity must not block a review.
+  - **Preflight and resume fail closed.** The auth-method assertion (requirement 1) and the resume
+    identity comparison (requirement 3) must reject an unreadable or mismatched identity
+    (`SESSION_NOT_RESUMABLE` for resume), never proceed under an assumed account. These are security
+    checks, not accounting, so "unknown" here means *stop*, not *continue*.
 - **Define locking and cleanup:** the vendor refresh writes the file concurrently with our reads; a
-  read must tolerate a partial write (retry / treat as unknown), and profile deletion must remove the
-  ACL'd tree.
+  read must tolerate a partial write (retry, then apply the direction above for its purpose), and
+  profile deletion must remove the ACL'd tree.
 
 ### Subscription implications (all accepted, none blocking)
 
@@ -175,11 +182,19 @@ These are the traps that will make an implementation subtly wrong if skipped:
    and `CLAUDE_CODE_OAUTH_TOKEN` *ahead* of the subscription OAuth credentials in `CLAUDE_CONFIG_DIR`
    (per its authentication docs). So pointing `CLAUDE_CONFIG_DIR` at the work profile is defeated if
    any of those is present in the inherited environment — the review silently uses the wrong
-   credential. Codex has the analogous `OPENAI_API_KEY`. The child `Command` must therefore start
-   from a controlled environment for these variables (remove/override the provider keys so the
-   profile OAuth wins), and the preflight must **assert the resolved auth method and account match
-   the profile** (`auth_check` already reports `authMethod`/account for Claude), failing closed on a
-   mismatch rather than proceeding under whatever won.
+   credential. Codex has analogous variables — **[assumed]** at least `OPENAI_API_KEY`,
+   `CODEX_API_KEY`, and `CODEX_ACCESS_TOKEN`. The child `Command` must therefore start from a
+   controlled environment for these variables (remove/override the provider keys so the profile OAuth
+   wins).
+
+   The enumerated scrub list is **version-pinned and cannot be trusted as complete** — a future
+   reviewer release could add a provider variable this list misses. So the enumeration is the first
+   line, not the guarantee: **the guarantee is the post-spawn assertion.** The preflight must
+   **assert the resolved auth method and account match the profile** (`auth_check` already reports
+   `authMethod`/account for Claude), failing closed on a mismatch — which catches any provider
+   variable the scrub list missed, because a bypass shows up as a resolved account that is not the
+   profile's. The list must be pinned to the supported reviewer version and each provider-auth path
+   tested; the assertion is what makes an incomplete list safe rather than silently wrong.
 
 2. **Thread the resolved home through *every* read site, not just the obvious three.** The profile
    home must be one value in `Config` that all of these read — auditing every `codex_home()` /
@@ -222,13 +237,15 @@ refuse) is an open decision below.
   Codex session is signed into. That is chosen at launch, before `cross-review` runs, and belongs to
   the host tool. This holds regardless of the host's internal auth-resolution details.
 - **Routing the caller's account per repo (e.g. `apiKeyHelper`, launch-env wiring).** Dropped with
-  the caller half. **[assumed, version-dependent]** We understand a committed `.claude/settings.json`
-  cannot reliably redirect Claude Code's *own* auth for a session (its `env` block is documented as
-  applying to the session's subprocesses, and `CLAUDE_CONFIG_DIR` is resolved early), but this is
-  host behaviour we have **not** version-tested and do not control, so the plan makes no load-bearing
-  claim about the mechanism — only that the caller account is not ours to route. (`CLAUDE_CONFIG_DIR`
-  *does* relocate credentials when set in the process environment before launch — that much is
-  agreed; it is the settings-file redirection specifically that is unverified.)
+  the caller half. How the host resolves its *own* auth — including whether a committed
+  `.claude/settings.json` can redirect it — is host behaviour that varies across host versions;
+  `cross-review` neither relies on nor asserts any particular mechanism here, so this plan makes **no
+  claim** about it (the earlier draft's statement about `.claude/settings.json` `env` scope is
+  removed as unverified rather than replaced with the opposite). The only claim is scope: the caller
+  account is not ours to route. Distinct and not a host claim: `CODEX_HOME` / `CLAUDE_CONFIG_DIR` set
+  in a *process's own environment before launch* relocate that process's credential store — that is
+  exactly the mechanism this plan uses for the reviewer child, verified for the reviewer, and says
+  nothing about how any host process behaves.
 - **API-key auth.** All accounts in view are subscription OAuth. No key minting or distribution.
 
 ## Open decisions
