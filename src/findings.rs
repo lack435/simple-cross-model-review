@@ -846,8 +846,10 @@ pub fn running_structured_value(session: &str, turn: u32, progress: RunningProgr
     })
 }
 
-/// The `outputSchema` for `cross_model_review_result`: a discriminated `oneOf` over the running and
-/// completed variants. `additionalProperties: false` on each makes the two disjoint (a completed
+/// The `outputSchema` for `cross_model_review_result`: an object schema whose body is a discriminated
+/// `oneOf` over the running and completed variants. The top-level `type: object` is mandatory — the
+/// MCP client validates `outputSchema.type` and drops the entire tool list otherwise (see the note at
+/// the return). `additionalProperties: false` on each branch makes the two disjoint (a completed
 /// object carries the convergence group the running variant forbids, and vice versa), so exactly one
 /// branch matches. Kept here, next to the envelope it describes, so the two cannot drift.
 pub fn output_schema() -> Value {
@@ -919,7 +921,12 @@ pub fn output_schema() -> Value {
         ],
         "additionalProperties": false
     });
-    json!({ "oneOf": [completed, running] })
+    // Top-level `type: object` is required: the MCP client validates a tool's `outputSchema` as an
+    // object schema and rejects a bare top-level `oneOf` (no `type`) with
+    // `expected "object" (at ...outputSchema.type)`, which discards the whole tool list. The
+    // discriminated union stays in `oneOf`; both branches are themselves `type: object`, so the
+    // constraint is consistent and exactly one branch still matches.
+    json!({ "type": "object", "oneOf": [completed, running] })
 }
 
 /// The `_OUT` text block for a *running* result, bearing `nonce`. The same shared-renderer output
@@ -1914,6 +1921,9 @@ mod tests {
     #[test]
     fn output_schema_is_a_discriminated_running_completed_union() {
         let schema = output_schema();
+        // Top-level `type: object` is required by the MCP client; a bare `oneOf` gets the whole
+        // tool list rejected with `expected "object" (at ...outputSchema.type)`.
+        assert_eq!(schema["type"], json!("object"));
         let variants = schema["oneOf"].as_array().expect("oneOf array");
         assert_eq!(variants.len(), 2);
         // Completed variant discriminates on result_status and requires the coverage discriminator.
