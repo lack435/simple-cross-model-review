@@ -11,13 +11,16 @@ claim about other Codex releases. The probes used `codex-cli 0.144.5` on Windows
 full model id `gpt-5.6-luna`, low effort, `--sandbox read-only`, `--ignore-user-config`, and
 `--strict-config`. Successful probes made real model calls and cost tokens.
 
-## Fixture implemented
+## Phase 0 fixture (now replaced)
 
-`cross-review --evidence-probe-server <nonce> [approval-control]` is a temporary hidden MCP
+`cross-review --evidence-probe-server <nonce> [approval-control]` was a temporary hidden MCP
 mode handled before normal server configuration. It exposes exactly one closed-schema tool,
 `repository_scope`, which returns only its nonce, PID, schema version, and whether the process
 belongs to any Windows job. It constructs no `App`, exposes no review tool, and performs no
 filesystem, shell, write, or network operation.
+
+The product implementation removed that flag after these facts were established. Its hidden
+mode is now `--evidence-server <bundle> <nonce>` with the real seven-tool dispatcher.
 
 `approval-control` changes only MCP annotations so the otherwise harmless tool requires an
 approval under Codex's default `auto` mode. It exists to test whether an `approve` setting on
@@ -70,23 +73,44 @@ the evidence server leaks to a second server.
   strict-config/fresh/resume/collision probes exercised. Compatibility is behavior-gated as
   well: a CLI that rejects the strict config or cannot initialize the required server fails
   closed before a review verdict.
+- A fresh turn and an explicit-ID resume ran from the same newly created empty directory
+  outside any repository with `--skip-git-repo-check`, `--ignore-user-config`, and
+  `--ignore-rules`. Each turn loaded a newly injected evidence fixture and returned its new
+  nonce (`sterile-fresh`, then `sterile-resume`). The directory contained zero entries after
+  each turn, and both reported fixture PIDs had exited afterward. The CLI warning about an
+  unsupported PowerShell shell snapshot went to stderr and created no working-directory
+  artifact. These two real model turns used 96,654 input tokens (86,016 cached) and 295 output
+  tokens in total.
 
-Unit coverage verifies the fixture's nonce validation, initialize/tools-list surface,
-read-only annotations, approval-control annotations, structured scope result, and rejection
-of unknown tools/extra arguments. Formatting, clippy with `-D warnings`, all 525 unit tests,
-and a release build passed after the Phase 0 fixture and control were added.
+The Phase 0 fixture had unit coverage for nonce validation, initialize/tools-list, annotations,
+structured results, and malformed calls. The replacement service now covers bundle/schema/nonce
+validation, closed input and output schemas, bounded pagination and counters, path/device/ADS/
+junction rejection, UTF-8 and digest handling, hardened Git providers, sterile-root validation,
+fresh/resume argv identity, and evidence-specific failure classification.
 
-## Still required before product dependency
+A final real product smoke on `codex-cli 0.144.5` passed the no-model status handshake, fresh and
+explicit-ID resume evidence calls, detached-poll collection, explicit cancellation, evidence-child
+reaping, and the zero-shell-policy-denial assertion. The completed fresh/resume turns reported
+127,747 input tokens (108,032 cached) and 538 output tokens; the detached-poll review also completed
+and reported 267,547 input tokens (218,112 cached) and 843 output tokens.
 
-- Test forced cancel, timeout, parent crash, and provider-child cleanup. Normal EOF is not a
-  substitute for those paths.
-- Exercise both a fresh and resumed probe from the same verified sterile working directory.
-  Confirm the CLI leaves the directory empty after each turn and the resumed fixture remains
-  callable. The final product must perform the empty/outside/non-reparse preflight before
-  every turn; an unexpected Codex-created entry is an architecture failure, not an allow-list
-  exception.
-- Replace this temporary fixture with the real capability-bundle handshake and evidence
-  dispatcher; do not ship the fixture as the product service.
+The smoke found two lifecycle defects before that pass. First, a process-ID watcher treated the
+anonymous pipe owner as the durable Codex parent and closed a longer turn; a concurrent stdin reader
+now makes EOF the authoritative parent-death signal and can cancel an active provider while it is
+running. Second, a maximum 196 KiB change page was duplicated into both MCP `content` and
+`structuredContent`, producing a 398,516-byte envelope that crossed the 256 KiB transport cap and
+terminated the service. Results now put the complete page only in `structuredContent` with concise
+text, as the MCP contract intends, and any remaining envelope overflow is an in-band retryable tool
+error rather than transport death. A unit test fixes the maximum-page envelope at the real cap.
+
+## Product dependency gates
+
+- Keep the real smoke's explicit cancel and detached-poll cases, its evidence-child process check,
+  and the provider runner's kill-on-close job/cancellation tests green. The MCP stdin reader runs
+  concurrently with provider work, so parent EOF sets the same cancellation flag the provider
+  runner observes instead of waiting for the operation deadline.
+- Do not restore the temporary probe or make model-selected tool use an availability gate. The
+  no-model handshake plus Codex `required=true` startup are the deterministic gate.
 
 If any remaining check fails, amend the architecture and repeat the plan review before making
 the evidence service mandatory. Do not fall back to exec-policy allow rules.

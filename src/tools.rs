@@ -452,7 +452,7 @@ impl App {
         let prior = match prior {
             Some(record) => match self.cfg.resume_entry_index(&record) {
                 Some(entry) => {
-                    let now_mode = crate::reviewer::claude_cwd_mode(
+                    let now_mode = crate::reviewer::reviewer_cwd_mode(
                         &self.cfg,
                         self.cfg.reviewers[entry].reviewer,
                     );
@@ -1201,6 +1201,30 @@ impl App {
             ));
         }
 
+        if self
+            .cfg
+            .reviewers
+            .iter()
+            .any(|spec| spec.reviewer == crate::config::ReviewerKind::Codex)
+        {
+            match crate::evidence::readiness(&self.cfg) {
+                Ok(()) => out.push_str(&format!(
+                    "evidence:      ready (schema {}, {} read-only tools; no-model handshake passed)\n",
+                    crate::evidence::SCHEMA_VERSION,
+                    crate::evidence::TOOLS.len()
+                )),
+                Err(e) => {
+                    all_ready = false;
+                    out.push_str(&format!(
+                        "evidence:      NO - EVIDENCE_UNAVAILABLE ({e})\n"
+                    ));
+                }
+            }
+        }
+        if !multi && !all_ready {
+            out.push_str("overall ready: NO\n");
+        }
+
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
         out.push_str(&format!("turn timeout:  {}s\n", self.cfg.timeout.as_secs()));
         out.push_str(&format!(
@@ -1407,6 +1431,7 @@ struct CaptureOutputs<'a> {
     /// for git.
     capture_identity: Option<&'a crate::vcs::baseline::CaptureIdentity>,
     perforce_baseline: Option<&'a crate::vcs::baseline::PerforceBaseline>,
+    summary: Option<&'a crate::vcs::CaptureSummary>,
 }
 
 /// What the attempt that produced the outcome actually did, gathered for the usage record.
@@ -1805,6 +1830,7 @@ impl Job {
                     base_sha: base_sha.as_deref(),
                     capture_identity: capture_identity.as_ref(),
                     perforce_baseline: perforce_baseline.as_ref(),
+                    summary: capture_summary.as_ref(),
                 },
                 &capture_warnings,
                 &mut facts.prompt_bytes,
@@ -2060,6 +2086,7 @@ impl Job {
             base_sha,
             capture_identity,
             perforce_baseline,
+            summary,
         } = captured;
         let preamble = if self.cfg.no_preamble {
             None
@@ -2143,6 +2170,49 @@ impl Job {
             }
         }
 
+        // Codex runs outside the repository and receives repository context through a mandatory
+        // per-turn evidence capability. Build and handshake it before the findings write-ahead
+        // marker: any failure here starts no reviewer process and advances no conversation.
+        let evidence_setup = if self.spec.reviewer == crate::config::ReviewerKind::Codex {
+            let executable = std::env::current_exe().map_err(|e| {
+                errors::evidence_unavailable(format!(
+                    "cannot resolve the running cross-review executable: {e}"
+                ))
+            })?;
+            let sterile = if self.cfg.isolate_reviewer {
+                Some(
+                    crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
+                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let change_label = summary
+                .map(crate::vcs::CaptureSummary::summary)
+                .unwrap_or_else(|| "no selected change was captured".to_string());
+            let status_summary = if capture_warnings.is_empty() {
+                change_label.clone()
+            } else {
+                format!("{}\n{}", change_label, capture_warnings.join("\n"))
+            };
+            let bundle = crate::evidence::Bundle::create(
+                &self.cfg.cwd,
+                self.cfg.vcs,
+                &self.id,
+                change_label,
+                status_summary,
+                change.map(str::to_string),
+            )
+            .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            Some((executable, sterile, bundle_file))
+        } else {
+            None
+        };
+
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
         // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
         // detected and the ledger could go stale relative to the reviewer's advanced conversation,
@@ -2170,8 +2240,8 @@ impl Job {
         // working root. `None` (the common case) leaves both as they were.
         let neutral = crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer);
         let (neutral_root, context_paths): (Option<&std::path::Path>, std::borrow::Cow<[String]>) =
-            match &neutral {
-                Some(_) => (
+            match (&neutral, &evidence_setup) {
+                (Some(_), _) => (
                     Some(self.cfg.cwd.as_path()),
                     std::borrow::Cow::Owned(
                         self.context_paths
@@ -2180,8 +2250,19 @@ impl Job {
                             .collect(),
                     ),
                 ),
-                None => (None, std::borrow::Cow::Borrowed(&self.context_paths)),
+                (None, Some(_)) if self.cfg.isolate_reviewer => (
+                    Some(self.cfg.cwd.as_path()),
+                    std::borrow::Cow::Borrowed(&self.context_paths),
+                ),
+                (None, _) => (None, std::borrow::Cow::Borrowed(&self.context_paths)),
             };
+        // The isolated Codex change is available through repository_change. Do not duplicate it
+        // into the prompt (or let prompt size become the service's effective pagination limit).
+        let prompt_change = if evidence_setup.is_some() {
+            None
+        } else {
+            change
+        };
         let text = prompt::build(&PromptParts {
             instructions: &self.instructions,
             context_paths: &context_paths,
@@ -2190,7 +2271,7 @@ impl Job {
             resumed: resume_id.is_some(),
             preamble,
             capabilities,
-            change,
+            change: prompt_change,
             resumed_capture_note,
             // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
             // repository lookalike cannot know it. The prior-findings digest is built from the
@@ -2204,10 +2285,24 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let invocation = match self
-            .reviewer
-            .invocation(&self.cfg, &self.spec, &self.bin, resume_id, &self.id)
-        {
+        let evidence_invocation = evidence_setup
+            .as_ref()
+            .map(
+                |(executable, sterile, bundle)| crate::reviewer::EvidenceInvocation {
+                    executable,
+                    bundle_file: &bundle.path,
+                    nonce: &self.id,
+                    sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
+                },
+            );
+        let invocation = match self.reviewer.invocation(
+            &self.cfg,
+            &self.spec,
+            &self.bin,
+            resume_id,
+            &self.id,
+            evidence_invocation.as_ref(),
+        ) {
             Ok(inv) => inv,
             Err(e) => {
                 // Building the invocation failed (e.g. a temp last-message file could not be
@@ -2465,7 +2560,7 @@ impl Job {
                             terminal_reason: terminal_reason_to_persist.clone(),
                             // The working-directory mode this turn ran in, so a later resume can
                             // detect a mode change it cannot survive and rebind fresh.
-                            reviewer_cwd_mode: crate::reviewer::claude_cwd_mode(
+                            reviewer_cwd_mode: crate::reviewer::reviewer_cwd_mode(
                                 &self.cfg,
                                 self.spec.reviewer,
                             ),

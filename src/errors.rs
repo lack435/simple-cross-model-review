@@ -349,6 +349,19 @@ pub fn spawn_failed(reviewer: &str, bin: &str, detail: impl Into<String>) -> Fai
     .with_detail(detail)
 }
 
+pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "EVIDENCE_UNAVAILABLE",
+        "The isolated Codex evidence service could not be proved available, so the review was not started.",
+        "The Codex reviewer could not receive its required read-only repository evidence service. \
+         Check that this cross-review executable can start its hidden evidence mode, that the \
+         configured state/temp directory is writable, and that Codex supports strict required MCP \
+         server configuration. Then retry the review. Do not bypass the failure with reviewer shell \
+         allow rules; the review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
 pub fn reviewer_crashed(reviewer: &str, exit: Option<i32>, detail: impl Into<String>) -> Failure {
     let exit_desc = match exit {
         Some(c) => format!("exit code {c}"),

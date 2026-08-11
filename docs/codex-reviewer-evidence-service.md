@@ -1,6 +1,6 @@
 # Codex reviewer evidence service
 
-Status: proposed implementation plan for [issue #47](https://github.com/lack435/simple-cross-model-review/issues/47)
+Status: approved plan, implemented on `codex/issue-47-reviewer-evidence`
 
 ## Decision
 

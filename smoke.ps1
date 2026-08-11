@@ -202,21 +202,39 @@ try {
     Write-Host $statusText
     Assert-That 'status reports the tool is ready' ($statusText -match 'ready:\s+yes') `
         'the reviewer CLI is missing or not signed in; the rest of the smoke test cannot run'
+    if ($Reviewer -eq 'codex') {
+        Assert-That 'Codex evidence handshake is ready' `
+            ($statusText -match 'evidence:\s+ready \(schema 1, 7 read-only tools; no-model handshake passed\)') `
+            $statusText
+    }
 
     if ($statusText -notmatch 'ready:\s+yes') {
         throw 'reviewer not ready'
     }
 
     Write-Host "`n=== 4. a real review ===" -ForegroundColor Cyan
-    $start = Send-Rpc -Method 'tools/call' -Params @{
-        name      = 'cross_model_review'
-        arguments = @{
-            instructions  = @'
+    if ($Reviewer -eq 'codex') {
+        $firstInstructions = @'
+This is an automated smoke test of a review tool. Do not review any code. Do not use the shell.
+Call repository_scope, repository_list for the repository root, repository_search for the literal
+"cross-review", and repository_change. These calls test the repository evidence service.
+After they complete, reply with exactly two lines and nothing else:
+SMOKE-OK
+COUNTER=1
+'@
+    }
+    else {
+        $firstInstructions = @'
 This is an automated smoke test of a review tool. Do not review any code.
 Reply with exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=1
 '@
+    }
+    $start = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review'
+        arguments = @{
+            instructions  = $firstInstructions
             session       = 'smoke'
         }
     } -TimeoutSeconds 60
@@ -243,21 +261,36 @@ COUNTER=1
     Assert-That 'review completed without error' ($collected.result.isError -eq $false) $resultText
     Assert-That 'review reports completed status' ($resultText -match 'status:\s+completed') $resultText
     Assert-That 'the reviewer actually answered' ($resultText -match 'SMOKE-OK') $resultText
+    if ($Reviewer -eq 'codex') {
+        Assert-That 'fresh Codex turn used all requested evidence operations' `
+            ($resultText -match 'evidence service completed (?:[4-9]|[1-9][0-9]+) tool call') $resultText
+    }
     Assert-That 'review body is delimited' ($resultText -match 'BEGIN REVIEW') $resultText
     Assert-That 'the wait emitted MCP progress notifications' `
         ($script:progressMessages.Count -gt $progressBefore)
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
-    $resume = Send-Rpc -Method 'tools/call' -Params @{
-        name      = 'cross_model_review'
-        arguments = @{
-            instructions = @'
+    if ($Reviewer -eq 'codex') {
+        $resumeInstructions = @'
+Still the smoke test. Call repository_scope and repository_read for README.md lines 1-5; do not
+use the shell. Then increment the counter you reported before and reply with exactly two lines:
+SMOKE-OK
+COUNTER=2
+'@
+    }
+    else {
+        $resumeInstructions = @'
 Still the smoke test. Increment the counter you reported before.
 Reply with exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=2
 '@
+    }
+    $resume = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_review'
+        arguments = @{
+            instructions = $resumeInstructions
             session      = 'smoke'
         }
     } -TimeoutSeconds 60
@@ -281,6 +314,10 @@ COUNTER=2
     $resumeResult = Get-ToolText $collected2
     Assert-That 'resumed review completed' ($resumeResult -match 'status:\s+completed') $resumeResult
     Assert-That 'reviewer remembered the earlier turn' ($resumeResult -match 'COUNTER=2') $resumeResult
+    if ($Reviewer -eq 'codex') {
+        Assert-That 'resumed Codex turn recreated and used the evidence service' `
+            ($resumeResult -match 'evidence service completed (?:[2-9]|[1-9][0-9]+) tool call') $resumeResult
+    }
     Assert-That 'the resumed wait emitted MCP progress notifications' `
         ($script:progressMessages.Count -gt $resumeProgressBefore)
     Write-Host $resumeResult
@@ -407,6 +444,14 @@ COUNTER=2
     # anchor keeps reviewer prose from masking a review that really was still running.
     Assert-That 'the cancelled review is not still running' ($afterBText -notmatch '\Astatus:\s+running') $afterBText
 
+    Start-Sleep -Milliseconds 500
+    $evidenceChildren = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.CommandLine -and $_.CommandLine.Contains('--evidence-server') -and
+        $_.CommandLine.Contains($stateDir)
+    })
+    Assert-That 'cancel and completion reaped every evidence service child' `
+        ($evidenceChildren.Count -eq 0) (($evidenceChildren | Select-Object ProcessId,CommandLine | Out-String))
+
     $ping = Send-Rpc -Method 'ping' -TimeoutSeconds 30
     Assert-That 'the server is still healthy afterwards' ($null -ne $ping.result) `
         'the server stopped answering after handling a cancellation'
@@ -431,6 +476,10 @@ finally {
     if ($stderrText.Trim()) {
         Write-Host "`n--- server stderr ---" -ForegroundColor DarkGray
         Write-Host $stderrText -ForegroundColor DarkGray
+    }
+    if ($Reviewer -eq 'codex') {
+        Assert-That 'Codex smoke had zero shell policy denials' `
+            ($stderrText -notmatch 'rejected: blocked by policy') $stderrText
     }
     Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue
 }

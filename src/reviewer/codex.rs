@@ -58,11 +58,15 @@ impl Reviewer for CodexReviewer {
         bin: &Path,
         resume: Option<&str>,
         tmp_id: &str,
+        evidence: Option<&super::EvidenceInvocation<'_>>,
     ) -> std::io::Result<Invocation> {
+        let evidence = evidence.ok_or_else(|| {
+            std::io::Error::other("Codex invocation requires a verified evidence capability")
+        })?;
         let last_message_file = super::tmp_file(cfg, tmp_id, "codex-last.txt")?;
 
         let mut cmd = Command::new(bin);
-        cmd.current_dir(&cfg.cwd);
+        cmd.current_dir(evidence.sterile_dir.unwrap_or(&cfg.cwd));
         cmd.arg("exec");
 
         match resume {
@@ -79,6 +83,7 @@ impl Reviewer for CodexReviewer {
 
         cmd.arg("--json");
         cmd.arg("--skip-git-repo-check");
+        cmd.arg("--strict-config");
         cmd.args(["-m", &spec.model]);
         // Stated on every turn, including resumes, via the config override that `resume`
         // does accept. A resumed session does appear to retain the policy it was created
@@ -98,6 +103,59 @@ impl Reviewer for CodexReviewer {
             // the user config entirely. Auth still resolves from CODEX_HOME, and model,
             // effort and sandbox are all passed explicitly above.
             cmd.arg("--ignore-user-config");
+            cmd.arg("--ignore-rules");
+        }
+        let command = toml_path(evidence.executable)?;
+        let bundle = toml_path(evidence.bundle_file)?;
+        let nonce = toml_string(evidence.nonce);
+        let evidence_cwd = toml_path(evidence.sterile_dir.unwrap_or(&cfg.cwd))?;
+        let enabled_tools =
+            serde_json::to_string(&crate::evidence::TOOLS).map_err(std::io::Error::other)?;
+        cmd.args([
+            "-c",
+            &format!(
+                "mcp_servers.{}.command={command}",
+                crate::evidence::SERVER_NAME
+            ),
+        ]);
+        cmd.args([
+            "-c",
+            &format!(
+                "mcp_servers.{}.args=[{}, {bundle}, {nonce}]",
+                crate::evidence::SERVER_NAME,
+                toml_string(crate::evidence::SERVER_FLAG)
+            ),
+        ]);
+        for value in [
+            format!("mcp_servers.{}.required=true", crate::evidence::SERVER_NAME),
+            format!("mcp_servers.{}.enabled=true", crate::evidence::SERVER_NAME),
+            format!(
+                "mcp_servers.{}.enabled_tools={enabled_tools}",
+                crate::evidence::SERVER_NAME
+            ),
+            format!(
+                "mcp_servers.{}.disabled_tools=[]",
+                crate::evidence::SERVER_NAME
+            ),
+            format!("mcp_servers.{}.env={{}}", crate::evidence::SERVER_NAME),
+            format!(
+                "mcp_servers.{}.cwd={evidence_cwd}",
+                crate::evidence::SERVER_NAME
+            ),
+            format!(
+                "mcp_servers.{}.startup_timeout_sec=15",
+                crate::evidence::SERVER_NAME
+            ),
+            format!(
+                "mcp_servers.{}.tool_timeout_sec=30",
+                crate::evidence::SERVER_NAME
+            ),
+            format!(
+                "mcp_servers.{}.default_tools_approval_mode=\"approve\"",
+                crate::evidence::SERVER_NAME
+            ),
+        ] {
+            cmd.args(["-c", &value]);
         }
         cmd.arg("-o").arg(&last_message_file);
 
@@ -131,6 +189,9 @@ impl Reviewer for CodexReviewer {
                 detail = format!("{}\n\n{}", events.errors.join("\n"), detail);
             }
 
+            if evidence_startup_failure(&evidence) {
+                return Err(errors::evidence_unavailable(detail));
+            }
             // An expired resume target is detected inside `classify`.
             return Err(errors::classify(
                 "codex",
@@ -140,6 +201,17 @@ impl Reviewer for CodexReviewer {
                 &evidence,
                 &detail,
             ));
+        }
+
+        if !events.evidence_infrastructure_errors.is_empty() {
+            let errors = events.evidence_infrastructure_errors.join("\n");
+            let diagnostics = out.diagnostics();
+            let detail = if diagnostics.trim().is_empty() {
+                errors
+            } else {
+                format!("{errors}\n\n--- complete reviewer CLI diagnostics ---\n{diagnostics}")
+            };
+            return Err(errors::evidence_unavailable(detail));
         }
 
         // The final-message file is authoritative; the event stream is the fallback. It is read
@@ -223,6 +295,12 @@ impl Reviewer for CodexReviewer {
                     .to_string(),
             );
         }
+        if events.evidence_calls > 0 {
+            warnings.push(format!(
+                "The repository evidence service completed {} tool call(s) during this turn.",
+                events.evidence_calls
+            ));
+        }
 
         let denial_count = policy_denial_count(&out.stderr);
         let denials = collect_denials(&out.stderr);
@@ -264,6 +342,22 @@ impl Reviewer for CodexReviewer {
     fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
         codex_account_id(&codex_home())
     }
+}
+
+fn toml_string(value: &str) -> String {
+    // JSON string escaping is a strict subset of TOML basic-string escaping for these paths and
+    // tokens, and unlike ad-hoc quoting handles spaces, quotes, backslashes and Unicode together.
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn toml_path(path: &Path) -> std::io::Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path is not representable in Codex TOML configuration: {path:?}"),
+        )
+    })?;
+    Ok(toml_string(value))
 }
 
 /// `$CODEX_HOME`, or `~/.codex` when unset — the same resolution the CLI uses for its session
@@ -413,6 +507,8 @@ struct Events {
     /// subset relationship Codex documents. Surfaced as a warning so the unreported fresh
     /// input is explained rather than read as a silent gap.
     input_inconsistent: bool,
+    evidence_calls: u32,
+    evidence_infrastructure_errors: Vec<String>,
 }
 
 /// Read `codex exec --json` output. The stream is JSONL, but the CLI also emits
@@ -448,6 +544,20 @@ fn parse_events(stdout: &str) -> Events {
                     if let Some(text) = item.and_then(|i| i.get("text")).and_then(Value::as_str) {
                         // Keep the last one: that is the reviewer's conclusion.
                         events.last_message = Some(text.trim().to_string());
+                    }
+                }
+                let is_evidence = item.and_then(|i| i.get("type")).and_then(Value::as_str)
+                    == Some("mcp_tool_call")
+                    && item.and_then(|i| i.get("server")).and_then(Value::as_str)
+                        == Some(crate::evidence::SERVER_NAME);
+                if is_evidence {
+                    events.evidence_calls = events.evidence_calls.saturating_add(1);
+                    if let Some(error) = item.and_then(|i| i.get("error")).filter(|e| !e.is_null())
+                    {
+                        events.evidence_infrastructure_errors.push(match error {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        });
                     }
                 }
             }
@@ -526,6 +636,17 @@ fn parse_events(stdout: &str) -> Events {
     events
 }
 
+fn evidence_startup_failure(evidence: &str) -> bool {
+    let lower = evidence.to_ascii_lowercase();
+    lower.contains("required mcp servers failed to initialize")
+        || (lower.contains(crate::evidence::SERVER_NAME)
+            && (lower.contains("failed")
+                || lower.contains("initialize")
+                || lower.contains("startup")
+                || lower.contains("configuration")
+                || lower.contains("unknown field")))
+}
+
 const POLICY_DENIAL_MARKER: &str = "rejected: blocked by policy";
 
 /// Count shell commands the Codex router refused before execution. This is separate from
@@ -576,6 +697,25 @@ mod tests {
 {"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"## Verdict\nREQUEST CHANGES"}}
 {"type":"turn.completed","usage":{"input_tokens":14124,"output_tokens":5}}"###;
+
+    #[test]
+    fn evidence_config_strings_escape_windows_paths_and_unicode_as_toml() {
+        let value = "C:\\path with space\\quote\"\\雪\\bundle.json";
+        assert_eq!(toml_string(value), serde_json::to_string(value).unwrap());
+    }
+
+    #[test]
+    fn an_unrepresentable_evidence_path_fails_instead_of_becoming_lossy() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ]));
+        assert!(toml_path(&path).is_err());
+    }
 
     #[test]
     fn usage_is_read_from_the_event_stream() {
@@ -806,6 +946,45 @@ mod tests {
     fn ignores_non_json_notices() {
         let events = parse_events("Reading additional input from stdin...\nnot json at all\n");
         assert_eq!(events, Events::default());
+    }
+
+    #[test]
+    fn required_evidence_startup_failure_has_its_own_contract() {
+        let mut failed = outcome(
+            r#"{"type":"turn.failed","error":{"message":"required MCP servers failed to initialize: cross_review_evidence"}}"#,
+            false,
+        );
+        failed.stderr = "required MCP servers failed to initialize: cross_review_evidence".into();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &failed, None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn evidence_transport_error_invalidates_an_otherwise_completed_review() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"connection closed","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn model_argument_error_is_not_misread_as_service_death() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{},"result":{"content":[{"type":"text","text":"invalid_arguments"}],"is_error":true},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"REQUEST CHANGES"}}"#,
+        );
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .expect("ordinary tool error does not invalidate transport");
+        assert_eq!(parsed.text, "REQUEST CHANGES");
     }
 
     #[test]

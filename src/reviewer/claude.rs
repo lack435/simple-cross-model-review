@@ -79,6 +79,7 @@ impl Reviewer for ClaudeReviewer {
         bin: &Path,
         resume: Option<&str>,
         _tmp_id: &str,
+        _evidence: Option<&super::EvidenceInvocation<'_>>,
     ) -> std::io::Result<Invocation> {
         let mut cmd = Command::new(bin);
         // Run from a neutral, non-git directory when it is safe and beneficial to (see
@@ -636,7 +637,14 @@ mod tests {
         ])
         .expect("config");
         let inv = ClaudeReviewer
-            .invocation(&armed, armed.primary(), Path::new("claude"), None, "id")
+            .invocation(
+                &armed,
+                armed.primary(),
+                Path::new("claude"),
+                None,
+                "id",
+                None,
+            )
             .expect("invocation");
         let argv: Vec<String> = inv
             .command
@@ -655,7 +663,14 @@ mod tests {
         );
         // Disarmed keeps buffered json.
         let dis: Vec<String> = ClaudeReviewer
-            .invocation(&cfg(), cfg().primary(), Path::new("claude"), None, "id")
+            .invocation(
+                &cfg(),
+                cfg().primary(),
+                Path::new("claude"),
+                None,
+                "id",
+                None,
+            )
             .expect("invocation")
             .command
             .get_args()

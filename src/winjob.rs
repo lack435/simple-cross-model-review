@@ -66,8 +66,6 @@ struct ExtendedLimitInformation {
 }
 
 extern "system" {
-    fn GetCurrentProcess() -> Handle;
-    fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
     fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
     fn SetInformationJobObject(
         job: Handle,
@@ -78,20 +76,6 @@ extern "system" {
     fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
     fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
     fn CloseHandle(object: Handle) -> i32;
-}
-
-/// Whether this process belongs to a Windows job object.
-///
-/// `job = NULL` asks about any job, which is exactly the compatibility question for the
-/// Codex evidence-service probe: a server spawned as the reviewer CLI's grandchild should
-/// inherit cross-review's kill-on-close job unless Codex explicitly breaks away. `None`
-/// means Windows refused the query, so callers report "unknown" rather than asserting no.
-pub fn current_process_in_job() -> Option<bool> {
-    let mut in_job = 0i32;
-    // SAFETY: GetCurrentProcess returns the documented pseudo-handle, NULL selects any job,
-    // and `in_job` is a valid writable BOOL for the duration of the call.
-    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) };
-    (ok != 0).then_some(in_job != 0)
 }
 
 /// A job object that kills everything still inside it when dropped.

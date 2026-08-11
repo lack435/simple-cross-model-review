@@ -215,6 +215,38 @@ pub struct Invocation {
     pub last_message_file: Option<PathBuf>,
 }
 
+/// Per-turn capability owned by the parent and injected only into a Codex invocation.
+/// Claude receives its captured change in the prompt and never starts this server.
+pub struct EvidenceInvocation<'a> {
+    pub executable: &'a Path,
+    pub bundle_file: &'a Path,
+    pub nonce: &'a str,
+    pub sterile_dir: Option<&'a Path>,
+}
+
+/// Guard for a verified empty Codex working directory outside the reviewed repository.
+/// The directory is removed after the turn and recreated at the same stable path on resume.
+pub struct SterileDir {
+    path: PathBuf,
+}
+
+impl SterileDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SterileDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir(&self.path) {
+            eprintln!(
+                "cross-review: warning: could not remove sterile Codex directory {}: {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// A directory to run non-review CLI invocations from, so they cannot pick up the
 /// reviewed project's configuration.
 ///
@@ -250,10 +282,11 @@ pub fn is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
 }
 
-/// The two working-directory modes the Claude reviewer can run in, stamped on a session so a
-/// resume can tell whether the mode changed under it (which the conversation cannot survive).
+/// Working-directory modes stamped on a session so a resume cannot cross the project/neutral or
+/// pre-evidence/sterile-evidence boundary under an existing reviewer conversation.
 pub const CWD_MODE_PROJECT: &str = "project";
 pub const CWD_MODE_NEUTRAL: &str = "neutral";
+pub const CWD_MODE_CODEX_EVIDENCE: &str = "codex-sterile-evidence-v1";
 
 /// Decide whether the Claude reviewer should run this turn from a neutral (non-git) working
 /// directory, and if so with which absolute read-scope rules. `Some((dir, rules))` means run
@@ -269,7 +302,7 @@ pub fn claude_neutral_target(
     cfg: &Config,
     reviewer: ReviewerKind,
 ) -> Option<(PathBuf, Vec<String>)> {
-    // Claude only: Codex uses a read-only shell and a different capture path entirely.
+    // Claude only: isolated Codex uses its own sterile cwd plus evidence-service path.
     if reviewer != ReviewerKind::Claude {
         return None;
     }
@@ -285,8 +318,9 @@ pub fn claude_neutral_target(
     if !cfg.isolate_reviewer {
         return None;
     }
-    // Shell-less only: a shell reviewer is expected to run git itself, and `--diff auto`
-    // withholds the captured diff on that basis -- both need the project as cwd. Use the
+    // Shell-less only: this helper predates the separate Codex evidence path. A shell-enabled
+    // Claude reviewer still expects to run git itself and `--diff auto` withholds the capture on
+    // that basis, so it needs the project as cwd. Use the
     // active entry's predicate, not the primary's, so a Codex->shell-less-Claude fallback is
     // judged on Claude.
     if cfg.reviewer_has_shell_of(reviewer) {
@@ -316,10 +350,12 @@ pub fn claude_neutral_target(
     Some((dir, rules))
 }
 
-/// The [`CWD_MODE_NEUTRAL`]/[`CWD_MODE_PROJECT`] tag for the reviewer that would run this turn,
-/// recorded on the session and compared on resume.
-pub fn claude_cwd_mode(cfg: &Config, reviewer: ReviewerKind) -> &'static str {
-    if claude_neutral_target(cfg, reviewer).is_some() {
+/// The cwd/evidence mode for the reviewer that would run this turn, recorded on the session and
+/// compared on resume.
+pub fn reviewer_cwd_mode(cfg: &Config, reviewer: ReviewerKind) -> &'static str {
+    if reviewer == ReviewerKind::Codex && cfg.isolate_reviewer {
+        CWD_MODE_CODEX_EVIDENCE
+    } else if claude_neutral_target(cfg, reviewer).is_some() {
         CWD_MODE_NEUTRAL
     } else {
         CWD_MODE_PROJECT
@@ -338,7 +374,7 @@ fn is_git_toplevel(dir: &Path) -> bool {
 /// while physically inside it, then every ancestor is checked for a `.git` entry. Any error --
 /// a failed canonicalisation, an unreadable ancestor -- returns `false` (fail closed): an
 /// unverifiable directory is treated as unsafe.
-fn verified_non_git_dir(dir: &Path) -> bool {
+pub fn verified_non_git_dir(dir: &Path) -> bool {
     let Ok(canon) = std::fs::canonicalize(dir) else {
         return false;
     };
@@ -350,6 +386,93 @@ fn verified_non_git_dir(dir: &Path) -> bool {
         }
     }
     true
+}
+
+/// Create and verify the stable empty directory used as an isolated Codex process cwd.
+pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<SterileDir> {
+    const MAX_STERILE_DIRS: usize = 256;
+    const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    let fingerprint = crate::digest::Fingerprint::of(session.as_bytes())
+        .ok_or_else(|| std::io::Error::other("SHA-256 unavailable for sterile directory name"))?;
+    let name = &fingerprint.sha256[..24];
+    // Use the process temp root unconditionally. A user-selected state directory can move or
+    // become writable between turns; choosing between it and temp dynamically would let one
+    // Codex session resume under a different cwd. One deterministic base makes that impossible.
+    let candidates = [std::env::temp_dir()];
+    let mut last = None;
+    for base in candidates {
+        if let Err(e) = std::fs::create_dir_all(&base) {
+            last = Some(e);
+            continue;
+        }
+        let Ok(base) = std::fs::canonicalize(&base) else {
+            continue;
+        };
+        if is_within(&base, &cfg.cwd) || !verified_non_git_dir(&base) {
+            continue;
+        }
+        // This is the deterministic base for this configuration. Once selected, any failure or
+        // contamination below refuses the turn; falling through to another base would silently
+        // change Codex's session cwd between fresh and resume.
+        let parent = base.join("cross-review-codex-cwd");
+        std::fs::create_dir_all(&parent)?;
+        let now = std::time::SystemTime::now();
+        let mut retained = 0usize;
+        for entry in std::fs::read_dir(&parent)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            let stale = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_AGE);
+            let empty_dir = metadata.is_dir()
+                && std::fs::read_dir(entry.path())?
+                    .next()
+                    .transpose()?
+                    .is_none();
+            if stale && empty_dir {
+                let _ = std::fs::remove_dir(entry.path());
+            } else {
+                retained = retained.saturating_add(1);
+            }
+        }
+        if retained >= MAX_STERILE_DIRS {
+            return Err(std::io::Error::other(
+                "sterile Codex directory reached its bounded live-entry limit",
+            ));
+        }
+        let path = parent.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let canonical = std::fs::canonicalize(&path)?;
+        let metadata = std::fs::symlink_metadata(&canonical)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(std::io::Error::other(
+                    "sterile directory is a reparse point",
+                ));
+            }
+        }
+        if !metadata.is_dir()
+            || is_within(&canonical, &cfg.cwd)
+            || !verified_non_git_dir(&canonical)
+        {
+            return Err(std::io::Error::other(
+                "sterile directory is not a verified non-repository directory",
+            ));
+        }
+        if std::fs::read_dir(&canonical)?.next().transpose()?.is_some() {
+            return Err(std::io::Error::other("sterile directory is not empty"));
+        }
+        return Ok(SterileDir { path: canonical });
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no safe sterile directory is available")))
 }
 
 pub trait Reviewer: Send + Sync {
@@ -368,6 +491,7 @@ pub trait Reviewer: Send + Sync {
         bin: &Path,
         resume: Option<&str>,
         tmp_id: &str,
+        evidence: Option<&EvidenceInvocation<'_>>,
     ) -> std::io::Result<Invocation>;
 
     /// `last_message_file` is whatever `invocation` asked the CLI to write its final

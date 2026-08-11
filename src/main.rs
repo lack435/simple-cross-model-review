@@ -39,25 +39,19 @@ use tools::{version_line, App};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Internal compatibility fixture for the Codex evidence-service work. This is handled
-    // before normal server configuration on purpose: the child must expose only its one
-    // read-only probe tool and must never construct `App` or the review tools. It is not
-    // advertised in --help and is removed once Phase 0 has established the external CLI
-    // contracts and the real `--evidence-server` mode replaces it.
-    if args.first().map(String::as_str) == Some(evidence::PROBE_FLAG) {
-        let nonce = args.get(1).map(String::as_str).unwrap_or("");
-        let approval_control = args.get(2).map(String::as_str) == Some("approval-control");
-        if !(args.len() == 2 || (args.len() == 3 && approval_control))
-            || !evidence::valid_probe_nonce(nonce)
-        {
+    // Internal evidence mode is handled before normal configuration by construction. The child
+    // therefore cannot load reviewer credentials, create review state, or expose an App/MCP review
+    // tool recursively; its entire surface lives in `evidence`.
+    if args.first().map(String::as_str) == Some(evidence::SERVER_FLAG) {
+        if args.len() != 3 {
             eprintln!(
-                "cross-review: {} requires one 1..=128 character ASCII nonce (letters, digits, '-' or '_') and optional 'approval-control'.",
-                evidence::PROBE_FLAG
+                "cross-review: {} requires a capability-bundle path and turn nonce",
+                evidence::SERVER_FLAG
             );
             std::process::exit(2);
         }
-        if let Err(e) = evidence::serve_probe_stdio(nonce, approval_control) {
-            eprintln!("cross-review: evidence probe failed: {e}");
+        if let Err(e) = evidence::serve_stdio(std::path::Path::new(&args[1]), &args[2]) {
+            eprintln!("cross-review: evidence server failed: {e}");
             std::process::exit(1);
         }
         return;

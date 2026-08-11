@@ -711,10 +711,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
 
     let read_commands = cfg.vcs.read_commands_phrase();
     let cli = cfg.vcs.cli();
+    let primary_isolated_codex = cfg
+        .reviewers
+        .first()
+        .is_some_and(|spec| spec.reviewer == crate::config::ReviewerKind::Codex)
+        && cfg.isolate_reviewer;
     let access = if cfg.reviewers.is_empty() {
         "The reviewer chain is misconfigured, so every review is refused until it is fixed. Run \
          cross_model_review_status for the specifics."
             .to_string()
+    } else if primary_isolated_codex {
+        let (captures, caveat) = cfg.capture_caller_summary();
+        format!(
+            "The reviewer receives a required, read-only repository evidence service with \
+             bounded scope/list/search/read/change/history/revision tools. Its process shell \
+             runs from a sterile non-repository directory and is not the normal repository \
+             interface. When the working root is a {vcs} repository, this server captures \
+             {captures}; the reviewer pages that immutable snapshot through repository_change. \
+             Do not paste a diff or whole files into 'instructions' -- describe the intent and \
+             what you want scrutinised instead. {caveat}",
+            vcs = cfg.vcs.name(),
+        )
     } else if cfg.reviewer_has_shell() && !cfg.supplies_change() {
         format!(
             "The reviewer can read and search files in this repository. {shell_clause}, so it \
@@ -1199,7 +1216,14 @@ mod tests {
                 .expect("description")
                 .to_string()
         };
-        assert!(codex_shell.contains("read-only shell"), "{codex_shell}");
+        assert!(
+            codex_shell.contains("repository evidence service"),
+            "{codex_shell}"
+        );
+        assert!(
+            codex_shell.contains("sterile non-repository directory"),
+            "{codex_shell}"
+        );
 
         // Shell *and* capture is a real configuration (`README.md` advertises `--diff HEAD`
         // regardless of shell), and it used to fall into the shell branch, so the caller was

@@ -1099,7 +1099,14 @@ impl Config {
         match self.vcs {
             Vcs::Git => match self.diff {
                 DiffMode::None => false,
-                DiffMode::Auto => !self.reviewer_has_shell_of(reviewer),
+                // An isolated Codex reviewer now runs from a sterile non-repository cwd. Its
+                // evidence service, not the mere presence of a shell, supplies the selected
+                // change, so auto must capture it. The explicit config opt-out retains the old
+                // project-cwd self-serve behaviour.
+                DiffMode::Auto => {
+                    !self.reviewer_has_shell_of(reviewer)
+                        || (reviewer == ReviewerKind::Codex && self.isolate_reviewer)
+                }
                 DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
             },
             // The `change` argument is required for a Perforce review (enforced in `tools.rs`
@@ -1145,6 +1152,11 @@ impl Config {
 
     /// `reviewer_can_self_serve_change`, evaluated for a specific chain entry.
     pub fn reviewer_can_self_serve_change_of(&self, reviewer: ReviewerKind) -> bool {
+        if reviewer == ReviewerKind::Codex && self.isolate_reviewer {
+            // The evidence service supplies repository data; the process shell is deliberately
+            // rooted elsewhere and is not the mechanism behind this predicate.
+            return false;
+        }
         match self.vcs {
             Vcs::Git => self.reviewer_has_shell_of(reviewer),
             Vcs::Perforce => {
@@ -1203,6 +1215,38 @@ impl Config {
     /// mixed-family fallback is told the truth about *its* shell and self-serve ability — the
     /// captured block itself is capability-neutral. See `docs/reviewer-fallback-chain.md`.
     pub fn reviewer_capabilities_of(&self, reviewer: ReviewerKind, diff_supplied: bool) -> String {
+        if reviewer == ReviewerKind::Codex {
+            let history = match self.vcs {
+                Vcs::Git => "Use `repository_history` and `repository_revision` for commit history and revisions.",
+                Vcs::Perforce => "`repository_history` and `repository_revision` report unsupported because this service performs no new Perforce network calls.",
+            };
+            let shell = if self.isolate_reviewer {
+                "Your process shell runs from a sterile non-repository directory, so repo-relative shell commands are not a source of evidence. Exceptional absolute-path reads may still work, subject to the CLI command policy, and writes remain blocked by the sandbox."
+            } else {
+                "Configuration isolation was explicitly disabled, so your shell runs from the reviewed repository and may self-serve additional context. The evidence tools remain the preferred bounded interface; writes remain subject to the configured sandbox."
+            };
+            let mut out = format!(
+                "Use the read-only repository evidence tools as the primary and complete \
+                 interface to this project. Start with `repository_scope` when you need scope or \
+                 drift state. Use `repository_list`, `repository_search`, and `repository_read` \
+                 for the live tree. {history} Use continuation cursors whenever \
+                 a result is truncated. Their paths are relative to the reviewed repository root. \
+                 {shell}"
+            );
+            if diff_supplied {
+                out.push_str(
+                    "\n\nThe selected change was captured before this turn and is available through \
+                     `repository_change`; page it to completion when the review depends on the \
+                     diff. Do not reconstruct it with a repo-relative shell command.",
+                );
+            } else {
+                out.push_str(
+                    "\n\nNo selected change was captured. If the request depends on a diff, state \
+                     that limitation under \"What I could not check\" rather than guessing.",
+                );
+            }
+            return out;
+        }
         let mut out = String::new();
         match reviewer {
             ReviewerKind::Codex if self.reviewer_can_self_serve_change_of(reviewer) => {
@@ -1769,11 +1813,11 @@ mod tests {
 
     #[test]
     fn chain_needs_capture_folds_across_entries() {
-        // Codex has a shell and needs no diff; Claude has none and does. A Codex->Claude chain
-        // under --diff auto must still capture, for the Claude fallback.
+        // Isolated Codex and shell-less Claude both receive auto through their non-shell evidence
+        // path, so a mixed chain captures once for either entry.
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
             .expect("config");
-        assert!(!cfg.supplies_change_of(ReviewerKind::Codex));
+        assert!(cfg.supplies_change_of(ReviewerKind::Codex));
         assert!(cfg.supplies_change_of(ReviewerKind::Claude));
         assert!(cfg.chain_needs_capture());
     }
@@ -2299,16 +2343,15 @@ mod tests {
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert!(codex.reviewer_has_shell());
         let text = codex.reviewer_capabilities(false);
-        assert!(text.contains("git diff"), "{text}");
+        assert!(text.contains("repository_scope"), "{text}");
         assert!(!text.contains("no shell"), "{text}");
         // Codex's shell has its writes denied by the OS sandbox, but the CLI may still
         // refuse a command form in non-interactive mode. A small model at low effort batched
         // its whole reconnaissance into one compound command, had it refused wholesale, and
         // gave up -- so the guidance steers it to one simple command at a time and to fall
         // back rather than abandon the review.
-        assert!(text.contains("ONE command per call"), "{text}");
-        assert!(text.contains("a refusal is final"), "{text}");
-        assert!(text.contains("carry on reviewing with"), "{text}");
+        assert!(text.contains("sterile non-repository directory"), "{text}");
+        assert!(text.contains("repository_search"), "{text}");
     }
 
     /// The prompt the reviewer itself reads must not claim a boundary the mechanism does
@@ -2355,12 +2398,17 @@ mod tests {
 
     #[test]
     fn auto_supplies_a_diff_only_to_a_reviewer_that_cannot_fetch_one() {
-        // The whole asymmetry this closes: Codex can run git diff itself, Claude cannot.
+        // Isolated Codex receives auto through repository_change; Claude receives it in-prompt.
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
         assert!(claude.supplies_change());
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert!(!codex.supplies_change());
+        assert!(codex.supplies_change());
+
+        let codex_opt_out =
+            Config::from_args(&args(&["--reviewer", "codex", "--allow-reviewer-config"]))
+                .expect("config");
+        assert!(!codex_opt_out.supplies_change());
 
         // And a Claude reviewer given Bash back -- in the session *and* permitted, since
         // either alone leaves it unable to run anything -- can fetch its own.
@@ -2646,7 +2694,7 @@ mod tests {
             Config::from_args(&args(&["--reviewer", "codex", "--vcs", "perforce"])).expect("cfg");
         assert!(!read_only.reviewer_can_self_serve_change());
         let caps = read_only.reviewer_capabilities(true);
-        assert!(caps.contains("network policy denies"), "{caps}");
+        assert!(caps.contains("no new Perforce network calls"), "{caps}");
         assert!(
             !caps.contains("inspect the change history yourself"),
             "{caps}"
@@ -2656,11 +2704,15 @@ mod tests {
         // which has a shell but cannot reach Perforce -- must still be told it had no diff and
         // not to guess, and must not be told to rely on a captured change that is not there.
         let no_capture = read_only.reviewer_capabilities(false);
-        assert!(no_capture.contains("no access to the diff"), "{no_capture}");
-        assert!(no_capture.contains("Do not guess"), "{no_capture}");
+        assert!(
+            no_capture.contains("No selected change was captured"),
+            "{no_capture}"
+        );
+        assert!(no_capture.contains("rather than guessing"), "{no_capture}");
         assert!(!no_capture.contains("captured for you"), "{no_capture}");
 
-        // A sandbox that grants network restores p4 self-serve.
+        // Disabling isolation and granting network restores p4 self-serve at the process level,
+        // but Codex is still directed to the evidence service as its bounded primary interface.
         let networked = Config::from_args(&args(&[
             "--reviewer",
             "codex",
@@ -2668,17 +2720,37 @@ mod tests {
             "perforce",
             "--sandbox",
             "danger-full-access",
+            "--allow-reviewer-config",
         ]))
         .expect("cfg");
         assert!(networked.reviewer_can_self_serve_change());
-        assert!(networked
-            .reviewer_capabilities(false)
-            .contains("p4 describe"));
+        let networked_caps = networked.reviewer_capabilities(false);
+        assert!(
+            networked_caps.contains("evidence tools remain the preferred bounded interface"),
+            "{networked_caps}"
+        );
+        assert!(
+            networked_caps.contains("no new Perforce network calls"),
+            "{networked_caps}"
+        );
 
-        // Git history is local, so a read-only Codex reviewer can still inspect it.
-        let git = Config::from_args(&args(&["--reviewer", "codex", "--vcs", "git"])).expect("cfg");
+        // Git history is local and self-serve remains technically available without
+        // isolation, while the review contract still points Codex at the evidence tools.
+        let git = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--vcs",
+            "git",
+            "--allow-reviewer-config",
+        ]))
+        .expect("cfg");
         assert!(git.reviewer_can_self_serve_change());
-        assert!(git.reviewer_capabilities(false).contains("git diff"));
+        let git_caps = git.reviewer_capabilities(false);
+        assert!(git_caps.contains("repository_history"), "{git_caps}");
+        assert!(
+            git_caps.contains("evidence tools remain the preferred bounded interface"),
+            "{git_caps}"
+        );
 
         // A Claude reviewer with a git-only Bash allow-list has a shell, but that allow-list
         // need not include p4 (and p4 here would be client-less), so it must NOT be promised
@@ -2706,7 +2778,7 @@ mod tests {
             Config::from_args(&args(&["--reviewer", "codex", "--vcs", "perforce"])).expect("cfg");
         let caps = cfg.reviewer_capabilities(false);
         assert!(caps.contains("Perforce"), "{caps}");
-        assert!(caps.contains("`p4`"), "{caps}");
+        assert!(caps.contains("repository_history"), "{caps}");
         assert!(!caps.contains("git diff"), "{caps}");
     }
 }
