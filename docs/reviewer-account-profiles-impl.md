@@ -112,11 +112,14 @@ env only for `Ambient`. Call sites to convert:
   `tokens.account_id`). So define a **typed `ResolvedIdentity { account, method }`** obtained at
   **UUID granularity** from the CLI's own machine output, **version-pinned**, that **fails closed**
   when the output is unrecognised or the method is not the subscription OAuth. Assert
-  `resolved.account == account_fingerprint(profile_home)` and `resolved.method == subscription`
-  before the review is delivered. **[deferred-to-impl, prerequisite]** the exact UUID/method surface
-  each CLI exposes must be found while building (candidate: a JSON auth-status mode, or the account
-  id echoed in the run's own result/rollout); if none exists, named profiles cannot be safely
-  enabled and the phase stops there rather than shipping a display-name approximation.
+  `resolved.account == account_fingerprint(profile_home)` and `resolved.method == subscription`.
+  **[f11] The probe is PRE-spawn** — part of the preflight, before the review `invocation` — so the
+  *first* request cannot go out under the wrong account. A value produced by the review run itself
+  (its `result` document or Codex rollout) is too late and is explicitly **not** the probe.
+  **[deferred-to-impl, prerequisite]** the pre-spawn UUID/method surface each CLI exposes must be
+  found while building (candidate: a JSON auth-status mode that reports the account UUID and method);
+  if none exists, named profiles **stay disabled** rather than shipping a display-name approximation
+  or a post-hoc check.
 - **[f2/f3] Never cache the assertion.** The preflight cache (`ensure_entry_ready`, `src/tools.rs`
   ~52, keyed by entry index, cached for process lifetime) may cache **only resolution data** (the
   resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
@@ -131,11 +134,21 @@ Result<Option<PathBuf>, Failure>` as the *only* way any code obtains a profile h
 `Ambient` → `Ok(None)`; a non-`Ambient` selector → resolve the effective home, then check
 authorization and return `Err(PROFILE_NOT_AUTHORIZED)` (actionable, pointing at the not-yet-shipped
 setup) unless approved. In Phase 1 the check is a deny-all stub for non-`Ambient`; Phase 3 fills it.
-Every profile-dependent site must obtain the home through this function *before* reading it or
-letting it influence a decision, and the authorization check must precede the preflight-cache
-lookup. Enumerated sites to route through it: **fresh selection / the usage gate
+Every profile-dependent site on the **review path** must obtain the home through this function
+*before* reading it or letting it influence a decision, and the authorization check must precede the
+preflight-cache lookup. Enumerated sites to route through it: **fresh selection / the usage gate
 (`gate`/`usage_headroom_key`), `status`, the resume `auth_check` path, fallback-entry execution, and
-every read site from the section above.** No path may read a profile home it has not authorized.
+every read site from the section above.** No review path may read a profile home it has not
+authorized.
+
+**[f10] Provisioning is a distinct resolver, not this one.** The Phase 3 setup tool must create and
+initialize a home *before* any repo is authorized to use it, so it cannot go through
+`resolve_authorized_home`. Split the two: `resolve_provisioning_target(name, reviewer)` — used only by
+setup, gated by the *human authorization gate* (not the allowlist), returns the `secure_profile_dir`
+target for creation/login — and `resolve_authorized_home` — the review path, gated by the allowlist.
+The provisioning target must never be reachable from a review path (a home that exists but has no
+allowlist entry is still refused there), so creating a profile never implicitly authorizes any repo
+to use it.
 
 ### Phase 1 tests (`cargo test`, no network)
 
@@ -143,9 +156,10 @@ every read site from the section above.** No path may read a profile home it has
 - `effective_home` / `secure_profile_dir`: containment holds; a traversal name, a rooted/drive name,
   and a reparse point **on an original (pre-canonical) component** are refused; `%CROSS_REVIEW_HOME%`
   override honoured; `Ambient` → `None`.
-- argv/env inspection (extend `src/reviewer/argv_tests.rs`): `CODEX_HOME`/`CLAUDE_CONFIG_DIR` set on
-  the child for a named profile; the provider vars are `env_remove`d; **`Ambient` sets and removes
-  nothing** (regression guard).
+- argv/env inspection (extend `src/reviewer/argv_tests.rs`): for a named profile the child env is the
+  **vetted allowlist plus the home var and nothing else** — assert the exact key set, that no
+  provider-auth var is present even when one is set in the parent, and that the child does not start
+  from the inherited environment; **`Ambient` sets/clears nothing** (byte-for-byte regression guard).
 - `account_fingerprint` / headroom read from the profile home, not ambient env.
 - `profile_authorized` denies a named profile in Phase 1; the routing path returns
   `PROFILE_NOT_AUTHORIZED`.
@@ -177,9 +191,15 @@ non-resumable). Reserving `None` for legacy is the whole point — do not repres
 [f8] **`account_fingerprint` is `Option` because the existing `account_fingerprint()` API returns
 `Option<String>` and usage accounting treats absence as normal — but the *session contract is
 per-variant*, and a missing value is never a wildcard:**
-- `Ambient`: no account binding (there is no profile). Resume matches on the `Ambient` tag alone,
-  exactly today's no-profile behaviour; `effective_home`/`account_fingerprint` are `None` and are not
-  compared.
+- `Ambient`: **carries and compares its account fingerprint**, matching the approved design note
+  ("an `Ambient` record carries its own fingerprint and resumes normally"). `effective_home` is
+  `None` (there is no profile home), but a **present** stored fingerprint that differs from the
+  current one refuses the resume — otherwise re-logging the ambient account to a different account
+  and resuming would be exactly the silent cross-account resume this feature exists to stop [f12].
+  The one degradation: if no fingerprint was capturable at record time (stored `None`), resume falls
+  back to today's no-account-comparison behaviour rather than fail closed — ambient is the inherit
+  default, and hard-failing an unreadable ambient identity would regress existing sessions. This is
+  the *only* place a missing fingerprint is permissive, and it is scoped to ambient.
 - `Named` / `ExplicitHome`: the fingerprint is **required**. If it could not be read at record time,
   or is absent/unreadable at resume, the resume **fails closed** (`SESSION_NOT_RESUMABLE`) — a named
   profile whose identity cannot be established is refused, never resumed under an assumed account.
