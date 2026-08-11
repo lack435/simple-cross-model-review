@@ -76,7 +76,9 @@ already defends against. Required: a strict grammar (`[A-Za-z0-9._-]+`, non-empt
 separators, no drive prefix), a **canonical containment check** that the resolved directory is
 under the profile root, **reparse-point rejection** (as `codex_sterile_dir` does via
 `file_attributes() & 0x400`), and verification that the parent chain's ACLs are ours before writing
-into it.
+into it. This is containment only — it stops a name from escaping the profile root, but **does not
+authorize which profile a repo may select**; that is a separate local decision, [Trust
+boundaries](#trust-boundaries) point 1.
 
 ### Per-repo configuration is a name, never a path
 
@@ -111,10 +113,14 @@ The audience is not terminal users; PowerShell is a hard sell, and most work fro
 surface. So setup is an **MCP tool** the user invokes from chat ("set up my work account for
 reviews"), not a documented shell command.
 
+Because this tool writes credential state and can overwrite a profile, it is gated by an explicit
+human authorization step and is never completed on a model decision alone — [Trust
+boundaries](#trust-boundaries) point 3.
+
 The tool, per profile:
 
-1. Creates the profile directory with an NTFS ACL locked to the current user (and validates the name
-   per the safe-name rule above).
+1. Confirms human authorization (see above), then creates the profile directory with an NTFS ACL
+   locked to the current user (and validates the name per the safe-name rule above).
 2. Sets `CODEX_HOME` / `CLAUDE_CONFIG_DIR` to it and spawns the **vendor's own** login, which opens
    the subscription OAuth page in the default browser. `cross-review` never sees the credential.
 3. Polls the profile's credential file for arrival, then confirms the resolved account.
@@ -145,7 +151,10 @@ secret of its own — it only *causes* the vendor CLI to write its normal creden
 different directory. So there is nothing for us to encrypt; the honest posture is NTFS-ACL-only,
 same protection class the vendors already rely on by default, applied to a per-user directory we
 create with an explicit restrictive ACL. (No DPAPI layer is proposed; we hold no plaintext to wrap.)
-Requirements on our handling of those files:
+**The ACL protects the credentials from *other users*, not from the reviewer process itself** — it
+runs as the same user with unconfined reads, so it can read the profile credential store; that
+exposure is a trust-boundary concern, [Trust boundaries](#trust-boundaries) point 2, not something an
+ACL closes. Requirements on our handling of those files:
 
 - **Never log or return their contents.** Today the code reads them wholesale
   (`codex_account_id`, `src/reviewer/codex.rs` ~374-383; `claude_account_id`,
@@ -173,6 +182,43 @@ Requirements on our handling of those files:
 - **The same subscription used by a desktop app and the reviewer home** shares that account's own
   concurrency/rate limits — already handled by the usage-remaining gate (`src/reviewer/mod.rs`).
 
+## Trust boundaries
+
+The reviewed repository *and its committed cross-review config* are untrusted — that is this
+project's whole premise. Account routing adds three exposures OS ACLs alone do not close, because
+the reviewer and the setup tool run as the same OS user as everything else.
+
+1. **Which account a repo may select is an authorization decision, not just path-safety.** [f5]
+   The safe-name rule stops traversal, but a valid name is still attacker-chosen: an untrusted repo's
+   `.mcp.json` could name `--codex-profile personal` and route a review — its usage, and (see 2) its
+   credential exposure — through an account the user never authorized for that repo. **[decided]**
+   Profile *use* is gated locally, not by committed config alone: a per-machine, non-committed
+   allowlist (under `%CROSS_REVIEW_HOME%`) or a first-use confirmation decides whether a given working
+   root may use a given profile. The repo *requests* a name; the machine *authorizes* it. The
+   `--codex-home` / `--claude-config-dir` absolute escape hatch is local/trusted-only, gets the same
+   containment + ACL checks, and is never honoured from committed repo config that is not on the
+   local allowlist.
+
+2. **The reviewer can read the profile credential store; ACLs do not stop it.** [f4] The Codex
+   reviewer runs as the same user, and — per the README — its read-only posture confines *writes*,
+   not *reads*; no CLI surface was found that confines its reads. So a prompt-injected review of a
+   hostile repo could read `auth.json` / `.credentials.json` from the profile home and return the
+   tokens in its review text. This is already true of the shared `~/.codex` today; profiles neither
+   create nor cure it, but the plan must **not** claim OS ACLs protect the credentials from the
+   reviewer — they protect against *other users*, not the same-user reviewer process. Residual-risk
+   options, to be decided before implementation: (a) accept and document (status-quo posture, trusted
+   repos only); (b) run the reviewer under a **separate OS identity / credential broker** so the
+   review process cannot read the user's credential homes; (c) keep the profile home outside any path
+   the reviewer can reach and confirm its direct (non-evidence) reads cannot touch `%LOCALAPPDATA%`.
+   This bounds where profiles may safely be used, so it interacts with point 1.
+
+3. **The setup/login tool is side-effectful and needs a human gate.** [f6] It writes credential
+   state, launches OAuth, and can overwrite a profile. The MCP dispatcher runs model-issued tool
+   calls without confirmation, so prompt injection from an untrusted repo could trigger a login or
+   silently overwrite a profile. **[decided]** Setup, login, and profile overwrite require explicit
+   human authorization — a client-side confirmation or a local one-time authorization token — and are
+   never completed on a model decision alone.
+
 ## Correctness requirements
 
 These are the traps that will make an implementation subtly wrong if skipped:
@@ -196,6 +242,17 @@ These are the traps that will make an implementation subtly wrong if skipped:
    profile's. The list must be pinned to the supported reviewer version and each provider-auth path
    tested; the assertion is what makes an incomplete list safe rather than silently wrong.
 
+   **The assertion must be an *exact identity probe*, run per spawn.** [f2] Today's preflight is too
+   weak to serve as that assertion: `claude auth status` reports the account *email / org name* while
+   the routing fingerprint is the account/org *UUID* (`account_fingerprint`), and the Codex preflight
+   only checks exit status. The assertion must compare the **same fingerprint identity the routing
+   uses**, be pinned to a known reviewer-output version, and fail closed on unrecognised output —
+   never pass on a display-string match. [f3] It must run on **every actual spawn**: the
+   process-lifetime preflight cache keyed by entry index (`src/tools.rs`) would otherwise let a review
+   reuse a stale success after a profile was re-authenticated under the still-running server, so
+   either the cache key includes the current account fingerprint (revalidated before reuse) or the
+   assertion re-runs at spawn regardless of cache.
+
 2. **Thread the resolved home through *every* read site, not just the obvious three.** The profile
    home must be one value in `Config` that all of these read — auditing every `codex_home()` /
    `claude_config_path()` call site, because missing one splits identity from behaviour:
@@ -212,9 +269,14 @@ These are the traps that will make an implementation subtly wrong if skipped:
    (`src/config.rs` ~939-970) does not compare account identity — so binding "into the session
    identity" is not automatic, it is new persisted state. Required: persist the **normalized profile
    identity and the account fingerprint** on the record; compare both before spawning a resume;
-   reject a missing or mismatched identity with `SESSION_NOT_RESUMABLE`; and **define legacy-record
-   behaviour** — a record written before this field exists has no identity to match, so it must be
-   treated as non-resumable (fail closed), never resumed under an assumed account.
+   reject a missing or mismatched identity with `SESSION_NOT_RESUMABLE`.
+
+   [f1] Persist the identity as a **tagged value** — `Ambient` / `Profile(name)` / `Explicit(path)` —
+   serialized explicitly, and reserve *absence of the field* for legacy records only. Otherwise a new
+   no-profile (ambient) session, which by design must keep resuming, is indistinguishable from a
+   legacy record, which must not: both would look like "no identity." With the tag, an `Ambient`
+   record carries its own fingerprint and resumes normally, while a field-absent legacy record is
+   non-resumable (fail closed), never resumed under an assumed account.
 
 4. **Set env per-`Command`, never `std::env::set_var`.** Reviews run concurrently; a process-global
    mutation to select an account is a race that cross-wires two reviews.
@@ -250,9 +312,16 @@ refuse) is an open decision below.
 
 ## Open decisions
 
-1. **Setup surface:** MCP tool only to start, or ship the localhost manager page in the first cut.
-   (Leaning tool-only first — gated on the login protocol above being specified and tested.)
-2. **Guardrail severity** on a reviewer/profile account mismatch: warn in every response, or refuse
+1. **Reviewer read-exposure mitigation** ([Trust boundaries](#trust-boundaries) point 2): accept and
+   document (trusted repos only), run the reviewer under a separate OS identity / credential broker,
+   or scope the reviewer's reads away from the credential homes. This is the load-bearing security
+   decision — it bounds where profiles may be used at all.
+2. **Profile-use authorization** ([Trust boundaries](#trust-boundaries) point 1): a per-machine
+   allowlist keyed by working root, a first-use confirmation, or both.
+3. **Setup surface:** MCP tool only to start, or ship the localhost manager page in the first cut.
+   (Leaning tool-only first — gated on the login protocol and the human-authorization gate being
+   specified and tested.)
+4. **Guardrail severity** on a reviewer/profile account mismatch: warn in every response, or refuse
    the review.
 
 (The earlier "profile scope" decision is resolved above: per reviewer-chain entry, not global.)
