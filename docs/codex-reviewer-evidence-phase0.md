@@ -91,8 +91,8 @@ fresh/resume argv identity, and evidence-specific failure classification.
 A final real product smoke on `codex-cli 0.144.5` passed the no-model status handshake, fresh and
 explicit-ID resume evidence calls, detached-poll collection, explicit cancellation, evidence-child
 reaping, and the zero-shell-policy-denial assertion. The completed fresh/resume turns reported
-127,747 input tokens (108,032 cached) and 538 output tokens; the detached-poll review also completed
-and reported 267,547 input tokens (218,112 cached) and 843 output tokens.
+120,014 input tokens (101,888 cached) and 420 output tokens; the detached-poll review also completed
+and reported 141,743 input tokens (91,904 cached) and 917 output tokens.
 
 The smoke found two lifecycle defects before that pass. First, a process-ID watcher treated the
 anonymous pipe owner as the durable Codex parent and closed a longer turn; a concurrent stdin reader

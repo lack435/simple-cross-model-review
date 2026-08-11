@@ -195,8 +195,9 @@ small defaults:
 
 Every result reports `complete`, `truncated`, and a continuation cursor. A cap can reduce an
 answer, but it cannot silently label a prefix as the whole result. Cursors are opaque,
-server-held state bound to the per-turn nonce and normalized operation arguments, so they
-cannot be reused for a different root, query, or revision.
+single-use server-held state whose token carries the per-turn nonce and whose stored page is
+bound to one operation. Continuations accept only the cursor and a page-size limit, so callers
+cannot replace the original root, query, or revision while paging the captured result.
 
 ### 3. Shared evidence core, VCS-specific providers
 
@@ -227,8 +228,10 @@ operation.
 The configured change is captured once by the parent before the reviewer starts and stored
 in the capability bundle with the same omission accounting used in the prompt today. The
 service pages that immutable snapshot. Live file reads include a digest and stat metadata;
-if the working tree changes after capture, `repository_scope` and subsequent reads surface
-drift rather than presenting two revisions as one coherent snapshot.
+the first `repository_scope` or `repository_read` compares a bounded whole-tree stamp with the
+parent's capture-time stamp, and that observation is cached for the rest of the serial service
+turn so reading many files does not rescan the whole tree each time. The result surfaces observed
+drift rather than presenting the captured change and live tree as one coherent snapshot.
 
 This capture is unconditional for an isolated Codex reviewer, including `--diff auto`.
 Phase 3 must change the existing `reviewer_has_shell && !supplies_change` decision: the shell

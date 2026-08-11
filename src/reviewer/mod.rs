@@ -276,10 +276,46 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn is_within(path: &Path, root: &Path) -> bool {
-    let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
-    let root = root.to_string_lossy().to_lowercase().replace('\\', "/");
+    let path = normalize_windows_path(path);
+    let root = normalize_windows_path(root);
     let root = root.trim_end_matches('/');
     path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn normalize_windows_path(path: &Path) -> String {
+    let value = path.to_string_lossy().to_lowercase().replace('\\', "/");
+    if let Some(rest) = value.strip_prefix("//?/unc/") {
+        format!("//{rest}")
+    } else if let Some(rest) = value.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn containment_normalizes_verbatim_drive_and_unc_paths() {
+        assert!(is_within(
+            Path::new(r"\\?\C:\dev\repo\sub"),
+            Path::new(r"C:\dev\repo")
+        ));
+        assert!(is_within(
+            Path::new(r"C:\dev\repo\sub"),
+            Path::new(r"\\?\C:\dev\repo")
+        ));
+        assert!(is_within(
+            Path::new(r"\\?\UNC\server\share\repo\sub"),
+            Path::new(r"\\server\share\repo")
+        ));
+        assert!(!is_within(
+            Path::new(r"\\?\C:\dev\repository"),
+            Path::new(r"C:\dev\repo")
+        ));
+    }
 }
 
 /// Working-directory modes stamped on a session so a resume cannot cross the project/neutral or

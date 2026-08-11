@@ -16,7 +16,6 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 #[derive(Clone)]
 struct CursorPage {
     operation: String,
-    signature: String,
     values: Vec<Value>,
     offset: usize,
     source_complete: bool,
@@ -29,6 +28,7 @@ pub struct Core {
     next_cursor: u64,
     calls: u32,
     returned_bytes: u64,
+    observed_stamp: Option<String>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -62,6 +62,7 @@ impl Core {
             next_cursor: 0,
             calls: 0,
             returned_bytes: 0,
+            observed_stamp: None,
             cancel,
         })
     }
@@ -142,8 +143,9 @@ impl Core {
         Ok(result)
     }
 
-    fn scope(&self) -> Result<Value, EvidenceError> {
-        let current_stamp = tree_stamp(&self.root, &self.bundle.limits)?;
+    fn scope(&mut self) -> Result<Value, EvidenceError> {
+        let current_stamp = self.current_stamp()?;
+        let drifted = current_stamp != self.bundle.initial_stamp;
         Ok(json!({
             "schema_version": self.bundle.schema_version,
             "nonce": self.bundle.nonce,
@@ -155,7 +157,7 @@ impl Core {
             "excluded_directory_names": [".git", ".hg", ".svn", "target", "dist"],
             "initial_stamp": self.bundle.initial_stamp,
             "current_stamp": current_stamp,
-            "drifted": current_stamp != self.bundle.initial_stamp,
+            "drifted": drifted,
             "complete": true,
             "truncated": false,
             "cursor": Value::Null,
@@ -174,7 +176,6 @@ impl Core {
             return self.cursor_page("repository_list", &cursor, limit, "entries");
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
-        let signature = format!("path={path}");
         let dir = self.resolve_existing(&path, true)?;
         let mut entries = Vec::new();
         for entry in fs::read_dir(&dir)
@@ -207,14 +208,7 @@ impl Core {
             }
         }
         entries.sort_by_key(value_path);
-        self.first_page(
-            "repository_list",
-            signature,
-            entries,
-            limit,
-            "entries",
-            true,
-        )
+        self.first_page("repository_list", entries, limit, "entries", true)
     }
 
     fn search(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
@@ -236,8 +230,6 @@ impl Core {
             ));
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
-        let signature = format!("query={query:?};path={path}");
-
         let start = Instant::now();
         let base = self.resolve_existing(&path, false)?;
         let files = self.walk_files(&base, start)?;
@@ -288,7 +280,6 @@ impl Core {
         }
         self.first_page(
             "repository_search",
-            signature,
             matches,
             limit,
             "matches",
@@ -296,7 +287,7 @@ impl Core {
         )
     }
 
-    fn read(&self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn read(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
         let path = required_string(args, "path")?;
         let start_line = positive_arg(args, "start_line", 1, u32::MAX)? as usize;
         let line_count = positive_arg(
@@ -337,7 +328,8 @@ impl Core {
         }
         let fingerprint = crate::digest::Fingerprint::of(&bytes)
             .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
-        let current_stamp = tree_stamp(&self.root, &self.bundle.limits)?;
+        let current_stamp = self.current_stamp()?;
+        let drifted = current_stamp != self.bundle.initial_stamp;
         Ok(json!({
             "path": relative_slash(&self.root, &resolved)?,
             "bytes": bytes.len(),
@@ -347,8 +339,17 @@ impl Core {
             "complete": end == all.len(),
             "truncated": end < all.len(),
             "cursor": Value::Null,
-            "drifted": current_stamp != self.bundle.initial_stamp,
+            "drifted": drifted,
         }))
+    }
+
+    fn current_stamp(&mut self) -> Result<String, EvidenceError> {
+        if let Some(stamp) = &self.observed_stamp {
+            return Ok(stamp.clone());
+        }
+        let current_stamp = tree_stamp(&self.root, &self.bundle.limits)?;
+        self.observed_stamp = Some(current_stamp.clone());
+        Ok(current_stamp)
     }
 
     fn change(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
@@ -358,13 +359,12 @@ impl Core {
             self.bundle.limits.default_change_bytes,
             self.bundle.limits.max_change_bytes,
         )? as usize;
-        let signature = "change";
         let offset = if let Some(cursor) = optional_string(args, "cursor")? {
-            return self.change_cursor(&cursor, signature, limit);
+            return self.change_cursor(&cursor, limit);
         } else {
             0
         };
-        self.change_page(offset, limit, signature)
+        self.change_page(offset, limit)
     }
 
     fn history(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
@@ -395,7 +395,6 @@ impl Core {
                 "before must be a full Git object id",
             ));
         }
-        let signature = format!("path={path};before={before}");
         let (commits, source_complete) = super::git::history(
             &self.root,
             &path,
@@ -405,7 +404,6 @@ impl Core {
         )?;
         self.first_page(
             "repository_history",
-            signature,
             commits,
             limit,
             "commits",
@@ -441,9 +439,8 @@ impl Core {
         if !path.is_empty() {
             self.validate_relative(&path)?;
         }
-        let signature = format!("revision={id};path={path}");
         let text = super::git::revision(&self.root, &id, &path, &self.bundle.limits, &self.cancel)?;
-        self.first_text_page("repository_revision", signature, text, limit, "content")
+        self.first_text_page("repository_revision", text, limit, "content")
     }
 
     fn walk_files(&self, base: &Path, start: Instant) -> Result<Vec<PathBuf>, EvidenceError> {
@@ -576,7 +573,6 @@ impl Core {
     fn first_page(
         &mut self,
         operation: &str,
-        signature: String,
         values: Vec<Value>,
         limit: u32,
         field: &str,
@@ -585,7 +581,7 @@ impl Core {
         let take = (limit as usize).min(values.len());
         let page = values[..take].to_vec();
         let cursor = if take < values.len() {
-            Some(self.store_cursor(operation, signature, values, take, source_complete))
+            Some(self.store_cursor(operation, values, take, source_complete))
         } else {
             None
         };
@@ -600,18 +596,11 @@ impl Core {
         field: &str,
     ) -> Result<Value, EvidenceError> {
         let state = self.take_cursor(cursor, operation)?;
-        let signature = state.signature.clone();
         let start = state.offset;
         let end = start.saturating_add(limit as usize).min(state.values.len());
         let page = state.values[start..end].to_vec();
         let next = if end < state.values.len() {
-            Some(self.store_cursor(
-                operation,
-                signature,
-                state.values,
-                end,
-                state.source_complete,
-            ))
+            Some(self.store_cursor(operation, state.values, end, state.source_complete))
         } else {
             None
         };
@@ -621,7 +610,6 @@ impl Core {
     fn store_cursor(
         &mut self,
         operation: &str,
-        signature: String,
         values: Vec<Value>,
         offset: usize,
         source_complete: bool,
@@ -632,7 +620,6 @@ impl Core {
             token.clone(),
             CursorPage {
                 operation: operation.to_string(),
-                signature,
                 values,
                 offset,
                 source_complete,
@@ -657,12 +644,7 @@ impl Core {
         Ok(state)
     }
 
-    fn change_page(
-        &mut self,
-        offset: usize,
-        limit: usize,
-        signature: &str,
-    ) -> Result<Value, EvidenceError> {
+    fn change_page(&mut self, offset: usize, limit: usize) -> Result<Value, EvidenceError> {
         let text = self.bundle.change.clone().unwrap_or_default();
         let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
         let content = text.get(offset..end).ok_or_else(|| {
@@ -670,7 +652,7 @@ impl Core {
         })?;
         let cursor = if end < text.len() {
             let values = vec![json!({"offset": end})];
-            Some(self.store_cursor("repository_change", signature.to_string(), values, 0, true))
+            Some(self.store_cursor("repository_change", values, 0, true))
         } else {
             None
         };
@@ -684,12 +666,7 @@ impl Core {
         }))
     }
 
-    fn change_cursor(
-        &mut self,
-        token: &str,
-        signature: &str,
-        limit: usize,
-    ) -> Result<Value, EvidenceError> {
+    fn change_cursor(&mut self, token: &str, limit: usize) -> Result<Value, EvidenceError> {
         let state = self.take_cursor(token, "repository_change")?;
         let offset = state
             .values
@@ -698,13 +675,12 @@ impl Core {
             .and_then(Value::as_u64)
             .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed change cursor"))?
             as usize;
-        self.change_page(offset, limit, signature)
+        self.change_page(offset, limit)
     }
 
     fn first_text_page(
         &mut self,
         operation: &str,
-        signature: String,
         text: String,
         limit: usize,
         field: &str,
@@ -714,7 +690,6 @@ impl Core {
         let cursor = if end < text.len() {
             Some(self.store_cursor(
                 operation,
-                signature,
                 vec![json!({"text": text, "offset": end})],
                 0,
                 true,
@@ -733,7 +708,6 @@ impl Core {
         field: &str,
     ) -> Result<Value, EvidenceError> {
         let state = self.take_cursor(token, operation)?;
-        let signature = state.signature.clone();
         let item = state
             .values
             .first()
@@ -753,7 +727,6 @@ impl Core {
         let cursor = if end < text.len() {
             Some(self.store_cursor(
                 operation,
-                signature,
                 vec![json!({"text": text, "offset": end})],
                 0,
                 true,
@@ -1224,5 +1197,22 @@ mod tests {
             core.call("repository_scope", &json!({})).unwrap()["nonce"],
             "test-nonce"
         );
+    }
+
+    #[test]
+    fn drift_stamp_is_observed_once_per_service_turn() {
+        let dir = temp_dir("evidence-drift-cache");
+        fs::write(dir.as_path().join("before.txt"), "before").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+
+        fs::write(dir.as_path().join("after.txt"), "after").unwrap();
+        let first = core.call("repository_scope", &json!({})).unwrap();
+        assert_eq!(first["drifted"], true);
+        let observed = first["current_stamp"].clone();
+
+        fs::write(dir.as_path().join("later.txt"), "later").unwrap();
+        let second = core.call("repository_scope", &json!({})).unwrap();
+        assert_eq!(second["current_stamp"], observed);
+        assert_eq!(second["drifted"], true);
     }
 }
