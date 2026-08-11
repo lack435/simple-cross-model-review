@@ -139,10 +139,14 @@ home already pointed at the profile dir is the reason the tool owns login rather
 - what "logged in" is confirmed against (the credential file existing is necessary but the
   *resolved account* is what the tool reports).
 
-An optional visual profile manager (a status grid) should be a **tiny localhost HTML page opened in
-the default browser**, not a GUI toolkit — it keeps the serde-only, self-contained-binary posture.
-It must never render a credential field of its own; sign-in is always the vendor OAuth page. Polish,
-sequenced after the tool-only flow.
+**[decided] First cut is the MCP tool plus a minimal one-off localhost confirmation page — no full
+manager yet.** The human authorization gate (point 3) and first-use confirmation (point 1) both need
+a surface a non-terminal user can act on; a small, single-purpose localhost page opened in the
+default browser ("authorize root X to use profile `work`? [approve]") serves that without a GUI
+toolkit and reuses the browser the OAuth already uses. The full visual profile manager (a status
+grid of every profile's set-up / logged-in / authorized state) is the same tiny-localhost-page
+technique scaled up and is **deferred** — it is polish, sequenced after the tool-only flow. Neither
+page ever renders a credential field of its own; sign-in is always the vendor OAuth page.
 
 ### Credentials at rest
 
@@ -192,9 +196,12 @@ the reviewer and the setup tool run as the same OS user as everything else.
    The safe-name rule stops traversal, but a valid name is still attacker-chosen: an untrusted repo's
    `.mcp.json` could name `--codex-profile personal` and route a review — its usage, and (see 2) its
    credential exposure — through an account the user never authorized for that repo. **[decided]**
-   Profile *use* is gated locally, not by committed config alone: a per-machine, non-committed
-   allowlist (under `%CROSS_REVIEW_HOME%`) or a first-use confirmation decides whether a given working
-   root may use a given profile. The repo *requests* a name; the machine *authorizes* it. The
+   Profile *use* is gated locally, not by committed config alone, by **first-use confirmation that
+   persists to a local allowlist**: the first time a working root requests a profile, the human
+   authorization gate (point 3) approves it once, and the approval is written to a per-machine,
+   non-committed allowlist under `%CROSS_REVIEW_HOME%` so later reviews from that root run without
+   re-prompting. The confirmation is the gate; the allowlist is its memory. The repo *requests* a
+   name; the machine *authorizes* it. The
    `--codex-home` / `--claude-config-dir` absolute escape hatch is local/trusted-only, gets the same
    containment + ACL checks, and is never honoured from committed repo config that is not on the
    local allowlist.
@@ -220,12 +227,18 @@ the reviewer and the setup tool run as the same OS user as everything else.
    hostile repo could read `auth.json` / `.credentials.json` from the profile home and return the
    tokens in its review text. This is already true of the shared `~/.codex` today; profiles neither
    create nor cure it, but the plan must **not** claim OS ACLs protect the credentials from the
-   reviewer — they protect against *other users*, not the same-user reviewer process. Residual-risk
-   options, to be decided before implementation: (a) accept and document (status-quo posture, trusted
-   repos only); (b) run the reviewer under a **separate OS identity / credential broker** so the
-   review process cannot read the user's credential homes; (c) keep the profile home outside any path
-   the reviewer can reach and confirm its direct (non-evidence) reads cannot touch `%LOCALAPPDATA%`.
-   This bounds where profiles may safely be used, so it interacts with point 1.
+   reviewer — they protect against *other users*, not the same-user reviewer process. **[decided]**
+   **Accept and document, with the point-1 allowlist as the trust boundary.** Authorizing a working
+   root to route through a profile *is* the assertion that the code there is trusted with that
+   account's token — the same exposure the reviewer has had over `~/.codex` since day one, neither
+   widened nor narrowed per review. This matches the tool's existing posture and adds no new
+   machinery. Two supporting notes: a **separate OS identity / credential broker** (running the
+   reviewer under a restricted token that cannot read the user's credential homes) is the documented
+   hardening path for anyone who must route a profile at genuinely untrusted code, deferred as a
+   large lift that fights the small-self-contained-binary posture; and scoping the reviewer's *reads*
+   away from the homes was rejected as infeasible — the README records that no CLI surface confines
+   Codex's direct reads. This decision bounds where profiles may safely be used, so it is inseparable
+   from point 1: the allowlist is not just usage control, it is the security boundary.
 
 3. **The setup/login tool is side-effectful and needs a human gate.** [f6] It writes credential
    state, launches OAuth, and can overwrite a profile. The MCP dispatcher runs model-issued tool
@@ -308,12 +321,16 @@ These are the traps that will make an implementation subtly wrong if skipped:
    would be wrong and spoofable. Read the id from the home's own files, as `claude_account_id` /
    `codex_account_id` already do.
 
-### Optional guardrail
+### Guardrail on a detected mismatch
 
-Because the dedicated home already makes the reviewer's account deterministic, a guardrail is polish
-rather than a rescue. If added: after a review, confirm the reviewer resolved to the profile's
-intended account via the existing `account_fingerprint`, and surface a mismatch. Severity (warn vs
-refuse) is an open decision below.
+The primary defence is requirement 1's assertion, which fails closed *at spawn*, before tokens are
+spent. This guardrail covers only the residual case — a mismatch that emerges *during* a review (e.g.
+a mid-run token refresh switches accounts): after a review, confirm the reviewer resolved to the
+profile's intended account via the existing `account_fingerprint`. **[decided] On a mismatch,
+refuse** — do not deliver a review whose provenance is wrong, consistent with requirement 1's
+fail-closed posture and the project's explicit-refusal-over-silent-fallback stance. A warning that
+still delivers the review invites being ignored, which is the failure mode this whole feature exists
+to prevent.
 
 ## Explicitly out of scope
 
@@ -332,21 +349,24 @@ refuse) is an open decision below.
   nothing about how any host process behaves.
 - **API-key auth.** All accounts in view are subscription OAuth. No key minting or distribution.
 
-## Open decisions
+## Decisions
 
-1. **Reviewer read-exposure mitigation** ([Trust boundaries](#trust-boundaries) point 2): accept and
-   document (trusted repos only), run the reviewer under a separate OS identity / credential broker,
-   or scope the reviewer's reads away from the credential homes. This is the load-bearing security
-   decision — it bounds where profiles may be used at all.
-2. **Profile-use authorization** ([Trust boundaries](#trust-boundaries) point 1): a per-machine
-   allowlist, a first-use confirmation, or both. Whichever form, the invariant is fixed, not open:
-   the key is the immutable launch/repository root (never a repo-settable `--cwd`), and the authorized
-   target is the canonical effective home + reviewer family (never a bare name), reauthorized when
-   that mapping changes.
-3. **Setup surface:** MCP tool only to start, or ship the localhost manager page in the first cut.
-   (Leaning tool-only first — gated on the login protocol and the human-authorization gate being
-   specified and tested.)
-4. **Guardrail severity** on a reviewer/profile account mismatch: warn in every response, or refuse
-   the review.
+The four design forks are resolved:
+
+1. **Reviewer read-exposure** ([Trust boundaries](#trust-boundaries) point 2): **accept and document,
+   with the point-1 allowlist as the trust boundary.** Separate-OS-identity is the documented
+   hardening path; read-scoping was rejected as infeasible.
+2. **Profile-use authorization** ([Trust boundaries](#trust-boundaries) point 1): **first-use
+   confirmation that persists to a local allowlist.** The invariant is fixed: key on the immutable
+   launch/repository root (never a repo-settable `--cwd`), target the canonical effective home +
+   reviewer family (never a bare name), reauthorize when that mapping changes.
+3. **Setup surface:** **MCP tool plus a minimal one-off localhost confirmation page**; the full
+   visual manager is deferred.
+4. **Mismatch severity:** **refuse (fail closed)**, consistent with requirement 1.
 
 (The earlier "profile scope" decision is resolved above: per reviewer-chain entry, not global.)
+
+**Deferred to implementation, not design forks:** the exact terminal-less login protocol (login
+commands, non-TTY browser callback, stdin/timeout/cancellation, output redaction — see
+[Setup UX](#setup-ux-terminal-less-subscription-oauth)) and the version-pinned exact-identity probe
+(requirement 1) must be specified and tested when built.
