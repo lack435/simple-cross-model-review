@@ -263,12 +263,15 @@ These are the traps that will make an implementation subtly wrong if skipped:
 
    The enumerated scrub list is **version-pinned and cannot be trusted as complete** — a future
    reviewer release could add a provider variable this list misses. So the enumeration is the first
-   line, not the guarantee: **the guarantee is the post-spawn assertion.** The preflight must
-   **assert the resolved auth method and account match the profile** (`auth_check` already reports
-   `authMethod`/account for Claude), failing closed on a mismatch — which catches any provider
-   variable the scrub list missed, because a bypass shows up as a resolved account that is not the
-   profile's. The list must be pinned to the supported reviewer version and each provider-auth path
-   tested; the assertion is what makes an incomplete list safe rather than silently wrong.
+   line, not the guarantee: **the guarantee is a pre-spawn identity assertion.** Before the review
+   invocation, the preflight must **assert the resolved auth method and account match the profile**,
+   failing closed on a mismatch — which catches any provider variable the scrub list missed, because a
+   bypass shows up as a resolved account that is not the profile's. It runs *before* the child spawns,
+   so the first request cannot go out under the wrong account; a separate post-review check is only
+   the residual mid-run *switch* guard, not this assertion. The list must be pinned to the supported
+   reviewer version and each provider-auth path tested; the assertion is what makes an incomplete list
+   safe rather than silently wrong. (Probe mechanics — UUID-level identity, fail-closed on unknown
+   output — are specified in the implementation plan.)
 
    **The assertion must be an *exact identity probe*, run per spawn.** [f2] Today's preflight is too
    weak to serve as that assertion: `claude auth status` reports the account *email / org name* while

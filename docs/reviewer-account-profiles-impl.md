@@ -90,20 +90,24 @@ env only for `Ambient`. Call sites to convert:
 - `usage_headroom_key` (`src/tools.rs` ~94) already funnels through `account_fingerprint`, so it
   inherits the fix — call out in a test that its key is the profile account.
 
-### `src/reviewer/claude.rs` + `codex.rs` — child env + scrub + assertion
+### `src/reviewer/claude.rs` + `codex.rs` — controlled child env + assertion
 
 - **Set the home per-`Command`** ([design requirement 4], never `std::env::set_var`): in `invocation`
   *and* `auth_check`, when `reviewer_home(spec)` is `Some(home)`, `cmd.env("CODEX_HOME"/
   "CLAUDE_CONFIG_DIR", home)`. `Ambient` sets nothing (byte-for-byte today's behaviour).
-- **[f2/f3] Controlled child environment, not a denylist scrub.** Because the provider-var list is
-  admittedly incomplete, removing known names is not enough. For a non-`Ambient` child, build the
-  environment from a **vetted allowlist** — carry the OS essentials the CLI needs to run on Windows
-  (`SystemRoot`, `windir`, `PATH`, `TEMP`/`TMP`, `USERPROFILE`, `APPDATA`/`LOCALAPPDATA`,
-  `PATHEXT`, `NUMBER_OF_PROCESSORS`, etc.) plus the profile home var, and let **no** provider-auth
-  variable through. The known set (Claude `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-  `CLAUDE_CODE_OAUTH_TOKEN`; Codex `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`) is
-  belt-and-braces on top. The allowlist is the primary guarantee: an unknown future provider var
-  simply is not present to override the home.
+- **[f2/f3/f16] Controlled child environment — a concrete allowlist, started from empty.** For a
+  non-`Ambient` child, call `cmd.env_clear()` and then set **exactly** this set, each **passed through
+  from the parent's value** (except the home var, which we set):
+  `SystemRoot`, `windir`, `SystemDrive`, `ComSpec`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `USERPROFILE`,
+  `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`, `PROGRAMFILES`,
+  `PROGRAMFILES(X86)`, `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE` — **plus** the profile home
+  var (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`). This list is the contract: no `etc.`, and any key not on
+  it (every provider-auth variable included) is simply **absent**. The known provider names (Claude
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`; Codex `OPENAI_API_KEY`,
+  `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`) need no explicit removal since we start from empty — they are
+  listed only as the things the assertion below double-checks are gone. **[deferred-to-impl]** the
+  list is a starting contract; if a CLI turns out to need another OS var to launch, it is added to the
+  allowlist explicitly (never by falling back to inheriting the parent environment).
 - **[f3] Exact, typed, per-spawn identity + method assertion — and it is a hard prerequisite for
   enabling named profiles.** `auth_check`'s current probes cannot establish identity: Claude reports
   email/org *display* fields and accepts any `authMethod` and even unrecognised-but-successful output
@@ -196,13 +200,19 @@ per-variant*, and a missing value is never a wildcard:**
   `None` (there is no profile home), but a **present** stored fingerprint that differs from the
   current one refuses the resume — otherwise re-logging the ambient account to a different account
   and resuming would be exactly the silent cross-account resume this feature exists to stop [f12].
-  The one degradation: if no fingerprint was capturable at record time (stored `None`), resume falls
-  back to today's no-account-comparison behaviour rather than fail closed — ambient is the inherit
-  default, and hard-failing an unreadable ambient identity would regress existing sessions. This is
-  the *only* place a missing fingerprint is permissive, and it is scoped to ambient.
+  [f14] There is **no permissive path**: if a fingerprint could not be captured for a *new* ambient
+  session (`account_fingerprint` returned `None` at record time), the session is recorded but marked
+  **non-resumable**, and its resume is refused — not allowed to fall back to an unbound resume.
+  Normally the fingerprint *is* capturable (the reviewer just authenticated), so this only bites a
+  genuine read failure, which fails closed like every other unestablished identity. (This is distinct
+  from a *legacy* record, `profile_identity: None`, which is non-resumable for predating the field.)
 - `Named` / `ExplicitHome`: the fingerprint is **required**. If it could not be read at record time,
   or is absent/unreadable at resume, the resume **fails closed** (`SESSION_NOT_RESUMABLE`) — a named
   profile whose identity cannot be established is refused, never resumed under an assumed account.
+
+So the rule is uniform across all variants: **a resumable session requires a captured account
+fingerprint; absent it, the session is non-resumable.** This matches the approved design note's
+fail-closed resume rule with no exception.
 
 [f7] `effective_home` is the *canonical resolved home*, not the name: the same `Named(work)` resolves
 to different homes under different `%CROSS_REVIEW_HOME%`, and the account fingerprint alone catches a
@@ -246,17 +256,22 @@ confirmation rather than silently inheriting the launch root's authorization. A 
 
 ### Profile-dir provisioning + ACL
 
-**[f6] Specify the ACL fully; this dir will hold credentials.** Create the profile home and set a
-DACL that grants only the current-user SID (plus SYSTEM and Administrators per Windows norms) and
-**removes inheritance** — `SetNamedSecurityInfo` with `DACL_SECURITY_INFORMATION |
-PROTECTED_DACL_SECURITY_INFORMATION`, an ACL built with `InitializeAcl` + explicit
-`AddAccessAllowedAce` for each SID (current user from the process token via
-`OpenProcessToken`/`GetTokenInformation(TokenUser)`). **[decided]** implement via direct
+**[f6] Specify the ACL fully; this dir will hold credentials.** Set a DACL that grants only the
+current-user SID (plus SYSTEM and Administrators per Windows norms) and **removes inheritance** — an
+ACL built with `InitializeAcl` + explicit `AddAccessAllowedAce` for each SID (current user from the
+process token via `OpenProcessToken`/`GetTokenInformation(TokenUser)`), applied with
+`DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`. **[decided]** implement via direct
 `windows`/`windows-sys` FFI in the style of `src/winjob.rs` (which is job-object FFI, *not* ACL code —
-so this is new, not a reuse); **no `icacls`/shell fallback** (unspecified shell-outs are the thing to
-avoid). **Verify** the resulting DACL after setting it and **fail closed** (refuse to write any
-credential) on any error. Use the `secure_profile_dir` reparse/containment/TOCTOU helper from Phase 1,
-not `codex_sterile_dir`.
+so this is new, not a reuse); **no `icacls`/shell fallback**. **Verify** the resulting DACL after
+setting it and **fail closed** (refuse to write any credential) on any error.
+
+**[f15] Do it all through ONE handle — never reopen by path.** The `secure_profile_dir` helper
+creates/opens the directory with a handle (no-follow); the ACL is applied and verified on **that same
+handle** via `SetSecurityInfo` / `GetSecurityInfo` (the `HANDLE` forms), **not** `SetNamedSecurityInfo`
+(the path form), and the credential-file writes happen relative to the same handle/identity. Reopening
+by path between create, ACL-set, verify, and write reintroduces exactly the reparse/replacement TOCTOU
+`secure_profile_dir` closed — a swapped path could receive the DACL meant for the verified object. One
+handle from creation through write, or fail closed.
 
 ### Wire authorization + the guardrail
 
@@ -272,18 +287,23 @@ not `codex_sterile_dir`.
 
 ### Setup MCP tool + one-off localhost confirmation page
 
-- New MCP tool (`src/tools.rs` / `src/mcp.rs`): validates the name, **requires human authorization**
-  (below), creates the ACL'd dir, spawns the vendor login with the home env set (`codex login` /
-  `claude` sign-in) which opens the browser OAuth, polls the credential file, confirms the resolved
-  account, and writes the allowlist entry.
+- New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine: validate the name →
+  **human approval** (below) → create the ACL'd dir → spawn the vendor login → poll the credential
+  file → confirm the resolved account → **only then commit the allowlist entry**.
+- **[f18] Approval authorizes the *intent*; the allowlist commits only after login + identity
+  confirmation.** Human approval does **not** itself write the allowlist entry — it moves the profile
+  into a **provisional/in-setup** state and lets login proceed. The `(launch_root → effective_home +
+  fingerprint)` entry is committed only after the vendor login succeeds *and* the pre-spawn identity
+  probe confirms the account. A profile still in setup is **refused by `resolve_authorized_home`**
+  (in-setup ≠ authorized), so a half-finished setup can never route a review.
 - **[f9] The localhost human-authorization page is an attack surface; specify its invariants.** Bind
   the listener to **loopback only** (`127.0.0.1`, ephemeral port). The approval URL carries an
   **unguessable one-time capability token** with a **short expiry**; the server **validates every
   request** (method, path, token, single-use) and matches the `(root, profile)` **server-side** from
   state it holds, never trusting page/query parameters. All interpolated values are **HTML/URL
-  escaped**. The page is opened with `ShellExecute`/`start`; approval consumes the token and writes
-  the allowlist entry. No GUI crate; no credential field of our own — sign-in is always the vendor
-  page.
+  escaped**. The page is opened with `ShellExecute`/`start`; approval consumes the token and advances
+  the state machine to the provisional/in-setup state (it does **not** commit the allowlist — see
+  f18). No GUI crate; no credential field of our own — sign-in is always the vendor page.
 - **Redaction:** the login subprocess's stdout/stderr may echo tokens/URLs; captured for
   liveness/timeout only, never logged or returned.
 - **[deferred-to-impl, from the design]** exact login command per reviewer, non-TTY browser callback
