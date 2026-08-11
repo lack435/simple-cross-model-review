@@ -199,6 +199,13 @@ the reviewer and the setup tool run as the same OS user as everything else.
    containment + ACL checks, and is never honoured from committed repo config that is not on the
    local allowlist.
 
+   [f8] The allowlist key must be a root the **repo cannot forge**. Committed project config is the
+   CLI source of truth and can set `--cwd` (`src/config.rs`; README), so an allowlist keyed by the
+   effective working root lets a hostile repo present an already-authorized path as its key. Bind
+   authorization instead to the immutable launch/repository root the host determined *before* repo
+   config was applied — or require explicit confirmation whenever `--cwd` is supplied — and keep the
+   authorization store itself under a fixed, ACL-protected location, not one the repo can point at.
+
 2. **The reviewer can read the profile credential store; ACLs do not stop it.** [f4] The Codex
    reviewer runs as the same user, and — per the README — its read-only posture confines *writes*,
    not *reads*; no CLI surface was found that confines its reads. So a prompt-injected review of a
@@ -277,6 +284,13 @@ These are the traps that will make an implementation subtly wrong if skipped:
    legacy record, which must not: both would look like "no identity." With the tag, an `Ambient`
    record carries its own fingerprint and resumes normally, while a field-absent legacy record is
    non-resumable (fail closed), never resumed under an assumed account.
+
+   [f7] The tag must identify the **canonical effective home**, not just the name. `Profile(name)`
+   resolves to a different directory under a different `%CROSS_REVIEW_HOME%` (or default root), and
+   the account fingerprint only catches a *different account* — not the *same account in a different
+   home* (a different credential/config/session store). So the persisted identity is the resolved,
+   canonicalized home path plus reviewer family (or a stable local profile id anchored to a trusted
+   root), and resume compares that, not the bare name.
 
 4. **Set env per-`Command`, never `std::env::set_var`.** Reviews run concurrently; a process-global
    mutation to select an account is a race that cross-wires two reviews.
