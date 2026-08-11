@@ -54,8 +54,11 @@ still override it. See correctness requirement 1 (auth-var precedence) below.
 - `--codex-profile <name>` / `--claude-profile <name>`: resolve to
   `{base}\profiles\{reviewer}\{name}`, where `{base}` is `%CROSS_REVIEW_HOME%` or, unset,
   `%LOCALAPPDATA%\cross-review`.
-- `--codex-home <abs>` / `--claude-config-dir <abs>`: explicit escape hatch, wins over the profile
-  name.
+- `--codex-home <abs>` / `--claude-config-dir <abs>`: explicit escape hatch (local/trusted-only). It
+  and the profile-name flag for the same family are **mutually exclusive on one entry** — setting both
+  is a parse error, not a precedence contest (an ambiguous combination fails closed rather than
+  silently picking one). Like a named profile, an explicit home still requires an allowlist entry and
+  is authorized through the same setup flow.
 - **Neither set**: inherit the ambient environment exactly as today. This feature is purely
   additive; existing setups are unchanged.
 

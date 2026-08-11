@@ -146,8 +146,19 @@ sites to convert:
   account fingerprint → probe identity+method → launch the review child, all while holding the lock**;
   the exclusive setup lock cannot interleave. Equivalently, carry a **generation token** read at the
   authorization check (credential-file identity + mtime) and re-verify it is unchanged at both probe
-  and spawn, failing closed on any change. The identity asserted here is the one carried to the
-  post-review switch guard.
+  and spawn, failing closed on any change.
+
+  **[f1-fresh] Be honest about the boundary of this lock: it serializes *cross-review's* writers, not
+  an external `codex login`.** A user (or another tool) writing the credential file directly does not
+  take our lock, so it can change the account after our recheck and before the reviewer child's first
+  read — and a generation token cannot close that final gap either. So this pre-spawn atomicity is a
+  *best-effort narrowing*, not an absolute guarantee, and the plan does **not** claim otherwise. The
+  actual fail-closed backstop for the external-login race is the **post-review switch guard**: the
+  identity asserted here is carried through the run and compared against the final fingerprint, so a
+  review whose account was swapped mid-flight is **refused, never delivered** — a request may briefly
+  issue under a swapped account, but its result does not reach the caller. Attempting to hard-lock the
+  file against external writes for the whole review is rejected: it would also block the reviewer's own
+  legitimate token refresh.
 
 ### Phase 1 authorization at the resolution choke point
 
@@ -166,12 +177,24 @@ authorized.
 
 **[f10] Provisioning is a distinct resolver, not this one.** The Phase 3 setup tool must create and
 initialize a home *before* any repo is authorized to use it, so it cannot go through
-`resolve_authorized_home`. Split the two: `resolve_provisioning_target(name, reviewer)` — used only by
-setup, gated by the *human authorization gate* (not the allowlist), returns the `secure_profile_dir`
-target for creation/login — and `resolve_authorized_home` — the review path, gated by the allowlist.
-The provisioning target must never be reachable from a review path (a home that exists but has no
-allowlist entry is still refused there), so creating a profile never implicitly authorizes any repo
-to use it.
+`resolve_authorized_home`. Split the two: `resolve_provisioning_target(selector, reviewer)` — used
+only by setup, gated by the *human authorization gate* (not the allowlist), returns the
+`secure_profile_dir` target for creation/login — and `resolve_authorized_home` — the review path,
+gated by the allowlist. The provisioning target must never be reachable from a review path (a home
+that exists but has no allowlist entry is still refused there), so creating a profile never implicitly
+authorizes any repo to use it.
+
+**[f2-fresh] The provisioning resolver takes a `ProfileSelector`, not just a name, so the explicit-home
+escape hatch is reachable.** `ExplicitHome` requires an allowlist entry like any non-ambient selector,
+so setup must be able to authorize one — otherwise `--codex-home` / `--claude-config-dir` are dead
+flags. For `Named(n)` it resolves under the profile root (safe-name + containment); for
+`ExplicitHome(p)` it validates the path directly (canonicalize, reparse-reject, must resolve to a real
+directory, **local/trusted-only** — never accepted from committed repo config that is not on the local
+allowlist) and returns it as the provisioning target. Both then go through the same human-gated
+create/login/confirm/commit flow and land the same `(launch_root → effective_home + reviewer_family +
+account_fingerprint)` allowlist entry keyed on the resolved home. (If explicit homes are judged not
+worth the surface for the first cut, the alternative is to drop the two flags entirely — but the plan
+must not leave them defined-yet-unauthorizable.)
 
 ### Phase 1 tests (`cargo test`, no network)
 
