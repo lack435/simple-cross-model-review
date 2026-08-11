@@ -68,21 +68,27 @@ identity is the counter-example to follow in reverse: the profile *is* identity,
   (open with `FILE_FLAG_OPEN_REPARSE_POINT` and inspect, rather than path-check-then-create). Write
   this as a dedicated `secure_profile_dir` helper with its own tests; note in passing that
   `codex_sterile_dir`'s ordering is worth a separate look but is out of scope for this PR.
-- **`Config::reviewer_home(spec) -> Option<PathBuf>`**: the resolved effective home for an entry, or
-  `None` for `Ambient`. Single source of truth for the read sites below.
+- **[f1] There is no unauthorized `reviewer_home` accessor on the review path.** Home resolution and
+  authorization are one operation: `resolve_authorized_home(cfg, spec) -> Result<Option<PathBuf>,
+  Failure>` (`Ok(None)` = ambient/inherit; `Ok(Some(home))` = authorized; `Err(PROFILE_NOT_AUTHORIZED)`
+  otherwise). The plain-`Option` resolver stays **private** to that function (and to the separate
+  provisioning path), so a review-path caller cannot obtain a home without passing authorization — the
+  `Option` return of a bare accessor could not express the refusal anyway.
 
 ### `src/config.rs` / `src/reviewer/*` — thread the home through *every* read site
 
-[design requirement 2] The home must reach all of these from `Config`, not ambient env. `codex_home`
-(`src/reviewer/codex.rs` ~363) and `claude_config_path` (`src/reviewer/claude.rs` ~444) become
-`(cfg, spec)`-parameterised, returning `reviewer_home(spec)` when set and falling back to ambient
-env only for `Ambient`. Call sites to convert:
+[design requirement 2] The home must reach all of these from `Config` (not ambient env) **and through
+`resolve_authorized_home`** (not a bypassing accessor). `codex_home` (`src/reviewer/codex.rs` ~363)
+and `claude_config_path` (`src/reviewer/claude.rs` ~444) become `(cfg, spec)`-parameterised and obtain
+the home via the authorized resolver, falling back to ambient env only for `Ambient`; a
+non-`Ambient` selector that is unauthorized surfaces the `Err`, it does not silently read a home. Call
+sites to convert:
 
 - `auth_check` — **signature gains `spec`** (`fn auth_check(&self, bin, cfg, spec, cancel)`), since
   today it takes only `(bin, cfg, cancel)` and cannot know the profile. Ripples to the trait
   (`src/reviewer/mod.rs` ~521), both adapters, `ensure_entry_ready` (`src/tools.rs` ~78), and tests.
 - `account_fingerprint` — already `(cfg, spec)`; switch its `codex_home()` / `claude_config_path()`
-  to the parameterised form.
+  to the authorized form.
 - `invocation` — set the child env (below).
 - **`observe_headroom` / `find_rollout(&codex_home())`** (`src/reviewer/codex.rs` ~326-336) — the
   site the design's first draft missed. Same conversion, or the usage gate reads headroom from the
@@ -129,6 +135,15 @@ env only for `Ambient`. Call sites to convert:
   resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
   fingerprint-keyed cache would still miss a same-account auth-*method* change or a newly-introduced
   provider var, so the assertion is not cacheable at all.
+- **[f4] The assertion must be atomic with the invocation it guards.** The probe runs in a child
+  before the review child; a concurrent re-login (a setup, or an external `codex login`) could swap the
+  home's account from A to B *between* the probe and the review spawn, so the first request goes out
+  under B and is only caught post-hoc by the switch guard (after billing). Close the window: take the
+  **per-home lock in shared/read mode across probe → review-child launch** (the same OS lock setup
+  takes exclusively, §Phase 3), so an account-changing operation cannot interleave; equivalently, bind
+  a **generation token** read with the probe (e.g. the credential file's identity + mtime) and
+  re-verify it is unchanged immediately before spawn, failing closed on any change. The probe's
+  asserted identity is the one carried to the post-review switch guard [f4-Phase-3].
 
 ### Phase 1 authorization at the resolution choke point
 
@@ -297,12 +312,16 @@ keep the directory it writes into the one we verified: (a) hold the directory ha
 child's lifetime, opened with `CreateFile`/`FILE_FLAG_BACKUP_SEMANTICS` and a **share mode that omits
 `FILE_SHARE_DELETE`** — a directory open without delete-sharing cannot be renamed or deleted while the
 handle is held, which concretely blocks the rename-over (the DACL already denies other users write
-access, so the same-user hold is the remaining lever); (b) after the child exits, **re-verify by
-handle identity** — open the credential file no-follow and confirm via `BY_HANDLE_FILE_INFORMATION`
-(volume + file id) that it resolves inside the directory object we held, and re-read its DACL; (c)
-**fail closed** (discard the login, do not commit the allowlist) on any mismatch. The held handle
-prevents replacement of the verified directory; the post-write identity re-check bounds what the
-child left behind.
+access, so the same-user hold is the remaining lever); (b) after the child exits, **prove containment
+by handle-relative open, not by file identity** — [f3] `BY_HANDLE_FILE_INFORMATION`'s volume+file id
+identify the credential file but do *not* encode its parent, so they cannot show it sits inside the
+held directory (ancestor/intermediate reparse or replacement stays unproven). Instead open the
+credential file **relative to the held directory handle** (`NtCreateFile` with `RootDirectory` set to
+that handle, a leaf name with no separators, `OBJ_DONT_REPARSE` / no-follow) so containment is
+*structural* — the open can only resolve a direct child of the object we hold — then re-read its DACL;
+(c) **fail closed** (discard the login, do not commit the allowlist) on any failure or DACL mismatch.
+The held handle prevents replacement of the verified directory; the handle-relative open proves the
+credential file is genuinely inside it.
 
 ### Wire authorization + the guardrail
 
@@ -320,9 +339,23 @@ child left behind.
 
 ### Setup MCP tool + one-off localhost confirmation page
 
-- New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine: validate the name →
-  **human approval** (below) → create the ACL'd dir → spawn the vendor login → poll the credential
-  file → confirm the resolved account → **only then commit the allowlist entry**.
+- **[f2] Three distinct operations, because a credential home may already exist and be valid.** The
+  tool must not treat every setup as a fresh provision, or a failed re-login could delete a working
+  home:
+  - **Authorize-only** (home exists, already logged in, just needs this repo authorized): the common
+    "add this repo to my existing `work` profile" case. It **touches neither the credential home nor
+    the login** — it runs the identity probe read-only and commits the allowlist entry. No dir
+    creation, so nothing to roll back.
+  - **First provision** (no home yet): create the dir, login, confirm, commit. Rollback deletes the
+    dir **because this run created it**.
+  - **Re-login existing** (home exists, re-authenticating / switching account): use **staged
+    replacement** — log in to a fresh staging dir, confirm identity, then swap into place; on failure
+    the existing home is untouched. Never log in directly over a valid home.
+  - Rollback is scoped by an **ownership/generation marker**: a run removes **only** what it created
+    (its staging dir / freshly-created dir), never a pre-existing home. [f2]
+- New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine: classify the operation
+  (above) → validate the name → **human approval** (below) → [provision/stage as needed] → confirm the
+  resolved account → **only then commit the allowlist entry**.
 - **[f18] Approval authorizes the *intent*; the allowlist commits only after login + identity
   confirmation.** Human approval does **not** itself write the allowlist entry — it moves the profile
   into a **provisional/in-setup** state and lets login proceed. The `(launch_root → effective_home +
@@ -344,9 +377,10 @@ child left behind.
   not an in-process `Mutex`. A second setup for the same profile that cannot take the lock waits or is
   refused. The provisional marker records a **holder + expiry**; if the holding process dies, the
   marker's expiry lets the next setup **reclaim** it rather than deadlock. On cancellation, timeout,
-  login failure, or identity-mismatch the flow **rolls back** — remove the provisional marker and the
-  partially-created dir, release the lock, commit nothing — so a failed or abandoned setup never
-  strands the profile in a half-state or leaves an orphaned credential dir.
+  login failure, or identity-mismatch the flow **rolls back** — remove the provisional marker and only
+  the dirs **this run created** (its staging / freshly-created dir, per the [f2] ownership marker;
+  never a pre-existing home), release the lock, commit nothing — so a failed or abandoned setup never
+  strands the profile in a half-state, orphans a credential dir, or destroys a valid existing one.
 - **[f9] The localhost human-authorization page is an attack surface; specify its invariants.** Bind
   the listener to **loopback only** (`127.0.0.1`, ephemeral port). The approval URL carries an
   **unguessable one-time capability token** with a **short expiry**; the server **validates every
