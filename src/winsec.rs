@@ -51,6 +51,11 @@ const FILE_SHARE_READ: Dword = 0x0000_0001;
 const FILE_SHARE_WRITE: Dword = 0x0000_0002;
 const FILE_SHARE_DELETE: Dword = 0x0000_0004;
 const OPEN_EXISTING: Dword = 3;
+// MoveFileExW flags. We deliberately do NOT set MOVEFILE_REPLACE_EXISTING (0x1): a rename onto an
+// existing target must **fail**, which is the race-safe collision check for `staging → home` and the
+// safety rail for every recovery move (f-c1/f-c4). MOVEFILE_WRITE_THROUGH flushes the rename to disk
+// before returning, making the directory-entry change durable across power loss (f-b5).
+const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
 const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
 const FILE_ATTRIBUTE_NORMAL: Dword = 0x0000_0080;
@@ -87,6 +92,8 @@ extern "system" {
     fn GetFileInformationByHandle(file: Handle, info: *mut ByHandleFileInformation) -> Bool;
     fn LocalFree(mem: *mut c_void) -> *mut c_void;
     fn GetCurrentProcess() -> Handle;
+    fn MoveFileExW(existing_name: *const u16, new_name: *const u16, flags: Dword) -> Bool;
+    fn FlushFileBuffers(file: Handle) -> Bool;
 }
 
 // --- advapi32 -------------------------------------------------------------------------------------
@@ -239,6 +246,11 @@ const FILE_SYNCHRONOUS_IO_NONALERT: Dword = 0x0000_0020;
 // ACCESS_MASK: required alongside FILE_SYNCHRONOUS_IO_NONALERT.
 const SYNCHRONIZE: Dword = 0x0010_0000;
 const STATUS_SUCCESS: i32 = 0;
+// NtCreateFile with FILE_CREATE returns this when the target already exists. Mapped to
+// `io::ErrorKind::AlreadyExists` so an exclusive create can be distinguished from any other failure
+// (the ownership proof for first-provision, impl-plan f1).
+const STATUS_OBJECT_NAME_COLLISION: i32 = -1073741771; // 0xC0000035
+const ERROR_ALREADY_EXISTS: i32 = 183;
 
 #[repr(C)]
 struct UnicodeString {
@@ -480,6 +492,52 @@ pub fn create_secured_child_dir(parent: &OwnedHandle, leaf: &OsStr) -> io::Resul
     Ok(handle)
 }
 
+/// Like [`create_secured_child_dir`] but **exclusive** (`FILE_CREATE`): fails with
+/// [`io::ErrorKind::AlreadyExists`] if `leaf` already exists rather than opening it. The successful
+/// exclusive create is the **ownership proof** the setup flow needs — a nonce-named staging dir that
+/// this call created is provably this run's, so rollback can delete it without ever adopting and then
+/// destroying a directory it did not create (impl-plan f1/f-a1). Locked and verified through the same
+/// handle it created.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn create_new_secured_child_dir(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<OwnedHandle> {
+    let handle = nt_open(
+        parent,
+        leaf,
+        READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+        false,
+    )?;
+    apply_restrictive_dacl(&handle)?;
+    verify_restrictive_dacl(&handle)?;
+    Ok(handle)
+}
+
+/// Prove a credential **file** (`auth.json`, `.credentials.json`, `.claude.json`) is a direct child of
+/// the held `parent` directory and lock it to the current user, then verify.
+///
+/// The vendor login writes its credential file **by path** into the directory we handed it as
+/// `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, so after it exits we re-establish two guarantees on that file
+/// ([f20]): (1) **structural containment** — the open is handle-relative (`RootDirectory = parent`,
+/// `OBJ_DONT_REPARSE`), so it can only resolve a direct child of the object we hold, not a reparse or
+/// replacement; and (2) **lockdown** — because the directory's restrictive ACEs are non-inheritable, a
+/// freshly written child does *not* inherit them, so a verify-only re-read would fail closed on a
+/// legitimate login. We therefore **apply** the restrictive DACL to the file and then **verify** it,
+/// mirroring what [`create_secured_dir`] does for a directory. Fails closed on any error.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn secure_and_verify_child_file(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<()> {
+    let handle = open_child_relative(
+        parent,
+        leaf,
+        GENERIC_READ | WRITE_DAC | READ_CONTROL,
+        FILE_OPEN,
+        false,
+    )?;
+    apply_restrictive_dacl(&handle)?;
+    verify_restrictive_dacl(&handle)?;
+    Ok(())
+}
+
 /// Reject a path any of whose **existing original components** is a reparse point (junction/symlink),
 /// checked *before* canonicalization.
 ///
@@ -584,6 +642,12 @@ fn nt_open(
             0,
         )
     };
+    if status == STATUS_OBJECT_NAME_COLLISION {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{leaf:?} already exists"),
+        ));
+    }
     if status != STATUS_SUCCESS {
         return Err(io::Error::other(format!(
             "handle-relative open of {leaf:?} failed (NTSTATUS {status:#010x})"
@@ -981,6 +1045,104 @@ pub fn read_secured_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Rename `from` to `to` **without replacing an existing target**, flushing the move to disk before
+/// returning.
+///
+/// `std::fs::rename` maps to `MoveFileExW` **with** `MOVEFILE_REPLACE_EXISTING`, which on NTFS can
+/// silently replace an existing *empty* directory — so it cannot be used where the rename doubles as a
+/// collision check. This uses `MoveFileExW` with **no** replace flag, so a `to` that already exists
+/// makes the call fail with [`io::ErrorKind::AlreadyExists`]; that is the race-safe guarantee behind
+/// `staging → home` and every recovery move (f-c1/f-c4). `MOVEFILE_WRITE_THROUGH` makes the
+/// directory-entry change durable across power loss (f-b5).
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let from_w = wide(from);
+    let to_w = wide(to);
+    // SAFETY: both buffers are valid NUL-terminated UTF-16 paths that outlive the call.
+    let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        // Normalise the "target exists" case to AlreadyExists so callers can branch on it uniformly.
+        if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("cannot rename onto existing {}", to.display()),
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Flush a file's contents and metadata to stable storage (`FlushFileBuffers`), so a
+/// just-written/verified file survives a power loss (f-b2). The handle is opened no-follow with
+/// `GENERIC_WRITE` (required by `FlushFileBuffers`; the current user's DACL grants it) and does not
+/// modify the contents.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn flush_file(path: &Path) -> io::Result<()> {
+    let wide = wide(path);
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path; other args are scalars.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = finish_open(raw)?;
+    flush_handle(&handle)
+}
+
+/// Best-effort flush of a directory's metadata to stable storage after a rename/unlink changed its
+/// entries. The durable-rename guarantee already comes from `MOVEFILE_WRITE_THROUGH` in
+/// [`rename_no_replace`]; this is a belt-and-suspenders parent-directory barrier (f-b3/f-b5). Because
+/// Windows does not universally support `FlushFileBuffers` on a directory handle, an
+/// `ACCESS_DENIED`/`INVALID_PARAMETER` "not supported here" result is tolerated rather than treated as
+/// a durability failure — the write-through rename is the load-bearing guarantee.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn flush_dir(path: &Path) -> io::Result<()> {
+    let handle = match open_no_follow(path, true, true, OPEN_EXISTING) {
+        Ok(h) => h,
+        Err(_) => return Ok(()), // best-effort: a dir we cannot open write is not a hard failure here
+    };
+    match flush_handle(&handle) {
+        Ok(()) => Ok(()),
+        // Directory flush is not supported on every filesystem/handle; the write-through rename holds.
+        Err(e) if matches!(e.raw_os_error(), Some(5) | Some(87)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn flush_handle(handle: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: `handle` is a valid, owned handle opened with write access.
+    let ok = unsafe { FlushFileBuffers(handle.as_raw_handle() as Handle) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The stable object identity of the directory at `path` — its NTFS `(volume serial, file index)`,
+/// which a rename preserves. Opened **no-follow** (reparse points refused). Captured before a
+/// `home → .old` move and re-checked at recovery, so a post-crash reparse or replacement at that path
+/// is detected before recovery restores or removes it (f-a3). Returns `(volume_serial, file_index)`.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn dir_identity_no_follow(path: &Path) -> io::Result<(u32, u64)> {
+    let handle = open_dir_no_follow(path, false)?;
+    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle` is valid; `info` is a correctly sized output struct.
+    let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle() as Handle, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Ok((info.volume_serial_number, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,5 +1283,88 @@ mod tests {
             read_secured_file(&file).is_err(),
             "a file under an unsecured parent directory must fail closed"
         );
+    }
+
+    #[test]
+    fn create_new_secured_child_dir_is_exclusive() {
+        // The exclusive create is the ownership proof: it succeeds once and then reports AlreadyExists,
+        // never silently adopting a pre-existing directory (f1/f-a1).
+        let dir = temp_dir();
+        let parent = create_secured_dir(dir.as_path()).expect("secure parent");
+        let first =
+            create_new_secured_child_dir(&parent, OsStr::new("stage")).expect("first create");
+        verify_restrictive_dacl(&first).expect("child is locked");
+        let err = create_new_secured_child_dir(&parent, OsStr::new("stage"))
+            .expect_err("a second exclusive create must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn secure_and_verify_child_file_locks_a_child_and_rejects_a_widened_one() {
+        // A vendor-written credential file does not inherit the (non-inheritable) directory DACL, so
+        // apply-then-verify is required and a file left with a widened ACL fails ([f20]).
+        let dir = temp_dir();
+        let parent = create_secured_dir(dir.as_path()).expect("secure parent");
+        // A plain file written into the secured dir (as the vendor login would) starts un-locked.
+        std::fs::write(dir.join("auth.json"), b"{}").expect("write cred");
+        // apply-then-verify locks it and passes.
+        secure_and_verify_child_file(&parent, OsStr::new("auth.json")).expect("secure child file");
+        // Re-opening independently and verifying also passes (the DACL persisted).
+        let reopened = open_dir_no_follow(dir.as_path(), false).expect("reopen dir");
+        let child = open_child_relative(
+            &reopened,
+            OsStr::new("auth.json"),
+            GENERIC_READ | READ_CONTROL,
+            FILE_OPEN,
+            false,
+        )
+        .expect("open child");
+        verify_restrictive_dacl(&child).expect("child stayed locked");
+    }
+
+    #[test]
+    fn rename_no_replace_refuses_an_existing_target() {
+        let dir = temp_dir();
+        let from = dir.join("staging");
+        let to = dir.join("home");
+        std::fs::create_dir(&from).expect("mkdir from");
+        // No collision: the move succeeds.
+        rename_no_replace(&from, &to).expect("first move");
+        assert!(to.exists() && !from.exists());
+        // A second staging that collides with the now-existing target is refused, not merged/replaced.
+        let from2 = dir.join("staging2");
+        std::fs::create_dir(&from2).expect("mkdir from2");
+        let err = rename_no_replace(&from2, &to).expect_err("must refuse an existing target");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from2.exists(), "the source is left in place on refusal");
+    }
+
+    #[test]
+    fn dir_identity_is_stable_across_a_rename_and_distinct_between_dirs() {
+        // A rename preserves the (volume, file-index) identity; two different dirs differ. This is what
+        // lets recovery prove `.old` is the object it moved aside, not a replacement (f-a3).
+        let dir = temp_dir();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir(&a).expect("mkdir a");
+        std::fs::create_dir(&b).expect("mkdir b");
+        let id_a = dir_identity_no_follow(&a).expect("id a");
+        let id_b = dir_identity_no_follow(&b).expect("id b");
+        assert_ne!(id_a, id_b, "distinct directories have distinct identities");
+        let moved = dir.join("a-moved");
+        rename_no_replace(&a, &moved).expect("rename a");
+        let id_moved = dir_identity_no_follow(&moved).expect("id moved");
+        assert_eq!(id_a, id_moved, "a rename preserves the object identity");
+    }
+
+    #[test]
+    fn flush_file_flushes_without_altering_contents() {
+        let dir = temp_dir();
+        let f = dir.join("cred.json");
+        std::fs::write(&f, b"{\"a\":1}").expect("write");
+        flush_file(&f).expect("flush");
+        assert_eq!(std::fs::read(&f).expect("read"), b"{\"a\":1}");
+        // flush_dir is best-effort and must not error on an ordinary directory.
+        flush_dir(dir.as_path()).expect("flush dir best-effort");
     }
 }
