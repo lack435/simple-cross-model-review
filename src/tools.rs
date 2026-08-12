@@ -79,7 +79,7 @@ fn ensure_entry_ready(
     }
     let spec = &cfg.reviewers[index];
     let bin = reviewer::resolve_bin(spec)?;
-    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, cancel)?;
+    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, spec, cancel)?;
     let ready = Preflight { bin, auth };
     cache
         .lock()
@@ -550,7 +550,8 @@ impl App {
                     }
                 }
                 // Identity confirmed: now auth-check and cache the validated binary.
-                let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
+                let auth =
+                    reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, spec, cancel)?;
                 let ready = Preflight { bin, auth };
                 self.preflight
                     .lock()

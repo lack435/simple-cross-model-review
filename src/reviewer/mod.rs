@@ -275,6 +275,71 @@ pub fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// Environment variables carried through to a *controlled* reviewer child, by name.
+///
+/// A non-ambient child starts from a cleared environment ([`apply_controlled_env`]) and receives
+/// only these, each from the parent's current value, plus its config-home variable. Everything else —
+/// every provider-auth variable (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+/// `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, …) included — is simply absent, so an
+/// unknown inherited variable cannot override the profile's OAuth credentials. This list is the
+/// contract; the pre-spawn identity assertion (a later phase) is the backstop that catches anything it
+/// still misses. See `docs/reviewer-account-profiles-impl.md`.
+pub const CONTROLLED_ENV_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Give `cmd` a controlled environment: clear the inherited environment, carry only
+/// [`CONTROLLED_ENV_ALLOWLIST`] (each from the parent's current value), then set `home_var` to
+/// `home`. Used for a non-ambient reviewer child. Ambient children are never passed here — they
+/// inherit the environment unchanged, exactly as before this feature existed.
+pub fn apply_controlled_env(cmd: &mut Command, home_var: &str, home: &Path) {
+    cmd.env_clear();
+    for key in CONTROLLED_ENV_ALLOWLIST {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.env(home_var, home.as_os_str());
+}
+
+/// The config home an adapter should *read* an account from for `spec`, or `None` when it must read
+/// none. The single account-read seam, threaded through [`Config::resolve_authorized_home`]:
+///
+/// - `Ok(Some(home))` — an authorized profile: read that home.
+/// - `Ok(None)` — ambient: read the adapter's own ambient home via `ambient()`, today's behaviour.
+/// - `Err(_)` — a non-ambient profile that is unauthorized or unresolvable: `None`. Accounting reads
+///   (`account_fingerprint`, headroom observation) then fail open (`Unknown`); the *review* path
+///   never reaches an accounting read for such a spec, because `resolve_authorized_home` already
+///   refused the entry upstream.
+pub fn home_for_reads(
+    cfg: &Config,
+    spec: &ReviewerSpec,
+    ambient: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match cfg.resolve_authorized_home(spec) {
+        Ok(Some(home)) => Some(home),
+        Ok(None) => ambient(),
+        Err(_) => None,
+    }
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = normalize_windows_path(path);
     let root = normalize_windows_path(root);
@@ -518,7 +583,13 @@ pub trait Reviewer: Send + Sync {
     /// `cancel` interrupts the check: a fallback entry's preflight runs inside the review's walk,
     /// so a cancellation (or shutdown) must be able to stop a 30-second auth probe rather than
     /// wait it out. See `docs/reviewer-fallback-chain.md`.
-    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure>;
+    fn auth_check(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        spec: &ReviewerSpec,
+        cancel: &AtomicBool,
+    ) -> Result<String, Failure>;
 
     fn invocation(
         &self,
@@ -1601,5 +1672,70 @@ mod drain_tests {
             "{}",
             failure.summary
         );
+    }
+}
+
+#[cfg(test)]
+mod controlled_env_tests {
+    use super::*;
+
+    fn envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn controlled_env_sets_the_home_and_drops_provider_variables() {
+        let mut cmd = Command::new("x");
+        // Provider-auth variables explicitly present before the controlled env must be gone after —
+        // `env_clear` wipes the whole map, including prior explicit sets, so nothing inherited can
+        // override the profile OAuth.
+        cmd.env("ANTHROPIC_API_KEY", "secret");
+        cmd.env("OPENAI_API_KEY", "secret");
+        cmd.env("CODEX_ACCESS_TOKEN", "secret");
+        apply_controlled_env(&mut cmd, "CODEX_HOME", Path::new(r"C:\profiles\codex\work"));
+
+        let envs = envs(&cmd);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "CODEX_HOME" && v.as_deref() == Some(r"C:\profiles\codex\work")),
+            "home var must be set to the profile home: {envs:?}"
+        );
+        // No provider-auth variable survives, by exact name or by shape.
+        for (k, _) in &envs {
+            assert!(
+                !k.contains("API_KEY") && !k.contains("ACCESS_TOKEN") && !k.contains("OAUTH_TOKEN"),
+                "provider-auth variable leaked into the controlled env: {k}"
+            );
+        }
+        // Every remaining key is on the allowlist or is the home var itself — nothing else leaks.
+        for (k, _) in &envs {
+            assert!(
+                k == "CODEX_HOME" || CONTROLLED_ENV_ALLOWLIST.contains(&k.as_str()),
+                "unexpected key in controlled env: {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_carries_no_provider_auth_variable() {
+        for key in CONTROLLED_ENV_ALLOWLIST {
+            assert!(
+                !key.contains("API_KEY")
+                    && !key.contains("ACCESS_TOKEN")
+                    && !key.contains("OAUTH")
+                    && !key.starts_with("ANTHROPIC")
+                    && !key.starts_with("OPENAI")
+                    && !key.starts_with("CODEX")
+                    && !key.starts_with("CLAUDE"),
+                "the controlled-env allowlist must not carry a provider/auth variable: {key}"
+            );
+        }
     }
 }

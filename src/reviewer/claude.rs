@@ -19,7 +19,13 @@ const DENIED_TOOLS: &str = "Edit,Write,NotebookEdit";
 pub struct ClaudeReviewer;
 
 impl Reviewer for ClaudeReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
+    fn auth_check(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        spec: &ReviewerSpec,
+        cancel: &AtomicBool,
+    ) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
         // Isolated and run outside the project, like `invocation`. The stated policy is
         // that the reviewer CLI never loads the reviewed repository's configuration, and
@@ -27,6 +33,13 @@ impl Reviewer for ClaudeReviewer {
         // the one invocation that broke it by construction, inheriting the project as its
         // working directory with no isolation flags.
         cmd.current_dir(super::neutral_dir(cfg));
+        // Profile: refuse an unauthorized non-ambient profile (the `?`), and for an authorized one
+        // run the check in a controlled environment against that home, so it verifies the *profile*
+        // account rather than whatever the ambient environment resolves to. Ambient leaves the
+        // environment untouched -- byte-for-byte today's behaviour.
+        if let Some(home) = cfg.resolve_authorized_home(spec)? {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home);
+        }
         if cfg.isolate_reviewer {
             cmd.arg("--safe-mode");
             cmd.arg("--strict-mcp-config");
@@ -95,6 +108,17 @@ impl Reviewer for ClaudeReviewer {
             None => (cfg.cwd.as_path(), &cfg.allowed_tools),
         };
         cmd.current_dir(cwd);
+        // Profile: for an authorized non-ambient profile, run in a controlled environment against
+        // that home (so the review bills the profile account, and no inherited provider-auth
+        // variable can override it). Ambient leaves the environment untouched. An unauthorized
+        // profile cannot reach here -- the review path is refused upstream by
+        // `resolve_authorized_home` -- but map its `Failure` defensively rather than panic.
+        if let Some(home) = cfg
+            .resolve_authorized_home(spec)
+            .map_err(|e| std::io::Error::other(e.summary))?
+        {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home);
+        }
         cmd.arg("-p");
         if cfg.chain_gates_on_usage() {
             // Armed: stream-json carries the `rate_limit_event` we read headroom from; its terminal
@@ -201,8 +225,8 @@ impl Reviewer for ClaudeReviewer {
     /// The logged-in account, read from the CLI's local account file `~/.claude.json`
     /// (`oauthAccount.accountUuid`, with the org uuid to disambiguate) — a local file, the
     /// account *identifier* only, never the credentials in `~/.claude/.credentials.json`.
-    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
-        claude_account_id(&claude_config_path()?)
+    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+        claude_account_id(&claude_config_path(cfg, spec)?)
     }
 }
 
@@ -439,13 +463,26 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     ))
 }
 
-/// Path to Claude Code's account file: `$CLAUDE_CONFIG_DIR/.claude.json` when set, else
-/// `~/.claude.json` — the same resolution the CLI uses.
-fn claude_config_path() -> Option<std::path::PathBuf> {
+/// The *ambient* Claude config home: `$CLAUDE_CONFIG_DIR` when set, else `~` — the same resolution
+/// the CLI uses when no profile redirects it.
+fn ambient_claude_home() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+        let p = std::path::PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
     }
-    super::home_dir().map(|h| h.join(".claude.json"))
+    super::home_dir()
+}
+
+/// Path to Claude Code's account file `.claude.json` in the config home selected for `spec`.
+///
+/// Profile-aware: an authorized profile's home, else the ambient home. Threaded through
+/// [`super::home_for_reads`] so the fingerprint read cannot cross an account-authorization boundary —
+/// a non-ambient profile that is unauthorized yields `None` (fail open for accounting). `None` also
+/// when no home can be resolved at all.
+fn claude_config_path(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::PathBuf> {
+    super::home_for_reads(cfg, spec, ambient_claude_home).map(|h| h.join(".claude.json"))
 }
 
 /// Read a stable account identifier from `~/.claude.json`: the OAuth account uuid, combined with
