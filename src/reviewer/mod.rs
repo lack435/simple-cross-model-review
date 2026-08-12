@@ -439,9 +439,13 @@ pub fn run_login(
 /// Abort a login job: terminate it, wait (bounded) for the direct child, then wait for the whole job
 /// to go quiet, so the caller never cleans up staging while a member is still writing (f8). The child
 /// wait is bounded rather than an unbounded `child.wait()` so a wedged process cannot hang the runner.
+///
+/// Returns **contained** only if `TerminateJobObject` was accepted **and** the job reached zero active
+/// processes — a failed terminate (even if quiescence then coincidentally reads zero) is *not*
+/// containment. The caller leaves staging for recovery whenever this is false.
 #[allow(dead_code)] // reached via run_login, whose caller lands with the setup provisioning flow.
 fn terminate_and_settle(job: &crate::winjob::JobObject, child: &mut Child) -> bool {
-    job.terminate();
+    let terminated = job.terminate();
     let deadline = Instant::now() + LOGIN_QUIESCE_BOUND;
     loop {
         match child.try_wait() {
@@ -453,7 +457,7 @@ fn terminate_and_settle(job: &crate::winjob::JobObject, child: &mut Child) -> bo
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    wait_quiescent(job)
+    terminated && wait_quiescent(job)
 }
 
 /// Wait (bounded) for the job's live process count to reach zero. `true` if it quiesced; `false` on
@@ -2075,6 +2079,13 @@ mod controlled_env_tests {
         let start = Instant::now();
         let out = run_login(slow, &scratch, Duration::from_secs(120), &cancel);
         assert!(out.cancelled && !out.success);
+        // A normally-terminable child is proven contained (terminate accepted + job quiesced), so the
+        // caller may clean up staging rather than leaking it. (The `uncontained == true` path requires
+        // an OS terminate failure / non-quiescence, which is impractical to force in a unit test.)
+        assert!(
+            !out.uncontained,
+            "a killable login child must be reported contained"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(15),
             "a cancelled login must not wait out the child"
