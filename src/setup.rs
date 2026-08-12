@@ -368,17 +368,40 @@ fn parse_selector(args: &Value, _reviewer: ReviewerKind) -> Result<ProfileSelect
     }
 }
 
-/// A stable key for a home path, so the lock/marker file names are the same for the *same physical
-/// directory* regardless of spelling. The path is canonicalized first (resolving `.`/`..`, symlinks,
-/// and 8.3/short-name and case aliases via the OS), so equivalent spellings such as `C:\x\work` and
-/// `C:\x\.\work` map to one key and cannot run concurrent setups of one home ([f5]). When the path
-/// cannot be canonicalized (it does not exist yet), the normalized string is used as a best effort.
-/// Collision-resistant (SHA-256), truncated for a tidy file name.
+/// A stable key for a home path, so the lock/marker/journal file names are the same for the *same
+/// physical directory* regardless of spelling **and regardless of whether the leaf exists yet**.
+///
+/// Canonicalizing the full path only works once it exists; during the `home → .old` swap window, and
+/// on a fresh first-provision where even `profiles/{reviewer}` is not created yet, it does not. So the
+/// key is built from the **longest existing ancestor** (canonicalized, resolving `.`/`..`, symlinks,
+/// and 8.3/short-name and case aliases) plus the remaining components **lower-cased** — Windows
+/// directories are case-insensitive, so `…\Work` and `…\work` are one directory and must map to one
+/// key (f-a1/f-c2). Two equivalent spellings therefore collapse to one lock/journal, so they cannot run
+/// concurrent setups of one home or bypass each other's recovery ([f5]). Collision-resistant
+/// (SHA-256), truncated for a tidy file name.
 fn home_key(effective_home: &Path) -> String {
-    let resolved =
-        std::fs::canonicalize(effective_home).unwrap_or_else(|_| effective_home.to_path_buf());
-    let normalized = resolved.to_string_lossy().to_lowercase().replace('/', "\\");
-    let normalized = normalized.trim_end_matches('\\');
+    // Walk up to the longest existing ancestor, collecting the non-existent tail (leaf-first).
+    let mut existing: &Path = effective_home;
+    let mut remainder: Vec<String> = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                remainder.push(name.to_string_lossy().to_lowercase());
+                existing = parent;
+            }
+            // No parent (a root/prefix) or no file name: stop here and use what we have.
+            _ => break,
+        }
+    }
+    let base = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    let mut normalized = base.to_string_lossy().to_lowercase().replace('/', "\\");
+    while normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    for comp in remainder.iter().rev() {
+        normalized.push('\\');
+        normalized.push_str(comp);
+    }
     match crate::digest::Fingerprint::of(normalized.as_bytes()) {
         Some(fp) => fp.sha256[..24].to_string(),
         // The digest is only unavailable if the OS CNG call fails, which is essentially never; fall
@@ -422,6 +445,29 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         crate::testutil::temp_dir("cross-review-setup-tests")
+    }
+
+    #[test]
+    fn home_key_is_stable_across_case_and_a_missing_leaf() {
+        let base = temp_dir();
+        // The reviewer/profiles ancestor exists; the leaf does not (a fresh first-provision).
+        let ancestor = base.join("profiles").join("codex");
+        std::fs::create_dir_all(&ancestor).expect("mkdir ancestor");
+        // Two case spellings of the same not-yet-created leaf map to one key (f-c2)...
+        let upper = ancestor.join("Work");
+        let lower = ancestor.join("work");
+        assert_eq!(
+            home_key(&upper),
+            home_key(&lower),
+            "case-only spellings of one home must share a key"
+        );
+        // ...and even with NO existing parent at all, a stable key is produced (f-a1) and distinct
+        // homes still differ.
+        let missing_a = base.join("nope").join("a");
+        let missing_b = base.join("nope").join("b");
+        assert_ne!(home_key(&missing_a), home_key(&missing_b));
+        // A different profile name is a different key.
+        assert_ne!(home_key(&lower), home_key(&ancestor.join("personal")));
     }
 
     #[test]
