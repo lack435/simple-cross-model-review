@@ -95,16 +95,42 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
      out-of-job process). Two honest residuals: same-user post-verify tampering is outside the ACL-only
      trust boundary (README), and full callback-lifecycle verification needs a synthetic-provider
      harness or the deferred real smoke. Build against that doc.
-   - **#15·part 3b implementation — TODO (the last piece):** **first-provision** and **staged re-login**, which need
-     **vendor-login orchestration** (drive `codex login` / `claude login`, non-TTY browser callback, closed
-     child stdin, bounded timeout, cancellation, **redaction** of login stdout/stderr) — the riskiest,
-     least-specified part. These use `secure_profile_dir` to create/stage the home and the deferred
-     **ownership-scoped created-dir rollback** (build it *with* the creation mechanism: record ownership
-     before creating, refuse a pre-existing dir, retain the marker until cleanup succeeds — `src/setup.rs`
-     module doc says so), plus the `[f20]` post-login handle-relative credential re-verify (primitive
-     present). Also still deferred: the `[f5]` review-vs-setup **shared** lock (setup takes the exclusive
-     side already; add the shared read around `attempt()`), and `smoke.ps1` end-to-end against a real
-     provisioned profile.
+   - **#15·part 3b implementation — DONE (committed, green; NOT yet gated).** The approved design is
+     implemented across nine committed slices (all `cargo fmt --check` / `clippy -D warnings` / 647
+     tests green; release build passes). What landed:
+     - **`src/winsec.rs`**: `create_new_secured_child_dir` (exclusive `FILE_CREATE` ownership proof),
+       `secure_and_verify_child_file` ([f20] apply-then-verify), `read_child_file` (handle-relative
+       account read, f-a5), `rename_no_replace` (`MoveFileExW` no-replace + write-through, f-c1/f-c4/f-b5),
+       `flush_file`/`flush_dir` (f-b2/f-b3), `dir_identity_no_follow` (`BY_HANDLE_FILE_INFORMATION`, f-a3).
+     - **`src/winjob.rs`**: login-job `spawn_in_job` (CREATE_SUSPENDED → assign → resume via Toolhelp,
+       creation-time association, f10/f-r3.3), `active_processes` quiescence query (f14); keeps
+       `KILL_ON_JOB_CLOSE` (f-b1) and no breakaway.
+     - **`src/session.rs`**: `ExclusiveLock`/`SharedLock` refactored to `LockFileEx` byte-range locks (f9).
+     - **`src/reviewer/mod.rs`**: `LoginOutcome` + `run_login` (redacted/contained/isolated, closed
+       stdin, bounded timeout, cancel, quiescence, fail-closed-if-uncontainable).
+     - **`src/reviewer/codex.rs`/`claude.rs`**: `login_command`, `credential_files`,
+       `confirm_setup_identity` (handle-relative account read + isolated method probe, f-a5/f-r2.6).
+     - **`src/profile.rs`**: `secure_staging_dir`, `SecuredProfileDir::{secure_and_verify_credential,
+       read_credential, open_existing}`.
+     - **`src/allowlist.rs`**: durable store publication (flush before `.old` delete, f-b2); recovery
+       certifies the exact `AllowEntry` via `is_authorized` (f-b4).
+     - **`src/setup.rs`**: path-independent + case-normalized `home_key` (f-a1/f-c2); the WAL `Journal`
+       + presence-driven `recover` (8-state table + prioritized rejected-path phase, marker-verified
+       quarantine-never-delete, object-identity-proven `.old` restore); the unified staged
+       provisioning flow (`provision`/`provision_after_approval`) with `OwnedStaging` rollback +
+       `arm`ed journal-leaves-on-failure; `acquire_review_home_lock` for the [f5] shared side.
+     - **`src/mcp.rs`**: the `login` boolean added to `cross_model_setup_profile`.
+     - **`src/tools.rs`**: the [f5] shared home-lock held across the whole review `attempt()`.
+     - Tests: winsec/winjob/session/login-runner units; setup recovery-state units; **injected-login
+       integration tests** for first-provision, re-login (account swap + `.old` cleanup), failed-login
+       rollback, and the review-vs-setup lock coupling.
+     - **Scope note:** the vendor login lock is **per-user** (`{base}/auth/login.lock`), not the
+       machine-wide `Global` the plan's f19 specified — a normal-user process cannot create a `Global\`
+       object and a cross-user %PROGRAMDATA% lock was judged disproportionate; the rarer two-user
+       collision surfaces as the vendor's own fixed-port bind error. Flag this in the gate.
+     - **Still remaining:** the cross-review **gate** on the implementation; the **no-token login probe**
+       (validates non-TTY browser-open + callback, spends no tokens); `build.ps1` **dist restage** (needs
+       the running MCP server unloaded); and the deferred real-OAuth **`smoke.ps1`**.
 
 ## Resume-critical gotchas (not obvious from the code)
 
