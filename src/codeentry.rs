@@ -13,9 +13,6 @@
 //! in memory, handed straight to the child's stdin, and **never logged or returned in any error**.
 
 #![cfg(windows)]
-// The production caller is the Claude code-paste login flow (setup provisioning, #15 part 3b); until
-// that wiring lands the server is exercised only by this module's tests.
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};

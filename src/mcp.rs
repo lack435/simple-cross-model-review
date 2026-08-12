@@ -957,7 +957,8 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  localhost page in your browser and blocks until you click Approve, so a person — not \
                  an agent — decides. By default it only authorizes an ALREADY-provisioned, signed-in \
                  profile (no login). Pass \"login\": true to provision one: it drives the vendor login \
-                 in your browser and BLOCKS for several minutes while you sign in, then authorizes the \
+                 in your browser and BLOCKS for several minutes while you sign in (for some reviewers a \
+                 local page asks you to paste a code shown in the browser), then authorizes the \
                  result — this both first-provisions a new home and re-signs-in (switches the account \
                  of) an existing one. Nothing is authorized unless you approve, and authorization is \
                  scoped to the directory this server was launched from.",

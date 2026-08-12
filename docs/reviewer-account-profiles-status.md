@@ -139,11 +139,26 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
        machine-wide `Global` the plan's f19 specified — a normal-user process cannot create a `Global\`
        object and a cross-user %PROGRAMDATA% lock was judged disproportionate; the rarer two-user
        collision surfaces as the vendor's own fixed-port bind error. Flag this in the gate.
-     - **Still remaining (all deferred, not blockers to the code landing):** the **no-token login
-       probe** (validates non-TTY browser-open + callback + no out-of-job spawn; spends no tokens — the
-       supported-vendor gate for f9); `build.ps1` **dist restage** (needs the running MCP server
-       unloaded — a release-time step); and the deferred real-OAuth **`smoke.ps1`** end-to-end (first
-       real login, account switch, cancelled/failed-login-leaves-prior-home-intact).
+   - **#15·part 3b — Claude code-paste login flow (DONE, committed, green).** The no-token probe (run
+     2026-08-12) showed **Codex** uses a localhost-callback login (validated: closed stdin OK, binds
+     `:1455`, browser auto-opens) but **Claude's `auth login --claudeai` is a code-paste flow** — the
+     browser redirects to a hosted page that shows a code the human must paste back into the CLI's
+     **stdin**, incompatible with the closed-stdin/redacted `run_login`. So a Claude path was built:
+     `src/codeentry.rs` (a loopback `CodeEntryServer` — same lockdown as `approval.rs`: one-time token,
+     bounded reads incl. the POST body, HTML-escaped, no-store, terminal-state; shows the auth URL + a
+     code field, captures the pasted code, never logs it) and `reviewer::run_login_code_paste` (piped
+     stdin/stdout under the login job, background scanners extract the auth URL — redacted, only the URL
+     is surfaced — then serve the code page, write the submitted code to the child's stdin, wait for
+     exit; same containment/uncontained/quiescence handling as `run_login`). The adapter's
+     `login_mode()` (Codex `BrowserCallback`, Claude `CodePaste`) picks the executor in the setup
+     `login_fn`. Unit-tested: `CodeEntryServer` round-trip + percent-decode; `extract_https_url` against
+     the exact Claude output. **The full Claude interactive path (spawn → paste → creds) is validated
+     by the deferred real smoke, not unit tests** (the CodeEntryServer port is internal to the runner).
+     Still to gate this addition through cross-review.
+     - **Still remaining (all deferred, not blockers to the code landing):** `build.ps1` **dist restage**
+       (needs the running MCP server unloaded — a release-time step); and the deferred real-OAuth
+       **`smoke.ps1`** end-to-end (Codex first-login + Claude code-paste + account switch +
+       cancelled/failed-login-leaves-prior-home-intact).
 
 ## Resume-critical gotchas (not obvious from the code)
 

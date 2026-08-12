@@ -319,6 +319,18 @@ pub fn apply_controlled_env(cmd: &mut Command, home_var: &str, home: &Path) {
     cmd.env(home_var, home.as_os_str());
 }
 
+/// Which interactive shape a reviewer's vendor login takes (#15 part 3b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the setup provisioning flow (#15 part 3b).
+pub enum LoginMode {
+    /// The login opens a browser that redirects to a localhost callback the CLI hosts; it completes on
+    /// its own with stdin closed and output discarded (Codex).
+    BrowserCallback,
+    /// The login shows a code the human must paste back into the CLI's stdin (Claude); needs the
+    /// interactive code-entry page + [`run_login_code_paste`].
+    CodePaste,
+}
+
 /// The outcome of a vendor login run — deliberately **carries no captured text** (redaction, f-r2.7):
 /// the child's stdout/stderr may echo OAuth tokens or the authorize URL, so they are discarded, never
 /// returned or logged. Only these control-flow signals are exposed, so a caller cannot accidentally
@@ -1113,13 +1125,22 @@ pub trait Reviewer: Send + Sync {
 
     /// Build the vendor **login** command that signs a fresh subscription session into `home` (the
     /// staging dir), with the controlled environment applied (`env_clear` + allowlist + the home var).
-    /// The caller adds the owned scratch cwd, null stdio and containment. Never an api-key/token flow.
+    /// The caller adds the owned scratch cwd, stdio and containment. Never an api-key/token flow.
     /// Default fails closed for an adapter with no login. (#15 part 3b)
     #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
     fn login_command(&self, _bin: &Path, _home: &Path) -> Result<Command, Failure> {
         Err(errors::bad_request(
             "no vendor login is implemented for this reviewer",
         ))
+    }
+
+    /// Which login flow this reviewer uses (#15 part 3b): a **browser callback** to a localhost server
+    /// (Codex — stdin closed, output discarded) or a **code paste** where the human pastes the
+    /// authorization code back into the login's stdin (Claude). The setup runner picks the matching
+    /// login executor. Default browser-callback.
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn login_mode(&self) -> LoginMode {
+        LoginMode::BrowserCallback
     }
 
     /// The credential files the vendor writes into a signed-in home, in the order to poll-for-arrival

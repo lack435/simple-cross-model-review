@@ -638,7 +638,17 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
             };
             let login_fn = |h: &Path, scratch: &Path, cancel: &std::sync::atomic::AtomicBool| {
                 match adapter.login_command(&bin, h) {
-                    Ok(cmd) => crate::reviewer::run_login(cmd, scratch, LOGIN_TIMEOUT, cancel),
+                    // Pick the executor by the reviewer's login shape: a browser-callback login runs
+                    // with stdin closed and output discarded; a code-paste login needs the interactive
+                    // code-entry page.
+                    Ok(cmd) => match adapter.login_mode() {
+                        crate::reviewer::LoginMode::BrowserCallback => {
+                            crate::reviewer::run_login(cmd, scratch, LOGIN_TIMEOUT, cancel)
+                        }
+                        crate::reviewer::LoginMode::CodePaste => {
+                            crate::reviewer::run_login_code_paste(cmd, scratch, LOGIN_TIMEOUT, cancel)
+                        }
+                    },
                     Err(_) => crate::reviewer::LoginOutcome {
                         success: false,
                         timed_out: false,

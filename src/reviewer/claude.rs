@@ -244,6 +244,13 @@ impl Reviewer for ClaudeReviewer {
         Ok(cmd)
     }
 
+    /// Claude's `auth login` shows an authorization **code** the human pastes back into stdin (verified
+    /// by the no-token probe: the browser redirects to a hosted page, not a localhost callback), so it
+    /// needs the interactive code-paste flow.
+    fn login_mode(&self) -> super::LoginMode {
+        super::LoginMode::CodePaste
+    }
+
     /// Claude writes the account file `.claude.json` (read handle-relative for the fingerprint) and the
     /// OAuth secret `.credentials.json`. The account file is first (f-a5). Both are **required** by
     /// setup (f6) as direct children of `CLAUDE_CONFIG_DIR`. NOTE: that `.credentials.json` lands as a
