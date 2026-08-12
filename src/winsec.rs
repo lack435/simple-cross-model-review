@@ -40,10 +40,13 @@ const READ_CONTROL: Dword = 0x0002_0000;
 // traverse into them.
 const FILE_LIST_DIRECTORY: Dword = 0x0000_0001;
 const FILE_TRAVERSE: Dword = 0x0000_0020;
-// Share reads with other openers but never DELETE: a directory or file opened without
-// FILE_SHARE_DELETE cannot be renamed or deleted out from under the held handle ([f20]).
+// Share reads with other openers. Whether DELETE is shared is per-open: a *held* directory or a
+// write temp omits it (so the object cannot be renamed/deleted out from under the handle, [f20]),
+// but a brief *read* of the store file shares DELETE so it does not block a concurrent atomic
+// replacement — the reader keeps its already-opened snapshot while the writer's rename swaps the name.
 const FILE_SHARE_READ: Dword = 0x0000_0001;
 const FILE_SHARE_WRITE: Dword = 0x0000_0002;
+const FILE_SHARE_DELETE: Dword = 0x0000_0004;
 const OPEN_EXISTING: Dword = 3;
 const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
@@ -437,6 +440,7 @@ fn open_child_relative(
     leaf: &OsStr,
     access: Dword,
     disposition: Dword,
+    share_delete: bool,
 ) -> io::Result<OwnedHandle> {
     let name: Vec<u16> = leaf.encode_wide().collect();
     let is_dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
@@ -464,6 +468,10 @@ fn open_child_relative(
         security_descriptor: std::ptr::null_mut(),
         security_quality_of_service: std::ptr::null_mut(),
     };
+    let mut share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    if share_delete {
+        share |= FILE_SHARE_DELETE;
+    }
     let mut handle: Handle = std::ptr::null_mut();
     let mut iosb = IoStatusBlock {
         status_or_pointer: 0,
@@ -479,7 +487,7 @@ fn open_child_relative(
             &mut iosb,
             std::ptr::null_mut(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share,
             disposition,
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null_mut(),
@@ -784,6 +792,8 @@ pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resul
         tmp_leaf,
         GENERIC_READ | GENERIC_WRITE | WRITE_DAC | READ_CONTROL,
         FILE_CREATE,
+        // The temp is ours alone until we rename it; do not share DELETE.
+        false,
     )?;
     apply_restrictive_dacl(&handle)?;
     verify_restrictive_dacl(&handle)?;
@@ -826,7 +836,16 @@ pub fn read_secured_file(path: &Path) -> io::Result<Vec<u8>> {
     let (dir, leaf) = split_parent_leaf(path)?;
     let dir_handle = open_dir_no_follow(dir, false)?;
     verify_restrictive_dacl(&dir_handle)?;
-    let file = open_child_relative(&dir_handle, leaf, GENERIC_READ | READ_CONTROL, FILE_OPEN)?;
+    // Share DELETE on the read so a held read handle never blocks a concurrent atomic replacement:
+    // `is_authorized` reads without the store lock, so a writer's rename-over must not be able to
+    // fail merely because a reader has the old file open. The reader keeps its opened snapshot.
+    let file = open_child_relative(
+        &dir_handle,
+        leaf,
+        GENERIC_READ | READ_CONTROL,
+        FILE_OPEN,
+        true,
+    )?;
     verify_restrictive_dacl(&file)?;
     let mut f = std::fs::File::from(file);
     let mut buf = Vec::new();
@@ -902,6 +921,28 @@ mod tests {
         let dir = temp_dir();
         let missing = dir.join("nope.json");
         assert!(read_secured_file(&missing).is_err());
+    }
+
+    #[test]
+    fn a_shared_delete_reader_does_not_block_a_secured_rewrite() {
+        // The store read path opens with FILE_SHARE_DELETE so a held read handle never blocks a
+        // concurrent atomic replacement. Prove the mechanism: hold the target open with that exact
+        // share mode, then a secured rewrite (rename-over) must still succeed and be visible.
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir();
+        let _parent = create_secured_dir(dir.as_path()).expect("secure parent");
+        let target = dir.join("store.json");
+        let tmp = dir.join("store.json.tmp");
+        write_secured_file(&target, &tmp, b"v1").expect("write v1");
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&target)
+            .expect("hold a shared-delete reader");
+        let tmp2 = dir.join("store.json.tmp2");
+        write_secured_file(&target, &tmp2, b"v2")
+            .expect("a rewrite must not be blocked by a shared-delete reader");
+        assert_eq!(read_secured_file(&target).expect("read"), b"v2");
     }
 
     #[test]

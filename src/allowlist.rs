@@ -311,6 +311,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reads_do_not_block_authorization_writes() {
+        // is_authorized reads without the store lock, so a reader must not be able to make a
+        // concurrent authorize's atomic rename fail. With FILE_SHARE_DELETE on read handles this is
+        // guaranteed, so every write below must succeed despite a reader hammering the same file.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = temp_dir();
+        let store = AllowlistStore::at(&dir);
+        store
+            .authorize(entry(r"C:\seed", r"C:\seedhome", "codex", "acct-0"))
+            .expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_dir = dir.as_path().to_path_buf();
+        let reader_stop = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let store = AllowlistStore::at(&reader_dir);
+            let q = entry(r"C:\seed", r"C:\seedhome", "codex", "acct-0");
+            // Transient read errors are tolerated; the point is only to hold the file open often.
+            // Yield between reads rather than busy-spinning, so this thread does not starve the other
+            // tests running in parallel while still overlapping the writer frequently.
+            while !reader_stop.load(Ordering::Relaxed) {
+                let _ = store.is_authorized(&q);
+                std::thread::yield_now();
+            }
+        });
+
+        for i in 0..40 {
+            let e = entry(
+                r"C:\seed",
+                &format!(r"C:\home\{i}"),
+                "codex",
+                &format!("acct-{i}"),
+            );
+            store
+                .authorize(e)
+                .expect("a concurrent reader must not block an authorization write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
     fn a_corrupt_store_fails_closed() {
         let dir = temp_dir();
         let store = AllowlistStore::at(&dir);
