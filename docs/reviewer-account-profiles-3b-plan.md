@@ -107,11 +107,28 @@ pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> Lo
   does not quiesce within the bound, login **fails closed** — refuse or report an uncontained-abort
   error; we never run, abandon, or clean up after a login we cannot prove contained. Child stdin is
   **closed**.
-- **Machine-wide serialization (f4).** The vendor CLIs bind a **fixed localhost callback port**
-  (Codex ~1455), so concurrent logins collide regardless of home or `CROSS_REVIEW_HOME`. Serialize
-  with a **Windows named mutex** (`CreateMutexW`, session-scoped `Local\` name), held for the entire
-  login+callback lifetime. A base-scoped lockfile is insufficient. Small named-mutex RAII primitive
-  (FFI, no new crate). Login timeout ~3 min, separate from the 5-min `APPROVAL_TIMEOUT`.
+- **Containment limits, stated honestly (f18).** `ActiveProcesses == 0` proves only that *job members*
+  are gone. Two escape routes exist and are handled as follows: (1) **job breakaway** — the login job
+  is created **without** `JOB_OBJECT_LIMIT_BREAKAWAY_OK` / silent-breakaway, so a child cannot detach
+  itself from the job via the standard mechanism; (2) a helper spawned **out-of-band** (via the WMI or
+  service-control path, whose real parent is a system service, not our child) **cannot be contained by
+  any job** — this is an inherent Windows limitation, not something this design can close. Per the
+  project's "claim only what was verified" rule, the plan **documents this residual** rather than
+  claiming full containment, and the **no-token probe records whether either vendor spawns any
+  out-of-job process** during login (a smoke observation, not a guarantee). **Stale-callback safety**
+  across the reused fixed port rests on: the machine-wide login mutex (no two callback servers coexist)
+  + job teardown on abort (the server dies, so a late redirect after cancellation hits a dead port) +
+  the **vendor's own OAuth `state`/PKCE**, which rejects a redirect whose state does not match the
+  in-flight login — a reliance we state explicitly because we neither run nor can inspect the callback
+  server ourselves.
+- **Machine-wide serialization (f4, f19).** The vendor CLIs bind a **fixed localhost callback port**
+  (Codex ~1455). A loopback TCP port is **per-machine, not per-session**, so two RDP/console users on
+  one machine collide on it — a **`Local\` (per-session) mutex is therefore wrong** (f19). Serialize
+  **machine-wide** with a **`Global\` named mutex secured by a DACL** (or, equivalently, a secured
+  machine-wide lockfile under a protected `%PROGRAMDATA%` location), created with an explicit DACL so it
+  cannot be squatted by another user to deny service, and held for the entire login+callback lifetime.
+  A base-scoped lockfile is insufficient. Small secured-named-mutex RAII primitive (FFI, no new crate).
+  Login timeout ~3 min, separate from the 5-min `APPROVAL_TIMEOUT`.
 
 ### Confirmation probe, mandatorily isolated (f-r2.6)
 
@@ -193,10 +210,17 @@ spellings map to one key whether or not the leaf currently exists. Alias tests (
 `.`/`..`) assert one key.
 
 **One write-ahead journal for both operations, flushed to stable storage (f15).** The marker is
-extended into a journal `{ operation, home, staging_path, old_path, nonce, intent }`, written
-**before** each filesystem mutation (write-ahead) so the nonce-named paths are durable before any
-rename that could crash: before creating staging, before `rename(home → .old)`, before
-`rename(staging → home)`. Because atomic-write-plus-rename alone can be reordered behind the directory
+extended into a journal `{ operation, home, staging_path, old_path, rejected_path, nonce, intent }`,
+written **before** each filesystem mutation (write-ahead) so the nonce-named paths are durable before
+any rename that could crash: before creating staging, before `rename(home → .old)`, before
+`rename(staging → home)`, **and before a quarantine `rename(home → rejected_path)` (f17)**. The
+quarantine is thus itself a journaled WAL step, not an untracked side effect: if recovery crashes after
+renaming `home → rejected-{nonce}` but before restoring `.old`, the journal still names
+`rejected_path`, so the next `begin` sees a present, journal-owned, marker-verified rejected dir and
+finishes the transition (restore `.old`, retain the rejected dir under the journal for the human to
+resolve) rather than stranding it. A `rejected-{nonce}` that is present, marker-matching, and named in
+the journal is an **owned quarantined dir**; one whose marker does not match is left untouched
+(fail closed). Because atomic-write-plus-rename alone can be reordered behind the directory
 renames under **power loss**, each write-ahead journal update calls **`FlushFileBuffers`** on the
 journal file before the mutation it guards proceeds, so the intent reaches stable storage first and the
 recovery invariant holds across power loss, not only a process crash.
@@ -215,7 +239,7 @@ and refuses**, surfacing an error rather than guessing:
 | 0 | 0 | 1 | staging created, not swapped in | remove staging (ours); first-provision: clear journal; re-login: home lost → **retain journal, refuse** |
 | 0 | 1 | 0 | home moved to `.old`, staging gone before swap-in (failed cleanup) | **restore `.old→home`**, clear journal |
 | 0 | 1 | 1 | crashed between `home→.old` and `staging→home` | **restore `.old→home`**, remove staging, clear journal |
-| 1 | 0 | 0 | complete, or crashed during authorize; or first-provision never started | consult store; **never delete a store-authorized home**; clear journal |
+| 1 | 0 | 0 | complete; **or first-provision/re-login crashed after `staging→home` but before authorize** (f16); or first-provision never started | **consult store + marker (f16)**: exact store entry present → committed, clear journal, keep home; no entry + home marker matches journal nonce → uncommitted → **quarantine** the home (re-login also restores `.old`; first-provision leaves home absent), journalling the quarantine (f17); no entry + marker absent/mismatched → **retain journal, refuse** |
 | 1 | 0 | 1 | pre-swap original home + our staging (or an external home collided with our first-provision rename) | remove staging (ours); **do not touch home** (not ours to delete); clear journal |
 | 1 | 1 | 0 | re-login crashed after `staging→home`, before/at authorize | **consult store (f9)**: new entry durably present → remove `.old`, keep home, clear journal; else **roll back** — see object-ownership proof + quarantine (f13) below — restore `.old→home`, clear journal |
 | 1 | 1 | 1 | our `.old` + our staging + a present home (external re-creation / impossible interleave) | **unexpected → retain journal, refuse** |
@@ -291,13 +315,27 @@ Factor the login step behind an injected callback so unit tests never run real O
   no process quiescence / undefined browser ownership → browser out-of-job, bounded quiescence waits,
   callback invalidation on abort; **f-r4.4 (f15)** WAL not power-loss durable → `FlushFileBuffers`
   before each guarded mutation.
+- **rv-20864-6** marked f13/f14 resolved and raised four more, folded in: **f-r5.1 (f16)**
+  first-provision `H=1,O=0,S=0` cleared its journal with an uncommitted home → marker+store-driven
+  quarantine at that state; **f-r5.2 (f17)** the quarantine was not itself journaled → `rejected_path`
+  added to the WAL schema and a partial quarantine is recoverable; **f-r5.3 (f18)** out-of-job
+  browser/helper lifetime → deny breakaway, rely on vendor OAuth `state` + machine-wide mutex + server
+  teardown for stale callbacks, and **document the WMI/service-escape residual honestly**; **f-r5.4
+  (f19)** a `Local\` mutex is per-session but the callback port is per-machine → **`Global\` secured
+  mutex** (or `%PROGRAMDATA%` secured lockfile).
+- **Ledger note:** across rv-20864-4..6 the entries f9/f12/f15 repeatedly froze at a stale `open`
+  (identical detail text, non-advancing turn — issue #62). Their live content was addressed: f9's
+  successor **f13 is resolved**; f12's parent-canonical key and f15's `FlushFileBuffers` are in the doc
+  with no live successor finding. The authoritative verdict is taken from the running fresh session as
+  the remaining live findings converge.
 
 ## Files to modify
 
 - **`src/winsec.rs`** — `secure_and_verify_child_file` (f20); `create_new_secured_child_dir`
   (exclusive create, f1); named-mutex RAII primitive (f4); tests.
-- **`src/winjob.rs`** — a no-kill-on-close job variant + **creation-time association** (suspended
-  create → assign → resume) + checked terminate for login (f-r2.5/f-r3.3).
+- **`src/winjob.rs`** — a no-kill-on-close, **no-breakaway** job variant + **creation-time
+  association** (suspended create → assign → resume) + checked terminate + a **quiescence wait**
+  (`ActiveProcesses==0`) for login (f-r2.5/f-r3.3/f14/f18).
 - **`src/session.rs`** — refactor `ExclusiveLock` to `LockFileEx` `Shared`/`Exclusive` on one path
   (f9); recovery-aware `SetupSession::begin` (WAL journal replay, f2/f8/f-r2.1..4).
 - **`src/profile.rs`** — `SecuredProfileDir::secure_and_verify_credential`; staging-create path.
@@ -329,7 +367,10 @@ Factor the login step behind an injected callback so unit tests never run real O
   the job is uncontainable, incl. creation-time association (f-r2.5/f-r3.3); staging handle released
   before the commit rename (f-r3.4); **`home_key` alias stability** — 8.3/long/case spellings map to
   one key with the leaf absent (f12); **ownership-marker mismatch → quarantine-and-refuse** rather than
-  delete (f13); login **fails closed if the job does not quiesce** before staging cleanup (f14).
+  delete (f13); login **fails closed if the job does not quiesce** before staging cleanup (f14);
+  first-provision uncommitted-home quarantine at `H=1,O=0,S=0` (f16); **partial-quarantine recovery**
+  (crash mid-quarantine leaves a journaled, recoverable `rejected` dir) (f17); a `Global\` mutex
+  excludes a second session (f19).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
