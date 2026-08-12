@@ -323,13 +323,17 @@ pub fn apply_controlled_env(cmd: &mut Command, home_var: &str, home: &Path) {
 /// the child's stdout/stderr may echo OAuth tokens or the authorize URL, so they are discarded, never
 /// returned or logged. Only these control-flow signals are exposed, so a caller cannot accidentally
 /// surface a secret in a `Failure` or diagnostic.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
 pub struct LoginOutcome {
     pub success: bool,
     pub timed_out: bool,
     pub cancelled: bool,
     pub exit: Option<i32>,
+    /// The login job could not be proven quiesced (terminate failed or a member outlived the bounded
+    /// wait). A member may still be writing the staging dir, so the caller must **not** delete it now —
+    /// leave it for recovery, whose armed journal owns it (f8/f1-impl-round-3).
+    pub uncontained: bool,
 }
 
 /// How long to wait for in-job login helpers to exit after the login process itself does, before the
@@ -366,6 +370,7 @@ pub fn run_login(
         timed_out: false,
         cancelled: false,
         exit: None,
+        uncontained: false,
     };
 
     // Fail closed if we cannot obtain a containment job at all.
@@ -383,21 +388,26 @@ pub fn run_login(
             Ok(Some(status)) => break status.code(),
             Ok(None) => {}
             Err(_) => {
-                terminate_and_settle(&job, &mut child);
-                return fail;
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
             }
         }
         if cancel.load(Ordering::SeqCst) {
-            terminate_and_settle(&job, &mut child);
+            let contained = terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 cancelled: true,
+                uncontained: !contained,
                 ..fail
             };
         }
         if Instant::now() >= deadline {
-            terminate_and_settle(&job, &mut child);
+            let contained = terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 timed_out: true,
+                uncontained: !contained,
                 ..fail
             };
         }
@@ -406,12 +416,14 @@ pub fn run_login(
 
     // Natural exit: wait for in-job helpers to quiesce before the caller verifies/renames staging. A
     // lingering in-job writer that does not clear in time is reaped **and we then wait for the reaping
-    // to settle** before returning fail-closed, so the caller never cleans up staging while a member is
-    // still writing (f8).
+    // to settle** before returning; if it still cannot be proven quiesced the outcome is marked
+    // **uncontained**, so the caller leaves staging for recovery rather than deleting it under a
+    // possibly-still-writing member (f8/f1-impl-round-3).
     if !wait_quiescent(&job) {
-        terminate_and_settle(&job, &mut child);
+        let contained = terminate_and_settle(&job, &mut child);
         return LoginOutcome {
             exit: exit_code,
+            uncontained: !contained,
             ..fail
         };
     }
@@ -420,6 +432,7 @@ pub fn run_login(
         timed_out: false,
         cancelled: false,
         exit: exit_code,
+        uncontained: false,
     }
 }
 

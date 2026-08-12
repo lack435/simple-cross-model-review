@@ -644,6 +644,7 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
                         timed_out: false,
                         cancelled: false,
                         exit: None,
+                        uncontained: false,
                     },
                 }
             };
@@ -779,6 +780,13 @@ impl OwnedStaging {
         self.committed = true;
         self.secured = None;
         self.path.clone()
+    }
+    /// Leave the staging dir on disk (drop the handle but do **not** remove it): used when a login
+    /// could not be proven contained, so a possibly-still-writing member is never raced by a delete.
+    /// The armed journal owns cleanup via recovery on the next `begin`.
+    fn leak(&mut self) {
+        self.committed = true;
+        self.secured = None;
     }
 }
 impl Drop for OwnedStaging {
@@ -1008,15 +1016,21 @@ fn provision_after_approval(
 
     // Drive the vendor login into the staging home.
     let outcome = login_fn(&staging_home, &scratch, request.cancel_flag());
-    if outcome.cancelled {
-        return Err(errors::cancelled());
-    }
-    if outcome.timed_out {
-        return Err(setup_failure(
-            "The vendor login did not complete in time, so nothing was changed. Run setup again.",
-        ));
-    }
     if !outcome.success {
+        // If the login could not be proven contained, a member may still be writing the staging dir —
+        // do NOT delete it now; leave it for recovery (the armed journal owns it) rather than racing a
+        // dying writer (f1, impl round 3).
+        if outcome.uncontained {
+            owned.leak();
+        }
+        if outcome.cancelled {
+            return Err(errors::cancelled());
+        }
+        if outcome.timed_out {
+            return Err(setup_failure(
+                "The vendor login did not complete in time, so nothing was changed. Run setup again.",
+            ));
+        }
         return Err(setup_failure(
             "The vendor login did not complete (no credentials were written), so nothing was \
              changed. Run setup again.",
@@ -1685,6 +1699,7 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
                 exit: Some(0),
+                uncontained: false,
             }
         }
     }
@@ -1759,6 +1774,7 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
                 exit: Some(1),
+                uncontained: false,
             }
         };
 
