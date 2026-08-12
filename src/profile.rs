@@ -349,6 +349,104 @@ pub fn secure_profile_dir(
     }
 }
 
+/// Exclusively create a **nonce-named staging sibling** of the profile home and return it held open.
+///
+/// The provisioning flow never creates the final `home` directly; it logs into a staging dir named
+/// `{leaf}.staging-{nonce}` beside it (created with `FILE_CREATE`, so a collision is refused, not
+/// adopted — the ownership proof, f1/f-a1) and later renames it into place. Same handle-relative,
+/// ACL-locked descent as [`secure_profile_dir`], only the leaf differs.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn secure_staging_dir(
+    selector: &ProfileSelector,
+    reviewer: ReviewerKind,
+    base: Option<&Path>,
+    nonce: &str,
+) -> std::io::Result<SecuredProfileDir> {
+    use std::ffi::OsStr;
+    use std::io;
+
+    match selector {
+        ProfileSelector::Ambient => {
+            Err(io::Error::other("ambient has no profile home to provision"))
+        }
+        ProfileSelector::Named(name) => {
+            validate_profile_name(name).map_err(io::Error::other)?;
+            let base = base.ok_or_else(|| {
+                io::Error::other(
+                    "cannot provision a named profile: no CROSS_REVIEW_HOME/LOCALAPPDATA",
+                )
+            })?;
+            if !base.is_absolute() {
+                return Err(io::Error::other("the profile base is not absolute"));
+            }
+            std::fs::create_dir_all(base)?;
+            let anchor = crate::winsec::open_dir_no_follow(base, false)?;
+            let profiles =
+                crate::winsec::create_secured_child_dir(&anchor, OsStr::new("profiles"))?;
+            let family =
+                crate::winsec::create_secured_child_dir(&profiles, OsStr::new(reviewer.as_str()))?;
+            let staging_leaf = format!("{name}.staging-{nonce}");
+            let handle =
+                crate::winsec::create_new_secured_child_dir(&family, OsStr::new(&staging_leaf))?;
+            let path = profile_root(base, reviewer).join(&staging_leaf);
+            Ok(SecuredProfileDir { path, handle })
+        }
+        ProfileSelector::ExplicitHome(p) => {
+            use std::path::Component;
+            if p.as_os_str().is_empty() || !p.is_absolute() {
+                return Err(io::Error::other(
+                    "explicit home requires a non-empty absolute path",
+                ));
+            }
+            if p.components()
+                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+            {
+                return Err(io::Error::other(
+                    "explicit home must not contain a '.' or '..' component",
+                ));
+            }
+            let leaf = match p.components().next_back() {
+                Some(Component::Normal(n)) => n.to_string_lossy().into_owned(),
+                _ => {
+                    return Err(io::Error::other(
+                        "explicit home must name a directory, not a root",
+                    ))
+                }
+            };
+            crate::winsec::reject_reparse_on_ancestors(p)?;
+            let parent = p
+                .parent()
+                .ok_or_else(|| io::Error::other("explicit home has no parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            let parent_handle = crate::winsec::open_dir_no_follow(parent, false)?;
+            let staging_leaf = format!("{leaf}.staging-{nonce}");
+            let handle = crate::winsec::create_new_secured_child_dir(
+                &parent_handle,
+                OsStr::new(&staging_leaf),
+            )?;
+            Ok(SecuredProfileDir {
+                path: parent.join(&staging_leaf),
+                handle,
+            })
+        }
+    }
+}
+
+impl SecuredProfileDir {
+    /// Open an **existing** secured home no-follow, verify its restrictive DACL, and hold it — the
+    /// re-open after a `staging → home` rename, so the final identity re-probe and the allowlist commit
+    /// run bound to the held object (f3/f-a5). Fails closed on a widened DACL or a reparse point.
+    #[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+    pub fn open_existing(path: &Path) -> std::io::Result<SecuredProfileDir> {
+        let handle = crate::winsec::open_dir_no_follow(path, false)?;
+        crate::winsec::verify_restrictive_dacl(&handle)?;
+        Ok(SecuredProfileDir {
+            path: path.to_path_buf(),
+            handle,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
