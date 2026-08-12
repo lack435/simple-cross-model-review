@@ -172,6 +172,99 @@ pub(crate) fn resolve_home(
     Ok(Some(home))
 }
 
+/// A provisioned profile home, held open across the vendor login so it cannot be swapped or deleted
+/// while a credential is written into it ([f20]).
+///
+/// The `_handle` is deliberately kept private and alive: it is a no-follow, no-delete-share handle on
+/// the verified directory, so dropping [`SecuredProfileDir`] is what releases the hold. `path` is the
+/// directory's location, for handing to the vendor CLI as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`.
+#[allow(dead_code)] // constructed and held by the Phase 3 setup tool (#15).
+pub struct SecuredProfileDir {
+    pub path: PathBuf,
+    /// The held directory handle. Kept for its lifetime effect (the hold); `#[allow(dead_code)]`
+    /// because the setup flow (#15) holds it implicitly by keeping the value alive rather than reading
+    /// the field. When #15 lands the handle-relative credential re-verify, it reads this.
+    #[allow(dead_code)]
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+/// Provision a profile home directory securely and return it **held open**.
+///
+/// This is the provisioning-path resolver ([f10]) — it *creates and locks* a directory, so it is used
+/// only by the human-gated setup flow (#15), never the review path (which reads an already-authorized
+/// home via [`crate::config::Config::resolve_authorized_home`]). Creating a profile here never
+/// authorizes any repo to use it; that is a separate allowlist entry.
+///
+/// - **`Named`**: descends **handle-relative** from the trusted base (`profiles` → `{reviewer}` →
+///   `{name}`), creating and locking each level to the current user. Because every step is a
+///   handle-relative open with `OBJ_DONT_REPARSE`, a junction swapped in at any level fails the open
+///   rather than redirecting, and containment under the profile root is *structural* — no path
+///   component is re-resolved ([f5]/[f15]/[f20]). The name is validated first.
+/// - **`ExplicitHome`**: the deliberately-outside-the-root escape hatch. Rejects a reparse point on
+///   each original ancestor component, then creates and locks the leaf directory by handle. Local /
+///   trusted-only.
+/// - **`Ambient`**: has no profile home to provision — an error, never reached in the setup flow.
+#[allow(dead_code)] // production caller lands with the setup tool (Phase 3 task #15).
+pub fn secure_profile_dir(
+    selector: &ProfileSelector,
+    reviewer: ReviewerKind,
+    base: Option<&Path>,
+) -> std::io::Result<SecuredProfileDir> {
+    use std::ffi::OsStr;
+    use std::io;
+
+    match selector {
+        ProfileSelector::Ambient => {
+            Err(io::Error::other("ambient has no profile home to provision"))
+        }
+        ProfileSelector::Named(name) => {
+            validate_profile_name(name).map_err(io::Error::other)?;
+            let base = base.ok_or_else(|| {
+                io::Error::other(
+                    "cannot provision a named profile: neither CROSS_REVIEW_HOME nor LOCALAPPDATA \
+                     is set",
+                )
+            })?;
+            if !base.is_absolute() {
+                return Err(io::Error::other(format!(
+                    "the profile base {} is not absolute; set CROSS_REVIEW_HOME to an absolute path",
+                    base.display()
+                )));
+            }
+            // The trusted anchor: `{base}` inherits the user-scoped %LOCALAPPDATA% ACL (created plain),
+            // then is opened no-follow — rejecting `{base}` itself being a reparse point. Everything
+            // below is created and locked by handle-relative descent, so it is checked structurally.
+            std::fs::create_dir_all(base)?;
+            let anchor = crate::winsec::open_dir_no_follow(base, false)?;
+            let profiles =
+                crate::winsec::create_secured_child_dir(&anchor, OsStr::new("profiles"))?;
+            let family =
+                crate::winsec::create_secured_child_dir(&profiles, OsStr::new(reviewer.as_str()))?;
+            let leaf = crate::winsec::create_secured_child_dir(&family, OsStr::new(name))?;
+            let path = profile_root(base, reviewer).join(name);
+            Ok(SecuredProfileDir { path, handle: leaf })
+        }
+        ProfileSelector::ExplicitHome(p) => {
+            if p.as_os_str().is_empty() || !p.is_absolute() {
+                return Err(io::Error::other(
+                    "--codex-home / --claude-config-dir requires a non-empty absolute path",
+                ));
+            }
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Reject a reparse point on any original ancestor (checked before the handle-based create
+            // below canonicalizes), then create and lock the leaf itself by handle.
+            crate::winsec::reject_reparse_on_ancestors(p)?;
+            let handle = crate::winsec::create_secured_dir(p)?;
+            Ok(SecuredProfileDir {
+                path: p.clone(),
+                handle,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +346,105 @@ mod tests {
             )
             .unwrap(),
             Some(p)
+        );
+    }
+
+    fn temp_dir() -> crate::testutil::TempDir {
+        crate::testutil::temp_dir("cross-review-profile-tests")
+    }
+
+    /// Confirm a provisioned directory carries the restrictive DACL: open it no-follow and verify.
+    fn assert_locked(path: &Path) {
+        let handle = crate::winsec::open_dir_no_follow(path, false).expect("open provisioned dir");
+        crate::winsec::verify_restrictive_dacl(&handle).expect("provisioned dir must be locked");
+    }
+
+    #[test]
+    fn secure_profile_dir_named_creates_a_locked_dir_under_the_root() {
+        let base = temp_dir();
+        let secured = secure_profile_dir(
+            &ProfileSelector::Named("work".to_string()),
+            ReviewerKind::Codex,
+            Some(base.as_path()),
+        )
+        .expect("provision");
+        let root = base.join("profiles").join("codex");
+        assert!(crate::reviewer::is_within(&secured.path, &root));
+        assert!(secured.path.ends_with("work"));
+        assert!(secured.path.is_dir());
+        // The leaf and both intermediate directories are locked to the current user.
+        assert_locked(&secured.path);
+        assert_locked(&root);
+        assert_locked(&base.join("profiles"));
+    }
+
+    #[test]
+    fn secure_profile_dir_named_is_idempotent() {
+        let base = temp_dir();
+        let sel = ProfileSelector::Named("work".to_string());
+        secure_profile_dir(&sel, ReviewerKind::Codex, Some(base.as_path())).expect("first");
+        // A second provision of an already-secured profile re-verifies rather than failing.
+        secure_profile_dir(&sel, ReviewerKind::Codex, Some(base.as_path())).expect("second");
+    }
+
+    #[test]
+    fn secure_profile_dir_rejects_a_traversal_name() {
+        let base = temp_dir();
+        assert!(secure_profile_dir(
+            &ProfileSelector::Named("..".to_string()),
+            ReviewerKind::Codex,
+            Some(base.as_path()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_creates_a_locked_leaf() {
+        let base = temp_dir();
+        let home = base.join("explicit").join("home");
+        let secured = secure_profile_dir(
+            &ProfileSelector::ExplicitHome(home.clone()),
+            ReviewerKind::Claude,
+            None,
+        )
+        .expect("provision");
+        assert_eq!(secured.path, home);
+        assert!(home.is_dir());
+        assert_locked(&home);
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_rejects_a_relative_path() {
+        assert!(secure_profile_dir(
+            &ProfileSelector::ExplicitHome(PathBuf::from(r"rel\home")),
+            ReviewerKind::Claude,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_rejects_a_junctioned_ancestor() {
+        // A junction standing in for an ancestor of an explicit home must be refused before the leaf
+        // is created — a canonicalize-then-check test would see through it. Junctions do not need
+        // elevation, so this runs unprivileged.
+        let base = temp_dir();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = base.join("link");
+        assert!(
+            crate::testutil::make_junction(&link, &real),
+            "could not create a junction to exercise the reparse check"
+        );
+        let home = link.join("home");
+        assert!(
+            secure_profile_dir(
+                &ProfileSelector::ExplicitHome(home),
+                ReviewerKind::Claude,
+                None,
+            )
+            .is_err(),
+            "an explicit home under a junctioned ancestor must be refused"
         );
     }
 }

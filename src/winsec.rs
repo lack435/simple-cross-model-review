@@ -40,6 +40,9 @@ const READ_CONTROL: Dword = 0x0002_0000;
 // traverse into them.
 const FILE_LIST_DIRECTORY: Dword = 0x0000_0001;
 const FILE_TRAVERSE: Dword = 0x0000_0020;
+// Needed by GetFileInformationByHandle (the reparse-point check in `finish_open`). CreateFileW grants
+// it implicitly, but NtCreateFile grants exactly what is asked, so `nt_open` must request it.
+const FILE_READ_ATTRIBUTES: Dword = 0x0000_0080;
 // Share reads with other openers. Whether DELETE is shared is per-open: a *held* directory or a
 // write temp omits it (so the object cannot be renamed/deleted out from under the handle, [f20]),
 // but a brief *read* of the store file shares DELETE so it does not block a concurrent atomic
@@ -224,7 +227,9 @@ const OBJ_DONT_REPARSE: Dword = 0x0000_1000;
 // NtCreateFile CreateDisposition
 const FILE_OPEN: Dword = 1;
 const FILE_CREATE: Dword = 2;
+const FILE_OPEN_IF: Dword = 3;
 // NtCreateFile CreateOptions
+const FILE_DIRECTORY_FILE: Dword = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: Dword = 0x0000_0040;
 const FILE_SYNCHRONOUS_IO_NONALERT: Dword = 0x0000_0020;
 // ACCESS_MASK: required alongside FILE_SYNCHRONOUS_IO_NONALERT.
@@ -431,15 +436,89 @@ fn split_parent_leaf(path: &Path) -> io::Result<(&Path, &OsStr)> {
     Ok((parent, leaf))
 }
 
-/// Open a direct child of `parent` **by handle-relative resolution**, rejecting a reparse point and
-/// any name that is not a single path component. `NtCreateFile` with `RootDirectory = parent` and
-/// `OBJ_DONT_REPARSE` can only reach a direct child of the held directory object, so containment is
-/// structural — no ancestor path component is re-resolved ([f15]/[f20]).
+/// Open a direct **file** child of `parent` by handle-relative resolution.
 fn open_child_relative(
     parent: &OwnedHandle,
     leaf: &OsStr,
     access: Dword,
     disposition: Dword,
+    share_delete: bool,
+) -> io::Result<OwnedHandle> {
+    nt_open(
+        parent,
+        leaf,
+        access,
+        disposition,
+        FILE_NON_DIRECTORY_FILE,
+        share_delete,
+    )
+}
+
+/// Open (creating if absent) a direct **subdirectory** of `parent` by handle-relative resolution and
+/// lock it to the current user with the restrictive DACL, returning the held no-follow handle.
+///
+/// Because the open is handle-relative with `OBJ_DONT_REPARSE`, the subdirectory is provably a direct
+/// child of `parent` — a junction swapped in at this level fails the open rather than redirecting —
+/// and no ancestor path component is re-resolved. The handle carries `WRITE_DAC` (to set the DACL),
+/// `READ_CONTROL` (to verify it), and list/traverse (so it can in turn be a RootDirectory for the next
+/// level down). Idempotent: an existing correctly-secured child re-verifies.
+pub fn create_secured_child_dir(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<OwnedHandle> {
+    let handle = nt_open(
+        parent,
+        leaf,
+        READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE,
+        false,
+    )?;
+    apply_restrictive_dacl(&handle)?;
+    verify_restrictive_dacl(&handle)?;
+    Ok(handle)
+}
+
+/// Reject a path any of whose **existing original components** is a reparse point (junction/symlink),
+/// checked *before* canonicalization.
+///
+/// A junction placed at a pre-canonical component resolves to an ordinary directory, so a
+/// canonicalize-then-check test would see straight through it; this walks the original path and opens
+/// each existing prefix no-follow, refusing if any is a reparse point. Used for the explicit-home
+/// escape hatch, whose ancestors are arbitrary directories not under the profile root (a `Named`
+/// profile instead descends handle-relative from the trusted base, where every level is checked
+/// structurally). A non-existent prefix is fine — it will be created. There is a residual TOCTOU on an
+/// ancestor between this check and use, accepted for the local/trusted-only explicit-home path.
+pub fn reject_reparse_on_ancestors(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(md) => {
+                if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(io::Error::other(format!(
+                        "path component {} is a reparse point (junction/symlink); refusing",
+                        prefix.display()
+                    )));
+                }
+            }
+            // A component that does not exist yet cannot be a reparse point; it will be created.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The shared `NtCreateFile` handle-relative open, rejecting a reparse point and any name that is not
+/// a single path component. `RootDirectory = parent` + `OBJ_DONT_REPARSE` can only reach a direct
+/// child of the held directory object, so containment is structural — no ancestor path component is
+/// re-resolved ([f15]/[f20]). `create_options` selects file vs directory; `disposition` selects
+/// open/create/open-if.
+fn nt_open(
+    parent: &OwnedHandle,
+    leaf: &OsStr,
+    access: Dword,
+    disposition: Dword,
+    kind_option: Dword,
     share_delete: bool,
 ) -> io::Result<OwnedHandle> {
     let name: Vec<u16> = leaf.encode_wide().collect();
@@ -482,14 +561,14 @@ fn open_child_relative(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            access | SYNCHRONIZE,
+            access | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
             &oa,
             &mut iosb,
             std::ptr::null_mut(),
             FILE_ATTRIBUTE_NORMAL,
             share,
             disposition,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            kind_option | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null_mut(),
             0,
         )
@@ -943,6 +1022,23 @@ mod tests {
         write_secured_file(&target, &tmp2, b"v2")
             .expect("a rewrite must not be blocked by a shared-delete reader");
         assert_eq!(read_secured_file(&target).expect("read"), b"v2");
+    }
+
+    #[test]
+    fn reject_reparse_on_ancestors_refuses_a_junctioned_component() {
+        let dir = temp_dir();
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = dir.join("link");
+        assert!(
+            crate::testutil::make_junction(&link, &real),
+            "could not create a junction to exercise the check"
+        );
+        // A path whose ancestor is the junction is refused...
+        assert!(reject_reparse_on_ancestors(&link.join("child")).is_err());
+        // ...while the same path through the real directory is accepted, and a not-yet-created
+        // component is fine (it will be made).
+        assert!(reject_reparse_on_ancestors(&real.join("child")).is_ok());
     }
 
     #[test]
