@@ -276,15 +276,19 @@ These are the traps that will make an implementation subtly wrong if skipped:
    so the first request cannot go out under the wrong account; a separate post-review check is only
    the residual mid-run *switch* guard, not this assertion. The provider-variable list must be pinned
    to the supported reviewer version and each provider-auth path tested; the assertion is what makes an
-   incomplete list safe rather than silently wrong. (Probe mechanics — UUID-level identity, fail-closed
-   on unknown output — are specified in the implementation plan.)
+   incomplete list safe rather than silently wrong. (Probe mechanics — the verified per-reviewer
+   surfaces and the fail-closed method+identity check — are specified in the implementation plan.)
 
-   **The assertion must be an *exact identity probe*, run per spawn.** [f2] Today's preflight is too
-   weak to serve as that assertion: `claude auth status` reports the account *email / org name* while
-   the routing fingerprint is the account/org *UUID* (`account_fingerprint`), and the Codex preflight
-   only checks exit status. The assertion must compare the **same fingerprint identity the routing
-   uses**, be pinned to a known reviewer-output version, and fail closed on unrecognised output —
-   never pass on a display-string match. [f3] It must run on **every actual spawn**: the
+   **The assertion must be an *exact method+identity check*, run per spawn.** [f2] Today's `auth_check`
+   only confirms *liveness* (signed-in), not the method or account. The assertion adds, from surfaces
+   since **verified** (see the implementation plan): the profile's auth **method** is the subscription
+   OAuth (Codex `auth.json.auth_mode == "chatgpt"` / `codex doctor`; Claude `auth status`
+   `authMethod`/`subscriptionType`) — never an API key — and its **account** is the one the routing
+   fingerprint pins (`account_fingerprint`; the Codex id_token's `chatgpt_account_id` equals
+   `tokens.account_id`, and Claude `auth status` `orgId`/`email` cross-check the file uuids). Pinned to
+   a known reviewer/auth-file version, failing closed on an unrecognised shape or a non-subscription
+   method. The controlled environment is the structural guarantee the profile account is *used*; this
+   check confirms it. [f3] It must run on **every actual spawn**: the
    process-lifetime preflight cache keyed by entry index (`src/tools.rs`) would otherwise let a review
    reuse a stale success after a profile was re-authenticated under the still-running server, so
    either the cache key includes the current account fingerprint (revalidated before reuse) or the

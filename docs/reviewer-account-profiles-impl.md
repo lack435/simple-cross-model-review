@@ -114,22 +114,36 @@ sites to convert:
   listed only as the things the assertion below double-checks are gone. **[deferred-to-impl]** the
   list is a starting contract; if a CLI turns out to need another OS var to launch, it is added to the
   allowlist explicitly (never by falling back to inheriting the parent environment).
-- **[f3] Exact, typed, per-spawn identity + method assertion — and it is a hard prerequisite for
-  enabling named profiles.** `auth_check`'s current probes cannot establish identity: Claude reports
-  email/org *display* fields and accepts any `authMethod` and even unrecognised-but-successful output
-  (`src/reviewer/claude.rs` ~47-72); `codex login status` is exit-status-only with no account id
-  (`src/reviewer/codex.rs` ~37-51); the fingerprint is UUID-level (`accountUuid`/`organizationUuid`,
-  `tokens.account_id`). So define a **typed `ResolvedIdentity { account, method }`** obtained at
-  **UUID granularity** from the CLI's own machine output, **version-pinned**, that **fails closed**
-  when the output is unrecognised or the method is not the subscription OAuth. Assert
-  `resolved.account == account_fingerprint(profile_home)` and `resolved.method == subscription`.
-  **[f11] The probe is PRE-spawn** — part of the preflight, before the review `invocation` — so the
-  *first* request cannot go out under the wrong account. A value produced by the review run itself
-  (its `result` document or Codex rollout) is too late and is explicitly **not** the probe.
-  **[deferred-to-impl, prerequisite]** the pre-spawn UUID/method surface each CLI exposes must be
-  found while building (candidate: a JSON auth-status mode that reports the account UUID and method);
-  if none exists, named profiles **stay disabled** rather than shipping a display-name approximation
-  or a post-hoc check.
+- **[f3, surfaces verified] Pre-spawn identity + method assertion — built from real local surfaces,
+  with the controlled env as the structural guarantee.** The security guarantee that the reviewer
+  uses the profile account is the **controlled environment** (`env_clear` + positive allowlist +
+  home var): with the child's environment cleared and no provider-auth variable on the allowlist,
+  the profile's own credential file is the child's *only* credential source — nothing can override
+  it, so the account is fixed by construction. The assertion below is the fail-closed confirmation of
+  that, not the sole mechanism. It is **pre-spawn** [f11] (part of the preflight, before the review
+  `invocation`), so the first request cannot go out wrong; a value from the review run itself (its
+  `result`/rollout) is too late and is explicitly **not** the probe.
+
+  **Verified surfaces (Codex CLI 0.144.5, Claude Code, Windows, 2026-08):**
+  - **Liveness** (already built): `auth_check` under the controlled env + profile home confirms the
+    home is signed in — Codex `login status` exit 0 / Claude `auth status` `loggedIn:true`.
+  - **Method** (subscription vs API key): **Codex** — `auth.json.auth_mode == "chatgpt"` (the auth
+    file, read under the airtight env; also confirmable via `codex doctor`, which is `CODEX_HOME`-aware
+    — verified it reports `auth mode: none` for an empty home). **Claude** — `auth status`
+    `authMethod`/`subscriptionType` (keys present: `authMethod`, `subscriptionType`, `orgId`, `email`,
+    `orgName`, verified). Fail closed unless the method is the subscription/ChatGPT OAuth.
+  - **Identity** (which account): `account_fingerprint` (already built) — Codex `tokens.account_id`,
+    Claude `accountUuid`/`organizationUuid`. **Verified** the Codex `id_token` JWT's nested
+    `https://api.openai.com/auth.chatgpt_account_id` equals `tokens.account_id`, and the id_token also
+    carries `sub`/`email`/`chatgpt_plan_type` — available as an optional richer cross-check. For
+    Claude, `auth status` `orgId`/`email` cross-check the file's uuids.
+
+  So define a typed `ResolvedIdentity { account, method }` read from these surfaces, **version-pinned**
+  (Codex 0.144.x auth-file shape / Claude `auth status` keys), that **fails closed** on an
+  unrecognised shape or a non-subscription method. Assert the profile's method is subscription and its
+  `account_fingerprint` is present. **Named profiles enable for both reviewers** — the earlier
+  "no Codex surface → disable" concern is resolved: `codex doctor` + the auth-file `auth_mode`/id_token
+  give a real method+identity surface, and the airtight env is the guarantee it is used.
 - **[f2/f3] Never cache the assertion.** The preflight cache (`ensure_entry_ready`, `src/tools.rs`
   ~52, keyed by entry index, cached for process lifetime) may cache **only resolution data** (the
   resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
@@ -444,19 +458,25 @@ credential file is genuinely inside it.
   each phase back; `smoke.ps1` only for Phase 3. Never commit `dist\cross-review.exe`.
 - **Ethos:** no new crate unless unavoidable; the ACL work is new FFI in `winjob`'s *style* (not a
   reuse — `winjob` is job objects, not ACLs); keep the serde-only footprint.
-- **Claim discipline:** the remaining `[assumed]` items — the Codex provider-var list and the exact
-  UUID/method probe surface each CLI exposes — are the two things to verify while building; each fails
-  closed if the assumption is wrong, and the cleared-plus-allowlist child environment means an unknown
-  provider var is simply absent rather than relied upon to have been removed.
+- **Claim discipline:** the identity/method probe surfaces are now **verified** (Codex `auth.json`
+  `auth_mode`/`tokens.account_id`/id_token claims and `codex doctor`; Claude `auth status`
+  `authMethod`/`subscriptionType`/`orgId`/`email`) — see the assertion bullet. The one remaining
+  `[assumed]` item is the Codex provider-var list, and the cleared-plus-allowlist child environment
+  makes it non-load-bearing: an unknown provider var is simply absent rather than relied upon to have
+  been removed.
 
 ## Resolved questions (from review)
 
 1. **Immutable launch root — resolved:** the process-start cwd *is* available before `--cwd` parsing;
    capture and canonicalize it in `main.rs` before `Config::from_args`, key the allowlist on it, and
    require explicit confirmation when `--cwd` is supplied. (Phase 3.)
-2. **Assertion granularity — resolved:** email/org display comparison is **not** sufficient; a typed,
-   version-pinned **UUID-level** identity + OAuth-method probe that fails closed when unavailable is
-   required, and is a prerequisite for enabling named profiles. (Phase 1.)
+2. **Assertion granularity — resolved (surfaces since verified):** the probe reads real local
+   surfaces — Codex `auth.json` `auth_mode`/`tokens.account_id`/id_token (and `CODEX_HOME`-aware
+   `codex doctor`), Claude `auth status` `authMethod`/`subscriptionType`/`orgId`/`email` — for a
+   typed, version-pinned method+identity assertion that fails closed on an unrecognised shape or a
+   non-subscription method. The controlled environment is the structural guarantee the profile
+   account is used; the assertion confirms it. **Named profiles enable for both reviewers** (the
+   earlier "no Codex surface → disable" fear is resolved). See the assertion bullet above. (Phase 3.)
 3. **Phase boundaries — decided:** keep Phase 2 (session identity) separate from Phase 1. Given the
    depth the identity/fail-closed contract turned out to need (`f8`), the smaller first diff is worth
    the extra gate round rather than bundling it into an already-large routing-core PR.
