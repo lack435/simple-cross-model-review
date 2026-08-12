@@ -319,6 +319,131 @@ pub fn apply_controlled_env(cmd: &mut Command, home_var: &str, home: &Path) {
     cmd.env(home_var, home.as_os_str());
 }
 
+/// The outcome of a vendor login run — deliberately **carries no captured text** (redaction, f-r2.7):
+/// the child's stdout/stderr may echo OAuth tokens or the authorize URL, so they are discarded, never
+/// returned or logged. Only these control-flow signals are exposed, so a caller cannot accidentally
+/// surface a secret in a `Failure` or diagnostic.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub struct LoginOutcome {
+    pub success: bool,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub exit: Option<i32>,
+}
+
+/// How long to wait for in-job login helpers to exit after the login process itself does, before the
+/// caller verifies credentials / renames staging (f14). Generous: normal logins quiesce at once.
+const LOGIN_QUIESCE_BOUND: Duration = Duration::from_secs(10);
+
+/// Run a vendor login `command` to completion under strict containment and redaction (#15 part 3b).
+///
+/// - **Redaction:** stdin/stdout/stderr are all `null`, so nothing the child prints is captured; the
+///   result type has no text field.
+/// - **Isolation:** the child runs from `scratch_cwd`, an owned empty directory (never a repo-settable
+///   state dir), with the controlled environment already applied by the adapter's `login_command`.
+/// - **Containment (f10/f14/f-b1):** the child is created suspended and assigned to a
+///   `KILL_ON_JOB_CLOSE`, no-breakaway job *before* it runs (creation-time association), then resumed.
+///   On timeout or cancel the job is terminated and drained; on natural exit the runner waits for the
+///   job to quiesce (no in-job helper still writing the staging dir) before returning. If the job
+///   cannot be created/assigned, or does not quiesce, login **fails closed** (`success == false`). The
+///   browser the vendor opens is out-of-job and so never gated on or killed. Dropping the job at the
+///   end reaps any straggler — including if *this* process later crashes (f-b1).
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn run_login(
+    mut command: Command,
+    scratch_cwd: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> LoginOutcome {
+    command
+        .current_dir(scratch_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let fail = LoginOutcome {
+        success: false,
+        timed_out: false,
+        cancelled: false,
+        exit: None,
+    };
+
+    // Fail closed if we cannot obtain a containment job at all.
+    let Some(job) = crate::winjob::JobObject::new() else {
+        return fail;
+    };
+    let mut child = match job.spawn_in_job(&mut command) {
+        Ok(c) => c,
+        Err(_) => return fail,
+    };
+
+    let deadline = Instant::now() + timeout;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(_) => {
+                job.terminate();
+                let _ = child.wait();
+                return fail;
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            job.terminate();
+            let _ = child.wait();
+            wait_quiescent(&job);
+            return LoginOutcome {
+                cancelled: true,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline {
+            job.terminate();
+            let _ = child.wait();
+            wait_quiescent(&job);
+            return LoginOutcome {
+                timed_out: true,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    // Natural exit: wait for in-job helpers to quiesce before the caller verifies/renames staging. A
+    // lingering in-job writer that does not clear in time is reaped and the login fails closed.
+    if !wait_quiescent(&job) {
+        job.terminate();
+        return LoginOutcome {
+            exit: exit_code,
+            ..fail
+        };
+    }
+    LoginOutcome {
+        success: exit_code == Some(0),
+        timed_out: false,
+        cancelled: false,
+        exit: exit_code,
+    }
+}
+
+/// Wait (bounded) for the job's live process count to reach zero. `true` if it quiesced; `false` on
+/// timeout or an unqueryable job (treated as uncontained by the caller).
+#[allow(dead_code)] // reached via run_login, whose caller lands with the setup provisioning flow.
+fn wait_quiescent(job: &crate::winjob::JobObject) -> bool {
+    let deadline = Instant::now() + LOGIN_QUIESCE_BOUND;
+    loop {
+        match job.active_processes() {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The config home an adapter should *read* an account from for `spec`, or `None` when it must read
 /// none. The single account-read seam, threaded through [`Config::resolve_authorized_home`]:
 ///
@@ -1879,5 +2004,48 @@ mod controlled_env_tests {
                 "the controlled-env allowlist must not carry a provider/auth variable: {key}"
             );
         }
+    }
+
+    #[test]
+    fn run_login_reports_success_and_failure_exit_codes() {
+        let scratch = std::env::temp_dir();
+        // A "login" that exits 0 succeeds and reports its code.
+        let mut ok = Command::new("cmd.exe");
+        ok.args(["/C", "exit 0"]);
+        let out = run_login(
+            ok,
+            &scratch,
+            Duration::from_secs(20),
+            &AtomicBool::new(false),
+        );
+        assert!(out.success && out.exit == Some(0) && !out.timed_out && !out.cancelled);
+
+        // A non-zero exit is a failed login, not a success.
+        let mut bad = Command::new("cmd.exe");
+        bad.args(["/C", "exit 3"]);
+        let out = run_login(
+            bad,
+            &scratch,
+            Duration::from_secs(20),
+            &AtomicBool::new(false),
+        );
+        assert!(!out.success && out.exit == Some(3));
+    }
+
+    #[test]
+    fn run_login_honours_cancellation() {
+        // A pre-cancelled run terminates the child promptly and reports cancelled, never success.
+        let scratch = std::env::temp_dir();
+        let mut slow = Command::new("cmd.exe");
+        // ping is a portable ~9s sleep; the runner must not wait it out once cancel is set.
+        slow.args(["/C", "ping -n 10 127.0.0.1"]);
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        let out = run_login(slow, &scratch, Duration::from_secs(30), &cancel);
+        assert!(out.cancelled && !out.success);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a cancelled login must not wait out the child"
+        );
     }
 }
