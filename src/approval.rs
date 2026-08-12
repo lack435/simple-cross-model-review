@@ -382,13 +382,13 @@ fn is_terminal(shared: &(Mutex<Shared>, Condvar), deadline: Instant) -> bool {
     terminal || Instant::now() >= deadline
 }
 
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Value of `name` in an `&`-separated `k=v` query string, or `None`. Only the token is read this way,
 /// and it is a hex string, so no percent-decoding is needed.
-fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then_some(v)
@@ -397,7 +397,7 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 
 /// Length-checked, difference-accumulating comparison, so token validation does not leak length or a
 /// prefix match through timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -419,7 +419,7 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str)
 }
 
 /// HTML-escape a value for safe interpolation into the page ([f9]).
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {

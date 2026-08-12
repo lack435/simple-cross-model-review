@@ -15,6 +15,7 @@ mod allowlist;
 mod approval;
 mod cancel;
 mod changeset;
+mod codeentry;
 mod config;
 mod digest;
 mod errors;
