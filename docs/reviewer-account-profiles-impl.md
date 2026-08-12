@@ -132,18 +132,32 @@ sites to convert:
     — verified it reports `auth mode: none` for an empty home). **Claude** — `auth status`
     `authMethod`/`subscriptionType` (keys present: `authMethod`, `subscriptionType`, `orgId`, `email`,
     `orgName`, verified). Fail closed unless the method is the subscription/ChatGPT OAuth.
-  - **Identity** (which account): `account_fingerprint` (already built) — Codex `tokens.account_id`,
-    Claude `accountUuid`/`organizationUuid`. **Verified** the Codex `id_token` JWT's nested
-    `https://api.openai.com/auth.chatgpt_account_id` equals `tokens.account_id`, and the id_token also
-    carries `sub`/`email`/`chatgpt_plan_type` — available as an optional richer cross-check. For
-    Claude, `auth status` `orgId`/`email` cross-check the file's uuids.
+  - **Identity** (which account): the authoritative account identity is `account_fingerprint`
+    (already built) — Codex `tokens.account_id`, Claude `accountUuid`/`organizationUuid` — read from
+    the profile's own auth file. **Verified** the Codex `id_token` JWT's nested
+    `https://api.openai.com/auth.chatgpt_account_id` equals `tokens.account_id` (an optional richer
+    cross-check, alongside `sub`/`email`/`chatgpt_plan_type`). [f7] **Claude field mapping, precisely:**
+    `auth status` `orgId` is the **organization** uuid (cross-checks the file's `organizationUuid`),
+    and `email` is the account email — **not** the account uuid; so `auth status` cross-checks the org
+    and coarsely the account, while the authoritative account identity stays the file's `accountUuid`
+    (via `account_fingerprint`). The CLI cross-check is defense-in-depth, not the identity of record.
 
-  So define a typed `ResolvedIdentity { account, method }` read from these surfaces, **version-pinned**
-  (Codex 0.144.x auth-file shape / Claude `auth status` keys), that **fails closed** on an
-  unrecognised shape or a non-subscription method. Assert the profile's method is subscription and its
-  `account_fingerprint` is present. **Named profiles enable for both reviewers** — the earlier
-  "no Codex surface → disable" concern is resolved: `codex doctor` + the auth-file `auth_mode`/id_token
-  give a real method+identity surface, and the airtight env is the guarantee it is used.
+  So define a typed `ResolvedIdentity { account, method }` read from these surfaces. The assertion
+  **fails closed** on an unrecognised shape or a non-subscription method, and [f7] **requires exact
+  account equality**: `ResolvedIdentity.account` (from the profile file) must equal the authorized
+  `account_fingerprint(profile_home)`, and any Claude CLI cross-check (`orgId` == file
+  `organizationUuid`) must match too — a mismatch or a missing required field refuses. **Named
+  profiles enable for both reviewers** — the earlier "no Codex surface → disable" concern is resolved:
+  `codex doctor` + the auth-file `auth_mode`/id_token give a real method+identity surface, and the
+  airtight env is the guarantee it is used.
+
+  [f8] **Version matrix:** surfaces were verified on the CLIs installed here (Codex CLI 0.144.5,
+  Claude Code) while the repo's recorded support matrix (`docs/usage-remaining-gate.md`) is Codex
+  0.146.0 / Claude 2.1.210 — **re-verify the auth-file/`auth status` shapes against the supported
+  versions when building.** Because the probe is **version-pinned and fails closed on any
+  unrecognised shape**, a version drift degrades to a refused profile review (fail closed), never a
+  silent wrong-account pass; that is the safety property that makes the exact pinned versions a
+  build-time detail rather than a correctness risk.
 - **[f2/f3] Never cache the assertion.** The preflight cache (`ensure_entry_ready`, `src/tools.rs`
   ~52, keyed by entry index, cached for process lifetime) may cache **only resolution data** (the
   resolved bin). The identity + method assertion **re-runs on every non-`Ambient` spawn** — a
