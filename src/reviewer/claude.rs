@@ -232,17 +232,50 @@ impl Reviewer for ClaudeReviewer {
         cancel: &AtomicBool,
     ) -> Result<super::ResolvedIdentity, Failure> {
         let out = run_auth_status(bin, cfg, Some(home), cancel)?;
-        if out.cancelled {
-            return Err(errors::cancelled());
-        }
-        let status: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
-            errors::profile_identity_mismatch(
-                "claude",
-                "the profile `auth status` output was not valid JSON",
-            )
-        })?;
-        claude_resolve_identity(&status, &home.join(".claude.json"))
+        claude_identity_from_status(&out, &home.join(".claude.json"))
     }
+}
+
+/// Validate a `claude auth status` outcome and resolve the profile's identity, or fail closed.
+///
+/// Split from [`resolve_home_identity`](ClaudeReviewer::resolve_home_identity) so its trustworthiness
+/// guards are unit-testable without spawning the CLI. Identity is resolved **only** from output that
+/// is complete and successful: a cancelled, failed, timed-out, truncated, incomplete, or lossily
+/// decoded run — even one whose partial stdout happens to parse with plausible method/account fields —
+/// is refused (f2), as is a home that is not explicitly signed in (`loggedIn == true`, mirroring the
+/// liveness gate). Only then is the method/account read via [`claude_resolve_identity`].
+fn claude_identity_from_status(
+    out: &RunOutcome,
+    account_path: &Path,
+) -> Result<super::ResolvedIdentity, Failure> {
+    if out.cancelled {
+        return Err(errors::cancelled());
+    }
+    if !out.success
+        || out.timed_out
+        || out.stdout_truncated
+        || out.stdout_incomplete
+        || out.stdout_lossy
+    {
+        return Err(errors::profile_identity_mismatch(
+            "claude",
+            "the profile `auth status` did not complete with trustworthy output (it failed, timed \
+             out, was truncated, or decoded lossily); refusing to resolve identity from it",
+        ));
+    }
+    let status: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
+        errors::profile_identity_mismatch(
+            "claude",
+            "the profile `auth status` output was not valid JSON",
+        )
+    })?;
+    if status.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        return Err(errors::profile_identity_mismatch(
+            "claude",
+            "the profile home is not signed in",
+        ));
+    }
+    claude_resolve_identity(&status, account_path)
 }
 
 /// Run `claude auth status` for `home` (an authorized profile home, or `None` for ambient) under the
@@ -784,6 +817,64 @@ mod tests {
             .code,
             "PROFILE_IDENTITY_MISMATCH"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_identity_probe_refuses_untrustworthy_or_signed_out_status() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-claude-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(".claude.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"oauthAccount":{"accountUuid":"acc-9","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        let good_stdout = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-1"}"#;
+        // A RunOutcome builder defaulting to a clean, successful run; each test flips one field.
+        let outcome = |stdout: &str, mut f: Box<dyn FnMut(&mut RunOutcome)>| {
+            let mut out = RunOutcome {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                exit: Some(0),
+                success: true,
+                timed_out: false,
+                cancelled: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                stdout_lossy: false,
+                stdout_incomplete: false,
+                stdout_cap_hit: None,
+            };
+            f(&mut out);
+            out
+        };
+        let noop = || Box::new(|_: &mut RunOutcome| {}) as Box<dyn FnMut(&mut RunOutcome)>;
+
+        // A clean, successful, signed-in run resolves the subscription identity.
+        let id = claude_identity_from_status(&outcome(good_stdout, noop()), &cfg_path).unwrap();
+        assert_eq!(id.account, "org-1/acc-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+
+        // Each untrustworthy signal fails closed even with the same good stdout...
+        for flip in [
+            Box::new(|o: &mut RunOutcome| o.success = false) as Box<dyn FnMut(&mut RunOutcome)>,
+            Box::new(|o: &mut RunOutcome| o.timed_out = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_truncated = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_incomplete = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_lossy = true),
+            Box::new(|o: &mut RunOutcome| o.cancelled = true),
+        ] {
+            assert!(
+                claude_identity_from_status(&outcome(good_stdout, flip), &cfg_path).is_err(),
+                "an untrustworthy run must fail closed"
+            );
+        }
+
+        // ...and a successful run that is not signed in is refused too.
+        let signed_out = r#"{"loggedIn":false,"authMethod":"claude.ai"}"#;
+        assert!(claude_identity_from_status(&outcome(signed_out, noop()), &cfg_path).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
