@@ -152,9 +152,10 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
      exit; same containment/uncontained/quiescence handling as `run_login`). The adapter's
      `login_mode()` (Codex `BrowserCallback`, Claude `CodePaste`) picks the executor in the setup
      `login_fn`. Unit-tested: `CodeEntryServer` round-trip + percent-decode; `extract_https_url` against
-     the exact Claude output. **The full Claude interactive path (spawn → paste → creds) is validated
-     by the deferred real smoke, not unit tests** (the CodeEntryServer port is internal to the runner).
-     Still to gate this addition through cross-review.
+     the exact Claude output. **GATE-APPROVED (`rv-20864-27`, 0 open)** after f1–f5 (bounded scanner
+     cleanup, non-blocking detached stdin write, byte-buffer scanner, strict + overflow-safe HTTP body
+     framing). The full Claude interactive path (spawn → paste → creds) is validated by the deferred
+     real smoke, not unit tests (the CodeEntryServer port is internal to the runner).
      - **Still remaining (all deferred, not blockers to the code landing):** `build.ps1` **dist restage**
        (needs the running MCP server unloaded — a release-time step); and the deferred real-OAuth
        **`smoke.ps1`** end-to-end (Codex first-login + Claude code-paste + account switch +
