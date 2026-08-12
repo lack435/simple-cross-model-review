@@ -62,10 +62,25 @@ authorized profile is part of #15, as is the deferred `[f5]` per-home lock (setu
 side; the review path takes a **shared** read — add the shared acquire around `attempt()`'s
 authorize→probe→spawn when the setup lock lands, keyed on the effective home like `[f23]`).
 
-5. **#15 Setup MCP tool + localhost page** — ordered state machine (classify op → human approval →
-   provision/stage → confirm → commit); three ops (authorize-only / first-provision / staged
-   re-login); loopback one-time-token approval page; redaction; per-profile cross-process lock +
-   expiry reclaim + rollback. Plan: impl `## Phase 3 → Setup MCP tool …` (`[f9]`,`[f18]`,`[f21]`,`[f23]`).
+5. **#15 Setup MCP tool + localhost page** — being built in parts.
+   - **#15·part 1 — DONE, gate-approved (`rv-19320-19`):** the loopback approval page (`src/approval.rs`,
+     `[f9]`) + `digest::random_hex_token` (CSPRNG). `ApprovalServer::start` binds loopback/ephemeral,
+     mints a one-time token, and serves a single approval page (per-connection bounded threads, absolute
+     read+write budgets, atomic first-writer-wins outcome, terminal-state invalidation, HTML-escaped,
+     `no-store`). `open_in_browser` via `ShellExecuteW`. `#![allow(dead_code)]` until the state machine
+     wires it — **remove that when part 3 lands**.
+   - **#15·part 2 — TODO: setup lock + provisional marker** (`[f23]`) — an OS-level cross-process lock
+     keyed by the effective home (reuse `session::ExclusiveLock`), a provisional marker recording
+     holder+expiry (reclaim if the holder died), and rollback scoping that removes **only** dirs this run
+     created (the `[f2]` ownership marker). This is also the **exclusive** side of the `[f5]` review-path
+     lock — wire the shared read around `attempt()` here too.
+   - **#15·part 3 — TODO: the setup MCP tool state machine** (`[f2]`,`[f18]`,`[f21]`) — classify op →
+     validate name → human approval (part 1) → provision/stage (`secure_profile_dir`) → confirm identity
+     (`resolve_home_identity`, the [f21] shared probe) → commit (`allowlist::authorize`). Three ops:
+     **authorize-only** (home exists+logged-in → probe → commit; no vendor login — the simplest, do it
+     first), **first-provision** and **staged re-login** (both need vendor login orchestration +
+     redaction, the riskiest/least-specified part). Wire into `mcp.rs`/`tools.rs` as a new tool, and do
+     the `[f20]` post-login handle-relative credential re-verify. Then `smoke.ps1` end-to-end.
 
 ## Resume-critical gotchas (not obvious from the code)
 
