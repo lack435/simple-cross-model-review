@@ -12,9 +12,6 @@
 //! page.
 
 #![cfg(windows)]
-// The whole module is exercised by tests but has no production caller until the setup MCP tool
-// (Phase 3 task #15) wires it in; remove this once that lands.
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -178,7 +175,17 @@ impl ApprovalServer {
         &self.url
     }
 
-    /// Block until the human approves, the expiry elapses, or the server is cancelled.
+    /// The outcome if one has been decided, without blocking. Lets a caller interleave waiting for
+    /// approval with polling its own cancellation (via [`cancel`](Self::cancel) when it sees it).
+    pub fn poll(&self) -> Option<ApprovalOutcome> {
+        let (lock, _) = &*self.shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).outcome
+    }
+
+    /// Block until the human approves, the expiry elapses, or the server is cancelled. The setup flow
+    /// uses [`poll`](Self::poll) instead so it can interleave its own cancellation; this blocking form
+    /// is exercised by the tests and kept as the simpler API.
+    #[allow(dead_code)]
     pub fn wait(&self) -> ApprovalOutcome {
         let (lock, cvar) = &*self.shared;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -470,6 +477,7 @@ const EXPIRED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset
      <title>No longer valid</title><style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}</style>\
      </head><body><h1>This approval link is no longer valid</h1><p>It expired or was already used or cancelled. Start the setup again if you still want to authorize this profile.</p></body></html>";
 
+#[link(name = "shell32")]
 extern "system" {
     fn ShellExecuteW(
         hwnd: *mut std::ffi::c_void,

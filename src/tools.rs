@@ -266,6 +266,16 @@ impl App {
         &self.cfg
     }
 
+    /// Run the profile-setup tool (authorize an existing profile for this repository). Blocks while a
+    /// loopback approval page waits for the human; a cancelled tool call cancels the wait.
+    pub fn setup_profile(
+        &self,
+        args: &Value,
+        request: &crate::cancel::RequestCancel,
+    ) -> Result<String, Failure> {
+        crate::setup::run_setup(&self.cfg, args, request)
+    }
+
     /// Release anything parked in a long poll: stdin has closed and the process is on its
     /// way out, so a waiter's remaining budget is time nobody is waiting for.
     pub fn begin_shutdown(&self) {

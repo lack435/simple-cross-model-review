@@ -28,6 +28,7 @@ mod prompt;
 mod registry;
 mod reviewer;
 mod session;
+mod setup;
 #[cfg(test)]
 mod testutil;
 mod tools;
