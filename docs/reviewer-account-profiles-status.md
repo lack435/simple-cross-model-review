@@ -22,13 +22,16 @@ Resume point for the account-profiles feature. Read this, then
 | 3·#12 | `profile::secure_profile_dir` provisioning (handle-relative descent + name safety) | `1fa38a2`..`fa9d14f` | **approved** (`rv-19320-11`) |
 | 3·#14 | probe-against-authorized-account + per-spawn identity/method probe + switch guard | `efb7e8d`, `b4ac18a`, `58bf1f3` | **approved** (`rv-19320-14`) |
 
-**Invariant that holds today:** ambient (no profile) is byte-for-byte unchanged; every *non-ambient*
-profile use is refused (`PROFILE_NOT_AUTHORIZED`). Since #11, that refusal is driven by the **real
-allowlist store**: `Config::profile_authorized` reads the account currently in the profile home (via the
-`Reviewer::fingerprint_at` seam, a direct home-path read that does *not* recurse through
-`resolve_authorized_home`) and asks the store whether the full four-field tuple is on file. With no
-setup tool yet the store is always empty, so the check still denies every non-ambient profile — the
-invariant holds, now on live data. Since #14 the account check is no longer tautological
+**State today:** ambient (no profile) is byte-for-byte unchanged. A non-ambient profile is refused
+(`PROFILE_NOT_AUTHORIZED`) unless the allowlist store holds a matching entry — and **since #15 part 3a
+the store can be populated**: `cross_model_setup_profile` (authorize-only) lets a human authorize an
+already-provisioned, signed-in profile, at which point the whole non-ambient review path goes **live**
+(probe, switch guard, controlled-env spawn). So the feature is now usable end-to-end for a profile you
+have already logged in; only *provisioning a brand-new home via the vendor login* (#15 part 3b) is
+missing. Authorization is driven by the **real allowlist store**: `Config::profile_authorized` reads
+the account currently in the profile home (via the `Reviewer::fingerprint_at` seam, a direct home-path
+read that does *not* recurse through `resolve_authorized_home`) and asks the store whether the full
+four-field tuple is on file. Since #14 the account check is no longer tautological
 (`resolve_authorized_home_with_account` pins the authorized account; the probe and switch guard compare
 against *it*), the identity+method probe re-runs on **every** non-ambient spawn (never cached — worker
 `attempt()`, `Reviewer::resolve_home_identity`), and the post-review switch guard refuses a review whose
@@ -64,23 +67,29 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
 
 5. **#15 Setup MCP tool + localhost page** — being built in parts.
    - **#15·part 1 — DONE, gate-approved (`rv-19320-19`):** the loopback approval page (`src/approval.rs`,
-     `[f9]`) + `digest::random_hex_token` (CSPRNG). `ApprovalServer::start` binds loopback/ephemeral,
-     mints a one-time token, and serves a single approval page (per-connection bounded threads, absolute
+     `[f9]`) + `digest::random_hex_token` (CSPRNG). `ApprovalServer` binds loopback/ephemeral, mints a
+     one-time token, and serves a single approval page (per-connection bounded threads, absolute
      read+write budgets, atomic first-writer-wins outcome, terminal-state invalidation, HTML-escaped,
-     `no-store`). `open_in_browser` via `ShellExecuteW`. `#![allow(dead_code)]` until the state machine
-     wires it — **remove that when part 3 lands**.
-   - **#15·part 2 — TODO: setup lock + provisional marker** (`[f23]`) — an OS-level cross-process lock
-     keyed by the effective home (reuse `session::ExclusiveLock`), a provisional marker recording
-     holder+expiry (reclaim if the holder died), and rollback scoping that removes **only** dirs this run
-     created (the `[f2]` ownership marker). This is also the **exclusive** side of the `[f5]` review-path
-     lock — wire the shared read around `attempt()` here too.
-   - **#15·part 3 — TODO: the setup MCP tool state machine** (`[f2]`,`[f18]`,`[f21]`) — classify op →
-     validate name → human approval (part 1) → provision/stage (`secure_profile_dir`) → confirm identity
-     (`resolve_home_identity`, the [f21] shared probe) → commit (`allowlist::authorize`). Three ops:
-     **authorize-only** (home exists+logged-in → probe → commit; no vendor login — the simplest, do it
-     first), **first-provision** and **staged re-login** (both need vendor login orchestration +
-     redaction, the riskiest/least-specified part). Wire into `mcp.rs`/`tools.rs` as a new tool, and do
-     the `[f20]` post-login handle-relative credential re-verify. Then `smoke.ps1` end-to-end.
+     `no-store`); `open_in_browser` via `ShellExecuteW`.
+   - **#15·part 2 + 3a — DONE, gate-approved (`rv-4656-4`):** the setup lock + provisional marker
+     (`src/setup.rs`, `[f23]`) and the **authorize-only** setup MCP tool. `SetupSession` holds an OS-level
+     cross-process exclusive lock keyed by the **canonicalized** effective home (`session::ExclusiveLock`)
+     and a small in-progress marker (cleared on commit/drop, stale one reclaimed on next begin). The
+     `cross_model_setup_profile` tool (`mcp.rs`/`tools.rs`) authorizes an **already-provisioned, signed-in**
+     profile for this `launch_root`: parse → read-only identity probe (`resolve_home_identity`, the [f21]
+     shared probe) → **human approval** (part 1) → re-confirm the account → commit `allowlist::authorize`,
+     all under the lock and honouring tool-call cancellation **at the atomic rename boundary** (the store
+     write threads a cancel flag). A home that does not exist yet is refused (vendor login is part 3b).
+   - **#15·part 3b — TODO (the last piece):** **first-provision** and **staged re-login**, which need
+     **vendor-login orchestration** (drive `codex login` / `claude login`, non-TTY browser callback, closed
+     child stdin, bounded timeout, cancellation, **redaction** of login stdout/stderr) — the riskiest,
+     least-specified part. These use `secure_profile_dir` to create/stage the home and the deferred
+     **ownership-scoped created-dir rollback** (build it *with* the creation mechanism: record ownership
+     before creating, refuse a pre-existing dir, retain the marker until cleanup succeeds — `src/setup.rs`
+     module doc says so), plus the `[f20]` post-login handle-relative credential re-verify (primitive
+     present). Also still deferred: the `[f5]` review-vs-setup **shared** lock (setup takes the exclusive
+     side already; add the shared read around `attempt()`), and `smoke.ps1` end-to-end against a real
+     provisioned profile.
 
 ## Resume-critical gotchas (not obvious from the code)
 
