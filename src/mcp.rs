@@ -955,10 +955,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  dedicated config home that fixes which account a review bills, regardless of what \
                  the desktop app is signed into. This is a one-time, human-approved step: it opens a \
                  localhost page in your browser and blocks until you click Approve, so a person — not \
-                 an agent — decides. It only authorizes an ALREADY-provisioned, signed-in profile \
-                 (it does not run a login); if the profile home does not exist yet, sign it in first. \
-                 Nothing is authorized unless you approve, and authorization is scoped to the \
-                 directory this server was launched from.",
+                 an agent — decides. By default it only authorizes an ALREADY-provisioned, signed-in \
+                 profile (no login). Pass \"login\": true to provision one: it drives the vendor login \
+                 in your browser and BLOCKS for several minutes while you sign in, then authorizes the \
+                 result — this both first-provisions a new home and re-signs-in (switches the account \
+                 of) an existing one. Nothing is authorized unless you approve, and authorization is \
+                 scoped to the directory this server was launched from.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -978,6 +980,14 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                         "description":
                             "An explicit absolute config-home path (the escape hatch), instead of a \
                              named profile. Provide this OR 'profile', not both."
+                    },
+                    "login": {
+                        "type": "boolean",
+                        "description":
+                            "Run the vendor login to provision (first-time) or re-sign-in (switch \
+                             account) the profile home. The call BLOCKS for minutes while a human \
+                             completes OAuth in the browser. Default false (authorize an existing, \
+                             signed-in home only)."
                     }
                 },
                 "required": ["reviewer"],

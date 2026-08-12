@@ -2192,6 +2192,28 @@ impl Job {
         // has no profile account (`Ok(None)`) and is never guarded, so its behaviour is unchanged.
         let authorized_start = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
 
+        // [f5]: hold the SHARED side of the per-home setup lock across the whole attempt — the probe,
+        // the child's lifetime, and the switch guard — so a setup swap (which takes the exclusive side
+        // of the same lock) cannot rename the home out from under this review. Concurrent reviews
+        // coexist (all shared); a setup in progress refuses the review until it completes. Ambient has
+        // no profile home and is never locked.
+        let _home_lock = if let Some(start) = &authorized_start {
+            match crate::setup::acquire_review_home_lock(&start.home) {
+                Ok(lock) => lock,
+                Err(_) => {
+                    return Err(Failure::new(
+                        "PROFILE_SETUP_IN_PROGRESS",
+                        "A setup for this profile is in progress, so the review cannot run under it \
+                         yet. Try again once setup finishes.",
+                        "A setup for this profile is in progress, so the review cannot run under it \
+                         yet. Try again once setup finishes.",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // Per-spawn identity + method probe [f2/f3]: run the full probe (account **and** auth method)
         // before every non-ambient spawn, never cached — the liveness gate in `auth_check` is process-
         // cached, so a same-account method downgrade (e.g. ChatGPT → API key) since the preflight would

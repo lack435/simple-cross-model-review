@@ -51,6 +51,40 @@ const SETUP_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// is treated as abandoned and reclaimed even if the lock discipline were somehow bypassed.
 const MARKER_TTL_SECS: u64 = 30 * 60;
 
+/// How long the review path waits for the shared per-home lock before concluding a setup is in
+/// progress ([f5]).
+const SHARED_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Acquire the **shared** side of the per-home setup lock for the review path ([f5]).
+///
+/// Held across the whole review attempt so a setup swap (which takes the *exclusive* side of the very
+/// same lock file) cannot rename the home out from under a live review. Contends on
+/// `{base}/auth/setup-{home_key}.lock` — the exact path [`SetupSession`] locks — so review-vs-setup of
+/// one profile mutually exclude, while concurrent reviews (all shared) coexist.
+///
+/// `Ok(None)` when no profile base is resolvable (nothing to contend with — proceed unlocked, as
+/// before this feature). `Err(WouldBlock)` when a setup currently holds the exclusive side (the review
+/// should refuse and retry). Any other lock-setup error maps to `Ok(None)` — a lock we cannot even
+/// create must not block reviews when no setup is running.
+pub fn acquire_review_home_lock(
+    effective_home: &Path,
+) -> io::Result<Option<crate::session::SharedLock>> {
+    let Some(base) = crate::profile::profile_base() else {
+        return Ok(None);
+    };
+    let auth = base.join("auth");
+    if std::fs::create_dir_all(&auth).is_err() {
+        return Ok(None);
+    }
+    let key = home_key(effective_home);
+    let lock_path = auth.join(format!("setup-{key}.lock"));
+    match crate::session::SharedLock::acquire(&lock_path, SHARED_LOCK_WAIT) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// The operation a setup journal records. `AuthorizeOnly` creates nothing, so it needs no recovery
 /// beyond clearing the marker; the two provisioning operations are recovered by the presence-driven
 /// state machine in [`recover`].
@@ -1458,6 +1492,26 @@ mod tests {
         assert!(marker.exists(), "the fresh run wrote its own marker");
         session.commit().unwrap();
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_live_setup_blocks_the_review_shared_lock() {
+        // [f5]: setup holds the exclusive side of the per-home lock; a review's shared acquire on the
+        // same path is blocked until setup releases it, so a swap cannot race a live review.
+        let base = temp_dir();
+        let home = base.join("profiles").join("codex").join("work");
+        let session = SetupSession::begin(&base, &home).expect("begin");
+        let lock_path = base
+            .join("auth")
+            .join(format!("setup-{}.lock", home_key(&home)));
+        assert!(
+            crate::session::SharedLock::acquire(&lock_path, Duration::from_millis(100)).is_err(),
+            "a review shared-lock must be blocked while a setup holds the exclusive side"
+        );
+        drop(session);
+        // Once setup releases, the review acquires the shared lock immediately.
+        crate::session::SharedLock::acquire(&lock_path, Duration::from_millis(500))
+            .expect("shared lock after setup releases");
     }
 
     #[test]
