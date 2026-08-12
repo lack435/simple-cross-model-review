@@ -20,16 +20,21 @@ Resume point for the account-profiles feature. Read this, then
 | 3·#10 | `Config.launch_root` captured before `--cwd`, canonicalized (allowlist key) | `9d934f4` | **approved** (`rv-19320-6`) |
 | 3·#11 | allowlist store (`allowlist.rs`) + `winsec.rs` ACL FFI + authorization wiring | `9d934f4`, `e5d35de`, `b858568` | **approved** (`rv-19320-6`) |
 | 3·#12 | `profile::secure_profile_dir` provisioning (handle-relative descent + name safety) | `1fa38a2`..`fa9d14f` | **approved** (`rv-19320-11`) |
+| 3·#14 | probe-against-authorized-account + per-spawn identity/method probe + switch guard | `efb7e8d`, `b4ac18a`, `58bf1f3` | **approved** (`rv-19320-14`) |
 
 **Invariant that holds today:** ambient (no profile) is byte-for-byte unchanged; every *non-ambient*
 profile use is refused (`PROFILE_NOT_AUTHORIZED`). Since #11, that refusal is driven by the **real
-allowlist store** rather than a deny-all stub: `Config::profile_authorized` reads the account currently
-in the profile home (via the new `Reviewer::fingerprint_at` seam, a direct home-path read that does
-*not* recurse through `resolve_authorized_home`) and asks the store whether the full four-field tuple
-is on file. With no setup tool yet the store is always empty, so the check still denies every
-non-ambient profile — the invariant holds, now on live data. The `[f4]`/`[f5]` pre-spawn lock +
-switch guard remain **deferred to #14** (documented in `resolve_authorized_home`); the empty store
-means that race window authorizes nothing meanwhile.
+allowlist store**: `Config::profile_authorized` reads the account currently in the profile home (via the
+`Reviewer::fingerprint_at` seam, a direct home-path read that does *not* recurse through
+`resolve_authorized_home`) and asks the store whether the full four-field tuple is on file. With no
+setup tool yet the store is always empty, so the check still denies every non-ambient profile — the
+invariant holds, now on live data. Since #14 the account check is no longer tautological
+(`resolve_authorized_home_with_account` pins the authorized account; the probe and switch guard compare
+against *it*), the identity+method probe re-runs on **every** non-ambient spawn (never cached — worker
+`attempt()`, `Reviewer::resolve_home_identity`), and the post-review switch guard refuses a review whose
+account moved mid-flight. **Remaining for #15:** the `[f5]` per-home cross-process lock (shared read on
+the review path, exclusive in setup) — deferred deliberately because #15 owns the setup side of that
+same lock; and `smoke.ps1` profile end-to-end, which needs a real authorized profile (#15).
 
 **New foundation landed with #11 — `src/winsec.rs`** (new module, gate-approved): Windows security-
 descriptor FFI in `winjob`'s style (no new crate; declares `advapi32`/`ntdll` directly). It builds one
@@ -50,15 +55,13 @@ exists; #15 wires it into the setup flow.
 
 ## Remaining (Phase 3)
 
-Do roughly in this order.
+Only #15 is left. It is the largest piece and it *activates* everything above: once a profile can be
+authorized, the store stops being empty and the whole non-ambient path (probe, switch guard,
+controlled-env spawn) goes live — so `smoke.ps1 -Reviewer codex|claude` end-to-end against a real
+authorized profile is part of #15, as is the deferred `[f5]` per-home lock (setup takes the **exclusive**
+side; the review path takes a **shared** read — add the shared acquire around `attempt()`'s
+authorize→probe→spawn when the setup lock lands, keyed on the effective home like `[f23]`).
 
-4. **#14 Switch guard + probe expected-account + spawn atomicity** — the store *consultation* half of
-   #14 is **already done** (#11: `profile_authorized` now checks the full 4-field tuple, `launch_root`
-   key). What remains: (a) change the probe's `expected` account in both `auth_check`s from the home's
-   own fingerprint to the **allowlist's authorized** account (see gotcha below); (b) the post-review
-   start-vs-final fingerprint guard (`[f4]`); (c) the pre-spawn per-home lock + generation recheck so
-   authorize→probe→spawn is one critical section (`[f5]`); (d) validate the codex-invocation
-   controlled-env / evidence-server interaction (`smoke.ps1`).
 5. **#15 Setup MCP tool + localhost page** — ordered state machine (classify op → human approval →
    provision/stage → confirm → commit); three ops (authorize-only / first-provision / staged
    re-login); loopback one-time-token approval page; redaction; per-profile cross-process lock +
@@ -66,11 +69,13 @@ Do roughly in this order.
 
 ## Resume-critical gotchas (not obvious from the code)
 
-- **The probe's account check is currently a self-consistency check.** In both `auth_check`s,
-  `assert_profile_identity(resolved, expected)` passes `expected = <home>`'s own fingerprint, so the
-  account half is tautological *today* — the **method** check (subscription) is the live part.
-  **Task #14 must switch `expected` to the allowlist's authorized account** — that is what catches a
-  profile silently re-logged to a different account. Commented at both call sites (`dd69142`).
+- **The probe's account check is no longer tautological (fixed in #14).** The identity+method probe
+  now runs per non-ambient spawn in the worker (`attempt()` → `Reviewer::resolve_home_identity`, never
+  cached — `auth_check` is liveness-only) and asserts against the **allowlist-authorized** account that
+  `resolve_authorized_home_with_account` pins, not the home's own re-read. The post-review `switch_guard`
+  re-reads the account and refuses a mid-flight swap before recording/delivery. So a profile silently
+  re-logged to a different account is caught pre-spawn *and* post-review. (Historical note: task #13 left
+  `expected = <home>`'s own fingerprint, which #14 replaced.)
 - **Verified identity surfaces (task #13):** Codex — `auth.json.auth_mode=="chatgpt"` (method) +
   `tokens.account_id` (== `id_token` `chatgpt_account_id`, verified); `codex doctor` is
   `CODEX_HOME`-aware. Claude — `auth status` `authMethod=="claude.ai"` + `apiProvider=="firstParty"`
