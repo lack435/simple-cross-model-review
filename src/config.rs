@@ -261,6 +261,16 @@ impl PendingEntry {
         if path.as_os_str().is_empty() {
             return Err(format!("{flag} requires a non-empty path"));
         }
+        // Must be absolute: a relative or drive-relative home would resolve against whatever working
+        // directory the reviewer child happened to run under, so the same config could bind different
+        // accounts and weaken authorization (code-review f4). Symlink canonicalization happens later,
+        // at provisioning, once the directory exists.
+        if !path.is_absolute() {
+            return Err(format!(
+                "{flag} requires an absolute path, got '{}'",
+                path.display()
+            ));
+        }
         self.profile = Some(ProfileSelector::ExplicitHome(path));
         Ok(())
     }
@@ -1590,6 +1600,15 @@ OPTIONS:
                               claude: low|medium|high|xhigh|max          (default medium)
                               codex:  low|medium|high|xhigh|max|ultra    (default max)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
+  --codex-profile <name>      Run the codex reviewer under a dedicated account profile (a named
+  --claude-profile <name>     config home under %CROSS_REVIEW_HOME% or %LOCALAPPDATA%\\cross-review),
+                              claude equivalent --claude-profile, so a review bills the intended
+                              account regardless of the desktop app. Name: letters, digits, '.',
+                              '_', '-'. Using a profile requires the working root to be authorized
+                              for it first; until then a review is refused (PROFILE_NOT_AUTHORIZED).
+  --codex-home <abs>          Run the reviewer under an explicit absolute config home instead of a
+  --claude-config-dir <abs>   named profile (local/trusted-only escape hatch). Mutually exclusive
+                              with the profile flag for the same reviewer; also authorization-gated.
   --min-usage-remaining <n>   Proactive gate (codex only): skip this entry when its
                               last-observed usage remaining is known and below n% (1..=100),
                               advancing to the next reviewer before spending a call. Optional;
@@ -1773,6 +1792,18 @@ mod tests {
             err.contains("invalid character") || err.contains("traversal"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn an_explicit_home_must_be_absolute() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-home",
+            r"relative\path",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
     }
 
     #[test]

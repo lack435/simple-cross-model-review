@@ -433,19 +433,13 @@ impl SessionStore {
             ),
         };
 
-        // Profile identity: this turn's, but carry a prior turn's fingerprint forward when this turn
-        // could not read one -- a transient account-file read failure must not poison a session whose
-        // identity was already verified on the resume that reached here. `prior` is same-conversation
-        // only, so a fresh or rebound session keeps exactly this turn's identity: an unbindable new
-        // session (fingerprint `None`) stays non-resumable, per the uniform fail-closed contract.
-        let profile_identity = profile_identity.map(|mut this| {
-            if this.account_fingerprint.is_none() {
-                this.account_fingerprint = prior
-                    .and_then(|p| p.profile_identity.as_ref())
-                    .and_then(|pi| pi.account_fingerprint.clone());
-            }
-            this
-        });
+        // Profile identity: exactly this turn's, never a carry-forward. A turn that could not read
+        // the account fingerprint records `None`, which makes the session non-resumable -- the
+        // uniform fail-closed contract. Carrying a prior turn's fingerprint forward was removed
+        // (code-review f3): it could record a fingerprint the *current* turn did not verify, masking
+        // an account switch that a partial credential-file read left unseen. Tolerating a transient
+        // read failure instead belongs to the Phase 3 start-vs-final identity guard, which retains
+        // the account asserted at spawn and verifies the final one equals it before delivery.
 
         let record = match store.sessions.get(name) {
             // Same underlying session: another turn on it. The changelist binding is
@@ -999,22 +993,20 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_missing_fingerprint_carries_the_prior_forward() {
+    fn a_turn_records_exactly_its_own_fingerprint_never_a_carry_forward() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         // Turn 1 captured the account.
         store
             .record_turn("s", ambient_facts("thread-1", Some("acct-1")))
             .unwrap();
-        // Turn 2 on the same conversation could not read it -- the prior fingerprint is retained, so
-        // a transient account-file read failure does not poison an already-verified session.
+        // Turn 2 on the same conversation could not read it: it records `None` (non-resumable), not
+        // the prior fingerprint. A fingerprint the current turn did not verify must never be
+        // recorded -- it could mask an account switch (code-review f3).
         let rec = store
             .record_turn("s", ambient_facts("thread-1", None))
             .unwrap();
-        assert_eq!(
-            rec.profile_identity.unwrap().account_fingerprint.as_deref(),
-            Some("acct-1")
-        );
+        assert!(rec.profile_identity.unwrap().account_fingerprint.is_none());
     }
 
     #[test]

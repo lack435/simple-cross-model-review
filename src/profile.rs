@@ -111,19 +111,26 @@ fn profile_root(base: &Path, reviewer: ReviewerKind) -> PathBuf {
 
 /// Resolve a selector to its effective config home, or `None` for `Ambient` (inherit).
 ///
-/// For `Named`, the path is `{base}\profiles\{reviewer}\{name}` and is checked to lie under the
-/// profile root (belt-and-braces with [`validate_profile_name`]). For `ExplicitHome`, the caller's
-/// path is returned as-is (no containment: it is deliberately outside the root). Filesystem
-/// hardening — reparse-point rejection on the real directory, handle-based creation, ACLs — belongs
-/// to provisioning (a later phase) and is applied when the home is actually created/opened; Phase 1
-/// never opens the home because non-ambient use is refused upstream.
-pub fn resolve_home(
+/// **Not the review-path resolver.** Review code must obtain a home through
+/// [`crate::config::Config::resolve_authorized_home`], which resolves *and* authorizes in one step;
+/// this raw resolver performs no authorization and exists only for that function and the Phase 3
+/// provisioning path to build on (code-review f5). `pub(crate)` keeps it off any external surface.
+///
+/// For `Named`, the path is `{base}\profiles\{reviewer}\{name}`, checked to lie under the profile
+/// root (belt-and-braces with [`validate_profile_name`]). For `ExplicitHome`, the caller's path is
+/// returned as-is (no containment: it is deliberately outside the root). Either way the resolved home
+/// must be **absolute** — a relative home would bind differently under different child working
+/// directories (code-review f4). Filesystem hardening — reparse-point rejection on the real
+/// directory, handle-based creation, ACLs, and symlink canonicalization — belongs to provisioning
+/// (a later phase) and is applied when the home is created/opened; Phase 1 never opens it because
+/// non-ambient use is refused upstream.
+pub(crate) fn resolve_home(
     selector: &ProfileSelector,
     reviewer: ReviewerKind,
     base: Option<&Path>,
 ) -> Result<Option<PathBuf>, String> {
-    match selector {
-        ProfileSelector::Ambient => Ok(None),
+    let home = match selector {
+        ProfileSelector::Ambient => return Ok(None),
         ProfileSelector::Named(name) => {
             validate_profile_name(name)?;
             let base = base.ok_or_else(|| {
@@ -141,7 +148,7 @@ pub fn resolve_home(
                     root.display()
                 ));
             }
-            Ok(Some(home))
+            home
         }
         ProfileSelector::ExplicitHome(path) => {
             if path.as_os_str().is_empty() {
@@ -149,9 +156,20 @@ pub fn resolve_home(
                     "--codex-home / --claude-config-dir requires a non-empty path".to_string(),
                 );
             }
-            Ok(Some(path.clone()))
+            path.clone()
         }
+    };
+    // The effective home must be absolute so it names one directory regardless of any child's cwd.
+    // Named homes are absolute only if their base is (CROSS_REVIEW_HOME could be set to anything);
+    // explicit homes are checked at parse too, but this is the single guarantee both share.
+    if !home.is_absolute() {
+        return Err(format!(
+            "the resolved profile home {} is not absolute; set CROSS_REVIEW_HOME (or the explicit \
+             home) to an absolute path",
+            home.display()
+        ));
     }
+    Ok(Some(home))
 }
 
 #[cfg(test)]
