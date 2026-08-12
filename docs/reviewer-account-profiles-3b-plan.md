@@ -78,14 +78,23 @@ pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> Lo
   the repo-settable `--state-dir` (`reviewer/mod.rs:257-262`). Vendor login-subcommand isolation flags
   are passed where supported. **This isolation is mandatory for every setup-path vendor CLI call**,
   including the post-login confirmation probe (below), not just the login child.
-- **Process containment (f-r2.5).** Merely omitting `job.terminate()` is insufficient: the existing
-  `JobObject` sets `KILL_ON_JOB_CLOSE`, so its `Drop`→`CloseHandle` kills survivors even after a clean
-  exit (`winjob.rs:143-151`). Login therefore uses a **dedicated job created WITHOUT
-  `KILL_ON_JOB_CLOSE`**: `run_login` **waits for the vendor process's natural exit** (the vendor *is*
-  the callback server), and on **success closes the job without terminating** (browser/helpers
-  survive); on **timeout/cancel** it calls `TerminateJobObject` explicitly. If the job cannot be
-  created or the child assigned, login **fails closed** (refuse — we will not run a login we cannot
-  contain on abort). Needs a small `winjob` no-kill-on-close variant. Child stdin is **closed**.
+- **Process containment (f-r2.5, f10).** Merely omitting `job.terminate()` is insufficient: the
+  existing `JobObject` sets `KILL_ON_JOB_CLOSE`, so its `Drop`→`CloseHandle` kills survivors even after
+  a clean exit (`winjob.rs:143-151`). And it **assigns the child to the job *after* spawn**
+  (`winjob.rs:121-131`, whose own comment notes `std::process::Command` "cannot spawn suspended, so a
+  child that spawns a grandchild before this call lands would leave that grandchild outside the job") —
+  an uncontained window unacceptable for a login we must be able to abort cleanly. Login therefore uses
+  a **dedicated job without `KILL_ON_JOB_CLOSE`** and **creation-time association**: create the child
+  **suspended** (`CREATE_SUSPENDED`), `AssignProcessToJobObject` while suspended, **then resume**, so
+  every descendant is in the job from the first instruction. This needs process creation beyond
+  `std::process::Command` (`creation_flags(CREATE_SUSPENDED)` + resuming the primary thread, or a
+  direct `CreateProcessW`), scoped to the login runner (the existing review runner keeps its
+  pre-existing post-spawn assignment; this plan does not weaken it). `run_login` **waits for the vendor
+  process's natural exit** (the vendor *is* the callback server) and on **success closes the job
+  without terminating** (browser/helpers survive); on **timeout/cancel** it calls `TerminateJobObject`
+  and **checks the result**. If the job cannot be created, the child cannot be associated, or a
+  terminate fails, login **fails closed** — refuse or report an uncontained-abort error; we never run
+  or abandon a login we cannot contain. Child stdin is **closed**.
 - **Machine-wide serialization (f4).** The vendor CLIs bind a **fixed localhost callback port**
   (Codex ~1455), so concurrent logins collide regardless of home or `CROSS_REVIEW_HOME`. Serialize
   with a **Windows named mutex** (`CreateMutexW`, session-scoped `Local\` name), held for the entire
@@ -126,11 +135,15 @@ traversal — recursion is an optional hardening follow-up.
 ### Identity binding (f3) — first-provision and re-login
 
 Capture the **expected `ResolvedIdentity`** (account + method) from the probe run against the staging
-dir **while its handle is held**; require `method == Subscription`. After the rename into place,
-**re-open and hold the final `home` handle**, re-run the probe, and require **exact equality** with the
-captured identity (not merely "is a subscription account"). The `AllowlistStore::authorize` commit
-records **exactly** that account, with the final handle held across the write, binding the recorded
-account to the verified object.
+dir **while its handle is held**; require `method == Subscription`. Then follow the explicit handle
+ordering (f11): **release the staging handle → `rename(staging→home)` → re-open and hold the final
+`home` handle**. The release is mandatory because `SecuredProfileDir`'s handle omits
+`FILE_SHARE_DELETE` (`profile.rs:210-224`), so a rename while it is held would fail; between release
+and rename the staging dir is still protected by its restrictive DACL and by the per-home exclusive
+setup lock plus the global login mutex, so nothing else touches it. After the rename, re-run the probe
+against the held final `home` and require **exact equality** with the captured identity (not merely "is
+a subscription account"). The `AllowlistStore::authorize` commit records **exactly** that account, with
+the final handle held across the write, binding the recorded account to the verified object.
 
 ### Exclusive-create staging + ownership (f1, f-r2.2)
 
@@ -162,25 +175,36 @@ approval**; the lock+marker exist only to serialize approval and enable recovery
 mutation (write-ahead), so the nonce-named paths are durable before any rename that could crash:
 before creating staging, before `rename(home → .old)`, before `rename(staging → home)`.
 
-**Recovery is presence-driven, not phase-driven (f-r2.1).** `SetupSession::begin` replays under the
-lock, deciding from the **actual presence** of the three journalled paths (the `intent` field is only
-an advisory hint; renames are atomic and the nonce'd paths are unique, so presence determines state):
+**Recovery is presence-driven, over all eight states, with a fail-closed default (f-r2.1, f8).**
+`SetupSession::begin` replays under the lock, deciding from the **actual presence** of the three
+journalled nonce'd paths (`intent` is only an advisory hint; renames are atomic and the paths are
+nonce-unique, so presence determines state). `H`=home present, `O`=`.old-nonce` present,
+`S`=`staging-nonce` present. **Every one of the eight combinations has a specified fail-closed
+action**; any state the operation could not have produced (marked *unexpected*) **retains the journal
+and refuses**, surfacing an error rather than guessing:
 
-| home | `.old-nonce` | `staging-nonce` | meaning | action |
+| H | O | S | interpretation | action |
 |---|---|---|---|---|
-| present/absent | absent | present | login/verify done, not yet swapped in | **remove staging**; home untouched |
-| absent | present | present | crashed between `home→.old` and `staging→home` | **restore `.old→home`**, remove staging |
-| present | present | absent | crashed after `staging→home`, before cleanup | **remove `.old`**; keep home |
-| present | absent | absent | complete, or crashed during authorize | consult the store; **never delete home**; clear journal |
+| 0 | 0 | 0 | nothing created / fully rolled back (first-provision); **home lost with nothing to restore** (re-login) | first-provision: clear journal. re-login: **unexpected → retain journal, refuse** |
+| 0 | 0 | 1 | staging created, not swapped in | remove staging (ours); first-provision: clear journal; re-login: home lost → **retain journal, refuse** |
+| 0 | 1 | 0 | home moved to `.old`, staging gone before swap-in (failed cleanup) | **restore `.old→home`**, clear journal |
+| 0 | 1 | 1 | crashed between `home→.old` and `staging→home` | **restore `.old→home`**, remove staging, clear journal |
+| 1 | 0 | 0 | complete, or crashed during authorize; or first-provision never started | consult store; **never delete a store-authorized home**; clear journal |
+| 1 | 0 | 1 | pre-swap original home + our staging (or an external home collided with our first-provision rename) | remove staging (ours); **do not touch home** (not ours to delete); clear journal |
+| 1 | 1 | 0 | re-login crashed after `staging→home`, before/at authorize | **consult store (f9)**: new entry durably present → remove `.old`, keep home, clear journal; else **roll back** — discard the uncommitted new home, `restore .old→home` — clear journal |
+| 1 | 1 | 1 | our `.old` + our staging + a present home (external re-creation / impossible interleave) | **unexpected → retain journal, refuse** |
 
-**Never delete a final `home` (f3).** Once `home` exists via rename it is a valid, ACL-locked,
-logged-in dir; recovery only reconciles the nonce'd `staging`/`.old` siblings and clears the journal.
-So the commit is crash-safe: order is `rename(staging→home)` → journal `authorizing` →
-`AllowlistStore::authorize` (its own atomic write is the **source of truth**; recovery never invents an
-authorization) → clear journal. A crash after the store publishes but before the journal clears simply
-leaves the journal to be cleared next `begin`; `home` is never removed, so the store never points at a
-missing profile. A pre-commit failure always ends with the valid existing home restored (re-login) or
-just an orphaned staging removed (first-provision), and **no** allowlist change.
+**Delete only what is provably safe (f3, f9).** Recovery deletes only (a) a nonce'd `staging`/`.old`
+dir this run created, or (b) an *uncommitted* new home while rolling a swap back — and it decides (b)
+by **consulting the store**, which is the source of truth. It **never deletes a home the store
+authorizes**, and it **never deletes `.old` until the new store entry is durably confirmed** (f9): at
+`H,O,¬S`, if the new authorization did not land, `.old` still holds the store-authorized credentials,
+so recovery rolls the swap back rather than destroying them. Commit order is therefore
+`release staging handle → rename(staging→home) → reopen+hold home → journal authorizing →
+AllowlistStore::authorize (atomic; the authorization source of truth) → clear journal`. A crash after
+the store publishes but before the journal clears leaves only the journal to clear next `begin`;
+`home` (now store-authorized) is never removed. A pre-commit failure ends with the valid existing home
+restored (re-login) or an orphaned staging removed (first-provision), and **no** allowlist change.
 
 **Retain-until-clean (f8).** If a required cleanup `remove_dir_all` fails (a lingering handle, a
 transient lock), the journal is **retained** so the next `begin` retries, rather than clearing the
@@ -221,12 +245,20 @@ Factor the login step behind an injected callback so unit tests never run real O
   `KILL_ON_JOB_CLOSE` → dedicated no-kill-on-close job, fail-closed if uncontainable; **f-r2.6** Claude
   confirmation probe still ran from `neutral_dir` → mandatory isolated setup-scoped probe; **f-r2.7**
   login child had no controlled-env contract → required, tested `apply_controlled_env`.
+- **rv-20864-4** marked all seven above resolved and raised four more, all folded in: **f-r3.1** the
+  presence table was incomplete → all **eight** states enumerated with a fail-closed default;
+  **f-r3.2** re-login recovery could delete `.old` before the new authorization was durable → consult
+  the store, roll the swap back rather than destroy the only valid credentials; **f-r3.3** the job is
+  assigned *after* spawn (uncontained window) → creation-time association (suspended create → assign →
+  resume), checked, fail-closed; **f-r3.4** the held staging handle (no delete-sharing) would block the
+  commit rename → explicit release-then-rename-then-reopen ordering.
 
 ## Files to modify
 
 - **`src/winsec.rs`** — `secure_and_verify_child_file` (f20); `create_new_secured_child_dir`
   (exclusive create, f1); named-mutex RAII primitive (f4); tests.
-- **`src/winjob.rs`** — a no-kill-on-close job variant + explicit terminate/detach for login (f-r2.5).
+- **`src/winjob.rs`** — a no-kill-on-close job variant + **creation-time association** (suspended
+  create → assign → resume) + checked terminate for login (f-r2.5/f-r3.3).
 - **`src/session.rs`** — refactor `ExclusiveLock` to `LockFileEx` `Shared`/`Exclusive` on one path
   (f9); recovery-aware `SetupSession::begin` (WAL journal replay, f2/f8/f-r2.1..4).
 - **`src/profile.rs`** — `SecuredProfileDir::secure_and_verify_credential`; staging-create path.
@@ -246,13 +278,16 @@ Factor the login step behind an injected callback so unit tests never run real O
 
 - `cargo test` — unit tests: exclusive-create collision refused (f1); first-provision rename refuses a
   concurrently-appeared home (f-r2.2); identity-equality binding (f3); non-subscription rejected;
-  first-provision + re-login happy paths; **fault-injection recovery** between every mutation/journal
-  write for both operations, incl. crash-after-store-publish keeps home (f3/f-r2.1/f-r2.3);
+  first-provision + re-login happy paths; **fault-injection recovery** driving a crash between every
+  mutation and its journal write for both operations, asserting **each of the eight presence states**
+  reaches its specified action incl. crash-after-store-publish keeps home and the `H,O,¬S` store-driven
+  roll-back vs. cleanup (f-r2.1/f-r2.3/f-r3.1/f-r3.2); unexpected states retain the journal and refuse;
   recovery-runs-before-classification (f-r2.4); retain-journal-on-failed-cleanup (f8); [f20] primitive
   (apply+verify child; widened-ACL negative); named-mutex mutual exclusion (f4); shared/exclusive lock
   (readers coexist, reader⇄writer exclude) (f9); controlled-env clears rogue vars (f-r2.7);
   hostile-cwd-config for login **and** the confirmation probe (f6/f-r2.6); login fails closed when
-  the job is uncontainable (f-r2.5).
+  the job is uncontainable, incl. creation-time association (f-r2.5/f-r3.3); staging handle released
+  before the commit rename (f-r3.4).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
