@@ -286,18 +286,21 @@ pub fn secure_profile_dir(
                     "--codex-home / --claude-config-dir requires a non-empty absolute path",
                 ));
             }
-            // The path must name a real *directory leaf*, not a root/prefix, and must not traverse
-            // upward: `create_secured_dir` reports an existing file as already-present and a `..`
-            // resolves to a parent or the drive root, either of which would otherwise receive the
-            // restrictive DACL — the wrong object (f1). We reject every `..` (`ParentDir`) component,
-            // which `Path::components()` preserves. A `.` (`CurDir`) component is *not* checked here
-            // and needs no check: `components()` normalizes non-leading `.` away entirely, and a
-            // leading `.` cannot occur because the path is required to be absolute above — either way
-            // a `.` is a no-op that resolves to the same directory, never a different object (f4). The
+            // The path must name a real *directory leaf*, not a root/prefix, and must contain no
+            // `.`/`..` component: `create_secured_dir` reports an existing file as already-present and
+            // a `..` resolves to a parent or the drive root, either of which would otherwise receive
+            // the restrictive DACL — the wrong object (f1). Reject **both** `CurDir` and `ParentDir`.
+            // For an ordinary absolute path `Path::components()` normalizes non-leading `.` away, so
+            // the `CurDir` arm never fires there; but a **verbatim `\\?\` path disables that
+            // normalization and preserves `.`**, so without the `CurDir` arm a form like
+            // `\\?\C:\.\home` would slip through while `\\?\C:\home\.` was inconsistently caught by the
+            // leaf check. Rejecting any `.`/`..` outright makes the contract hold uniformly (f4). The
             // directory attribute is also verified on the opened handle inside `create_secured_dir`.
-            if p.components().any(|c| matches!(c, Component::ParentDir)) {
+            if p.components()
+                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+            {
                 return Err(io::Error::other(
-                    "--codex-home / --claude-config-dir must not contain a '..' component",
+                    "--codex-home / --claude-config-dir must not contain a '.' or '..' component",
                 ));
             }
             if !matches!(p.components().next_back(), Some(Component::Normal(_))) {
@@ -514,6 +517,20 @@ mod tests {
         let sneaky = base.join("sub").join("..");
         assert!(secure_profile_dir(
             &ProfileSelector::ExplicitHome(sneaky),
+            ReviewerKind::Claude,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_rejects_a_verbatim_dot_component() {
+        // A verbatim `\\?\` path disables `.` normalization, so a `.` survives as a CurDir component.
+        // It must be refused (the reject check covers CurDir as well as ParentDir), before any
+        // filesystem access — so this needs no real directory.
+        let verbatim = PathBuf::from(r"\\?\C:\trusted\.\home");
+        assert!(secure_profile_dir(
+            &ProfileSelector::ExplicitHome(verbatim),
             ReviewerKind::Claude,
             None,
         )
