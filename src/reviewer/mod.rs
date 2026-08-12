@@ -717,6 +717,45 @@ pub trait Reviewer: Send + Sync {
         ))
     }
 
+    /// Build the vendor **login** command that signs a fresh subscription session into `home` (the
+    /// staging dir), with the controlled environment applied (`env_clear` + allowlist + the home var).
+    /// The caller adds the owned scratch cwd, null stdio and containment. Never an api-key/token flow.
+    /// Default fails closed for an adapter with no login. (#15 part 3b)
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn login_command(&self, _bin: &Path, _home: &Path) -> Result<Command, Failure> {
+        Err(errors::bad_request(
+            "no vendor login is implemented for this reviewer",
+        ))
+    }
+
+    /// The credential files the vendor writes into a signed-in home, in the order to poll-for-arrival
+    /// and re-secure ([f20]). The **first** entry is the account file the confirmation reads
+    /// handle-relative (f-a5). Empty for an adapter with no login.
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn credential_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Confirm the just-provisioned `home`'s identity for the **setup** flow: read the account
+    /// fingerprint **handle-relative** through the held directory (f-a5) and establish the auth method
+    /// from an isolated probe run from `scratch_cwd` (f-r2.6). Distinct from
+    /// [`resolve_home_identity`](Self::resolve_home_identity), which reads by path on the review path.
+    /// Default fails closed. (#15 part 3b)
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn confirm_setup_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        _home: &crate::profile::SecuredProfileDir,
+        _scratch_cwd: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<ResolvedIdentity, Failure> {
+        Err(errors::profile_identity_mismatch(
+            "reviewer",
+            "no setup identity confirmation is implemented for this reviewer",
+        ))
+    }
+
     /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
     /// `MAX_OUTPUT_BYTES`; the armed Claude path raises the byte cap, adds a line cap, and asks
     /// the runner to *terminate* the child at either bound (because `stream-json` carries the

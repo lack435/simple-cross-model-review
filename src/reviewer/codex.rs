@@ -397,6 +397,42 @@ impl Reviewer for CodexReviewer {
     ) -> Result<super::ResolvedIdentity, Failure> {
         codex_resolve_identity(home)
     }
+
+    /// Bare `codex login` (subscription/browser OAuth), under the controlled environment with
+    /// `CODEX_HOME` pointed at the staging dir. Never `--with-api-key`/`--with-access-token`.
+    fn login_command(&self, bin: &Path, home: &Path) -> Result<Command, Failure> {
+        let mut cmd = Command::new(bin);
+        super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
+        cmd.arg("login");
+        Ok(cmd)
+    }
+
+    /// Codex writes its subscription tokens to `auth.json` — the single credential + account file.
+    fn credential_files(&self) -> &'static [&'static str] {
+        &["auth.json"]
+    }
+
+    /// Both the account and the method come from `auth.json`, so the setup confirmation is a single
+    /// **handle-relative** read of that file through the held home (no CLI call, no by-path window,
+    /// f-a5). Fails closed on a missing/unrecognised shape.
+    fn confirm_setup_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        home: &crate::profile::SecuredProfileDir,
+        _scratch_cwd: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let bytes = home
+            .read_credential(std::ffi::OsStr::new("auth.json"))
+            .map_err(|e| {
+                errors::profile_identity_mismatch(
+                    "codex",
+                    &format!("could not read the provisioned auth file: {e}"),
+                )
+            })?;
+        codex_identity_from_bytes(&bytes)
+    }
 }
 
 fn toml_string(value: &str) -> String {
@@ -448,7 +484,15 @@ fn codex_resolve_identity(home: &Path) -> Result<super::ResolvedIdentity, Failur
             &format!("could not read the profile auth file: {e}"),
         )
     })?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|_| {
+    codex_identity_from_bytes(&bytes)
+}
+
+/// Parse a Codex `auth.json`'s account + method from its **bytes**, so the same check serves a by-path
+/// read (the review probe) and a handle-relative read (the setup confirmation, f-a5). `auth_mode ==
+/// "chatgpt"` is the subscription method; `tokens.account_id` is the account. Any missing/unrecognised
+/// shape **fails closed**.
+fn codex_identity_from_bytes(bytes: &[u8]) -> Result<super::ResolvedIdentity, Failure> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|_| {
         errors::profile_identity_mismatch("codex", "the profile auth file is not valid JSON")
     })?;
     let account = v

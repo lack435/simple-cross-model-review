@@ -234,6 +234,60 @@ impl Reviewer for ClaudeReviewer {
         let out = run_auth_status(bin, cfg, Some(home), cancel)?;
         claude_identity_from_status(&out, &home.join(".claude.json"))
     }
+
+    /// `claude auth login --claudeai` (subscription/browser OAuth), under the controlled environment
+    /// with `CLAUDE_CONFIG_DIR` pointed at the staging dir. Never `--console` (API billing).
+    fn login_command(&self, bin: &Path, home: &Path) -> Result<Command, Failure> {
+        let mut cmd = Command::new(bin);
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
+        cmd.arg("auth").arg("login").arg("--claudeai");
+        Ok(cmd)
+    }
+
+    /// Claude writes the account file `.claude.json` (read handle-relative for the fingerprint) and the
+    /// OAuth secret `.credentials.json`. The account file is first (f-a5).
+    fn credential_files(&self) -> &'static [&'static str] {
+        &[".claude.json", ".credentials.json"]
+    }
+
+    /// Confirm identity for setup: the **method** from an isolated `claude auth status` run from the
+    /// owned scratch cwd (f-r2.6), the **account** from a **handle-relative** read of `.claude.json`
+    /// through the held home (f-a5).
+    fn confirm_setup_identity(
+        &self,
+        bin: &Path,
+        _cfg: &Config,
+        home: &crate::profile::SecuredProfileDir,
+        scratch_cwd: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let mut cmd = Command::new(bin);
+        cmd.current_dir(scratch_cwd);
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home.path);
+        // Mandatory isolation for the setup probe (not conditional on cfg.isolate_reviewer).
+        cmd.arg("--safe-mode");
+        cmd.arg("--strict-mcp-config");
+        cmd.arg("auth").arg("status");
+        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
+            errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
+        })?;
+        let status = claude_trustworthy_status(&out)?;
+        let bytes = home
+            .read_credential(std::ffi::OsStr::new(".claude.json"))
+            .map_err(|e| {
+                errors::profile_identity_mismatch(
+                    "claude",
+                    &format!("could not read the provisioned account file: {e}"),
+                )
+            })?;
+        let account = claude_account_from_bytes(&bytes).ok_or_else(|| {
+            errors::profile_identity_mismatch(
+                "claude",
+                "the provisioned config file has no oauth account uuid",
+            )
+        })?;
+        claude_resolve_identity_acct(&status, account)
+    }
 }
 
 /// Validate a `claude auth status` outcome and resolve the profile's identity, or fail closed.
@@ -248,6 +302,14 @@ fn claude_identity_from_status(
     out: &RunOutcome,
     account_path: &Path,
 ) -> Result<super::ResolvedIdentity, Failure> {
+    let status = claude_trustworthy_status(out)?;
+    claude_resolve_identity(&status, account_path)
+}
+
+/// The trustworthy-output guards on a `claude auth status` run, returning the parsed, signed-in status
+/// document. Shared by the review-path probe and the setup confirmation so both refuse a cancelled,
+/// failed, timed-out, truncated, or not-signed-in run identically (f2).
+fn claude_trustworthy_status(out: &RunOutcome) -> Result<Value, Failure> {
     if out.cancelled {
         return Err(errors::cancelled());
     }
@@ -275,7 +337,7 @@ fn claude_identity_from_status(
             "the profile home is not signed in",
         ));
     }
-    claude_resolve_identity(&status, account_path)
+    Ok(status)
 }
 
 /// Run `claude auth status` for `home` (an authorized profile home, or `None` for ambient) under the
@@ -564,7 +626,13 @@ fn claude_config_path(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::Pa
 /// the gate fails open.
 fn claude_account_id(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    claude_account_from_bytes(&bytes)
+}
+
+/// Parse the `{org}/{account}` fingerprint from `.claude.json` **bytes**, so the same parse serves a
+/// by-path read (the review probe) and a handle-relative read (the setup confirmation, f-a5).
+fn claude_account_from_bytes(bytes: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
     let acct = v.get("oauthAccount")?;
     let uuid = acct.get("accountUuid").and_then(Value::as_str)?;
     let org = acct
@@ -592,6 +660,16 @@ fn claude_resolve_identity(
             "the profile config file has no oauth account uuid",
         )
     })?;
+    claude_resolve_identity_acct(auth_status, account)
+}
+
+/// The method-from-status + org-cross-check + build, given an already-resolved `account`. Factored so
+/// the setup confirmation can supply an account read **handle-relative** (f-a5) rather than by path,
+/// while the review path supplies one read from the config file.
+fn claude_resolve_identity_acct(
+    auth_status: &Value,
+    account: String,
+) -> Result<super::ResolvedIdentity, Failure> {
     let method = match (
         auth_status.get("authMethod").and_then(Value::as_str),
         auth_status.get("apiProvider").and_then(Value::as_str),
@@ -764,7 +842,7 @@ mod tests {
 
     #[test]
     fn claude_account_id_combines_org_and_account_uuid() {
-        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cr-claude-acctid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".claude.json");
         std::fs::write(
@@ -780,7 +858,7 @@ mod tests {
     #[test]
     fn claude_resolve_identity_checks_method_and_org() {
         use crate::reviewer::AuthMethod;
-        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cr-claude-resolveid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join(".claude.json");
         std::fs::write(

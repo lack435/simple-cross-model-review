@@ -216,11 +216,35 @@ pub(crate) fn resolve_home(
 #[allow(dead_code)] // constructed and held by the Phase 3 setup tool (#15).
 pub struct SecuredProfileDir {
     pub path: PathBuf,
-    /// The held directory handle. Kept for its lifetime effect (the hold); `#[allow(dead_code)]`
-    /// because the setup flow (#15) holds it implicitly by keeping the value alive rather than reading
-    /// the field. When #15 lands the handle-relative credential re-verify, it reads this.
-    #[allow(dead_code)]
+    /// The held directory handle. Kept both for its lifetime effect (the no-delete-share hold across
+    /// the vendor login) and as the `RootDirectory` for the handle-relative credential operations
+    /// below ([f20]/f-a5).
     handle: std::os::windows::io::OwnedHandle,
+}
+
+impl SecuredProfileDir {
+    /// Prove a credential file the vendor just wrote is a direct child of this held directory and lock
+    /// it to the current user, then verify ([f20], apply-then-verify — a fresh child does not inherit
+    /// the directory's non-inheritable DACL). Fails closed.
+    #[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+    pub fn secure_and_verify_credential(&self, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
+        crate::winsec::secure_and_verify_child_file(&self.handle, leaf)
+    }
+
+    /// Read a credential/account file **handle-relative** to this held directory (no by-path window),
+    /// so the account fingerprint used for authorization is bound to the object we hold (f-a5).
+    #[allow(dead_code)] // production caller lands with the setup confirmation probe (#15 part 3b).
+    pub fn read_credential(&self, leaf: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
+        crate::winsec::read_child_file(&self.handle, leaf)
+    }
+
+    /// Release the held directory handle **before** a rename into place: the handle omits
+    /// `FILE_SHARE_DELETE`, so a `staging → home` rename would fail while it is held (f-r3.4). Returns
+    /// the plain path; the caller renames it, then re-opens and re-holds the final home.
+    #[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
 }
 
 /// Provision a profile home directory securely and return it **held open**.

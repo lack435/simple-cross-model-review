@@ -538,6 +538,23 @@ pub fn secure_and_verify_child_file(parent: &OwnedHandle, leaf: &OsStr) -> io::R
     Ok(())
 }
 
+/// Read a credential/account file that is a **direct child of the held `parent` directory**,
+/// resolved handle-relative (`RootDirectory = parent`, `OBJ_DONT_REPARSE`).
+///
+/// The setup confirmation reads the account fingerprint through this, not by path, so a late reparse
+/// or replacement between the [f20] verify and the read cannot make the authorized account describe a
+/// different object than the home we hold (f-a5). Structural containment is the guarantee; the file's
+/// own DACL was already applied+verified by [`secure_and_verify_child_file`].
+#[allow(dead_code)] // production caller lands with the setup confirmation probe (#15 part 3b).
+pub fn read_child_file(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let handle = open_child_relative(parent, leaf, GENERIC_READ | READ_CONTROL, FILE_OPEN, false)?;
+    let mut f = std::fs::File::from(handle);
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Reject a path any of whose **existing original components** is a reparse point (junction/symlink),
 /// checked *before* canonicalization.
 ///
