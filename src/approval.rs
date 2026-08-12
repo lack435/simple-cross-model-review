@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 /// is also bounded by this, after which the connection is dropped ([f3]).
 const CONNECTION_BUDGET: Duration = Duration::from_secs(5);
 
+/// Absolute cap on writing a response. A client that never reads the response would otherwise block
+/// `write_all` (and the handler) once the send buffer fills; this bounds that ([f5]).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Cap on in-flight connection handlers. Loopback-only and short-lived, but bounded so a local flood
 /// cannot spawn unbounded threads; excess connections are closed immediately.
 const MAX_HANDLERS: usize = 32;
@@ -256,11 +260,17 @@ fn serve_loop(listener: TcpListener, ctx: Arc<ServerCtx>) {
 /// approval POST record the outcome atomically.
 fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
     stream.set_nonblocking(false).ok();
-    // A short per-read timeout keeps the read loop re-checking the absolute connection budget below,
-    // rather than blocking indefinitely on a half-open client.
-    stream
+    // Bound both directions, and **fail closed** if either bound cannot be set: without them a
+    // half-open or non-reading client could block a handler forever, exhausting `MAX_HANDLERS` and
+    // outliving `Drop` ([f5]). A short per-read timeout keeps the read loop re-checking the absolute
+    // connection budget below; the write timeout bounds a client that will not consume the response.
+    if stream
         .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok();
+        .is_err()
+        || stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+    {
+        return;
+    }
     let connection_deadline = Instant::now() + CONNECTION_BUDGET;
 
     let mut buf = Vec::with_capacity(1024);
@@ -311,6 +321,18 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
         );
         return;
     }
+    // Once the server is terminal (approved/cancelled/timed out) or past its deadline, no route serves
+    // the live approval page — a request that was accepted before the outcome and finished reading
+    // after it (or a re-used token) gets the invalid-link page, not a stale approval page ([f4]).
+    if is_terminal(&ctx.shared, ctx.deadline) {
+        respond(
+            &mut stream,
+            "409 Conflict",
+            "text/html; charset=utf-8",
+            EXPIRED_PAGE,
+        );
+        return;
+    }
     match (method, path) {
         ("GET", "/") => respond(&mut stream, "200 OK", "text/html; charset=utf-8", &ctx.page),
         ("POST", "/approve") => {
@@ -339,6 +361,18 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
             "Not found.\n",
         ),
     }
+}
+
+/// Whether the server has reached a terminal outcome or passed its deadline, so no live approval page
+/// should be served ([f4]).
+fn is_terminal(shared: &(Mutex<Shared>, Condvar), deadline: Instant) -> bool {
+    let (lock, _) = shared;
+    let terminal = lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .outcome
+        .is_some();
+    terminal || Instant::now() >= deadline
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -607,6 +641,56 @@ mod tests {
         assert_eq!(
             shared.0.lock().unwrap().outcome,
             Some(ApprovalOutcome::Cancelled)
+        );
+    }
+
+    #[test]
+    fn is_terminal_reflects_outcome_and_deadline() {
+        let shared = fresh_shared();
+        // Fresh, with a future deadline: not terminal.
+        assert!(!is_terminal(
+            &shared,
+            Instant::now() + Duration::from_secs(30)
+        ));
+        // A past deadline is terminal even with no recorded outcome.
+        assert!(is_terminal(
+            &shared,
+            Instant::now() - Duration::from_secs(1)
+        ));
+        // A recorded outcome is terminal even with a future deadline.
+        set_terminal(&shared, ApprovalOutcome::Approved, false);
+        assert!(is_terminal(
+            &shared,
+            Instant::now() + Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn a_request_that_finishes_after_a_terminal_outcome_gets_the_invalid_link_page() {
+        // [f4]: a connection accepted while live but whose request completes after the server goes
+        // terminal must NOT get the live approval page. Connect and hold the request back, let the
+        // handler accept and begin reading, then cancel, then send the request.
+        let server = ApprovalServer::start(&details(), Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+        let mut stream =
+            TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).expect("connect");
+        // Give the accept loop time to accept the connection and spawn its handler (which is now
+        // looping on per-read timeouts waiting for the request).
+        std::thread::sleep(Duration::from_millis(120));
+        server.cancel();
+        assert_eq!(server.wait(), ApprovalOutcome::Cancelled);
+        // Now send the request; the handler reads it and, seeing the terminal state, refuses.
+        stream
+            .write_all(format!("GET /?token={token} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .expect("write");
+        stream.flush().ok();
+        let mut resp = String::new();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        stream.read_to_string(&mut resp).ok();
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        assert!(
+            !resp.contains("Approve</button>"),
+            "must not serve the live page: {resp}"
         );
     }
 
