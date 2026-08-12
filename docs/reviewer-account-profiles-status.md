@@ -17,30 +17,46 @@ Resume point for the account-profiles feature. Read this, then
 | — | Phase 1/2 code-review fixes (f3–f6) | `d99e39d` | **approved** (`rv-24708-26`) |
 | — | identity section rewritten from verified CLI surfaces | `a7a06f1`, `a608447` | **approved** |
 | 3·#13 | pre-spawn identity + method probe | `dd69142` | (built; not separately gated yet) |
+| 3·#10 | `Config.launch_root` captured before `--cwd`, canonicalized (allowlist key) | `9d934f4` | **approved** (`rv-19320-6`) |
+| 3·#11 | allowlist store (`allowlist.rs`) + `winsec.rs` ACL FFI + authorization wiring | `9d934f4`, `e5d35de`, `b858568` | **approved** (`rv-19320-6`) |
 
 **Invariant that holds today:** ambient (no profile) is byte-for-byte unchanged; every *non-ambient*
-profile use is refused (`PROFILE_NOT_AUTHORIZED`) because `Config::profile_authorized` is deny-all.
-So all non-ambient code paths are wired + unit-tested but **dormant at runtime** until task #14.
+profile use is refused (`PROFILE_NOT_AUTHORIZED`). Since #11, that refusal is driven by the **real
+allowlist store** rather than a deny-all stub: `Config::profile_authorized` reads the account currently
+in the profile home (via the new `Reviewer::fingerprint_at` seam, a direct home-path read that does
+*not* recurse through `resolve_authorized_home`) and asks the store whether the full four-field tuple
+is on file. With no setup tool yet the store is always empty, so the check still denies every
+non-ambient profile — the invariant holds, now on live data. The `[f4]`/`[f5]` pre-spawn lock +
+switch guard remain **deferred to #14** (documented in `resolve_authorized_home`); the empty store
+means that race window authorizes nothing meanwhile.
+
+**New foundation landed with #11 — `src/winsec.rs`** (new module, gate-approved): Windows security-
+descriptor FFI in `winjob`'s style (no new crate; declares `advapi32`/`ntdll` directly). It builds one
+restrictive, inheritance-protected DACL (current user + SYSTEM + Administrators, deduped by SID for the
+LocalSystem case) and **applies + verifies it through a handle** (`SetSecurityInfo`/`GetSecurityInfo`);
+`create_secured_dir`, `write_secured_file`, `read_secured_file`, plus a **handle-relative
+`open_child_relative` (`NtCreateFile`, `RootDirectory` + `OBJ_DONT_REPARSE`)** so a store/credential
+file is proven a direct child of its verified parent — no by-path reopen TOCTOU (`[f15]`/`[f20]`/`[f22]`).
+**#12 should compose `secure_profile_dir` from these**, not start the ACL FFI from scratch — what #12
+still adds is reparse-reject on each *original* path component, containment under the profile root, and
+the create-across-vendor-child hold (`[f6]`/`[f15]`/`[f20]`).
 
 ## Remaining (Phase 3)
 
-Do roughly in this order — the store underpins authorization, which the probe's account check needs.
+Do roughly in this order.
 
-1. **#10 Launch root** — capture+canonicalize `std::env::current_dir()` in `main.rs` *before*
-   `Config::from_args`; store as `Config.launch_root`. Never key the allowlist on `Config::cwd`
-   (repo-settable via `--cwd`). Plan: impl `## Phase 3 → Allowlist store → [f7]`.
-2. **#11 Allowlist store** — ACL'd, cross-process-locked, atomic (temp+rename); entries
-   `(launch_root) → (canonical effective_home + reviewer_family + account_fingerprint)`. Plan: impl
-   `## Phase 3 → Allowlist store` (`[f19]` schema, `[f22]` store security).
-3. **#12 `secure_profile_dir`** — handle-based, no-follow, reparse-reject on original components,
-   containment under the profile root, DACL via `SetSecurityInfo` on the creation handle (new FFI in
-   `winjob`'s style — `winjob` is job objects, not ACLs). Plan: impl `## Phase 3 → Profile-dir
-   provisioning + ACL` (`[f6]`, `[f15]`, `[f20]`).
-4. **#14 Wire authorization + switch guard** — replace `profile_authorized` deny-all with the
-   allowlist check (full 4-field tuple, `launch_root` key). Change the probe's `expected` account in
-   both `auth_check`s from the home's own fingerprint to the **allowlist's authorized** account (see
-   gotcha below). Add the post-review start-vs-final fingerprint guard (`[f4]`). Validate the
-   codex-invocation controlled-env / evidence-server interaction (`smoke.ps1`).
+3. **#12 `secure_profile_dir`** — **build on `winsec.rs`** (which now provides the handle-based
+   create/apply/verify DACL and the handle-relative open). What remains: reparse-reject on each
+   *original* (pre-canonical) path component, containment under the profile root (not `cfg.cwd`), and
+   holding the dir handle across the vendor login child with a handle-relative re-open to prove
+   containment. Plan: impl `## Phase 3 → Profile-dir provisioning + ACL` (`[f6]`, `[f15]`, `[f20]`).
+4. **#14 Switch guard + probe expected-account + spawn atomicity** — the store *consultation* half of
+   #14 is **already done** (#11: `profile_authorized` now checks the full 4-field tuple, `launch_root`
+   key). What remains: (a) change the probe's `expected` account in both `auth_check`s from the home's
+   own fingerprint to the **allowlist's authorized** account (see gotcha below); (b) the post-review
+   start-vs-final fingerprint guard (`[f4]`); (c) the pre-spawn per-home lock + generation recheck so
+   authorize→probe→spawn is one critical section (`[f5]`); (d) validate the codex-invocation
+   controlled-env / evidence-server interaction (`smoke.ps1`).
 5. **#15 Setup MCP tool + localhost page** — ordered state machine (classify op → human approval →
    provision/stage → confirm → commit); three ops (authorize-only / first-provision / staged
    re-login); loopback one-time-token approval page; redaction; per-profile cross-process lock +
@@ -71,7 +87,10 @@ Do roughly in this order — the store underpins authorization, which the probe'
   reviewer at `main..HEAD` files with a symbol map (as done for `rv-24708-22`). Known gate flakiness
   this session: evidence-service timeouts, frozen findings ledger on resume, unstructured envelope —
   filed as issues #61/#62/#63; when a resumed finding freezes at a stale status, verify in-file then
-  use a `fresh: true` review.
+  use a `fresh: true` review. The #10/#11 gate (`rv-19320`) hit **all three** flakes across six
+  attempts — an evidence-service timeout, a 1800s reviewer timeout, and an unstructured envelope —
+  before converging to `approve` on `rv-19320-6`; budget extra collect attempts and expect to re-issue
+  `fresh: true` after a lost turn (the write-ahead marker makes the session non-resumable, by design).
 - **Before the PR:** run the full `.\build.ps1` (release + restage `dist\cross-review.exe`) — needs
   the agent MCP sessions unloaded (the running server locks `dist\`). Not done yet; everything it
   checks *except* the release/dist stage has been run green manually.
