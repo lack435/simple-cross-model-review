@@ -225,7 +225,17 @@ renames under **power loss**, each write-ahead journal update calls **`FlushFile
 journal file before the mutation it guards proceeds, so the intent reaches stable storage first and the
 recovery invariant holds across power loss, not only a process crash.
 
-**Recovery is presence-driven, over all eight states, with a fail-closed default (f-r2.1, f8).**
+**Recovery runs two phases: rejected-path first, then presence-driven H/O/S (f20).** A journalled
+`rejected_path` is a fourth tracked object, so recovery **first** reconciles it before the H/O/S table:
+if the journal names `rejected_path` and it is present with a **matching ownership marker**, the run
+reached quarantine — recovery completes any pending `.old→home` restore, then **retains the journal
+with the rejected dir recorded** (quarantined credentials are never auto-deleted; they await operator
+disposition, the journal being their durable ownership record). If `rejected_path` is named but absent
+(already resolved), recovery drops it from the journal and continues. Only once no unresolved
+journal-owned rejected path remains does the H/O/S phase run; the all-absent row below therefore clears
+the journal **only when `rejected_path` is also absent/resolved**.
+
+**The H/O/S phase is presence-driven over all eight states, with a fail-closed default (f-r2.1, f8).**
 `SetupSession::begin` replays under the lock, deciding from the **actual presence** of the three
 journalled nonce'd paths (`intent` is only an advisory hint; renames are atomic and the paths are
 nonce-unique, so presence determines state). `H`=home present, `O`=`.old-nonce` present,
@@ -235,7 +245,7 @@ and refuses**, surfacing an error rather than guessing:
 
 | H | O | S | interpretation | action |
 |---|---|---|---|---|
-| 0 | 0 | 0 | nothing created / fully rolled back (first-provision); **home lost with nothing to restore** (re-login) | first-provision: clear journal. re-login: **unexpected → retain journal, refuse** |
+| 0 | 0 | 0 | nothing created / fully rolled back (first-provision); **home lost with nothing to restore** (re-login) | first-provision: clear journal **iff `rejected_path` is also resolved** (f20), else retain for the rejected phase. re-login: **unexpected → retain journal, refuse** |
 | 0 | 0 | 1 | staging created, not swapped in | remove staging (ours); first-provision: clear journal; re-login: home lost → **retain journal, refuse** |
 | 0 | 1 | 0 | home moved to `.old`, staging gone before swap-in (failed cleanup) | **restore `.old→home`**, clear journal |
 | 0 | 1 | 1 | crashed between `home→.old` and `staging→home` | **restore `.old→home`**, remove staging, clear journal |
@@ -323,11 +333,20 @@ Factor the login step behind an injected callback so unit tests never run real O
   teardown for stale callbacks, and **document the WMI/service-escape residual honestly**; **f-r5.4
   (f19)** a `Local\` mutex is per-session but the callback port is per-machine → **`Global\` secured
   mutex** (or `%PROGRAMDATA%` secured lockfile).
-- **Ledger note:** across rv-20864-4..6 the entries f9/f12/f15 repeatedly froze at a stale `open`
+- **rv-20864-7** resolved f15/f16/f17/f19 and raised one: **f-r6.1 (f20)** the journalled
+  `rejected_path` was outside the H/O/S recovery machine → a **prioritized rejected-path recovery
+  phase** now runs first, and the all-absent row clears the journal only when the rejected path is also
+  resolved.
+- **Ledger note:** across rv-20864-4..7 the entries f9/f12/f18 repeatedly froze at a stale `open`
   (identical detail text, non-advancing turn — issue #62). Their live content was addressed: f9's
-  successor **f13 is resolved**; f12's parent-canonical key and f15's `FlushFileBuffers` are in the doc
-  with no live successor finding. The authoritative verdict is taken from the running fresh session as
-  the remaining live findings converge.
+  successor **f13 is resolved**; f12's parent-canonical key is in the doc with no live successor; **f18
+  is dispositioned as a documented residual** — a helper a third-party CLI spawns via WMI/service
+  control has a system service as its real parent and **cannot be contained by any job object**, so the
+  honest posture (breakaway denied, residual documented, probe-observed, stale-callback handled by
+  vendor OAuth `state` + machine-wide mutex + server teardown) is the correct engineering answer, not a
+  guarantee we could truthfully make (matching the repo's README posture on unconfined reviewer reads).
+  The authoritative verdict is taken from the running fresh session as the remaining live findings
+  converge.
 
 ## Files to modify
 
@@ -370,7 +389,8 @@ Factor the login step behind an injected callback so unit tests never run real O
   delete (f13); login **fails closed if the job does not quiesce** before staging cleanup (f14);
   first-provision uncommitted-home quarantine at `H=1,O=0,S=0` (f16); **partial-quarantine recovery**
   (crash mid-quarantine leaves a journaled, recoverable `rejected` dir) (f17); a `Global\` mutex
-  excludes a second session (f19).
+  excludes a second session (f19); **rejected-path recovery phase** — a lone `R=1` after quarantine is
+  reconciled before the H/O/S table and never stranded by the all-absent row (f20).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
