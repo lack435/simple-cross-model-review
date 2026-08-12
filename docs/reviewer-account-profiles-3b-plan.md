@@ -54,6 +54,16 @@ incorporates each. Summary of how:
 | f5 | primary login path unverified; job reaping | **No-token probe per vendor required before landing**; login runner **waits for natural exit and does not reap on success**; device-auth fallback given an **explicit flow interface**, not "localized". |
 | f6 | login config isolation not guaranteed | Login runs from a **freshly created, verified, owned, empty scratch dir** (never `neutral_dir`/`--state-dir`) + vendor config-isolation flags; **hostile-cwd-config test** added. |
 | f7 | approval-before-side-effects wording too broad | State explicitly that the lock+marker are **pre-approval bookkeeping that create/authorize nothing**; the [f18] invariant is no credential write and no allowlist write before approval. |
+| f8 | exclusive create is not a durable ownership record across crashes | The durable journal now covers **first-provision too**, not just re-login: the owned path is journalled **before** the exclusive create, and the marker/journal is **retained until cleanup actually succeeds**, so a crashed or failed-`remove_dir_all` first-provision is recovered on the next `begin`. |
+| f9 | shared review-lock protocol unspecified | Specify the shared-reader protocol on the **same lock path** as `SetupSession`'s exclusive lock via `LockFileEx` byte-range locks (shared vs exclusive), with reader-reader coexistence and reader-writer exclusion, and tests. |
+
+> **Ledger note (rv-20864-2, resumed):** the re-review marked f1 and f7 resolved and raised the new
+> f8/f9, but f2–f6 froze at a stale `open` with their turn-1 detail text (e.g. f4 still describing the
+> `login.lock` this revision replaced with a named mutex; f2 still saying the marker "has no swap
+> phase" after the journal was added) — the known frozen-findings-ledger flake (issue #62). f8 itself
+> confirms the reviewer read the revision ("the durable journal covers only staged re-login"). The
+> live remainder of those five is captured by f8/f9; an authoritative verdict is taken from a fresh
+> review carrying this whole ledger.
 
 ## Design
 
@@ -147,17 +157,31 @@ record-a-path API). **Ownership is proved by an atomic exclusive create, not a p
 
 ```rust
 struct OwnedProvision { secured: Option<SecuredProfileDir>, path: PathBuf, committed: bool }
-//   create_fresh(...)   first-provision: EXCLUSIVE create of the profile leaf; AlreadyExists → refuse
-//                       ("home already exists; use re-login"). No probe-then-create race.
-//   create_staging(...) re-login: exclusive create of a fresh nonce'd staging path we always own.
+//   create_fresh(...)   first-provision: journal {phase=provisioning, owned=path} FIRST, then
+//                       EXCLUSIVE create of the profile leaf; AlreadyExists → refuse ("home already
+//                       exists; use re-login"). No probe-then-create race.
+//   create_staging(...) re-login: journal the owned staging path, then exclusive create of a fresh
+//                       nonce'd staging path we always own.
 //   disarm(self)        success: keep the dir.
-// Drop: if !committed { self.secured = None; remove_dir_all(&path) }
+// Drop: if !committed { self.secured = None; if remove_dir_all(&path).is_ok() { clear journal entry }
+//                       else { RETAIN the journal so the next begin() retries cleanup } }
 //                       drop the no-delete-share handle BEFORE removal, else the hold blocks it.
 ```
 
+The **durable ownership record is the journal, not the in-memory guard (f8).** The owned path is
+written to the journal **before** the exclusive create, so a crash *after* creating the dir (before
+commit) leaves a durable record that this run owns it — the next `SetupSession::begin` recovers and
+removes it under the lock. The marker/journal is **retained until `remove_dir_all` actually
+succeeds**: a rollback whose delete fails (handle still held elsewhere, transient lock) keeps the
+record so a later `begin` retries, rather than clearing the marker and stranding a credential-bearing
+dir with no owner. This unifies first-provision and re-login under **one** journal+recovery mechanism
+(below); the in-memory `OwnedProvision` Drop is the fast path, the journal is the crash-durable
+backstop.
+
 Any early return between creation and the allowlist commit unwinds cleanly: `OwnedProvision` drops
-(removes only what this run exclusively created), `SetupSession` drops (clears marker after running any
-needed recovery, releases the per-home lock), nothing committed.
+(removes only what this run exclusively created, retaining the journal if the delete fails),
+`SetupSession` drops (clears the marker only after recovery/cleanup succeeds, releases the per-home
+lock), nothing committed.
 
 ### Identity binding ([f19]/[f4]/f3) — first-provision and re-login
 
@@ -203,18 +227,22 @@ happens before human approval**; the lock+marker exist to serialize the approval
 crash recovery. The plan states this exception explicitly rather than leaving "no side effects before
 approval" to imply the marker too.
 
-**Durable swap journal + recovery (f2).** The provisional marker is extended into a swap journal: when
-a re-login begins its swap it records `{ phase, home, old_path, staging_path, nonce }` (atomic write,
-the existing `atomic_write`). `SetupSession::begin` **no longer blindly clears** a found marker — under
-the lock it first **replays** any swap journal to a consistent state:
+**One durable journal for both operations + recovery (f2 + f8).** The provisional marker is extended
+into a journal that records `{ operation, phase, owned_path, home, old_path, staging_path, nonce }`
+(atomic write, the existing `atomic_write`), written **before** any dir is created.
+`SetupSession::begin` **no longer blindly clears** a found marker — under the lock it first **replays**
+the journal to a consistent state, then clears it (or **retains** it if a required cleanup delete
+fails, so the next `begin` retries):
 
-- `phase=swap-out` (or no rename done): remove an orphaned staging dir; home is intact.
-- `phase=swap-in` (home moved to `.old`, staging not yet in place): **restore** `rename(.old → home)`;
-  remove staging.
-- `phase=verify`/`commit` with `home` present and `.old` present: the new home is in place; remove the
-  leftover `.old`. (A `phase=commit` means the allowlist may or may not have been written; the store's
-  own atomic write is the source of truth — recovery never invents an authorization.)
-- once consistent, clear the journal/marker and proceed.
+- **first-provision** (f8) `phase=provisioning`: the run created `owned_path` but never committed —
+  `remove_dir_all(owned_path)`; retain the journal if the delete fails.
+- re-login `phase=swap-out` (or no rename done): remove an orphaned staging dir; home is intact.
+- re-login `phase=swap-in` (home moved to `.old`, staging not yet in place): **restore**
+  `rename(.old → home)`; remove staging.
+- re-login `phase=verify`/`commit` with `home` present and `.old` present: the new home is in place;
+  remove the leftover `.old`. (A `phase=commit` means the allowlist may or may not have been written;
+  the store's own atomic write is the source of truth — recovery never invents an authorization.)
+- once consistent **and** any needed delete succeeded, clear the journal/marker and proceed.
 
 Because recovery runs **under the per-home exclusive lock**, no other setup or the (shared-locked)
 review path can observe a half-swapped home. A pre-commit failure therefore always ends with the
@@ -222,11 +250,22 @@ review path can observe a half-swapped home. A pre-commit failure therefore alwa
 valid, locked home in place with the allowlist simply not updated (review path stays refused until
 re-run) — never a stranded-absent home and never a destroyed valid home.
 
-**[f5] shared review lock spans the whole attempt (f2).** Setup holds the per-home **exclusive** lock;
-the review path takes a **shared** read lock that must be **held across the entire `attempt()`** —
-authorize → identity probe → spawn → switch guard, i.e. the child's whole lifetime — not just a
-sub-step. Only then can the swap's `rename(home, …)` never race a live review that has the home open.
-Keyed on the effective home like [f23].
+**[f5] shared review lock spans the whole attempt (f2), with an explicit shared-reader protocol (f9).**
+Setup holds the per-home **exclusive** lock; the review path takes a **shared** read lock **held across
+the entire `attempt()`** — authorize → identity probe → spawn → switch guard, i.e. the child's whole
+lifetime — not just a sub-step. Only then can the swap's `rename(home, …)` never race a live review
+that has the home open.
+
+The existing `session::ExclusiveLock` opens the lock file with share-mode zero, which cannot express a
+shared reader, so a compatible primitive is required (f9). Specify it as **`LockFileEx` byte-range
+locks on the same per-home lock path** that `SetupSession` uses: setup takes an **exclusive**
+byte-range lock (`LOCKFILE_EXCLUSIVE_LOCK`), the review path a **shared** one (no exclusive flag), both
+on a handle opened with `FILE_SHARE_READ | FILE_SHARE_WRITE` so the file can be opened concurrently and
+the *lock* provides the exclusion. Contract, keyed on the effective home like [f23]: multiple review
+readers coexist; a held shared reader blocks a setup exclusive acquire (and vice-versa); the setup
+side keeps its current semantics. Refactor `ExclusiveLock` to this `LockFileEx`-based lock with
+`Shared`/`Exclusive` modes on one path. Tests: N concurrent shared acquires succeed; a held shared lock
+makes an exclusive acquire block/`WouldBlock`; a held exclusive blocks a shared acquire.
 
 ## Files to modify
 
@@ -241,7 +280,9 @@ Keyed on the effective home like [f23].
 - **`src/setup.rs`** — classification, `login` arg, `OwnedProvision`, first-provision + staged
   re-login flows, swap journal + recovery in `SetupSession::begin`, identity binding, injected-login
   seam, tests.
-- **the review path (`attempt()`)** — [f5] shared-read lock spanning the whole attempt.
+- **`src/session.rs`** — refactor `ExclusiveLock` to a `LockFileEx`-based lock with `Shared`/`Exclusive`
+  modes on one path (f9); recovery-aware `SetupSession::begin` journal replay (f2/f8).
+- **the review path (`attempt()`)** — [f5] **shared**-read lock spanning the whole attempt (f5/f9).
 - **`src/mcp.rs` / `src/tools.rs`** — add the `login` boolean to the setup tool schema + description
   (note that setup blocks minutes while the human OAuths).
 - **`docs/reviewer-account-profiles-status.md`** — mark 3b done; record the deferred real smoke, the
@@ -251,9 +292,11 @@ Keyed on the effective home like [f23].
 
 - `cargo test` — new unit tests: first-provision happy/failure/timeout/cancel; **exclusive-create
   collision is refused** (f1); non-subscription rejected; **identity-equality binding** (f3);
-  re-login happy; **swap journal recovery** for each phase (swap-out/swap-in/verify) on plain temp
-  dirs (f2); login-failure-leaves-home-intact; [f20] primitive (apply+verify child; widened-ACL
-  negative); named-mutex mutual exclusion (f4); **hostile-cwd-config** test (f6).
+  re-login happy; **journal recovery** for each phase — first-provision `provisioning`, re-login
+  swap-out/swap-in/verify — on plain temp dirs (f2/f8); **retain-journal-on-failed-cleanup** (f8);
+  login-failure-leaves-home-intact; [f20] primitive (apply+verify child; widened-ACL negative);
+  named-mutex mutual exclusion (f4); **shared/exclusive lock** protocol — N readers coexist, reader
+  blocks writer and vice-versa (f9); **hostile-cwd-config** test (f6).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** for each vendor, spawn the login
