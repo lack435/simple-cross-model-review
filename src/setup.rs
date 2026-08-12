@@ -4,13 +4,15 @@
 //! per-machine state that concurrent setups — in one server or across separate server processes —
 //! must not race on. So each setup runs inside a [`SetupSession`] holding an **OS-level, cross-process
 //! exclusive lock keyed by the effective home** ([`crate::session::ExclusiveLock`], released even if
-//! the process dies), and records a **provisional marker** of what it is doing and what it created.
-//! If a prior setup died mid-flight, the next one to take the lock finds that marker and **rolls back
-//! only the directories that run created** (never a pre-existing home) before proceeding — the
-//! ownership-scoped rollback the plan requires (`[f2]`/`[f23]`).
+//! the process dies), and records a small **provisional marker** that a setup is (or was) in progress.
+//! If a prior setup died mid-flight, the next one to take the lock finds and clears that marker.
 //!
-//! Authorize-only setup creates nothing, so its rollback is a no-op; the lock still serializes it. The
-//! marker's created-dir rollback is what protects the provisioning/re-login flows (later part of #15).
+//! **Scope note:** authorize-only setup creates nothing, so this session only needs the lock and the
+//! in-progress marker. The **ownership-scoped rollback of created directories** the plan requires
+//! (`[f2]`/`[f23]`) is deferred to the provisioning / re-login part of #15 and will be built together
+//! with the directory-creation mechanism it must be entangled with — recording ownership *before*
+//! creating, refusing a pre-existing directory, and retaining the marker until cleanup actually
+//! succeeds — rather than as a standalone record-a-path API that could be pointed at any directory.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,8 +41,7 @@ const SETUP_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// is treated as abandoned and reclaimed even if the lock discipline were somehow bypassed.
 const MARKER_TTL_SECS: u64 = 30 * 60;
 
-/// The in-setup marker beside the lock: who holds the setup, until when, and which directories this
-/// run created (so a crashed run can be rolled back by the next one to take the lock).
+/// The in-setup marker beside the lock: a small record that a setup is (or was) in progress.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProvisionalMarker {
     holder_pid: u32,
@@ -48,26 +49,20 @@ struct ProvisionalMarker {
     holder_nonce: String,
     /// Unix seconds after which this marker is considered abandoned (secondary to the lock).
     expiry_unix: u64,
-    /// Directories this run created, in creation order. Rolled back (removed) if the run does not
-    /// commit. Only ever directories the run itself made — never a pre-existing home ([f2]).
-    #[serde(default)]
-    created_dirs: Vec<String>,
 }
 
 /// A live setup: holds the per-home exclusive lock and owns the provisional marker for its lifetime.
-/// Dropping it without [`commit`](Self::commit) rolls back everything this run created and clears the
-/// marker; the lock releases with it.
+/// Dropping it without [`commit`](Self::commit) clears the marker; the lock releases with it.
 pub struct SetupSession {
     _lock: ExclusiveLock,
     marker_path: PathBuf,
     holder_nonce: String,
-    created_dirs: Vec<PathBuf>,
     committed: bool,
 }
 
 impl SetupSession {
-    /// Acquire the exclusive setup lock for `effective_home` under `base`, reclaim and roll back any
-    /// marker a crashed prior run left behind, and write a fresh provisional marker.
+    /// Acquire the exclusive setup lock for `effective_home` under `base`, clear any in-progress marker
+    /// a crashed prior run left behind, and write a fresh one.
     ///
     /// Fails with [`io::ErrorKind::WouldBlock`] if another live setup for the same home holds the lock.
     pub fn begin(base: &Path, effective_home: &Path) -> io::Result<Self> {
@@ -91,9 +86,8 @@ impl SetupSession {
         let lock = ExclusiveLock::acquire(&lock_path, wait)?;
 
         // We now hold the lock, so any marker present is from a prior run that died or exited without
-        // committing (a live run would still hold the lock we just took). Roll back what it created
-        // and clear it before starting ours.
-        reclaim_stale_marker(&marker_path);
+        // clearing it (a live run would still hold the lock we just took). Clear it before starting.
+        let _ = remove_if_present(&marker_path);
 
         let holder_nonce = crate::digest::random_hex_token(16)
             .ok_or_else(|| io::Error::other("could not generate a setup nonce"))?;
@@ -101,25 +95,14 @@ impl SetupSession {
             _lock: lock,
             marker_path,
             holder_nonce,
-            created_dirs: Vec::new(),
             committed: false,
         };
         session.write_marker()?;
         Ok(session)
     }
 
-    /// Record a directory this run created, so it is rolled back if the setup does not commit. Written
-    /// through to the marker immediately, so a crash right after creating the directory still lets the
-    /// next setup reclaim it. Used by the provisioning / re-login operations (a later part of #15);
-    /// authorize-only creates nothing, so it does not call this yet.
-    #[allow(dead_code)]
-    pub fn record_created_dir(&mut self, dir: PathBuf) -> io::Result<()> {
-        self.created_dirs.push(dir);
-        self.write_marker()
-    }
-
-    /// Commit the setup: the run succeeded, so its created directories are kept and the marker is
-    /// removed. After this, dropping the session rolls nothing back.
+    /// Commit the setup: the run succeeded, so the marker is removed. After this, dropping the session
+    /// does nothing.
     pub fn commit(mut self) -> io::Result<()> {
         remove_if_present(&self.marker_path)?;
         self.committed = true;
@@ -131,11 +114,6 @@ impl SetupSession {
             holder_pid: std::process::id(),
             holder_nonce: self.holder_nonce.clone(),
             expiry_unix: now_unix().saturating_add(MARKER_TTL_SECS),
-            created_dirs: self
-                .created_dirs
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
         };
         let json = serde_json::to_vec_pretty(&marker)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -148,14 +126,8 @@ impl Drop for SetupSession {
         if self.committed {
             return;
         }
-        // Uncommitted: roll back exactly what this run created (newest first, so a nested dir is
-        // removed before its parent), then clear the marker. Best-effort — a failure here cannot make
-        // things worse than the crash case the reclaim path already handles.
-        for dir in self.created_dirs.iter().rev() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // Uncommitted: clear the in-progress marker (best-effort). The lock releases as `_lock` drops.
         let _ = remove_if_present(&self.marker_path);
-        // The lock releases as `_lock` drops.
     }
 }
 
@@ -288,6 +260,13 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
         ));
     }
 
+    // A tool call cancelled between approval and the commit must not silently persist an
+    // authorization the caller has walked away from. Check right before the write (`store.authorize`
+    // is a single atomic rename, so the residual window is a hair's breadth) ([f1]).
+    if request.is_cancelled() {
+        return Err(errors::cancelled());
+    }
+
     // Commit the allowlist entry, then clear the setup marker.
     let store = crate::allowlist::AllowlistStore::at(&base);
     let entry = crate::allowlist::AllowEntry {
@@ -332,8 +311,22 @@ fn setup_failure(message: impl Into<String>) -> Failure {
     Failure::new("PROFILE_SETUP_FAILED", message.clone(), message)
 }
 
+/// A string-typed optional argument, distinguishing **absent** (`Ok(None)`) from **present but
+/// wrong-typed** (`Err`). A wrong-typed field must be a hard error, not silently treated as absent —
+/// otherwise e.g. a numeric `profile` beside a valid `home` would be accepted as a home-only request,
+/// contrary to the schema ([f6]).
+fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Failure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(errors::bad_request(format!(
+            "The \"{key}\" argument must be a string."
+        ))),
+    }
+}
+
 fn parse_reviewer(args: &Value) -> Result<ReviewerKind, Failure> {
-    match args.get("reviewer").and_then(Value::as_str) {
+    match string_arg(args, "reviewer")? {
         Some("codex") => Ok(ReviewerKind::Codex),
         Some("claude") => Ok(ReviewerKind::Claude),
         _ => Err(errors::bad_request(
@@ -343,8 +336,8 @@ fn parse_reviewer(args: &Value) -> Result<ReviewerKind, Failure> {
 }
 
 fn parse_selector(args: &Value, _reviewer: ReviewerKind) -> Result<ProfileSelector, Failure> {
-    let name = args.get("profile").and_then(Value::as_str);
-    let home = args.get("home").and_then(Value::as_str);
+    let name = string_arg(args, "profile")?;
+    let home = string_arg(args, "home")?;
     match (name, home) {
         (Some(_), Some(_)) => Err(errors::bad_request(
             "Pass either \"profile\" (a named profile) or \"home\" (an explicit config-home path), not \
@@ -357,9 +350,7 @@ fn parse_selector(args: &Value, _reviewer: ReviewerKind) -> Result<ProfileSelect
         (None, Some(home)) => {
             let path = PathBuf::from(home);
             if !path.is_absolute() {
-                return Err(errors::bad_request(
-                    "\"home\" must be an absolute path.",
-                ));
+                return Err(errors::bad_request("\"home\" must be an absolute path."));
             }
             Ok(ProfileSelector::ExplicitHome(path))
         }
@@ -369,45 +360,16 @@ fn parse_selector(args: &Value, _reviewer: ReviewerKind) -> Result<ProfileSelect
     }
 }
 
-/// Roll back and clear a marker left by a crashed prior run. Called while holding the lock, so the
-/// marker cannot belong to a live run. An unparseable marker is removed but cannot be rolled back
-/// (its created-dir list is unreadable); that is logged rather than silently ignored.
-fn reclaim_stale_marker(marker_path: &Path) {
-    let bytes = match std::fs::read(marker_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-        Err(e) => {
-            eprintln!(
-                "cross-review: warning: could not read a stale setup marker {}: {e}",
-                marker_path.display()
-            );
-            return;
-        }
-    };
-    match serde_json::from_slice::<ProvisionalMarker>(&bytes) {
-        Ok(marker) => {
-            for dir in marker.created_dirs.iter().rev() {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "cross-review: warning: a stale setup marker {} was unreadable ({e}); removing it, \
-                 but any directories it created could not be rolled back",
-                marker_path.display()
-            );
-        }
-    }
-    let _ = remove_if_present(marker_path);
-}
-
-/// A stable key for a home path, so the lock/marker file names are the same for the same home
-/// regardless of spelling (case/separators). Collision-resistant (SHA-256), truncated for a tidy name.
+/// A stable key for a home path, so the lock/marker file names are the same for the *same physical
+/// directory* regardless of spelling. The path is canonicalized first (resolving `.`/`..`, symlinks,
+/// and 8.3/short-name and case aliases via the OS), so equivalent spellings such as `C:\x\work` and
+/// `C:\x\.\work` map to one key and cannot run concurrent setups of one home ([f5]). When the path
+/// cannot be canonicalized (it does not exist yet), the normalized string is used as a best effort.
+/// Collision-resistant (SHA-256), truncated for a tidy file name.
 fn home_key(effective_home: &Path) -> String {
-    let normalized = effective_home
-        .to_string_lossy()
-        .to_lowercase()
-        .replace('/', "\\");
+    let resolved =
+        std::fs::canonicalize(effective_home).unwrap_or_else(|_| effective_home.to_path_buf());
+    let normalized = resolved.to_string_lossy().to_lowercase().replace('/', "\\");
     let normalized = normalized.trim_end_matches('\\');
     match crate::digest::Fingerprint::of(normalized.as_bytes()) {
         Some(fp) => fp.sha256[..24].to_string(),
@@ -527,67 +489,68 @@ mod tests {
         let _reacquired = SetupSession::begin(&base, &home).expect("reacquire after release");
     }
 
+    fn marker_path(base: &Path, home: &Path) -> PathBuf {
+        base.join("auth")
+            .join(format!("setup-{}.marker", home_key(home)))
+    }
+
     #[test]
-    fn dropping_without_commit_rolls_back_created_dirs() {
+    fn a_live_setup_has_a_marker_and_commit_or_drop_clears_it() {
         let base = temp_dir();
         let home = base.join("profiles").join("codex").join("work");
-        let created = base.join("staging-xyz");
-        std::fs::create_dir_all(&created).unwrap();
-        std::fs::write(created.join("file"), b"x").unwrap();
+        let marker = marker_path(&base, &home);
         {
-            let mut session = SetupSession::begin(&base, &home).expect("begin");
-            session.record_created_dir(created.clone()).expect("record");
-            // No commit: drop rolls the created dir back.
+            let session = SetupSession::begin(&base, &home).expect("begin");
+            assert!(
+                marker.exists(),
+                "a live setup records an in-progress marker"
+            );
+            session.commit().expect("commit");
         }
-        assert!(
-            !created.exists(),
-            "an uncommitted run's created dir is removed"
-        );
+        assert!(!marker.exists(), "commit clears the marker");
+        // A dropped (uncommitted) session also clears its marker.
+        {
+            let _session = SetupSession::begin(&base, &home).expect("begin");
+            assert!(marker.exists());
+        }
+        assert!(!marker.exists(), "drop clears the marker");
     }
 
     #[test]
-    fn commit_keeps_created_dirs_and_clears_the_marker() {
-        let base = temp_dir();
-        let home = base.join("profiles").join("claude").join("work");
-        let created = base.join("kept-dir");
-        std::fs::create_dir_all(&created).unwrap();
-        let mut session = SetupSession::begin(&base, &home).expect("begin");
-        session.record_created_dir(created.clone()).expect("record");
-        session.commit().expect("commit");
-        assert!(created.exists(), "a committed run keeps its created dir");
-        // The marker is gone, so the next setup finds nothing to reclaim.
-        let key = home_key(&home);
-        assert!(!base
-            .join("auth")
-            .join(format!("setup-{key}.marker"))
-            .exists());
-    }
-
-    #[test]
-    fn a_crashed_runs_marker_is_reclaimed_and_its_dirs_rolled_back() {
+    fn a_stale_marker_from_a_crashed_run_is_cleared_on_the_next_begin() {
         let base = temp_dir();
         let home = base.join("profiles").join("codex").join("work");
-        let orphan = base.join("orphan-staging");
-        std::fs::create_dir_all(&orphan).unwrap();
-        // Simulate a crashed run: write a marker recording `orphan` as created, but leak it (no
-        // SetupSession Drop cleanup — as if the process died). Then a new setup must reclaim it.
-        let key = home_key(&home);
-        let marker_path = base.join("auth").join(format!("setup-{key}.marker"));
-        // The auth dir must exist to place the marker; begin() creates it, so do a throwaway begin
-        // first, commit it (clears its own marker), then plant the orphan marker.
+        let marker = marker_path(&base, &home);
+        // Create the auth dir (via a throwaway committed session), then plant a stale marker as a
+        // crashed run would leave (no live lock holder).
         SetupSession::begin(&base, &home).unwrap().commit().unwrap();
-        let planted = serde_json::json!({
-            "holder_pid": 999999,
-            "holder_nonce": "deadbeef",
-            "expiry_unix": 0,
-            "created_dirs": [orphan.to_string_lossy()],
-        });
-        std::fs::write(&marker_path, serde_json::to_vec(&planted).unwrap()).unwrap();
-        assert!(orphan.exists());
-        // A fresh setup takes the lock, sees the stale marker, and rolls back the orphan dir.
-        let session = SetupSession::begin(&base, &home).expect("begin reclaims");
-        assert!(!orphan.exists(), "the crashed run's dir is rolled back");
-        assert!(marker_path.exists(), "the fresh run wrote its own marker");
+        std::fs::write(
+            &marker,
+            br#"{"holder_pid":999999,"holder_nonce":"x","expiry_unix":0}"#,
+        )
+        .unwrap();
+        // A fresh setup takes the lock and replaces the stale marker with its own.
+        let session = SetupSession::begin(&base, &home).expect("begin over stale marker");
+        assert!(marker.exists(), "the fresh run wrote its own marker");
         session.commit().unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_wrong_typed_optional_argument_is_rejected_not_ignored() {
+        use serde_json::json;
+        // [f6]: a numeric `profile` beside a valid `home` must be a hard error, not silently treated
+        // as a home-only request.
+        assert_eq!(
+            parse_selector(&json!({"profile": 5, "home": r"C:\x"}), ReviewerKind::Codex)
+                .unwrap_err()
+                .code,
+            "BAD_REQUEST"
+        );
+        // A non-string reviewer is likewise rejected rather than read as absent.
+        assert_eq!(
+            parse_reviewer(&json!({"reviewer": true})).unwrap_err().code,
+            "BAD_REQUEST"
+        );
     }
 }
