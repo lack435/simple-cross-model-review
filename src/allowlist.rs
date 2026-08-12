@@ -141,8 +141,16 @@ impl AllowlistStore {
     /// tool (#15) once a profile's identity is confirmed under the human gate; there is no review-path
     /// caller. Serialized across processes by the store lock, written atomically with the restrictive
     /// DACL. Returns whether a new entry was written (`false` if it already existed).
-    #[allow(dead_code)] // production caller lands with the setup tool (Phase 3 task #15).
-    pub fn authorize(&self, entry: AllowEntry) -> io::Result<bool> {
+    ///
+    /// `cancel`, when set, is honoured at the **atomic commit boundary** (immediately before the
+    /// rename that publishes the store), so a setup cancelled while this waits for the lock or performs
+    /// its ACL I/O aborts without persisting the entry — the residual window shrinks to the rename
+    /// itself, and the mutex is never held across I/O.
+    pub fn authorize(
+        &self,
+        entry: AllowEntry,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> io::Result<bool> {
         // Secure the directory first (create + ACL + verify), so the file we write and lock lives in a
         // directory only this user can write. `{base}` itself is created plain (it inherits the
         // user-scoped %LOCALAPPDATA% ACL); `{base}\auth` gets the protected DACL.
@@ -157,7 +165,7 @@ impl AllowlistStore {
             return Ok(false);
         }
         store.entries.push(entry);
-        self.write_locked(&store)?;
+        self.write_locked(&store, cancel)?;
         Ok(true)
     }
 
@@ -183,7 +191,11 @@ impl AllowlistStore {
         }
     }
 
-    fn write_locked(&self, store: &StoreFile) -> io::Result<()> {
+    fn write_locked(
+        &self,
+        store: &StoreFile,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(store)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tmp = self.dir.join(format!(
@@ -191,7 +203,7 @@ impl AllowlistStore {
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        crate::winsec::write_secured_file(&self.file(), &tmp, &json)
+        crate::winsec::write_secured_file(&self.file(), &tmp, &json, cancel)
     }
 }
 
@@ -226,7 +238,7 @@ mod tests {
         let dir = temp_dir();
         let store = AllowlistStore::at(&dir);
         let e = entry(r"C:\repo", r"C:\home\work", "codex", "acct-1");
-        assert!(store.authorize(e.clone()).expect("authorize"));
+        assert!(store.authorize(e.clone(), None).expect("authorize"));
         // The exact tuple is authorized.
         assert!(store.is_authorized(&e).expect("q1"));
         // A different account (re-login) is not.
@@ -259,12 +271,15 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let store = AllowlistStore::at(&dir);
         store
-            .authorize(entry(
-                &root.to_string_lossy(),
-                &home.to_string_lossy(),
-                "codex",
-                "acct-1",
-            ))
+            .authorize(
+                entry(
+                    &root.to_string_lossy(),
+                    &home.to_string_lossy(),
+                    "codex",
+                    "acct-1",
+                ),
+                None,
+            )
             .expect("authorize");
 
         // The same real directories spelled with forward slashes still match (they resolve to the
@@ -294,9 +309,9 @@ mod tests {
         let dir = temp_dir();
         let store = AllowlistStore::at(&dir);
         let e = entry(r"C:\repo", r"C:\home\work", "codex", "acct-1");
-        assert!(store.authorize(e.clone()).expect("first"));
+        assert!(store.authorize(e.clone(), None).expect("first"));
         // A second identical authorize writes nothing new.
-        assert!(!store.authorize(e).expect("second"));
+        assert!(!store.authorize(e, None).expect("second"));
     }
 
     #[test]
@@ -304,7 +319,7 @@ mod tests {
         let dir = temp_dir();
         let e = entry(r"C:\repo", r"C:\home\work", "claude", "org/acct");
         AllowlistStore::at(&dir)
-            .authorize(e.clone())
+            .authorize(e.clone(), None)
             .expect("write");
         // A fresh handle (as a later process would open) reads the persisted, secured store.
         assert!(AllowlistStore::at(&dir).is_authorized(&e).expect("read"));
@@ -321,7 +336,7 @@ mod tests {
         let dir = temp_dir();
         let store = AllowlistStore::at(&dir);
         store
-            .authorize(entry(r"C:\seed", r"C:\seedhome", "codex", "acct-0"))
+            .authorize(entry(r"C:\seed", r"C:\seedhome", "codex", "acct-0"), None)
             .expect("seed");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -347,7 +362,7 @@ mod tests {
                 &format!("acct-{i}"),
             );
             store
-                .authorize(e)
+                .authorize(e, None)
                 .expect("a concurrent reader must not block an authorization write");
         }
         stop.store(true, Ordering::Relaxed);
@@ -361,7 +376,7 @@ mod tests {
         // Seed a valid store so the secured directory and file exist, then corrupt the file in place
         // (preserving its DACL) so the failure is parse, not permissions.
         store
-            .authorize(entry(r"C:\repo", r"C:\home\work", "codex", "acct-1"))
+            .authorize(entry(r"C:\repo", r"C:\home\work", "codex", "acct-1"), None)
             .expect("seed");
         std::fs::write(store.file(), b"{ not json").expect("corrupt");
         let err = store

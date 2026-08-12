@@ -261,8 +261,10 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
     }
 
     // A tool call cancelled between approval and the commit must not silently persist an
-    // authorization the caller has walked away from. Check right before the write (`store.authorize`
-    // is a single atomic rename, so the residual window is a hair's breadth) ([f1]).
+    // authorization the caller has walked away from ([f1]). An early check avoids even waiting on the
+    // store lock for an already-cancelled call; the *authoritative* check is inside `authorize`, at the
+    // atomic rename boundary (passing the cancel flag), so a cancellation during the lock wait or the
+    // ACL I/O still aborts before anything is published.
     if request.is_cancelled() {
         return Err(errors::cancelled());
     }
@@ -276,8 +278,14 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
         account_fingerprint: confirmed.account.clone(),
     };
     let newly = store
-        .authorize(entry)
-        .map_err(|e| setup_failure(format!("Could not record the authorization: {e}")))?;
+        .authorize(entry, Some(request.cancel_flag()))
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::Interrupted {
+                errors::cancelled()
+            } else {
+                setup_failure(format!("Could not record the authorization: {e}"))
+            }
+        })?;
     session.commit().map_err(|e| {
         setup_failure(format!(
             "Authorized, but the setup marker could not be cleared: {e}"

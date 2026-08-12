@@ -871,8 +871,20 @@ pub fn create_secured_dir(path: &Path) -> io::Result<OwnedHandle> {
 /// The ACL travels with the file across the same-directory rename, so the destination keeps the
 /// restrictive DACL. `path` and `tmp` must be siblings in a directory that is already a secured
 /// directory ([`create_secured_dir`]); `tmp` is the sibling temp name.
-pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Result<()> {
+///
+/// `cancel`, when set, is checked immediately before each rename attempt — the atomic commit boundary
+/// — so a caller can abort *before* the temp file is published, discarding it, without any of the
+/// preceding I/O having taken effect. Cancellation returns [`io::ErrorKind::Interrupted`].
+pub fn write_secured_file(
+    path: &Path,
+    tmp: &Path,
+    contents: &[u8],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
 
     let (dir, _leaf) = split_parent_leaf(path)?;
     let tmp_leaf = tmp
@@ -912,6 +924,16 @@ pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resul
     // MoveFileExW(MOVEFILE_REPLACE_EXISTING) via std::fs::rename; retry a transient sharing loss.
     let mut last = None;
     for attempt in 0..10 {
+        // Cancellation is honoured at the atomic commit boundary: if it wins the race with the rename,
+        // nothing is published — discard the temp and report interrupted. Checked without holding any
+        // caller lock across the I/O below.
+        if cancelled() {
+            std::fs::remove_file(tmp).ok();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "write cancelled",
+            ));
+        }
         match std::fs::rename(tmp, path) {
             Ok(()) => {
                 drop(dir_handle);
@@ -1010,11 +1032,29 @@ mod tests {
         let _parent = create_secured_dir(dir.as_path()).expect("secure parent");
         let target = dir.join("store.json");
         let tmp = dir.join("store.json.tmp");
-        write_secured_file(&target, &tmp, b"hello").expect("write");
+        write_secured_file(&target, &tmp, b"hello", None).expect("write");
         let back = read_secured_file(&target).expect("read");
         assert_eq!(back, b"hello");
         // The tmp is consumed by the rename.
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_cancelled_secured_write_publishes_nothing() {
+        // The cancel flag is honoured at the atomic commit boundary: a pre-cancelled write does the
+        // preceding I/O but never renames the temp into place, so `path` is not created and the temp
+        // is discarded (f1).
+        use std::sync::atomic::AtomicBool;
+        let dir = temp_dir();
+        let _parent = create_secured_dir(dir.as_path()).expect("secure parent");
+        let target = dir.join("store.json");
+        let tmp = dir.join("store.json.tmp");
+        let cancelled = AtomicBool::new(true);
+        let err = write_secured_file(&target, &tmp, b"nope", Some(&cancelled))
+            .expect_err("a cancelled write must not publish");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(!target.exists(), "nothing was published");
+        assert!(!tmp.exists(), "the temp was discarded");
     }
 
     #[test]
@@ -1037,14 +1077,14 @@ mod tests {
         let _parent = create_secured_dir(dir.as_path()).expect("secure parent");
         let target = dir.join("store.json");
         let tmp = dir.join("store.json.tmp");
-        write_secured_file(&target, &tmp, b"v1").expect("write v1");
+        write_secured_file(&target, &tmp, b"v1", None).expect("write v1");
         let _reader = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&target)
             .expect("hold a shared-delete reader");
         let tmp2 = dir.join("store.json.tmp2");
-        write_secured_file(&target, &tmp2, b"v2")
+        write_secured_file(&target, &tmp2, b"v2", None)
             .expect("a rewrite must not be blocked by a shared-delete reader");
         assert_eq!(read_secured_file(&target).expect("read"), b"v2");
     }
