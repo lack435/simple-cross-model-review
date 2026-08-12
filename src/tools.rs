@@ -88,6 +88,33 @@ fn ensure_entry_ready(
     Ok(ready)
 }
 
+/// Build the account identity for `spec` as it resolves right now: the selector, the canonical
+/// effective home (`None` for ambient, or an unauthorized/unresolvable profile), and the
+/// profile-aware account fingerprint. Recorded on each turn and re-derived on resume, so a resume
+/// whose account or profile changed is refused. Reads only cheap local sources (a local account
+/// file); it does not spawn or auth-check.
+fn current_profile_identity(cfg: &Config, spec: &ReviewerSpec) -> session::ProfileIdentity {
+    use crate::profile::ProfileSelector;
+    let selector = match &spec.profile {
+        ProfileSelector::Ambient => session::ProfileSelectorId::Ambient,
+        ProfileSelector::Named(name) => session::ProfileSelectorId::Named(name.clone()),
+        ProfileSelector::ExplicitHome(path) => {
+            session::ProfileSelectorId::ExplicitHome(path.to_string_lossy().into_owned())
+        }
+    };
+    let effective_home = cfg
+        .resolve_authorized_home(spec)
+        .ok()
+        .flatten()
+        .map(|home| home.to_string_lossy().into_owned());
+    let account_fingerprint = reviewer::for_kind(spec.reviewer).account_fingerprint(cfg, spec);
+    session::ProfileIdentity {
+        selector,
+        effective_home,
+        account_fingerprint,
+    }
+}
+
 /// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
 /// so is never gated: the chain is not armed, the entry has no minimum, its binary cannot be
 /// resolved, or its account fingerprint cannot be read. Reads only cheap local sources — a
@@ -548,6 +575,26 @@ impl App {
                             Some(record),
                         ));
                     }
+                }
+                // Refuse a resume whose reviewer account or profile changed since the session was
+                // created, or whose account cannot be re-verified now. A legacy record (created
+                // before identity was tracked) has no captured account and is non-resumable. This is
+                // the uniform fail-closed contract -- a conversation must never continue under a
+                // different account than the one it started on.
+                let current_identity = current_profile_identity(&self.cfg, spec);
+                let identity_ok = record
+                    .profile_identity
+                    .as_ref()
+                    .is_some_and(|stored| stored.resume_matches(&current_identity));
+                if !identity_ok {
+                    return Err(resume_refusal(
+                        &session,
+                        "the reviewer account or profile it was created under changed, or its \
+                         account identity could not be re-verified; a conversation cannot be resumed \
+                         under a different account. Start a fresh review."
+                            .to_string(),
+                        Some(record),
+                    ));
                 }
                 // Identity confirmed: now auth-check and cache the validated binary.
                 let auth =
@@ -2569,6 +2616,9 @@ impl Job {
                                 &self.cfg,
                                 self.spec.reviewer,
                             ),
+                            // The account identity this turn ran under, so a resume that would cross
+                            // an account or profile is refused.
+                            profile_identity: Some(current_profile_identity(&self.cfg, &self.spec)),
                         },
                     ) {
                         Ok(_) => {
@@ -3275,6 +3325,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         }
     }
 

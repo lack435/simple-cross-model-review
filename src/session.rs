@@ -69,6 +69,55 @@ impl RawBin {
     }
 }
 
+/// The account-profile selector a session was created under, persisted so a resume cannot cross an
+/// account. The session-side mirror of `config::ProfileSelector` (kept here, like [`RawBin`], because
+/// `config` imports `session` and not the reverse); the conversion is done at the call site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileSelectorId {
+    Ambient,
+    Named(String),
+    ExplicitHome(String),
+}
+
+/// The account identity a session was created under.
+///
+/// Presence of this field distinguishes a **new** session (which always records `Some`, even for
+/// ambient) from a **legacy** record predating the field (`SessionRecord::profile_identity == None`),
+/// exactly as [`RawBin`] distinguishes a new PATH entry from a legacy one — a legacy record has no
+/// captured account and so is fail-closed non-resumable. The `selector`/`effective_home` pin *which*
+/// account home this ran under; `account_fingerprint` pins *which account* was in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIdentity {
+    pub selector: ProfileSelectorId,
+    /// The canonical resolved config home (a string path). `None` only for `Ambient`, which has no
+    /// profile home. Part of identity so the same `Named(name)` under a different base is a different
+    /// identity, not just a different account (f7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_home: Option<String>,
+    /// The account fingerprint captured at record time (Codex `tokens.account_id`, Claude
+    /// account/org uuid). `None` when it could not be read — which, by the uniform fail-closed
+    /// contract, makes the session non-resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
+}
+
+impl ProfileIdentity {
+    /// Whether a resume from `self` (stored) to `current` (freshly resolved/read) is allowed.
+    ///
+    /// The uniform fail-closed contract (f14): the selector and effective home must match, and a
+    /// captured account fingerprint must be **present on both sides and equal**. A missing fingerprint
+    /// on either side refuses — an unbindable session (none captured at record time) or a current
+    /// account that cannot be read now is not resumed under an assumed identity.
+    pub fn resume_matches(&self, current: &ProfileIdentity) -> bool {
+        self.selector == current.selector
+            && self.effective_home == current.effective_home
+            && matches!(
+                (&self.account_fingerprint, &current.account_fingerprint),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub reviewer: String,
@@ -171,6 +220,13 @@ pub struct SessionRecord {
     /// `docs/resume-cache-cwd-invalidation.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_cwd_mode: Option<String>,
+    /// The account identity this session was created under (selector, effective home, account
+    /// fingerprint). A resume whose freshly-resolved identity does not [`ProfileIdentity::resume_matches`]
+    /// the stored one is refused, so a session cannot resume under a different account or profile.
+    /// `None` on a record written before this field existed (legacy): fail-closed non-resumable, since
+    /// its account was never captured and cannot be verified. See `docs/reviewer-account-profiles.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<ProfileIdentity>,
 }
 
 /// The tri-state result of loading a session's findings ledger. A single record whose ledger is
@@ -264,6 +320,11 @@ pub struct TurnFacts<'a> {
     /// The working-directory mode the reviewer ran in this turn (`CWD_MODE_PROJECT` /
     /// `CWD_MODE_NEUTRAL`), stored so a later resume can detect a mode change it cannot survive.
     pub reviewer_cwd_mode: &'a str,
+    /// The account identity this turn ran under (selector, resolved home, account fingerprint),
+    /// recorded so a later resume can refuse an account/profile change. Always `Some` on the live
+    /// review path; `None` only leaves the record at the fail-closed legacy state (used by tests that
+    /// do not exercise profiles).
+    pub profile_identity: Option<ProfileIdentity>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -343,6 +404,7 @@ impl SessionStore {
             findings_ledger,
             terminal_reason,
             reviewer_cwd_mode,
+            profile_identity,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -370,6 +432,20 @@ impl SessionStore {
                 prior.and_then(|p| p.base_sha.clone()),
             ),
         };
+
+        // Profile identity: this turn's, but carry a prior turn's fingerprint forward when this turn
+        // could not read one -- a transient account-file read failure must not poison a session whose
+        // identity was already verified on the resume that reached here. `prior` is same-conversation
+        // only, so a fresh or rebound session keeps exactly this turn's identity: an unbindable new
+        // session (fingerprint `None`) stays non-resumable, per the uniform fail-closed contract.
+        let profile_identity = profile_identity.map(|mut this| {
+            if this.account_fingerprint.is_none() {
+                this.account_fingerprint = prior
+                    .and_then(|p| p.profile_identity.as_ref())
+                    .and_then(|pi| pi.account_fingerprint.clone());
+            }
+            this
+        });
 
         let record = match store.sessions.get(name) {
             // Same underlying session: another turn on it. The changelist binding is
@@ -409,6 +485,7 @@ impl SessionStore {
                 findings_ledger,
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
+                profile_identity: profile_identity.clone(),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -433,6 +510,7 @@ impl SessionStore {
                 findings_ledger,
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
+                profile_identity: profile_identity.clone(),
             },
         };
 
@@ -833,9 +911,122 @@ mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    profile_identity: None,
                 },
             )
             .expect("record turn")
+    }
+
+    fn ident(sel: ProfileSelectorId, home: Option<&str>, fp: Option<&str>) -> ProfileIdentity {
+        ProfileIdentity {
+            selector: sel,
+            effective_home: home.map(String::from),
+            account_fingerprint: fp.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resume_matches_requires_same_identity_and_a_matching_fingerprint() {
+        let amb = |fp| ident(ProfileSelectorId::Ambient, None, fp);
+        // Same account resumes.
+        assert!(amb(Some("acct-1")).resume_matches(&amb(Some("acct-1"))));
+        // A different account refuses.
+        assert!(!amb(Some("acct-1")).resume_matches(&amb(Some("acct-2"))));
+        // A missing fingerprint on either side refuses -- the uniform fail-closed contract.
+        assert!(!amb(None).resume_matches(&amb(Some("acct-1"))));
+        assert!(!amb(Some("acct-1")).resume_matches(&amb(None)));
+        assert!(!amb(None).resume_matches(&amb(None)));
+        // A different selector refuses even with a matching fingerprint.
+        let named = ident(
+            ProfileSelectorId::Named("work".into()),
+            Some(r"C:\h\work"),
+            Some("acct-1"),
+        );
+        assert!(!amb(Some("acct-1")).resume_matches(&named));
+        // Same named account but a different effective home refuses (f7): the same name under a
+        // different base is a different identity, not the same account in the same place.
+        let named_other_home = ident(
+            ProfileSelectorId::Named("work".into()),
+            Some(r"D:\h\work"),
+            Some("acct-1"),
+        );
+        assert!(!named.resume_matches(&named_other_home));
+    }
+
+    #[test]
+    fn profile_identity_round_trips_through_serde() {
+        for id in [
+            ident(ProfileSelectorId::Ambient, None, Some("a")),
+            ident(
+                ProfileSelectorId::Named("work".into()),
+                Some(r"C:\h\work"),
+                Some("a"),
+            ),
+            ident(
+                ProfileSelectorId::ExplicitHome(r"C:\x".into()),
+                Some(r"C:\x"),
+                None,
+            ),
+        ] {
+            let json = serde_json::to_string(&id).expect("serialize");
+            let back: ProfileIdentity = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(id, back);
+        }
+    }
+
+    fn ambient_facts(cli: &'static str, fp: Option<&'static str>) -> TurnFacts<'static> {
+        TurnFacts {
+            reviewer: "codex",
+            cli_session_id: cli,
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: r"C:\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: "project",
+            profile_identity: Some(ident(ProfileSelectorId::Ambient, None, fp)),
+        }
+    }
+
+    #[test]
+    fn a_transient_missing_fingerprint_carries_the_prior_forward() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        // Turn 1 captured the account.
+        store
+            .record_turn("s", ambient_facts("thread-1", Some("acct-1")))
+            .unwrap();
+        // Turn 2 on the same conversation could not read it -- the prior fingerprint is retained, so
+        // a transient account-file read failure does not poison an already-verified session.
+        let rec = store
+            .record_turn("s", ambient_facts("thread-1", None))
+            .unwrap();
+        assert_eq!(
+            rec.profile_identity.unwrap().account_fingerprint.as_deref(),
+            Some("acct-1")
+        );
+    }
+
+    #[test]
+    fn a_fresh_session_without_a_capturable_fingerprint_stays_unbound() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        // No prior turn to carry forward from: an unbindable new session records `None`, which the
+        // resume check treats as non-resumable (f14).
+        let rec = store
+            .record_turn("s", ambient_facts("thread-1", None))
+            .unwrap();
+        assert!(rec.profile_identity.unwrap().account_fingerprint.is_none());
     }
 
     #[test]
@@ -962,6 +1153,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -1009,6 +1201,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -1064,6 +1257,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         // The old conversation establishes a complete baseline.
         store
@@ -1104,6 +1298,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -1143,6 +1338,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,
@@ -1329,6 +1525,7 @@ mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    profile_identity: None,
                 },
             )
             .expect_err("record_turn must refuse a corrupt store");

@@ -44,6 +44,21 @@ impl ProfileSelector {
     pub fn is_ambient(&self) -> bool {
         matches!(self, ProfileSelector::Ambient)
     }
+
+    /// Whether this (config-side) selector is the same as a persisted [`crate::session::ProfileSelectorId`]
+    /// — used so a resume binds to the chain entry with the *same* profile, not merely the same
+    /// reviewer/model/effort. An explicit home is compared as a path (case/separator-insensitive).
+    pub fn matches_id(&self, id: &crate::session::ProfileSelectorId) -> bool {
+        use crate::session::ProfileSelectorId as Id;
+        match (self, id) {
+            (ProfileSelector::Ambient, Id::Ambient) => true,
+            (ProfileSelector::Named(a), Id::Named(b)) => a == b,
+            (ProfileSelector::ExplicitHome(a), Id::ExplicitHome(b)) => {
+                crate::pathcmp::identity_eq_str(&a.to_string_lossy(), b)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Validate a profile name: a strict safe name, so it cannot escape the profile root when joined.

@@ -1079,6 +1079,14 @@ impl Config {
             s.reviewer.as_str() == record.reviewer
                 && s.model == record.model
                 && s.effort == record.effort
+                // The profile is part of entry identity, so a resume binds to the entry with the
+                // *same* account, not merely the same reviewer/model/effort/bin. A legacy record has
+                // no stored selector, so it matches on the other fields (and is refused later by the
+                // fail-closed identity check); a new record's selector must match the entry's.
+                && match &record.profile_identity {
+                    Some(pi) => s.profile.matches_id(&pi.selector),
+                    None => true,
+                }
         };
         match &record.raw_bin {
             Some(raw) => self
@@ -2204,11 +2212,71 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         // Matches the fallback entry (index 1), not the primary.
         assert_eq!(cfg.resume_entry_index(&rec), Some(1));
         // A model the chain no longer has: no match.
         rec.model = "gpt-5.6-sol".into();
+        assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn resume_binds_to_the_entry_with_the_matching_profile() {
+        use crate::session::{ProfileIdentity, ProfileSelectorId, RawBin, SessionRecord};
+        // Two codex entries identical but for their profile.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "personal",
+        ]))
+        .expect("config");
+        let named = |name: &str| {
+            Some(ProfileIdentity {
+                selector: ProfileSelectorId::Named(name.into()),
+                effective_home: None,
+                account_fingerprint: None,
+            })
+        };
+        let mut rec = SessionRecord {
+            reviewer: "codex".into(),
+            cli_session_id: "t".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::PathSearch),
+            resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: None,
+            profile_identity: named("personal"),
+        };
+        // The selector is part of entry identity, so a record created under 'personal' binds to
+        // entry 1 and 'work' to entry 0 -- same reviewer/model/effort/bin never misbinds across
+        // profiles.
+        assert_eq!(cfg.resume_entry_index(&rec), Some(1));
+        rec.profile_identity = named("work");
+        assert_eq!(cfg.resume_entry_index(&rec), Some(0));
+        // A legacy record has no stored selector and matches on the other fields, but it is now
+        // ambiguous across the two same-identity entries, so the exact-one legacy rule refuses.
+        rec.raw_bin = None;
+        rec.profile_identity = None;
         assert_eq!(cfg.resume_entry_index(&rec), None);
     }
 
@@ -2251,6 +2319,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         assert_eq!(cfg.resume_entry_index(&rec), Some(0));
 
@@ -2304,6 +2373,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
         let ambiguous = Config::from_args(&args(&[
