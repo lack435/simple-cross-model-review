@@ -80,7 +80,22 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
      shared probe) → **human approval** (part 1) → re-confirm the account → commit `allowlist::authorize`,
      all under the lock and honouring tool-call cancellation **at the atomic rename boundary** (the store
      write threads a cancel flag). A home that does not exist yet is refused (vendor login is part 3b).
-   - **#15·part 3b — TODO (the last piece):** **first-provision** and **staged re-login**, which need
+   - **#15·part 3b — DESIGN APPROVED, not yet implemented.** A detailed design for the last piece lives
+     in [`reviewer-account-profiles-3b-plan.md`](reviewer-account-profiles-3b-plan.md) and was driven to
+     **APPROVE** through the `cross-review` gate (Codex, `rv-20864-16`, 0 open) over 16 passes / ~30
+     findings. Key decisions the plan locks in: **one unified staged-create-then-rename mechanism** for
+     both first-provision and re-login (create a nonce staging dir, login into it, [f20]
+     apply-then-verify + handle-relative account read, then a **no-replace** rename into place; recovery
+     runs *before* classification via a FlushFileBuffers'd write-ahead journal — schema carries
+     `old_file_id`, the full expected `AllowEntry`, and a `committed` phase — with an 8-state
+     presence-driven table + a prioritized rejected-path phase, and **never deletes a final home**);
+     login is a redacted, controlled-env, isolated runner in a **KILL_ON_JOB_CLOSE-retained,
+     no-breakaway** job with creation-time association + quiescence waits + a machine-wide `Global`
+     mutex + a **fail-closed probe gate** (tool-login disabled for any vendor whose login spawns an
+     out-of-job process). Two honest residuals: same-user post-verify tampering is outside the ACL-only
+     trust boundary (README), and full callback-lifecycle verification needs a synthetic-provider
+     harness or the deferred real smoke. Build against that doc.
+   - **#15·part 3b implementation — TODO (the last piece):** **first-provision** and **staged re-login**, which need
      **vendor-login orchestration** (drive `codex login` / `claude login`, non-TTY browser callback, closed
      child stdin, bounded timeout, cancellation, **redaction** of login stdout/stderr) — the riskiest,
      least-specified part. These use `secure_profile_dir` to create/stage the home and the deferred

@@ -1,7 +1,8 @@
 # Plan — #15 part 3b: vendor-login orchestration (first-provision + staged re-login)
 
-> **Status:** proposed, under cross-model review. Not yet implemented. This is the design that must
-> reach APPROVE through this repository's own `cross-review` gate before code is written.
+> **Status: APPROVED** by the `cross-review` gate (Codex reviewer, `rv-20864-16`, `verdict: approve`,
+> `converged: true`, 0 open findings) after 16 review passes and ~30 findings, all resolved. Not yet
+> implemented — this is the approved design to build against.
 
 ## Context
 
