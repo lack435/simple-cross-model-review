@@ -203,7 +203,14 @@ impl AllowlistStore {
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        crate::winsec::write_secured_file(&self.file(), &tmp, &json, cancel)
+        crate::winsec::write_secured_file(&self.file(), &tmp, &json, cancel)?;
+        // Durable publication (f-b2): flush the store file and its directory to stable storage before
+        // returning, so a setup that then removes `.old` cannot leave, after a power loss, the new home
+        // present with the store still on the old entry. `flush_dir` is best-effort; the file flush and
+        // the temp write's write-through carry the guarantee.
+        crate::winsec::flush_file(&self.file())?;
+        crate::winsec::flush_dir(&self.dir)?;
+        Ok(())
     }
 }
 
