@@ -437,15 +437,26 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
     let old = journal.old_path.clone().map(PathBuf::from);
     let rejected = journal.rejected_path.clone().map(PathBuf::from);
 
+    // Presence is read with `try_exists`, and **any non-NotFound error fails closed** (f12): a
+    // credential-bearing dir we cannot observe (an access or transient I/O error) must never be
+    // classified as absent, which would clear the journal and strand it.
+    let present = |p: &Path| -> io::Result<bool> { p.try_exists() };
+    let present_opt = |p: &Option<PathBuf>| -> io::Result<bool> {
+        match p {
+            Some(p) => p.try_exists(),
+            None => Ok(false),
+        }
+    };
+
     // Phase 0: a journal-owned rejected dir is handled first (f20). Complete any pending `.old → home`
     // restore, then keep the rejected dir (marker-tagged) and retain the journal for the human.
-    if let Some(rej) = rejected {
-        if rej.exists() {
-            if !owned_marker_matches(&rej, &journal.holder_nonce) {
+    if let Some(rej) = &rejected {
+        if present(rej)? {
+            if !owned_marker_matches(rej, &journal.holder_nonce) {
                 return Ok(Recovery::Retain); // not provably ours -> fail closed
             }
             if let Some(old) = &old {
-                if old.exists() && !home.exists() && !restore_old(old, &home, &journal)? {
+                if present(old)? && !present(&home)? && !restore_old(old, &home, &journal)? {
                     return Ok(Recovery::Retain);
                 }
             }
@@ -454,9 +465,9 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
         // named but absent: already resolved; fall through.
     }
 
-    let h = home.exists();
-    let o = old.as_ref().map(|p| p.exists()).unwrap_or(false);
-    let s = staging.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let h = present(&home)?;
+    let o = present_opt(&old)?;
+    let s = present_opt(&staging)?;
     let relogin = journal.operation == Operation::Relogin;
 
     let outcome = match (h, o, s) {
@@ -969,22 +980,28 @@ fn provision_after_approval(
         .map_err(|e| setup_failure(format!("Could not create the login scratch directory: {e}")))?;
     let _scratch_guard = DirGuard(scratch.clone());
 
-    // Exclusively create the nonce staging dir (the ownership proof) and mark it ours.
-    let staging = crate::profile::secure_staging_dir(selector, reviewer, Some(base), &nonce)
-        .map_err(|e| setup_failure(format!("Could not create the staging directory: {e}")))?;
-    write_owned_marker(&staging.path, &nonce)
-        .map_err(|e| setup_failure(format!("Could not mark the staging directory: {e}")))?;
-
-    // WAL: record the staging path before the login writes into it, then **arm** (f3): once a
-    // credential-bearing staging dir can exist, an uncommitted drop must leave the journal so recovery
-    // owns cleanup — even if the in-process `OwnedStaging` removal later fails. Recovery self-heals a
-    // failed login (removes the orphan staging) on the next `begin`.
+    // WAL **before** creating the staging dir (f13): the staging path is deterministic
+    // (`{home}.staging-{nonce}`), so record it — and **arm** (f3) — first. A crash between this record
+    // and the create leaves a journal that names the (possibly-created) staging path, so recovery can
+    // find and remove it; a crash after leaves the same. Once armed, an uncommitted drop keeps the
+    // journal so recovery owns cleanup even if the in-process `OwnedStaging` removal fails.
+    let planned_staging = sibling_with_suffix(home, &format!("staging-{nonce}"));
     let mut journal = session.blank_journal(home, op);
-    journal.staging_path = Some(staging.path.to_string_lossy().into_owned());
+    journal.staging_path = Some(planned_staging.to_string_lossy().into_owned());
     session
         .write_journal(&journal)
         .map_err(|e| setup_failure(format!("Could not write the setup journal: {e}")))?;
     session.arm();
+
+    // Exclusively create the nonce staging dir (the ownership proof) and mark it ours.
+    let staging = crate::profile::secure_staging_dir(selector, reviewer, Some(base), &nonce)
+        .map_err(|e| setup_failure(format!("Could not create the staging directory: {e}")))?;
+    debug_assert_eq!(
+        staging.path, planned_staging,
+        "the created staging path must match the journalled one"
+    );
+    write_owned_marker(&staging.path, &nonce)
+        .map_err(|e| setup_failure(format!("Could not mark the staging directory: {e}")))?;
 
     let mut owned = OwnedStaging::new(staging);
     let staging_home = owned.secured().path.clone();
@@ -1107,19 +1124,31 @@ fn provision_after_approval(
     let _ = session.write_journal(&journal);
 
     drop(final_home); // release the held handle so the .old cleanup / marker removal can proceed
-    if op == Operation::Relogin {
-        if let Some(old) = &journal.old_path {
-            // Delete `.old` only after proving it is the object we moved aside (f5); a mismatch leaves
-            // it for recovery rather than deleting by path.
-            let _ = verify_and_remove_old(Path::new(old), &journal);
+
+    // Delete `.old` only after proving it is the object we moved aside (f5); if it cannot be proven or
+    // removed, **leave the journal** (do not commit-clear) so recovery — now certified by the durable
+    // `committed` phase and the store entry — finishes the cleanup on the next `begin`. The
+    // authorization is already durable, so the profile is usable regardless.
+    let old_cleaned = match (op, &journal.old_path) {
+        (Operation::Relogin, Some(old)) => {
+            verify_and_remove_old(Path::new(old), &journal).unwrap_or(false)
         }
-    }
+        _ => true,
+    };
     let _ = std::fs::remove_file(home.join(OWNED_MARKER));
-    session.commit().map_err(|e| {
-        setup_failure(format!(
-            "Provisioned, but the setup marker could not be cleared: {e}"
-        ))
-    })?;
+    if old_cleaned {
+        session.commit().map_err(|e| {
+            setup_failure(format!(
+                "Provisioned, but the setup marker could not be cleared: {e}"
+            ))
+        })?;
+    } else {
+        eprintln!(
+            "cross-review: provisioned and authorized, but the previous home could not be cleaned up \
+             yet; it will be removed automatically on the next setup of this profile."
+        );
+        // Leave the (armed) journal: recovery removes the verified `.old` next time.
+    }
 
     Ok(format!(
         "Provisioned and authorized the {} profile {} (account {}) for reviews launched from {}.",
