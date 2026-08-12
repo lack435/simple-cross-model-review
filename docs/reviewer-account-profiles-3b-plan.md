@@ -84,12 +84,17 @@ pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> Lo
   (`winjob.rs:121-131`, whose own comment notes `std::process::Command` "cannot spawn suspended, so a
   child that spawns a grandchild before this call lands would leave that grandchild outside the job") —
   an uncontained window unacceptable for a login we must be able to abort cleanly. Login therefore uses
-  a **dedicated job without `KILL_ON_JOB_CLOSE`** and **creation-time association**: create the child
-  **suspended** (`CREATE_SUSPENDED`), `AssignProcessToJobObject` while suspended, **then resume**, so
-  every descendant is in the job from the first instruction. This needs process creation beyond
-  `std::process::Command` (`creation_flags(CREATE_SUSPENDED)` + resuming the primary thread, or a
+  a **dedicated job that keeps `KILL_ON_JOB_CLOSE`** (f-b1) and **creation-time association**: create
+  the child **suspended** (`CREATE_SUSPENDED`), `AssignProcessToJobObject` while suspended, **then
+  resume**, so every descendant is in the job from the first instruction. This needs process creation
+  beyond `std::process::Command` (`creation_flags(CREATE_SUSPENDED)` + resuming the primary thread, or a
   direct `CreateProcessW`), scoped to the login runner (the existing review runner keeps its
-  pre-existing post-spawn assignment; this plan does not weaken it).
+  pre-existing post-spawn assignment; this plan does not weaken it). **`KILL_ON_JOB_CLOSE` is retained,
+  not dropped (f-b1):** if the *setup process itself crashes* mid-login, the OS closes the job handle
+  and **reaps the still-running login child/helpers**, so a later recovery can never race a login that
+  is still writing staging. This does not harm the success path because success closes the job **only
+  after** the quiescence wait below (`ActiveProcesses == 0`) — there is nothing left in-job to kill —
+  and the browser is out-of-job, so it is unaffected either way.
 - **Browser ownership + process quiescence (f14).** The **browser is out-of-job and never gated on**:
   the vendor launches it via the shell (`ShellExecute`/`start`), handing the URL to a detached or
   already-running browser that is not our descendant, and the vendor **login process** (the callback
@@ -99,7 +104,9 @@ pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> Lo
   process's exit**, then, before [f20]-verify + rename, **waits (bounded) for in-job helper quiescence**
   (`QueryInformationJobObject` `ActiveProcesses == 0`; the browser is out-of-job so excluded) so no
   lingering helper is still writing the staging dir during verification or the rename; the rename also
-  retries on a transient sharing loss (as `write_secured_file` does). On **timeout/cancel** it calls
+  retries on a transient sharing loss (as `write_secured_file` does). On success the job is closed only
+  **after** this quiescence wait, so `KILL_ON_JOB_CLOSE` (retained, f-b1) has nothing left to kill. On
+  **timeout/cancel** it calls
   `TerminateJobObject`, **waits (bounded) for `ActiveProcesses == 0`** before cleaning up staging (so
   `remove_dir_all` never races a dying writer), and **invalidates the callback** — tearing the job down
   kills the callback server, so a late OAuth redirect hits a dead port and cannot complete after we have
@@ -235,10 +242,13 @@ locks/journals and race. Key instead on a **path-independent identity**:
 Tests cover a **missing parent** on fresh provisioning and 8.3/long/case/`.`/`..` aliases → one key.
 
 **One write-ahead journal for both operations, flushed to stable storage (f15).** The marker is
-extended into a journal `{ operation, home, staging_path, old_path, rejected_path, nonce, intent }`,
-written **before** each filesystem mutation (write-ahead) so the nonce-named paths are durable before
-any rename that could crash: before creating staging, before `rename(home → .old)`, before
-`rename(staging → home)`, **and before a quarantine `rename(home → rejected_path)` (f17)**. The
+extended into a journal `{ operation, home, staging_path, old_path, rejected_path, nonce, intent,
+old_file_id, expected_entry, phase }` — where `old_file_id` is `.old`'s `BY_HANDLE_FILE_INFORMATION`
+identity (f-a3), `expected_entry` is the complete `AllowEntry` this run will commit (f-b4), and `phase`
+advances to a durable `committed` after the store flush. It is written **before** each filesystem
+mutation (write-ahead) so the nonce-named paths are durable before any rename that could crash: before
+creating staging, before `rename(home → .old)`, before `rename(staging → home)`, **and before a
+quarantine `rename(home → rejected_path)` (f17)**. The
 quarantine is thus itself a journaled WAL step, not an untracked side effect: if recovery crashes after
 renaming `home → rejected-{nonce}` but before restoring `.old`, the journal still names
 `rejected_path`, so the next `begin` sees a present, journal-owned, marker-verified rejected dir and
@@ -298,14 +308,37 @@ to clear next `begin`; `home` (now store-authorized) is never removed. A pre-com
 the valid existing home restored (re-login) or an orphaned staging removed (first-provision), and
 **no** allowlist change.
 
-**Durable store publication before the irreversible `.old` delete (f-a2).** "Durably confirmed" must
-mean *on stable storage*, not just atomically renamed. The store writer today does an atomic temp-file
-rename with no flush (`allowlist.rs:194-206`, `winsec.rs:917-940`), so a power loss could leave the new
-home present, `.old` removed, and the store still publishing the **old** entry — an unrecoverable
-split. The setup commit therefore **`FlushFileBuffers` the store file and its parent directory** (and
-the journal) **before** removing `.old`; recovery treats only a flushed store entry as durably present.
-Fault tests simulate a power loss between the store rename and the flush, and between the flush and the
-`.old` delete.
+**A uniform stable-storage contract for every publication (f-a2, f-b2, f-b3).** "Durable" means *on
+stable storage*, not just atomically renamed. `atomic_write` and `write_secured_file`
+(`allowlist.rs:194-206`, `winsec.rs:917-940`) today do temp-write + rename with at most a `File::flush`
+(a userspace flush, not `FlushFileBuffers`). So **every** durable publication in the setup path
+follows the same rule: **`FlushFileBuffers` the file, then `FlushFileBuffers` the containing directory**
+(the directory flush makes the atomic *rename*/directory-entry itself durable — flushing only the file
+leaves the rename able to be lost, f-b3). This applies to:
+- **the credential files (f-b2):** after [f20] apply-and-verify, flush the vendor-written credential
+  file contents (Codex `auth.json`; Claude `.credentials.json` + `.claude.json`) **and the home
+  directory metadata** before commit — otherwise a power loss after the store flush + `.old` delete
+  could leave the newly-authorized home with missing or truncated credentials and no `.old` to fall
+  back to;
+- **the store:** flush the store file + its parent dir before the irreversible `.old` delete, so a
+  power loss cannot leave the new home present, `.old` removed, and the store still on the **old**
+  entry;
+- **the journal:** flush the journal file + its parent dir on every write-ahead update, so a lost
+  directory entry cannot strand `.old` or an untracked replacement.
+
+Commit order with durability: `[f20]-verify → flush credential files + home dir → handle-relative
+account read → journal authorizing (flushed) → AllowlistStore::authorize → flush store + parent →
+journal committed (flushed) → remove .old → clear journal`. If any required flush cannot be proven,
+**fail closed**. Fault tests simulate a power loss at each boundary (after credential flush, after
+store rename, after store flush, after `.old` delete).
+
+**Recovery can certify and attribute the commit (f-b4).** Recovery's "consult the store" must check for
+**this run's exact authorization**, not merely that *some* entry exists — otherwise a pre-existing
+entry for a different launch-root/account, or a store rename that happened before its flush, could be
+mistaken for a successful commit. So the journal records the **complete expected `AllowEntry`**
+(`launch_root`, `effective_home`, `reviewer_family`, `account_fingerprint`) and a durable **post-flush
+`committed` phase**. Recovery certifies the commit only when the **flushed** store contains that exact
+entry; otherwise it treats the authorization as not landed and takes the rollback path.
 
 **Object-identity proof for `.old`, not paths alone (f-a3).** `.old` holds the *pre-existing* home,
 which we did not create, so the ownership-nonce marker does not cover it; recovery must not restore or
@@ -390,6 +423,16 @@ Factor the login step behind an injected callback so unit tests never run real O
   out-of-job helper could write after verify → **probe-time fail-closed gate** (unsupported vendor if it
   spawns out-of-job) + trust-boundary scoping + broker as future work; **f-a5** identity probes read by
   path → read the account fingerprint **handle-relative** to the held home immediately before authorize.
+- **rv-20864-10..12 (fresh authoritative).** rv-10 resolved the `.old` object-identity and
+  handle-relative account-read findings (f9/f12/f18-successors); rv-11 flaked with an unstructured
+  envelope (issue #63); rv-12 confirmed the earlier resolutions and raised a final power-loss-durability
+  cluster, all folded in: **f-b1** dropping `KILL_ON_JOB_CLOSE` let a login child survive a
+  *setup-process crash* and race recovery → **retain `KILL_ON_JOB_CLOSE`** (safe because success closes
+  the job only after quiescence, and the browser is out-of-job); **f-b2** vendor credential contents
+  were never flushed → flush the credential files + home dir before commit; **f-b3** the journal rename
+  flushed the file but not its parent dir → flush file **and** parent for every publication; **f-b4**
+  recovery could not certify/attribute the commit → persist the full expected `AllowEntry` + a durable
+  post-flush `committed` phase and require the exact flushed entry.
 - **Ledger note:** across rv-20864-4..7 the entries f9/f12/f18 repeatedly froze at a stale `open`
   (identical detail text, non-advancing turn — issue #62). Their live content was addressed: f9's
   successor **f13 is resolved**; f12's parent-canonical key is in the doc with no live successor; **f18
@@ -405,9 +448,9 @@ Factor the login step behind an injected callback so unit tests never run real O
 
 - **`src/winsec.rs`** — `secure_and_verify_child_file` (f20); `create_new_secured_child_dir`
   (exclusive create, f1); named-mutex RAII primitive (f4); tests.
-- **`src/winjob.rs`** — a no-kill-on-close, **no-breakaway** job variant + **creation-time
-  association** (suspended create → assign → resume) + checked terminate + a **quiescence wait**
-  (`ActiveProcesses==0`) for login (f-r2.5/f-r3.3/f14/f18).
+- **`src/winjob.rs`** — a **no-breakaway** login job that **keeps `KILL_ON_JOB_CLOSE`** (f-b1) +
+  **creation-time association** (suspended create → assign → resume) + checked terminate + a
+  **quiescence wait** (`ActiveProcesses==0`) before close/cleanup for login (f-r2.5/f-r3.3/f14/f18/f-b1).
 - **`src/session.rs`** — refactor `ExclusiveLock` to `LockFileEx` `Shared`/`Exclusive` on one path
   (f9); recovery-aware `SetupSession::begin` (WAL journal replay, f2/f8/f-r2.1..4).
 - **`src/profile.rs`** — `SecuredProfileDir::secure_and_verify_credential`; staging-create path.
@@ -416,9 +459,11 @@ Factor the login step behind an injected callback so unit tests never run real O
 - **`src/reviewer/codex.rs` / `claude.rs`** — login command shapes; credential-file names; a
   setup-scoped, mandatorily-isolated confirmation probe (f-r2.6) that reads the account fingerprint
   **handle-relative** to the held home (f-a5).
-- **`src/allowlist.rs` / `src/winsec.rs`** — durable store publication (`FlushFileBuffers` on the store
-  file + parent) before the irreversible `.old` delete (f-a2); a handle-relative account-file read
-  helper (f-a5); capture/verify `BY_HANDLE_FILE_INFORMATION` for the swap (f-a3).
+- **`src/allowlist.rs` / `src/winsec.rs`** — a **uniform `FlushFileBuffers`(file)+`FlushFileBuffers`
+  (parent-dir) durability helper** used for the store, journal, and credential-file/home flushes
+  (f-a2/f-b2/f-b3); the store carries the full expected `AllowEntry` recovery certifies (f-b4); a
+  handle-relative account-file read helper (f-a5); capture/verify `BY_HANDLE_FILE_INFORMATION` for the
+  swap (f-a3).
 - **`src/setup.rs`** — `login` arg, recovery-before-classification, `OwnedStaging` (with ownership-nonce
   marker, f13), unified staged-create + rename-into-place for both operations, identity binding,
   `home_key` stable-parent keying (f12), `FlushFileBuffers` WAL (f15), injected-login seam, tests.
@@ -451,7 +496,11 @@ Factor the login step behind an injected callback so unit tests never run real O
   a missing parent** on fresh provisioning (f-a1); **power-loss between store-flush and `.old`-delete**
   leaves a recoverable state (f-a2); recovery **refuses on a `.old` reparse/file-id mismatch** (f-a3);
   the confirmation **account read is handle-relative** and a by-path reparse cannot shift the authorized
-  account (f-a5).
+  account (f-a5); a **login child is reaped on a setup-process crash** (`KILL_ON_JOB_CLOSE` retained)
+  and cannot race recovery (f-b1); **power-loss fault tests** at each flush boundary — after credential
+  flush, after store rename, after store flush, after `.old` delete — leave a recoverable state
+  (f-b2/f-b3); recovery **certifies the exact flushed `AllowEntry`** before removing `.old` or rolling
+  back (f-b4).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
