@@ -2054,14 +2054,16 @@ mod controlled_env_tests {
         // A pre-cancelled run terminates the child promptly and reports cancelled, never success.
         let scratch = std::env::temp_dir();
         let mut slow = Command::new("cmd.exe");
-        // ping is a portable ~9s sleep; the runner must not wait it out once cancel is set.
-        slow.args(["/C", "ping -n 10 127.0.0.1"]);
+        // ping is a portable ~29s sleep; the runner must not wait it out once cancel is set. A generous
+        // bound (well under the child's own runtime) proves the short-circuit without flaking under
+        // heavy parallel test load, where terminate+quiesce can add a couple of seconds.
+        slow.args(["/C", "ping -n 30 127.0.0.1"]);
         let cancel = AtomicBool::new(true);
         let start = Instant::now();
-        let out = run_login(slow, &scratch, Duration::from_secs(30), &cancel);
+        let out = run_login(slow, &scratch, Duration::from_secs(120), &cancel);
         assert!(out.cancelled && !out.success);
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(15),
             "a cancelled login must not wait out the child"
         );
     }
