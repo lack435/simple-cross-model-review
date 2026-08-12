@@ -112,10 +112,19 @@ pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> Lo
   is created **without** `JOB_OBJECT_LIMIT_BREAKAWAY_OK` / silent-breakaway, so a child cannot detach
   itself from the job via the standard mechanism; (2) a helper spawned **out-of-band** (via the WMI or
   service-control path, whose real parent is a system service, not our child) **cannot be contained by
-  any job** — this is an inherent Windows limitation, not something this design can close. Per the
-  project's "claim only what was verified" rule, the plan **documents this residual** rather than
-  claiming full containment, and the **no-token probe records whether either vendor spawns any
-  out-of-job process** during login (a smoke observation, not a guarantee). **Stale-callback safety**
+  any job** — this is an inherent Windows limitation, not something this design can close. Two things
+  make this a bounded, fail-closed posture rather than an open risk (f-a4): **(a) probe-time gate,
+  fail closed** — the no-token probe does not merely *record* out-of-job spawns; if it observes the
+  vendor spawning **any** out-of-job/breakaway process during login, tool-login for that vendor is
+  **not enabled** (setup refuses and directs the user to sign in manually), so the feature ships only
+  for vendors whose login the probe proves stays in-job, closing the "a helper writes staging after
+  [f20]-verify" window (f4) by construction rather than tolerating it; **(b) trust-boundary scope** — a
+  *same-user* process tampering with the credential home is outside the ACL-only boundary this project
+  documents (README "Credentials at rest": the ACL protects from *other users*, not same-user code; the
+  reviewer already runs same-user with unconfined reads), and a bare `codex login` has the identical
+  exposure. The robust closure (running login under a **separate restricted identity / AppContainer
+  broker** whose writes can be gated) is **future hardening, out of 3b scope**, not a regression this
+  plan introduces. **Stale-callback safety**
   across the reused fixed port rests on: the machine-wide login mutex (no two callback servers coexist)
   + job teardown on abort (the server dies, so a late redirect after cancellation hits a dead port) +
   the **vendor's own OAuth `state`/PKCE**, which rejects a redirect whose state does not match the
@@ -171,8 +180,19 @@ ordering (f11): **release the staging handle → `rename(staging→home)` → re
 and rename the staging dir is still protected by its restrictive DACL and by the per-home exclusive
 setup lock plus the global login mutex, so nothing else touches it. After the rename, re-run the probe
 against the held final `home` and require **exact equality** with the captured identity (not merely "is
-a subscription account"). The `AllowlistStore::authorize` commit records **exactly** that account, with
-the final handle held across the write, binding the recorded account to the verified object.
+a subscription account").
+
+**The account read must be structurally bound to the held home (f-a5).** The identity probes today read
+the account file **by path** — Codex `home/auth.json` (`codex.rs:444`), Claude `home/.claude.json`
+(`claude.rs:235`) — so a late reparse/replacement between [f20]-verify and the probe could make the
+authorized fingerprint describe a *different* object than the one we verified. The setup confirmation
+therefore reads the **account fingerprint handle-relative through the held `home` directory handle**
+(`open_child_relative` + no-reparse, the same primitive as [f20]) rather than by path, and does so
+**immediately before** `AllowlistStore::authorize`. So the account written into the allowlist is bound
+to the structurally-contained object we hold, with no by-path window. (Claude's `auth status` CLI call
+still runs for the *method*; the *account UUID* that becomes the fingerprint is read handle-relative
+from `.claude.json`.) The `AllowlistStore::authorize` commit records **exactly** that account, the
+final handle held across the write.
 
 ### Exclusive-create staging + ownership (f1, f-r2.2)
 
@@ -199,15 +219,20 @@ creates and authorizes nothing** — no credential home, no credential file, no 
 [f18] invariant is precisely that **no credential write and no allowlist write happens before human
 approval**; the lock+marker exist only to serialize approval and enable recovery.
 
-**Stable per-home key across the swap window (f12).** The lock, marker, and journal are keyed by
-`home_key`, which today canonicalizes the home path but **falls back to the raw spelling when the path
-does not exist** (`setup.rs:377-379`). During the `home → .old` window `home` is absent, so two
-equivalent spellings (8.3 short-name vs long, case) would key to **different** locks/journals and a
-second setup could bypass recovery and race the swap. Fix `home_key` to a **leaf-existence-independent
-identity**: canonicalize the **parent** (which persists across the swap — for `Named` it is the trusted
-`profiles/{reviewer}` descent, always present) and append the case-normalized leaf name, so all
-spellings map to one key whether or not the leaf currently exists. Alias tests (8.3 vs long, case,
-`.`/`..`) assert one key.
+**Stable per-home key, independent of any leaf that may not exist yet (f12, f-a1).** The lock, marker,
+and journal are keyed by `home_key`, which today canonicalizes the home path but **falls back to the
+raw spelling when the path does not exist** (`setup.rs:377-379`). During the `home → .old` window
+`home` is absent, and on a **fresh first-provision even `profiles/{reviewer}` does not exist yet** (it
+is created later, `profile.rs:272`), so canonicalizing the parent is *also* insufficient (f-a1) — two
+equivalent spellings (8.3 vs long, case, explicit-home aliases) would still key to different
+locks/journals and race. Key instead on a **path-independent identity**:
+- **`Named`:** `canonical(base) + reviewer + validated-name`. The base is created and canonicalized
+  **before** any lock is taken; `reviewer` and the validated name are exact strings. The key never
+  depends on whether `profiles/{reviewer}/{name}` exists.
+- **`ExplicitHome`:** canonicalize the **longest existing ancestor** and append the normalized
+  remaining components, so all spellings of the same target collapse to one key whether or not the leaf
+  exists.
+Tests cover a **missing parent** on fresh provisioning and 8.3/long/case/`.`/`..` aliases → one key.
 
 **One write-ahead journal for both operations, flushed to stable storage (f15).** The marker is
 extended into a journal `{ operation, home, staging_path, old_path, rejected_path, nonce, intent }`,
@@ -266,11 +291,30 @@ mismatched** (a late helper or another process replaced `home`), recovery **reta
 refuses** (fail closed), quarantining nothing it cannot prove it owns. It **never deletes a
 store-authorized home** and **never removes `.old` until the new store entry is durably confirmed**
 (f9) — at `H,O,¬S`, `.old` still holds the store-authorized credentials. Commit order:
-`release staging handle → rename(staging→home) → reopen+hold home → journal authorizing →
-AllowlistStore::authorize (atomic; the authorization source of truth) → clear journal`. A crash after
-the store publishes but before the journal clears leaves only the journal to clear next `begin`;
-`home` (now store-authorized) is never removed. A pre-commit failure ends with the valid existing home
-restored (re-login) or an orphaned staging removed (first-provision), and **no** allowlist change.
+`release staging handle → rename(staging→home) → reopen+hold home → handle-relative account read →
+journal authorizing → AllowlistStore::authorize → flush store to stable storage → remove .old →
+clear journal`. A crash after the store publishes but before the journal clears leaves only the journal
+to clear next `begin`; `home` (now store-authorized) is never removed. A pre-commit failure ends with
+the valid existing home restored (re-login) or an orphaned staging removed (first-provision), and
+**no** allowlist change.
+
+**Durable store publication before the irreversible `.old` delete (f-a2).** "Durably confirmed" must
+mean *on stable storage*, not just atomically renamed. The store writer today does an atomic temp-file
+rename with no flush (`allowlist.rs:194-206`, `winsec.rs:917-940`), so a power loss could leave the new
+home present, `.old` removed, and the store still publishing the **old** entry — an unrecoverable
+split. The setup commit therefore **`FlushFileBuffers` the store file and its parent directory** (and
+the journal) **before** removing `.old`; recovery treats only a flushed store entry as durably present.
+Fault tests simulate a power loss between the store rename and the flush, and between the flush and the
+`.old` delete.
+
+**Object-identity proof for `.old`, not paths alone (f-a3).** `.old` holds the *pre-existing* home,
+which we did not create, so the ownership-nonce marker does not cover it; recovery must not restore or
+delete it **by path** alone (a post-crash reparse or replacement at that path could be installed as
+`home` or destroyed). Before `rename(home → .old)`, capture the directory's
+`BY_HANDLE_FILE_INFORMATION` (volume serial + file index) into the journal; at recovery, open `.old`
+(and the swap target) **no-reparse** and **verify the file-id matches** before any restore/delete — a
+reparse point or a mismatched id → **retain journal, refuse** (fail closed). The same guard covers the
+`restore .old → home` step.
 
 **Retain-until-clean (f8).** If a required cleanup `remove_dir_all` fails (a lingering handle, a
 transient lock), the journal is **retained** so the next `begin` retries, rather than clearing the
@@ -337,6 +381,15 @@ Factor the login step behind an injected callback so unit tests never run real O
   `rejected_path` was outside the H/O/S recovery machine → a **prioritized rejected-path recovery
   phase** now runs first, and the all-absent row clears the journal only when the rejected path is also
   resolved.
+- **rv-20864-9 (fresh authoritative)** confirmed the resumed ledger's resolutions and, un-frozen,
+  surfaced five deeper last-mile findings, all folded in: **f-a1** parent-canonical key still unstable
+  on a fresh first-provision (parent not yet created) → key `Named` on `base+reviewer+name`, `Explicit`
+  on the longest existing ancestor; **f-a2** "durably confirmed" store had no flush → `FlushFileBuffers`
+  the store + parent before removing `.old`; **f-a3** `.old` restored/deleted by path → capture its
+  `BY_HANDLE_FILE_INFORMATION` id, verify no-reparse + id before restore/delete; **f-a4** an observed
+  out-of-job helper could write after verify → **probe-time fail-closed gate** (unsupported vendor if it
+  spawns out-of-job) + trust-boundary scoping + broker as future work; **f-a5** identity probes read by
+  path → read the account fingerprint **handle-relative** to the held home immediately before authorize.
 - **Ledger note:** across rv-20864-4..7 the entries f9/f12/f18 repeatedly froze at a stale `open`
   (identical detail text, non-advancing turn — issue #62). Their live content was addressed: f9's
   successor **f13 is resolved**; f12's parent-canonical key is in the doc with no live successor; **f18
@@ -361,7 +414,11 @@ Factor the login step behind an injected callback so unit tests never run real O
 - **`src/reviewer/mod.rs`** — `LoginOutcome` + `run_login` (contained, isolated, controlled-env,
   closed stdin); per-reviewer login command builder.
 - **`src/reviewer/codex.rs` / `claude.rs`** — login command shapes; credential-file names; a
-  setup-scoped, mandatorily-isolated confirmation probe (f-r2.6).
+  setup-scoped, mandatorily-isolated confirmation probe (f-r2.6) that reads the account fingerprint
+  **handle-relative** to the held home (f-a5).
+- **`src/allowlist.rs` / `src/winsec.rs`** — durable store publication (`FlushFileBuffers` on the store
+  file + parent) before the irreversible `.old` delete (f-a2); a handle-relative account-file read
+  helper (f-a5); capture/verify `BY_HANDLE_FILE_INFORMATION` for the swap (f-a3).
 - **`src/setup.rs`** — `login` arg, recovery-before-classification, `OwnedStaging` (with ownership-nonce
   marker, f13), unified staged-create + rename-into-place for both operations, identity binding,
   `home_key` stable-parent keying (f12), `FlushFileBuffers` WAL (f15), injected-login seam, tests.
@@ -390,7 +447,11 @@ Factor the login step behind an injected callback so unit tests never run real O
   first-provision uncommitted-home quarantine at `H=1,O=0,S=0` (f16); **partial-quarantine recovery**
   (crash mid-quarantine leaves a journaled, recoverable `rejected` dir) (f17); a `Global\` mutex
   excludes a second session (f19); **rejected-path recovery phase** — a lone `R=1` after quarantine is
-  reconciled before the H/O/S table and never stranded by the all-absent row (f20).
+  reconciled before the H/O/S table and never stranded by the all-absent row (f20); **key stability with
+  a missing parent** on fresh provisioning (f-a1); **power-loss between store-flush and `.old`-delete**
+  leaves a recoverable state (f-a2); recovery **refuses on a `.old` reparse/file-id mismatch** (f-a3);
+  the confirmation **account read is handle-relative** and a by-path reparse cannot shift the authorized
+  account (f-a5).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
