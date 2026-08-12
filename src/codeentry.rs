@@ -232,7 +232,11 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
             }
         }
         if let Some(end) = header_end {
-            if buf.len() >= end + content_length {
+            // Stop **immediately** if the declared body cannot fit the request cap (including an absurd
+            // usize::MAX length): waiting for a body that the handler will reject anyway would tie the
+            // handler up for the whole connection budget (f5). Otherwise wait for the exact body;
+            // `saturating_add` keeps the comparison overflow-free.
+            if content_length > MAX_REQUEST || buf.len() >= end.saturating_add(content_length) {
                 break;
             }
         }
@@ -282,20 +286,23 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
     match (method, path) {
         ("GET", "/") => respond(&mut stream, "200 OK", "text/html; charset=utf-8", &ctx.page),
         ("POST", "/submit") => {
-            // Framing checks (f4): the body must be declared (non-zero Content-Length), within the
-            // request cap, and **fully received** (exactly Content-Length bytes) — a missing, oversized,
-            // or incomplete body is a bad request, never a partial parse.
+            // Framing checks (f4/f5): the body must be declared (non-zero Content-Length), fit the
+            // request cap, and be **fully received** (exactly Content-Length bytes). `checked_add`
+            // makes an absurd length (usize::MAX) fail closed rather than overflow the range arithmetic.
             let hend = header_end.unwrap_or(buf.len());
-            if content_length == 0 || hend + content_length > MAX_REQUEST {
-                respond(
-                    &mut stream,
-                    "400 Bad Request",
-                    "text/plain; charset=utf-8",
-                    "Bad request.\n",
-                );
-                return;
-            }
-            if buf.len() < hend + content_length {
+            let end = match hend.checked_add(content_length) {
+                Some(e) if content_length != 0 && e <= MAX_REQUEST => e,
+                _ => {
+                    respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain; charset=utf-8",
+                        "Bad request.\n",
+                    );
+                    return;
+                }
+            };
+            if buf.len() < end {
                 respond(
                     &mut stream,
                     "400 Bad Request",
@@ -305,7 +312,7 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
                 return;
             }
             // Parse **exactly** the declared body, not any extra buffered bytes.
-            let body = &buf[hend..hend + content_length];
+            let body = &buf[hend..end];
             match form_field(body, "code") {
                 // Empty code: refuse without recording.
                 Some(code) if code.is_empty() => {
@@ -583,7 +590,17 @@ mod tests {
             ),
         );
         assert!(overlong.starts_with("HTTP/1.1 400"), "{overlong}");
-        // Nothing was recorded by either.
+
+        // An absurd Content-Length must fail closed, never overflow/panic the handler (f5).
+        let huge = raw(
+            port,
+            &format!(
+                "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: \
+                 18446744073709551615\r\n\r\ncode=x"
+            ),
+        );
+        assert!(huge.starts_with("HTTP/1.1 400"), "{huge}");
+        // Nothing was recorded by any of them.
         assert!(server.poll().is_none());
     }
 
