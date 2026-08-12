@@ -12,314 +12,269 @@ vendor's own login**, and **re-logging an existing home**.
 
 Today [`src/setup.rs`](../src/setup.rs) `run_setup` implements only **authorize-only** setup — it
 authorizes a repo to use a home that *already exists and is signed in*, and hard-refuses a
-non-existent home (`src/setup.rs:160`). So the feature is unusable for anyone who hasn't already
-manually pointed a vendor CLI at a profile dir. This task adds the two missing operations from the
-[f2] design in [`reviewer-account-profiles-impl.md`](reviewer-account-profiles-impl.md):
-**first-provision** (create home → vendor login → confirm account → authorize) and **re-login
-existing** (staged replacement into a fresh dir, then swap in). It activates the whole non-ambient
-path for new users.
+non-existent home (`src/setup.rs:160`). This task adds **first-provision** (create home → vendor login
+→ confirm account → authorize) and **re-login existing** (staged replacement), activating the whole
+non-ambient path for new users.
 
 Scope decisions (confirmed with the maintainer): implement **all of 3b in one gated chunk**;
 **defer the real-OAuth, token-spending `smoke.ps1`** and land with unit tests over a mocked login
-child — but a **no-token login-behaviour probe per vendor is required before landing** (see f5
-resolution below), which spends no tokens and completes no sign-in.
+child — but a **no-token login-behaviour probe per vendor is required before landing** (spends no
+tokens, completes no sign-in).
 
-Two correctness findings, verified against the code during planning, drive the design:
+### The unifying design decision
 
-- **[f20] must apply-then-verify, not verify-only.** The dir DACL's ACEs are non-inheritable
-  (`build_dacl` → `AddAccessAllowedAce` with ace_flags 0, `winsec.rs:687-694`; `apply_restrictive_dacl`
-  sets `PROTECTED_DACL_SECURITY_INFORMATION`, `winsec.rs:712`). A credential file the vendor writes
-  inside the home does *not* inherit that DACL, so `verify_restrictive_dacl` alone
-  (`winsec.rs:729`, requires `SE_DACL_PROTECTED` + an exact ACE set) would **fail closed on every
-  legitimate login**. We must **apply** the restrictive DACL to the credential file (handle-relative)
-  and *then* verify — locking it down and proving structural containment. This is a deliberate,
-  documented refinement of the literal [f20] wording ("re-read its DACL").
-- **Non-TTY vendor login is the highest-risk assumption.** Bare `codex login` /
-  `claude auth login --claudeai` self-host a localhost OAuth callback and auto-open the default
-  browser; nothing reads stdin or needs a TTY *in principle*, and this process already auto-opens a
-  browser via `ShellExecuteW` (`approval::open_in_browser`). Its headless viability is de-risked by a
-  no-token probe before landing (f5), with the full real-OAuth end-to-end deferred.
+Both operations use **one mechanism**: always create a **nonce-named staging directory**, drive the
+vendor login into *that*, verify + confirm identity while holding its handle, and only then **rename it
+into place**. The final `home` is *only ever produced by an atomic rename from a staging dir this run
+exclusively created* — it is never created, written, or (in recovery) deleted directly. This collapses
+the ownership-ambiguity and rename-window hazards the reviewer found (see review rounds below) into a
+single invariant:
 
-## Review-response log (rv-20864-1, Codex reviewer)
-
-The first plan review returned request-changes with 7 findings. All were accepted; the design below
-incorporates each. Summary of how:
-
-| # | Finding | Resolution |
-|---|---|---|
-| f1 | refuse-if-exists is a TOCTOU, not ownership proof | First-provision uses an **atomic exclusive create** (`FILE_CREATE`) as the ownership record — a collision is refused, never "adopted then rolled back". |
-| f2 | staged swap not crash-safe/reversible | Add a **durable swap journal** in the marker + **recovery on `SetupSession::begin`** (replayed under the lock) + phase-aware restore; the [f5] shared review lock is held across the **whole** attempt. |
-| f3 | final identity not bound to the confirmed one | Retain the expected `ResolvedIdentity`; require **exact equality** (account+method) on the post-swap re-probe; hold the final dir handle through the allowlist commit; authorize exactly the confirmed account. |
-| f4 | login lock only base-scoped | Replace with a **machine/session-wide named mutex** held for the whole login+callback lifetime. |
-| f5 | primary login path unverified; job reaping | **No-token probe per vendor required before landing**; login runner **waits for natural exit and does not reap on success**; device-auth fallback given an **explicit flow interface**, not "localized". |
-| f6 | login config isolation not guaranteed | Login runs from a **freshly created, verified, owned, empty scratch dir** (never `neutral_dir`/`--state-dir`) + vendor config-isolation flags; **hostile-cwd-config test** added. |
-| f7 | approval-before-side-effects wording too broad | State explicitly that the lock+marker are **pre-approval bookkeeping that create/authorize nothing**; the [f18] invariant is no credential write and no allowlist write before approval. |
-| f8 | exclusive create is not a durable ownership record across crashes | The durable journal now covers **first-provision too**, not just re-login: the owned path is journalled **before** the exclusive create, and the marker/journal is **retained until cleanup actually succeeds**, so a crashed or failed-`remove_dir_all` first-provision is recovered on the next `begin`. |
-| f9 | shared review-lock protocol unspecified | Specify the shared-reader protocol on the **same lock path** as `SetupSession`'s exclusive lock via `LockFileEx` byte-range locks (shared vs exclusive), with reader-reader coexistence and reader-writer exclusion, and tests. |
-
-> **Ledger note (rv-20864-2, resumed):** the re-review marked f1 and f7 resolved and raised the new
-> f8/f9, but f2–f6 froze at a stale `open` with their turn-1 detail text (e.g. f4 still describing the
-> `login.lock` this revision replaced with a named mutex; f2 still saying the marker "has no swap
-> phase" after the journal was added) — the known frozen-findings-ledger flake (issue #62). f8 itself
-> confirms the reviewer read the revision ("the durable journal covers only staged re-login"). The
-> live remainder of those five is captured by f8/f9; an authoritative verdict is taken from a fresh
-> review carrying this whole ledger.
+> **Recovery only ever deletes a nonce-named `staging`/`.old` directory named in the durable journal.
+> A final `home` is never deleted by this feature.**
 
 ## Design
 
-### Operation classification ([f2])
+### Operation classification ([f2]) — after recovery, not before (f-r2.4)
 
 Add an optional boolean tool arg (`login`, default false) so a side-effectful vendor login is
-**opt-in**. Classification in `run_setup`:
+**opt-in**. **`run_setup` runs recovery first, then classifies:** resolve the effective home →
+`SetupSession::begin` (acquire the per-home exclusive lock, **replay the journal to a consistent
+state**, write a fresh marker) → *then* branch on `home.is_dir()`:
 
-| home | `login` | operation |
+| home (post-recovery) | `login` | operation |
 |---|---|---|
 | absent | `true` | **first-provision** |
 | absent | unset/false | today's "sign it in first, or pass login:true" refusal |
 | present | `true` | **re-login existing** (staged replacement) |
 | present | unset/false | **authorize-only** (unchanged, already built) |
 
-The chosen operation is shown on the existing approval page so the human sees which of the three they
-are authorizing (and, for re-login, that a working home will be replaced). Approval still precedes any
-credential or allowlist side effect ([f18]; see the bookkeeping exception under Crash-safety).
+Classifying *before* recovery would let an interrupted swap (home absent, `.old` present) be misread
+as first-provision and skip repair — so recovery is inside `begin`, ahead of the `is_dir` check.
+The chosen operation is shown on the approval page. Approval precedes any credential/allowlist side
+effect ([f18]; the lock+marker are the bookkeeping exception, below).
 
-### Redacted login runner (`src/reviewer/mod.rs`)
+### Redacted, contained, isolated login runner (`src/reviewer/mod.rs`)
 
 ```rust
 pub struct LoginOutcome { pub success: bool, pub timed_out: bool, pub cancelled: bool, pub exit: Option<i32> }
 pub fn run_login(command: Command, timeout: Duration, cancel: &AtomicBool) -> LoginOutcome
 ```
 
-**Redaction is enforced at the type level**: `LoginOutcome` has no text field, and `run_login` drops
-the child's stdout/stderr without returning or `eprintln!`-ing them (tokens/URLs may appear there).
-Only exit code / timed-out / cancelled drive control flow. Login failures produce a **generic**
-`setup_failure`, never `out.diagnostics()`. Per-reviewer command builder keyed on `ReviewerKind`:
-Codex `codex login`; Claude `claude auth login --claudeai`. Never the api-key/access-token stdin flags.
+- **Redaction (type-level).** `LoginOutcome` has no text field; `run_login` drops the child's
+  stdout/stderr without returning or `eprintln!`-ing them (tokens/URLs may appear there). Only exit /
+  timed-out / cancelled drive control flow. Login failures produce a **generic** `setup_failure`,
+  never `out.diagnostics()`. Per-reviewer command: Codex `codex login`; Claude
+  `claude auth login --claudeai`. Never the api-key/access-token stdin flags.
+- **Controlled environment (f-r2.7).** The login child gets `apply_controlled_env`
+  (`env_clear` + `CONTROLLED_ENV_ALLOWLIST` + the home var → staging path, `reviewer/mod.rs:308`) as a
+  **required, tested invariant** — dropping inherited `BROWSER`, proxy, provider-auth
+  (`ANTHROPIC_*`/`OPENAI_*`/`CODEX_*`) and any vendor-specific variable that could redirect the OAuth
+  flow or expose its URL. A hostile-environment test sets rogue `BROWSER`/provider-auth vars and
+  asserts they are cleared. (Residual: corporate `HTTP(S)_PROXY` is dropped too, exactly as the
+  already-working review path drops it; flagged for smoke validation.)
+- **Config isolation from cwd (f-r2.6).** The child runs from a **freshly created, restrictive-DACL,
+  verified, empty scratch directory this run owns** — **never** `neutral_dir(cfg)`, which resolves to
+  the repo-settable `--state-dir` (`reviewer/mod.rs:257-262`). Vendor login-subcommand isolation flags
+  are passed where supported. **This isolation is mandatory for every setup-path vendor CLI call**,
+  including the post-login confirmation probe (below), not just the login child.
+- **Process containment (f-r2.5).** Merely omitting `job.terminate()` is insufficient: the existing
+  `JobObject` sets `KILL_ON_JOB_CLOSE`, so its `Drop`→`CloseHandle` kills survivors even after a clean
+  exit (`winjob.rs:143-151`). Login therefore uses a **dedicated job created WITHOUT
+  `KILL_ON_JOB_CLOSE`**: `run_login` **waits for the vendor process's natural exit** (the vendor *is*
+  the callback server), and on **success closes the job without terminating** (browser/helpers
+  survive); on **timeout/cancel** it calls `TerminateJobObject` explicitly. If the job cannot be
+  created or the child assigned, login **fails closed** (refuse — we will not run a login we cannot
+  contain on abort). Needs a small `winjob` no-kill-on-close variant. Child stdin is **closed**.
+- **Machine-wide serialization (f4).** The vendor CLIs bind a **fixed localhost callback port**
+  (Codex ~1455), so concurrent logins collide regardless of home or `CROSS_REVIEW_HOME`. Serialize
+  with a **Windows named mutex** (`CreateMutexW`, session-scoped `Local\` name), held for the entire
+  login+callback lifetime. A base-scoped lockfile is insufficient. Small named-mutex RAII primitive
+  (FFI, no new crate). Login timeout ~3 min, separate from the 5-min `APPROVAL_TIMEOUT`.
 
-**Process lifetime (f5).** The vendor process *is* the localhost callback server; it stays alive until
-the OAuth redirect completes, then exits after writing the credential. So `run_login` **waits for the
-vendor process's natural exit** (bounded by the login timeout) and, on success, **does not** call
-`job.terminate()` — the existing review runner reaps the whole job tree after the direct child exits
-(`reviewer/mod.rs:1176`), which could kill a login helper or the just-opened browser. Job termination
-is used **only** on timeout or cancellation, to guarantee no orphaned child survives an abort. Child
-gets stdin **closed** (empty payload → immediate EOF via the existing stdin thread).
+### Confirmation probe, mandatorily isolated (f-r2.6)
 
-**Config isolation (f6).** The login child runs from a **freshly created, restrictive-DACL, verified,
-empty scratch directory that this run owns** — **not** `neutral_dir(cfg)`, which resolves to the
-repo-settable `--state-dir` (`reviewer/mod.rs:257-262`) and could carry a hostile `config`/hooks that
-an auth command loads from cwd. In addition, pass the vendor config-isolation flags the *login*
-subcommand accepts (to be verified per-CLI during impl: Codex `-c`/`--ignore-user-config`-style;
-Claude `--safe-mode`/`--strict-mcp-config`), falling back to the clean-cwd guarantee when a flag is
-unsupported. A **hostile-cwd-config test** plants a malicious config in a scratch cwd and asserts the
-login command builder never runs from it.
+After login, identity is confirmed by `resolve_home_identity`. Codex's probe is a pure `auth.json`
+read (no CLI, no cwd) and is safe. **Claude's probe spawns `claude auth status` from
+`neutral_dir(cfg)` with `--safe-mode` only conditional** (`claude.rs:294-301`) — a hostile
+`--state-dir` config could influence the confirmation *before* authorization. The setup flow therefore
+runs the confirmation probe through a **setup-scoped path that forces the owned scratch cwd and
+mandatory isolation flags**, tested against a planted hostile config.
 
-**Machine-wide login serialization (f4).** The vendor CLIs bind a **fixed localhost callback port**
-(Codex ~1455), so two concurrent logins collide regardless of profile home *or* `CROSS_REVIEW_HOME`.
-Serialize with a **Windows named mutex** (`CreateMutexW`, session-scoped `Local\` name — the callback
-port is per-user-session), acquired before spawning login and **held for the entire login+callback
-lifetime**. A base-scoped lockfile is insufficient because different bases would not share it. Add a
-small named-mutex RAII primitive (FFI in the `winjob`/`winsec` style — no new crate). Login gets its
-own timeout constant (~3 min), separate from the 5-min `APPROVAL_TIMEOUT`.
+### [f20] credential re-verify — apply-then-verify (`src/winsec.rs`, `src/profile.rs`)
 
-### [f20] credential re-verify (`src/winsec.rs`, `src/profile.rs`)
-
-New `pub` primitive wrapping the existing private `open_child_relative` (`winsec.rs:444`):
+The dir DACL's ACEs are non-inheritable (`build_dacl`→`AddAccessAllowedAce` ace_flags 0,
+`winsec.rs:687-694`; `apply_restrictive_dacl` sets `PROTECTED_DACL_SECURITY_INFORMATION`), so a
+vendor-written credential file does *not* inherit the restrictive DACL and a **verify-only** check
+would fail closed on every legitimate login. So we **apply then verify** — a deliberate refinement of
+the impl-doc's "re-read its DACL". New `pub` primitive over the private `open_child_relative`
+(`winsec.rs:444`):
 
 ```rust
 /// Open a direct file child of `parent` handle-relative (RootDirectory + OBJ_DONT_REPARSE,
 /// no share-delete), lock it to the restrictive DACL, then verify it.
 pub fn secure_and_verify_child_file(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<()>
+// SecuredProfileDir::secure_and_verify_credential(&self, leaf) reads its held `handle` (profile.rs:223)
 ```
 
-Method on `SecuredProfileDir` (reads its currently-`dead_code` private `handle`, `profile.rs:223`):
+Re-verified per reviewer after a bounded poll-for-arrival: Codex `auth.json`; Claude
+`.credentials.json` **and** `.claude.json`. Fail closed (→ rollback) on missing file, containment
+failure, or DACL error. Structural containment (handle-relative, no reparse) proves the file is a
+direct child of the held staging dir. Nested trees (Codex `sessions/`) are covered by the dir DACL for
+traversal — recursion is an optional hardening follow-up.
+
+### Identity binding (f3) — first-provision and re-login
+
+Capture the **expected `ResolvedIdentity`** (account + method) from the probe run against the staging
+dir **while its handle is held**; require `method == Subscription`. After the rename into place,
+**re-open and hold the final `home` handle**, re-run the probe, and require **exact equality** with the
+captured identity (not merely "is a subscription account"). The `AllowlistStore::authorize` commit
+records **exactly** that account, with the final handle held across the write, binding the recorded
+account to the verified object.
+
+### Exclusive-create staging + ownership (f1, f-r2.2)
+
+Staging dirs are created with a **new winsec `create_new_secured_child_dir(parent, leaf)`** =
+`create_secured_child_dir` but with `FILE_CREATE` (exclusive, `winsec.rs:233` `FILE_CREATE=2`) instead
+of `FILE_OPEN_IF`; a collision → distinct `AlreadyExists`. Because staging names are nonce-unique, an
+`AlreadyExists` there means a crashed prior run's leftover, handled by recovery — never an adopt-then-
+delete of someone else's dir. The final `home` is produced only by `rename(staging → home)`; on
+Windows a directory rename **fails if the target exists**, so a `home` that appeared concurrently
+(first-provision) is refused at the atomic rename and staging is rolled back — the rename *is* the
+race-safe collision check, and no pre-existing home is ever deleted.
 
 ```rust
-pub fn secure_and_verify_credential(&self, leaf: &OsStr) -> io::Result<()>
+struct OwnedStaging { secured: Option<SecuredProfileDir>, staging: PathBuf, committed: bool }
+// Drop: if !committed { self.secured = None; if remove_dir_all(&staging).is_err() { retain journal } }
+//       (drop the no-delete-share handle BEFORE removal, else the hold blocks it)
 ```
 
-Files re-verified per reviewer, after a bounded poll-for-arrival (a CLI may flush just after exit):
-Codex `auth.json`; Claude `.credentials.json` **and** `.claude.json`. Fail closed (→ rollback) on a
-missing file, containment failure, or DACL error. Structural containment (handle-relative, no reparse)
-proves the file is a direct child of the dir we hold; nested trees (Codex `sessions/`) are covered by
-the dir's own DACL for traversal — recursing is an optional hardening follow-up.
+## Crash-safety & recovery (f2, f3, f-r2.1, f-r2.3, f7)
 
-### Ownership-scoped rollback ([f2]/[f23]) — `src/setup.rs`
+**[f18] bookkeeping exception (f7).** `SetupSession::begin` creates the secured `auth` dir, takes the
+per-home lock, and writes the marker **before** approval. This is **pre-approval bookkeeping that
+creates and authorizes nothing** — no credential home, no credential file, no allowlist entry. The
+[f18] invariant is precisely that **no credential write and no allowlist write happens before human
+approval**; the lock+marker exist only to serialize approval and enable recovery.
 
-RAII guard entangled with directory creation (the `setup.rs` module doc forbids a standalone
-record-a-path API). **Ownership is proved by an atomic exclusive create, not a prior existence check
-(f1):**
+**One write-ahead journal for both operations.** The marker is extended into a journal
+`{ operation, home, staging_path, old_path, nonce, intent }`. It is written **before** each filesystem
+mutation (write-ahead), so the nonce-named paths are durable before any rename that could crash:
+before creating staging, before `rename(home → .old)`, before `rename(staging → home)`.
 
-- New winsec `create_new_secured_child_dir(parent, leaf)` = `create_secured_child_dir` but with
-  `FILE_CREATE` (exclusive) instead of `FILE_OPEN_IF`; `ERROR_ALREADY_EXISTS`/`OBJECT_NAME_COLLISION`
-  maps to a distinct `AlreadyExists` error. The **successful exclusive create is the ownership record**
-  — there is no window in which a pre-existing dir could be adopted and later deleted by rollback.
-  (`FILE_CREATE = 2` already exists in `winsec.rs:233`; `write_secured_file` already relies on it.)
+**Recovery is presence-driven, not phase-driven (f-r2.1).** `SetupSession::begin` replays under the
+lock, deciding from the **actual presence** of the three journalled paths (the `intent` field is only
+an advisory hint; renames are atomic and the nonce'd paths are unique, so presence determines state):
 
-```rust
-struct OwnedProvision { secured: Option<SecuredProfileDir>, path: PathBuf, committed: bool }
-//   create_fresh(...)   first-provision: journal {phase=provisioning, owned=path} FIRST, then
-//                       EXCLUSIVE create of the profile leaf; AlreadyExists → refuse ("home already
-//                       exists; use re-login"). No probe-then-create race.
-//   create_staging(...) re-login: journal the owned staging path, then exclusive create of a fresh
-//                       nonce'd staging path we always own.
-//   disarm(self)        success: keep the dir.
-// Drop: if !committed { self.secured = None; if remove_dir_all(&path).is_ok() { clear journal entry }
-//                       else { RETAIN the journal so the next begin() retries cleanup } }
-//                       drop the no-delete-share handle BEFORE removal, else the hold blocks it.
-```
+| home | `.old-nonce` | `staging-nonce` | meaning | action |
+|---|---|---|---|---|
+| present/absent | absent | present | login/verify done, not yet swapped in | **remove staging**; home untouched |
+| absent | present | present | crashed between `home→.old` and `staging→home` | **restore `.old→home`**, remove staging |
+| present | present | absent | crashed after `staging→home`, before cleanup | **remove `.old`**; keep home |
+| present | absent | absent | complete, or crashed during authorize | consult the store; **never delete home**; clear journal |
 
-The **durable ownership record is the journal, not the in-memory guard (f8).** The owned path is
-written to the journal **before** the exclusive create, so a crash *after* creating the dir (before
-commit) leaves a durable record that this run owns it — the next `SetupSession::begin` recovers and
-removes it under the lock. The marker/journal is **retained until `remove_dir_all` actually
-succeeds**: a rollback whose delete fails (handle still held elsewhere, transient lock) keeps the
-record so a later `begin` retries, rather than clearing the marker and stranding a credential-bearing
-dir with no owner. This unifies first-provision and re-login under **one** journal+recovery mechanism
-(below); the in-memory `OwnedProvision` Drop is the fast path, the journal is the crash-durable
-backstop.
+**Never delete a final `home` (f3).** Once `home` exists via rename it is a valid, ACL-locked,
+logged-in dir; recovery only reconciles the nonce'd `staging`/`.old` siblings and clears the journal.
+So the commit is crash-safe: order is `rename(staging→home)` → journal `authorizing` →
+`AllowlistStore::authorize` (its own atomic write is the **source of truth**; recovery never invents an
+authorization) → clear journal. A crash after the store publishes but before the journal clears simply
+leaves the journal to be cleared next `begin`; `home` is never removed, so the store never points at a
+missing profile. A pre-commit failure always ends with the valid existing home restored (re-login) or
+just an orphaned staging removed (first-provision), and **no** allowlist change.
 
-Any early return between creation and the allowlist commit unwinds cleanly: `OwnedProvision` drops
-(removes only what this run exclusively created, retaining the journal if the delete fails),
-`SetupSession` drops (clears the marker only after recovery/cleanup succeeds, releases the per-home
-lock), nothing committed.
+**Retain-until-clean (f8).** If a required cleanup `remove_dir_all` fails (a lingering handle, a
+transient lock), the journal is **retained** so the next `begin` retries, rather than clearing the
+marker and stranding a credential-bearing staging dir with no owner.
 
-### Identity binding ([f19]/[f4]/f3) — first-provision and re-login
+**[f5] shared review lock spans the whole attempt, explicit protocol (f9).** Setup holds the per-home
+**exclusive** lock; the review path takes a **shared** read lock **held across the entire `attempt()`**
+(authorize → probe → spawn → switch guard, the child's whole lifetime), so a swap's `rename(home,…)`
+never races a live review holding the home open. The existing `session::ExclusiveLock` opens
+share-mode-zero and cannot express a shared reader, so refactor it to **`LockFileEx` byte-range locks**
+(`LOCKFILE_EXCLUSIVE_LOCK` for setup, shared for review) on **one** per-home lock path opened
+`FILE_SHARE_READ|WRITE`. Contract: readers coexist; reader blocks writer and vice-versa. Keyed on the
+effective home like [f23].
 
-Capture the **expected `ResolvedIdentity`** (account + method) from the probe run **against the home
-while its handle is held**. The allowlist entry is committed with **exactly that account**, and:
-
-- **first-provision:** the probe under the held handle is the confirmed identity; require
-  `method == Subscription`; authorize that exact account.
-- **re-login:** after the swap, **re-open the final `home` no-follow and hold it**, then re-run the
-  identity probe and require **exact equality** with the pre-swap confirmed identity (not merely "is a
-  subscription account"). The held final handle is kept across the `AllowlistStore::authorize` commit,
-  so the account the store records is bound to the verified object, closing the "probe reads a file by
-  path after the handle was dropped" gap the reviewer flagged.
-
-### Staged-replacement swap (re-login) — `src/setup.rs`
-
-Windows has no atomic dir swap (`ReplaceFile` is files-only; `MoveFileEx` cannot swap two dirs), so
-do a **journalled** three-move with `home`, `home.staging-{nonce}`, `home.old-{nonce}`. See
-Crash-safety for the durable journal + recovery that makes each step reversible.
-
-1. login + [f20] re-verify + identity probe on the staging dir **while holding its handle**.
-2. write journal `phase=swap-out {home, old, staging}`; drop the staging handle.
-3. if `home` exists: `rename(home, home.old-{nonce})`; update journal `phase=swap-in`.
-4. `rename(home.staging-{nonce}, home)`; update journal `phase=verify`.
-5. re-open `home` no-follow + hold, `verify_restrictive_dacl`, re-run identity probe, require exact
-   equality with the pre-swap identity (f3).
-6. commit allowlist (with the held final handle alive); update journal `phase=commit`; then
-   best-effort remove `home.old-{nonce}`; clear the journal.
+**Fault-injection tests** exercise a crash between **every** filesystem mutation and its journal write,
+for both operations, asserting recovery reaches a consistent state that never loses a valid home and
+never deletes one it did not create.
 
 ### Testability seam
 
 Factor the login step behind an injected callback so unit tests never run real OAuth:
 `login: &dyn Fn(&Path, &RequestCancel) -> LoginOutcome`, production impl calls `run_login`. Same
-`begin_with_wait`-style split already used in `setup.rs:74`.
+`begin_with_wait`-style split already in `setup.rs:74`.
 
-## Crash-safety & recovery ([f18] bookkeeping exception + f2 + f7)
+## Review rounds (Codex reviewer)
 
-**[f18] bookkeeping exception (f7).** `SetupSession::begin` creates the secured `auth` dir, takes the
-per-home lock, and writes the provisional marker **before** approval. This is **pre-approval
-bookkeeping that creates and authorizes nothing** — no credential home, no credential file, no
-allowlist entry. The [f18] invariant is precisely that **no credential write and no allowlist write
-happens before human approval**; the lock+marker exist to serialize the approval itself and to enable
-crash recovery. The plan states this exception explicitly rather than leaving "no side effects before
-approval" to imply the marker too.
-
-**One durable journal for both operations + recovery (f2 + f8).** The provisional marker is extended
-into a journal that records `{ operation, phase, owned_path, home, old_path, staging_path, nonce }`
-(atomic write, the existing `atomic_write`), written **before** any dir is created.
-`SetupSession::begin` **no longer blindly clears** a found marker — under the lock it first **replays**
-the journal to a consistent state, then clears it (or **retains** it if a required cleanup delete
-fails, so the next `begin` retries):
-
-- **first-provision** (f8) `phase=provisioning`: the run created `owned_path` but never committed —
-  `remove_dir_all(owned_path)`; retain the journal if the delete fails.
-- re-login `phase=swap-out` (or no rename done): remove an orphaned staging dir; home is intact.
-- re-login `phase=swap-in` (home moved to `.old`, staging not yet in place): **restore**
-  `rename(.old → home)`; remove staging.
-- re-login `phase=verify`/`commit` with `home` present and `.old` present: the new home is in place;
-  remove the leftover `.old`. (A `phase=commit` means the allowlist may or may not have been written;
-  the store's own atomic write is the source of truth — recovery never invents an authorization.)
-- once consistent **and** any needed delete succeeded, clear the journal/marker and proceed.
-
-Because recovery runs **under the per-home exclusive lock**, no other setup or the (shared-locked)
-review path can observe a half-swapped home. A pre-commit failure therefore always ends with the
-**valid existing home restored** and **no allowlist change**; a post-`swap-in` failure leaves the new,
-valid, locked home in place with the allowlist simply not updated (review path stays refused until
-re-run) — never a stranded-absent home and never a destroyed valid home.
-
-**[f5] shared review lock spans the whole attempt (f2), with an explicit shared-reader protocol (f9).**
-Setup holds the per-home **exclusive** lock; the review path takes a **shared** read lock **held across
-the entire `attempt()`** — authorize → identity probe → spawn → switch guard, i.e. the child's whole
-lifetime — not just a sub-step. Only then can the swap's `rename(home, …)` never race a live review
-that has the home open.
-
-The existing `session::ExclusiveLock` opens the lock file with share-mode zero, which cannot express a
-shared reader, so a compatible primitive is required (f9). Specify it as **`LockFileEx` byte-range
-locks on the same per-home lock path** that `SetupSession` uses: setup takes an **exclusive**
-byte-range lock (`LOCKFILE_EXCLUSIVE_LOCK`), the review path a **shared** one (no exclusive flag), both
-on a handle opened with `FILE_SHARE_READ | FILE_SHARE_WRITE` so the file can be opened concurrently and
-the *lock* provides the exclusion. Contract, keyed on the effective home like [f23]: multiple review
-readers coexist; a held shared reader blocks a setup exclusive acquire (and vice-versa); the setup
-side keeps its current semantics. Refactor `ExclusiveLock` to this `LockFileEx`-based lock with
-`Shared`/`Exclusive` modes on one path. Tests: N concurrent shared acquires succeed; a held shared lock
-makes an exclusive acquire block/`WouldBlock`; a held exclusive blocks a shared acquire.
+- **rv-20864-1 → -2** (7 findings): f1 exclusive-create ownership; f2 durable swap journal; f3
+  identity binding; f4 named-mutex login lock; f5 no-token probe + no-reap; f6 login cwd isolation; f7
+  [f18] bookkeeping exception. All accepted and folded in; f1/f7 marked resolved (f2–f6 froze at a
+  stale `open` — the known frozen-ledger flake, issue #62 — their live remainder captured by f8/f9).
+- **rv-20864-2** raised f8 (durable journal must cover first-provision) and f9 (shared-lock protocol).
+- **rv-20864-3 (fresh authoritative)** raised 7 deeper findings, all folded into the **unified
+  staged-create model** above: **f-r2.1** stale swap-phase across rename windows → presence-driven WAL
+  recovery + fault injection; **f-r2.2** pre-create journal could delete a colliding home → only ever
+  create/delete nonce'd staging, final home only via rename; **f-r2.3** first-provision commit had no
+  durable state → never-delete-home + store-as-source-of-truth ordering; **f-r2.4** recovery bypassed
+  when home absent → recovery runs in `begin` before classification; **f-r2.5** no-reap conflicts with
+  `KILL_ON_JOB_CLOSE` → dedicated no-kill-on-close job, fail-closed if uncontainable; **f-r2.6** Claude
+  confirmation probe still ran from `neutral_dir` → mandatory isolated setup-scoped probe; **f-r2.7**
+  login child had no controlled-env contract → required, tested `apply_controlled_env`.
 
 ## Files to modify
 
 - **`src/winsec.rs`** — `secure_and_verify_child_file` (f20); `create_new_secured_child_dir`
-  (exclusive create, f1); a named-mutex RAII primitive (f4) + unit tests.
-- **`src/profile.rs`** — `SecuredProfileDir::secure_and_verify_credential`; an exclusive-create
-  provisioning path for first-provision.
-- **`src/reviewer/mod.rs`** — `LoginOutcome` + `run_login` (no-reap-on-success, closed stdin, own
-  scratch cwd) + per-reviewer login command builder.
-- **`src/reviewer/codex.rs` / `claude.rs`** — login command shape + credential-file names + any
-  login-subcommand isolation flags.
-- **`src/setup.rs`** — classification, `login` arg, `OwnedProvision`, first-provision + staged
-  re-login flows, swap journal + recovery in `SetupSession::begin`, identity binding, injected-login
-  seam, tests.
-- **`src/session.rs`** — refactor `ExclusiveLock` to a `LockFileEx`-based lock with `Shared`/`Exclusive`
-  modes on one path (f9); recovery-aware `SetupSession::begin` journal replay (f2/f8).
-- **the review path (`attempt()`)** — [f5] **shared**-read lock spanning the whole attempt (f5/f9).
-- **`src/mcp.rs` / `src/tools.rs`** — add the `login` boolean to the setup tool schema + description
-  (note that setup blocks minutes while the human OAuths).
+  (exclusive create, f1); named-mutex RAII primitive (f4); tests.
+- **`src/winjob.rs`** — a no-kill-on-close job variant + explicit terminate/detach for login (f-r2.5).
+- **`src/session.rs`** — refactor `ExclusiveLock` to `LockFileEx` `Shared`/`Exclusive` on one path
+  (f9); recovery-aware `SetupSession::begin` (WAL journal replay, f2/f8/f-r2.1..4).
+- **`src/profile.rs`** — `SecuredProfileDir::secure_and_verify_credential`; staging-create path.
+- **`src/reviewer/mod.rs`** — `LoginOutcome` + `run_login` (contained, isolated, controlled-env,
+  closed stdin); per-reviewer login command builder.
+- **`src/reviewer/codex.rs` / `claude.rs`** — login command shapes; credential-file names; a
+  setup-scoped, mandatorily-isolated confirmation probe (f-r2.6).
+- **`src/setup.rs`** — `login` arg, recovery-before-classification, `OwnedStaging`, unified
+  staged-create + rename-into-place for both operations, identity binding, injected-login seam, tests.
+- **the review path (`attempt()`)** — [f5] shared-read lock spanning the whole attempt.
+- **`src/mcp.rs` / `src/tools.rs`** — `login` boolean in the setup schema + description (setup blocks
+  minutes while the human OAuths).
 - **`docs/reviewer-account-profiles-status.md`** — mark 3b done; record the deferred real smoke, the
   no-token probe requirement, and the non-TTY-login / [f20] apply-then-verify findings.
 
 ## Verification
 
-- `cargo test` — new unit tests: first-provision happy/failure/timeout/cancel; **exclusive-create
-  collision is refused** (f1); non-subscription rejected; **identity-equality binding** (f3);
-  re-login happy; **journal recovery** for each phase — first-provision `provisioning`, re-login
-  swap-out/swap-in/verify — on plain temp dirs (f2/f8); **retain-journal-on-failed-cleanup** (f8);
-  login-failure-leaves-home-intact; [f20] primitive (apply+verify child; widened-ACL negative);
-  named-mutex mutual exclusion (f4); **shared/exclusive lock** protocol — N readers coexist, reader
-  blocks writer and vice-versa (f9); **hostile-cwd-config** test (f6).
+- `cargo test` — unit tests: exclusive-create collision refused (f1); first-provision rename refuses a
+  concurrently-appeared home (f-r2.2); identity-equality binding (f3); non-subscription rejected;
+  first-provision + re-login happy paths; **fault-injection recovery** between every mutation/journal
+  write for both operations, incl. crash-after-store-publish keeps home (f3/f-r2.1/f-r2.3);
+  recovery-runs-before-classification (f-r2.4); retain-journal-on-failed-cleanup (f8); [f20] primitive
+  (apply+verify child; widened-ACL negative); named-mutex mutual exclusion (f4); shared/exclusive lock
+  (readers coexist, reader⇄writer exclude) (f9); controlled-env clears rogue vars (f-r2.7);
+  hostile-cwd-config for login **and** the confirmation probe (f6/f-r2.6); login fails closed when
+  the job is uncontainable (f-r2.5).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
-- **No-token login-behaviour probe, required before landing (f5):** for each vendor, spawn the login
-  command into a scratch home with stdin closed and a short timeout, and confirm it (a) auto-opens the
-  browser, (b) binds its localhost callback, (c) does not block on stdin — then kill before completing
-  OAuth. Spends no tokens, completes no sign-in. Validates the headless assumption. **If it fails, the
-  device-auth fallback is not localized:** it requires an explicit flow that surfaces the user
-  code/URL on our own `ApprovalServer` loopback page (a `LoginOutcome`/flow variant carrying a
-  "needs user code" state), designed and reviewed separately before use.
+- **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
+  scratch home with stdin closed and a short timeout; confirm it auto-opens the browser, binds its
+  callback, and does not block on stdin; kill before OAuth completes. No tokens, no sign-in. **If it
+  fails, the device-auth fallback is not localized** — it needs an explicit flow surfacing the user
+  code/URL on our own `ApprovalServer` page (a `LoginOutcome`/flow "needs user code" variant), designed
+  and reviewed separately.
 - **Deferred (needs the maintainer + tokens):** `smoke.ps1 -Reviewer codex|claude` real end-to-end —
-  first-provision lands the credential in the *dedicated* home (not `~/.codex`/`~`), identity probe
-  reports the account, allowlist entry + restrictive DACLs on home and credential file; then a
-  re-login account switch; then a cancelled/failed login leaving the prior home intact.
+  first-provision lands the credential in the *dedicated* home (not `~/.codex`/`~`), the probe reports
+  the account, allowlist entry + restrictive DACLs on home and credential file; then a re-login account
+  switch; then a cancelled/failed login leaving the prior home intact.
 
 ## Risks / unknowns to carry into implementation
 
-1. Non-TTY vendor login completing headless with stdin closed + browser auto-open — de-risked by the
-   no-token probe (f5) before landing; device-auth fallback has an explicit, separately-reviewed flow.
-2. [f20] apply-then-verify (not verify-only) — deliberate refinement of the doc wording; rationale
-   above.
+1. Non-TTY vendor login completing headless (stdin closed + browser auto-open) — de-risked by the
+   no-token probe before landing; device-auth fallback has an explicit, separately-reviewed flow.
+2. [f20] apply-then-verify (not verify-only) — deliberate refinement of the doc wording.
 3. Exact credential-file set + write timing per reviewer (poll-for-arrival guards the race).
 4. Total tool-call time budget (approval ≤5 min + login minutes) vs the MCP client timeout.
-5. Whether each login subcommand accepts the vendor config-isolation flags (f6) — verified per-CLI
-   during impl; clean-scratch-cwd is the guaranteed fallback.
-6. Named-mutex scope (`Local\` per-session vs `Global\`) — per-session matches the per-user callback
-   port; confirmed during impl.
+5. Whether each login subcommand accepts config-isolation flags (f6) — verified per-CLI in impl; the
+   owned-scratch-cwd + controlled-env are the guaranteed floor.
+6. Corporate proxy vars dropped by the controlled env (f-r2.7) — same as the working review path;
+   confirm in smoke.
+7. Named-mutex scope (`Local\` per-session) matches the per-user callback port; confirm in impl.
