@@ -245,7 +245,12 @@ impl Reviewer for ClaudeReviewer {
     }
 
     /// Claude writes the account file `.claude.json` (read handle-relative for the fingerprint) and the
-    /// OAuth secret `.credentials.json`. The account file is first (f-a5).
+    /// OAuth secret `.credentials.json`. The account file is first (f-a5). Both are **required** by
+    /// setup (f6) as direct children of `CLAUDE_CONFIG_DIR`. NOTE: that `.credentials.json` lands as a
+    /// direct child (rather than under a `.claude/` subdir) is a **version-pinned assumption validated
+    /// by `smoke.ps1`** — if a supported Claude version places it elsewhere, provisioning fails closed
+    /// ("did not write .credentials.json") rather than authorizing an incomplete home, and this list is
+    /// the single place to correct it.
     fn credential_files(&self) -> &'static [&'static str] {
         &[".claude.json", ".credentials.json"]
     }

@@ -2200,13 +2200,22 @@ impl Job {
         let _home_lock = if let Some(start) = &authorized_start {
             match crate::setup::acquire_review_home_lock(&start.home) {
                 Ok(lock) => lock,
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     return Err(Failure::new(
                         "PROFILE_SETUP_IN_PROGRESS",
                         "A setup for this profile is in progress, so the review cannot run under it \
                          yet. Try again once setup finishes.",
                         "A setup for this profile is in progress, so the review cannot run under it \
                          yet. Try again once setup finishes.",
+                    ));
+                }
+                // Fail closed on any other lock-setup failure rather than racing a setup swap (f7).
+                Err(e) => {
+                    return Err(Failure::new(
+                        "PROFILE_HOME_LOCK_FAILED",
+                        format!("Could not take the per-profile review lock: {e}"),
+                        "Could not take the per-profile review lock; refusing to run the review \
+                         unsynchronised with setup. Check the profile store directory's permissions.",
                     ));
                 }
             }

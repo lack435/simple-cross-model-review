@@ -182,12 +182,11 @@ impl JobObject {
     }
 
     /// Kill every process in the job now. Used on timeout and cancel so the pipes close
-    /// promptly instead of leaving output collection to wait out its grace period.
-    pub fn terminate(&self) {
+    /// promptly instead of leaving output collection to wait out its grace period. Returns whether the
+    /// OS accepted the request, so a login-abort path can fail closed when containment is uncertain.
+    pub fn terminate(&self) -> bool {
         // SAFETY: the handle is owned and valid until Drop.
-        unsafe {
-            TerminateJobObject(self.handle, 1);
-        }
+        unsafe { TerminateJobObject(self.handle, 1) != 0 }
     }
 
     /// Spawn `cmd` **already inside this job**, closing the assign-after-spawn window (impl-plan
@@ -287,12 +286,16 @@ fn resume_process_threads(pid: u32) -> io::Result<()> {
             // SAFETY: opening the thread by id for resume access; null on failure is handled.
             let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32_thread_id) };
             if !thread.is_null() {
-                // SAFETY: `thread` is a valid handle we own; ResumeThread decrements the suspend count.
+                // SAFETY: `thread` is a valid handle we own; ResumeThread decrements the suspend count
+                // and returns the previous count, or `u32::MAX` (DWORD -1) on failure.
+                let prev = unsafe { ResumeThread(thread) };
+                // SAFETY: closing the owned thread handle exactly once.
                 unsafe {
-                    ResumeThread(thread);
                     CloseHandle(thread);
                 }
-                resumed_any = true;
+                if prev != u32::MAX {
+                    resumed_any = true;
+                }
             }
         }
         entry.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;

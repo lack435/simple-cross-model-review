@@ -62,10 +62,11 @@ const SHARED_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// `{base}/auth/setup-{home_key}.lock` — the exact path [`SetupSession`] locks — so review-vs-setup of
 /// one profile mutually exclude, while concurrent reviews (all shared) coexist.
 ///
-/// `Ok(None)` when no profile base is resolvable (nothing to contend with — proceed unlocked, as
-/// before this feature). `Err(WouldBlock)` when a setup currently holds the exclusive side (the review
-/// should refuse and retry). Any other lock-setup error maps to `Ok(None)` — a lock we cannot even
-/// create must not block reviews when no setup is running.
+/// `Ok(None)` **only** when no profile base is resolvable (nothing to contend with — proceed unlocked,
+/// exactly as before this feature). Every other error propagates (f7): a lock we cannot set up must
+/// make the review **fail closed** rather than silently skip the lock and race a setup swap. The auth
+/// directory is created *secured* (the same protected dir setup uses), so the review and setup contend
+/// on one file another user cannot tamper with.
 pub fn acquire_review_home_lock(
     effective_home: &Path,
 ) -> io::Result<Option<crate::session::SharedLock>> {
@@ -73,16 +74,11 @@ pub fn acquire_review_home_lock(
         return Ok(None);
     };
     let auth = base.join("auth");
-    if std::fs::create_dir_all(&auth).is_err() {
-        return Ok(None);
-    }
+    std::fs::create_dir_all(&auth)?;
+    crate::winsec::create_secured_dir(&auth)?;
     let key = home_key(effective_home);
     let lock_path = auth.join(format!("setup-{key}.lock"));
-    match crate::session::SharedLock::acquire(&lock_path, SHARED_LOCK_WAIT) {
-        Ok(lock) => Ok(Some(lock)),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-        Err(_) => Ok(None),
-    }
+    crate::session::SharedLock::acquire(&lock_path, SHARED_LOCK_WAIT).map(Some)
 }
 
 /// The operation a setup journal records. `AuthorizeOnly` creates nothing, so it needs no recovery
@@ -187,8 +183,17 @@ impl SetupSession {
         let lock = ExclusiveLock::acquire(&lock_path, wait)?;
 
         // Any journal present is from a prior run that died or exited without clearing it (a live run
-        // would still hold the lock we just took). Replay it to a consistent state before starting.
-        if let Some(journal) = read_journal(&marker_path) {
+        // would still hold the lock we just took). A **corrupt** journal is not treated as absent (f2):
+        // `read_journal` errors, and we refuse rather than skip recovery and overwrite real state.
+        let found = read_journal(&marker_path).map_err(|e| {
+            io::Error::other(format!(
+                "a previous setup of {} left a journal that could not be read ({e}); inspect the \
+                 profile directory and remove {} once resolved",
+                effective_home.display(),
+                marker_path.display(),
+            ))
+        })?;
+        if let Some(journal) = found {
             match recover(base, &marker_path, &journal)? {
                 Recovery::Clear => {
                     let _ = remove_if_present(&marker_path);
@@ -271,17 +276,34 @@ impl Drop for SetupSession {
     }
 }
 
-fn read_journal(marker_path: &Path) -> Option<Journal> {
-    let bytes = std::fs::read(marker_path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Read the journal, **distinguishing absent from corrupt** (f2): `Ok(None)` only when the marker file
+/// genuinely does not exist; a present-but-unreadable/unparseable marker is an error, so `begin`
+/// refuses rather than silently skipping recovery and overwriting a real crashed run's state.
+fn read_journal(marker_path: &Path) -> io::Result<Option<Journal>> {
+    let bytes = match std::fs::read(marker_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the setup journal {} is corrupt: {e}",
+                marker_path.display()
+            ),
+        )
+    })
 }
 
+/// Write the write-ahead journal durably (f1/f-b3): `atomic_write` now uses a write-through replacing
+/// rename and flushes the contents, so the recorded intent reaches stable storage before the mutation
+/// it guards — a lost journal can no longer defeat recovery. A directory-entry flush is a best-effort
+/// belt on top of the write-through rename.
 fn write_journal_at(marker_path: &Path, journal: &Journal) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(journal)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     atomic_write(marker_path, &json)?;
-    // Durability: flush the journal file and its directory so the intent survives a power loss (f-b3).
-    let _ = crate::winsec::flush_file(marker_path);
     if let Some(dir) = marker_path.parent() {
         let _ = crate::winsec::flush_dir(dir);
     }
@@ -331,6 +353,21 @@ fn restore_old(old: &Path, home: &Path, journal: &Journal) -> io::Result<bool> {
     if let Some(parent) = home.parent() {
         let _ = crate::winsec::flush_dir(parent);
     }
+    Ok(true)
+}
+
+/// Delete `.old` only after proving it is the object this run moved aside — its recorded `(volume,
+/// file-index)` identity, opened no-follow (f-a3/f5). `false` (fail closed, `.old` untouched) on a
+/// missing/mismatched id or a reparse point, so a post-crash replacement is never deleted by path.
+fn verify_and_remove_old(old: &Path, journal: &Journal) -> io::Result<bool> {
+    match journal.old_file_id {
+        Some(expected) => match crate::winsec::dir_identity_no_follow(old) {
+            Ok(id) if id == expected => {}
+            _ => return Ok(false),
+        },
+        None => return Ok(false),
+    }
+    remove_dir_all_durable(old)?;
     Ok(true)
 }
 
@@ -441,7 +478,11 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
             if !restore_old(old, &home, &journal)? {
                 return Ok(Recovery::Retain);
             }
-            let _ = remove_owned_staging(staging, &journal)?;
+            // Fail closed if the staging is not provably ours (f4): do not clear over an object we
+            // cannot prove we created.
+            if !remove_owned_staging(staging, &journal)? {
+                return Ok(Recovery::Retain);
+            }
             Recovery::Clear
         }
         // Home moved to .old, staging gone (failed cleanup): restore .old.
@@ -456,7 +497,11 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
         (true, true, false) => {
             let old = old.as_ref().unwrap();
             if commit_certified(base, &journal)? {
-                remove_dir_all_durable(old)?; // committed: drop the old, keep the new home
+                // Committed: drop the old home — but only after proving it is the object we moved
+                // aside, never a replacement (f5). If we cannot prove it, retain rather than delete.
+                if !verify_and_remove_old(old, &journal)? {
+                    return Ok(Recovery::Retain);
+                }
                 Recovery::Clear
             } else {
                 // Not committed: roll back. Quarantine the uncommitted new home, restore .old. This
@@ -483,7 +528,9 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
                 }
                 Recovery::Clear
             } else {
-                Recovery::Clear // home is not ours and not authorized by us
+                // A home we can neither prove we own nor find authorized: fail closed rather than
+                // clear over an unexplained object (f4).
+                Recovery::Retain
             }
         }
         // All absent.
@@ -781,14 +828,19 @@ fn commit_authorization(
         })
 }
 
-/// Poll for each credential file to arrive and re-secure it handle-relative ([f20], apply-then-verify).
-/// The first (account) file must arrive; later files are best-effort if present.
+/// Poll for **every** declared credential file to arrive as a direct child, then re-secure each
+/// handle-relative ([f20], apply-then-verify).
+///
+/// All declared files are required (f6): a Claude profile missing `.credentials.json` would authorize
+/// a home that cannot actually run a review, so a missing file fails the whole provision rather than
+/// being accepted. `credential_files` therefore lists only files the vendor writes as direct children
+/// of the config home.
 fn secure_credentials(
     staging: &crate::profile::SecuredProfileDir,
     adapter: &dyn crate::reviewer::Reviewer,
     request: &RequestCancel,
 ) -> Result<(), Failure> {
-    for (i, file) in adapter.credential_files().iter().enumerate() {
+    for file in adapter.credential_files() {
         let target = staging.path.join(file);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !target.exists() {
@@ -796,25 +848,20 @@ fn secure_credentials(
                 return Err(errors::cancelled());
             }
             if Instant::now() >= deadline {
-                if i == 0 {
-                    return Err(setup_failure(format!(
-                        "The vendor login did not write the expected credential file '{file}'. \
-                         Nothing was changed."
-                    )));
-                }
-                break; // a non-account file may live elsewhere; the dir DACL still protects it
+                return Err(setup_failure(format!(
+                    "The vendor login did not write the expected credential file '{file}'. Nothing \
+                     was changed."
+                )));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        if target.exists() {
-            staging
-                .secure_and_verify_credential(std::ffi::OsStr::new(file))
-                .map_err(|e| {
-                    setup_failure(format!(
-                        "Could not secure the credential file '{file}': {e}"
-                    ))
-                })?;
-        }
+        staging
+            .secure_and_verify_credential(std::ffi::OsStr::new(file))
+            .map_err(|e| {
+                setup_failure(format!(
+                    "Could not secure the credential file '{file}': {e}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -928,12 +975,16 @@ fn provision_after_approval(
     write_owned_marker(&staging.path, &nonce)
         .map_err(|e| setup_failure(format!("Could not mark the staging directory: {e}")))?;
 
-    // WAL: record the staging path before the login writes into it.
+    // WAL: record the staging path before the login writes into it, then **arm** (f3): once a
+    // credential-bearing staging dir can exist, an uncommitted drop must leave the journal so recovery
+    // owns cleanup — even if the in-process `OwnedStaging` removal later fails. Recovery self-heals a
+    // failed login (removes the orphan staging) on the next `begin`.
     let mut journal = session.blank_journal(home, op);
     journal.staging_path = Some(staging.path.to_string_lossy().into_owned());
     session
         .write_journal(&journal)
         .map_err(|e| setup_failure(format!("Could not write the setup journal: {e}")))?;
+    session.arm();
 
     let mut owned = OwnedStaging::new(staging);
     let staging_home = owned.secured().path.clone();
@@ -971,9 +1022,17 @@ fn provision_after_approval(
         ));
     }
 
-    // Flush the just-verified credential contents to stable storage before the swap (f-b2).
+    // Flush the just-verified credential contents to stable storage before the swap (f-b2/f1). A
+    // credential file we cannot flush is a durability failure — fail closed rather than swap in a home
+    // whose credentials might be lost to a power loss. (Every declared file is present here, since
+    // `secure_credentials` requires them.)
     for file in adapter.credential_files() {
-        let _ = crate::winsec::flush_file(&staging_home.join(file));
+        let cred = staging_home.join(file);
+        if cred.exists() {
+            crate::winsec::flush_file(&cred).map_err(|e| {
+                setup_failure(format!("Could not flush the credential file '{file}': {e}"))
+            })?;
+        }
     }
     let _ = crate::winsec::flush_dir(&staging_home);
 
@@ -984,8 +1043,8 @@ fn provision_after_approval(
         account_fingerprint: identity.account.clone(),
     };
 
-    // From here on the final home is mutated; arm so any failure leaves the journal for recovery.
-    session.arm();
+    // The final home is mutated from here; the session was already armed at staging creation (f3), so
+    // any failure below leaves the journal for recovery.
     journal.expected_entry = Some(entry.clone());
 
     // Re-login: capture the existing home's object identity (f-a3), then move it aside.
@@ -1036,15 +1095,23 @@ fn provision_after_approval(
         return Err(errors::cancelled());
     }
 
-    // Commit the authorization durably, then finalize.
+    // Commit the authorization durably (the store flush is inside `authorize`), then record a durable
+    // `committed` phase before the irreversible `.old` delete, so a crash in between is unambiguous to
+    // recovery (f5).
     journal.phase = "authorizing".to_string();
-    let _ = session.write_journal(&journal);
+    session
+        .write_journal(&journal)
+        .map_err(|e| setup_failure(format!("Could not write the setup journal: {e}")))?;
     commit_authorization(base, entry, request)?;
+    journal.phase = "committed".to_string();
+    let _ = session.write_journal(&journal);
 
     drop(final_home); // release the held handle so the .old cleanup / marker removal can proceed
     if op == Operation::Relogin {
         if let Some(old) = &journal.old_path {
-            let _ = remove_dir_all_durable(Path::new(old));
+            // Delete `.old` only after proving it is the object we moved aside (f5); a mismatch leaves
+            // it for recovery rather than deleting by path.
+            let _ = verify_and_remove_old(Path::new(old), &journal);
         }
     }
     let _ = std::fs::remove_file(home.join(OWNED_MARKER));
@@ -1188,7 +1255,10 @@ fn home_key(effective_home: &Path) -> String {
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
+    // Make the contents durable, then publish with a write-through replacing rename so the atomic
+    // replace itself survives a power loss (f1) — not the fail-open `std::fs::rename` of before.
+    crate::winsec::flush_file(&tmp)?;
+    match crate::winsec::rename_replace_write_through(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -1512,6 +1582,25 @@ mod tests {
         // Once setup releases, the review acquires the shared lock immediately.
         crate::session::SharedLock::acquire(&lock_path, Duration::from_millis(500))
             .expect("shared lock after setup releases");
+    }
+
+    #[test]
+    fn a_corrupt_journal_is_refused_not_silently_overwritten() {
+        // f2: a present-but-unparseable journal must not be treated as absent (which would skip
+        // recovery and overwrite a real crashed run's state); begin refuses and leaves it.
+        let base = temp_dir();
+        let home = base.join("profiles").join("codex").join("work");
+        SetupSession::begin(&base, &home).unwrap().commit().unwrap();
+        let marker = marker_path(&base, &home);
+        std::fs::write(&marker, b"{ not valid json").unwrap();
+        match SetupSession::begin(&base, &home) {
+            Err(_) => {}
+            Ok(_) => panic!("a corrupt journal must be refused, not ignored"),
+        }
+        assert!(
+            marker.exists(),
+            "the corrupt journal is left for inspection"
+        );
     }
 
     #[test]

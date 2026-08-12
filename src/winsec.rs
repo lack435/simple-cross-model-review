@@ -56,6 +56,7 @@ const OPEN_EXISTING: Dword = 3;
 // safety rail for every recovery move (f-c1/f-c4). MOVEFILE_WRITE_THROUGH flushes the rename to disk
 // before returning, making the directory-entry change durable across power loss (f-b5).
 const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
+const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
 const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
 const FILE_ATTRIBUTE_NORMAL: Dword = 0x0000_0080;
@@ -1087,6 +1088,28 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
             ));
         }
         return Err(err);
+    }
+    Ok(())
+}
+
+/// Rename `from` **over** `to` (replacing an existing target), flushing the move to disk before
+/// returning (`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`). Used for the write-ahead journal,
+/// whose atomic replace must itself be durable across power loss, not just fail-open (f1/f-b3). Unlike
+/// [`rename_no_replace`] this is *for* replacing (the journal file is overwritten each update).
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn rename_replace_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    let from_w = wide(from);
+    let to_w = wide(to);
+    // SAFETY: both buffers are valid NUL-terminated UTF-16 paths that outlive the call.
+    let ok = unsafe {
+        MoveFileExW(
+            from_w.as_ptr(),
+            to_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

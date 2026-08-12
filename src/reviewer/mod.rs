@@ -383,24 +383,19 @@ pub fn run_login(
             Ok(Some(status)) => break status.code(),
             Ok(None) => {}
             Err(_) => {
-                job.terminate();
-                let _ = child.wait();
+                terminate_and_settle(&job, &mut child);
                 return fail;
             }
         }
         if cancel.load(Ordering::SeqCst) {
-            job.terminate();
-            let _ = child.wait();
-            wait_quiescent(&job);
+            terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 cancelled: true,
                 ..fail
             };
         }
         if Instant::now() >= deadline {
-            job.terminate();
-            let _ = child.wait();
-            wait_quiescent(&job);
+            terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 timed_out: true,
                 ..fail
@@ -410,9 +405,11 @@ pub fn run_login(
     };
 
     // Natural exit: wait for in-job helpers to quiesce before the caller verifies/renames staging. A
-    // lingering in-job writer that does not clear in time is reaped and the login fails closed.
+    // lingering in-job writer that does not clear in time is reaped **and we then wait for the reaping
+    // to settle** before returning fail-closed, so the caller never cleans up staging while a member is
+    // still writing (f8).
     if !wait_quiescent(&job) {
-        job.terminate();
+        terminate_and_settle(&job, &mut child);
         return LoginOutcome {
             exit: exit_code,
             ..fail
@@ -424,6 +421,26 @@ pub fn run_login(
         cancelled: false,
         exit: exit_code,
     }
+}
+
+/// Abort a login job: terminate it, wait (bounded) for the direct child, then wait for the whole job
+/// to go quiet, so the caller never cleans up staging while a member is still writing (f8). The child
+/// wait is bounded rather than an unbounded `child.wait()` so a wedged process cannot hang the runner.
+#[allow(dead_code)] // reached via run_login, whose caller lands with the setup provisioning flow.
+fn terminate_and_settle(job: &crate::winjob::JobObject, child: &mut Child) -> bool {
+    job.terminate();
+    let deadline = Instant::now() + LOGIN_QUIESCE_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_quiescent(job)
 }
 
 /// Wait (bounded) for the job's live process count to reach zero. `true` if it quiesced; `false` on
