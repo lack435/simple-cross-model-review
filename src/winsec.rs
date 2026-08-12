@@ -17,7 +17,7 @@
 
 #![cfg(windows)]
 
-use std::ffi::c_void;
+use std::ffi::{c_void, OsStr};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -36,12 +36,15 @@ const GENERIC_READ: Dword = 0x8000_0000;
 const GENERIC_WRITE: Dword = 0x4000_0000;
 const WRITE_DAC: Dword = 0x0004_0000;
 const READ_CONTROL: Dword = 0x0002_0000;
+// Directory rights needed for a handle used as an `NtCreateFile` RootDirectory: list names and
+// traverse into them.
+const FILE_LIST_DIRECTORY: Dword = 0x0000_0001;
+const FILE_TRAVERSE: Dword = 0x0000_0020;
 // Share reads with other openers but never DELETE: a directory or file opened without
 // FILE_SHARE_DELETE cannot be renamed or deleted out from under the held handle ([f20]).
 const FILE_SHARE_READ: Dword = 0x0000_0001;
 const FILE_SHARE_WRITE: Dword = 0x0000_0002;
 const OPEN_EXISTING: Dword = 3;
-const CREATE_NEW: Dword = 1;
 const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
 const FILE_ATTRIBUTE_NORMAL: Dword = 0x0000_0080;
@@ -203,6 +206,70 @@ extern "system" {
     ) -> Bool;
 }
 
+// --- ntdll (handle-relative open) -----------------------------------------------------------------
+//
+// A file opened by full path re-resolves every ancestor component, so `CreateFileW`'s
+// `FILE_FLAG_OPEN_REPARSE_POINT` guards only the *final* component: a junction swapped in for the
+// parent directory would still be followed. To prove a store/credential file is genuinely a direct
+// child of the directory whose DACL we verified, we open it **relative to that directory's handle**
+// with `NtCreateFile` (`RootDirectory` = the held handle, `OBJ_DONT_REPARSE`), so the resolution can
+// only reach a direct child of the verified object and refuses if it is a reparse point ([f15]/[f20]).
+
+// OBJECT_ATTRIBUTES.Attributes
+const OBJ_CASE_INSENSITIVE: Dword = 0x0000_0040;
+const OBJ_DONT_REPARSE: Dword = 0x0000_1000;
+// NtCreateFile CreateDisposition
+const FILE_OPEN: Dword = 1;
+const FILE_CREATE: Dword = 2;
+// NtCreateFile CreateOptions
+const FILE_NON_DIRECTORY_FILE: Dword = 0x0000_0040;
+const FILE_SYNCHRONOUS_IO_NONALERT: Dword = 0x0000_0020;
+// ACCESS_MASK: required alongside FILE_SYNCHRONOUS_IO_NONALERT.
+const SYNCHRONIZE: Dword = 0x0010_0000;
+const STATUS_SUCCESS: i32 = 0;
+
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    length: Dword,
+    root_directory: Handle,
+    object_name: *const UnicodeString,
+    attributes: Dword,
+    security_descriptor: *mut c_void,
+    security_quality_of_service: *mut c_void,
+}
+
+#[repr(C)]
+struct IoStatusBlock {
+    // A union of NTSTATUS and PVOID; pointer-sized. We never read it, but its layout must be right.
+    status_or_pointer: usize,
+    information: usize,
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    #[allow(clippy::too_many_arguments)]
+    fn NtCreateFile(
+        file_handle: *mut Handle,
+        desired_access: Dword,
+        object_attributes: *const ObjectAttributes,
+        io_status_block: *mut IoStatusBlock,
+        allocation_size: *mut i64,
+        file_attributes: Dword,
+        share_access: Dword,
+        create_disposition: Dword,
+        create_options: Dword,
+        ea_buffer: *mut c_void,
+        ea_length: Dword,
+    ) -> i32;
+}
+
 /// A self-contained SID as raw bytes. A SID is a position-independent blob, so a byte copy is a
 /// valid SID whose pointer is `bytes.as_ptr()` — this is how the three principals are carried
 /// around after being read out of a token or synthesised from a well-known type.
@@ -307,15 +374,30 @@ fn copy_sid(psid: *mut c_void) -> io::Result<Sid> {
     Ok(Sid { bytes })
 }
 
-/// The three principals every cross-review credential object grants, and nobody else: the current
-/// user, plus SYSTEM and Administrators per Windows norms (a machine admin can already read anything;
+/// The principals every cross-review credential object grants, and nobody else: the current user,
+/// plus SYSTEM and Administrators per Windows norms (a machine admin can already read anything;
 /// denying them buys nothing and breaks backup/AV).
+///
+/// Deduplicated by SID: when the process itself runs as LocalSystem the current-user SID *is* the
+/// SYSTEM SID, and a naive three-entry set would emit a duplicate ACE that `apply` writes but
+/// `verify` then rejects (it marks the first matching slot and reports the twin missing). The set is
+/// therefore the *distinct* principals, so apply and verify agree in every token context.
 fn principals() -> io::Result<Vec<Sid>> {
-    Ok(vec![
+    let mut sids: Vec<Sid> = Vec::with_capacity(3);
+    for sid in [
         current_user_sid()?,
         well_known_sid(WIN_LOCAL_SYSTEM_SID)?,
         well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?,
-    ])
+    ] {
+        // SAFETY: both operands are valid SIDs; EqualSid compares them by value.
+        let dup = sids
+            .iter()
+            .any(|existing| unsafe { EqualSid(existing.as_ptr(), sid.as_ptr()) } != 0);
+        if !dup {
+            sids.push(sid);
+        }
+    }
+    Ok(sids)
 }
 
 /// Wide, NUL-terminated form of a path for the `…W` APIs.
@@ -333,22 +415,83 @@ pub fn open_dir_no_follow(path: &Path, writable: bool) -> io::Result<OwnedHandle
     open_no_follow(path, writable, true, OPEN_EXISTING)
 }
 
-/// Open (or create, with `CREATE_NEW`) a file with a no-follow handle, rejecting a reparse point.
-fn open_file(path: &Path, access: Dword, disposition: Dword) -> io::Result<OwnedHandle> {
-    let wide = wide(path);
-    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path; all other arguments are plain scalars.
-    let raw = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            access,
+/// Split a path into its parent directory and its final component, rejecting a path with no parent
+/// or no file name (both required for a handle-relative open of the child within its directory).
+fn split_parent_leaf(path: &Path) -> io::Result<(&Path, &OsStr)> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("path has no parent directory"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("path has no final component"))?;
+    Ok((parent, leaf))
+}
+
+/// Open a direct child of `parent` **by handle-relative resolution**, rejecting a reparse point and
+/// any name that is not a single path component. `NtCreateFile` with `RootDirectory = parent` and
+/// `OBJ_DONT_REPARSE` can only reach a direct child of the held directory object, so containment is
+/// structural — no ancestor path component is re-resolved ([f15]/[f20]).
+fn open_child_relative(
+    parent: &OwnedHandle,
+    leaf: &OsStr,
+    access: Dword,
+    disposition: Dword,
+) -> io::Result<OwnedHandle> {
+    let name: Vec<u16> = leaf.encode_wide().collect();
+    let is_dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
+    if name.is_empty()
+        || is_dot
+        || name
+            .iter()
+            .any(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
+    {
+        return Err(io::Error::other(
+            "a handle-relative open requires a single path component (no separators)",
+        ));
+    }
+    let byte_len = (name.len() * 2) as u16;
+    let unicode = UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        buffer: name.as_ptr() as *mut u16,
+    };
+    let oa = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as Dword,
+        root_directory: parent.as_raw_handle() as Handle,
+        object_name: &unicode,
+        attributes: OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut handle: Handle = std::ptr::null_mut();
+    let mut iosb = IoStatusBlock {
+        status_or_pointer: 0,
+        information: 0,
+    };
+    // SAFETY: every pointer references a local (`unicode`, `name`, `oa`, `iosb`, `handle`) that lives
+    // across the call; `name` backs the UNICODE_STRING buffer; the parent handle is valid and held.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access | SYNCHRONIZE,
+            &oa,
+            &mut iosb,
+            std::ptr::null_mut(),
+            FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null_mut(),
             disposition,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null_mut(),
+            0,
         )
     };
-    finish_open(raw)
+    if status != STATUS_SUCCESS {
+        return Err(io::Error::other(format!(
+            "handle-relative open of {leaf:?} failed (NTSTATUS {status:#010x})"
+        )));
+    }
+    finish_open(handle)
 }
 
 fn open_no_follow(
@@ -364,8 +507,10 @@ fn open_no_follow(
     }
     let mut flags = FILE_FLAG_OPEN_REPARSE_POINT;
     if is_dir {
-        // Required to obtain a handle to a *directory* rather than a file.
+        // Required to obtain a handle to a *directory* rather than a file, and the list/traverse
+        // rights let this handle serve as an `NtCreateFile` RootDirectory for handle-relative opens.
         flags |= FILE_FLAG_BACKUP_SEMANTICS;
+        access |= FILE_LIST_DIRECTORY | FILE_TRAVERSE;
     } else {
         flags |= FILE_ATTRIBUTE_NORMAL;
     }
@@ -605,24 +750,40 @@ pub fn create_secured_dir(path: &Path) -> io::Result<OwnedHandle> {
 }
 
 /// Atomically write `contents` to `path` as a temp file secured to the current user, then rename it
-/// into place. The temp file is created `CREATE_NEW` (so it cannot be an attacker's pre-existing
-/// reparse point), locked with the restrictive DACL, verified, written, and renamed over `path`.
+/// into place. The parent directory is opened no-follow, its restrictive DACL verified, and **held**
+/// (no delete-sharing) across the whole operation, so it cannot be swapped or removed mid-write. The
+/// temp file is created **relative to that held directory handle** (`FILE_CREATE`, so it cannot be an
+/// attacker's pre-existing reparse point), locked with the restrictive DACL, verified, written, and
+/// renamed over `path`.
 ///
-/// The ACL travels with the file across a same-volume rename, so the destination inherits the
-/// restrictive DACL. Callers must ensure `path`'s parent is itself a secured directory.
+/// The ACL travels with the file across the same-directory rename, so the destination keeps the
+/// restrictive DACL. `path` and `tmp` must be siblings in a directory that is already a secured
+/// directory ([`create_secured_dir`]); `tmp` is the sibling temp name.
 pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    // Remove any stale temp from a crashed writer; CREATE_NEW would otherwise fail.
+    let (dir, _leaf) = split_parent_leaf(path)?;
+    let tmp_leaf = tmp
+        .file_name()
+        .ok_or_else(|| io::Error::other("temp path has no final component"))?;
+
+    // Verify and hold the parent directory across create+write+rename. `open_dir_no_follow` shares
+    // reads/writes but not DELETE, so while this handle lives the directory cannot be renamed or
+    // deleted, and the rename below therefore resolves within the object whose DACL we verified.
+    let dir_handle = open_dir_no_follow(dir, false)?;
+    verify_restrictive_dacl(&dir_handle)?;
+
+    // Remove any stale temp from a crashed writer; FILE_CREATE would otherwise fail.
     match std::fs::remove_file(tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let handle = open_file(
-        tmp,
+    let handle = open_child_relative(
+        &dir_handle,
+        tmp_leaf,
         GENERIC_READ | GENERIC_WRITE | WRITE_DAC | READ_CONTROL,
-        CREATE_NEW,
+        FILE_CREATE,
     )?;
     apply_restrictive_dacl(&handle)?;
     verify_restrictive_dacl(&handle)?;
@@ -638,7 +799,10 @@ pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resul
     let mut last = None;
     for attempt in 0..10 {
         match std::fs::rename(tmp, path) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                drop(dir_handle);
+                return Ok(());
+            }
             Err(e) => {
                 last = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
@@ -649,16 +813,26 @@ pub fn write_secured_file(path: &Path, tmp: &Path, contents: &[u8]) -> io::Resul
     Err(last.unwrap_or_else(|| io::Error::other("rename failed")))
 }
 
-/// Open an existing file no-follow (rejecting a reparse point), verify its DACL is the restrictive
-/// one, and return its contents. Used to read the allowlist store: a store whose ACL was widened or
-/// whose path was replaced by a reparse point is untrusted and fails closed here.
+/// Read a secured file's contents, proving it is a direct child of its **verified** parent directory.
+///
+/// The parent is opened no-follow and its restrictive DACL verified; the file is then opened
+/// *relative to that handle* (rejecting a reparse point) and its own DACL verified before the read.
+/// This closes the gap a by-path open leaves — `FILE_FLAG_OPEN_REPARSE_POINT` guards only the final
+/// component, so a junction swapped in for the parent could otherwise redirect to a file whose own
+/// DACL happens to verify ([f22]). Any widened ACL, reparse point, or unverifiable parent fails
+/// closed here, so the allowlist store refuses rather than trusting a tampered file.
 pub fn read_secured_file(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let handle = open_file(path, GENERIC_READ | READ_CONTROL, OPEN_EXISTING)?;
-    verify_restrictive_dacl(&handle)?;
-    let mut file = std::fs::File::from(handle);
+    let (dir, leaf) = split_parent_leaf(path)?;
+    let dir_handle = open_dir_no_follow(dir, false)?;
+    verify_restrictive_dacl(&dir_handle)?;
+    let file = open_child_relative(&dir_handle, leaf, GENERIC_READ | READ_CONTROL, FILE_OPEN)?;
+    verify_restrictive_dacl(&file)?;
+    let mut f = std::fs::File::from(file);
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    f.read_to_end(&mut buf)?;
+    // The parent handle is held until here so the child open above resolved within the verified dir.
+    drop(dir_handle);
     Ok(buf)
 }
 
@@ -728,5 +902,22 @@ mod tests {
         let dir = temp_dir();
         let missing = dir.join("nope.json");
         assert!(read_secured_file(&missing).is_err());
+    }
+
+    #[test]
+    fn a_file_in_an_unsecured_parent_is_refused_on_read() {
+        // [f22]/f1: the read path must verify the PARENT directory, not only the file. A file whose
+        // own contents look fine but which sits in an unsecured (default-ACL) directory must fail
+        // closed — otherwise a widened or junctioned parent could redirect the read. Here the parent
+        // is a plain directory (never create_secured_dir'd), so the parent-DACL check must reject it.
+        let dir = temp_dir();
+        let plain_parent = dir.join("plain");
+        std::fs::create_dir_all(&plain_parent).expect("mkdir");
+        let file = plain_parent.join("store.json");
+        std::fs::write(&file, b"{}").expect("write plain file");
+        assert!(
+            read_secured_file(&file).is_err(),
+            "a file under an unsecured parent directory must fail closed"
+        );
     }
 }

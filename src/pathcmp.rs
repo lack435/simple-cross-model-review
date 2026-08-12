@@ -55,6 +55,21 @@ pub fn identity_eq_str(a: &str, b: &str) -> bool {
 /// Resolved bins are absolutized at resolution time (`reviewer::resolve_bin`), so the fast path
 /// normally applies; the guard is defense in depth against a relative path reaching here.
 pub fn resolved_bin_matches(current: &Path, stored: &str) -> bool {
+    identity_path_matches(current, stored)
+}
+
+/// Whether a live path `current` and a persisted path string `stored` name the same on-disk object,
+/// **fail-closed against a case-sensitive directory** — the general form of [`resolved_bin_matches`].
+///
+/// - Byte-equal *absolute* paths: same, no I/O (identical bytes name one object).
+/// - Not even fold-equal: different.
+/// - Fold-equal but not byte-equal (or a relative path): confirmed via `same_file_on_disk`
+///   (canonicalize both), and treated as **different** if either cannot be resolved.
+///
+/// Used for authorization-path matching (launch root, profile home), where a case- or separator-only
+/// difference must not over-authorize a *different* directory on a case-sensitive volume, and a stored
+/// path that no longer resolves must fail closed rather than match by folded string alone.
+pub fn identity_path_matches(current: &Path, stored: &str) -> bool {
     let current_str = current.to_string_lossy();
     if current.is_absolute() && Path::new(stored).is_absolute() && current_str == stored {
         return true;

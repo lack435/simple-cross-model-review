@@ -58,11 +58,20 @@ pub struct AllowEntry {
 }
 
 impl AllowEntry {
-    /// Whether `self` authorizes the profile use described by `query`. All four fields must agree;
-    /// the two paths compare by filesystem identity, family and fingerprint exactly.
+    /// Whether `self` (a stored entry) authorizes the profile use described by `query` (built from the
+    /// live launch root and profile home). All four fields must agree.
+    ///
+    /// The two paths compare by **filesystem identity**, not a folded string: on a case-sensitive
+    /// directory `C:\dev\Repo` and `C:\dev\repo` are *different* objects, so a folded comparison could
+    /// let an entry for one authorize a launch from the other. [`identity_path_matches`] treats a mere
+    /// case/separator difference as a match only when both spellings resolve to the same directory on
+    /// disk, and fails closed when a stored path no longer resolves. Family and fingerprint are exact.
     fn authorizes(&self, query: &AllowEntry) -> bool {
-        crate::pathcmp::identity_eq_str(&self.launch_root, &query.launch_root)
-            && crate::pathcmp::identity_eq_str(&self.effective_home, &query.effective_home)
+        crate::pathcmp::identity_path_matches(Path::new(&query.launch_root), &self.launch_root)
+            && crate::pathcmp::identity_path_matches(
+                Path::new(&query.effective_home),
+                &self.effective_home,
+            )
             && self.reviewer_family == query.reviewer_family
             && self.account_fingerprint == query.account_fingerprint
     }
@@ -239,17 +248,45 @@ mod tests {
     }
 
     #[test]
-    fn paths_match_case_and_separator_insensitively() {
+    fn a_different_spelling_of_the_same_real_dir_matches_but_a_folded_nonexistent_one_does_not() {
+        // Identity, not folded strings: a case/separator-only difference authorizes only when both
+        // spellings resolve to the *same real directory*. Use real temp dirs so the on-disk identity
+        // check (canonicalize) has something to resolve.
         let dir = temp_dir();
+        let root = dir.join("launch");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
         let store = AllowlistStore::at(&dir);
         store
-            .authorize(entry(r"C:\Repo", r"C:\Home\Work", "codex", "acct-1"))
+            .authorize(entry(
+                &root.to_string_lossy(),
+                &home.to_string_lossy(),
+                "codex",
+                "acct-1",
+            ))
             .expect("authorize");
-        // The same paths spelled with different case/separators still match (Windows path identity),
-        // while the fingerprint stays byte-exact.
+
+        // The same real directories spelled with forward slashes still match (they resolve to the
+        // same object on disk).
+        let root_fwd = root.to_string_lossy().replace('\\', "/");
+        let home_fwd = home.to_string_lossy().replace('\\', "/");
         assert!(store
-            .is_authorized(&entry(r"c:\repo", r"c:/home/work", "codex", "acct-1"))
-            .expect("query"));
+            .is_authorized(&entry(&root_fwd, &home_fwd, "codex", "acct-1"))
+            .expect("query same dir, different spelling"));
+
+        // A *different* real directory does not match, even one that only differs in a trailing
+        // component — identity is by object, not by folded string.
+        let other = dir.join("launch2");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(!store
+            .is_authorized(&entry(
+                &other.to_string_lossy(),
+                &home.to_string_lossy(),
+                "codex",
+                "acct-1"
+            ))
+            .expect("query different dir"));
     }
 
     #[test]
