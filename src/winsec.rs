@@ -54,7 +54,11 @@ const OPEN_EXISTING: Dword = 3;
 const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
 const FILE_ATTRIBUTE_NORMAL: Dword = 0x0000_0080;
+const FILE_ATTRIBUTE_DIRECTORY: Dword = 0x0000_0010;
 const FILE_ATTRIBUTE_REPARSE_POINT: Dword = 0x0000_0400;
+// NTFS caps a path component at 255 UTF-16 units; refuse anything longer before it is cast into a
+// `USHORT`-length UNICODE_STRING (where an oversized name would silently truncate).
+const MAX_COMPONENT_UTF16: usize = 255;
 
 #[repr(C)]
 struct ByHandleFileInformation {
@@ -533,6 +537,13 @@ fn nt_open(
             "a handle-relative open requires a single path component (no separators)",
         ));
     }
+    // Bound the length before the USHORT cast below, so an oversized name cannot be silently
+    // truncated into a shorter one that opens a *different* object.
+    if name.len() > MAX_COMPONENT_UTF16 {
+        return Err(io::Error::other(
+            "path component exceeds the maximum length for a handle-relative open",
+        ));
+    }
     let byte_len = (name.len() * 2) as u16;
     let unicode = UnicodeString {
         length: byte_len,
@@ -613,7 +624,20 @@ fn open_no_follow(
             std::ptr::null_mut(),
         )
     };
-    finish_open(raw)
+    let handle = finish_open(raw)?;
+    // Require the opened object to actually be a directory when one was asked for. `create_dir`
+    // reports an existing *file* as `AlreadyExists`, and a backup-semantics open will happily open a
+    // file, so without this an explicit-home path naming a file (or, via a trailing `..`, a parent
+    // directory or drive root) could receive the restrictive DACL — the wrong object entirely (f1).
+    if is_dir {
+        let attrs = handle_attributes(&handle)?;
+        if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(io::Error::other(
+                "path is not a directory; refusing to treat it as a profile/credential directory",
+            ));
+        }
+    }
+    Ok(handle)
 }
 
 fn finish_open(raw: Handle) -> io::Result<OwnedHandle> {
@@ -622,7 +646,7 @@ fn finish_open(raw: Handle) -> io::Result<OwnedHandle> {
     }
     // SAFETY: a valid, owned handle from CreateFileW; OwnedHandle closes it exactly once on drop.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut _) };
-    if is_reparse_point(&handle)? {
+    if handle_attributes(&handle)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::other(
             "path is a reparse point (junction/symlink); refusing to treat it as a real object",
         ));
@@ -630,14 +654,15 @@ fn finish_open(raw: Handle) -> io::Result<OwnedHandle> {
     Ok(handle)
 }
 
-fn is_reparse_point(handle: &OwnedHandle) -> io::Result<bool> {
+/// The Win32 file attributes of an open handle.
+fn handle_attributes(handle: &OwnedHandle) -> io::Result<Dword> {
     let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
     // SAFETY: `handle` is valid; `info` is a correctly sized output struct.
     let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle() as Handle, &mut info) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    Ok(info.file_attributes)
 }
 
 /// Build the restrictive DACL for `sids` (each granted `FILE_ALL_ACCESS`) as an owned, DWORD-aligned

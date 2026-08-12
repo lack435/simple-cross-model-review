@@ -61,15 +61,35 @@ impl ProfileSelector {
     }
 }
 
-/// Validate a profile name: a strict safe name, so it cannot escape the profile root when joined.
+/// The maximum length of a profile name, in characters. Well under the 255-unit NTFS component cap,
+/// and generous for a human-chosen label.
+const MAX_PROFILE_NAME_LEN: usize = 64;
+
+/// Windows reserved device basenames (case-insensitive), which alias a device regardless of any
+/// extension (`NUL.txt` is still the null device). A profile directory named for one of these could
+/// be redirected or misbehave, so they are refused.
+const RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate a profile name: a strict *safe Windows path component*, so it cannot escape the profile
+/// root, alias another profile, or name a device.
 ///
-/// Grammar: one or more of `[A-Za-z0-9._-]`, and not the traversal names `.` or `..`. This rejects
-/// path separators, drive prefixes (`C:`), rooted paths, whitespace, and anything else that could
-/// turn `{base}\profiles\{reviewer}\{name}` into a path outside the root. Containment is *also*
-/// checked at resolution time; this is the first line, not the only one.
+/// Grammar: 1..=[`MAX_PROFILE_NAME_LEN`] of `[A-Za-z0-9._-]`, not the traversal names `.`/`..`, not
+/// ending in `.` (Win32 path APIs strip a trailing dot, so `work.` would alias `work` while the native
+/// `NtCreateFile` path treats them as distinct — a cross-API aliasing hazard), and whose device
+/// basename (the part before the first `.`) is not a reserved device (`CON`, `NUL`, `COM1`…). This
+/// rejects path separators, drive prefixes (`C:`), rooted paths, and whitespace by construction.
+/// Containment is *also* checked structurally at provisioning time; this is the first line.
 pub fn validate_profile_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("a profile name must not be empty".to_string());
+    }
+    if name.len() > MAX_PROFILE_NAME_LEN {
+        return Err(format!(
+            "profile name '{name}' is too long (max {MAX_PROFILE_NAME_LEN} characters)"
+        ));
     }
     if name == "." || name == ".." {
         return Err(format!(
@@ -83,6 +103,21 @@ pub fn validate_profile_name(name: &str) -> Result<(), String> {
         return Err(format!(
             "invalid character {bad:?} in profile name '{name}' (allowed: letters, digits, '.', \
              '_', '-')"
+        ));
+    }
+    if name.ends_with('.') {
+        return Err(format!(
+            "profile name '{name}' must not end in '.' (Windows would strip it, aliasing another \
+             profile)"
+        ));
+    }
+    let device_base = name.split('.').next().unwrap_or(name);
+    if RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|reserved| device_base.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!(
+            "profile name '{name}' is a reserved Windows device name"
         ));
     }
     Ok(())
@@ -245,17 +280,37 @@ pub fn secure_profile_dir(
             Ok(SecuredProfileDir { path, handle: leaf })
         }
         ProfileSelector::ExplicitHome(p) => {
+            use std::path::Component;
             if p.as_os_str().is_empty() || !p.is_absolute() {
                 return Err(io::Error::other(
                     "--codex-home / --claude-config-dir requires a non-empty absolute path",
                 ));
             }
+            // The path must name a real *directory leaf*, not a root/prefix, and contain no `.`/`..`
+            // component: `create_secured_dir` reports an existing file as already-present and a
+            // trailing `..` resolves to a parent or the drive root, either of which would otherwise
+            // receive the restrictive DACL — the wrong object (f1). The directory attribute is also
+            // verified on the opened handle inside `create_secured_dir`.
+            if p.components()
+                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+            {
+                return Err(io::Error::other(
+                    "--codex-home / --claude-config-dir must not contain '.' or '..' components",
+                ));
+            }
+            if !matches!(p.components().next_back(), Some(Component::Normal(_))) {
+                return Err(io::Error::other(
+                    "--codex-home / --claude-config-dir must name a directory, not a drive root",
+                ));
+            }
+            // Reject a reparse point on any existing original ancestor **before** creating anything:
+            // creating the tail first could follow a junctioned ancestor and mutate the redirected
+            // target before we ever error (f3). There is a documented residual ancestor TOCTOU for
+            // this local/trusted-only escape hatch; the leaf itself is created and verified by handle.
+            crate::winsec::reject_reparse_on_ancestors(p)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Reject a reparse point on any original ancestor (checked before the handle-based create
-            // below canonicalizes), then create and lock the leaf itself by handle.
-            crate::winsec::reject_reparse_on_ancestors(p)?;
             let handle = crate::winsec::create_secured_dir(p)?;
             Ok(SecuredProfileDir {
                 path: p.clone(),
@@ -271,11 +326,23 @@ mod tests {
 
     #[test]
     fn safe_names_accept_and_reject() {
-        for ok in ["work", "personal", "acme-corp", "a.b_c-1", "A1"] {
+        for ok in [
+            "work",
+            "personal",
+            "acme-corp",
+            "a.b_c-1",
+            "A1",
+            "con-fig",
+            "nullish",
+        ] {
             assert!(validate_profile_name(ok).is_ok(), "{ok} should be valid");
         }
+        let too_long = "a".repeat(MAX_PROFILE_NAME_LEN + 1);
         for bad in [
-            "", ".", "..", "a/b", "a\\b", "..\\x", "C:x", "a b", "a:b", "a*b",
+            "", ".", "..", "...", "a/b", "a\\b", "..\\x", "C:x", "a b", "a:b", "a*b",
+            // Trailing-dot aliases (Win32 strips the dot); reserved device names, with or without an
+            // extension and any case; and an over-length name.
+            "work.", "CON", "con", "nul.txt", "COM1", "LPT9", "aux", &too_long,
         ] {
             assert!(
                 validate_profile_name(bad).is_err(),
@@ -417,6 +484,34 @@ mod tests {
     fn secure_profile_dir_explicit_home_rejects_a_relative_path() {
         assert!(secure_profile_dir(
             &ProfileSelector::ExplicitHome(PathBuf::from(r"rel\home")),
+            ReviewerKind::Claude,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_rejects_a_file_target() {
+        // An explicit home naming an existing *file* must not have the restrictive DACL applied to it
+        // (or to a directory reached via a trailing `..`) — it must be a real directory leaf (f1).
+        let base = temp_dir();
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").expect("write file");
+        assert!(secure_profile_dir(
+            &ProfileSelector::ExplicitHome(file),
+            ReviewerKind::Claude,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secure_profile_dir_explicit_home_rejects_a_dotdot_component() {
+        let base = temp_dir();
+        // `{base}\sub\..` resolves to `{base}` — locking that would be the wrong object (f1).
+        let sneaky = base.join("sub").join("..");
+        assert!(secure_profile_dir(
+            &ProfileSelector::ExplicitHome(sneaky),
             ReviewerKind::Claude,
             None,
         )
