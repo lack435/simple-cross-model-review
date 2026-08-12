@@ -9,7 +9,7 @@ pub mod codex;
 #[cfg(test)]
 mod argv_tests;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -475,6 +475,241 @@ fn wait_quiescent(job: &crate::winjob::JobObject) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run a vendor login that uses a **code-paste** flow (Claude's `auth login`): the browser shows an
+/// authorization code the human must paste back into the login's **stdin**, rather than redirecting to
+/// a localhost callback (#15 part 3b). Same containment/redaction posture as [`run_login`], plus the
+/// interactive plumbing:
+///
+/// - The child runs in the login job (creation-time association) with stdin/stdout/stderr **piped**.
+/// - Background scanners drain stdout+stderr (so the child never blocks on a full pipe) and extract the
+///   vendor's **authorization URL** — the *only* thing taken from that output; the raw stream is never
+///   logged or returned (it carries the URL's `state`/PKCE, redaction f-r2.7).
+/// - A loopback [`crate::codeentry::CodeEntryServer`] shows the human that URL and a field to paste the
+///   code; the submitted code is written to the child's stdin and never logged.
+/// - Cancellation, an overall timeout, quiescence, and `uncontained` are handled exactly as in
+///   [`run_login`]; on any abort the job is terminated-and-settled and staging is left for recovery.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn run_login_code_paste(
+    mut command: Command,
+    scratch_cwd: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> LoginOutcome {
+    command
+        .current_dir(scratch_cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let fail = LoginOutcome::default();
+
+    let Some(job) = crate::winjob::JobObject::new() else {
+        return fail;
+    };
+    let mut child = match job.spawn_in_job(&mut command) {
+        Ok(c) => c,
+        Err(_) => return fail,
+    };
+    let url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut scanners = Vec::new();
+    if let Some(o) = child.stdout.take() {
+        scanners.push(spawn_url_scanner(o, Arc::clone(&url)));
+    }
+    if let Some(e) = child.stderr.take() {
+        scanners.push(spawn_url_scanner(e, Arc::clone(&url)));
+    }
+    let mut stdin = child.stdin.take();
+    let deadline = Instant::now() + timeout;
+
+    // Phase 1: wait for the authorization URL to appear in the child's output.
+    let auth_url = loop {
+        if let Some(u) = url.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            break u;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline || matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            // Timed out, or the child exited before printing a URL — a failed login.
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: Instant::now() >= deadline,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+
+    // Phase 2: show the URL + a code field on a loopback page and wait for the human's code.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let server = match crate::codeentry::CodeEntryServer::start(
+        "Finish signing in your reviewer profile",
+        &auth_url,
+        remaining,
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                uncontained: !contained,
+                ..fail
+            };
+        }
+    };
+    let _ = crate::approval::open_in_browser(server.url());
+    eprintln!(
+        "cross-review: after signing in, paste the code on this local page to finish:\n  {}",
+        server.url()
+    );
+
+    let code = loop {
+        match server.poll() {
+            Some(crate::codeentry::CodeOutcome::Submitted(c)) => break c,
+            Some(_) => {
+                // The page timed out or was cancelled.
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    timed_out: Instant::now() >= deadline,
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+            None => {}
+        }
+        if cancel.load(Ordering::SeqCst) {
+            server.cancel();
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline || matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            server.cancel();
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: Instant::now() >= deadline,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+
+    // Feed the code to the child's stdin, then close stdin (EOF) and stop the page.
+    if let Some(si) = stdin.as_mut() {
+        let _ = si.write_all(code.as_bytes());
+        let _ = si.write_all(b"\n");
+        let _ = si.flush();
+    }
+    drop(stdin);
+    drop(server);
+
+    // Phase 3: wait (bounded) for the child to exchange the code, write credentials, and exit.
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(_) => {
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    for s in scanners {
+        let _ = s.join();
+    }
+    if !wait_quiescent(&job) {
+        let contained = terminate_and_settle(&job, &mut child);
+        return LoginOutcome {
+            exit: exit_code,
+            uncontained: !contained,
+            ..fail
+        };
+    }
+    LoginOutcome {
+        success: exit_code == Some(0),
+        exit: exit_code,
+        ..fail
+    }
+}
+
+/// Drain `reader` (a child stdout/stderr pipe) so the child never blocks on a full pipe, scanning for
+/// the first `https://…` authorization URL and storing it in `url`. The buffered output is bounded and
+/// **never logged or returned** — only the extracted URL is surfaced.
+#[allow(dead_code)] // reached via run_login_code_paste, whose caller lands with the setup flow.
+fn spawn_url_scanner<R: Read + Send + 'static>(
+    mut reader: R,
+    url: Arc<Mutex<Option<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut acc = String::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    let mut slot = url.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        if let Some(found) = extract_https_url(&acc) {
+                            *slot = Some(found);
+                        }
+                    }
+                    drop(slot);
+                    // Keep the buffer bounded: retain a tail large enough to hold a split URL.
+                    if acc.len() > 64 * 1024 {
+                        acc = acc.split_off(acc.len() - 8192);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Extract the first `https://…` URL from `text`, ending at whitespace/control. `None` until a
+/// plausibly-complete one is present.
+fn extract_https_url(text: &str) -> Option<String> {
+    let start = text.find("https://")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c.is_control() || c == '"' || c == '<')
+        .unwrap_or(rest.len());
+    // Only accept a URL that has clearly ended (a delimiter followed), so we do not grab a prefix that
+    // is still being written; and require a minimum length.
+    if end < rest.len() && end > "https://a.b/".len() {
+        Some(rest[..end].to_string())
+    } else {
+        None
     }
 }
 
@@ -2064,6 +2299,24 @@ mod controlled_env_tests {
             &AtomicBool::new(false),
         );
         assert!(!out.success && out.exit == Some(3));
+    }
+
+    #[test]
+    fn extract_https_url_finds_a_complete_url_only() {
+        // A complete URL followed by a delimiter is extracted; a still-being-written prefix is not.
+        let claude = "Opening browser to sign in…\nIf the browser didn't open, visit: \
+                      https://claude.com/cai/oauth/authorize?code=true&state=abc\nPaste code here > ";
+        assert_eq!(
+            extract_https_url(claude).as_deref(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&state=abc")
+        );
+        // No delimiter yet (URL may still be streaming) -> None.
+        assert_eq!(
+            extract_https_url("visit: https://claude.com/cai/oauth"),
+            None
+        );
+        // No URL at all.
+        assert_eq!(extract_https_url("Opening browser to sign in…\n"), None);
     }
 
     #[test]
