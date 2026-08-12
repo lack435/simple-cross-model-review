@@ -31,8 +31,9 @@ impl Reviewer for CodexReviewer {
         // Profile: refuse an unauthorized non-ambient profile (the `?`); for an authorized one, run
         // the check in a controlled environment against that home so it verifies the *profile*
         // account. Ambient leaves the environment untouched.
-        if let Some(home) = cfg.resolve_authorized_home(spec)? {
-            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &home);
+        let home = cfg.resolve_authorized_home(spec)?;
+        if let Some(home) = &home {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
         }
         cmd.arg("login").arg("status");
         let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
@@ -52,6 +53,19 @@ impl Reviewer for CodexReviewer {
         // signed-in user as unauthenticated.
         if !out.success {
             return Err(errors::not_authenticated("codex", out.diagnostics()));
+        }
+        // Profile identity: liveness alone (signed-in) is not enough for a profile -- confirm the
+        // home's auth is a subscription and resolves to its authorized account before it is used.
+        // Ambient skips this (no profile to verify). See `docs/reviewer-account-profiles-impl.md`.
+        if let Some(home) = &home {
+            let resolved = codex_resolve_identity(home)?;
+            let expected = codex_account_id(home).ok_or_else(|| {
+                errors::profile_identity_mismatch(
+                    "codex",
+                    "the profile home has no readable account id",
+                )
+            })?;
+            super::assert_profile_identity("codex", &resolved, &expected)?;
         }
         let reported = out
             .diagnostics()
@@ -412,6 +426,40 @@ fn ambient_codex_home() -> Option<std::path::PathBuf> {
 /// when no home can be resolved.
 fn codex_home(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::PathBuf> {
     super::home_for_reads(cfg, spec, ambient_codex_home)
+}
+
+/// Resolve a Codex profile home's account + auth method from `$CODEX_HOME/auth.json` (pure,
+/// file-based — the airtight controlled env guarantees this is the file the reviewer uses).
+/// `auth_mode == "chatgpt"` is the subscription method; `tokens.account_id` is the account. A
+/// missing, unreadable, or unrecognised file **fails closed** (`Err`), never a silent pass. Verified
+/// against Codex CLI 0.144.5; the shape is version-pinned so a drift refuses. See
+/// `docs/reviewer-account-profiles-impl.md`.
+fn codex_resolve_identity(home: &Path) -> Result<super::ResolvedIdentity, Failure> {
+    let bytes = std::fs::read(home.join("auth.json")).map_err(|e| {
+        errors::profile_identity_mismatch(
+            "codex",
+            &format!("could not read the profile auth file: {e}"),
+        )
+    })?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        errors::profile_identity_mismatch("codex", "the profile auth file is not valid JSON")
+    })?;
+    let account = v
+        .get("tokens")
+        .and_then(|t| t.get("account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            errors::profile_identity_mismatch(
+                "codex",
+                "the profile auth file has no tokens.account_id",
+            )
+        })?
+        .to_string();
+    let method = match v.get("auth_mode").and_then(Value::as_str) {
+        Some("chatgpt") => super::AuthMethod::Subscription,
+        _ => super::AuthMethod::Other,
+    };
+    Ok(super::ResolvedIdentity { account, method })
 }
 
 /// Read `tokens.account_id` from `$CODEX_HOME/auth.json`. Returns `None` on any miss so the gate
@@ -825,6 +873,43 @@ mod tests {
         .unwrap();
         assert_eq!(codex_account_id(&dir), Some("acct-123".to_string()));
         assert_eq!(codex_account_id(&dir.join("nope")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_resolve_identity_reads_method_and_account() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-codex-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Subscription (chatgpt) with an account id.
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-9"}}"#,
+        )
+        .unwrap();
+        let id = codex_resolve_identity(&dir).unwrap();
+        assert_eq!(id.account, "acct-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+        // An API-key mode resolves to Other (refused upstream).
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","tokens":{"account_id":"acct-9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_resolve_identity(&dir).unwrap().method,
+            AuthMethod::Other
+        );
+        // A missing account id fails closed.
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_resolve_identity(&dir).unwrap_err().code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

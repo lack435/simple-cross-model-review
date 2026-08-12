@@ -37,8 +37,9 @@ impl Reviewer for ClaudeReviewer {
         // run the check in a controlled environment against that home, so it verifies the *profile*
         // account rather than whatever the ambient environment resolves to. Ambient leaves the
         // environment untouched -- byte-for-byte today's behaviour.
-        if let Some(home) = cfg.resolve_authorized_home(spec)? {
-            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home);
+        let home = cfg.resolve_authorized_home(spec)?;
+        if let Some(home) = &home {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
         }
         if cfg.isolate_reviewer {
             cmd.arg("--safe-mode");
@@ -64,6 +65,20 @@ impl Reviewer for ClaudeReviewer {
                 .unwrap_or(false);
             if !logged_in {
                 return Err(errors::not_authenticated("claude", out.diagnostics()));
+            }
+            let status = Value::Object(map.clone());
+            // Profile identity: liveness alone is not enough for a profile -- confirm the home's auth
+            // is a subscription (claude.ai first-party) and resolves to its authorized account before
+            // it is used. Ambient skips this (no profile to verify).
+            if let Some(home) = &home {
+                let resolved = claude_resolve_identity(&status, &home.join(".claude.json"))?;
+                let expected = claude_account_id(&home.join(".claude.json")).ok_or_else(|| {
+                    errors::profile_identity_mismatch(
+                        "claude",
+                        "the profile config file has no oauth account uuid",
+                    )
+                })?;
+                super::assert_profile_identity("claude", &resolved, &expected)?;
             }
             let method = map
                 .get("authMethod")
@@ -500,6 +515,45 @@ fn claude_account_id(path: &Path) -> Option<String> {
     Some(format!("{org}/{uuid}"))
 }
 
+/// Resolve a Claude profile home's account + auth method: the **method** from the `auth status` JSON
+/// already obtained (`authMethod == "claude.ai"` + `apiProvider == "firstParty"` is the subscription),
+/// the **account** (authoritative) from `.claude.json` via [`claude_account_id`]. As a CLI-side
+/// cross-check, the org the CLI reports (`orgId`) must match the org uuid in the file (the prefix of
+/// the fingerprint); a mismatch means the CLI resolved a different account than the file, so it
+/// **fails closed**. Verified against Claude Code `auth status` (keys `authMethod`, `subscriptionType`,
+/// `apiProvider`, `orgId`, `email`); version-pinned so an unrecognised shape refuses. See
+/// `docs/reviewer-account-profiles-impl.md`.
+fn claude_resolve_identity(
+    auth_status: &Value,
+    config_path: &Path,
+) -> Result<super::ResolvedIdentity, Failure> {
+    let account = claude_account_id(config_path).ok_or_else(|| {
+        errors::profile_identity_mismatch(
+            "claude",
+            "the profile config file has no oauth account uuid",
+        )
+    })?;
+    let method = match (
+        auth_status.get("authMethod").and_then(Value::as_str),
+        auth_status.get("apiProvider").and_then(Value::as_str),
+    ) {
+        (Some("claude.ai"), Some("firstParty")) => super::AuthMethod::Subscription,
+        _ => super::AuthMethod::Other,
+    };
+    // CLI-side org cross-check: the fingerprint is "{orgUuid}/{accountUuid}", so `orgId` from the
+    // CLI must be that prefix. Only enforced when both are present -- an absent orgId is not treated
+    // as a mismatch (the account equality remains the primary check upstream).
+    if let Some(cli_org) = auth_status.get("orgId").and_then(Value::as_str) {
+        if !account.starts_with(&format!("{cli_org}/")) {
+            return Err(errors::profile_identity_mismatch(
+                "claude",
+                "the organization the CLI reports does not match the profile config file",
+            ));
+        }
+    }
+    Ok(super::ResolvedIdentity { account, method })
+}
+
 /// The last `rate_limit_event.rate_limit_info` object in a `stream-json` stream, if any. Scans
 /// JSONL lines and keeps the last match (the freshest reading). Non-JSON and other event types
 /// are skipped.
@@ -661,6 +715,49 @@ mod tests {
         .unwrap();
         assert_eq!(claude_account_id(&path), Some("org-1/acc-9".to_string()));
         assert_eq!(claude_account_id(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_resolve_identity_checks_method_and_org() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(".claude.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"oauthAccount":{"accountUuid":"acc-9","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        let status = |json: &str| serde_json::from_str::<Value>(json).unwrap();
+        // Subscription (claude.ai / firstParty), org matches the file.
+        let id = claude_resolve_identity(
+            &status(r#"{"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-1"}"#),
+            &cfg_path,
+        )
+        .unwrap();
+        assert_eq!(id.account, "org-1/acc-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+        // An API-key method resolves to Other.
+        assert_eq!(
+            claude_resolve_identity(
+                &status(r#"{"authMethod":"apiKey","apiProvider":"firstParty","orgId":"org-1"}"#),
+                &cfg_path,
+            )
+            .unwrap()
+            .method,
+            AuthMethod::Other
+        );
+        // The CLI reporting a different org than the file fails closed.
+        assert_eq!(
+            claude_resolve_identity(
+                &status(r#"{"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-2"}"#),
+                &cfg_path,
+            )
+            .unwrap_err()
+            .code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

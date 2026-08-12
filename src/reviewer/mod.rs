@@ -340,6 +340,58 @@ pub fn home_for_reads(
     }
 }
 
+/// Whether a profile home's authentication is the subscription OAuth — the only method a profile may
+/// use — or something else (an API key, an unrecognised method) that must be refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// Codex ChatGPT (`auth_mode == "chatgpt"`) / Claude claude.ai first-party subscription.
+    Subscription,
+    /// An API key or an unrecognised method: never valid for a profile.
+    Other,
+}
+
+/// The account and auth method a profile home resolves to, established **pre-spawn** from local
+/// surfaces (the auth file, the CLI's own `auth status` machine output) — never the model's prose.
+/// The fail-closed confirmation that the controlled environment routed the reviewer to the intended
+/// subscription account. See `docs/reviewer-account-profiles-impl.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    /// The account fingerprint the home resolves to (the same value `account_fingerprint` reads).
+    pub account: String,
+    /// Whether that home's auth is the subscription OAuth.
+    pub method: AuthMethod,
+}
+
+/// Assert a profile home's resolved identity is usable for `expected_account`: the method is the
+/// subscription OAuth, **and** the account matches exactly.
+///
+/// Fail-closed — a non-subscription method or any account mismatch refuses, so a review never runs
+/// under the wrong credential. `expected_account` is the account the routing already authorized: at
+/// the auth-check it is the profile home's own fingerprint (a method + self-consistency check); once
+/// the allowlist exists it is the *authorized* account from the allowlist entry, so a profile
+/// silently re-logged to a different account is caught here.
+pub fn assert_profile_identity(
+    reviewer: &str,
+    resolved: &ResolvedIdentity,
+    expected_account: &str,
+) -> Result<(), Failure> {
+    if resolved.method != AuthMethod::Subscription {
+        return Err(errors::profile_identity_mismatch(
+            reviewer,
+            "the profile home's authentication is not a subscription sign-in (it is an API key or \
+             an unrecognised method); a profile must be a subscription account",
+        ));
+    }
+    if resolved.account != expected_account {
+        return Err(errors::profile_identity_mismatch(
+            reviewer,
+            "the account the profile home resolves to is not the account authorized for this \
+             profile; it may have been re-logged to a different account",
+        ));
+    }
+    Ok(())
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = normalize_windows_path(path);
     let root = normalize_windows_path(root);
@@ -1721,6 +1773,25 @@ mod controlled_env_tests {
                 "unexpected key in controlled env: {k}"
             );
         }
+    }
+
+    #[test]
+    fn assert_profile_identity_requires_subscription_and_matching_account() {
+        let sub = ResolvedIdentity {
+            account: "acct-1".to_string(),
+            method: AuthMethod::Subscription,
+        };
+        assert!(assert_profile_identity("codex", &sub, "acct-1").is_ok());
+        // A different account refuses.
+        let e = assert_profile_identity("codex", &sub, "acct-2").unwrap_err();
+        assert_eq!(e.code, "PROFILE_IDENTITY_MISMATCH");
+        // A non-subscription method refuses even with a matching account.
+        let apikey = ResolvedIdentity {
+            account: "acct-1".to_string(),
+            method: AuthMethod::Other,
+        };
+        let e = assert_profile_identity("codex", &apikey, "acct-1").unwrap_err();
+        assert_eq!(e.code, "PROFILE_IDENTITY_MISMATCH");
     }
 
     #[test]

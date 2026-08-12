@@ -80,6 +80,23 @@ fn truncate(s: &str, max: usize) -> String {
 // Constructors, one per failure mode the calling agent can encounter.
 // ---------------------------------------------------------------------------
 
+/// A profile home resolved to the wrong account or a non-subscription method at the pre-spawn
+/// identity check. Fail-closed: the review is refused rather than run under an unexpected credential.
+pub fn profile_identity_mismatch(reviewer: &str, detail: &str) -> Failure {
+    Failure::new(
+        "PROFILE_IDENTITY_MISMATCH",
+        format!(
+            "The '{reviewer}' reviewer's account profile did not resolve to the expected \
+             subscription account."
+        ),
+        format!(
+            "The cross-model review tool refused the review because the profile's account identity \
+             check failed: {detail}. Re-run setup for this profile, or verify it is signed in to \
+             the intended subscription account."
+        ),
+    )
+}
+
 /// A reviewer entry names an account profile that is not authorized for this working root.
 ///
 /// The profile mechanism refuses a named profile (or explicit home) until the machine has
