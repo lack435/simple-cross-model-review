@@ -2182,6 +2182,25 @@ impl Job {
         // has no profile account (`Ok(None)`) and is never guarded, so its behaviour is unchanged.
         let authorized_start = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
 
+        // Per-spawn identity + method probe [f2/f3]: run the full probe (account **and** auth method)
+        // before every non-ambient spawn, never cached — the liveness gate in `auth_check` is process-
+        // cached, so a same-account method downgrade (e.g. ChatGPT → API key) since the preflight would
+        // otherwise slip through. Assert against the account the allowlist authorized, so a re-login is
+        // caught here too, before the review child starts. Ambient (no home) is not probed.
+        if let Some(authorized_start) = &authorized_start {
+            let resolved = self.reviewer.resolve_home_identity(
+                &self.bin,
+                &self.cfg,
+                &authorized_start.home,
+                &self.cancel,
+            )?;
+            crate::reviewer::assert_profile_identity(
+                self.spec.reviewer.as_str(),
+                &resolved,
+                &authorized_start.account,
+            )?;
+        }
+
         // --no-preamble means "send my instructions with nothing added", so it has to
         // suppress the capability section too, not just the preamble. It does not
         // suppress the change: that is evidence the reviewer cannot fetch, not framing

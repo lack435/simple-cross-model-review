@@ -29,12 +29,14 @@ impl Reviewer for CodexReviewer {
         // what it is checking.
         cmd.current_dir(super::neutral_dir(cfg));
         // Profile: refuse an unauthorized non-ambient profile (the `?`); for an authorized one, run
-        // the check in a controlled environment against that home so it verifies the *profile*
-        // account. Ambient leaves the environment untouched. The authorized account is captured here
-        // so the identity assertion below can compare against *it* rather than a fresh self-read.
-        let authorized = cfg.resolve_authorized_home_with_account(spec)?;
-        if let Some(authorized) = &authorized {
-            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &authorized.home);
+        // the liveness check in a controlled environment against that home. This is only a *liveness*
+        // gate (signed-in), which is cacheable; the identity + auth-method assertion is NOT done here —
+        // it must re-run on every spawn (a cached subscription check could miss a later method
+        // downgrade), so it lives in the per-spawn preflight in the worker. Ambient leaves the
+        // environment untouched.
+        let home = cfg.resolve_authorized_home(spec)?;
+        if let Some(home) = &home {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
         }
         cmd.arg("login").arg("status");
         let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
@@ -54,15 +56,6 @@ impl Reviewer for CodexReviewer {
         // signed-in user as unauthenticated.
         if !out.success {
             return Err(errors::not_authenticated("codex", out.diagnostics()));
-        }
-        // Profile identity: liveness alone (signed-in) is not enough for a profile -- confirm the
-        // home's auth is a subscription and *still* resolves to the account the allowlist authorized
-        // (not a fresh self-read of the home, which would be tautological). A profile silently
-        // re-logged to a different account since it was authorized is caught here. Ambient skips this
-        // (no profile to verify). See `docs/reviewer-account-profiles-impl.md`.
-        if let Some(authorized) = &authorized {
-            let resolved = codex_resolve_identity(&authorized.home)?;
-            super::assert_profile_identity("codex", &resolved, &authorized.account)?;
         }
         let reported = out
             .diagnostics()
@@ -391,6 +384,18 @@ impl Reviewer for CodexReviewer {
     /// Read `tokens.account_id` straight from `home/auth.json`, without the authorization seam.
     fn fingerprint_at(&self, home: &Path) -> Option<String> {
         codex_account_id(home)
+    }
+
+    /// The per-spawn identity+method probe: read the home's `auth.json` (no CLI call). Fails closed on
+    /// a missing/unreadable/unrecognised file. Runs on every profile spawn, never cached.
+    fn resolve_home_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        home: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        codex_resolve_identity(home)
     }
 }
 
@@ -910,6 +915,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             codex_resolve_identity(&dir).unwrap_err().code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_home_identity_is_the_per_spawn_probe_and_asserts_against_the_authorized_account() {
+        use crate::reviewer::Reviewer;
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!("cr-codex-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let cfg = cfg();
+        let cancel = AtomicBool::new(false);
+        // The per-spawn probe (trait method) reads the home and, combined with the assertion, passes
+        // for the authorized account and refuses a different one — this is the worker's per-spawn path.
+        let resolved = CodexReviewer
+            .resolve_home_identity(Path::new("codex.exe"), &cfg, &dir, &cancel)
+            .expect("resolve");
+        assert!(crate::reviewer::assert_profile_identity("codex", &resolved, "acct-1").is_ok());
+        assert_eq!(
+            crate::reviewer::assert_profile_identity("codex", &resolved, "acct-2")
+                .unwrap_err()
+                .code,
             "PROFILE_IDENTITY_MISMATCH"
         );
         std::fs::remove_dir_all(&dir).ok();

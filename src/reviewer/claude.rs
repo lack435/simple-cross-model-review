@@ -26,31 +26,14 @@ impl Reviewer for ClaudeReviewer {
         spec: &ReviewerSpec,
         cancel: &AtomicBool,
     ) -> Result<String, Failure> {
-        let mut cmd = Command::new(bin);
-        // Isolated and run outside the project, like `invocation`. The stated policy is
-        // that the reviewer CLI never loads the reviewed repository's configuration, and
-        // this preflight -- which runs before every review and on every status call -- was
-        // the one invocation that broke it by construction, inheriting the project as its
-        // working directory with no isolation flags.
-        cmd.current_dir(super::neutral_dir(cfg));
-        // Profile: refuse an unauthorized non-ambient profile (the `?`), and for an authorized one
-        // run the check in a controlled environment against that home, so it verifies the *profile*
-        // account rather than whatever the ambient environment resolves to. Ambient leaves the
-        // environment untouched -- byte-for-byte today's behaviour.
-        // The authorized account is captured here so the identity assertion below compares against
-        // *it* rather than a fresh self-read of the home (which would be tautological).
-        let authorized = cfg.resolve_authorized_home_with_account(spec)?;
-        if let Some(authorized) = &authorized {
-            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &authorized.home);
-        }
-        if cfg.isolate_reviewer {
-            cmd.arg("--safe-mode");
-            cmd.arg("--strict-mcp-config");
-        }
-        cmd.arg("auth").arg("status");
-        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
-            errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
-        })?;
+        // Profile: refuse an unauthorized non-ambient profile (the `?`), and for an authorized one run
+        // the check in a controlled environment against that home. This is only a *liveness* gate
+        // (signed-in), which is cacheable; the identity + auth-method assertion is NOT done here — it
+        // must re-run on every spawn (a cached subscription check could miss a later method downgrade),
+        // so it lives in the per-spawn preflight in the worker. Ambient leaves the environment
+        // untouched -- byte-for-byte today's behaviour.
+        let home = cfg.resolve_authorized_home(spec)?;
+        let out = run_auth_status(bin, cfg, home.as_deref(), cancel)?;
 
         // A cancelled probe reports CANCELLED, not a misclassified auth failure: `run` kills the
         // child on cancellation, leaving `success` false and the output partial, which the checks
@@ -67,17 +50,6 @@ impl Reviewer for ClaudeReviewer {
                 .unwrap_or(false);
             if !logged_in {
                 return Err(errors::not_authenticated("claude", out.diagnostics()));
-            }
-            let status = Value::Object(map.clone());
-            // Profile identity: liveness alone is not enough for a profile -- confirm the home's auth
-            // is a subscription (claude.ai first-party) and *still* resolves to the account the
-            // allowlist authorized (not a fresh self-read, which would be tautological). A profile
-            // silently re-logged to a different account since it was authorized is caught here.
-            // Ambient skips this (no profile to verify).
-            if let Some(authorized) = &authorized {
-                let resolved =
-                    claude_resolve_identity(&status, &authorized.home.join(".claude.json"))?;
-                super::assert_profile_identity("claude", &resolved, &authorized.account)?;
             }
             let method = map
                 .get("authMethod")
@@ -247,6 +219,56 @@ impl Reviewer for ClaudeReviewer {
     fn fingerprint_at(&self, home: &Path) -> Option<String> {
         claude_account_id(&home.join(".claude.json"))
     }
+
+    /// The per-spawn identity+method probe: run `claude auth status` under the controlled environment
+    /// against `home` (for the method), and read the account from `home/.claude.json`. Runs on every
+    /// profile spawn, never cached. A cancelled probe reports CANCELLED; unrecognised output fails
+    /// closed.
+    fn resolve_home_identity(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        home: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let out = run_auth_status(bin, cfg, Some(home), cancel)?;
+        if out.cancelled {
+            return Err(errors::cancelled());
+        }
+        let status: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
+            errors::profile_identity_mismatch(
+                "claude",
+                "the profile `auth status` output was not valid JSON",
+            )
+        })?;
+        claude_resolve_identity(&status, &home.join(".claude.json"))
+    }
+}
+
+/// Run `claude auth status` for `home` (an authorized profile home, or `None` for ambient) under the
+/// same isolation and controlled environment a review uses, returning the raw outcome. Shared by the
+/// liveness gate in [`auth_check`](ClaudeReviewer::auth_check) and the per-spawn identity probe in
+/// [`resolve_home_identity`](ClaudeReviewer::resolve_home_identity) so both run the CLI identically.
+fn run_auth_status(
+    bin: &Path,
+    cfg: &Config,
+    home: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<RunOutcome, Failure> {
+    let mut cmd = Command::new(bin);
+    // Isolated and run outside the project, like `invocation`: the reviewer CLI must never load the
+    // reviewed repository's configuration, and this runs before every review and on every status call.
+    cmd.current_dir(super::neutral_dir(cfg));
+    if let Some(home) = home {
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
+    }
+    if cfg.isolate_reviewer {
+        cmd.arg("--safe-mode");
+        cmd.arg("--strict-mcp-config");
+    }
+    cmd.arg("auth").arg("status");
+    super::run(cmd, "", Duration::from_secs(30), cancel)
+        .map_err(|e| errors::spawn_failed("claude", &bin.display().to_string(), e.to_string()))
 }
 
 /// Turn a Claude result document — from the buffered `json` path or the terminal `result`

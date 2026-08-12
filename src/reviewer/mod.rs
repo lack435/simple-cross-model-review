@@ -698,6 +698,25 @@ pub trait Reviewer: Send + Sync {
         None
     }
 
+    /// The per-spawn profile identity + auth-method probe: resolve the account and method a profile
+    /// `home` currently presents, from local surfaces (Codex `auth.json`; Claude `auth status` + the
+    /// account file). Runs **before every non-ambient spawn** and by the setup confirmation (#15) —
+    /// **never cached**, because a cached subscription assertion could miss a later same-account
+    /// auth-method downgrade (`[f2/f3]`). The caller passes the result to [`assert_profile_identity`]
+    /// against the authorized account. Default fails closed for an adapter with no probe.
+    fn resolve_home_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        _home: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<ResolvedIdentity, Failure> {
+        Err(errors::profile_identity_mismatch(
+            "reviewer",
+            "no profile identity probe is implemented for this reviewer",
+        ))
+    }
+
     /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
     /// `MAX_OUTPUT_BYTES`; the armed Claude path raises the byte cap, adds a line cap, and asks
     /// the runner to *terminate* the child at either bound (because `stream-json` carries the
