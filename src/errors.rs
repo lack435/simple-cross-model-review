@@ -80,6 +80,31 @@ fn truncate(s: &str, max: usize) -> String {
 // Constructors, one per failure mode the calling agent can encounter.
 // ---------------------------------------------------------------------------
 
+/// A reviewer entry names an account profile that is not authorized for this working root.
+///
+/// The profile mechanism refuses a named profile (or explicit home) until the machine has
+/// authorized *this* repository to use it — a review must not silently route through, or expose the
+/// credentials of, an account the user never approved for this code. See
+/// `docs/reviewer-account-profiles.md`. (In the current phase every non-ambient profile is refused,
+/// pending the setup/authorization flow.)
+pub fn profile_not_authorized(reviewer: &str, profile: &str) -> Failure {
+    Failure::new(
+        "PROFILE_NOT_AUTHORIZED",
+        format!(
+            "The '{reviewer}' reviewer is configured to use account profile '{profile}', which this \
+             machine has not authorized for this repository."
+        ),
+        format!(
+            "The cross-model review tool cannot run because the '{reviewer}' reviewer's account \
+             profile '{profile}' is not authorized for this working directory.\n\n\
+             Authorizing a repository to use a profile is a deliberate, per-machine step (its \
+             credentials become reachable to the reviewer), so it cannot be granted from repository \
+             configuration alone. Set the profile up and authorize this repository for it, then \
+             retry."
+        ),
+    )
+}
+
 pub fn cli_not_found(reviewer: &str, tried: &[String]) -> Failure {
     let install = match reviewer {
         "codex" => "npm install -g @openai/codex   (or install the Codex desktop app)",

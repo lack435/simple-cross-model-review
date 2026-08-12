@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::profile::ProfileSelector;
 use crate::reviewer::HeadroomLevel;
 use crate::vcs::DiffMode;
 
@@ -120,6 +121,11 @@ pub struct ReviewerSpec {
     /// so a duplicate that differs only by minimum is still a duplicate and editing a threshold
     /// between runs does not break resume. See `docs/usage-remaining-gate.md`.
     pub usage_minimum: UsageMinimum,
+    /// Which config home — and thus which account — this entry's reviewer runs under. Part of the
+    /// entry's *identity* (like `bin`, which can distinguish an account): a fallback entry carries
+    /// its own, duplicate detection and resume matching include it. `Ambient` is today's behaviour
+    /// (inherit the environment). See `docs/reviewer-account-profiles.md`.
+    pub profile: ProfileSelector,
 }
 
 impl ReviewerSpec {
@@ -134,6 +140,7 @@ impl ReviewerSpec {
         self.reviewer == other.reviewer
             && self.model == other.model
             && self.effort == other.effort
+            && self.profile == other.profile
             && self.raw_bin().identity_matches(&other.raw_bin())
     }
     /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
@@ -193,6 +200,10 @@ struct PendingEntry {
     effort: Option<String>,
     bin: Option<PathBuf>,
     usage_minimum: Option<UsageMinimum>,
+    /// The account profile under construction. `None` becomes `ProfileSelector::Ambient` at
+    /// `finalize`. A profile flag and an explicit-home flag for the same family are mutually
+    /// exclusive on one entry, so a second setter call is an error, not a precedence contest.
+    profile: Option<ProfileSelector>,
 }
 
 impl PendingEntry {
@@ -203,7 +214,55 @@ impl PendingEntry {
             effort: None,
             bin: None,
             usage_minimum: None,
+            profile: None,
         }
+    }
+
+    /// The reviewer family a profile/home flag names, checked against this entry so a
+    /// `--codex-profile` on a Claude entry (or vice versa) is a clear error rather than silently
+    /// binding to the wrong reviewer.
+    fn check_profile_family(&self, flag: &str, family: ReviewerKind) -> Result<(), String> {
+        if self.reviewer != family {
+            return Err(format!(
+                "{flag} applies to a {} reviewer, but the --reviewer entry before it is '{}'",
+                family.as_str(),
+                self.reviewer.as_str()
+            ));
+        }
+        if self.profile.is_some() {
+            return Err(format!(
+                "a profile or home was given twice for the same --reviewer '{}' (a profile name and \
+                 an explicit home are mutually exclusive on one entry)",
+                self.reviewer.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_profile_name(
+        &mut self,
+        flag: &str,
+        family: ReviewerKind,
+        name: String,
+    ) -> Result<(), String> {
+        self.check_profile_family(flag, family)?;
+        crate::profile::validate_profile_name(&name)?;
+        self.profile = Some(ProfileSelector::Named(name));
+        Ok(())
+    }
+
+    fn set_profile_home(
+        &mut self,
+        flag: &str,
+        family: ReviewerKind,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.check_profile_family(flag, family)?;
+        if path.as_os_str().is_empty() {
+            return Err(format!("{flag} requires a non-empty path"));
+        }
+        self.profile = Some(ProfileSelector::ExplicitHome(path));
+        Ok(())
     }
 
     /// Bind `--min-usage-remaining <1..=100>` to this entry. Codex only: Claude exposes no
@@ -319,6 +378,7 @@ impl PendingEntry {
             bin: self.bin,
             reviewer: self.reviewer,
             usage_minimum: self.usage_minimum.unwrap_or(UsageMinimum::None),
+            profile: self.profile.unwrap_or(ProfileSelector::Ambient),
         }
     }
 }
@@ -748,6 +808,34 @@ impl Config {
                         .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
                         .set_bin(PathBuf::from(v))?;
                 }
+                "--codex-profile" => {
+                    let v = take("--codex-profile")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--codex-profile must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_name("--codex-profile", ReviewerKind::Codex, v)?;
+                }
+                "--claude-profile" => {
+                    let v = take("--claude-profile")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--claude-profile must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_name("--claude-profile", ReviewerKind::Claude, v)?;
+                }
+                "--codex-home" => {
+                    let v = take("--codex-home")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--codex-home must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_home("--codex-home", ReviewerKind::Codex, PathBuf::from(v))?;
+                }
+                "--claude-config-dir" => {
+                    let v = take("--claude-config-dir")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--claude-config-dir must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_home("--claude-config-dir", ReviewerKind::Claude, PathBuf::from(v))?;
+                }
                 "--min-usage-remaining" => {
                     let v = take("--min-usage-remaining")?;
                     entries
@@ -934,6 +1022,49 @@ impl Config {
     /// `docs/usage-remaining-gate.md`.
     pub fn chain_gates_on_usage(&self) -> bool {
         self.reviewers.iter().any(|s| s.usage_minimum.is_gating())
+    }
+
+    /// Resolve an entry's authorized config home, or refuse.
+    ///
+    /// This is the single way any review-path code obtains a profile home: `Ambient` returns
+    /// `Ok(None)` (inherit the environment, today's behaviour); a named profile or explicit home is
+    /// resolved and then authorized, returning `Err(PROFILE_NOT_AUTHORIZED)` unless this working root
+    /// is approved for it. Home resolution and authorization are one operation so a caller cannot
+    /// obtain a home without passing the check. See `docs/reviewer-account-profiles-impl.md`.
+    ///
+    /// Phase 1: authorization is deny-all for every non-ambient profile — no allowlist store exists
+    /// yet, so any named profile or explicit home is refused. The setup/allowlist flow (Phase 3)
+    /// replaces [`Self::profile_authorized`] with a real per-root check.
+    pub fn resolve_authorized_home(
+        &self,
+        spec: &ReviewerSpec,
+    ) -> Result<Option<PathBuf>, crate::errors::Failure> {
+        if spec.profile.is_ambient() {
+            return Ok(None);
+        }
+        let base = crate::profile::profile_base();
+        let home = crate::profile::resolve_home(&spec.profile, spec.reviewer, base.as_deref())
+            .map_err(|e| {
+                crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
+                    .with_detail(e)
+            })?;
+        if !self.profile_authorized(spec) {
+            return Err(crate::errors::profile_not_authorized(
+                spec.reviewer.as_str(),
+                &spec.profile.label(),
+            ));
+        }
+        Ok(home)
+    }
+
+    /// Whether this working root is authorized to use `spec`'s (non-ambient) profile.
+    ///
+    /// Phase 1 deny-all stub: with no allowlist store, nothing is authorized. `Ambient` never reaches
+    /// here (handled in [`Self::resolve_authorized_home`]). Phase 3 consults the per-machine allowlist
+    /// keyed by the immutable launch root against the full `(effective_home + reviewer_family +
+    /// account_fingerprint)` tuple.
+    fn profile_authorized(&self, _spec: &ReviewerSpec) -> bool {
+        false
     }
 
     /// The chain index of the entry that matches a stored session's identity, if any.
@@ -1567,6 +1698,125 @@ mod tests {
     fn reviewer_is_required() {
         let err = Config::from_args(&args(&[])).unwrap_err();
         assert!(err.contains("--reviewer is required"), "{err}");
+    }
+
+    #[test]
+    fn profile_defaults_to_ambient() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.primary().profile, ProfileSelector::Ambient);
+    }
+
+    #[test]
+    fn codex_profile_binds_a_named_profile() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        assert_eq!(
+            cfg.primary().profile,
+            ProfileSelector::Named("work".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_binds_an_explicit_home() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--claude-config-dir",
+            r"C:\homes\work",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.primary().profile,
+            ProfileSelector::ExplicitHome(PathBuf::from(r"C:\homes\work"))
+        );
+    }
+
+    #[test]
+    fn a_profile_flag_on_the_wrong_family_is_rejected() {
+        let err = Config::from_args(&args(&["--reviewer", "claude", "--codex-profile", "work"]))
+            .unwrap_err();
+        assert!(err.contains("applies to a codex reviewer"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_name_and_an_explicit_home_on_one_entry_conflict() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--codex-home",
+            r"C:\x",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_profile_name_is_rejected_at_parse() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "../evil",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.contains("invalid character") || err.contains("traversal"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn profiles_bind_per_chain_entry() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "personal",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.reviewers[0].profile,
+            ProfileSelector::Named("work".to_string())
+        );
+        assert_eq!(
+            cfg.reviewers[1].profile,
+            ProfileSelector::Named("personal".to_string())
+        );
+        // Same reviewer/model/effort but different profiles are not identity-duplicates.
+        assert!(!cfg.reviewers[0].same_reviewer_identity(&cfg.reviewers[1]));
+    }
+
+    #[test]
+    fn ambient_profile_authorizes_to_no_home() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.resolve_authorized_home(cfg.primary()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_named_profile_is_denied_in_phase_1() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        let err = cfg.resolve_authorized_home(cfg.primary()).unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
+    }
+
+    #[test]
+    fn an_explicit_home_is_denied_in_phase_1() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--claude-config-dir",
+            r"C:\homes\work",
+        ]))
+        .expect("config");
+        let err = cfg.resolve_authorized_home(cfg.primary()).unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
     }
 
     #[test]

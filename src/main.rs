@@ -21,6 +21,7 @@ mod findings;
 mod mcp;
 mod metrics;
 mod pathcmp;
+mod profile;
 mod prompt;
 mod registry;
 mod reviewer;

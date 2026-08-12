@@ -65,6 +65,10 @@ fn ensure_entry_ready(
     index: usize,
     cancel: &AtomicBool,
 ) -> Result<Preflight, Failure> {
+    // Refuse a non-ambient profile this working root has not authorized, before any resolve, auth
+    // check, or cache reuse. Ambient returns Ok(None) and proceeds exactly as before this feature.
+    // (Phase 1 authorization is deny-all, so every named profile / explicit home is refused here.)
+    cfg.resolve_authorized_home(&cfg.reviewers[index])?;
     if let Some(cached) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
