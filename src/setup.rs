@@ -41,38 +41,93 @@ const SETUP_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// is treated as abandoned and reclaimed even if the lock discipline were somehow bypassed.
 const MARKER_TTL_SECS: u64 = 30 * 60;
 
-/// The in-setup marker beside the lock: a small record that a setup is (or was) in progress.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ProvisionalMarker {
+/// The operation a setup journal records. `AuthorizeOnly` creates nothing, so it needs no recovery
+/// beyond clearing the marker; the two provisioning operations are recovered by the presence-driven
+/// state machine in [`recover`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum Operation {
+    #[default]
+    AuthorizeOnly,
+    FirstProvision,
+    Relogin,
+}
+
+/// The ownership-nonce marker file written inside a nonce-named staging dir at creation and carried
+/// into `home` by the rename. Recovery only ever deletes/quarantines a directory whose marker matches
+/// the journal nonce, so it can never touch a home this run did not create (f13/f-a2).
+const OWNED_MARKER: &str = ".cross-review-owned";
+
+/// The write-ahead journal beside the setup lock: the in-progress marker extended with everything
+/// recovery needs to reach a consistent state after a crash at any point (f2/f8/f-a3/f-b1..b5). Written
+/// **before** each filesystem mutation. Older/authorize-only markers deserialize via the field
+/// defaults (operation `AuthorizeOnly`, empty paths), so they are simply cleared.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Journal {
     holder_pid: u32,
-    /// A per-run random nonce, so a recycled pid cannot be mistaken for the same run.
+    /// A per-run random nonce: the ownership proof for staging/rejected dirs, and a guard against a
+    /// recycled pid being mistaken for the same run.
     holder_nonce: String,
     /// Unix seconds after which this marker is considered abandoned (secondary to the lock).
     expiry_unix: u64,
+    #[serde(default)]
+    operation: Operation,
+    /// The final home path this setup targets.
+    #[serde(default)]
+    home: String,
+    /// The nonce-named staging dir this run exclusively created (once created).
+    #[serde(default)]
+    staging_path: Option<String>,
+    /// The nonce-named `.old` the existing home was moved aside to (re-login).
+    #[serde(default)]
+    old_path: Option<String>,
+    /// The nonce-named quarantine path an uncommitted home was moved to.
+    #[serde(default)]
+    rejected_path: Option<String>,
+    /// The `(volume, file-index)` identity of the home captured before `home → .old`, so recovery can
+    /// prove `.old` is the object it moved aside, not a replacement (f-a3).
+    #[serde(default)]
+    old_file_id: Option<(u32, u64)>,
+    /// The exact allowlist entry this run commits, so recovery can certify whether the commit landed
+    /// (f-b4).
+    #[serde(default)]
+    expected_entry: Option<crate::allowlist::AllowEntry>,
+    /// Advisory phase hint; recovery is driven by path presence, not this.
+    #[serde(default)]
+    phase: String,
 }
 
-/// A live setup: holds the per-home exclusive lock and owns the provisional marker for its lifetime.
+/// What recovery decided about the found journal: clear it (a consistent state was reached), or retain
+/// it because the state is ambiguous / unprovable and needs a human — in which case [`begin`] refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+    Clear,
+    Retain,
+}
+
+/// A live setup: holds the per-home exclusive lock and owns the journal/marker for its lifetime.
 /// Dropping it without [`commit`](Self::commit) clears the marker; the lock releases with it.
 pub struct SetupSession {
     _lock: ExclusiveLock,
+    base: PathBuf,
     marker_path: PathBuf,
     holder_nonce: String,
     committed: bool,
 }
 
 impl SetupSession {
-    /// Acquire the exclusive setup lock for `effective_home` under `base`, clear any in-progress marker
-    /// a crashed prior run left behind, and write a fresh one.
+    /// Acquire the exclusive setup lock for `effective_home` under `base`, **run recovery** on any
+    /// journal a crashed prior run left behind, then write a fresh in-progress marker.
     ///
-    /// Fails with [`io::ErrorKind::WouldBlock`] if another live setup for the same home holds the lock.
+    /// Recovery runs here, **before** the caller classifies the operation, so an interrupted swap
+    /// (which can leave `home` absent) is repaired before first-provision/re-login is chosen (f-r2.4).
+    /// Fails with [`io::ErrorKind::WouldBlock`] if another live setup holds the lock, or with a plain
+    /// error if a prior run left the profile in a state needing manual review (recovery retained it).
     pub fn begin(base: &Path, effective_home: &Path) -> io::Result<Self> {
         Self::begin_with_wait(base, effective_home, SETUP_LOCK_WAIT)
     }
 
-    /// [`begin`](Self::begin) with an explicit lock-wait, so tests do not wait the full production
-    /// timeout to observe contention.
     fn begin_with_wait(base: &Path, effective_home: &Path, wait: Duration) -> io::Result<Self> {
-        // The lock and marker live in the store's secured `auth` directory, so another user cannot
+        // The lock and journal live in the store's secured `auth` directory, so another user cannot
         // create or tamper with them. Ensure it exists and is locked down first.
         std::fs::create_dir_all(base)?;
         let auth = base.join("auth");
@@ -85,20 +140,62 @@ impl SetupSession {
         // Acquire the exclusive lock. Holding it means no other *live* setup of this home is running.
         let lock = ExclusiveLock::acquire(&lock_path, wait)?;
 
-        // We now hold the lock, so any marker present is from a prior run that died or exited without
-        // clearing it (a live run would still hold the lock we just took). Clear it before starting.
-        let _ = remove_if_present(&marker_path);
+        // Any journal present is from a prior run that died or exited without clearing it (a live run
+        // would still hold the lock we just took). Replay it to a consistent state before starting.
+        if let Some(journal) = read_journal(&marker_path) {
+            match recover(base, &marker_path, &journal)? {
+                Recovery::Clear => {
+                    let _ = remove_if_present(&marker_path);
+                }
+                Recovery::Retain => {
+                    return Err(io::Error::other(format!(
+                        "a previous setup of {} left it in a state needing manual review; inspect \
+                         the profile directory and any '.rejected-*' sibling, then remove {} to \
+                         retry",
+                        effective_home.display(),
+                        marker_path.display(),
+                    )));
+                }
+            }
+        }
 
         let holder_nonce = crate::digest::random_hex_token(16)
             .ok_or_else(|| io::Error::other("could not generate a setup nonce"))?;
         let session = Self {
             _lock: lock,
+            base: base.to_path_buf(),
             marker_path,
             holder_nonce,
             committed: false,
         };
-        session.write_marker()?;
+        // The initial in-progress journal: an authorize-only placeholder (creates nothing). The
+        // provisioning flow overwrites it with FirstProvision/Relogin journals as it advances.
+        session.write_journal(&session.blank_journal(effective_home, Operation::AuthorizeOnly))?;
         Ok(session)
+    }
+
+    /// The per-run nonce (the ownership proof written into staging dirs).
+    #[allow(dead_code)] // consumed by the provisioning flow (next slice of #15 part 3b).
+    fn nonce(&self) -> &str {
+        &self.holder_nonce
+    }
+
+    fn blank_journal(&self, home: &Path, operation: Operation) -> Journal {
+        Journal {
+            holder_pid: std::process::id(),
+            holder_nonce: self.holder_nonce.clone(),
+            expiry_unix: now_unix().saturating_add(MARKER_TTL_SECS),
+            operation,
+            home: home.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Write the journal (write-ahead): atomically replace the marker file and flush it plus its
+    /// directory to stable storage, so the recorded intent is durable before the mutation it guards
+    /// (f-b3). Called before each filesystem step of the provisioning flow.
+    fn write_journal(&self, journal: &Journal) -> io::Result<()> {
+        write_journal_at(&self.marker_path, journal)
     }
 
     /// Commit the setup: the run succeeded, so the marker is removed. After this, dropping the session
@@ -108,17 +205,6 @@ impl SetupSession {
         self.committed = true;
         Ok(())
     }
-
-    fn write_marker(&self) -> io::Result<()> {
-        let marker = ProvisionalMarker {
-            holder_pid: std::process::id(),
-            holder_nonce: self.holder_nonce.clone(),
-            expiry_unix: now_unix().saturating_add(MARKER_TTL_SECS),
-        };
-        let json = serde_json::to_vec_pretty(&marker)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        atomic_write(&self.marker_path, &json)
-    }
 }
 
 impl Drop for SetupSession {
@@ -127,8 +213,242 @@ impl Drop for SetupSession {
             return;
         }
         // Uncommitted: clear the in-progress marker (best-effort). The lock releases as `_lock` drops.
+        // A crash (rather than a clean drop) leaves the journal for the next `begin` to recover.
         let _ = remove_if_present(&self.marker_path);
     }
+}
+
+fn read_journal(marker_path: &Path) -> Option<Journal> {
+    let bytes = std::fs::read(marker_path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_journal_at(marker_path: &Path, journal: &Journal) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(journal)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    atomic_write(marker_path, &json)?;
+    // Durability: flush the journal file and its directory so the intent survives a power loss (f-b3).
+    let _ = crate::winsec::flush_file(marker_path);
+    if let Some(dir) = marker_path.parent() {
+        let _ = crate::winsec::flush_dir(dir);
+    }
+    Ok(())
+}
+
+fn write_owned_marker(dir: &Path, nonce: &str) -> io::Result<()> {
+    std::fs::write(dir.join(OWNED_MARKER), nonce.as_bytes())
+}
+
+fn owned_marker_matches(dir: &Path, nonce: &str) -> bool {
+    std::fs::read(dir.join(OWNED_MARKER))
+        .map(|b| b == nonce.as_bytes())
+        .unwrap_or(false)
+}
+
+/// Remove a directory tree and flush its parent so the unlink is durable (f-b5). Best-effort flush.
+fn remove_dir_all_durable(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = path.parent() {
+        let _ = crate::winsec::flush_dir(parent);
+    }
+    Ok(())
+}
+
+/// Restore `.old` back onto `home`, but only after proving `.old` is the object we moved aside (its
+/// recorded `(volume, file-index)` identity, opened no-follow — f-a3). Returns `false` (fail closed,
+/// leaving everything untouched) on a missing/mismatched id or a reparse point.
+fn restore_old(old: &Path, home: &Path, journal: &Journal) -> io::Result<bool> {
+    match journal.old_file_id {
+        Some(expected) => match crate::winsec::dir_identity_no_follow(old) {
+            Ok(id) if id == expected => {}
+            _ => return Ok(false),
+        },
+        None => return Ok(false),
+    }
+    // No-replace: if `home` somehow already exists, do not clobber it — fail closed.
+    match crate::winsec::rename_no_replace(old, home) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = home.parent() {
+        let _ = crate::winsec::flush_dir(parent);
+    }
+    Ok(true)
+}
+
+/// Remove a staging dir only if it carries this run's ownership marker (f13). `false` = not provably
+/// ours, left untouched.
+fn remove_owned_staging(staging: &Path, journal: &Journal) -> io::Result<bool> {
+    if !owned_marker_matches(staging, &journal.holder_nonce) {
+        return Ok(false);
+    }
+    remove_dir_all_durable(staging)?;
+    Ok(true)
+}
+
+/// Quarantine an uncommitted `home` this run created: WAL the rejected path, then rename it aside
+/// (no-replace) so it is never deleted, only set aside for the human (f17). Only touches a
+/// marker-verified home. `false` = not provably ours.
+fn quarantine_home(marker_path: &Path, home: &Path, journal: &mut Journal) -> io::Result<bool> {
+    if !owned_marker_matches(home, &journal.holder_nonce) {
+        return Ok(false);
+    }
+    let rejected = sibling_with_suffix(home, &format!("rejected-{}", journal.holder_nonce));
+    // Write-ahead: record the rejected path before the rename, so a mid-quarantine crash is
+    // recoverable rather than stranding an untracked dir (f17).
+    journal.rejected_path = Some(rejected.to_string_lossy().into_owned());
+    write_journal_at(marker_path, journal)?;
+    match crate::winsec::rename_no_replace(home, &rejected) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = home.parent() {
+        let _ = crate::winsec::flush_dir(parent);
+    }
+    Ok(true)
+}
+
+/// Whether this run's exact authorization is durably present in the store (f-b4): the certification
+/// that a re-login/first-provision commit actually landed before a crash.
+fn commit_certified(base: &Path, journal: &Journal) -> io::Result<bool> {
+    match &journal.expected_entry {
+        Some(entry) => crate::allowlist::AllowlistStore::at(base).is_authorized(entry),
+        None => Ok(false),
+    }
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match path.parent() {
+        Some(parent) => parent.join(format!("{name}.{suffix}")),
+        None => PathBuf::from(format!("{name}.{suffix}")),
+    }
+}
+
+/// Replay a crashed run's journal to a consistent state, driven by the **actual presence** of the
+/// journalled nonce-named paths (the `phase` field is only advisory). Runs under the per-home exclusive
+/// lock. See `docs/reviewer-account-profiles-3b-plan.md` "Crash-safety & recovery" for the full table.
+fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Recovery> {
+    if journal.operation == Operation::AuthorizeOnly {
+        return Ok(Recovery::Clear); // created nothing
+    }
+    let mut journal = journal.clone();
+    let home = PathBuf::from(&journal.home);
+    let staging = journal.staging_path.clone().map(PathBuf::from);
+    let old = journal.old_path.clone().map(PathBuf::from);
+    let rejected = journal.rejected_path.clone().map(PathBuf::from);
+
+    // Phase 0: a journal-owned rejected dir is handled first (f20). Complete any pending `.old → home`
+    // restore, then keep the rejected dir (marker-tagged) and retain the journal for the human.
+    if let Some(rej) = rejected {
+        if rej.exists() {
+            if !owned_marker_matches(&rej, &journal.holder_nonce) {
+                return Ok(Recovery::Retain); // not provably ours -> fail closed
+            }
+            if let Some(old) = &old {
+                if old.exists() && !home.exists() && !restore_old(old, &home, &journal)? {
+                    return Ok(Recovery::Retain);
+                }
+            }
+            return Ok(Recovery::Retain);
+        }
+        // named but absent: already resolved; fall through.
+    }
+
+    let h = home.exists();
+    let o = old.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let s = staging.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let relogin = journal.operation == Operation::Relogin;
+
+    let outcome = match (h, o, s) {
+        // Staging created, not swapped in: remove our staging, home untouched.
+        (_, false, true) => {
+            let staging = staging.as_ref().expect("s implies staging path");
+            if !remove_owned_staging(staging, &journal)? {
+                return Ok(Recovery::Retain);
+            }
+            if !h && relogin {
+                return Ok(Recovery::Retain); // re-login home lost with nothing to restore
+            }
+            Recovery::Clear
+        }
+        // Crashed between home->.old and staging->home: restore .old, remove staging.
+        (false, true, true) => {
+            let old = old.as_ref().unwrap();
+            let staging = staging.as_ref().unwrap();
+            if !restore_old(old, &home, &journal)? {
+                return Ok(Recovery::Retain);
+            }
+            let _ = remove_owned_staging(staging, &journal)?;
+            Recovery::Clear
+        }
+        // Home moved to .old, staging gone (failed cleanup): restore .old.
+        (false, true, false) => {
+            let old = old.as_ref().unwrap();
+            if !restore_old(old, &home, &journal)? {
+                return Ok(Recovery::Retain);
+            }
+            Recovery::Clear
+        }
+        // Re-login crashed after staging->home, before/at authorize: consult the store.
+        (true, true, false) => {
+            let old = old.as_ref().unwrap();
+            if commit_certified(base, &journal)? {
+                remove_dir_all_durable(old)?; // committed: drop the old, keep the new home
+                Recovery::Clear
+            } else {
+                // Not committed: roll back. Quarantine the uncommitted new home, restore .old.
+                if !quarantine_home(marker_path, &home, &mut journal)? {
+                    return Ok(Recovery::Retain);
+                }
+                if !restore_old(old, &home, &journal)? {
+                    return Ok(Recovery::Retain);
+                }
+                Recovery::Retain // a rejected dir remains for the human
+            }
+        }
+        // Complete, or an uncommitted first-provision/re-login home, or nothing of ours.
+        (true, false, false) => {
+            if commit_certified(base, &journal)? {
+                Recovery::Clear // committed: keep the authorized home
+            } else if owned_marker_matches(&home, &journal.holder_nonce) {
+                // Our uncommitted home (first-provision, or re-login after .old was already dropped):
+                // quarantine it. No .old to restore.
+                if !quarantine_home(marker_path, &home, &mut journal)? {
+                    return Ok(Recovery::Retain);
+                }
+                Recovery::Retain
+            } else {
+                Recovery::Clear // home is not ours and not authorized by us
+            }
+        }
+        // Home present + our staging, no .old: remove staging, keep home.
+        (true, false, true) => {
+            let staging = staging.as_ref().unwrap();
+            let _ = remove_owned_staging(staging, &journal)?;
+            Recovery::Clear
+        }
+        // All absent.
+        (false, false, false) => {
+            if relogin {
+                Recovery::Retain // home lost, nothing to restore
+            } else {
+                Recovery::Clear // first-provision never got anywhere
+            }
+        }
+        // Our .old + our staging + a present home: an external re-creation / impossible interleave.
+        (true, true, true) => Recovery::Retain,
+    };
+    Ok(outcome)
 }
 
 /// Run the profile-setup tool. Currently implements the **authorize-only** operation: authorize this
@@ -468,6 +788,141 @@ mod tests {
         assert_ne!(home_key(&missing_a), home_key(&missing_b));
         // A different profile name is a different key.
         assert_ne!(home_key(&lower), home_key(&ancestor.join("personal")));
+    }
+
+    // --- recovery state machine -------------------------------------------------------------------
+
+    /// Build a provisioning journal with the given nonce and paths, capturing `old`'s object identity
+    /// when present (as the real flow does before moving a home aside).
+    fn journal(
+        op: Operation,
+        home: &Path,
+        staging: Option<&Path>,
+        old: Option<&Path>,
+        nonce: &str,
+    ) -> Journal {
+        Journal {
+            holder_pid: 1,
+            holder_nonce: nonce.to_string(),
+            expiry_unix: 0,
+            operation: op,
+            home: home.to_string_lossy().into_owned(),
+            staging_path: staging.map(|p| p.to_string_lossy().into_owned()),
+            old_path: old.map(|p| p.to_string_lossy().into_owned()),
+            rejected_path: None,
+            old_file_id: old.and_then(|p| crate::winsec::dir_identity_no_follow(p).ok()),
+            expected_entry: None,
+            phase: String::new(),
+        }
+    }
+
+    fn owned_dir(path: &Path, nonce: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        write_owned_marker(path, nonce).unwrap();
+    }
+
+    #[test]
+    fn recovery_authorize_only_clears() {
+        let base = temp_dir();
+        let mp = base.join("m.marker");
+        let j = journal(
+            Operation::AuthorizeOnly,
+            &base.join("home"),
+            None,
+            None,
+            "n1",
+        );
+        assert_eq!(recover(&base, &mp, &j).unwrap(), Recovery::Clear);
+    }
+
+    #[test]
+    fn recovery_first_provision_removes_orphan_staging() {
+        // H=0,O=0,S=1: staging created, never swapped in -> removed; nothing else touched.
+        let base = temp_dir();
+        let home = base.join("home");
+        let staging = base.join("home.staging-n1");
+        owned_dir(&staging, "n1");
+        let j = journal(Operation::FirstProvision, &home, Some(&staging), None, "n1");
+        assert_eq!(
+            recover(&base, &base.join("m.marker"), &j).unwrap(),
+            Recovery::Clear
+        );
+        assert!(!staging.exists(), "orphan staging removed");
+        assert!(!home.exists(), "home was never created");
+    }
+
+    #[test]
+    fn recovery_relogin_restores_old_when_swap_interrupted() {
+        // H=0,O=1,S=1: crashed between home->.old and staging->home -> restore .old, drop staging.
+        let base = temp_dir();
+        let home = base.join("home");
+        let old = base.join("home.old-n2");
+        let staging = base.join("home.staging-n2");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("auth.json"), b"OLD").unwrap();
+        owned_dir(&staging, "n2");
+        let j = journal(Operation::Relogin, &home, Some(&staging), Some(&old), "n2");
+        assert_eq!(
+            recover(&base, &base.join("m.marker"), &j).unwrap(),
+            Recovery::Clear
+        );
+        assert!(
+            home.exists() && !old.exists(),
+            "the valid old home was restored"
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), b"OLD");
+        assert!(!staging.exists(), "staging dropped");
+    }
+
+    #[test]
+    fn recovery_relogin_rolls_back_an_uncommitted_swap() {
+        // H=1,O=1,S=0, not in the store: the new home is uncommitted -> quarantine it and restore .old,
+        // so the store-authorized credentials in .old are never destroyed (f9/f13).
+        let base = temp_dir();
+        let home = base.join("home");
+        let old = base.join("home.old-n3");
+        // The "new" home in place is this run's (marker-owned); .old is the original valid home.
+        owned_dir(&home, "n3");
+        std::fs::write(home.join("auth.json"), b"NEW").unwrap();
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("auth.json"), b"OLD").unwrap();
+        let mp = base.join("m.marker");
+        let j = journal(Operation::Relogin, &home, None, Some(&old), "n3");
+        assert_eq!(recover(&base, &mp, &j).unwrap(), Recovery::Retain);
+        // The valid old home is back in place; the uncommitted new home is quarantined, not deleted.
+        assert!(home.exists());
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), b"OLD");
+        let rejected = base.join("home.rejected-n3");
+        assert!(rejected.exists(), "the uncommitted home was quarantined");
+        assert_eq!(std::fs::read(rejected.join("auth.json")).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn recovery_refuses_when_a_relogin_home_is_lost() {
+        // H=0,O=0,S=0 for re-login: the home is gone with nothing to restore -> fail closed (Retain).
+        let base = temp_dir();
+        let home = base.join("home");
+        let j = journal(Operation::Relogin, &home, None, None, "n4");
+        assert_eq!(
+            recover(&base, &base.join("m.marker"), &j).unwrap(),
+            Recovery::Retain
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_to_touch_a_home_it_does_not_own() {
+        // H=1,O=1,S=0 uncommitted, but `home` lacks our ownership marker (a replacement): refuse.
+        let base = temp_dir();
+        let home = base.join("home");
+        let old = base.join("home.old-n5");
+        std::fs::create_dir_all(&home).unwrap(); // NOT owned-marked
+        std::fs::create_dir_all(&old).unwrap();
+        let j = journal(Operation::Relogin, &home, None, Some(&old), "n5");
+        assert_eq!(
+            recover(&base, &base.join("m.marker"), &j).unwrap(),
+            Recovery::Retain
+        );
+        assert!(home.exists() && old.exists(), "nothing was moved");
     }
 
     #[test]
