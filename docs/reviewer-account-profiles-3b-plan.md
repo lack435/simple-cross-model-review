@@ -326,11 +326,20 @@ leaves the rename able to be lost, f-b3). This applies to:
 - **the journal:** flush the journal file + its parent dir on every write-ahead update, so a lost
   directory entry cannot strand `.old` or an untracked replacement.
 
+**The parent-directory barrier also covers every swap rename (f-b5).** The profile-parent directory
+entries are mutated not only by the file publications above but by the swap renames themselves —
+`rename(home → .old)`, `rename(staging → home)`, the quarantine `rename(home → rejected)` and its
+restore, and the `.old` deletion. Each such directory-entry mutation is followed by a
+**`FlushFileBuffers` on the containing (profile-parent) directory before the journal advances or is
+cleared past it**, so a power loss cannot lose the rename/unlink and leave the final home missing or
+resurrect an orphaned credential-bearing `.old`. Fail closed if that barrier cannot be proven.
+
 Commit order with durability: `[f20]-verify → flush credential files + home dir → handle-relative
 account read → journal authorizing (flushed) → AllowlistStore::authorize → flush store + parent →
-journal committed (flushed) → remove .old → clear journal`. If any required flush cannot be proven,
-**fail closed**. Fault tests simulate a power loss at each boundary (after credential flush, after
-store rename, after store flush, after `.old` delete).
+journal committed (flushed) → remove .old → flush profile-parent dir → clear journal`, and likewise the
+swap renames each flush the profile-parent dir before the journal advances. If any required flush
+cannot be proven, **fail closed**. Fault tests simulate a power loss at each boundary (after credential
+flush, after each swap rename, after store rename, after store flush, after the `.old` delete).
 
 **Recovery can certify and attribute the commit (f-b4).** Recovery's "consult the store" must check for
 **this run's exact authorization**, not merely that *some* entry exists — otherwise a pre-existing
@@ -433,6 +442,11 @@ Factor the login step behind an injected callback so unit tests never run real O
   flushed the file but not its parent dir → flush file **and** parent for every publication; **f-b4**
   recovery could not certify/attribute the commit → persist the full expected `AllowEntry` + a durable
   post-flush `committed` phase and require the exact flushed entry.
+- **rv-20864-13** resolved f-b1/f-b2/f-b3 and raised **f-b5** — the parent-directory flush barrier had
+  to extend to the swap renames themselves (`home→.old`, `staging→home`, quarantine/restore, `.old`
+  delete), not only the file publications, so a lost directory-entry update cannot drop the final home
+  or resurrect `.old`. Folded into the durability contract. (f-b4 froze at a stale `open`; its full
+  `AllowEntry` + `committed`-phase resolution is in the doc.)
 - **Ledger note:** across rv-20864-4..7 the entries f9/f12/f18 repeatedly froze at a stale `open`
   (identical detail text, non-advancing turn — issue #62). Their live content was addressed: f9's
   successor **f13 is resolved**; f12's parent-canonical key is in the doc with no live successor; **f18
