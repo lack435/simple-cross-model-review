@@ -19,6 +19,7 @@ Resume point for the account-profiles feature. Read this, then
 | 3·#13 | pre-spawn identity + method probe | `dd69142` | (built; not separately gated yet) |
 | 3·#10 | `Config.launch_root` captured before `--cwd`, canonicalized (allowlist key) | `9d934f4` | **approved** (`rv-19320-6`) |
 | 3·#11 | allowlist store (`allowlist.rs`) + `winsec.rs` ACL FFI + authorization wiring | `9d934f4`, `e5d35de`, `b858568` | **approved** (`rv-19320-6`) |
+| 3·#12 | `profile::secure_profile_dir` provisioning (handle-relative descent + name safety) | `1fa38a2`..`fa9d14f` | **approved** (`rv-19320-11`) |
 
 **Invariant that holds today:** ambient (no profile) is byte-for-byte unchanged; every *non-ambient*
 profile use is refused (`PROFILE_NOT_AUTHORIZED`). Since #11, that refusal is driven by the **real
@@ -37,19 +38,20 @@ LocalSystem case) and **applies + verifies it through a handle** (`SetSecurityIn
 `create_secured_dir`, `write_secured_file`, `read_secured_file`, plus a **handle-relative
 `open_child_relative` (`NtCreateFile`, `RootDirectory` + `OBJ_DONT_REPARSE`)** so a store/credential
 file is proven a direct child of its verified parent — no by-path reopen TOCTOU (`[f15]`/`[f20]`/`[f22]`).
-**#12 should compose `secure_profile_dir` from these**, not start the ACL FFI from scratch — what #12
-still adds is reparse-reject on each *original* path component, containment under the profile root, and
-the create-across-vendor-child hold (`[f6]`/`[f15]`/`[f20]`).
+Since #12, `src/winsec.rs` also provides `create_secured_child_dir` (handle-relative secured subdir),
+`reject_reparse_on_ancestors`, a `FILE_ATTRIBUTE_DIRECTORY` check on `open_dir_no_follow` (so a DACL is
+never applied to a file), and a component-length guard in `nt_open`; `profile::secure_profile_dir`
+returns a **held** `SecuredProfileDir` (no-follow, no-delete-share handle) that #15 keeps alive across
+the vendor login. Name safety lives in `validate_profile_name` (rejects trailing-dot aliases, reserved
+device names, over-length). **What #15 still needs from the [f20] contract:** the post-login
+*handle-relative credential-file re-verify* (open the written `auth.json`/`.claude.json` relative to the
+held dir handle and re-check its DACL) — the primitive (`open_child_relative` + `verify_restrictive_dacl`)
+exists; #15 wires it into the setup flow.
 
 ## Remaining (Phase 3)
 
 Do roughly in this order.
 
-3. **#12 `secure_profile_dir`** — **build on `winsec.rs`** (which now provides the handle-based
-   create/apply/verify DACL and the handle-relative open). What remains: reparse-reject on each
-   *original* (pre-canonical) path component, containment under the profile root (not `cfg.cwd`), and
-   holding the dir handle across the vendor login child with a handle-relative re-open to prove
-   containment. Plan: impl `## Phase 3 → Profile-dir provisioning + ACL` (`[f6]`, `[f15]`, `[f20]`).
 4. **#14 Switch guard + probe expected-account + spawn atomicity** — the store *consultation* half of
    #14 is **already done** (#11: `profile_authorized` now checks the full 4-field tuple, `launch_root`
    key). What remains: (a) change the probe's `expected` account in both `auth_check`s from the home's
@@ -91,6 +93,10 @@ Do roughly in this order.
   attempts — an evidence-service timeout, a 1800s reviewer timeout, and an unstructured envelope —
   before converging to `approve` on `rv-19320-6`; budget extra collect attempts and expect to re-issue
   `fresh: true` after a lost turn (the write-ahead marker makes the session non-resumable, by design).
+  The #12 gate then hit the **frozen findings ledger** on a resume (a resolved finding stuck at
+  `open` with `last_status_change_turn` not advancing and its detail still quoting the pre-fix code):
+  verify the fix in-file, then take an authoritative verdict from a `fresh: true` review — that is what
+  converged #12 to `approve` (`rv-19320-11`). Do not trust a resumed finding whose status did not move.
 - **Before the PR:** run the full `.\build.ps1` (release + restage `dist\cross-review.exe`) — needs
   the agent MCP sessions unloaded (the running server locks `dist\`). Not done yet; everything it
   checks *except* the release/dist stage has been run green manually.
