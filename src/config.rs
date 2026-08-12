@@ -664,6 +664,18 @@ pub struct Config {
     /// Working root handed to the reviewer. Defaults to the server's cwd, which is
     /// the project root when a harness launches us from `.mcp.json`.
     pub cwd: PathBuf,
+    /// The immutable directory this process was launched from, canonicalized once at parse time
+    /// from `std::env::current_dir()` *before* any `--cwd` is applied.
+    ///
+    /// This is the key the Phase 3 authorization allowlist is keyed on — never [`Self::cwd`], which
+    /// `--cwd` can point anywhere (it is user- and repo-settable, and a reviewed repository's
+    /// committed config could set it). Keying authorization on `cwd` would let a repo redirect itself
+    /// into another root's approval; keying on the launch root, captured from the ambient environment
+    /// and independent of every flag, cannot be steered that way. When `--cwd` differs from the launch
+    /// root the difference is an out-of-band redirection that Phase 3 requires be confirmed on its own,
+    /// rather than inheriting the launch root's authorization. See
+    /// `docs/reviewer-account-profiles-impl.md` (Phase 3 → Allowlist store, `[f7]`).
+    pub launch_root: PathBuf,
     pub timeout: Duration,
     /// Refuse to resume a session idle longer than this. Zero disables the check. See
     /// `DEFAULT_RESUME_MAX_IDLE_SECS`. A tripped session is refused with
@@ -747,6 +759,18 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
+        // The immutable launch root, captured from the ambient process cwd *before* any argument
+        // is read, so no flag — least of all `--cwd` — can influence it. This is the Phase 3
+        // authorization key (see the field doc). Canonicalized like `cwd` is below, via
+        // `normalize_dir`, so the same directory keys one allowlist entry regardless of spelling.
+        // A process whose current directory cannot be read is already broken (the `cwd` default
+        // relies on the same call); failing closed here is the honest outcome for an authorization
+        // key that cannot be established.
+        let launch_root = normalize_dir(
+            std::env::current_dir()
+                .map_err(|e| format!("cannot determine the launch directory: {e}"))?,
+        );
+
         // The chain is built as a list of entries. A repeated `--reviewer` starts a new entry;
         // the identity flags `--model`/`--effort`/`--bin` bind to the most recent `--reviewer`.
         // Argument order is fallback order. See `docs/reviewer-fallback-chain.md`.
@@ -998,6 +1022,7 @@ impl Config {
             reviewers,
             state_dir,
             cwd,
+            launch_root,
             timeout: Duration::from_secs(timeout_secs),
             resume_max_idle: Duration::from_secs(resume_max_idle_secs),
             resume_max_turns,
@@ -1042,9 +1067,19 @@ impl Config {
     /// is approved for it. Home resolution and authorization are one operation so a caller cannot
     /// obtain a home without passing the check. See `docs/reviewer-account-profiles-impl.md`.
     ///
-    /// Phase 1: authorization is deny-all for every non-ambient profile — no allowlist store exists
-    /// yet, so any named profile or explicit home is refused. The setup/allowlist flow (Phase 3)
-    /// replaces [`Self::profile_authorized`] with a real per-root check.
+    /// Authorization consults the per-machine allowlist store ([`crate::allowlist`]), keyed on the
+    /// immutable [`launch_root`](Self::launch_root), against the full `(effective_home +
+    /// reviewer_family + account_fingerprint)` tuple `[f19]`. The fingerprint is the account
+    /// *currently* in the profile home, so a profile silently re-logged to a different account is
+    /// refused until reauthorized. A profile is authorized only when the store holds an entry matching
+    /// all four; with no store (or no entry) every non-ambient profile is refused — the same
+    /// fail-closed default the earlier deny-all stub had, now driven by real data.
+    ///
+    /// Not yet wired here: the pre-spawn per-home lock + generation recheck and the post-review
+    /// start-vs-final switch guard `[f4]`/`[f5]`, which make authorization→probe→spawn atomic against a
+    /// mid-flight re-login. Those are Phase 3 task #14; until the setup tool (#15) can write an entry
+    /// the store is empty, so this check denies every non-ambient profile and the race window
+    /// authorizes nothing.
     pub fn resolve_authorized_home(
         &self,
         spec: &ReviewerSpec,
@@ -1052,29 +1087,62 @@ impl Config {
         if spec.profile.is_ambient() {
             return Ok(None);
         }
+        let refuse = |detail: &str| {
+            crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
+                .with_detail(detail.to_string())
+        };
+
         let base = crate::profile::profile_base();
         let home = crate::profile::resolve_home(&spec.profile, spec.reviewer, base.as_deref())
-            .map_err(|e| {
-                crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
-                    .with_detail(e)
-            })?;
-        if !self.profile_authorized(spec) {
-            return Err(crate::errors::profile_not_authorized(
-                spec.reviewer.as_str(),
-                &spec.profile.label(),
+            .map_err(|e| refuse(&e))?
+            // `resolve_home` returns `None` only for `Ambient`, handled above.
+            .expect("a non-ambient selector resolves to a home");
+
+        if !self.profile_authorized(spec, &home)? {
+            return Err(refuse(
+                "no authorization on file for this launch root, profile home, and account. Run the \
+                 profile setup to authorize this repository for this profile.",
             ));
         }
-        Ok(home)
+        Ok(Some(home))
     }
 
-    /// Whether this working root is authorized to use `spec`'s (non-ambient) profile.
+    /// Whether this launch root is authorized to use `spec`'s (non-ambient) profile home `home`.
     ///
-    /// Phase 1 deny-all stub: with no allowlist store, nothing is authorized. `Ambient` never reaches
-    /// here (handled in [`Self::resolve_authorized_home`]). Phase 3 consults the per-machine allowlist
-    /// keyed by the immutable launch root against the full `(effective_home + reviewer_family +
-    /// account_fingerprint)` tuple.
-    fn profile_authorized(&self, _spec: &ReviewerSpec) -> bool {
-        false
+    /// Reads the account currently in `home` (directly, not through the authorization seam — see
+    /// [`crate::reviewer::Reviewer::fingerprint_at`]) and asks the allowlist store whether the full
+    /// four-field tuple is on file. Fail-closed on every uncertainty: no store base, an unreadable
+    /// account in the home, or an untrusted/corrupt store all refuse rather than authorize. A store
+    /// *security* failure surfaces as [`PROFILE_NOT_AUTHORIZED`](crate::errors::profile_not_authorized)
+    /// with the underlying reason, never a silent allow.
+    fn profile_authorized(
+        &self,
+        spec: &ReviewerSpec,
+        home: &Path,
+    ) -> Result<bool, crate::errors::Failure> {
+        let refuse = |detail: String| {
+            crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
+                .with_detail(detail)
+        };
+        // No resolvable base means nowhere an authorization could have been recorded: deny.
+        let Some(store) = crate::allowlist::AllowlistStore::current() else {
+            return Ok(false);
+        };
+        // The account currently in the home. A profile with no readable account (never provisioned,
+        // or mid re-login) cannot match any entry, so it is unauthorized — not an error.
+        let Some(fingerprint) = crate::reviewer::for_kind(spec.reviewer).fingerprint_at(home)
+        else {
+            return Ok(false);
+        };
+        let query = crate::allowlist::AllowEntry {
+            launch_root: self.launch_root.to_string_lossy().into_owned(),
+            effective_home: home.to_string_lossy().into_owned(),
+            reviewer_family: spec.reviewer.as_str().to_string(),
+            account_fingerprint: fingerprint,
+        };
+        store
+            .is_authorized(&query)
+            .map_err(|e| refuse(format!("the authorization store could not be trusted: {e}")))
     }
 
     /// The chain index of the entry that matches a stored session's identity, if any.
@@ -1829,6 +1897,32 @@ mod tests {
         );
         // Same reviewer/model/effort but different profiles are not identity-duplicates.
         assert!(!cfg.reviewers[0].same_reviewer_identity(&cfg.reviewers[1]));
+    }
+
+    #[test]
+    fn launch_root_is_captured_and_independent_of_cwd() {
+        // The launch root is the ambient process cwd, captured before any flag. A `--cwd` pointing
+        // elsewhere sets `cwd` but must not move `launch_root` — the Phase 3 authorization key must
+        // not be steerable by a flag a reviewed repo can set. (The path need not exist: `--cwd`
+        // accepts an arbitrary directory, and `normalize_dir` falls back to the given path when it
+        // cannot canonicalize, so the two simply differ.)
+        let expected = normalize_dir(std::env::current_dir().expect("cwd"));
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--cwd",
+            r"C:\some\other\root",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.launch_root, expected);
+        assert_ne!(
+            cfg.launch_root, cfg.cwd,
+            "a --cwd elsewhere must not move the launch root"
+        );
+
+        // With no --cwd, cwd defaults from the same process cwd, so the two coincide.
+        let plain = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(plain.launch_root, plain.cwd);
     }
 
     #[test]

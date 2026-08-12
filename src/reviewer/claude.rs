@@ -243,6 +243,11 @@ impl Reviewer for ClaudeReviewer {
     fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
         claude_account_id(&claude_config_path(cfg, spec)?)
     }
+
+    /// Read the account uuid straight from `home/.claude.json`, without the authorization seam.
+    fn fingerprint_at(&self, home: &Path) -> Option<String> {
+        claude_account_id(&home.join(".claude.json"))
+    }
 }
 
 /// Turn a Claude result document — from the buffered `json` path or the terminal `result`

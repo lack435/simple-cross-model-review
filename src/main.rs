@@ -11,6 +11,7 @@ compile_error!(
      share-mode locking."
 );
 
+mod allowlist;
 mod cancel;
 mod changeset;
 mod config;
@@ -32,6 +33,7 @@ mod tools;
 mod usage;
 mod vcs;
 mod winjob;
+mod winsec;
 
 use std::sync::Arc;
 

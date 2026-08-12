@@ -685,6 +685,19 @@ pub trait Reviewer: Send + Sync {
         None
     }
 
+    /// The same account identifier as [`account_fingerprint`](Self::account_fingerprint), but read
+    /// **directly from a given config home** rather than through the authorized-home seam.
+    ///
+    /// This is the account currently in `home`, used by
+    /// [`Config::resolve_authorized_home`](crate::config::Config::resolve_authorized_home) itself to
+    /// match the allowlist's fingerprint field. It cannot route through `account_fingerprint`, which
+    /// resolves the home via the very authorization being decided — that would recurse. `None` when
+    /// the home has no readable account (an unprovisioned or re-logging profile), which the caller
+    /// treats as unauthorized. See `docs/reviewer-account-profiles-impl.md` (`[f19]`).
+    fn fingerprint_at(&self, _home: &Path) -> Option<String> {
+        None
+    }
+
     /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
     /// `MAX_OUTPUT_BYTES`; the armed Claude path raises the byte cap, adds a line cap, and asks
     /// the runner to *terminate* the child at either bound (because `stream-json` carries the

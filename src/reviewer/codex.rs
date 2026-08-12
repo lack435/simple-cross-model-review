@@ -390,6 +390,11 @@ impl Reviewer for CodexReviewer {
     fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
         codex_account_id(&codex_home(cfg, spec)?)
     }
+
+    /// Read `tokens.account_id` straight from `home/auth.json`, without the authorization seam.
+    fn fingerprint_at(&self, home: &Path) -> Option<String> {
+        codex_account_id(home)
+    }
 }
 
 fn toml_string(value: &str) -> String {
