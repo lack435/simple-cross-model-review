@@ -37,9 +37,11 @@ impl Reviewer for ClaudeReviewer {
         // run the check in a controlled environment against that home, so it verifies the *profile*
         // account rather than whatever the ambient environment resolves to. Ambient leaves the
         // environment untouched -- byte-for-byte today's behaviour.
-        let home = cfg.resolve_authorized_home(spec)?;
-        if let Some(home) = &home {
-            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
+        // The authorized account is captured here so the identity assertion below compares against
+        // *it* rather than a fresh self-read of the home (which would be tautological).
+        let authorized = cfg.resolve_authorized_home_with_account(spec)?;
+        if let Some(authorized) = &authorized {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &authorized.home);
         }
         if cfg.isolate_reviewer {
             cmd.arg("--safe-mode");
@@ -68,17 +70,14 @@ impl Reviewer for ClaudeReviewer {
             }
             let status = Value::Object(map.clone());
             // Profile identity: liveness alone is not enough for a profile -- confirm the home's auth
-            // is a subscription (claude.ai first-party) and resolves to its authorized account before
-            // it is used. Ambient skips this (no profile to verify).
-            if let Some(home) = &home {
-                let resolved = claude_resolve_identity(&status, &home.join(".claude.json"))?;
-                let expected = claude_account_id(&home.join(".claude.json")).ok_or_else(|| {
-                    errors::profile_identity_mismatch(
-                        "claude",
-                        "the profile config file has no oauth account uuid",
-                    )
-                })?;
-                super::assert_profile_identity("claude", &resolved, &expected)?;
+            // is a subscription (claude.ai first-party) and *still* resolves to the account the
+            // allowlist authorized (not a fresh self-read, which would be tautological). A profile
+            // silently re-logged to a different account since it was authorized is caught here.
+            // Ambient skips this (no profile to verify).
+            if let Some(authorized) = &authorized {
+                let resolved =
+                    claude_resolve_identity(&status, &authorized.home.join(".claude.json"))?;
+                super::assert_profile_identity("claude", &resolved, &authorized.account)?;
             }
             let method = map
                 .get("authMethod")

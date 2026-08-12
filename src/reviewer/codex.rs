@@ -30,10 +30,11 @@ impl Reviewer for CodexReviewer {
         cmd.current_dir(super::neutral_dir(cfg));
         // Profile: refuse an unauthorized non-ambient profile (the `?`); for an authorized one, run
         // the check in a controlled environment against that home so it verifies the *profile*
-        // account. Ambient leaves the environment untouched.
-        let home = cfg.resolve_authorized_home(spec)?;
-        if let Some(home) = &home {
-            super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
+        // account. Ambient leaves the environment untouched. The authorized account is captured here
+        // so the identity assertion below can compare against *it* rather than a fresh self-read.
+        let authorized = cfg.resolve_authorized_home_with_account(spec)?;
+        if let Some(authorized) = &authorized {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &authorized.home);
         }
         cmd.arg("login").arg("status");
         let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
@@ -55,17 +56,13 @@ impl Reviewer for CodexReviewer {
             return Err(errors::not_authenticated("codex", out.diagnostics()));
         }
         // Profile identity: liveness alone (signed-in) is not enough for a profile -- confirm the
-        // home's auth is a subscription and resolves to its authorized account before it is used.
-        // Ambient skips this (no profile to verify). See `docs/reviewer-account-profiles-impl.md`.
-        if let Some(home) = &home {
-            let resolved = codex_resolve_identity(home)?;
-            let expected = codex_account_id(home).ok_or_else(|| {
-                errors::profile_identity_mismatch(
-                    "codex",
-                    "the profile home has no readable account id",
-                )
-            })?;
-            super::assert_profile_identity("codex", &resolved, &expected)?;
+        // home's auth is a subscription and *still* resolves to the account the allowlist authorized
+        // (not a fresh self-read of the home, which would be tautological). A profile silently
+        // re-logged to a different account since it was authorized is caught here. Ambient skips this
+        // (no profile to verify). See `docs/reviewer-account-profiles-impl.md`.
+        if let Some(authorized) = &authorized {
+            let resolved = codex_resolve_identity(&authorized.home)?;
+            super::assert_profile_identity("codex", &resolved, &authorized.account)?;
         }
         let reported = out
             .diagnostics()

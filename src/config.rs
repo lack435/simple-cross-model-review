@@ -757,6 +757,17 @@ pub struct Config {
     pub max_concurrent_reviews: u32,
 }
 
+/// A resolved, authorized profile home together with the account the allowlist authorized it for.
+///
+/// The `account` is captured at authorization time and carried through the run: the pre-spawn identity
+/// probe asserts the home still resolves to it, and the post-review switch guard `[f4]` compares the
+/// final fingerprint against it. See [`Config::resolve_authorized_home_with_account`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedHome {
+    pub home: PathBuf,
+    pub account: String,
+}
+
 impl Config {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
         // The immutable launch root, captured from the ambient process cwd *before* any argument
@@ -1075,15 +1086,36 @@ impl Config {
     /// all four; with no store (or no entry) every non-ambient profile is refused — the same
     /// fail-closed default the earlier deny-all stub had, now driven by real data.
     ///
-    /// Not yet wired here: the pre-spawn per-home lock + generation recheck and the post-review
-    /// start-vs-final switch guard `[f4]`/`[f5]`, which make authorization→probe→spawn atomic against a
-    /// mid-flight re-login. Those are Phase 3 task #14; until the setup tool (#15) can write an entry
-    /// the store is empty, so this check denies every non-ambient profile and the race window
-    /// authorizes nothing.
+    /// Not fully atomic yet: the pre-spawn per-home lock + generation recheck `[f5]` — which makes
+    /// authorization→probe→spawn one critical section against a concurrent setup — land with the
+    /// setup tool (#15), which owns the other side of that per-home lock. The post-review
+    /// start-vs-final switch guard `[f4]` (the actual fail-closed backstop for an external re-login) is
+    /// wired in the worker: the account this returns is asserted pre-spawn and re-checked after the
+    /// review. Until #15 can write an entry the store is empty, so this check denies every non-ambient
+    /// profile and the race window authorizes nothing meanwhile.
     pub fn resolve_authorized_home(
         &self,
         spec: &ReviewerSpec,
     ) -> Result<Option<PathBuf>, crate::errors::Failure> {
+        Ok(self
+            .resolve_authorized_home_with_account(spec)?
+            .map(|authorized| authorized.home))
+    }
+
+    /// Resolve *and authorize* a profile home, returning both the home and the **authorized account**
+    /// — the account fingerprint the allowlist entry was matched on (equal to the account in the home
+    /// at this instant, since the tuple match requires it).
+    ///
+    /// This is the only place the authorized account is established, and it is captured here so it can
+    /// be carried forward: the pre-spawn identity probe asserts the home *still* resolves to this
+    /// account (not a fresh self-read, which would be tautological — the gotcha the switch was made to
+    /// fix), and the post-review switch guard `[f4]` compares the final fingerprint against this same
+    /// value, refusing a review whose account was swapped mid-flight before it is recorded or
+    /// delivered. `Ok(None)` for ambient (no account to bind).
+    pub fn resolve_authorized_home_with_account(
+        &self,
+        spec: &ReviewerSpec,
+    ) -> Result<Option<AuthorizedHome>, crate::errors::Failure> {
         if spec.profile.is_ambient() {
             return Ok(None);
         }
@@ -1098,51 +1130,54 @@ impl Config {
             // `resolve_home` returns `None` only for `Ambient`, handled above.
             .expect("a non-ambient selector resolves to a home");
 
-        if !self.profile_authorized(spec, &home)? {
-            return Err(refuse(
+        match self.profile_authorized(spec, &home)? {
+            Some(account) => Ok(Some(AuthorizedHome { home, account })),
+            None => Err(refuse(
                 "no authorization on file for this launch root, profile home, and account. Run the \
                  profile setup to authorize this repository for this profile.",
-            ));
+            )),
         }
-        Ok(Some(home))
     }
 
-    /// Whether this launch root is authorized to use `spec`'s (non-ambient) profile home `home`.
+    /// The authorized account for `spec`'s (non-ambient) profile home `home`, or `None` if this
+    /// launch root is not authorized for it.
     ///
     /// Reads the account currently in `home` (directly, not through the authorization seam — see
     /// [`crate::reviewer::Reviewer::fingerprint_at`]) and asks the allowlist store whether the full
-    /// four-field tuple is on file. Fail-closed on every uncertainty: no store base, an unreadable
-    /// account in the home, or an untrusted/corrupt store all refuse rather than authorize. A store
-    /// *security* failure surfaces as [`PROFILE_NOT_AUTHORIZED`](crate::errors::profile_not_authorized)
-    /// with the underlying reason, never a silent allow.
+    /// four-field tuple is on file; on a match it returns that account. Fail-closed on every
+    /// uncertainty: no store base, an unreadable account in the home, or a store that is not on file
+    /// all yield `Ok(None)` (refuse), while an *untrusted/corrupt* store surfaces as
+    /// [`PROFILE_NOT_AUTHORIZED`](crate::errors::profile_not_authorized) with the underlying reason —
+    /// never a silent allow.
     fn profile_authorized(
         &self,
         spec: &ReviewerSpec,
         home: &Path,
-    ) -> Result<bool, crate::errors::Failure> {
+    ) -> Result<Option<String>, crate::errors::Failure> {
         let refuse = |detail: String| {
             crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
                 .with_detail(detail)
         };
         // No resolvable base means nowhere an authorization could have been recorded: deny.
         let Some(store) = crate::allowlist::AllowlistStore::current() else {
-            return Ok(false);
+            return Ok(None);
         };
         // The account currently in the home. A profile with no readable account (never provisioned,
         // or mid re-login) cannot match any entry, so it is unauthorized — not an error.
         let Some(fingerprint) = crate::reviewer::for_kind(spec.reviewer).fingerprint_at(home)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let query = crate::allowlist::AllowEntry {
             launch_root: self.launch_root.to_string_lossy().into_owned(),
             effective_home: home.to_string_lossy().into_owned(),
             reviewer_family: spec.reviewer.as_str().to_string(),
-            account_fingerprint: fingerprint,
+            account_fingerprint: fingerprint.clone(),
         };
-        store
+        let authorized = store
             .is_authorized(&query)
-            .map_err(|e| refuse(format!("the authorization store could not be trusted: {e}")))
+            .map_err(|e| refuse(format!("the authorization store could not be trusted: {e}")))?;
+        Ok(authorized.then_some(fingerprint))
     }
 
     /// The chain index of the entry that matches a stored session's identity, if any.
@@ -1929,6 +1964,26 @@ mod tests {
     fn ambient_profile_authorizes_to_no_home() {
         let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert_eq!(cfg.resolve_authorized_home(cfg.primary()).unwrap(), None);
+        // The account-bearing variant is also `None` for ambient (no profile account to bind — the
+        // switch guard therefore never fires for an ambient review).
+        assert_eq!(
+            cfg.resolve_authorized_home_with_account(cfg.primary())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn with_account_denies_an_unauthorized_named_profile() {
+        // The account-bearing resolver refuses an unauthorized profile just like the home-only one:
+        // the profile home does not exist, so its account cannot be read and no allowlist entry can
+        // match, so no account is surfaced — it is refused, not silently returned.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        let err = cfg
+            .resolve_authorized_home_with_account(cfg.primary())
+            .unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
     }
 
     #[test]

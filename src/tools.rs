@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerSpec, UsageMinimum};
+use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -113,6 +113,34 @@ fn current_profile_identity(cfg: &Config, spec: &ReviewerSpec) -> session::Profi
         effective_home,
         account_fingerprint,
     }
+}
+
+/// The post-review switch guard `[f4]`: refuse a review whose profile home was re-logged to a
+/// different account between spawn and now.
+///
+/// `start` is the account the profile was authorized for, captured at spawn (`None` for ambient, which
+/// is never guarded). It reads the account currently in the home directly (the same cheap local read
+/// the authorization uses) and refuses if it no longer matches — including when it cannot be read at
+/// all (mid re-login), which fails closed. Called after the reviewer produced output but *before* the
+/// turn is recorded or the review delivered, so a swapped-account review never reaches the caller. The
+/// comparison is against the pinned start account, not a fresh self-read, so an A→B swap is
+/// distinguishable from B→B. See `docs/reviewer-account-profiles-impl.md`.
+fn switch_guard(
+    reviewer: ReviewerKind,
+    start: Option<&crate::config::AuthorizedHome>,
+) -> Result<(), Failure> {
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let final_account = reviewer::for_kind(reviewer).fingerprint_at(&start.home);
+    if final_account.as_deref() != Some(start.account.as_str()) {
+        return Err(errors::profile_identity_mismatch(
+            reviewer.as_str(),
+            "the profile home's account changed while the review was running; the review is refused \
+             rather than delivered under a different account",
+        ));
+    }
+    Ok(())
 }
 
 /// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
@@ -2146,6 +2174,14 @@ impl Job {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
 
+        // Switch guard [f4], part 1 of 2: capture the account this profile is authorized for, at spawn
+        // time. This re-checks the allowlist tuple now, just before the child starts (so a profile
+        // de-authorized or re-logged since the cached preflight is refused here, before any marker is
+        // written or child spawned), and pins the account the post-review check below compares the
+        // final fingerprint against — not a fresh self-read, which could not tell A→B from B→B. Ambient
+        // has no profile account (`Ok(None)`) and is never guarded, so its behaviour is unchanged.
+        let authorized_start = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
+
         // --no-preamble means "send my instructions with nothing added", so it has to
         // suppress the capability section too, not just the preamble. It does not
         // suppress the change: that is evidence the reviewer cannot fetch, not framing
@@ -2434,6 +2470,18 @@ impl Job {
         }
 
         let mut parsed = result?;
+
+        // Switch guard [f4], part 2 of 2: a profile home re-logged to a different account *while the
+        // review was running* taints this review — it may have been billed to, or answered under, an
+        // account this repository never authorized. Re-read the account now and refuse to record or
+        // deliver if it no longer matches the account pinned at spawn (an unreadable account, mid
+        // re-login, fails closed too). This is the actual backstop for the external-`codex login` race
+        // that the pre-spawn checks cannot close (an external writer does not take our locks). Refusing
+        // here — after the reviewer conversation advanced — leaves the findings write-ahead marker set
+        // (it is cleared only in the durable record arm below), so the next call is refused and
+        // rebaselines fresh rather than resuming a conversation whose account moved. Ambient is not
+        // guarded (`authorized_start` is `None`).
+        switch_guard(self.spec.reviewer, authorized_start.as_ref())?;
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
         // build the completed envelope (pure — see `findings::evaluate_turn`). The nonce is this
@@ -3115,6 +3163,38 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn switch_guard_refuses_a_changed_or_unreadable_account() {
+        // The post-review switch guard reads the account currently in the home and compares it to the
+        // account pinned at spawn. Exercise the real read (a Codex auth.json) so this covers the live
+        // path, not just a comparison.
+        let dir = crate::testutil::temp_dir("cross-review-switch-guard-tests");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-1"}}"#,
+        )
+        .expect("write auth.json");
+
+        let bound = |account: &str| crate::config::AuthorizedHome {
+            home: home.clone(),
+            account: account.to_string(),
+        };
+        // Unchanged account: the review is delivered.
+        assert!(switch_guard(ReviewerKind::Codex, Some(&bound("acct-1"))).is_ok());
+        // The account changed under the profile (re-login): refuse.
+        assert!(switch_guard(ReviewerKind::Codex, Some(&bound("acct-2"))).is_err());
+        // Ambient (no pinned account) is never guarded.
+        assert!(switch_guard(ReviewerKind::Codex, None).is_ok());
+        // An unreadable account fails closed (the home is gone / mid re-login).
+        let gone = crate::config::AuthorizedHome {
+            home: dir.join("nonexistent"),
+            account: "acct-1".to_string(),
+        };
+        assert!(switch_guard(ReviewerKind::Codex, Some(&gone)).is_err());
+    }
 
     #[test]
     fn exhaustion_failure_words_itself_by_cause() {
