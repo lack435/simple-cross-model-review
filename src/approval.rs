@@ -19,9 +19,19 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Absolute wall-clock budget for reading one request. A per-read socket timeout is not enough: a
+/// client that dribbles a byte just inside each read window would never trip it, so the whole request
+/// is also bounded by this, after which the connection is dropped ([f3]).
+const CONNECTION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Cap on in-flight connection handlers. Loopback-only and short-lived, but bounded so a local flood
+/// cannot spawn unbounded threads; excess connections are closed immediately.
+const MAX_HANDLERS: usize = 32;
 
 /// One labelled fact shown to the human on the approval page, e.g. `("Profile", "work")`.
 pub struct ApprovalRow {
@@ -53,8 +63,62 @@ pub enum ApprovalOutcome {
 }
 
 struct Shared {
+    /// The single authoritative outcome. First writer wins (see [`set_terminal`]/[`try_approve`]), so
+    /// a cancellation or timeout already recorded cannot be overwritten by a later approval, and an
+    /// approval cannot land after the deadline.
     outcome: Option<ApprovalOutcome>,
     stop: bool,
+}
+
+/// Everything a connection handler needs, shared (via `Arc`) between the accept loop and the
+/// per-connection handler threads.
+struct ServerCtx {
+    token: String,
+    page: String,
+    /// The absolute approval expiry. Checked *under the lock* at approval time, so an approval cannot
+    /// succeed after it ([f1]).
+    deadline: Instant,
+    shared: Arc<(Mutex<Shared>, Condvar)>,
+    /// Count of in-flight handler threads, so acceptance can shed load past [`MAX_HANDLERS`].
+    active: AtomicUsize,
+}
+
+/// Decrements the in-flight handler count when a handler thread ends, even on panic.
+struct ActiveGuard(Arc<ServerCtx>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Record a terminal outcome if none is set yet, waking any waiter. `also_stop` additionally marks the
+/// server to stop accepting (used by cancel). First writer wins: a cancellation/timeout already
+/// recorded is not overwritten, and neither is an approval that already landed.
+fn set_terminal(shared: &(Mutex<Shared>, Condvar), outcome: ApprovalOutcome, also_stop: bool) {
+    let (lock, cvar) = shared;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if also_stop {
+        guard.stop = true;
+    }
+    if guard.outcome.is_none() {
+        guard.outcome = Some(outcome);
+        cvar.notify_all();
+    }
+}
+
+/// Atomically record an approval, or refuse it. Under the lock it checks that the server is not
+/// stopping, no outcome is set yet, and the deadline has not passed — so an approval cannot overwrite
+/// a cancellation ([f2]) or land after expiry ([f1]). Returns whether the approval was recorded.
+fn try_approve(shared: &(Mutex<Shared>, Condvar), deadline: Instant) -> bool {
+    let (lock, cvar) = shared;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.stop || guard.outcome.is_some() || Instant::now() >= deadline {
+        return false;
+    }
+    guard.outcome = Some(ApprovalOutcome::Approved);
+    cvar.notify_all();
+    true
 }
 
 /// A running approval server: bound to loopback, serving the approval page until the human approves,
@@ -80,19 +144,23 @@ impl ApprovalServer {
         let port = listener.local_addr()?.port();
         let url = format!("http://127.0.0.1:{port}/?token={token}");
         let page = render_page(details, &token);
-
-        let shared = Arc::new((
-            Mutex::new(Shared {
-                outcome: None,
-                stop: false,
-            }),
-            Condvar::new(),
-        ));
-        let deadline = Instant::now() + timeout;
-        let server_shared = Arc::clone(&shared);
+        let ctx = Arc::new(ServerCtx {
+            token,
+            page,
+            deadline: Instant::now() + timeout,
+            shared: Arc::new((
+                Mutex::new(Shared {
+                    outcome: None,
+                    stop: false,
+                }),
+                Condvar::new(),
+            )),
+            active: AtomicUsize::new(0),
+        });
+        let shared = Arc::clone(&ctx.shared);
         let handle = std::thread::Builder::new()
             .name("cross-review-approval".to_string())
-            .spawn(move || serve_loop(listener, token, page, deadline, server_shared))?;
+            .spawn(move || serve_loop(listener, ctx))?;
 
         Ok(Self {
             url,
@@ -116,12 +184,10 @@ impl ApprovalServer {
         guard.outcome.expect("outcome set")
     }
 
-    /// Ask the server to stop and record a `Cancelled` outcome if none is set yet.
+    /// Ask the server to stop and record a `Cancelled` outcome if none is set yet. Recording the
+    /// outcome (not just a stop flag) is what makes an in-flight approval lose to a cancellation ([f2]).
     pub fn cancel(&self) {
-        let (lock, cvar) = &*self.shared;
-        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        guard.stop = true;
-        cvar.notify_all();
+        set_terminal(&self.shared, ApprovalOutcome::Cancelled, true);
     }
 }
 
@@ -134,42 +200,49 @@ impl Drop for ApprovalServer {
     }
 }
 
-fn serve_loop(
-    listener: TcpListener,
-    token: String,
-    page: String,
-    deadline: Instant,
-    shared: Arc<(Mutex<Shared>, Condvar)>,
-) {
-    let (lock, cvar) = &*shared;
-    let finish = |outcome: ApprovalOutcome| {
-        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.outcome.is_none() {
-            guard.outcome = Some(outcome);
-            cvar.notify_all();
-        }
-    };
+fn serve_loop(listener: TcpListener, ctx: Arc<ServerCtx>) {
     loop {
+        // Stop once the outcome is decided (an approval landed on a handler thread, a cancellation
+        // arrived, or the timeout below fired) — the accept loop then exits promptly.
         {
-            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.stop {
-                drop(guard);
-                finish(ApprovalOutcome::Cancelled);
+            let (lock, cvar) = &*ctx.shared;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.stop && guard.outcome.is_none() {
+                guard.outcome = Some(ApprovalOutcome::Cancelled);
+                cvar.notify_all();
+            }
+            if guard.outcome.is_some() {
                 return;
             }
         }
-        if Instant::now() >= deadline {
-            finish(ApprovalOutcome::TimedOut);
+        if Instant::now() >= ctx.deadline {
+            set_terminal(&ctx.shared, ApprovalOutcome::TimedOut, false);
             return;
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                if handle_connection(stream, &token, &page) {
-                    finish(ApprovalOutcome::Approved);
-                    return;
+                // Shed load past the cap rather than spawn unbounded threads on a local flood.
+                if ctx.active.load(Ordering::SeqCst) >= MAX_HANDLERS {
+                    drop(stream);
+                    continue;
+                }
+                ctx.active.fetch_add(1, Ordering::SeqCst);
+                let handler_ctx = Arc::clone(&ctx);
+                // Handle each connection on its own short-lived thread, so a slow client can never
+                // stall acceptance or delay observing the deadline/cancellation ([f3]). The thread is
+                // detached but bounded by `CONNECTION_BUDGET`; `ActiveGuard` frees its slot on exit.
+                let spawned = std::thread::Builder::new()
+                    .name("cross-review-approval-conn".to_string())
+                    .spawn(move || {
+                        let _guard = ActiveGuard(Arc::clone(&handler_ctx));
+                        handle_connection(stream, &handler_ctx);
+                    });
+                if spawned.is_err() {
+                    // The thread never started, so no `ActiveGuard` will free the slot — do it here.
+                    ctx.active.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            // Non-blocking listener: nothing pending, sleep briefly and re-check stop/deadline.
+            // Non-blocking listener: nothing pending, sleep briefly and re-check outcome/deadline.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -179,25 +252,41 @@ fn serve_loop(
     }
 }
 
-/// Handle one HTTP connection. Returns `true` only for a valid single-use approval POST.
-fn handle_connection(mut stream: TcpStream, expected_token: &str, page: &str) -> bool {
-    // The accepted stream inherits non-blocking; make it blocking with a short read timeout so a
-    // half-open or slow client cannot stall the loop.
+/// Handle one HTTP connection: read the request under an absolute budget, validate, and for a valid
+/// approval POST record the outcome atomically.
+fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
     stream.set_nonblocking(false).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    // A short per-read timeout keeps the read loop re-checking the absolute connection budget below,
+    // rather than blocking indefinitely on a half-open client.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let connection_deadline = Instant::now() + CONNECTION_BUDGET;
 
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
+        // Absolute per-connection bound: a drip-feeding client that stays just inside each read
+        // window is still cut off here, so it cannot occupy a handler indefinitely ([f3]).
+        if buf.len() > 8192 || Instant::now() >= connection_deadline {
+            break;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
-                // Stop once the request headers are complete, or a bound is hit (a request line +
-                // headers this long is not one of ours).
-                if buf.len() > 8192 || ends_headers(&buf) {
+                if contains_subslice(&buf, b"\r\n\r\n") {
                     break;
                 }
+            }
+            // A per-read timeout (no bytes yet): loop to re-check the absolute connection deadline.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
             }
             Err(_) => break,
         }
@@ -210,46 +299,46 @@ fn handle_connection(mut stream: TcpStream, expected_token: &str, page: &str) ->
     let target = parts.next().unwrap_or("");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let token_ok = query_param(query, "token")
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), expected_token.as_bytes()));
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), ctx.token.as_bytes()));
 
     // Validate method, path, and token on every request; match nothing from the query but the token.
-    match (method, path) {
-        _ if !token_ok => {
-            respond(
-                &mut stream,
-                "403 Forbidden",
-                "text/plain; charset=utf-8",
-                "Forbidden: missing or invalid one-time token.\n",
-            );
-            false
-        }
-        ("GET", "/") => {
-            respond(&mut stream, "200 OK", "text/html; charset=utf-8", page);
-            false
-        }
-        ("POST", "/approve") => {
-            respond(
-                &mut stream,
-                "200 OK",
-                "text/html; charset=utf-8",
-                APPROVED_PAGE,
-            );
-            true
-        }
-        _ => {
-            respond(
-                &mut stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                "Not found.\n",
-            );
-            false
-        }
+    if !token_ok {
+        respond(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "Forbidden: missing or invalid one-time token.\n",
+        );
+        return;
     }
-}
-
-fn ends_headers(buf: &[u8]) -> bool {
-    buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" || contains_subslice(buf, b"\r\n\r\n")
+    match (method, path) {
+        ("GET", "/") => respond(&mut stream, "200 OK", "text/html; charset=utf-8", &ctx.page),
+        ("POST", "/approve") => {
+            // Record the approval atomically under the lock: it is refused if the deadline has passed
+            // or a cancellation/timeout already won ([f1]/[f2]).
+            if try_approve(&ctx.shared, ctx.deadline) {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    APPROVED_PAGE,
+                );
+            } else {
+                respond(
+                    &mut stream,
+                    "409 Conflict",
+                    "text/html; charset=utf-8",
+                    EXPIRED_PAGE,
+                );
+            }
+        }
+        _ => respond(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "Not found.\n",
+        ),
+    }
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -342,6 +431,10 @@ fn render_page(details: &ApprovalDetails, token: &str) -> String {
 const APPROVED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
      <title>Approved</title><style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}</style>\
      </head><body><h1>Approved</h1><p>You can close this tab and return to your terminal.</p></body></html>";
+
+const EXPIRED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+     <title>No longer valid</title><style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}</style>\
+     </head><body><h1>This approval link is no longer valid</h1><p>It expired or was already used or cancelled. Start the setup again if you still want to authorize this profile.</p></body></html>";
 
 extern "system" {
     fn ShellExecuteW(
@@ -468,6 +561,53 @@ mod tests {
         // Not approved: cancel and confirm the outcome is not Approved.
         server.cancel();
         assert_eq!(server.wait(), ApprovalOutcome::Cancelled);
+    }
+
+    fn fresh_shared() -> (Mutex<Shared>, Condvar) {
+        (
+            Mutex::new(Shared {
+                outcome: None,
+                stop: false,
+            }),
+            Condvar::new(),
+        )
+    }
+
+    #[test]
+    fn try_approve_refuses_after_the_deadline() {
+        // [f1]: an approval landing after the deadline must be refused under the lock, never recorded.
+        let shared = fresh_shared();
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(!try_approve(&shared, past));
+        assert_eq!(shared.0.lock().unwrap().outcome, None);
+        // A future deadline with no prior outcome approves.
+        let future = Instant::now() + Duration::from_secs(30);
+        assert!(try_approve(&shared, future));
+        assert_eq!(
+            shared.0.lock().unwrap().outcome,
+            Some(ApprovalOutcome::Approved)
+        );
+    }
+
+    #[test]
+    fn cancellation_beats_a_later_approval() {
+        // [f2]: once a terminal outcome (cancel/timeout) is recorded, an approval cannot overwrite it.
+        let shared = fresh_shared();
+        set_terminal(&shared, ApprovalOutcome::Cancelled, true);
+        assert!(!try_approve(
+            &shared,
+            Instant::now() + Duration::from_secs(30)
+        ));
+        assert_eq!(
+            shared.0.lock().unwrap().outcome,
+            Some(ApprovalOutcome::Cancelled)
+        );
+        // And a second terminal outcome does not overwrite the first (first writer wins).
+        set_terminal(&shared, ApprovalOutcome::TimedOut, false);
+        assert_eq!(
+            shared.0.lock().unwrap().outcome,
+            Some(ApprovalOutcome::Cancelled)
+        );
     }
 
     #[test]
