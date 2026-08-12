@@ -286,16 +286,18 @@ pub fn secure_profile_dir(
                     "--codex-home / --claude-config-dir requires a non-empty absolute path",
                 ));
             }
-            // The path must name a real *directory leaf*, not a root/prefix, and contain no `.`/`..`
-            // component: `create_secured_dir` reports an existing file as already-present and a
-            // trailing `..` resolves to a parent or the drive root, either of which would otherwise
-            // receive the restrictive DACL — the wrong object (f1). The directory attribute is also
-            // verified on the opened handle inside `create_secured_dir`.
-            if p.components()
-                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-            {
+            // The path must name a real *directory leaf*, not a root/prefix, and must not traverse
+            // upward: `create_secured_dir` reports an existing file as already-present and a `..`
+            // resolves to a parent or the drive root, either of which would otherwise receive the
+            // restrictive DACL — the wrong object (f1). We reject every `..` (`ParentDir`) component,
+            // which `Path::components()` preserves. A `.` (`CurDir`) component is *not* checked here
+            // and needs no check: `components()` normalizes non-leading `.` away entirely, and a
+            // leading `.` cannot occur because the path is required to be absolute above — either way
+            // a `.` is a no-op that resolves to the same directory, never a different object (f4). The
+            // directory attribute is also verified on the opened handle inside `create_secured_dir`.
+            if p.components().any(|c| matches!(c, Component::ParentDir)) {
                 return Err(io::Error::other(
-                    "--codex-home / --claude-config-dir must not contain '.' or '..' components",
+                    "--codex-home / --claude-config-dir must not contain a '..' component",
                 ));
             }
             if !matches!(p.components().next_back(), Some(Component::Normal(_))) {
