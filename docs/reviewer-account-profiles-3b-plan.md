@@ -215,8 +215,16 @@ The staging→home move instead uses a **raw no-replace primitive** — `MoveFil
 `MOVEFILE_REPLACE_EXISTING` (or `NtSetInformationFile`/`FileRenameInformation` with
 `ReplaceIfExists = FALSE`) — so a `home` that appeared concurrently (first-provision) makes the rename
 **fail**, staging is rolled back, and no pre-existing home is ever replaced. The rename is then the
-race-safe collision check. Tested against empty, non-empty, file, and reparse-point collisions at the
-target.
+race-safe collision check.
+
+**No-replace is the universal rule for *every* swap and recovery rename (f-c4), not just
+`staging→home`.** `rename(home → .old)`, `rename(.old → home)` (restore), `rename(home → rejected)`,
+and any recovery move all use the same `ReplaceIfExists = FALSE` primitive. The file-id/no-reparse
+check on `.old`/target is a **pre-check, not an atomic exclusion** — a target could appear between the
+check and a replacing rename — so the no-replace rename is what actually guarantees a recovery move
+never clobbers an object that materialized at the destination; on such a collision recovery **retains
+the journal and refuses** (fail closed). Every one of these renames is tested against empty, non-empty,
+file, and reparse-point collisions at the target.
 
 ```rust
 struct OwnedStaging { secured: Option<SecuredProfileDir>, staging: PathBuf, committed: bool }
@@ -459,6 +467,10 @@ Factor the login step behind an injected callback so unit tests never run real O
   (and reviewer) in the key**; **f-c3 (minor)** the kill-early probe can't observe post-callback
   behaviour → a **synthetic-OAuth-provider harness** (or the deferred smoke) validates process-exit +
   no-out-of-job-helper.
+- **rv-20864-15** resolved f-c1/f-c2/f-c3 and raised **f-c4** — no-replace was specified only for
+  `staging→home`; recovery's `.old→home`/`home→.old`/`home→rejected` moves were generic renames whose
+  file-id pre-check is not atomic → **`ReplaceIfExists=FALSE` is now the universal rule for every swap
+  and recovery rename**, fail-closed on a destination collision.
 - **rv-20864-13** resolved f-b1/f-b2/f-b3 and raised **f-b5** — the parent-directory flush barrier had
   to extend to the swap renames themselves (`home→.old`, `staging→home`, quarantine/restore, `.old`
   delete), not only the file publications, so a lost directory-entry update cannot drop the final home
