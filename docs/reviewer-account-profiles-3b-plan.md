@@ -207,10 +207,16 @@ Staging dirs are created with a **new winsec `create_new_secured_child_dir(paren
 `create_secured_child_dir` but with `FILE_CREATE` (exclusive, `winsec.rs:233` `FILE_CREATE=2`) instead
 of `FILE_OPEN_IF`; a collision → distinct `AlreadyExists`. Because staging names are nonce-unique, an
 `AlreadyExists` there means a crashed prior run's leftover, handled by recovery — never an adopt-then-
-delete of someone else's dir. The final `home` is produced only by `rename(staging → home)`; on
-Windows a directory rename **fails if the target exists**, so a `home` that appeared concurrently
-(first-provision) is refused at the atomic rename and staging is rolled back — the rename *is* the
-race-safe collision check, and no pre-existing home is ever deleted.
+delete of someone else's dir. The final `home` is produced only by `rename(staging → home)` — but this **must be a no-replace
+rename** (f-c1): the repo's existing rename path uses `std::fs::rename`, i.e. `MoveFileExW` with
+`MOVEFILE_REPLACE_EXISTING` (`session.rs`, `winsec.rs:924`), which on supported Windows filesystems can
+**replace an empty target directory** and would silently clobber a `home` that appeared concurrently.
+The staging→home move instead uses a **raw no-replace primitive** — `MoveFileExW` **without**
+`MOVEFILE_REPLACE_EXISTING` (or `NtSetInformationFile`/`FileRenameInformation` with
+`ReplaceIfExists = FALSE`) — so a `home` that appeared concurrently (first-provision) makes the rename
+**fail**, staging is rolled back, and no pre-existing home is ever replaced. The rename is then the
+race-safe collision check. Tested against empty, non-empty, file, and reparse-point collisions at the
+target.
 
 ```rust
 struct OwnedStaging { secured: Option<SecuredProfileDir>, staging: PathBuf, committed: bool }
@@ -233,9 +239,13 @@ raw spelling when the path does not exist** (`setup.rs:377-379`). During the `ho
 is created later, `profile.rs:272`), so canonicalizing the parent is *also* insufficient (f-a1) — two
 equivalent spellings (8.3 vs long, case, explicit-home aliases) would still key to different
 locks/journals and race. Key instead on a **path-independent identity**:
-- **`Named`:** `canonical(base) + reviewer + validated-name`. The base is created and canonicalized
-  **before** any lock is taken; `reviewer` and the validated name are exact strings. The key never
-  depends on whether `profiles/{reviewer}/{name}` exists.
+- **`Named`:** `canonical(base) + reviewer + case-normalized name`. The base is created and
+  canonicalized **before** any lock is taken. Because Windows directories are **case-insensitive**,
+  `validate_profile_name` accepts case variants, and `resolve_home` joins the raw name
+  (`profile.rs:85,169`), the name (and reviewer) are **lower-cased in the key** (f-c2) so `profile:Work`
+  and `profile:work` — one physical directory — map to one key even while the leaf is absent. The key
+  never depends on whether `profiles/{reviewer}/{name}` exists. (The raw name is still used to *create*
+  the directory; only the *key* is normalized.)
 - **`ExplicitHome`:** canonicalize the **longest existing ancestor** and append the normalized
   remaining components, so all spellings of the same target collapse to one key whether or not the leaf
   exists.
@@ -442,6 +452,13 @@ Factor the login step behind an injected callback so unit tests never run real O
   flushed the file but not its parent dir → flush file **and** parent for every publication; **f-b4**
   recovery could not certify/attribute the commit → persist the full expected `AllowEntry` + a durable
   post-flush `committed` phase and require the exact flushed entry.
+- **rv-20864-14 (fresh authoritative)** confirmed f-b4/f-b5 resolved and raised three tail items, all
+  folded in: **f-c1** `std::fs::rename` can replace an empty target → use a **no-replace rename**
+  (`MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`) for `staging→home`, so the collision check holds;
+  **f-c2** the `Named` key used case-sensitive strings on a case-insensitive FS → **lower-case the name
+  (and reviewer) in the key**; **f-c3 (minor)** the kill-early probe can't observe post-callback
+  behaviour → a **synthetic-OAuth-provider harness** (or the deferred smoke) validates process-exit +
+  no-out-of-job-helper.
 - **rv-20864-13** resolved f-b1/f-b2/f-b3 and raised **f-b5** — the parent-directory flush barrier had
   to extend to the swap renames themselves (`home→.old`, `staging→home`, quarantine/restore, `.old`
   delete), not only the file publications, so a lost directory-entry update cannot drop the final home
@@ -480,7 +497,10 @@ Factor the login step behind an injected callback so unit tests never run real O
   swap (f-a3).
 - **`src/setup.rs`** — `login` arg, recovery-before-classification, `OwnedStaging` (with ownership-nonce
   marker, f13), unified staged-create + rename-into-place for both operations, identity binding,
-  `home_key` stable-parent keying (f12), `FlushFileBuffers` WAL (f15), injected-login seam, tests.
+  `home_key` path-independent + case-normalized keying (f12/f-a1/f-c2), `FlushFileBuffers` WAL (f15),
+  injected-login seam, tests.
+- **`src/winsec.rs`** (also) — a **no-replace directory rename** primitive (`MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING`) for `staging→home` (f-c1).
 - **the review path (`attempt()`)** — [f5] shared-read lock spanning the whole attempt.
 - **`src/mcp.rs` / `src/tools.rs`** — `login` boolean in the setup schema + description (setup blocks
   minutes while the human OAuths).
@@ -514,7 +534,8 @@ Factor the login step behind an injected callback so unit tests never run real O
   and cannot race recovery (f-b1); **power-loss fault tests** at each flush boundary — after credential
   flush, after store rename, after store flush, after `.old` delete — leave a recoverable state
   (f-b2/f-b3); recovery **certifies the exact flushed `AllowEntry`** before removing `.old` or rolling
-  back (f-b4).
+  back (f-b4); **no-replace `staging→home`** refuses empty/nonempty/file/reparse collisions at the
+  target (f-c1); a **concurrent missing-leaf** test proves `Work`/`work` take one lock (f-c2).
 - `.\build.ps1` — fmt, clippy `-D warnings`, tests, release (needs agent MCP sessions unloaded to
   restage `dist\`).
 - **No-token login-behaviour probe, required before landing (f5):** per vendor, spawn login into a
@@ -523,6 +544,14 @@ Factor the login step behind an injected callback so unit tests never run real O
   fails, the device-auth fallback is not localized** — it needs an explicit flow surfacing the user
   code/URL on our own `ApprovalServer` page (a `LoginOutcome`/flow "needs user code" variant), designed
   and reviewed separately.
+  - **Post-callback behaviour needs the full lifecycle (f-c3, minor).** Killing before OAuth completes
+    cannot observe the claims that *depend on* callback completion — that the login process **exits on
+    callback** (not on browser close) and spawns **no out-of-job helper** afterward. The authoritative
+    check for those is a **synthetic-OAuth-provider harness**: point the vendor login at a local
+    fake authorization endpoint that returns a dummy code so the callback completes **without any real
+    token or account**, then observe process exit + job membership. Where a synthetic provider is not
+    feasible for a vendor, those two claims are validated by the **deferred real-OAuth smoke** instead,
+    and that dependency is stated explicitly rather than assumed proven by the kill-early probe.
 - **Deferred (needs the maintainer + tokens):** `smoke.ps1 -Reviewer codex|claude` real end-to-end —
   first-provision lands the credential in the *dedicated* home (not `~/.codex`/`~`), the probe reports
   the account, allowlist entry + restrictive DACLs on home and credential file; then a re-login account
