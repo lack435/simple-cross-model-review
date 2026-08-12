@@ -226,7 +226,9 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
         if header_end.is_none() {
             if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
                 header_end = Some(pos + 4);
-                content_length = parse_content_length(&buf[..pos]).min(MAX_REQUEST);
+                // The *declared* length, not clamped: an oversized or unparseable value is rejected in
+                // the POST handler rather than silently accepted (f4).
+                content_length = parse_content_length(&buf[..pos]);
             }
         }
         if let Some(end) = header_end {
@@ -280,7 +282,30 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
     match (method, path) {
         ("GET", "/") => respond(&mut stream, "200 OK", "text/html; charset=utf-8", &ctx.page),
         ("POST", "/submit") => {
-            let body = &buf[head_end.min(buf.len())..];
+            // Framing checks (f4): the body must be declared (non-zero Content-Length), within the
+            // request cap, and **fully received** (exactly Content-Length bytes) — a missing, oversized,
+            // or incomplete body is a bad request, never a partial parse.
+            let hend = header_end.unwrap_or(buf.len());
+            if content_length == 0 || hend + content_length > MAX_REQUEST {
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    "Bad request.\n",
+                );
+                return;
+            }
+            if buf.len() < hend + content_length {
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    "Incomplete request body.\n",
+                );
+                return;
+            }
+            // Parse **exactly** the declared body, not any extra buffered bytes.
+            let body = &buf[hend..hend + content_length];
             match form_field(body, "code") {
                 // Empty code: refuse without recording.
                 Some(code) if code.is_empty() => {
@@ -352,8 +377,9 @@ fn parse_content_length(headers: &[u8]) -> usize {
     0
 }
 
-/// The value of form field `name` in an `application/x-www-form-urlencoded` body, percent-decoded and
-/// length-bounded. Returns `None` if the field is absent.
+/// The value of form field `name` in an `application/x-www-form-urlencoded` body, percent-decoded.
+/// Returns `None` if the field is absent **or its decoded value exceeds [`MAX_CODE_LEN`]** — an
+/// overlong code is *rejected*, never silently truncated (f4).
 fn form_field(body: &[u8], name: &str) -> Option<String> {
     // Only the code is read; it is a short opaque string, so decode just the matching field.
     if !contains_subslice(body, name.as_bytes()) {
@@ -364,8 +390,11 @@ fn form_field(body: &[u8], name: &str) -> Option<String> {
         if let Some((k, v)) = pair.split_once('=') {
             if k == name {
                 let decoded = percent_decode(v);
-                let trimmed: String = decoded.trim().chars().take(MAX_CODE_LEN).collect();
-                return Some(trimmed);
+                let trimmed = decoded.trim();
+                if trimmed.chars().count() > MAX_CODE_LEN {
+                    return None;
+                }
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -529,6 +558,33 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
         server.cancel();
         assert!(matches!(server.poll(), Some(CodeOutcome::Cancelled)));
+    }
+
+    #[test]
+    fn a_post_without_a_body_or_with_an_overlong_code_is_rejected() {
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+
+        // No Content-Length (no declared body): bad request, not a partial parse.
+        let no_body = raw(
+            port,
+            &format!("POST /submit?token={token} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert!(no_body.starts_with("HTTP/1.1 400"), "{no_body}");
+
+        // An overlong code is rejected (not truncated and accepted).
+        let big = format!("code={}", "a".repeat(super::MAX_CODE_LEN + 100));
+        let overlong = raw(
+            port,
+            &format!(
+                "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{big}",
+                big.len()
+            ),
+        );
+        assert!(overlong.starts_with("HTTP/1.1 400"), "{overlong}");
+        // Nothing was recorded by either.
+        assert!(server.poll().is_none());
     }
 
     #[test]

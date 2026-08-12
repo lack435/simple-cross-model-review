@@ -617,13 +617,17 @@ pub fn run_login_code_paste(
         std::thread::sleep(Duration::from_millis(150));
     };
 
-    // Feed the code to the child's stdin, then close stdin (EOF) and stop the page.
-    if let Some(si) = stdin.as_mut() {
-        let _ = si.write_all(code.as_bytes());
-        let _ = si.write_all(b"\n");
-        let _ = si.flush();
+    // Feed the code to the child's stdin on a **detached thread** so a non-reading child cannot block
+    // the runner on a full pipe (f2): the overall timeout below reaps a wedged child, which closes this
+    // pipe and unblocks (or errors) the write. Dropping the writer's `ChildStdin` at the end of the
+    // thread gives the child EOF after the code. The code string is moved in and never logged.
+    if let Some(mut si) = stdin.take() {
+        let code_line = format!("{code}\n");
+        std::thread::spawn(move || {
+            let _ = si.write_all(code_line.as_bytes());
+            let _ = si.flush();
+        });
     }
-    drop(stdin);
     drop(server);
 
     // Phase 3: wait (bounded) for the child to exchange the code, write credentials, and exit.
@@ -657,20 +661,17 @@ pub fn run_login_code_paste(
         }
         std::thread::sleep(Duration::from_millis(150));
     };
-    for s in scanners {
-        let _ = s.join();
-    }
-    if !wait_quiescent(&job) {
-        let contained = terminate_and_settle(&job, &mut child);
-        return LoginOutcome {
-            exit: exit_code,
-            uncontained: !contained,
-            ..fail
-        };
-    }
+
+    // The child has exited. Prove containment with the **bounded** quiescence/terminate path, then
+    // return. The scanner threads are **not** joined unboundedly (f1): a descendant that inherited a
+    // pipe could hold it open forever, so joining could wedge the runner (and setup). They exit on
+    // their own once the pipes close — which job termination guarantees — so we detach them.
+    let contained = wait_quiescent(&job) || terminate_and_settle(&job, &mut child);
+    drop(scanners);
     LoginOutcome {
-        success: exit_code == Some(0),
+        success: contained && exit_code == Some(0),
         exit: exit_code,
+        uncontained: !contained,
         ..fail
     }
 }
@@ -684,23 +685,26 @@ fn spawn_url_scanner<R: Read + Send + 'static>(
     url: Arc<Mutex<Option<String>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut acc = String::new();
+        // A **byte** accumulator, so bounding it trims at a byte offset (a `String::split_off` at an
+        // arbitrary byte would panic on non-ASCII output and stop the drain, f3).
+        let mut acc: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 1024];
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    acc.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                    let mut slot = url.lock().unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        if let Some(found) = extract_https_url(&acc) {
-                            *slot = Some(found);
+                    acc.extend_from_slice(&chunk[..n]);
+                    {
+                        let mut slot = url.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            if let Some(found) = extract_https_url(&String::from_utf8_lossy(&acc)) {
+                                *slot = Some(found);
+                            }
                         }
                     }
-                    drop(slot);
                     // Keep the buffer bounded: retain a tail large enough to hold a split URL.
                     if acc.len() > 64 * 1024 {
-                        acc = acc.split_off(acc.len() - 8192);
+                        acc.drain(..acc.len() - 8192);
                     }
                 }
             }
