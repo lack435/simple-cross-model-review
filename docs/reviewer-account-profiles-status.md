@@ -95,9 +95,20 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
      out-of-job process). Two honest residuals: same-user post-verify tampering is outside the ACL-only
      trust boundary (README), and full callback-lifecycle verification needs a synthetic-provider
      harness or the deferred real smoke. Build against that doc.
-   - **#15·part 3b implementation — DONE (committed, green; NOT yet gated).** The approved design is
-     implemented across nine committed slices (all `cargo fmt --check` / `clippy -D warnings` / 647
-     tests green; release build passes). What landed:
+   - **#15·part 3b implementation — DONE + GATE-APPROVED (`rv-20864-24`, `verdict: approve`, 0 open).**
+     The approved design is implemented across committed slices (all `cargo fmt --check` /
+     `clippy -D warnings` / 650 tests green; release build passes). The implementation gate ran over
+     four rounds and ~15 findings, all resolved — durability made fail-closed (write-through WAL rename,
+     corrupt-journal refusal, propagated credential/store flushes), recovery hardened (`try_exists`
+     fail-closed, ownership-proof + `.old` object-identity before any delete, durable `committed`
+     phase, WAL-before-create, arm-at-staging-creation), require-all-credential-files, fail-closed
+     review/setup lock, creation-time job association with checked `ResumeThread`, and the login
+     runner's containment made rigorous (`terminate_and_settle` requires terminate-success AND
+     quiescence; an uncontained login **leaks** staging for recovery rather than racing its delete).
+     Two accepted residuals: **f9** an out-of-job WMI/service helper can't be job-contained (probe-time
+     supported-vendor gate + same-user-trust residual; runtime fails closed if the job can't be
+     created), **f11** the login lock is per-user not machine-wide `Global` (normal users can't create
+     `Global\` objects; cross-user collision degrades to the vendor's port-bind error). What landed:
      - **`src/winsec.rs`**: `create_new_secured_child_dir` (exclusive `FILE_CREATE` ownership proof),
        `secure_and_verify_child_file` ([f20] apply-then-verify), `read_child_file` (handle-relative
        account read, f-a5), `rename_no_replace` (`MoveFileExW` no-replace + write-through, f-c1/f-c4/f-b5),
@@ -128,9 +139,11 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
        machine-wide `Global` the plan's f19 specified — a normal-user process cannot create a `Global\`
        object and a cross-user %PROGRAMDATA% lock was judged disproportionate; the rarer two-user
        collision surfaces as the vendor's own fixed-port bind error. Flag this in the gate.
-     - **Still remaining:** the cross-review **gate** on the implementation; the **no-token login probe**
-       (validates non-TTY browser-open + callback, spends no tokens); `build.ps1` **dist restage** (needs
-       the running MCP server unloaded); and the deferred real-OAuth **`smoke.ps1`**.
+     - **Still remaining (all deferred, not blockers to the code landing):** the **no-token login
+       probe** (validates non-TTY browser-open + callback + no out-of-job spawn; spends no tokens — the
+       supported-vendor gate for f9); `build.ps1` **dist restage** (needs the running MCP server
+       unloaded — a release-time step); and the deferred real-OAuth **`smoke.ps1`** end-to-end (first
+       real login, account switch, cancelled/failed-login-leaves-prior-home-intact).
 
 ## Resume-critical gotchas (not obvious from the code)
 
