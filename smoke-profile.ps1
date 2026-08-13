@@ -156,10 +156,22 @@ try {
         $accountFile = if ($rv -eq 'codex') { 'auth.json' } else { '.claude.json' }
         Check "$rv account file '$accountFile' landed in the dedicated home" (Test-Path (Join-Path $homeDir $accountFile)) $homeDir
 
+        # Verify the allowlist by parsing the JSON (its paths are backslash-escaped, so a raw regex
+        # match on the text is unreliable): look for an entry for this reviewer whose effective_home is
+        # the dedicated profile home.
         $allow = Join-Path $crHome 'auth\allowlist.json'
         $allowText = if (Test-Path $allow) { Get-Content $allow -Raw } else { '' }
-        $wanted = 'profiles\' + $rv + '\' + $Profile
-        Check "$rv allowlist entry recorded" (($allowText -match [regex]::Escape($wanted)) -and ($allowText -match ('"reviewer_family":\s*"' + $rv + '"'))) $allowText
+        $allowOk = $false
+        if ($allowText.Trim()) {
+            try {
+                $entries = ($allowText | ConvertFrom-Json).entries
+                $allowOk = @($entries | Where-Object {
+                        $_.reviewer_family -eq $rv -and $_.effective_home -like "*profiles\$rv\$Profile"
+                    }).Count -gt 0
+            }
+            catch {}
+        }
+        Check "$rv allowlist entry recorded" $allowOk $allowText
     }
 }
 finally {
