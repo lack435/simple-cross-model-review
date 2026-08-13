@@ -154,12 +154,23 @@ authorize→probe→spawn when the setup lock lands, keyed on the effective home
      `login_fn`. Unit-tested: `CodeEntryServer` round-trip + percent-decode; `extract_https_url` against
      the exact Claude output. **GATE-APPROVED (`rv-20864-27`, 0 open)** after f1–f5 (bounded scanner
      cleanup, non-blocking detached stdin write, byte-buffer scanner, strict + overflow-safe HTTP body
-     framing). The full Claude interactive path (spawn → paste → creds) is validated by the deferred
-     real smoke, not unit tests (the CodeEntryServer port is internal to the runner).
-     - **Still remaining (all deferred, not blockers to the code landing):** `build.ps1` **dist restage**
-       (needs the running MCP server unloaded — a release-time step); and the deferred real-OAuth
-       **`smoke.ps1`** end-to-end (Codex first-login + Claude code-paste + account switch +
-       cancelled/failed-login-leaves-prior-home-intact).
+     framing).
+   - **#15·part 3b — REAL PROVISIONING SMOKE PASSED (2026-08-12).** An interactive profile smoke drove
+     `cross_model_setup_profile { login: true }` over MCP against the real CLIs, isolated under a
+     throwaway `CROSS_REVIEW_HOME`. **Codex first-provision passed 5/5** (credentials in the dedicated
+     home + allowlist entry). Claude **first failed** and exposed a real bug: Claude's `auth login` is
+     **hybrid** — some accounts complete via a browser **callback** (no code paste, like Codex) and the
+     CLI exits 0; others show a **code** to paste. `run_login_code_paste` assumed a paste always
+     happens, so a code-less callback exit was treated as a failure and the real credentials were rolled
+     back. **Fixed (gate-approved `rv-20864-28`):** the runner now watches child-exit AND the code page
+     together — a child exit 0 is success (callback or post-paste), a pasted code is fed once, only the
+     deadline/cancel aborts. Re-smoke: **Claude passed 5/5** (code-less account). So both reviewers are
+     **smoke-validated end-to-end**. The **code-paste (personal-account) sub-path** is exercised by the
+     unit tests (`CodeEntryServer` + `extract_https_url`) but has not yet had a live real-account run.
+     - **Still remaining (all deferred, not blockers):** `build.ps1` **dist restage** (needs the running
+       MCP server unloaded — a release step); a live **code-paste** smoke on an account that actually
+       shows a code (the callback path is live-validated; the paste path is unit-tested only); and the
+       broader real smoke for re-login/account-switch and cancelled/failed-login-leaves-home-intact.
 
 ## Resume-critical gotchas (not obvious from the code)
 
