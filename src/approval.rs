@@ -414,7 +414,31 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str)
          no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
+    write_all_deadline(stream, response.as_bytes(), Instant::now() + WRITE_TIMEOUT);
+}
+
+/// Write `bytes` under an **absolute** deadline. A per-socket write timeout only bounds a single
+/// stalled `write`; a client that accepts one byte just inside each window would let `write_all` make
+/// unbounded incremental progress and pin the handler past [`MAX_HANDLERS`] ([f5]). This loops against a
+/// hard end time and gives up (closing the connection) once it passes, so no handler is held longer than
+/// the budget regardless of how the peer reads. Responses here are a few KB and normally fit the socket
+/// send buffer, so the first `write` sends them all and the deadline only bites a pathological
+/// slow-reader.
+pub(crate) fn write_all_deadline(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) {
+    let mut written = 0;
+    while written < bytes.len() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return,
+            Ok(n) => written += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return,
+        }
+    }
     let _ = stream.flush();
 }
 

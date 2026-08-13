@@ -14,14 +14,16 @@
 
 #![cfg(windows)]
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::approval::{constant_time_eq, contains_subslice, escape, query_param};
+use crate::approval::{
+    constant_time_eq, contains_subslice, escape, query_param, write_all_deadline,
+};
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -452,8 +454,9 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str)
          no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    // Bound the write by an absolute deadline, not just the per-socket timeout (f5): see
+    // `approval::write_all_deadline`.
+    write_all_deadline(stream, response.as_bytes(), Instant::now() + WRITE_TIMEOUT);
 }
 
 fn render_page(title: &str, auth_url: &str, token: &str) -> String {
@@ -492,6 +495,7 @@ const EXPIRED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn split_url(url: &str) -> (u16, String) {
         let rest = url.strip_prefix("http://127.0.0.1:").expect("loopback url");

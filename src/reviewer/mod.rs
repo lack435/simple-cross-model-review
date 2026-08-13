@@ -535,8 +535,37 @@ pub fn run_login_code_paste(
     let mut stdin = child.stdin.take();
     let deadline = Instant::now() + timeout;
 
-    // Phase 1: wait for the authorization URL to appear in the child's output.
+    // Phase 1: wait for the authorization URL to appear — or for the child to finish on its own. The
+    // Claude login is **hybrid**: a browser-callback account completes without ever needing a pasted
+    // code, so the child can exit here before (or instead of) any code page. Treat that exactly like a
+    // phase-2 completion — exit 0 after proven quiescence is a SUCCESS, not a failure (the
+    // callback-success contract; this same bug once lived in phase 2, f1). Only enter the code-entry
+    // phase when a URL actually arrives.
     let auth_url = loop {
+        // The child finished on its own: a browser-callback login (success on exit 0), or a failure.
+        // Either way no code page is needed, and a URL still buffered in a scanner does not matter —
+        // the login is already over. Prove containment the same bounded way phase 2 does.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let exit_code = status.code();
+                let contained = wait_quiescent(&job) || terminate_and_settle(&job, &mut child);
+                drop(scanners);
+                return LoginOutcome {
+                    success: contained && exit_code == Some(0),
+                    exit: exit_code,
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+            Err(_) => {
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+            Ok(None) => {}
+        }
         if let Some(u) = url.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             break u;
         }
@@ -548,11 +577,10 @@ pub fn run_login_code_paste(
                 ..fail
             };
         }
-        if Instant::now() >= deadline || matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            // Timed out, or the child exited before printing a URL — a failed login.
+        if Instant::now() >= deadline {
             let contained = terminate_and_settle(&job, &mut child);
             return LoginOutcome {
-                timed_out: Instant::now() >= deadline,
+                timed_out: true,
                 uncontained: !contained,
                 ..fail
             };
@@ -2017,6 +2045,49 @@ mod drain_tests {
                 assert!(matches!(e, RunError::Spawn(_)));
             }
         }
+    }
+
+    #[test]
+    fn code_paste_login_accepts_a_callback_exit_before_any_url() {
+        // f1: a browser-callback (code-less) Claude login completes on its own and exits without ever
+        // printing a URL — phase 1 must treat exit 0 as SUCCESS, not reject it for lack of a URL (the
+        // callback-success contract). Modeled with a child that exits 0 immediately and prints nothing,
+        // so phase 1 never reaches the code page.
+        let scratch = std::env::temp_dir().join(format!("cr-cp-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "exit", "0"]);
+        let outcome = run_login_code_paste(
+            cmd,
+            &scratch,
+            Duration::from_secs(20),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(outcome.success, "callback exit 0 must succeed: {outcome:?}");
+        assert_eq!(outcome.exit, Some(0));
+        assert!(!outcome.uncontained && !outcome.timed_out && !outcome.cancelled);
+    }
+
+    #[test]
+    fn code_paste_login_rejects_a_nonzero_exit_before_any_url() {
+        // The complement: a login that exits non-zero without a URL is a failure, never a false success.
+        let scratch = std::env::temp_dir().join(format!("cr-cp-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "exit", "3"]);
+        let outcome = run_login_code_paste(
+            cmd,
+            &scratch,
+            Duration::from_secs(20),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !outcome.success,
+            "a non-zero exit must not succeed: {outcome:?}"
+        );
+        assert_eq!(outcome.exit, Some(3));
     }
 
     #[test]

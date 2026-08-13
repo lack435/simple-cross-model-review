@@ -401,6 +401,16 @@ fn quarantine_home(marker_path: &Path, home: &Path, journal: &mut Journal) -> io
     if let Some(parent) = home.parent() {
         let _ = crate::winsec::flush_dir(parent);
     }
+    // Quarantine happens inside recovery of a *prior* crashed run, so the run that created this home
+    // is long gone and never got to report anything. Surface the set-aside directory now (a path, not
+    // a credential — safe to print) so it is not a silent orphan the human never learns to clean up.
+    // The journal then clears: the on-disk state is consistent (this dir is renamed aside, never the
+    // live home), so retaining it would only strand future setup (f3).
+    eprintln!(
+        "cross-review: a previous interrupted setup left an unusable profile directory set aside at \
+         {}; it holds no active credentials and is safe to delete once you no longer need it.",
+        rejected.display()
+    );
     Ok(true)
 }
 
@@ -538,9 +548,19 @@ fn recover(base: &Path, marker_path: &Path, journal: &Journal) -> io::Result<Rec
                     return Ok(Recovery::Retain);
                 }
                 Recovery::Clear
+            } else if relogin {
+                // Re-login that never reached the swap: the present home is the *original* one we were
+                // re-logging (it carries its own, earlier marker, not ours) because a pre-swap step —
+                // most often the vendor login itself, which fails routinely — errored and our staging
+                // was already removed in-process. There is nothing of ours to recover: the original
+                // home still stands and its store authorization is unchanged, so clear our stale journal
+                // rather than stranding future setup behind a manual marker deletion (f2). A same-user
+                // replacement of the home is outside the ACL trust boundary (see the module note) — the
+                // same assumption every marker check here already relies on.
+                Recovery::Clear
             } else {
-                // A home we can neither prove we own nor find authorized: fail closed rather than
-                // clear over an unexplained object (f4).
+                // A first-provision home we can neither prove we own nor find authorized: fail closed
+                // rather than clear over an unexplained object (f4).
                 Recovery::Retain
             }
         }
@@ -759,10 +779,28 @@ fn authorize_only(
 }
 
 /// A directory removed when this guard drops (best-effort). Used for the login scratch cwd.
-struct DirGuard(PathBuf);
+struct DirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+impl DirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    /// Stop removing the dir on drop. Used when a login could not be proven contained: a surviving
+    /// member may still hold the scratch cwd, and racing it with `remove_dir_all` can leave partial,
+    /// untracked state (f4). The scratch dir holds no credentials — those go to the staging home, not
+    /// the cwd — so leaking an ACL-locked scratch dir under `auth/` on the rare uncontained path is
+    /// harmless, and far better than deleting a directory a dying process is still writing.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 impl Drop for DirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -996,7 +1034,7 @@ fn provision_after_approval(
     let scratch = base.join("auth").join(format!("scratch-{nonce}"));
     crate::winsec::create_secured_dir(&scratch)
         .map_err(|e| setup_failure(format!("Could not create the login scratch directory: {e}")))?;
-    let _scratch_guard = DirGuard(scratch.clone());
+    let mut scratch_guard = DirGuard::new(scratch.clone());
 
     // WAL **before** creating the staging dir (f13): the staging path is deterministic
     // (`{home}.staging-{nonce}`), so record it — and **arm** (f3) — first. A crash between this record
@@ -1028,10 +1066,12 @@ fn provision_after_approval(
     let outcome = login_fn(&staging_home, &scratch, request.cancel_flag());
     if !outcome.success {
         // If the login could not be proven contained, a member may still be writing the staging dir —
-        // do NOT delete it now; leave it for recovery (the armed journal owns it) rather than racing a
-        // dying writer (f1, impl round 3).
+        // and the scratch cwd — so do NOT delete either now; leave staging for recovery (the armed
+        // journal owns it) and leak the scratch dir rather than racing a dying writer (f1, impl round 3;
+        // f4).
         if outcome.uncontained {
             owned.leak();
+            scratch_guard.disarm();
         }
         if outcome.cancelled {
             return Err(errors::cancelled());
@@ -1467,6 +1507,28 @@ mod tests {
         let rejected = base.join("home.rejected-n3");
         assert!(rejected.exists(), "the uncommitted home was quarantined");
         assert_eq!(std::fs::read(rejected.join("auth.json")).unwrap(), b"NEW");
+    }
+
+    #[test]
+    fn recovery_relogin_pre_swap_failure_clears_and_leaves_original_home() {
+        // H=1,O=0,S=0 for re-login where the present home carries a DIFFERENT (earlier) marker than the
+        // journal's nonce: a pre-swap step (most often the vendor login) failed and our staging was
+        // already removed in-process, so the original home was never touched. Recovery must Clear our
+        // stale journal rather than Retain and strand future setup behind a manual marker deletion
+        // (f2). The original home is left exactly as it was — not quarantined, not deleted.
+        let base = temp_dir();
+        let home = base.join("home");
+        owned_dir(&home, "orig"); // the original home carries its own, older marker
+        std::fs::write(home.join("auth.json"), b"ORIG").unwrap();
+        let mp = base.join("m.marker");
+        let j = journal(Operation::Relogin, &home, None, None, "n5");
+        assert_eq!(recover(&base, &mp, &j).unwrap(), Recovery::Clear);
+        assert!(home.exists());
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), b"ORIG");
+        assert!(
+            !base.join("home.rejected-n5").exists(),
+            "the intact original home must not be quarantined"
+        );
     }
 
     #[test]
