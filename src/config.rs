@@ -1331,10 +1331,16 @@ impl Config {
         // on top, so the collect deadline has to include them or a blocking collect advertised as
         // covering a whole review would time out on exactly the turns the repair exists to rescue.
         // Zero attempts contributes zero, byte-for-byte as before.
-        let repair = self
+        // Each attempt is the child's own timeout *plus* the pre-spawn identity probe that runs
+        // before it -- a real CLI invocation with its own 30s auth-status timeout, not a free
+        // check, so a worst-case repaired turn would otherwise be able to outrun the deadline this
+        // function exists to define. `PREFLIGHT_CAP_SECS` is the same allowance the chain's
+        // preflight uses, and for the same call.
+        let per_repair = self
             .block_repair_timeout
             .as_secs()
-            .saturating_mul(self.block_repair_attempts as u64);
+            .saturating_add(PREFLIGHT_CAP_SECS);
+        let repair = per_repair.saturating_mul(self.block_repair_attempts as u64);
         let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
             .saturating_add(self.timeout.as_secs())
@@ -2258,7 +2264,8 @@ mod tests {
         // Capture + timeout + the default block-repair budget + grace.
         let single = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
-            + cfg.block_repair_timeout.as_secs() * cfg.block_repair_attempts as u64
+            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+                * cfg.block_repair_attempts as u64
             + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), single);
 
@@ -2326,7 +2333,8 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
             .expect("config");
         // A fallback entry's turn can degrade and repair too, so the repair term appears in both.
-        let repair = cfg.block_repair_timeout.as_secs() * cfg.block_repair_attempts as u64;
+        let repair = (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+            * cfg.block_repair_attempts as u64;
         let single = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
             + repair
@@ -2790,7 +2798,8 @@ mod tests {
         // its whole turn budget and then re-asks for the block -- rather than a fixed 300s window.
         let expected = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
-            + cfg.block_repair_timeout.as_secs() * cfg.block_repair_attempts as u64
+            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+                * cfg.block_repair_attempts as u64
             + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), expected);
         assert!(cfg.max_wait_secs() > 300);
@@ -2804,7 +2813,7 @@ mod tests {
             "3",
         ]))
         .expect("config");
-        assert!(repairing.max_wait_secs() >= cfg.max_wait_secs() + 2 * 180);
+        assert!(repairing.max_wait_secs() >= cfg.max_wait_secs() + 2 * (180 + PREFLIGHT_CAP_SECS));
 
         let bigger =
             Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "3600"]))

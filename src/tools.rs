@@ -24,6 +24,41 @@ use crate::vcs;
 /// How long to wait for another server process to release a named session.
 const SESSION_LEASE_WAIT: Duration = Duration::from_secs(3);
 
+/// Why a block repair did not produce a usable block, and whether that is a *security refusal*
+/// rather than a bookkeeping miss.
+///
+/// The distinction is load-bearing. Almost every repair-side failure -- a spawn that failed, a
+/// timeout, a cancel, a second unusable block -- leaves the turn a plain degraded turn, which
+/// commits through the single finalize -> record -> clear transaction exactly as a degraded turn
+/// always has. A tripped account switch guard is not that: the profile home re-logged to a different
+/// account while the turn was running, and the contract for that is to record nothing and leave the
+/// findings write-ahead marker set, so the next call is refused a resume. Funnelling both down one
+/// error path (as the first implementation did) committed the refusal as though it were a timeout,
+/// which is the opposite of what the guard is for.
+struct RepairFailure {
+    failure: Failure,
+    /// `true` only for a tripped switch guard: do not record this turn, and leave the marker set.
+    refusal: bool,
+}
+
+impl RepairFailure {
+    /// A repair that simply did not work. The turn degrades and commits normally.
+    fn ordinary(failure: Failure) -> Self {
+        Self {
+            failure,
+            refusal: false,
+        }
+    }
+
+    /// The account moved underneath this turn. Nothing is recorded and the marker stays set.
+    fn refusal(failure: Failure) -> Self {
+        Self {
+            failure,
+            refusal: true,
+        }
+    }
+}
+
 /// How much of a block-repair response's non-block prose is kept and shown. A repair answer is
 /// transport, so this is bounded — but discarding it entirely is how "I have reconsidered f2"
 /// arriving on one goes missing, so it is not discarded.
@@ -2241,20 +2276,19 @@ impl Job {
         authorized_start: Option<&crate::config::AuthorizedHome>,
         usage_key: Option<&str>,
         main: &mut reviewer::Parsed,
-    ) -> Result<String, Failure> {
+    ) -> Result<String, RepairFailure> {
         // Pre-spawn identity + method probe, against the *pinned* home and account.
         if let Some(start) = authorized_start {
-            let resolved = self.reviewer.resolve_home_identity(
-                &self.bin,
-                &self.cfg,
-                &start.home,
-                &self.cancel,
-            )?;
+            let resolved = self
+                .reviewer
+                .resolve_home_identity(&self.bin, &self.cfg, &start.home, &self.cancel)
+                .map_err(RepairFailure::ordinary)?;
             crate::reviewer::assert_profile_identity(
                 self.spec.reviewer.as_str(),
                 &resolved,
                 &start.account,
-            )?;
+            )
+            .map_err(RepairFailure::ordinary)?;
         }
 
         let invocation = self
@@ -2269,14 +2303,18 @@ impl Job {
                 authorized_start,
             )
             .map_err(|e| {
-                errors::spawn_failed(
+                RepairFailure::ordinary(errors::spawn_failed(
                     self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
-                )
+                ))
             })?;
         let last_message_file = invocation.last_message_file.clone();
 
+        // A repair child is a reviewer running, not finalization. The main attempt has already set
+        // `Finalizing`, so without this the progress a caller sees during the whole repair timeout
+        // says the turn is wrapping up while a model call is in flight.
+        self.registry.set_phase(&self.id, Phase::Reviewing);
         let run = reviewer::run_observed(
             invocation.command,
             prompt,
@@ -2309,27 +2347,35 @@ impl Job {
                 e.to_string(),
             )),
         };
+        self.registry.set_phase(&self.id, Phase::Finalizing);
         if let Some(path) = &last_message_file {
             std::fs::remove_file(path).ok();
         }
-        let parsed = parsed?;
 
-        // The account must still be the pinned one now that this child has answered — the same
-        // backstop the main run gets, for the same reason.
-        switch_guard(self.spec.reviewer, authorized_start)?;
+        // The account must still be the pinned one now that this child has run — the same backstop
+        // the main run gets, for the same reason. Checked **before** the parse is unwrapped, and on
+        // every outcome of the run: a repair whose output failed to parse still advanced the
+        // reviewer conversation, so a home that moved underneath it must not slip past the guard
+        // just because its answer was unreadable. And unlike every other repair-side failure this
+        // one is a *security refusal*, not a bookkeeping miss — `RepairFailure::refusal` is what
+        // stops the caller from committing the turn as though nothing had happened.
+        if let Err(failure) = switch_guard(self.spec.reviewer, authorized_start) {
+            return Err(RepairFailure::refusal(failure));
+        }
+        let parsed = parsed.map_err(RepairFailure::ordinary)?;
 
         // A repair that answered under a different conversation never saw the review it is meant to
         // be re-emitting a block for, so its block describes nothing. Discard it.
         if let Some(answered) = parsed.session_id.as_deref() {
             if !answered.is_empty() && answered != target {
-                return Err(Failure::new(
+                return Err(RepairFailure::ordinary(Failure::new(
                     "BLOCK_REPAIR_SESSION_MISMATCH",
                     format!(
                         "the block-repair turn answered under session id '{answered}' rather than \
                          the '{target}' it resumed"
                     ),
                     "The repair was discarded and the review is returned unstructured.",
-                ));
+                )));
             }
         }
 
@@ -2764,6 +2810,9 @@ impl Job {
             };
         let mut repair_notes: Vec<String> = Vec::new();
         let mut warnings_from_repair: Vec<String> = Vec::new();
+        // Set only by a tripped switch guard on a repair run: this turn is not recorded and its
+        // write-ahead marker is left set, exactly as the main run's guard refusal would.
+        let mut repair_refused_on_account = false;
         let mut attempts_left = self.cfg.block_repair_attempts;
         while let Some(request) = crate::findings::plan_repair(
             &assessment,
@@ -2800,15 +2849,36 @@ impl Job {
                     }
                     assessment = crate::findings::apply_repair(assessment, &repair_text);
                 }
-                Err(failure) => {
+                Err(RepairFailure { failure, refusal }) => {
                     // A failed repair never fails the review: the prose in hand is good. Record why
                     // and fall through to the degraded envelope the turn would have had anyway.
-                    warnings_from_repair.push(format!(
-                        "the reviewer was asked to re-emit its machine block and the attempt \
-                         failed ({}): {}",
-                        failure.code,
-                        failure.summary.trim()
-                    ));
+                    if refusal {
+                        // Except this one, which is a security refusal rather than a failed retry.
+                        // The account moved while the turn was running, so the repair's answer is
+                        // discarded unread *and* the turn must not be recorded -- leaving the
+                        // write-ahead marker set, so the next call is refused a resume and
+                        // rebaselines rather than continuing a conversation whose account moved.
+                        // The main run's prose was answered under the pinned account and verified
+                        // so, which is why it is still returned rather than erroring the call.
+                        repair_refused_on_account = true;
+                        warnings_from_repair.push(format!(
+                            "the profile home's account changed while this turn was running: the \
+                             block-repair response was discarded unread and this turn was not \
+                             recorded, so session '{}' cannot be resumed. Start a fresh review \
+                             (fresh: true) carrying the still-open findings. The review below was \
+                             produced under the authorized account and is still valid. ({}: {})",
+                            self.session,
+                            failure.code,
+                            failure.summary.trim()
+                        ));
+                    } else {
+                        warnings_from_repair.push(format!(
+                            "the reviewer was asked to re-emit its machine block and the attempt \
+                             failed ({}): {}",
+                            failure.code,
+                            failure.summary.trim()
+                        ));
+                    }
                     assessment = crate::findings::apply_repair(assessment, "");
                     // A spawn, probe, timeout or guard failure is not something the reviewer can
                     // answer differently on a second ask; only re-billing it. Stop.
@@ -2924,7 +2994,16 @@ impl Job {
         // Whether this turn was durably recorded. Distinct from `resumable` below: a turn can be
         // durable yet non-resumable (an over-budget turn persists a terminal state that refuses the
         // next resume, or a failed marker clear that refuses it).
-        let durable = if resumed_id_mismatch {
+        let durable = if repair_refused_on_account {
+            // The caller-facing warning was pushed where the refusal was detected. Nothing is
+            // recorded here, so the findings marker -- cleared only in the `record_turn` Ok arm
+            // below -- stays set and the next non-fresh call is refused at the findings gate.
+            eprintln!(
+                "cross-review: warning: the profile account changed during a block repair on                  session '{}'; not recording, leaving the session non-resumable",
+                self.session
+            );
+            false
+        } else if resumed_id_mismatch {
             warnings.push(format!(
                 "The reviewer answered under a different session id ('{}') than the one this resume \
                  targeted ('{}'), so its conversation did not contain this session's earlier turns \

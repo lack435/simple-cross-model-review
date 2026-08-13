@@ -17,6 +17,15 @@ history below), and the implementation goes through the gate again as its own re
 > recorded identity being a fresh read rather than the pin (f19) plus two claim-scoping fixes
 > (f20, f21).
 >
+> **Implementation review.** The code went back through the gate as its own review (session
+> `issue-63-impl`). The first attempt failed with `TIMEOUT` — the reviewer's CLI refused four
+> composed shell commands by policy and spent the turn on variants, filed as
+> [#68](https://github.com/lack435/simple-cross-model-review/issues/68). The retry returned four
+> findings, all accepted: **f1 (`major`)** the post-repair switch-guard refusal was committed as an
+> ordinary repair failure, and the guard sat behind the parse; **f2** the cumulative usage fold
+> dropped the main run's per-invocation call count; **f3** the repair child reported as `Finalizing`;
+> **f4** the collect cap omitted the repair's pre-spawn probe. Each is marked in place above.
+>
 > **This document did not receive an explicit APPROVE.** The session reached the configured
 > `--session-max-turns` limit of 10 on the turn that would have judged the final three fixes, and per
 > the maintainer's instruction the plan was not re-opened as a fresh session. So f19, f20 and f21 are
@@ -52,8 +61,7 @@ path. (The fallback chain can invoke a *second reviewer entry* when the first is
 turn is not literally one invocation; but that is a different reviewer and a different conversation,
 never a second ask for the block that is missing.) Decision A is the change to that.
 
-So a 5–20
-minute review at `effort=max` yields no machine result, and the only recovery available to the
+So a 5–20 minute review at `effort=max` yields no machine result, and the only recovery available to the
 caller is to run the whole review again — after escalating, because a degraded turn also breaks
 ledger coverage to `legacy_uncovered`/`needs_rebaseline`, which is a human-escalation outcome by
 design. The entire cost of the reviewer skipping one instruction is borne by the caller, and the
@@ -228,7 +236,9 @@ Two cases need naming individually because they are not simple failures:
   through `Reviewer::invocation`.** `authorized_start` is resolved once per attempt, before the child
   starts, precisely so the post-run check can tell A→B from B→B; a fresh self-read cannot. The repair
   runs inside the same attempt, with that value still in scope and the same shared per-home setup
-  lock still held, so it must **reuse the pinned identity and never re-resolve one**.
+  lock still held, so it must **reuse the pinned identity and never re-resolve one**. The repair
+  child also reports `Phase::Reviewing` while it runs, rather than leaving the turn's progress saying
+  `Finalizing` through a live model call (implementation review, f3).
 
   Requiring that is not enough, because the current boundary cannot honour it. `Reviewer::invocation`
   takes `cfg`/`spec` but no pinned identity, and **each adapter resolves the account itself** —

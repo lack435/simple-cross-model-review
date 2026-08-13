@@ -319,14 +319,25 @@ pub fn fold_runs(first: Usage, later: Usage, later_is_cumulative: bool) -> Usage
     if later.is_empty() {
         return first;
     }
-    if later_is_cumulative {
-        return later;
-    }
     fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
         match (a, b) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
         }
+    }
+    if later_is_cumulative {
+        // "Cumulative" is true of the *token and cost* readings, and not of everything in `Usage`.
+        // Codex counts `api_calls` by the `turn.completed` events seen in **this invocation**
+        // (`turns_seen`), so the repair child reports its own call count, not the thread's. Taking
+        // the later reading wholesale would silently drop the main run's model calls -- the figure
+        // that exists precisely to show why a turn costs more than its prompt. Per-invocation
+        // counters are therefore summed even here; `api_duration_ms` is measured the same way and
+        // gets the same treatment.
+        return Usage {
+            api_calls: add(first.api_calls, later.api_calls),
+            api_duration_ms: add(first.api_duration_ms, later.api_duration_ms),
+            ..later
+        };
     }
     Usage {
         input_tokens: add(first.input_tokens, later.input_tokens),
@@ -2205,6 +2216,29 @@ mod fold_tests {
             output_tokens: Some(output),
             ..Usage::default()
         }
+    }
+
+    #[test]
+    fn a_cumulative_fold_still_sums_the_per_invocation_call_count() {
+        // Codex's `api_calls` counts `turn.completed` events in one invocation, so it is per-child
+        // even though the token totals are cumulative. Replacing wholesale would lose the main
+        // run's model calls -- the multiplier that explains a turn's cost.
+        let first = Usage {
+            input_tokens: Some(100),
+            api_calls: Some(3),
+            api_duration_ms: Some(1_000),
+            ..Usage::default()
+        };
+        let later = Usage {
+            input_tokens: Some(140),
+            api_calls: Some(1),
+            api_duration_ms: Some(200),
+            ..Usage::default()
+        };
+        let folded = fold_runs(first, later, true);
+        assert_eq!(folded.input_tokens, Some(140), "tokens are cumulative");
+        assert_eq!(folded.api_calls, Some(4), "calls are per invocation");
+        assert_eq!(folded.api_duration_ms, Some(1_200));
     }
 
     #[test]
