@@ -25,12 +25,22 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 // bounded by a wall-clock budget: on timeout we stop waiting and return a fast in-band error the
 // review survives, converting the fatal transport abandon into an ordinary tool error.
 
-/// Total wall-clock budget for one `repository_read`, measured from request receipt and shared
-/// across both attempts. Derived from the Codex ceiling with a margin covering queue wait, worker
-/// spawn, the retry backoff, and response serialisation, so our in-band timeout always beats the
-/// transport abandon.
+/// Total wall-clock budget for **one request** — every stage that request runs, not one favoured
+/// stage — measured from the instant its line was read off the wire. Derived from the Codex ceiling
+/// with a margin covering queue wait, worker spawn, the retry backoff, and response serialisation,
+/// so our in-band answer always beats the transport abandon.
+///
+/// This being *the* budget rather than *a* budget is issue #71's fix. Bounding `repository_read`
+/// alone (issue #61) left every sibling free to hold the single-threaded request loop for longer
+/// than the client will wait: `repository_list` had no bound at all, `walk_files`' own syscalls
+/// only a cooperative check between directories, and the Git operations a fresh
+/// `operation_timeout_ms` anchored at the moment they *started* rather than at receipt — so a
+/// request that waited in the dispatch queue could still spend the full per-operation timeout on
+/// top of that wait and answer past the ceiling. A per-stage timeout that does not derive from the
+/// request's own clock cannot compose; deriving all of them from this one constant is what makes
+/// the guarantee hold for the whole surface instead of one tool.
 const READ_CEILING_MARGIN_MS: u64 = 10_000;
-const READ_BUDGET_MS: u64 = CODEX_TOOL_TIMEOUT_SECS * 1000 - READ_CEILING_MARGIN_MS;
+const REQUEST_BUDGET_MS: u64 = CODEX_TOOL_TIMEOUT_SECS * 1000 - READ_CEILING_MARGIN_MS;
 /// Per-attempt wait cap; a retry is bounded by whatever budget remains, never a fresh full cap.
 const READ_ATTEMPT_MS: u64 = 9_000;
 const READ_RETRY_BACKOFF_MS: u64 = 500;
@@ -44,13 +54,42 @@ const READ_WORKER_CAP: usize = 8;
 // Compile-time coupling guard (finding f4): the whole read budget plus its margin must sit under
 // the Codex ceiling. Deriving both from one constant means this can never drift into inversion —
 // a bad change fails to compile rather than shipping a budget that races the abandon.
-const _: () = assert!(READ_BUDGET_MS + READ_CEILING_MARGIN_MS <= CODEX_TOOL_TIMEOUT_SECS * 1000);
-const _: () = assert!(READ_ATTEMPT_MS <= READ_BUDGET_MS);
+const _: () = assert!(REQUEST_BUDGET_MS + READ_CEILING_MARGIN_MS <= CODEX_TOOL_TIMEOUT_SECS * 1000);
+const _: () = assert!(READ_ATTEMPT_MS <= REQUEST_BUDGET_MS);
 
 /// Number of read worker threads currently alive (awaited plus abandoned). Bounded by
 /// `READ_WORKER_CAP`. A `WorkerGuard` decrements it when a worker thread exits, whether it was
 /// awaited or abandoned.
 static LIVE_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Directory walks get their **own** pool rather than sharing the read pool, and a small one.
+///
+/// Sharing would have made this change's own fix a new failure: a stalled `repository_list` or
+/// search walk could consume the read pool's capacity and make every later `repository_read` refuse
+/// with `read_unavailable` — trading one way of losing a review for another (round-1 finding f1).
+/// Separate quotas mean a wedged walk can only ever cost walks. The cap is deliberately much
+/// smaller than the read cap: walks are rare next to reads, one is enough to serve a turn, and a
+/// second is headroom for the abandoned predecessor of a retry that is not coming.
+///
+/// The drift stamp deliberately stays on the *read* pool where #61 put it: `read` computes it
+/// inline, so moving it here would let two stalled walks make every first read of a turn refuse —
+/// re-introducing exactly the cross-operation coupling this separation exists to remove.
+static LIVE_WALK_WORKERS: AtomicUsize = AtomicUsize::new(0);
+const WALK_WORKER_CAP: usize = 2;
+
+/// Child-process operations (`repository_history`, `repository_revision`) get a third pool, for the
+/// same reason walks got the second: a wedged Git command must not spend capacity reads need.
+///
+/// It exists because reserving the drain grace inside the child's timeout is *not* sufficient on its
+/// own (round-2 finding f2). `reviewer::run` kills a child that overran and then calls
+/// `child.wait()`, which has no bound: a process that will not die — one stuck in an
+/// uninterruptible wait on a hung network path is the realistic case — holds the request loop
+/// indefinitely no matter what timeout it was given. Running the whole command on a bounded worker
+/// makes the loop's freedom independent of whether the child can actually be reaped. The reservation
+/// is kept as well, so in the ordinary case the child is bounded *and* returns its output rather
+/// than being abandoned.
+static LIVE_CHILD_WORKERS: AtomicUsize = AtomicUsize::new(0);
+const CHILD_WORKER_CAP: usize = 2;
 
 struct WorkerGuard(&'static AtomicUsize);
 impl Drop for WorkerGuard {
@@ -71,7 +110,7 @@ struct ReadWatchdog {
 }
 
 const READ_WATCHDOG: ReadWatchdog = ReadWatchdog {
-    budget: Duration::from_millis(READ_BUDGET_MS),
+    budget: Duration::from_millis(REQUEST_BUDGET_MS),
     attempt_cap: Duration::from_millis(READ_ATTEMPT_MS),
     backoff: Duration::from_millis(READ_RETRY_BACKOFF_MS),
     max_attempts: MAX_READ_ATTEMPTS,
@@ -79,12 +118,36 @@ const READ_WATCHDOG: ReadWatchdog = ReadWatchdog {
     cap: READ_WORKER_CAP,
 };
 
+/// Directory walks (`repository_list`'s enumeration, `repository_search`'s `walk_files`) get the
+/// same *shape* as the drift stamp — one attempt over whatever budget remains, because retrying a
+/// walk that stalled on a contended `read_dir`/`symlink_metadata` just spends the rest of the
+/// budget on the same blocked syscall — but their own pool and cap (see `LIVE_WALK_WORKERS`).
+const WALK_WATCHDOG: ReadWatchdog = ReadWatchdog {
+    budget: Duration::from_millis(REQUEST_BUDGET_MS),
+    attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
+    backoff: Duration::from_millis(0),
+    max_attempts: 1,
+    live: &LIVE_WALK_WORKERS,
+    cap: WALK_WORKER_CAP,
+};
+
+/// Same shape again for a child-process command: one attempt over what remains, its own pool. A
+/// retry would re-spawn a process against whatever is wedging the first one.
+const CHILD_WATCHDOG: ReadWatchdog = ReadWatchdog {
+    budget: Duration::from_millis(REQUEST_BUDGET_MS),
+    attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
+    backoff: Duration::from_millis(0),
+    max_attempts: 1,
+    live: &LIVE_CHILD_WORKERS,
+    cap: CHILD_WORKER_CAP,
+};
+
 /// The drift-stamp walk gets a single attempt over the whole budget: retrying a timed-out
 /// repository-wide walk is pointless, so `max_attempts: 1` with the full budget as the per-attempt
 /// cap. Shares the live-worker pool and cap with reads.
 const STAMP_WATCHDOG: ReadWatchdog = ReadWatchdog {
-    budget: Duration::from_millis(READ_BUDGET_MS),
-    attempt_cap: Duration::from_millis(READ_BUDGET_MS),
+    budget: Duration::from_millis(REQUEST_BUDGET_MS),
+    attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
     backoff: Duration::from_millis(0),
     max_attempts: 1,
     live: &LIVE_READ_WORKERS,
@@ -323,9 +386,47 @@ fn read_timeout_error(path: &str) -> EvidenceError {
         "read_timeout",
         format!(
             "reading '{path}' exceeded the {}ms evidence read budget",
-            READ_BUDGET_MS
+            REQUEST_BUDGET_MS
         ),
     )
+}
+
+/// What is left of this request's budget. Zero once it is spent — every stage clamps to this, so
+/// the stages compose to the ceiling instead of past it.
+fn remaining_budget(received_at: Instant) -> Duration {
+    Duration::from_millis(REQUEST_BUDGET_MS)
+        .checked_sub(received_at.elapsed())
+        .unwrap_or_default()
+}
+
+/// What is left for a **child process** to spend, which is less than the request's remaining budget.
+///
+/// `reviewer::run` keeps collecting a killed child's pipes for up to `DRAIN_GRACE` *after* its
+/// timeout fires, so a child handed the whole remaining budget would return that much past the
+/// deadline it was supposed to honour. Reserving the drain up front is what makes the child's
+/// timeout an actual request deadline rather than a per-command one (round-1 finding f2).
+pub(super) fn child_budget(received_at: Instant) -> Duration {
+    remaining_budget(received_at).saturating_sub(crate::reviewer::DRAIN_GRACE)
+}
+
+/// Run a blocking directory walk under the walk watchdog, so a stalled `read_dir`,
+/// `symlink_metadata` or `canonicalize` returns a fast in-band error instead of holding the request
+/// loop. The closure owns everything it touches (cloned root, limits and cancel flag) for the same
+/// reason the read worker does: an abandoned worker must never strand `Core` state.
+fn run_bounded_walk<T, W>(
+    watchdog: &ReadWatchdog,
+    label: &str,
+    received_at: Instant,
+    worker: W,
+) -> Result<T, EvidenceError>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, EvidenceError> + Send + Clone + 'static,
+{
+    bounded_attempts(watchdog, received_at, label, move || {
+        let worker = worker.clone();
+        move || worker().map_err(|e| ReadFailure::fatal(e.code, e.message))
+    })
 }
 
 #[derive(Clone)]
@@ -345,6 +446,14 @@ pub struct Core {
     returned_bytes: u64,
     observed_stamp: Option<String>,
     cancel: Arc<AtomicBool>,
+    /// The watchdog the walk-bearing routes (`repository_list`, `repository_search`) run under.
+    ///
+    /// A seam, not a setting: production always gets `WALK_WATCHDOG`, and it exists so a test can
+    /// drive the *real* route to its timeout with a tiny budget instead of asserting on
+    /// `bounded_attempts` in isolation and hoping the route is wired to it (round-1 finding f4).
+    /// Injecting the bound beats sleeping in a test: the assertion stays deterministic and the
+    /// suite stays fast.
+    walk_watchdog: &'static ReadWatchdog,
 }
 
 impl Core {
@@ -379,6 +488,7 @@ impl Core {
             returned_bytes: 0,
             observed_stamp: None,
             cancel,
+            walk_watchdog: &WALK_WATCHDOG,
         })
     }
 
@@ -405,6 +515,20 @@ impl Core {
                 "the evidence operation was cancelled or its parent transport closed",
             ));
         }
+        // This request's budget is already gone before any work starts — it waited behind a slower
+        // one for longer than the client will wait for an answer. Refuse now, fast and in-band,
+        // rather than spending the loop on a result the client has abandoned and making the *next*
+        // request late too. Deliberately ahead of the call counter: a request that did no work
+        // should not consume the caller's request budget as well as its own (#71).
+        if remaining_budget(received_at).is_zero() {
+            return Err(EvidenceError::new(
+                "request_expired",
+                format!(
+                    "the request waited longer than the {REQUEST_BUDGET_MS}ms evidence request \
+                     budget before it could be dispatched; retry it"
+                ),
+            ));
+        }
         self.calls = self
             .calls
             .checked_add(1)
@@ -425,7 +549,7 @@ impl Core {
             }
             "repository_list" => {
                 require_only(args, &["path", "cursor", "limit"])?;
-                self.list(args)
+                self.list(args, received_at)
             }
             "repository_search" => {
                 require_only(args, &["query", "path", "cursor", "limit"])?;
@@ -441,11 +565,11 @@ impl Core {
             }
             "repository_history" => {
                 require_only(args, &["path", "before", "cursor", "limit"])?;
-                self.history(args)
+                self.history(args, received_at)
             }
             "repository_revision" => {
                 require_only(args, &["id", "path", "cursor", "limit_bytes"])?;
-                self.revision(args)
+                self.revision(args, received_at)
             }
             _ => Err(EvidenceError::new(
                 "unknown_tool",
@@ -495,7 +619,11 @@ impl Core {
         }))
     }
 
-    fn list(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn list(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         let limit = limit_arg(
             args,
             "limit",
@@ -507,37 +635,56 @@ impl Core {
             return self.cursor_page("repository_list", &cursor, limit, "entries");
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
-        let dir = self.resolve_existing(&path, true)?;
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&dir)
-            .map_err(|e| EvidenceError::new("read_failed", format!("cannot list '{path}': {e}")))?
-        {
-            let entry = entry.map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
-            let name = entry.file_name();
-            if excluded_name(&name) {
-                continue;
-            }
-            let child = entry.path();
-            let meta = fs::symlink_metadata(&child)
-                .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
-            let kind = if metadata_is_reparse(&meta) {
-                "link"
-            } else if meta.is_dir() {
-                "directory"
-            } else if meta.is_file() {
-                "file"
-            } else {
-                "other"
-            };
-            let relative = relative_slash(&self.root, &child)?;
-            entries.push(json!({"path": relative, "type": kind, "bytes": meta.len()}));
-            if entries.len() > self.bundle.limits.max_files as usize {
-                return Err(EvidenceError::new(
-                    "limit_exceeded",
-                    "listing exceeded file budget",
-                ));
-            }
-        }
+        // The whole enumeration — resolve, `read_dir`, and a `symlink_metadata` per child — is
+        // blocking filesystem I/O on a single-threaded loop, and before #71 it carried no bound at
+        // all: not even the cooperative check the search walk had. One contended entry could hold
+        // the loop until the client abandoned the call it was serving *and* the next one. It now
+        // runs on a watchdog-bounded worker owning only clones, exactly like a read.
+        let root = self.root.clone();
+        let max_path_bytes = self.bundle.limits.max_path_bytes as usize;
+        let max_files = self.bundle.limits.max_files as usize;
+        let raw = path.clone();
+        let mut entries = run_bounded_walk(
+            self.walk_watchdog,
+            &format!("list '{path}'"),
+            received_at,
+            move || {
+                let dir = resolve_existing_bounded(&root, max_path_bytes, &raw, true)
+                    .map_err(ReadFailure::into_evidence)?;
+                let mut entries = Vec::new();
+                for entry in fs::read_dir(&dir).map_err(|e| {
+                    EvidenceError::new("read_failed", format!("cannot list '{raw}': {e}"))
+                })? {
+                    let entry =
+                        entry.map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
+                    let name = entry.file_name();
+                    if excluded_name(&name) {
+                        continue;
+                    }
+                    let child = entry.path();
+                    let meta = fs::symlink_metadata(&child)
+                        .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
+                    let kind = if metadata_is_reparse(&meta) {
+                        "link"
+                    } else if meta.is_dir() {
+                        "directory"
+                    } else if meta.is_file() {
+                        "file"
+                    } else {
+                        "other"
+                    };
+                    let relative = relative_slash(&root, &child)?;
+                    entries.push(json!({"path": relative, "type": kind, "bytes": meta.len()}));
+                    if entries.len() > max_files {
+                        return Err(EvidenceError::new(
+                            "limit_exceeded",
+                            "listing exceeded file budget",
+                        ));
+                    }
+                }
+                Ok(entries)
+            },
+        )?;
         entries.sort_by_key(value_path);
         self.first_page("repository_list", entries, limit, "entries", true)
     }
@@ -565,12 +712,10 @@ impl Core {
             ));
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
-        // The base resolution and the tree walk below still carry only the cooperative
-        // `deadline()` — a blocked stat there remains the documented sibling follow-up. The
-        // per-file *reads*, however, go through the same watchdog as `repository_read` so a single
-        // contended candidate cannot stall the loop.
-        let base = self.resolve_existing(&path, false)?;
-        let files = self.walk_files(&base, received_at)?;
+        // Base resolution and the tree walk run together on a bounded worker (#71); the per-file
+        // reads below go through the same watchdog as `repository_read` (#61). Every stage of this
+        // operation now derives its wait from the one request budget.
+        let files = self.resolve_and_walk(&path, received_at)?;
         let mut matches = Vec::new();
         let mut source_complete = true;
         for file in files {
@@ -698,8 +843,11 @@ impl Core {
             return Ok(stamp.clone());
         }
         // The drift-stamp walk runs under the watchdog so a stalled `read_dir`/`symlink_metadata`
-        // cannot hang the request loop (finding f4). This bounds the walk for both `read` and
-        // `scope`; `list`/search-base `walk_files` remain the documented sibling follow-up.
+        // cannot hang the request loop (#61 finding f4). It bounds the walk for both `read` and
+        // `scope`, and stays on the *read* pool: `read` computes it inline, so moving it to the
+        // small walk pool would let two stalled walks refuse every first read of a turn.
+        // `list`/search-base `walk_files` are no longer the exception here -- they are bounded on
+        // their own pool as of #71.
         let current_stamp = run_bounded_stamp(&self.root, &self.bundle.limits, received_at)?;
         self.observed_stamp = Some(current_stamp.clone());
         Ok(current_stamp)
@@ -720,7 +868,11 @@ impl Core {
         self.change_page(offset, limit)
     }
 
-    fn history(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn history(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         if self.bundle.vcs != VcsKind::Git {
             return Err(EvidenceError::new(
                 "unsupported",
@@ -748,13 +900,15 @@ impl Core {
                 "before must be a full Git object id",
             ));
         }
-        let (commits, source_complete) = super::git::history(
-            &self.root,
-            &path,
-            &before,
-            &self.bundle.limits,
-            &self.cancel,
-        )?;
+        // The Git child runs on a bounded worker: the request loop must stay free even if the
+        // process cannot be reaped (round-2 finding f2).
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let (commits, source_complete) =
+            run_bounded_walk(&CHILD_WATCHDOG, "git history", received_at, move || {
+                super::git::history(&root, &path, &before, &limits, &cancel, received_at)
+            })?;
         self.first_page(
             "repository_history",
             commits,
@@ -764,7 +918,11 @@ impl Core {
         )
     }
 
-    fn revision(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn revision(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         if self.bundle.vcs != VcsKind::Git {
             return Err(EvidenceError::new(
                 "unsupported",
@@ -792,11 +950,59 @@ impl Core {
         if !path.is_empty() {
             self.validate_relative(&path)?;
         }
-        let text = super::git::revision(&self.root, &id, &path, &self.bundle.limits, &self.cancel)?;
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let text = run_bounded_walk(&CHILD_WATCHDOG, "git revision", received_at, move || {
+            super::git::revision(&root, &id, &path, &limits, &cancel, received_at)
+        })?;
         self.first_text_page("repository_revision", text, limit, "content")
     }
 
-    fn walk_files(&self, base: &Path, start: Instant) -> Result<Vec<PathBuf>, EvidenceError> {
+    /// Resolve the search base and walk it, all on one watchdog-bounded worker.
+    ///
+    /// Both halves are blocking filesystem I/O that the cooperative `deadline()` cannot interrupt:
+    /// it fires *between* directories, so a `symlink_metadata`, `canonicalize` or `read_dir` that
+    /// blocks inside one holds the request loop indefinitely. #61 bounded the per-file reads this
+    /// walk performs and recorded the walk itself as the deferred sibling; #71 is that follow-up.
+    fn resolve_and_walk(
+        &self,
+        path: &str,
+        received_at: Instant,
+    ) -> Result<Vec<PathBuf>, EvidenceError> {
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let max_path_bytes = self.bundle.limits.max_path_bytes as usize;
+        let raw = path.to_string();
+        run_bounded_walk(
+            self.walk_watchdog,
+            &format!("search '{path}'"),
+            received_at,
+            move || {
+                let base = resolve_existing_bounded(&root, max_path_bytes, &raw, false)
+                    .map_err(ReadFailure::into_evidence)?;
+                walk_files(&root, &base, &limits, &cancel, received_at)
+            },
+        )
+    }
+
+    fn validate_relative(&self, raw: &str) -> Result<PathBuf, EvidenceError> {
+        validate_relative_path(self.bundle.limits.max_path_bytes as usize, raw)
+            .map_err(ReadFailure::into_evidence)
+    }
+}
+
+/// The blocking walk itself, over owned inputs so it can run on a detached worker that borrows
+/// nothing from `Core`.
+fn walk_files(
+    root: &Path,
+    base: &Path,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    start: Instant,
+) -> Result<Vec<PathBuf>, EvidenceError> {
+    {
         if base.is_file() {
             return Ok(vec![base.to_path_buf()]);
         }
@@ -809,13 +1015,13 @@ impl Core {
         let mut queue = VecDeque::from([base.to_path_buf()]);
         let mut files = Vec::new();
         while let Some(dir) = queue.pop_front() {
-            if self.cancel.load(Ordering::Acquire) {
+            if cancel.load(Ordering::Acquire) {
                 return Err(EvidenceError::new(
                     "cancelled",
                     "evidence walk was cancelled",
                 ));
             }
-            deadline(start, &self.bundle.limits)?;
+            deadline(start, limits)?;
             let dir_meta = fs::symlink_metadata(&dir)
                 .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
             if metadata_is_reparse(&dir_meta) {
@@ -823,7 +1029,7 @@ impl Core {
             }
             let dir = fs::canonicalize(&dir)
                 .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
-            if !within(&dir, &self.root) {
+            if !within(&dir, root) {
                 return Err(EvidenceError::new(
                     "path_escape",
                     "directory changed to resolve outside the repository root",
@@ -850,7 +1056,7 @@ impl Core {
                     queue.push_back(child);
                 } else if meta.is_file() {
                     files.push(child);
-                    if files.len() > self.bundle.limits.max_files as usize {
+                    if files.len() > limits.max_files as usize {
                         return Err(EvidenceError::new(
                             "limit_exceeded",
                             "walk exceeded file budget",
@@ -862,22 +1068,9 @@ impl Core {
         files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
         Ok(files)
     }
+}
 
-    fn validate_relative(&self, raw: &str) -> Result<PathBuf, EvidenceError> {
-        validate_relative_path(self.bundle.limits.max_path_bytes as usize, raw)
-            .map_err(ReadFailure::into_evidence)
-    }
-
-    fn resolve_existing(&self, raw: &str, directory: bool) -> Result<PathBuf, EvidenceError> {
-        resolve_existing_bounded(
-            &self.root,
-            self.bundle.limits.max_path_bytes as usize,
-            raw,
-            directory,
-        )
-        .map_err(ReadFailure::into_evidence)
-    }
-
+impl Core {
     fn first_page(
         &mut self,
         operation: &str,
@@ -1272,8 +1465,13 @@ pub fn initial_stamp(root: &Path, limits: &Limits) -> Result<String, EvidenceErr
     tree_stamp(root, limits)
 }
 
+/// The cooperative between-steps check, against **both** ceilings: the per-operation timeout the
+/// bundle configures, and the request budget every stage shares. Both are anchored at the same
+/// receipt instant, so this is just the tighter of the two — but taking the minimum is what stops a
+/// long-queued request from being handed a full fresh operation timeout on top of its wait (#71).
 fn deadline(start: Instant, limits: &Limits) -> Result<(), EvidenceError> {
-    if start.elapsed() > Duration::from_millis(limits.operation_timeout_ms) {
+    let ceiling = Duration::from_millis(limits.operation_timeout_ms.min(REQUEST_BUDGET_MS));
+    if start.elapsed() > ceiling {
         Err(EvidenceError::new(
             "deadline_exceeded",
             "evidence operation exceeded its deadline",
@@ -1557,7 +1755,12 @@ mod tests {
             "COM1.txt",
             ".git/config",
         ] {
-            assert!(core.resolve_existing(bad, false).is_err(), "{bad}");
+            // The free resolver is what every bounded worker calls; `Core` no longer wraps it.
+            let limit = core.bundle.limits.max_path_bytes as usize;
+            assert!(
+                resolve_existing_bounded(&core.root, limit, bad, false).is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -1748,6 +1951,198 @@ mod tests {
         assert!(watchdog.budget + Duration::from_millis(READ_CEILING_MARGIN_MS) <= ceiling);
         assert!(watchdog.attempt_cap <= watchdog.budget);
         assert!(watchdog.attempt_cap * watchdog.max_attempts + watchdog.backoff < ceiling);
+    }
+
+    // #71: a request whose budget was consumed while it waited behind a slower one is refused at
+    // dispatch, before any work, rather than served to a client that has already abandoned it. The
+    // refusal must also not consume the caller's call budget: it did nothing.
+    #[test]
+    fn a_request_past_its_budget_is_refused_before_any_work() {
+        let dir = temp_dir("evidence-expired");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let stale = Instant::now() - Duration::from_millis(REQUEST_BUDGET_MS + 1);
+        let error = core
+            .call_with_receipt("repository_read", &json!({"path":"a.txt"}), stale)
+            .unwrap_err();
+        assert_eq!(error.code, "request_expired");
+        assert_eq!(core.calls, 0, "an expired request spends no call budget");
+        // The service is still usable: expiry is per-request, not a poisoned core.
+        let ok = core
+            .call("repository_read", &json!({"path":"a.txt"}))
+            .unwrap();
+        assert_eq!(ok["total_lines"], json!(1));
+    }
+
+    // #71: every operation is bounded, not just `repository_read`. Each of these holds the
+    // single-threaded request loop, so each must refuse rather than run when the budget is gone —
+    // the property that stops one slow call making the *next* one late past the client ceiling.
+    #[test]
+    fn every_operation_is_bounded_by_the_request_budget() {
+        let dir = temp_dir("evidence-all-bounded");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let stale = Instant::now() - Duration::from_millis(REQUEST_BUDGET_MS + 1);
+        for (tool, args) in [
+            ("repository_scope", json!({})),
+            ("repository_list", json!({})),
+            ("repository_search", json!({"query":"hello"})),
+            ("repository_read", json!({"path":"a.txt"})),
+            ("repository_change", json!({})),
+            ("repository_history", json!({})),
+            ("repository_revision", json!({"id":"0".repeat(40)})),
+        ] {
+            let error = core.call_with_receipt(tool, &args, stale).unwrap_err();
+            assert_eq!(error.code, "request_expired", "{tool} ran past its budget");
+        }
+    }
+
+    // The cooperative check takes the *tighter* of the per-operation timeout and the request
+    // budget, so a queued request cannot be handed a full fresh operation timeout on top of its
+    // wait. Both ceilings are anchored at the same receipt instant.
+    #[test]
+    fn the_deadline_honours_both_ceilings() {
+        // An operation timeout far beyond the request budget must not extend the request.
+        let mut limits = Limits {
+            operation_timeout_ms: REQUEST_BUDGET_MS * 10,
+            ..Default::default()
+        };
+        let spent = Instant::now() - Duration::from_millis(REQUEST_BUDGET_MS + 50);
+        assert_eq!(
+            deadline(spent, &limits).unwrap_err().code,
+            "deadline_exceeded"
+        );
+        // And the per-operation timeout still binds when it is the tighter of the two.
+        limits.operation_timeout_ms = 10;
+        let recent = Instant::now() - Duration::from_millis(50);
+        assert_eq!(
+            deadline(recent, &limits).unwrap_err().code,
+            "deadline_exceeded"
+        );
+        assert!(deadline(Instant::now(), &limits).is_ok());
+    }
+
+    // A stalled walk returns a fast in-band error like a stalled read, and leaves the pool usable.
+    #[test]
+    fn a_stalled_walk_times_out_in_band() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let watchdog = ReadWatchdog {
+            budget: Duration::from_millis(200),
+            attempt_cap: Duration::from_millis(200),
+            backoff: Duration::from_millis(0),
+            max_attempts: 1,
+            live: &LIVE,
+            cap: READ_WORKER_CAP,
+        };
+        let stalled: Result<Vec<PathBuf>, EvidenceError> =
+            bounded_attempts(&watchdog, Instant::now(), "walk", || {
+                || {
+                    std::thread::sleep(Duration::from_millis(600));
+                    Ok(Vec::new())
+                }
+            });
+        assert_eq!(stalled.unwrap_err().code, "read_timeout");
+        assert_eq!(
+            WALK_WATCHDOG.max_attempts, 1,
+            "a stalled walk is not retried into the same blocked syscall"
+        );
+    }
+
+    // Round-1 f4: drive the *real* routes to their bound, rather than asserting on
+    // `bounded_attempts` in isolation and assuming the routes are wired to it. The watchdog is
+    // injected with a budget of zero, so both walk-bearing routes must refuse without depending on
+    // how fast the filesystem happens to be.
+    #[test]
+    fn the_walk_bearing_routes_are_bounded_at_the_route() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        static SPENT: ReadWatchdog = ReadWatchdog {
+            budget: Duration::ZERO,
+            attempt_cap: Duration::ZERO,
+            backoff: Duration::ZERO,
+            max_attempts: 1,
+            live: &LIVE,
+            cap: WALK_WORKER_CAP,
+        };
+        let dir = temp_dir("evidence-route-bounded");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        core.walk_watchdog = &SPENT;
+        for (tool, args) in [
+            ("repository_list", json!({})),
+            ("repository_search", json!({"query":"hello"})),
+        ] {
+            let error = core.call(tool, &args).unwrap_err();
+            assert_eq!(error.code, "read_timeout", "{tool} ran unbounded");
+        }
+        // With the production watchdog the same calls succeed, so the assertion above is the bound
+        // firing rather than the route being broken.
+        core.walk_watchdog = &WALK_WATCHDOG;
+        assert!(core.call("repository_list", &json!({})).is_ok());
+        assert!(core
+            .call("repository_search", &json!({"query":"hello"}))
+            .is_ok());
+    }
+
+    // Round-1 f1: a wedged walk must not be able to spend the read pool's capacity.
+    //
+    // The exhaustion half runs against an *injected* pool with its own counter, never the live
+    // statics. Filling a global counter would have made every concurrently-running test that lists
+    // or searches fail — which is what the first draft of this test did, and is the same class of
+    // cross-test interference as issue #72.
+    #[test]
+    fn a_stalled_walk_cannot_starve_reads() {
+        assert!(
+            !std::ptr::eq(WALK_WATCHDOG.live, READ_WATCHDOG.live),
+            "walks must not draw on the read pool"
+        );
+        const { assert!(WALK_WATCHDOG.cap < READ_WATCHDOG.cap) };
+        // The drift stamp deliberately stays on the read pool: `read` computes it inline, so a walk
+        // pool shared with it would let two stalled walks refuse every first read of a turn.
+        assert!(std::ptr::eq(STAMP_WATCHDOG.live, READ_WATCHDOG.live));
+
+        static FULL: AtomicUsize = AtomicUsize::new(WALK_WORKER_CAP);
+        static EXHAUSTED: ReadWatchdog = ReadWatchdog {
+            budget: Duration::from_millis(REQUEST_BUDGET_MS),
+            attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
+            backoff: Duration::ZERO,
+            max_attempts: 1,
+            live: &FULL,
+            cap: WALK_WORKER_CAP,
+        };
+        let dir = temp_dir("evidence-pool-isolation");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        core.walk_watchdog = &EXHAUSTED;
+        let refused = core.call("repository_list", &json!({})).unwrap_err();
+        assert_eq!(refused.code, "read_unavailable");
+        // Reads draw on their own pool and are untouched by a walk pool at its cap.
+        let read = core
+            .call("repository_read", &json!({"path":"a.txt"}))
+            .unwrap();
+        assert_eq!(read["total_lines"], json!(1));
+    }
+
+    // Round-1 f2: a child process must be given less than the request has left, because the runner
+    // keeps draining its pipes after the timeout fires. A budget that ignored the drain could answer
+    // a full `DRAIN_GRACE` past the deadline it claimed to honour.
+    #[test]
+    fn a_child_is_never_given_the_whole_remaining_budget() {
+        // Both figures are read from a live clock, so this asserts the reservation, not an exact
+        // equality that the microseconds between the two calls would break.
+        let fresh = Instant::now();
+        // Whole first: both are read from a live clock, so sampling the child budget first would
+        // measure it against a larger remainder than the comparison below then sees.
+        let whole = remaining_budget(fresh);
+        let child = child_budget(fresh);
+        assert!(child < whole);
+        assert!(whole - child >= crate::reviewer::DRAIN_GRACE);
+        assert!(!child.is_zero(), "a fresh request can still run a child");
+        // Once too little remains to run a child *and* drain it, nothing is started at all — while
+        // the request itself still has budget left to answer with.
+        let nearly_spent = Instant::now() - Duration::from_millis(REQUEST_BUDGET_MS)
+            + crate::reviewer::DRAIN_GRACE;
+        assert!(child_budget(nearly_spent).is_zero());
+        assert!(!remaining_budget(nearly_spent).is_zero());
     }
 
     // A read reached before any scope must still populate the drift cache, so the stamp is computed

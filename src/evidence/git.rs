@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -13,6 +13,7 @@ pub fn history(
     before: &str,
     limits: &Limits,
     cancel: &AtomicBool,
+    received_at: Instant,
 ) -> Result<(Vec<Value>, bool), EvidenceError> {
     let mut owned = vec![
         "log".to_string(),
@@ -29,7 +30,7 @@ pub fn history(
         owned.push("--".into());
         owned.push(path.to_string());
     }
-    let output = run(root, &owned, limits, cancel)?;
+    let output = run(root, &owned, limits, cancel, received_at)?;
     let mut commits = Vec::new();
     for line in output.lines() {
         let fields: Vec<&str> = line.split('\x1f').collect();
@@ -50,6 +51,7 @@ pub fn revision(
     path: &str,
     limits: &Limits,
     cancel: &AtomicBool,
+    received_at: Instant,
 ) -> Result<String, EvidenceError> {
     let mut args = vec![
         "show".to_string(),
@@ -64,14 +66,33 @@ pub fn revision(
         args.push("--".into());
         args.push(path.to_string());
     }
-    run(root, &args, limits, cancel)
+    run(root, &args, limits, cancel, received_at)
 }
 
+/// Run one bounded Git command, against the **request's** deadline rather than a fresh per-command
+/// one.
+///
+/// `received_at` is the request's own receipt instant, not a duration snapshot, and the child's
+/// timeout is computed from it at the last possible moment — after the PATH lookup and the command
+/// setup, which are themselves filesystem work that a snapshot taken at the call site would have
+/// silently spent (round-1 finding f2).
+///
+/// Two subtractions, both load-bearing:
+///
+/// - **The drain grace.** `reviewer::run` does not return when its timeout fires; it then collects
+///   the child's pipes for up to `DRAIN_GRACE`. A budget that ignored that could answer a full ten
+///   seconds after the deadline it claimed to honour — past the client ceiling, which is the whole
+///   failure this change exists to prevent.
+/// - **The configured per-operation timeout**, which still binds when it is the tighter of the two.
+///
+/// What is left is what the child may actually spend. If that is nothing, refuse rather than start
+/// a process whose output nobody is waiting for.
 fn run(
     root: &Path,
     args: &[String],
     limits: &Limits,
     cancel: &AtomicBool,
+    received_at: Instant,
 ) -> Result<String, EvidenceError> {
     let bin = crate::reviewer::on_path("git")
         .ok_or_else(|| EvidenceError::new("provider_unavailable", "git is not on PATH"))?;
@@ -87,13 +108,18 @@ fn run(
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "")
         .env("PAGER", "");
-    let output = crate::reviewer::run(
-        command,
-        "",
-        Duration::from_millis(limits.operation_timeout_ms),
-        cancel,
-    )
-    .map_err(|e| EvidenceError::new("provider_failed", format!("could not run git: {e}")))?;
+    // Computed here, immediately before the spawn, so the lookup and setup above are charged to the
+    // request rather than to the child.
+    let budget = super::core::child_budget(received_at)
+        .min(Duration::from_millis(limits.operation_timeout_ms));
+    if budget.is_zero() {
+        return Err(EvidenceError::new(
+            "deadline_exceeded",
+            "not enough of the evidence request budget remained to run a Git command and still              answer inside the client's per-call ceiling",
+        ));
+    }
+    let output = crate::reviewer::run(command, "", budget, cancel)
+        .map_err(|e| EvidenceError::new("provider_failed", format!("could not run git: {e}")))?;
     if output.cancelled {
         return Err(EvidenceError::new(
             "cancelled",
@@ -120,7 +146,7 @@ mod tests {
     fn provider_rejects_missing_git_root_without_a_shell() {
         let root = std::env::temp_dir();
         let cancel = AtomicBool::new(false);
-        let result = history(&root, "", "", &Limits::default(), &cancel);
+        let result = history(&root, "", "", &Limits::default(), &cancel, Instant::now());
         assert!(result.is_err());
     }
 }
