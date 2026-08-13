@@ -469,12 +469,12 @@ fn render_page(title: &str, auth_url: &str, token: &str) -> String {
          <h1>{title}</h1>\
          <p class=\"caution\">Only continue if you started this profile setup.</p>\
          <ol><li>Sign in in the browser tab that opened (or open <a href=\"{url}\">this sign-in link</a>).</li>\
-         <li>Copy the authorization code the page shows you.</li>\
-         <li>Paste it below and submit.</li></ol>\
+         <li><strong>If the sign-in shows an authorization code</strong>, copy it and paste it below. \
+         If the sign-in completed in the browser without showing a code, you can just close this page.</li></ol>\
          <form method=\"post\" action=\"/submit?token={token}\">\
-         <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Paste the code here\" autofocus>\
+         <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Paste the code here (only if shown)\" autofocus>\
          <br><button type=\"submit\">Submit</button></form>\
-         <p>The code is sent only to this local page and passed straight to the sign-in; nothing is authorized until sign-in completes and you approve.</p>\
+         <p>Any code is sent only to this local page and passed straight to the sign-in; nothing is authorized until sign-in completes and you approve.</p>\
          </body></html>",
         title = escape(title),
         url = escape(auth_url),

@@ -578,64 +578,28 @@ pub fn run_login_code_paste(
     };
     let _ = crate::approval::open_in_browser(server.url());
     eprintln!(
-        "cross-review: after signing in, paste the code on this local page to finish:\n  {}",
+        "cross-review: if the sign-in shows a code to paste, paste it on this local page; if it \
+         completed in the browser you can ignore this page:\n  {}",
         server.url()
     );
 
-    let code = loop {
-        match server.poll() {
-            Some(crate::codeentry::CodeOutcome::Submitted(c)) => break c,
-            Some(_) => {
-                // The page timed out or was cancelled.
-                let contained = terminate_and_settle(&job, &mut child);
-                return LoginOutcome {
-                    timed_out: Instant::now() >= deadline,
-                    uncontained: !contained,
-                    ..fail
-                };
-            }
-            None => {}
-        }
-        if cancel.load(Ordering::SeqCst) {
-            server.cancel();
-            let contained = terminate_and_settle(&job, &mut child);
-            return LoginOutcome {
-                cancelled: true,
-                uncontained: !contained,
-                ..fail
-            };
-        }
-        if Instant::now() >= deadline || matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            server.cancel();
-            let contained = terminate_and_settle(&job, &mut child);
-            return LoginOutcome {
-                timed_out: Instant::now() >= deadline,
-                uncontained: !contained,
-                ..fail
-            };
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    };
-
-    // Feed the code to the child's stdin on a **detached thread** so a non-reading child cannot block
-    // the runner on a full pipe (f2): the overall timeout below reaps a wedged child, which closes this
-    // pipe and unblocks (or errors) the write. Dropping the writer's `ChildStdin` at the end of the
-    // thread gives the child EOF after the code. The code string is moved in and never logged.
-    if let Some(mut si) = stdin.take() {
-        let code_line = format!("{code}\n");
-        std::thread::spawn(move || {
-            let _ = si.write_all(code_line.as_bytes());
-            let _ = si.flush();
-        });
-    }
-    drop(server);
-
-    // Phase 3: wait (bounded) for the child to exchange the code, write credentials, and exit.
+    // Wait for the login to finish. The Claude login is **hybrid**: some accounts complete on their
+    // own via a browser callback (no code, like Codex), others show a code the human must paste. So we
+    // watch the child **and** the code page at once — whichever finishes first:
+    //   - the child exits  -> the login is done (a callback login, or after a pasted code); check the
+    //     exit code (a code-less callback exiting 0 is a SUCCESS, not a failure — the earlier bug);
+    //   - a code is submitted -> feed it to stdin once (detached, so a non-reading child cannot block
+    //     us; the deadline reaps a wedged child, which closes the pipe).
+    // The code page timing out or being cancelled does NOT abort — a callback login may still be
+    // completing — only the overall deadline or a tool-call cancellation does (f2 preserved: the write
+    // is detached and never logs the code).
+    let mut code_fed = false;
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {}
             Err(_) => {
+                server.cancel();
                 let contained = terminate_and_settle(&job, &mut child);
                 return LoginOutcome {
                     uncontained: !contained,
@@ -643,7 +607,20 @@ pub fn run_login_code_paste(
                 };
             }
         }
+        if !code_fed {
+            if let Some(crate::codeentry::CodeOutcome::Submitted(c)) = server.poll() {
+                if let Some(mut si) = stdin.take() {
+                    let code_line = format!("{c}\n");
+                    std::thread::spawn(move || {
+                        let _ = si.write_all(code_line.as_bytes());
+                        let _ = si.flush();
+                    });
+                }
+                code_fed = true;
+            }
+        }
         if cancel.load(Ordering::SeqCst) {
+            server.cancel();
             let contained = terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 cancelled: true,
@@ -652,6 +629,7 @@ pub fn run_login_code_paste(
             };
         }
         if Instant::now() >= deadline {
+            server.cancel();
             let contained = terminate_and_settle(&job, &mut child);
             return LoginOutcome {
                 timed_out: true,
@@ -661,6 +639,7 @@ pub fn run_login_code_paste(
         }
         std::thread::sleep(Duration::from_millis(150));
     };
+    drop(server);
 
     // The child has exited. Prove containment with the **bounded** quiescence/terminate path, then
     // return. The scanner threads are **not** joined unboundedly (f1): a descendant that inherited a
