@@ -407,8 +407,9 @@ fn quarantine_home(marker_path: &Path, home: &Path, journal: &mut Journal) -> io
     // The journal then clears: the on-disk state is consistent (this dir is renamed aside, never the
     // live home), so retaining it would only strand future setup (f3).
     eprintln!(
-        "cross-review: a previous interrupted setup left an unusable profile directory set aside at \
-         {}; it holds no active credentials and is safe to delete once you no longer need it.",
+        "cross-review: a previous interrupted setup left a profile directory set aside at {}. It may \
+         still contain OAuth credential files from that sign-in, so delete it once you no longer need \
+         it (and revoke the tokens with the vendor if you want them invalidated).",
         rejected.display()
     );
     Ok(true)
