@@ -14,6 +14,7 @@
 .EXAMPLE
   .\smoke.ps1 -Reviewer codex
   .\smoke.ps1 -Reviewer claude -Effort low
+  .\smoke.ps1 -Reviewer codex -ProveBlockRepair
 #>
 [CmdletBinding()]
 param(
@@ -28,10 +29,28 @@ param(
     # Path to the reviewer CLI, when it is not on PATH.
     [string]$ReviewerBin,
 
-    [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe')
+    [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe'),
+
+    # Prove the block-repair path against a real reviewer (issue #63). Builds an instrumented
+    # binary -- with the non-default `repair-test-hook` feature, which discards each turn's machine
+    # block so the repair has to recover it -- into a scratch directory, and runs the round trip
+    # through that. Never touches dist\ or any binary built without the feature: the hook is
+    # compiled out of everything else, which is the point of it being a Cargo feature rather than
+    # an environment variable a shipped binary could inherit.
+    [switch]$ProveBlockRepair
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ProveBlockRepair) {
+    $hookTarget = Join-Path ([System.IO.Path]::GetTempPath()) "cross-review-repair-hook-$PID"
+    Write-Host "==> building an instrumented binary (repair-test-hook) into $hookTarget" -ForegroundColor Cyan
+    Write-Host "    It deliberately discards each turn's machine block, so the block repair has to" -ForegroundColor Yellow
+    Write-Host "    recover it. Built outside dist\ and never for a real review." -ForegroundColor Yellow
+    & cargo build --release --features repair-test-hook --target-dir $hookTarget
+    if ($LASTEXITCODE -ne 0) { throw "instrumented build failed" }
+    $Exe = Join-Path $hookTarget 'release\cross-review.exe'
+}
 
 if (-not (Test-Path $Exe)) {
     throw "cross-review.exe not found at $Exe. Run .\build.ps1 first."

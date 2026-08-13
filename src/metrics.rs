@@ -46,12 +46,28 @@ pub const RECORD_VERSION: u32 = 1;
 /// `docs/reviewer-fallback-chain.md`.
 pub const RECORD_VERSION_ATTEMPTS: u32 = 2;
 
-/// The schema version to stamp on a record, given whether it carries fall-through attempts.
+/// Schema version for a record that carries the issue-#63 structured/repair fields. Same discipline
+/// as `RECORD_VERSION_ATTEMPTS`: an older reader skips *and counts* it rather than reading a record
+/// whose fields it does not know about, and a turn that carries neither new field stays at the lower
+/// version so nothing an old reader could already read changes.
+pub const RECORD_VERSION_BLOCK_REPAIR: u32 = 3;
+
+/// The schema version to stamp on a record, given what optional groups it carries.
 pub fn record_version_for(has_attempts: bool) -> u32 {
     if has_attempts {
         RECORD_VERSION_ATTEMPTS
     } else {
         RECORD_VERSION
+    }
+}
+
+/// The version for a record that may also carry the structured/repair fields. The higher version
+/// wins when either group is present.
+pub fn record_version_for_all(has_attempts: bool, has_block_fields: bool) -> u32 {
+    if has_block_fields {
+        RECORD_VERSION_BLOCK_REPAIR
+    } else {
+        record_version_for(has_attempts)
     }
 }
 
@@ -285,6 +301,47 @@ pub struct Reconciled {
 /// expired resume now surfaces `SESSION_NOT_FOUND` instead of starting a fresh conversation),
 /// so this is reached only by genuine turns today; the two no-baseline arms above still hold
 /// on their own terms.
+/// Fold a second run's usage into the first's, within one turn.
+///
+/// A turn can now make two calls: the review, and — when the reviewer omitted its machine block — a
+/// short repair (see `docs/unstructured-turn-recovery.md`). The two CLIs report usage differently
+/// and the difference is invisible in the numbers, which is the same trap `reconcile_cumulative`
+/// exists for:
+///
+/// - **Cumulative reporter (Codex)**: the later reading already *includes* the earlier one, so
+///   summing would double-count the review. Take the later reading.
+/// - **Per-turn reporter (Claude)**: the two readings are disjoint costs of one turn, so add them.
+///
+/// `later_is_cumulative` is stated by the adapter that produced the second reading, never inferred.
+/// A later run that reported nothing (every field `None`) leaves the first reading untouched under
+/// either rule — an unreported run must not erase a reported one.
+pub fn fold_runs(first: Usage, later: Usage, later_is_cumulative: bool) -> Usage {
+    if later.is_empty() {
+        return first;
+    }
+    if later_is_cumulative {
+        return later;
+    }
+    fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        }
+    }
+    Usage {
+        input_tokens: add(first.input_tokens, later.input_tokens),
+        output_tokens: add(first.output_tokens, later.output_tokens),
+        cache_creation_tokens: add(first.cache_creation_tokens, later.cache_creation_tokens),
+        cache_read_tokens: add(first.cache_read_tokens, later.cache_read_tokens),
+        cost_usd: match (first.cost_usd, later.cost_usd) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        },
+        api_calls: add(first.api_calls, later.api_calls),
+        api_duration_ms: add(first.api_duration_ms, later.api_duration_ms),
+    }
+}
+
 pub fn reconcile_cumulative(total: Usage, baseline: Option<Usage>, resumed: bool) -> Reconciled {
     match baseline {
         // Fold the reading onto the baseline rather than replacing it, so a turn that
@@ -375,6 +432,16 @@ pub struct Record {
     /// two chain entries share a model but differ by `--bin`. Additive; absent on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_bin: Option<String>,
+    /// Whether this turn produced a trusted machine record (a valid, reconciled findings block).
+    /// Absent on records written before issue #63, and on failed turns where the question does not
+    /// arise. Logged so "the reviewer skipped its output contract" is a measurable rate rather than
+    /// the anecdote issue #63 had to be filed as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<bool>,
+    /// Whether this turn re-asked the reviewer for its block, and how that went (`recovered` /
+    /// `failed`). Absent when no repair was attempted — the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_repair: Option<String>,
     /// Earlier fall-through attempts on this same logical turn — the rate-limited entries the
     /// walk tried before the one that produced this record. Kept so a rate-limited primary stays
     /// visible without inflating the turn/wall/token totals (this is still one `Record`). Absent
@@ -562,7 +629,9 @@ impl MetricsLog {
                 }
                 match serde_json::from_str::<Record>(&line) {
                     Ok(record)
-                        if record.v == RECORD_VERSION || record.v == RECORD_VERSION_ATTEMPTS =>
+                        if record.v == RECORD_VERSION
+                            || record.v == RECORD_VERSION_ATTEMPTS
+                            || record.v == RECORD_VERSION_BLOCK_REPAIR =>
                     {
                         acc.push(&record)
                     }
@@ -603,7 +672,11 @@ impl MetricsLog {
                 Ok(text) => {
                     for line in text.lines().filter(|l| !l.trim().is_empty()) {
                         match serde_json::from_str::<Record>(line) {
-                            Ok(r) if r.v == RECORD_VERSION || r.v == RECORD_VERSION_ATTEMPTS => {
+                            Ok(r)
+                                if r.v == RECORD_VERSION
+                                    || r.v == RECORD_VERSION_ATTEMPTS
+                                    || r.v == RECORD_VERSION_BLOCK_REPAIR =>
+                            {
                                 records.push(r)
                             }
                             Ok(_) => report.unsupported_version += 1,
@@ -1167,6 +1240,8 @@ mod tests {
     fn record(session: &str, turn: u32, gap: Option<u64>, usage: Usage) -> Record {
         Record {
             v: RECORD_VERSION,
+            structured: None,
+            block_repair: None,
             ts_unix: 1_700_000_000 + turn as u64,
             review_id: format!("rv-1-{turn}"),
             session: session.to_string(),
@@ -2117,5 +2192,77 @@ mod tests {
         let text = render_summary(&summary, Path::new("C:\\state"), &ReadReport::default());
         assert!(text.contains("no turns recorded yet"), "{text}");
         assert!(!text.contains("input tokens"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn usage(input: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn a_cumulative_reporters_later_reading_replaces_the_earlier_one() {
+        // Codex reports the thread's running total, so the repair run's reading already contains
+        // the review's. Summing them would bill the review twice -- the same trap
+        // `reconcile_cumulative` exists for, one level down.
+        let folded = fold_runs(usage(100, 10), usage(140, 14), true);
+        assert_eq!(folded.input_tokens, Some(140));
+        assert_eq!(folded.output_tokens, Some(14));
+    }
+
+    #[test]
+    fn a_per_turn_reporters_two_readings_are_added() {
+        // Claude reports per turn, so the two runs are disjoint costs of one turn.
+        let folded = fold_runs(usage(100, 10), usage(40, 4), false);
+        assert_eq!(folded.input_tokens, Some(140));
+        assert_eq!(folded.output_tokens, Some(14));
+    }
+
+    #[test]
+    fn a_later_run_that_reported_nothing_never_erases_a_reported_one() {
+        for cumulative in [true, false] {
+            let folded = fold_runs(usage(100, 10), Usage::default(), cumulative);
+            assert_eq!(folded.input_tokens, Some(100), "cumulative={cumulative}");
+            assert_eq!(folded.output_tokens, Some(10), "cumulative={cumulative}");
+        }
+    }
+
+    #[test]
+    fn an_unreported_field_on_one_side_still_sums_rather_than_vanishing() {
+        let first = Usage {
+            input_tokens: Some(100),
+            ..Usage::default()
+        };
+        let later = Usage {
+            output_tokens: Some(7),
+            ..Usage::default()
+        };
+        let folded = fold_runs(first, later, false);
+        assert_eq!(folded.input_tokens, Some(100));
+        assert_eq!(folded.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn the_record_version_rises_only_when_the_new_fields_are_present() {
+        // Same discipline as the fall-through version: an old reader skips and counts a record it
+        // does not understand rather than reading it as a complete accounting, and a record with
+        // neither new group keeps the version an old reader can already read.
+        assert_eq!(record_version_for_all(false, false), RECORD_VERSION);
+        assert_eq!(record_version_for_all(true, false), RECORD_VERSION_ATTEMPTS);
+        assert_eq!(
+            record_version_for_all(false, true),
+            RECORD_VERSION_BLOCK_REPAIR
+        );
+        assert_eq!(
+            record_version_for_all(true, true),
+            RECORD_VERSION_BLOCK_REPAIR
+        );
     }
 }

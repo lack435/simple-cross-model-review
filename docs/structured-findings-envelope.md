@@ -234,6 +234,14 @@ character is one call, one response, `serde` as the only dependency. A structuri
 double the model cost of every review and add a second failure surface. The reviewer emits
 the block in the same turn it writes the prose.
 
+> **Amended for issue #63** (see [`unstructured-turn-recovery.md`](unstructured-turn-recovery.md)).
+> There *is* now a second call, on one path: when a turn produces no usable block, the server asks
+> the same reviewer, in the same conversation, to re-emit the block alone. The reasoning above still
+> holds and is what bounds it — it is not a structuring pass, it introduces no second model, it does
+> not read prose, it runs only on a degraded turn, and it cannot fail the review (a failed repair
+> returns the same degraded envelope the turn would have had). But "one call, one response" is no
+> longer true of every turn, and this document does not claim it is.
+
 **The block is the *sole* machine-authoritative source of findings and verdict — and the prompt
 makes that a contract, not a hope.** Round 4 named a real, non-injection failure: the reviewer is
 told to emit the block "in addition to" prose, and the server does not parse prose, so a response
@@ -367,7 +375,9 @@ no prose on that path. With that boundary:
   not be persisted (Decision 5, `turn_not_durable`) → the envelope still returns, but with
   `structured: false`, `open_count: null`, `verdict` **never `approve`** (it is reported as
   `unknown`), `converged: false`, and a warning naming which degradation occurred. The prose is
-  returned in full regardless, exactly as today. (An *unreadable ledger* is not in this list — it is
+  returned in full on the text channel regardless, exactly as today — and since issue #63 a capped
+  copy also rides the structured channel in `review_prose`, so a `structuredContent`-only client is
+  not left with an empty `findings` list and nothing to read. (An *unreadable ledger* is not in this list — it is
   the pre-model resume refusal above, not a completed degraded envelope.)
 
 The invariant round 1 demanded, made structural: **a numeric `open_count` and a `true`
@@ -593,6 +603,16 @@ Notes on the shape:
   parse prose for a verdict, not even as a degraded best-effort: a half-parsed prose verdict would
   both contradict Decision 1 and mislead. On any degraded turn the verdict is `unknown`, the source
   is `none`, and the turn is non-convergent regardless — so nothing is lost by refusing to guess.
+- **`outcome`, `review_prose`, `review_prose_truncated`, `block_repair`** were added by issue #63
+  (envelope `schema_version` 2; the *ledger* version is a separate constant and unchanged, so
+  ledgers written before this still load). `outcome` is what a caller switches on — `converged` /
+  `changes_requested` / `escalate` / `rebaseline` — derived totally from `non_convergence_reason`,
+  so it adds no second precedence that could disagree with the first. `review_prose` carries the
+  reviewer's prose on the structured channel **only when the machine channel does not represent the
+  turn** (`structured: false`, or `turn_not_durable`), capped at 16,000 characters; it is
+  transported, never interpreted, and `verdict_source` is unaffected. `block_repair` records whether
+  the block was re-asked for and how that went. Full detail in
+  [`unstructured-turn-recovery.md`](unstructured-turn-recovery.md).
 - **`detail` is the reviewer's prose, captured when the finding was first raised**, and not
   rewritten on later turns (Decision 2). Nothing is lost by adopting the structure: the block
   is a spine, the prose is the body, and the human rendering is unchanged.
@@ -651,7 +671,7 @@ its own.
 | `request_changes` | ≥1 | `changes` | false, `open_findings` |
 | `request_changes` | 0 (contradiction) | `changes` + warning | false², `verdict_contradiction` |
 | `blocked` | any | `changes` | false, `reviewer_blocked`³ |
-| *unstructured (no valid block)* | unknown (`null`) | `unknown` | false, `ledger_unavailable`⁴ |
+| *unstructured (no valid block, and the repair did not recover one)* | unknown (`null`) | `unknown` | false, `ledger_unavailable`⁴ |
 
 ¹ `approve_with_comments` with zero *open* findings means the reviewer left only informational
 comments. Those are not open findings and do not block convergence *numerically*, but the
@@ -669,7 +689,12 @@ is `reviewer_blocked` regardless of `open_count`, and it is a human-escalation o
 must not re-review-and-hope against a reviewer that has declared itself blocked. It sits above
 `verdict_contradiction` in the precedence order.
 
-⁴ An unstructured turn's *top-level* reason is `ledger_unavailable`, not `unstructured` (round 8):
+⁴ Since issue #63 a turn only reaches this row after the block repair has been tried and failed
+(or was disabled, unavailable, or not applicable): the server asks the reviewer once more, in the
+same conversation, before accepting that the turn has no machine record. A *recovered* turn is an
+ordinary structured turn and takes one of the rows above.
+
+An unstructured turn's *top-level* reason is `ledger_unavailable`, not `unstructured` (round 8):
 a degraded turn breaks coverage (`needs_rebaseline` mid-session, `legacy_uncovered` on turn 1), and
 coverage is stamped before reason selection, so the reason that reaches the caller is
 `ledger_unavailable` (**escalate for a rebaseline**, not a blind `fresh`) whenever the on-disk break
@@ -1235,8 +1260,9 @@ failure.
 
 - **The prose.** Every existing line of the completed-review rendering stays. The envelope is
   additive on both channels. Anything currently reading the prose keeps working.
-- **The single-call, single-dependency character.** No second model call, no new crate — the
-  block is emitted in the same turn and parsed with `serde`.
+- **The single-dependency character.** No new crate — the block is parsed with `serde`. (The
+  *single-call* half no longer holds unconditionally: issue #63 added a bounded re-ask on degraded
+  turns. See the amendment under Decision 1.)
 - **The failure contract.** No new failure code. "Unstructured this turn" is a `structured:
   false`, non-convergent envelope with a warning, not a `REVIEWER_FAILED`.
 - **The reviewer's isolation and read-only posture.** Nothing here touches the tool policy,

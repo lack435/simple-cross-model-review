@@ -5,7 +5,10 @@ back what it said.
 
 Claude Code asks Codex. Codex asks Claude. One request, one response — the calling agent
 decides what to do with the feedback. There is no orchestration, no multi-agent
-choreography, and no attempt to be clever about it.
+choreography, and no attempt to be clever about it. (One exception, bounded and opt-out: when
+a reviewer answers without the machine-readable findings block it was asked for, the server
+asks it once more for the block alone rather than throwing the whole turn away. See
+[block repair](#when-the-reviewer-skips-its-machine-block) below.)
 
 Windows only. A single 520 KB executable with no runtime dependencies: no Node, no
 Python, no DLLs. Vendor the `.exe` into a repository and a fresh clone works.
@@ -32,7 +35,8 @@ start over. Starting and collecting are separate calls, so the harness is never 
 before it chooses to wait. **A single `cross_model_review_result` collects a whole review in
 one blocking call** — omit `wait_seconds` to block to completion — so the mandatory
 poll-again loop is gone. The wait cap tracks the review budget rather than a fixed 300s: it
-is the capture budget plus `--timeout-seconds` plus a finalization grace. The default
+is the capture budget plus `--timeout-seconds` plus the block-repair budget plus a
+finalization grace. The default
 per-turn hard limit is 30 minutes and can be changed with `--timeout-seconds` (bounded at
 24h). Raising it also lets a wedged reviewer bill and hold its session lease for longer
 before the server stops it, and it widens the collect cap to match.
@@ -123,6 +127,13 @@ the single source of truth. There is no config file of our own to drift out of s
 --session-max-idle-seconds <n>
                             Refuse to resume a review session idle longer than this many
                             seconds. Default 3300 (55m). 0 disables.
+--block-repair-attempts <n> When a reviewer answers without a usable machine-readable
+                            findings block, ask it once more -- same conversation, block
+                            only -- instead of discarding the turn. Costs up to n further
+                            short calls on a degraded turn. Default 1. Max 3. 0 disables.
+--block-repair-timeout-seconds <n>
+                            Per-attempt timeout for the above, clamped to --timeout-seconds.
+                            Default 180.
 --cwd <path>                Review root. Defaults to the server's working directory.
 --state-dir <path>          Where named sessions live.
 --sandbox <mode>            Codex sandbox policy. Default read-only.
@@ -552,6 +563,52 @@ on one is shown as a floor (`at least ...`). A zero there would be an assertion 
 to Claude's measured value. Averages divide by the turns that actually reported the figure,
 and name that denominator, so a rollup mixing the two reviewers cannot read as though every
 turn had been measured.
+
+## When the reviewer skips its machine block
+
+Every review carries a machine-readable envelope alongside its prose: a verdict, findings with
+stable ids, and a `converged` signal a loop can stop on. The reviewer produces that structure
+itself, in a delimited block the server extracts and validates — the server never parses prose for
+a verdict. Occasionally a reviewer writes a perfectly good review and simply omits the block, or
+emits one that will not reconcile against the ids it was handed. That is issue #63, and untreated it
+throws away a 5–20 minute review: no verdict, no findings, and a coverage break that the caller can
+only recover from by escalating and starting again.
+
+So the server **asks once more, in the same conversation, for the block alone** — naming exactly
+what was wrong with the one it got, and telling the reviewer explicitly not to re-read the code or
+revise anything. A recovered turn is an ordinary structured turn, flagged `block_repair:
+"recovered"` with a warning so nothing is hidden.
+
+What that costs, and what it cannot do:
+
+- Up to `--block-repair-attempts` further short calls (default 1, max 3), each bounded by
+  `--block-repair-timeout-seconds` (default 180, clamped to `--timeout-seconds`). Only on a degraded
+  turn. `--block-repair-attempts 0` restores the previous single-shot behaviour exactly.
+- **A failed repair never fails the review.** Any failure — spawn, timeout, rate limit, cancel, a
+  second unusable block, a repair that answered under a different conversation — returns the same
+  degraded envelope the turn would have returned anyway, flagged `block_repair: "failed"`.
+- **It does not heal a broken ledger.** Coverage is a one-way state machine: a repair stops *this*
+  turn from breaking coverage, but a session already `legacy_uncovered` or `needs_rebaseline` stays
+  that way, structured counts and all.
+- It cannot start a conversation. A fresh run that reported no session id has nothing to resume, and
+  the server does not open a new one to ask for a block — a block describing a review that never
+  happened is worse than none.
+
+### Reading a completed result
+
+Switch on `outcome`:
+
+| `outcome` | What it means | What to do |
+| --- | --- | --- |
+| `converged` | The machine contract passed. | Stop. (It certifies the structured contract, not that a human read the prose.) |
+| `changes_requested` | Findings are open, or the verdict and the count disagree. | Act on `findings`, re-review the same session. |
+| `escalate` | The reviewer blocked, or withheld a clean approve. | A person decides; re-reviewing will keep producing this. |
+| `rebaseline` | This session cannot continue — coverage is broken, the turn was not durable, or the ledger is over budget. | A person decides, then starts a fresh review carrying the still-open findings. |
+
+`structured: false` means there is no machine record for this turn: `findings` is empty because
+nothing is in it, not because nothing was wrong. On those turns the review itself is in
+`review_prose` (capped, with the whole thing in the text body) so a client reading only
+`structuredContent` still has something to read.
 
 ## What the reviewer can and cannot do
 

@@ -1,7 +1,8 @@
 # Recovering a turn whose machine block never arrived — design
 
-Status: **planned.** This document is the plan. It goes through this repository's own
-`cross-review` gate before implementation begins, and the implementation goes through it again.
+Status: **implemented** on `fix/unstructured-turn-recovery`. This document is the plan; it went
+through this repository's own `cross-review` gate before implementation began (see the review
+history below), and the implementation goes through the gate again as its own review.
 
 > **Review history.** Ten rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), every one REQUEST CHANGES: 21 findings raised, all 21 accepted and acted on, **none
@@ -49,7 +50,9 @@ defects follow from that, and they are independent — fixing any one leaves the
 → parse → `evaluate_turn` → return — and there is no in-conversation re-request of the block on any
 path. (The fallback chain can invoke a *second reviewer entry* when the first is rate-limited, so a
 turn is not literally one invocation; but that is a different reviewer and a different conversation,
-never a second ask for the block that is missing.) Decision A is the change to that. On the degrade path nothing re-asks for the block. So a 5–20
+never a second ask for the block that is missing.) Decision A is the change to that.
+
+So a 5–20
 minute review at `effort=max` yields no machine result, and the only recovery available to the
 caller is to run the whole review again — after escalating, because a degraded turn also breaks
 ledger coverage to `legacy_uncovered`/`needs_rebaseline`, which is a human-escalation outcome by
