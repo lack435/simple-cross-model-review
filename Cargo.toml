@@ -11,6 +11,16 @@ publish = false
 name = "cross-review"
 path = "src/main.rs"
 
+[features]
+# Off by default and compiled out of every shipped binary. When enabled, the first response of each
+# turn has its machine block removed before evaluation, so the block-repair path can be exercised
+# against a *real* reviewer CLI once (`smoke.ps1 -ProveBlockRepair`) rather than shipping on the
+# strength of unit tests alone. It is a feature rather than an environment variable deliberately:
+# an ambient variable is inherited state, and a released binary that can be told to degrade real
+# reviews and spend real tokens is a backdoor no warning makes safe. `build.ps1`, `dist\` and the
+# release workflow never enable it. See docs/unstructured-turn-recovery.md.
+repair-test-hook = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

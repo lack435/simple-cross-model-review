@@ -75,6 +75,7 @@ impl Reviewer for CodexReviewer {
         resume: Option<&str>,
         tmp_id: &str,
         evidence: Option<&super::EvidenceInvocation<'_>>,
+        pinned_home: Option<&crate::config::AuthorizedHome>,
     ) -> std::io::Result<Invocation> {
         let evidence = evidence.ok_or_else(|| {
             std::io::Error::other("Codex invocation requires a verified evidence capability")
@@ -94,11 +95,9 @@ impl Reviewer for CodexReviewer {
         // read the tree. The allowlist carries the OS essentials (`SystemRoot`, `PATH`, `TEMP`, …),
         // so it should, but this end-to-end interaction is only exercisable once a profile is
         // authorized -- confirm it with `smoke.ps1` then.
-        if let Some(home) = cfg
-            .resolve_authorized_home(spec)
-            .map_err(|e| std::io::Error::other(e.summary))?
-        {
-            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &home);
+        // The account pinned for this attempt, never a fresh resolve: see the trait doc.
+        if let Some(home) = pinned_home {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &home.home);
         }
         cmd.arg("exec");
 

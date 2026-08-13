@@ -79,6 +79,7 @@ impl Reviewer for ClaudeReviewer {
         resume: Option<&str>,
         _tmp_id: &str,
         _evidence: Option<&super::EvidenceInvocation<'_>>,
+        pinned_home: Option<&crate::config::AuthorizedHome>,
     ) -> std::io::Result<Invocation> {
         let mut cmd = Command::new(bin);
         // Run from a neutral, non-git directory when it is safe and beneficial to (see
@@ -99,11 +100,9 @@ impl Reviewer for ClaudeReviewer {
         // variable can override it). Ambient leaves the environment untouched. An unauthorized
         // profile cannot reach here -- the review path is refused upstream by
         // `resolve_authorized_home` -- but map its `Failure` defensively rather than panic.
-        if let Some(home) = cfg
-            .resolve_authorized_home(spec)
-            .map_err(|e| std::io::Error::other(e.summary))?
-        {
-            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home);
+        // The account pinned for this attempt, never a fresh resolve: see the trait doc.
+        if let Some(home) = pinned_home {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home.home);
         }
         cmd.arg("-p");
         if cfg.chain_gates_on_usage() {
@@ -985,6 +984,8 @@ mod tests {
                 None,
                 "id",
                 None,
+                // Ambient: no pinned account home for this invocation.
+                None,
             )
             .expect("invocation");
         let argv: Vec<String> = inv
@@ -1010,6 +1011,8 @@ mod tests {
                 Path::new("claude"),
                 None,
                 "id",
+                None,
+                // Ambient: no pinned account home for this invocation.
                 None,
             )
             .expect("invocation")

@@ -654,6 +654,19 @@ pub const DEFAULT_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
 /// and prone to losing the thread. Zero disables the check.
 pub const DEFAULT_RESUME_MAX_TURNS: u32 = 10;
 
+/// How many times a degraded turn may ask the reviewer to re-emit its machine block, in the same
+/// conversation. One by default: a missing block is a contract slip, not a capability gap, so a
+/// reviewer told precisely what was wrong either complies immediately or is unlikely to on a third
+/// telling -- and every attempt adds tail latency to a turn that already ran long. Zero restores the
+/// single-shot behaviour exactly. See `docs/unstructured-turn-recovery.md`.
+pub const DEFAULT_BLOCK_REPAIR_ATTEMPTS: u32 = 1;
+/// Upper bound on `--block-repair-attempts`. More than a few re-asks is not persistence, it is a
+/// loop billing a reviewer that is not going to comply.
+pub const MAX_BLOCK_REPAIR_ATTEMPTS: u32 = 3;
+/// Per-attempt timeout for a block repair, clamped to `--timeout`. A repair re-states a block the
+/// reviewer has already computed; one that cannot do so in three minutes is not going to.
+pub const DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS: u64 = 180;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The reviewer chain, in fallback order. Always non-empty; `reviewers[0]` is the primary
@@ -684,6 +697,11 @@ pub struct Config {
     /// Refuse to resume a session that has already run this many turns. Zero disables the
     /// check. See `DEFAULT_RESUME_MAX_TURNS`.
     pub resume_max_turns: u32,
+    /// How many block-repair attempts a degraded turn may make (0 disables). See
+    /// `DEFAULT_BLOCK_REPAIR_ATTEMPTS`.
+    pub block_repair_attempts: u32,
+    /// Per-attempt repair timeout, already clamped to `timeout` at parse time.
+    pub block_repair_timeout: Duration,
     pub state_dir: PathBuf,
     /// Codex sandbox policy.
     pub sandbox: String,
@@ -790,6 +808,8 @@ impl Config {
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
         let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
         let mut resume_max_turns = DEFAULT_RESUME_MAX_TURNS;
+        let mut block_repair_attempts = DEFAULT_BLOCK_REPAIR_ATTEMPTS;
+        let mut block_repair_timeout_secs = DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS;
         let mut max_concurrent_reviews = DEFAULT_MAX_CONCURRENT_REVIEWS;
         let mut state_dir: Option<PathBuf> = None;
         let mut sandbox = "read-only".to_string();
@@ -933,6 +953,34 @@ impl Config {
                         )
                     })?;
                 }
+                "--block-repair-attempts" => {
+                    let v = take("--block-repair-attempts")?;
+                    let n: u32 = v.parse().map_err(|_| {
+                        format!(
+                            "--block-repair-attempts must be an integer (0 disables), got '{v}'"
+                        )
+                    })?;
+                    if n > MAX_BLOCK_REPAIR_ATTEMPTS {
+                        return Err(format!(
+                            "--block-repair-attempts must be at most {MAX_BLOCK_REPAIR_ATTEMPTS}, got {n}"
+                        ));
+                    }
+                    block_repair_attempts = n;
+                }
+                "--block-repair-timeout-seconds" => {
+                    let v = take("--block-repair-timeout-seconds")?;
+                    block_repair_timeout_secs = v.parse().map_err(|_| {
+                        format!(
+                            "--block-repair-timeout-seconds must be a positive integer, got '{v}'"
+                        )
+                    })?;
+                    if block_repair_timeout_secs == 0 {
+                        return Err(
+                            "--block-repair-timeout-seconds must be greater than 0; use                              --block-repair-attempts 0 to disable repairs"
+                                .to_string(),
+                        );
+                    }
+                }
                 "--state-dir" => state_dir = Some(PathBuf::from(take("--state-dir")?)),
                 "--sandbox" => sandbox = take("--sandbox")?,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
@@ -1037,6 +1085,12 @@ impl Config {
             timeout: Duration::from_secs(timeout_secs),
             resume_max_idle: Duration::from_secs(resume_max_idle_secs),
             resume_max_turns,
+            block_repair_attempts,
+            // Clamped to the turn budget: a repair that outlived the review timeout would be a
+            // second, larger budget nobody configured.
+            block_repair_timeout: Duration::from_secs(
+                block_repair_timeout_secs.min(timeout_secs.max(1)),
+            ),
             sandbox,
             allowed_tools,
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
@@ -1273,9 +1327,24 @@ impl Config {
     pub fn max_wait_secs(&self) -> u64 {
         // Today's single-reviewer budget: capture + one turn + finalization. For N == 1 this is
         // the whole cap, byte-for-byte as before.
+        // A degraded turn can spend its whole turn budget and then up to `attempts` repair budgets
+        // on top, so the collect deadline has to include them or a blocking collect advertised as
+        // covering a whole review would time out on exactly the turns the repair exists to rescue.
+        // Zero attempts contributes zero, byte-for-byte as before.
+        // Each attempt is the child's own timeout *plus* the pre-spawn identity probe that runs
+        // before it -- a real CLI invocation with its own 30s auth-status timeout, not a free
+        // check, so a worst-case repaired turn would otherwise be able to outrun the deadline this
+        // function exists to define. `PREFLIGHT_CAP_SECS` is the same allowance the chain's
+        // preflight uses, and for the same call.
+        let per_repair = self
+            .block_repair_timeout
+            .as_secs()
+            .saturating_add(PREFLIGHT_CAP_SECS);
+        let repair = per_repair.saturating_mul(self.block_repair_attempts as u64);
         let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
             .saturating_add(self.timeout.as_secs())
+            .saturating_add(repair)
             .saturating_add(FINALIZATION_GRACE_SECS);
         // Each *fallback* entry can add its own preflight + turn + drain to the walk, because a
         // rate-limited attempt is not guaranteed to fail fast. Expressed as "today's budget plus
@@ -1283,8 +1352,10 @@ impl Config {
         // practical sizing, not a proven ceiling (the resolve_bin residual is uninterruptible);
         // see docs/reviewer-fallback-chain.md.
         let fallbacks = (self.reviewers.len() as u64).saturating_sub(1);
+        // A fallback entry's turn can degrade and repair too, so it carries the repair term as well.
         let per_fallback = PREFLIGHT_CAP_SECS
             .saturating_add(self.timeout.as_secs())
+            .saturating_add(repair)
             .saturating_add(crate::reviewer::DRAIN_GRACE.as_secs());
         single.saturating_add(fallbacks.saturating_mul(per_fallback))
     }
@@ -1740,6 +1811,17 @@ OPTIONS:
                               re-reading the whole conversation. The caller is told to start
                               fresh rather than silently handed the stale resume. 0 disables.
                               Default: 3300 (55 minutes, just under the 1h cache lifetime).
+  --block-repair-attempts <n>
+                              When a reviewer answers without a usable machine-readable
+                              findings block, ask it once more -- in the same conversation,
+                              for the block alone -- rather than throwing the whole turn
+                              away. Costs up to n further short calls on a degraded turn,
+                              and adds up to n x --block-repair-timeout-seconds to it.
+                              0 disables (single-shot, as before). Max 3. Default: 1.
+  --block-repair-timeout-seconds <n>
+                              Per-attempt timeout for the above, clamped to --timeout-seconds.
+                              A repair re-states a block the reviewer already computed.
+                              Default: 180.
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
@@ -2179,10 +2261,28 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert_eq!(cfg.reviewers.len(), 1);
         assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex);
-        // Byte-for-byte the same budget as before the chain existed: capture + timeout + grace.
-        let single =
-            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        // Capture + timeout + the default block-repair budget + grace.
+        let single = crate::vcs::CAPTURE_BUDGET.as_secs()
+            + cfg.timeout.as_secs()
+            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+                * cfg.block_repair_attempts as u64
+            + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), single);
+
+        // With repairs disabled the budget is byte-for-byte what it was before they existed.
+        let no_repair = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--block-repair-attempts",
+            "0",
+        ]))
+        .expect("config");
+        assert_eq!(
+            no_repair.max_wait_secs(),
+            crate::vcs::CAPTURE_BUDGET.as_secs()
+                + no_repair.timeout.as_secs()
+                + FINALIZATION_GRACE_SECS
+        );
     }
 
     #[test]
@@ -2232,10 +2332,17 @@ mod tests {
     fn a_multi_entry_budget_adds_a_term_per_fallback() {
         let cfg = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
             .expect("config");
-        let single =
-            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
-        let per_fallback =
-            PREFLIGHT_CAP_SECS + cfg.timeout.as_secs() + crate::reviewer::DRAIN_GRACE.as_secs();
+        // A fallback entry's turn can degrade and repair too, so the repair term appears in both.
+        let repair = (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+            * cfg.block_repair_attempts as u64;
+        let single = crate::vcs::CAPTURE_BUDGET.as_secs()
+            + cfg.timeout.as_secs()
+            + repair
+            + FINALIZATION_GRACE_SECS;
+        let per_fallback = PREFLIGHT_CAP_SECS
+            + cfg.timeout.as_secs()
+            + repair
+            + crate::reviewer::DRAIN_GRACE.as_secs();
         assert_eq!(cfg.max_wait_secs(), single + per_fallback);
     }
 
@@ -2686,12 +2793,27 @@ mod tests {
     #[test]
     fn the_collect_cap_covers_the_whole_lifecycle_and_tracks_the_timeout() {
         let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        // Capture budget + reviewer turn + finalization grace, so a single blocking collect can
-        // cover a whole review rather than a fixed 300s window.
-        let expected =
-            crate::vcs::CAPTURE_BUDGET.as_secs() + cfg.timeout.as_secs() + FINALIZATION_GRACE_SECS;
+        // Capture budget + reviewer turn + the block-repair budget + finalization grace, so a
+        // single blocking collect can cover a whole review -- including a degraded turn that spends
+        // its whole turn budget and then re-asks for the block -- rather than a fixed 300s window.
+        let expected = crate::vcs::CAPTURE_BUDGET.as_secs()
+            + cfg.timeout.as_secs()
+            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
+                * cfg.block_repair_attempts as u64
+            + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), expected);
         assert!(cfg.max_wait_secs() > 300);
+
+        // The repair budget is part of it, not a documentation footnote: a turn that repairs must
+        // still fit inside the deadline the collect advertises.
+        let repairing = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--block-repair-attempts",
+            "3",
+        ]))
+        .expect("config");
+        assert!(repairing.max_wait_secs() >= cfg.max_wait_secs() + 2 * (180 + PREFLIGHT_CAP_SECS));
 
         let bigger =
             Config::from_args(&args(&["--reviewer", "codex", "--timeout-seconds", "3600"]))
@@ -3407,5 +3529,78 @@ mod tests {
         assert!(caps.contains("Perforce"), "{caps}");
         assert!(caps.contains("repository_history"), "{caps}");
         assert!(!caps.contains("git diff"), "{caps}");
+    }
+}
+
+#[cfg(test)]
+mod block_repair_flag_tests {
+    use super::*;
+
+    /// Same helper the sibling `tests` module uses.
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_repair_flags_default_and_parse() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.block_repair_attempts, DEFAULT_BLOCK_REPAIR_ATTEMPTS);
+        assert_eq!(
+            cfg.block_repair_timeout.as_secs(),
+            DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS
+        );
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--block-repair-attempts",
+            "0",
+            "--block-repair-timeout-seconds",
+            "60",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.block_repair_attempts, 0);
+        assert_eq!(cfg.block_repair_timeout.as_secs(), 60);
+    }
+
+    #[test]
+    fn too_many_attempts_are_refused_rather_than_clamped() {
+        // Silently clamping would leave the caller believing it configured something it did not.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--block-repair-attempts",
+            "9",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("at most 3"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_repair_timeout_is_refused_and_points_at_the_flag_that_disables_repairs() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--block-repair-timeout-seconds",
+            "0",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--block-repair-attempts 0"), "{err}");
+    }
+
+    #[test]
+    fn the_repair_timeout_is_clamped_to_the_turn_budget() {
+        // A repair that outlived the review timeout would be a second, larger budget nobody
+        // configured -- and it would blow past the collect deadline derived from the same numbers.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--timeout-seconds",
+            "90",
+            "--block-repair-timeout-seconds",
+            "600",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.block_repair_timeout.as_secs(), 90);
     }
 }

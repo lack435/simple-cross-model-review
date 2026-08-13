@@ -879,6 +879,15 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  cuts the call short (you get a client-side timeout rather than a result), simply \
                  call again with the same review_id. Use cross_model_review_cancel to actually stop \
                  a reviewer.\n\n\
+                 A completed result carries an `outcome` field saying what to do next, and that is \
+                 the field to switch on: `converged` (stop), `changes_requested` (act on \
+                 `findings`, then re-review the same session), `escalate` (the reviewer's own \
+                 judgement needs a person), or `rebaseline` (this session cannot continue -- a \
+                 human decides, then starts a fresh review carrying the still-open findings). When \
+                 `structured` is false the reviewer produced no machine-readable record this turn: \
+                 `findings` is empty because there is nothing in it, not because there was nothing \
+                 wrong, and the review itself is in `review_prose` as well as the text body. Read \
+                 it rather than re-running blind.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),

@@ -110,6 +110,12 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   same-model subagent: a model reviewing its own work shares its own blind spots, which is
   the entire premise of this project. `cross_model_review_status` checks the reviewer CLI
   and auth for free, before anything is billed.
+- **Read the result's `outcome` field rather than reassembling one from the other fields.**
+  `converged` stop, `changes_requested` act and re-review, `escalate` and `rebaseline` both mean a
+  person decides — the second because the session itself cannot continue, so carry the still-open
+  findings into a fresh one. When `structured` is false there is no machine record for that turn:
+  the empty `findings` list means nothing was recorded, not that nothing was wrong, and the review
+  is in `review_prose` and the text body. Read it; do not re-run blind.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
   and what is still disputed. Keep findings the reviewer has confirmed resolved separate
   from ones you argued against — they are not the same claim.

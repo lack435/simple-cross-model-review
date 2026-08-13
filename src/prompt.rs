@@ -162,9 +162,46 @@ pub fn build(parts: &PromptParts) -> String {
 
     if parts.resumed {
         out.push_str(&format!("\n{FOLLOW_UP_GUIDANCE}\n"));
+        // The block contract renders before this guidance, so on a resumed turn the last thing the
+        // reviewer reads would otherwise be the follow-up instruction. One line restores it to the
+        // end. An unmeasured mitigation, not a fix -- whether it reduces missing blocks is what the
+        // metrics record answers; see docs/unstructured-turn-recovery.md.
+        if parts.nonce.is_some() {
+            out.push_str(&format!("\n{BLOCK_REMINDER}\n"));
+        }
     }
 
     out
+}
+
+/// The closing one-liner that re-points a resumed reviewer at the block contract above.
+pub const BLOCK_REMINDER: &str =
+    "End your response with the machine-readable findings block described above.";
+
+/// The follow-up prompt sent when a turn's machine block was absent or unusable: ask for the block
+/// alone, in the same conversation, naming exactly what was wrong.
+///
+/// This is deliberately **not** a re-review. The reviewer has already done the work and written the
+/// prose; asking it to reconsider would produce a second, differently-argued review whose findings
+/// the prose does not match. So the prompt says plainly not to re-read or revise anything.
+///
+/// The markers, schema and (on a resumed turn) the digest come from [`machine_block_section`], the
+/// same renderer the turn prompt uses. Two separately-worded statements of one contract are two
+/// things that drift, and a repair prompt describing a slightly different schema would produce
+/// blocks that fail for a new reason.
+pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -> String {
+    let mut s = String::new();
+    s.push_str("## Your machine-readable findings block was not usable\n\n");
+    s.push_str(corrective.trim());
+    s.push_str(
+        "\n\nRe-emit the block, and only the block. This is NOT a re-review: do not read the code \
+         again, do not revise, add, or withdraw findings, and do not change your verdict. Your \
+         prose review has been kept exactly as you wrote it -- what is missing is only its \
+         machine-readable record, so re-state what you already said, in the required form.\n\n",
+    );
+    s.push_str(&machine_block_section(nonce, prior_digest));
+    s.push('\n');
+    s
 }
 
 /// The machine-readable findings-block contract, carrying this turn's `nonce`. On a resumed turn the
@@ -598,5 +635,66 @@ mod tests {
             neutral_root: None,
         });
         assert!(!text.contains("flagged"));
+    }
+}
+
+#[cfg(test)]
+mod repair_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn the_repair_prompt_says_what_was_wrong_and_forbids_a_re_review() {
+        let text = block_repair(
+            "Your response contained no machine-readable findings block.",
+            "rv-9-1",
+            None,
+        );
+        assert!(text.contains("no machine-readable findings block"));
+        // Not a re-review: the reviewer has already done the work and written the prose, and a
+        // second opinion here would produce findings the prose does not match.
+        assert!(text.contains("NOT a re-review"));
+        assert!(text.contains("do not revise, add, or withdraw findings"));
+        assert!(text.contains("do not change your verdict"));
+        // The exact markers the extractor looks for, from the same renderer the turn prompt uses,
+        // so the two statements of the contract cannot drift apart.
+        assert!(text.contains("<<<CROSS_REVIEW_FINDINGS_IN:rv-9-1>>>"));
+        assert!(text.contains("<<<CROSS_REVIEW_FINDINGS_IN_END:rv-9-1>>>"));
+        assert!(text.contains("sole authoritative machine record"));
+    }
+
+    #[test]
+    fn a_resumed_repair_restates_the_digest_and_total_accounting() {
+        let digest = "- f1 [major] Race (src/a.rs:1) - currently open";
+        let text = block_repair(
+            "Your block did not account for id `f1`.",
+            "rv-9-2",
+            Some(digest),
+        );
+        assert!(text.contains(digest));
+        assert!(text.contains("report a status for **every** id above, **exactly once**"));
+    }
+
+    #[test]
+    fn a_resumed_turn_ends_on_the_block_reminder_when_a_nonce_is_rendered() {
+        // The contract renders before the follow-up guidance, so without this the last thing a
+        // resumed reviewer reads is the follow-up instruction rather than the block it must emit.
+        let parts = |nonce| PromptParts {
+            instructions: "x",
+            context_paths: &[],
+            cwd: Path::new("C:\\repo"),
+            turn: 2,
+            resumed: true,
+            preamble: None,
+            capabilities: None,
+            change: None,
+            resumed_capture_note: None,
+            nonce,
+            prior_findings_digest: None,
+            neutral_root: None,
+        };
+        let text = build(&parts(Some("rv-9-3")));
+        assert!(text.trim_end().ends_with(BLOCK_REMINDER), "{text}");
+        // No block contract, no reminder to point at it.
+        assert!(!build(&parts(None)).contains(BLOCK_REMINDER));
     }
 }

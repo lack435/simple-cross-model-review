@@ -1060,6 +1060,19 @@ pub trait Reviewer: Send + Sync {
         cancel: &AtomicBool,
     ) -> Result<String, Failure>;
 
+    /// Build the command for one child.
+    ///
+    /// `pinned_home` is the account identity resolved **once per attempt** by the caller, and the
+    /// adapters apply it rather than resolving their own. That is load-bearing rather than tidy: an
+    /// adapter that re-read the account would re-pin a profile that had moved since the attempt
+    /// began, so a home re-logged from account A to account B mid-attempt would be launched under B
+    /// while the guard believed it was still A. With the pin threaded, "the account is fixed for the
+    /// attempt" is a property of the signature, not a convention each adapter must remember. `None`
+    /// is ambient, which has no profile home and is never pinned or guarded.
+    // Eight arguments, and each one is a distinct axis of the child being built (config, chain
+    // entry, binary, resume target, temp id, evidence capability, pinned account). Bundling them
+    // into a struct would only move the same list one level out.
+    #[allow(clippy::too_many_arguments)]
     fn invocation(
         &self,
         cfg: &Config,
@@ -1068,6 +1081,7 @@ pub trait Reviewer: Send + Sync {
         resume: Option<&str>,
         tmp_id: &str,
         evidence: Option<&EvidenceInvocation<'_>>,
+        pinned_home: Option<&crate::config::AuthorizedHome>,
     ) -> std::io::Result<Invocation>;
 
     /// `last_message_file` is whatever `invocation` asked the CLI to write its final

@@ -254,7 +254,7 @@ impl SessionRecord {
                 // sound — unique ids and a `next_seq` strictly greater than every existing id — or
                 // reconciliation could mint a colliding id. Fail-closed: anything else is `Invalid`.
                 Ok(l)
-                    if l.schema_version == crate::findings::SCHEMA_VERSION
+                    if l.schema_version == crate::findings::LEDGER_SCHEMA_VERSION
                         && l.is_structurally_valid() =>
                 {
                     LedgerLoad::Valid(l)

@@ -56,6 +56,8 @@ fn argv(reviewer: &dyn Reviewer, cfg: &Config, resume: Option<&str>) -> Vec<Stri
             resume,
             "tmp-1",
             Some(&evidence),
+            // Ambient: no pinned account home for this invocation.
+            None,
         )
         .expect("invocation");
     inv.command
@@ -74,6 +76,8 @@ fn program(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
             None,
             "tmp-1",
             Some(&evidence),
+            // Ambient: no pinned account home for this invocation.
+            None,
         )
         .expect("invocation");
     PathBuf::from(inv.command.get_program())
@@ -89,6 +93,8 @@ fn cwd_of(reviewer: &dyn Reviewer, cfg: &Config) -> PathBuf {
             None,
             "tmp-1",
             Some(&evidence),
+            // Ambient: no pinned account home for this invocation.
+            None,
         )
         .expect("invocation");
     inv.command
@@ -548,6 +554,8 @@ fn codex_writes_its_final_message_to_a_file_it_reports() {
             None,
             "tmp-1",
             Some(&evidence),
+            // Ambient: no pinned account home for this invocation.
+            None,
         )
         .expect("invocation");
     let path = inv
@@ -562,4 +570,79 @@ fn codex_writes_its_final_message_to_a_file_it_reports() {
     // The file is authoritative for the review text, so the argv and the reported path
     // must agree or the review would be read from the wrong place.
     assert_eq!(value_after(&args, "-o").map(PathBuf::from), Some(path));
+}
+
+/// The environment a built invocation would hand the child, as (key, value) pairs.
+fn env_of(
+    reviewer: &dyn Reviewer,
+    cfg: &Config,
+    pinned: Option<&crate::config::AuthorizedHome>,
+) -> Vec<(String, String)> {
+    let evidence = test_evidence(cfg);
+    let inv = reviewer
+        .invocation(
+            cfg,
+            cfg.primary(),
+            Path::new("C:\\fake\\reviewer.exe"),
+            None,
+            "tmp-pin",
+            Some(&evidence),
+            pinned,
+        )
+        .expect("invocation");
+    inv.command
+        .get_envs()
+        .filter_map(|(k, v)| {
+            Some((
+                k.to_string_lossy().into_owned(),
+                v?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn an_invocation_applies_the_pinned_home_rather_than_resolving_its_own() {
+    // The account is resolved once per attempt and threaded in. An adapter that re-read it would
+    // re-pin a profile that had moved since the attempt began, so a home re-logged from account A
+    // to account B mid-attempt would be launched under B while the guard still believed it was A --
+    // and with a repair there are now two spawns per turn for that to happen between. Threading the
+    // pin makes "the account is fixed for the attempt" a property of the signature.
+    let dir = crate::testutil::temp_dir("argv-pin");
+    let home = dir.as_path().join("pinned-home");
+    std::fs::create_dir_all(&home).expect("home");
+    let pinned = crate::config::AuthorizedHome {
+        home: home.clone(),
+        account: "acct-a".to_string(),
+    };
+
+    for (reviewer, var) in [
+        (&CodexReviewer as &dyn Reviewer, "CODEX_HOME"),
+        (&ClaudeReviewer as &dyn Reviewer, "CLAUDE_CONFIG_DIR"),
+    ] {
+        let cfg = Config::from_args(&[
+            "--reviewer".to_string(),
+            if var == "CODEX_HOME" {
+                "codex"
+            } else {
+                "claude"
+            }
+            .to_string(),
+        ])
+        .expect("config");
+        let env = env_of(reviewer, &cfg, Some(&pinned));
+        let got = env
+            .iter()
+            .find(|(k, _)| k == var)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{var} should be set from the pin"));
+        assert_eq!(got, home.to_string_lossy(), "{var}");
+
+        // Ambient: no pin, and the adapter must not invent one.
+        let env = env_of(reviewer, &cfg, None);
+        assert!(
+            !env.iter().any(|(k, _)| k == var),
+            "{var} must be absent when nothing was pinned"
+        );
+    }
 }

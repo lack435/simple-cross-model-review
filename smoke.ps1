@@ -14,6 +14,7 @@
 .EXAMPLE
   .\smoke.ps1 -Reviewer codex
   .\smoke.ps1 -Reviewer claude -Effort low
+  .\smoke.ps1 -Reviewer codex -ProveBlockRepair
 #>
 [CmdletBinding()]
 param(
@@ -28,10 +29,36 @@ param(
     # Path to the reviewer CLI, when it is not on PATH.
     [string]$ReviewerBin,
 
-    [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe')
+    [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe'),
+
+    # Prove the block-repair path against a real reviewer (issue #63). Builds an instrumented
+    # binary -- with the non-default `repair-test-hook` feature, which discards each turn's machine
+    # block so the repair has to recover it -- into a scratch directory, and runs the round trip
+    # through that. Never touches dist\ or any binary built without the feature: the hook is
+    # compiled out of everything else, which is the point of it being a Cargo feature rather than
+    # an environment variable a shipped binary could inherit.
+    [switch]$ProveBlockRepair
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ProveBlockRepair) {
+    $hookTarget = Join-Path ([System.IO.Path]::GetTempPath()) "cross-review-repair-hook-$PID"
+    Write-Host "==> building an instrumented binary (repair-test-hook) into $hookTarget" -ForegroundColor Cyan
+    Write-Host "    It deliberately discards each turn's machine block, so the block repair has to" -ForegroundColor Yellow
+    Write-Host "    recover it. Built outside dist\ and never for a real review." -ForegroundColor Yellow
+    # cargo writes its progress to stderr, and Windows PowerShell turns a native command's stderr
+    # into ErrorRecords -- which under the script-wide 'Stop' preference kills the build on the
+    # first "Compiling ..." line. Drop to 'Continue' for the call and judge it by its exit code,
+    # which is the only reliable signal from a native executable here.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo build --release --features repair-test-hook --target-dir $hookTarget
+    $buildExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($buildExit -ne 0) { throw "instrumented build failed (cargo exit $buildExit)" }
+    $Exe = Join-Path $hookTarget 'release\cross-review.exe'
+}
 
 if (-not (Test-Path $Exe)) {
     throw "cross-review.exe not found at $Exe. Run .\build.ps1 first."
@@ -190,7 +217,19 @@ try {
     Write-Host "`n=== 2. tools/list ===" -ForegroundColor Cyan
     $list = Send-Rpc -Method 'tools/list' -TimeoutSeconds 30
     $names = @($list.result.tools | ForEach-Object { $_.name })
-    Assert-That 'four tools are exposed' ($names.Count -eq 4) "got: $($names -join ', ')"
+    # The exact set, not a count. This asserted "four tools are exposed" and went stale the moment a
+    # fifth was added (cross_model_setup_profile), failing with a number rather than a name. Comparing
+    # the sorted set says which tool appeared or vanished, and still catches an accidental extra one.
+    $expectedTools = @(
+        'cross_model_review',
+        'cross_model_review_cancel',
+        'cross_model_review_result',
+        'cross_model_review_status',
+        'cross_model_setup_profile'
+    )
+    $sorted = ($names | Sort-Object) -join ', '
+    Assert-That 'exactly the expected tools are exposed' ($sorted -eq (($expectedTools | Sort-Object) -join ', ')) `
+        "expected: $(($expectedTools | Sort-Object) -join ', ')`n        got:      $sorted"
     Assert-That 'cross_model_review is present' ($names -contains 'cross_model_review')
     Assert-That 'cross_model_review_result is present' ($names -contains 'cross_model_review_result')
 
