@@ -47,8 +47,16 @@ if ($ProveBlockRepair) {
     Write-Host "==> building an instrumented binary (repair-test-hook) into $hookTarget" -ForegroundColor Cyan
     Write-Host "    It deliberately discards each turn's machine block, so the block repair has to" -ForegroundColor Yellow
     Write-Host "    recover it. Built outside dist\ and never for a real review." -ForegroundColor Yellow
+    # cargo writes its progress to stderr, and Windows PowerShell turns a native command's stderr
+    # into ErrorRecords -- which under the script-wide 'Stop' preference kills the build on the
+    # first "Compiling ..." line. Drop to 'Continue' for the call and judge it by its exit code,
+    # which is the only reliable signal from a native executable here.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & cargo build --release --features repair-test-hook --target-dir $hookTarget
-    if ($LASTEXITCODE -ne 0) { throw "instrumented build failed" }
+    $buildExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($buildExit -ne 0) { throw "instrumented build failed (cargo exit $buildExit)" }
     $Exe = Join-Path $hookTarget 'release\cross-review.exe'
 }
 
@@ -209,7 +217,19 @@ try {
     Write-Host "`n=== 2. tools/list ===" -ForegroundColor Cyan
     $list = Send-Rpc -Method 'tools/list' -TimeoutSeconds 30
     $names = @($list.result.tools | ForEach-Object { $_.name })
-    Assert-That 'four tools are exposed' ($names.Count -eq 4) "got: $($names -join ', ')"
+    # The exact set, not a count. This asserted "four tools are exposed" and went stale the moment a
+    # fifth was added (cross_model_setup_profile), failing with a number rather than a name. Comparing
+    # the sorted set says which tool appeared or vanished, and still catches an accidental extra one.
+    $expectedTools = @(
+        'cross_model_review',
+        'cross_model_review_cancel',
+        'cross_model_review_result',
+        'cross_model_review_status',
+        'cross_model_setup_profile'
+    )
+    $sorted = ($names | Sort-Object) -join ', '
+    Assert-That 'exactly the expected tools are exposed' ($sorted -eq (($expectedTools | Sort-Object) -join ', ')) `
+        "expected: $(($expectedTools | Sort-Object) -join ', ')`n        got:      $sorted"
     Assert-That 'cross_model_review is present' ($names -contains 'cross_model_review')
     Assert-That 'cross_model_review_result is present' ($names -contains 'cross_model_review_result')
 
