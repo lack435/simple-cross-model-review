@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerSpec, UsageMinimum};
+use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -65,6 +65,10 @@ fn ensure_entry_ready(
     index: usize,
     cancel: &AtomicBool,
 ) -> Result<Preflight, Failure> {
+    // Refuse a non-ambient profile this working root has not authorized, before any resolve, auth
+    // check, or cache reuse. Ambient returns Ok(None) and proceeds exactly as before this feature.
+    // (Phase 1 authorization is deny-all, so every named profile / explicit home is refused here.)
+    cfg.resolve_authorized_home(&cfg.reviewers[index])?;
     if let Some(cached) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -75,13 +79,68 @@ fn ensure_entry_ready(
     }
     let spec = &cfg.reviewers[index];
     let bin = reviewer::resolve_bin(spec)?;
-    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, cancel)?;
+    let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, cfg, spec, cancel)?;
     let ready = Preflight { bin, auth };
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(index, ready.clone());
     Ok(ready)
+}
+
+/// Build the account identity for `spec` as it resolves right now: the selector, the canonical
+/// effective home (`None` for ambient, or an unauthorized/unresolvable profile), and the
+/// profile-aware account fingerprint. Recorded on each turn and re-derived on resume, so a resume
+/// whose account or profile changed is refused. Reads only cheap local sources (a local account
+/// file); it does not spawn or auth-check.
+fn current_profile_identity(cfg: &Config, spec: &ReviewerSpec) -> session::ProfileIdentity {
+    use crate::profile::ProfileSelector;
+    let selector = match &spec.profile {
+        ProfileSelector::Ambient => session::ProfileSelectorId::Ambient,
+        ProfileSelector::Named(name) => session::ProfileSelectorId::Named(name.clone()),
+        ProfileSelector::ExplicitHome(path) => {
+            session::ProfileSelectorId::ExplicitHome(path.to_string_lossy().into_owned())
+        }
+    };
+    let effective_home = cfg
+        .resolve_authorized_home(spec)
+        .ok()
+        .flatten()
+        .map(|home| home.to_string_lossy().into_owned());
+    let account_fingerprint = reviewer::for_kind(spec.reviewer).account_fingerprint(cfg, spec);
+    session::ProfileIdentity {
+        selector,
+        effective_home,
+        account_fingerprint,
+    }
+}
+
+/// The post-review switch guard `[f4]`: refuse a review whose profile home was re-logged to a
+/// different account between spawn and now.
+///
+/// `start` is the account the profile was authorized for, captured at spawn (`None` for ambient, which
+/// is never guarded). It reads the account currently in the home directly (the same cheap local read
+/// the authorization uses) and refuses if it no longer matches — including when it cannot be read at
+/// all (mid re-login), which fails closed. Called after the reviewer produced output but *before* the
+/// turn is recorded or the review delivered, so a swapped-account review never reaches the caller. The
+/// comparison is against the pinned start account, not a fresh self-read, so an A→B swap is
+/// distinguishable from B→B. See `docs/reviewer-account-profiles-impl.md`.
+fn switch_guard(
+    reviewer: ReviewerKind,
+    start: Option<&crate::config::AuthorizedHome>,
+) -> Result<(), Failure> {
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let final_account = reviewer::for_kind(reviewer).fingerprint_at(&start.home);
+    if final_account.as_deref() != Some(start.account.as_str()) {
+        return Err(errors::profile_identity_mismatch(
+            reviewer.as_str(),
+            "the profile home's account changed while the review was running; the review is refused \
+             rather than delivered under a different account",
+        ));
+    }
+    Ok(())
 }
 
 /// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
@@ -205,6 +264,16 @@ impl App {
 
     pub fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Run the profile-setup tool (authorize an existing profile for this repository). Blocks while a
+    /// loopback approval page waits for the human; a cancelled tool call cancels the wait.
+    pub fn setup_profile(
+        &self,
+        args: &Value,
+        request: &crate::cancel::RequestCancel,
+    ) -> Result<String, Failure> {
+        crate::setup::run_setup(&self.cfg, args, request)
     }
 
     /// Release anything parked in a long poll: stdin has closed and the process is on its
@@ -545,8 +614,29 @@ impl App {
                         ));
                     }
                 }
+                // Refuse a resume whose reviewer account or profile changed since the session was
+                // created, or whose account cannot be re-verified now. A legacy record (created
+                // before identity was tracked) has no captured account and is non-resumable. This is
+                // the uniform fail-closed contract -- a conversation must never continue under a
+                // different account than the one it started on.
+                let current_identity = current_profile_identity(&self.cfg, spec);
+                let identity_ok = record
+                    .profile_identity
+                    .as_ref()
+                    .is_some_and(|stored| stored.resume_matches(&current_identity));
+                if !identity_ok {
+                    return Err(resume_refusal(
+                        &session,
+                        "the reviewer account or profile it was created under changed, or its \
+                         account identity could not be re-verified; a conversation cannot be resumed \
+                         under a different account. Start a fresh review."
+                            .to_string(),
+                        Some(record),
+                    ));
+                }
                 // Identity confirmed: now auth-check and cache the validated binary.
-                let auth = reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, cancel)?;
+                let auth =
+                    reviewer::for_kind(spec.reviewer).auth_check(&bin, &self.cfg, spec, cancel)?;
                 let ready = Preflight { bin, auth };
                 self.preflight
                     .lock()
@@ -2094,6 +2184,64 @@ impl Job {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
 
+        // Switch guard [f4], part 1 of 2: capture the account this profile is authorized for, at spawn
+        // time. This re-checks the allowlist tuple now, just before the child starts (so a profile
+        // de-authorized or re-logged since the cached preflight is refused here, before any marker is
+        // written or child spawned), and pins the account the post-review check below compares the
+        // final fingerprint against — not a fresh self-read, which could not tell A→B from B→B. Ambient
+        // has no profile account (`Ok(None)`) and is never guarded, so its behaviour is unchanged.
+        let authorized_start = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
+
+        // [f5]: hold the SHARED side of the per-home setup lock across the whole attempt — the probe,
+        // the child's lifetime, and the switch guard — so a setup swap (which takes the exclusive side
+        // of the same lock) cannot rename the home out from under this review. Concurrent reviews
+        // coexist (all shared); a setup in progress refuses the review until it completes. Ambient has
+        // no profile home and is never locked.
+        let _home_lock = if let Some(start) = &authorized_start {
+            match crate::setup::acquire_review_home_lock(&start.home) {
+                Ok(lock) => lock,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(Failure::new(
+                        "PROFILE_SETUP_IN_PROGRESS",
+                        "A setup for this profile is in progress, so the review cannot run under it \
+                         yet. Try again once setup finishes.",
+                        "A setup for this profile is in progress, so the review cannot run under it \
+                         yet. Try again once setup finishes.",
+                    ));
+                }
+                // Fail closed on any other lock-setup failure rather than racing a setup swap (f7).
+                Err(e) => {
+                    return Err(Failure::new(
+                        "PROFILE_HOME_LOCK_FAILED",
+                        format!("Could not take the per-profile review lock: {e}"),
+                        "Could not take the per-profile review lock; refusing to run the review \
+                         unsynchronised with setup. Check the profile store directory's permissions.",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Per-spawn identity + method probe [f2/f3]: run the full probe (account **and** auth method)
+        // before every non-ambient spawn, never cached — the liveness gate in `auth_check` is process-
+        // cached, so a same-account method downgrade (e.g. ChatGPT → API key) since the preflight would
+        // otherwise slip through. Assert against the account the allowlist authorized, so a re-login is
+        // caught here too, before the review child starts. Ambient (no home) is not probed.
+        if let Some(authorized_start) = &authorized_start {
+            let resolved = self.reviewer.resolve_home_identity(
+                &self.bin,
+                &self.cfg,
+                &authorized_start.home,
+                &self.cancel,
+            )?;
+            crate::reviewer::assert_profile_identity(
+                self.spec.reviewer.as_str(),
+                &resolved,
+                &authorized_start.account,
+            )?;
+        }
+
         // --no-preamble means "send my instructions with nothing added", so it has to
         // suppress the capability section too, not just the preamble. It does not
         // suppress the change: that is evidence the reviewer cannot fetch, not framing
@@ -2383,6 +2531,18 @@ impl Job {
 
         let mut parsed = result?;
 
+        // Switch guard [f4], part 2 of 2: a profile home re-logged to a different account *while the
+        // review was running* taints this review — it may have been billed to, or answered under, an
+        // account this repository never authorized. Re-read the account now and refuse to record or
+        // deliver if it no longer matches the account pinned at spawn (an unreadable account, mid
+        // re-login, fails closed too). This is the actual backstop for the external-`codex login` race
+        // that the pre-spawn checks cannot close (an external writer does not take our locks). Refusing
+        // here — after the reviewer conversation advanced — leaves the findings write-ahead marker set
+        // (it is cleared only in the durable record arm below), so the next call is refused and
+        // rebaselines fresh rather than resuming a conversation whose account moved. Ambient is not
+        // guarded (`authorized_start` is `None`).
+        switch_guard(self.spec.reviewer, authorized_start.as_ref())?;
+
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
         // build the completed envelope (pure — see `findings::evaluate_turn`). The nonce is this
         // review's id, matching what the prompt told the reviewer to emit. Then strip the reviewer's
@@ -2564,6 +2724,9 @@ impl Job {
                                 &self.cfg,
                                 self.spec.reviewer,
                             ),
+                            // The account identity this turn ran under, so a resume that would cross
+                            // an account or profile is refused.
+                            profile_identity: Some(current_profile_identity(&self.cfg, &self.spec)),
                         },
                     ) {
                         Ok(_) => {
@@ -3062,6 +3225,38 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn switch_guard_refuses_a_changed_or_unreadable_account() {
+        // The post-review switch guard reads the account currently in the home and compares it to the
+        // account pinned at spawn. Exercise the real read (a Codex auth.json) so this covers the live
+        // path, not just a comparison.
+        let dir = crate::testutil::temp_dir("cross-review-switch-guard-tests");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-1"}}"#,
+        )
+        .expect("write auth.json");
+
+        let bound = |account: &str| crate::config::AuthorizedHome {
+            home: home.clone(),
+            account: account.to_string(),
+        };
+        // Unchanged account: the review is delivered.
+        assert!(switch_guard(ReviewerKind::Codex, Some(&bound("acct-1"))).is_ok());
+        // The account changed under the profile (re-login): refuse.
+        assert!(switch_guard(ReviewerKind::Codex, Some(&bound("acct-2"))).is_err());
+        // Ambient (no pinned account) is never guarded.
+        assert!(switch_guard(ReviewerKind::Codex, None).is_ok());
+        // An unreadable account fails closed (the home is gone / mid re-login).
+        let gone = crate::config::AuthorizedHome {
+            home: dir.join("nonexistent"),
+            account: "acct-1".to_string(),
+        };
+        assert!(switch_guard(ReviewerKind::Codex, Some(&gone)).is_err());
+    }
+
+    #[test]
     fn exhaustion_failure_words_itself_by_cause() {
         // Pure rate-limited keeps today's exact single-reviewer detail (byte-for-byte contract).
         let rate_only = exhaustion_failure(&["a".into(), "b".into()], &[]);
@@ -3270,6 +3465,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         }
     }
 

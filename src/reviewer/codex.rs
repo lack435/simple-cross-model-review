@@ -15,13 +15,29 @@ use crate::metrics::Usage;
 pub struct CodexReviewer;
 
 impl Reviewer for CodexReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
+    fn auth_check(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        spec: &ReviewerSpec,
+        cancel: &AtomicBool,
+    ) -> Result<String, Failure> {
         let mut cmd = Command::new(bin);
         // Run outside the project, like `invocation`, so this preflight is not the one
         // invocation that loads the reviewed repository's configuration. `login status`
         // takes no `--ignore-user-config`, and must not have one anyway: auth is exactly
         // what it is checking.
         cmd.current_dir(super::neutral_dir(cfg));
+        // Profile: refuse an unauthorized non-ambient profile (the `?`); for an authorized one, run
+        // the liveness check in a controlled environment against that home. This is only a *liveness*
+        // gate (signed-in), which is cacheable; the identity + auth-method assertion is NOT done here —
+        // it must re-run on every spawn (a cached subscription check could miss a later method
+        // downgrade), so it lives in the per-spawn preflight in the worker. Ambient leaves the
+        // environment untouched.
+        let home = cfg.resolve_authorized_home(spec)?;
+        if let Some(home) = &home {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
+        }
         cmd.arg("login").arg("status");
         let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
             errors::spawn_failed("codex", &bin.display().to_string(), e.to_string())
@@ -67,6 +83,23 @@ impl Reviewer for CodexReviewer {
 
         let mut cmd = Command::new(bin);
         cmd.current_dir(evidence.sterile_dir.unwrap_or(&cfg.cwd));
+        // Profile: for an authorized non-ambient profile, run in a controlled environment against
+        // that home so the review bills the profile account and no inherited provider-auth variable
+        // can override it. Ambient leaves the environment untouched. An unauthorized profile cannot
+        // reach here (the review path is refused upstream); map its `Failure` defensively.
+        //
+        // NOTE (validate in Phase 3, when profiles are actually authorized): `exec` spawns the
+        // evidence MCP server (our own binary, by absolute path) which the config pins to
+        // `env={}`; the controlled environment here must still leave that server able to start and
+        // read the tree. The allowlist carries the OS essentials (`SystemRoot`, `PATH`, `TEMP`, …),
+        // so it should, but this end-to-end interaction is only exercisable once a profile is
+        // authorized -- confirm it with `smoke.ps1` then.
+        if let Some(home) = cfg
+            .resolve_authorized_home(spec)
+            .map_err(|e| std::io::Error::other(e.summary))?
+        {
+            super::apply_controlled_env(&mut cmd, "CODEX_HOME", &home);
+        }
         cmd.arg("exec");
 
         match resume {
@@ -327,20 +360,78 @@ impl Reviewer for CodexReviewer {
     /// stdout: locate the rollout by the `thread_id` stdout announced, read a bounded tail, and
     /// take the last `token_count.rate_limits`. Fail-open to `Unknown` on any miss. This is a
     /// pure post-turn read that changes no invocation. See `docs/usage-remaining-gate.md`.
-    fn observe_headroom(&self, _cfg: &Config, _spec: &ReviewerSpec, out: &RunOutcome) -> Headroom {
+    fn observe_headroom(&self, cfg: &Config, spec: &ReviewerSpec, out: &RunOutcome) -> Headroom {
         let Some(thread_id) = parse_events(&out.stdout).thread_id else {
             return Headroom::Unknown;
         };
-        match find_rollout(&codex_home(), &thread_id) {
+        // Read the rollout from the same home the review ran under (profile-aware), not the ambient
+        // one -- otherwise the headroom would describe a different account than the usage key.
+        let Some(home) = codex_home(cfg, spec) else {
+            return Headroom::Unknown;
+        };
+        match find_rollout(&home, &thread_id) {
             Some(path) => headroom_from_rollout(&path),
             None => Headroom::Unknown,
         }
     }
 
     /// The logged-in ChatGPT account id, read from `$CODEX_HOME/auth.json` — a local file, the
-    /// account *identifier* (never the OAuth tokens beside it), and no CLI call.
-    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
-        codex_account_id(&codex_home())
+    /// account *identifier* (never the OAuth tokens beside it), and no CLI call. Profile-aware.
+    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+        codex_account_id(&codex_home(cfg, spec)?)
+    }
+
+    /// Read `tokens.account_id` straight from `home/auth.json`, without the authorization seam.
+    fn fingerprint_at(&self, home: &Path) -> Option<String> {
+        codex_account_id(home)
+    }
+
+    /// The per-spawn identity+method probe: read the home's `auth.json` (no CLI call). Fails closed on
+    /// a missing/unreadable/unrecognised file. Runs on every profile spawn, never cached.
+    fn resolve_home_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        home: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        codex_resolve_identity(home)
+    }
+
+    /// Bare `codex login` (subscription/browser OAuth), under the controlled environment with
+    /// `CODEX_HOME` pointed at the staging dir. Never `--with-api-key`/`--with-access-token`.
+    fn login_command(&self, bin: &Path, home: &Path) -> Result<Command, Failure> {
+        let mut cmd = Command::new(bin);
+        super::apply_controlled_env(&mut cmd, "CODEX_HOME", home);
+        cmd.arg("login");
+        Ok(cmd)
+    }
+
+    /// Codex writes its subscription tokens to `auth.json` — the single credential + account file.
+    fn credential_files(&self) -> &'static [&'static str] {
+        &["auth.json"]
+    }
+
+    /// Both the account and the method come from `auth.json`, so the setup confirmation is a single
+    /// **handle-relative** read of that file through the held home (no CLI call, no by-path window,
+    /// f-a5). Fails closed on a missing/unrecognised shape.
+    fn confirm_setup_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        home: &crate::profile::SecuredProfileDir,
+        _scratch_cwd: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let bytes = home
+            .read_credential(std::ffi::OsStr::new("auth.json"))
+            .map_err(|e| {
+                errors::profile_identity_mismatch(
+                    "codex",
+                    &format!("could not read the provisioned auth file: {e}"),
+                )
+            })?;
+        codex_identity_from_bytes(&bytes)
     }
 }
 
@@ -360,15 +451,66 @@ fn toml_path(path: &Path) -> std::io::Result<String> {
     Ok(toml_string(value))
 }
 
-/// `$CODEX_HOME`, or `~/.codex` when unset — the same resolution the CLI uses for its session
-/// and auth state.
-fn codex_home() -> std::path::PathBuf {
+/// The *ambient* Codex home: `$CODEX_HOME`, or `~/.codex` when unset — the same resolution the CLI
+/// uses for its session and auth state when no profile redirects it.
+fn ambient_codex_home() -> Option<std::path::PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
-        return std::path::PathBuf::from(h);
+        let p = std::path::PathBuf::from(h);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
     }
-    super::home_dir()
-        .map(|h| h.join(".codex"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".codex"))
+    super::home_dir().map(|h| h.join(".codex"))
+}
+
+/// The Codex home to read an account from for `spec`: an authorized profile's home, else the ambient
+/// home. Threaded through [`super::home_for_reads`] so a read cannot cross an account-authorization
+/// boundary; `None` for a non-ambient profile that is unauthorized (accounting then fails open) or
+/// when no home can be resolved.
+fn codex_home(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::PathBuf> {
+    super::home_for_reads(cfg, spec, ambient_codex_home)
+}
+
+/// Resolve a Codex profile home's account + auth method from `$CODEX_HOME/auth.json` (pure,
+/// file-based — the airtight controlled env guarantees this is the file the reviewer uses).
+/// `auth_mode == "chatgpt"` is the subscription method; `tokens.account_id` is the account. A
+/// missing, unreadable, or unrecognised file **fails closed** (`Err`), never a silent pass. Verified
+/// against Codex CLI 0.144.5; the shape is version-pinned so a drift refuses. See
+/// `docs/reviewer-account-profiles-impl.md`.
+fn codex_resolve_identity(home: &Path) -> Result<super::ResolvedIdentity, Failure> {
+    let bytes = std::fs::read(home.join("auth.json")).map_err(|e| {
+        errors::profile_identity_mismatch(
+            "codex",
+            &format!("could not read the profile auth file: {e}"),
+        )
+    })?;
+    codex_identity_from_bytes(&bytes)
+}
+
+/// Parse a Codex `auth.json`'s account + method from its **bytes**, so the same check serves a by-path
+/// read (the review probe) and a handle-relative read (the setup confirmation, f-a5). `auth_mode ==
+/// "chatgpt"` is the subscription method; `tokens.account_id` is the account. Any missing/unrecognised
+/// shape **fails closed**.
+fn codex_identity_from_bytes(bytes: &[u8]) -> Result<super::ResolvedIdentity, Failure> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|_| {
+        errors::profile_identity_mismatch("codex", "the profile auth file is not valid JSON")
+    })?;
+    let account = v
+        .get("tokens")
+        .and_then(|t| t.get("account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            errors::profile_identity_mismatch(
+                "codex",
+                "the profile auth file has no tokens.account_id",
+            )
+        })?
+        .to_string();
+    let method = match v.get("auth_mode").and_then(Value::as_str) {
+        Some("chatgpt") => super::AuthMethod::Subscription,
+        _ => super::AuthMethod::Other,
+    };
+    Ok(super::ResolvedIdentity { account, method })
 }
 
 /// Read `tokens.account_id` from `$CODEX_HOME/auth.json`. Returns `None` on any miss so the gate
@@ -783,6 +925,89 @@ mod tests {
         assert_eq!(codex_account_id(&dir), Some("acct-123".to_string()));
         assert_eq!(codex_account_id(&dir.join("nope")), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_resolve_identity_reads_method_and_account() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-codex-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Subscription (chatgpt) with an account id.
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-9"}}"#,
+        )
+        .unwrap();
+        let id = codex_resolve_identity(&dir).unwrap();
+        assert_eq!(id.account, "acct-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+        // An API-key mode resolves to Other (refused upstream).
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","tokens":{"account_id":"acct-9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_resolve_identity(&dir).unwrap().method,
+            AuthMethod::Other
+        );
+        // A missing account id fails closed.
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_resolve_identity(&dir).unwrap_err().code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_home_identity_is_the_per_spawn_probe_and_asserts_against_the_authorized_account() {
+        use crate::reviewer::Reviewer;
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!("cr-codex-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let cfg = cfg();
+        let cancel = AtomicBool::new(false);
+        // The per-spawn probe (trait method) reads the home and, combined with the assertion, passes
+        // for the authorized account and refuses a different one — this is the worker's per-spawn path.
+        let resolved = CodexReviewer
+            .resolve_home_identity(Path::new("codex.exe"), &cfg, &dir, &cancel)
+            .expect("resolve");
+        assert!(crate::reviewer::assert_profile_identity("codex", &resolved, "acct-1").is_ok());
+        assert_eq!(
+            crate::reviewer::assert_profile_identity("codex", &resolved, "acct-2")
+                .unwrap_err()
+                .code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_home_reads_ambient_for_ambient_and_refuses_a_denied_profile() {
+        // Ambient entry: reads the ambient home ($CODEX_HOME or ~/.codex).
+        let ambient = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        assert!(codex_home(&ambient, ambient.primary()).is_some());
+
+        // A named profile is deny-all in Phase 1, so the account read fails open to None rather
+        // than falling back to the ambient home (which would read the wrong account).
+        let profiled = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--codex-profile".into(),
+            "work".into(),
+        ])
+        .expect("config");
+        assert!(codex_home(&profiled, profiled.primary()).is_none());
     }
 
     #[test]

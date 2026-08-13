@@ -30,6 +30,10 @@ const BCRYPT_SHA256_ALG_HANDLE: *mut c_void = 0x0000_0041 as *mut c_void;
 /// negative code on failure.
 const STATUS_SUCCESS: i32 = 0;
 
+/// `BCryptGenRandom` flag: use the system-preferred RNG without opening a provider, so the
+/// algorithm handle may be null. Defined by `bcrypt.h` as `BCRYPT_USE_SYSTEM_PREFERRED_RNG`.
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
 #[link(name = "bcrypt")]
 extern "system" {
     /// One-shot hash (Windows 10+). Passing the algorithm pseudo-handle avoids the
@@ -44,6 +48,34 @@ extern "system" {
         pbOutput: *mut u8,
         cbOutput: u32,
     ) -> i32;
+    /// Fill a buffer with cryptographically-random bytes from the OS CSPRNG (Windows CNG). With a
+    /// null algorithm handle and `BCRYPT_USE_SYSTEM_PREFERRED_RNG` it needs no provider handle.
+    fn BCryptGenRandom(
+        hAlgorithm: *mut c_void,
+        pbBuffer: *mut u8,
+        cbBuffer: u32,
+        dwFlags: u32,
+    ) -> i32;
+}
+
+/// A lowercase-hex token of `n` cryptographically-random bytes (`2n` chars), or `None` if the OS
+/// CSPRNG could not be read (fail-closed: an unguessable token must never be replaced by a
+/// predictable fallback). Used for the setup approval page's one-time capability token.
+#[allow(dead_code)] // production caller lands with the setup tool (Phase 3 task #15).
+pub fn random_hex_token(n: usize) -> Option<String> {
+    let len = u32::try_from(n).ok()?;
+    let mut buf = vec![0u8; n];
+    // SAFETY: `BCryptGenRandom` writes exactly `cbBuffer` bytes into `pbBuffer`; the buffer is `n`
+    // bytes and the length matches. A null algorithm handle is valid with the system-preferred flag.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    (status == STATUS_SUCCESS).then(|| to_hex(&buf))
 }
 
 /// SHA-256 of `bytes`, or `None` if the OS digest could not be produced.

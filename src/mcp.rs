@@ -572,12 +572,13 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
         "cross_model_review" => app.start_review(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
+        "cross_model_setup_profile" => app.setup_profile(&args, request),
         other => {
             return text_result(
                 format!(
                     "Unknown tool '{other}'. This server provides cross_model_review, \
-                     cross_model_review_result, cross_model_review_status, and \
-                     cross_model_review_cancel."
+                     cross_model_review_result, cross_model_review_status, \
+                     cross_model_review_cancel, and cross_model_setup_profile."
                 ),
                 true,
             )
@@ -947,6 +948,53 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "cross_model_setup_profile",
+            "description":
+                "Authorize THIS repository to run reviews under a reviewer account profile — a \
+                 dedicated config home that fixes which account a review bills, regardless of what \
+                 the desktop app is signed into. This is a one-time, human-approved step: it opens a \
+                 localhost page in your browser and blocks until you click Approve, so a person — not \
+                 an agent — decides. By default it only authorizes an ALREADY-provisioned, signed-in \
+                 profile (no login). Pass \"login\": true to provision one: it drives the vendor login \
+                 in your browser and BLOCKS for several minutes while you sign in (for some reviewers a \
+                 local page asks you to paste a code shown in the browser), then authorizes the \
+                 result — this both first-provisions a new home and re-signs-in (switches the account \
+                 of) an existing one. Nothing is authorized unless you approve, and authorization is \
+                 scoped to the directory this server was launched from.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reviewer": {
+                        "type": "string",
+                        "enum": ["codex", "claude"],
+                        "description": "Which reviewer family the profile is for."
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description":
+                            "A named profile (letters, digits, '.', '_', '-'), resolved under the \
+                             fixed profile root. Provide this OR 'home', not both."
+                    },
+                    "home": {
+                        "type": "string",
+                        "description":
+                            "An explicit absolute config-home path (the escape hatch), instead of a \
+                             named profile. Provide this OR 'profile', not both."
+                    },
+                    "login": {
+                        "type": "boolean",
+                        "description":
+                            "Run the vendor login to provision (first-time) or re-sign-in (switch \
+                             account) the profile home. The call BLOCKS for minutes while a human \
+                             completes OAuth in the browser. Default false (authorize an existing, \
+                             signed-in home only)."
+                    }
+                },
+                "required": ["reviewer"],
+                "additionalProperties": false
+            }
+        }),
     ];
 
     // The Perforce backend names its changelists per call, so those inputs exist only for a
@@ -1062,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_four_tools_with_valid_schemas() {
+    fn lists_exactly_the_five_tools_with_valid_schemas() {
         let response = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
         let tools = response["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1072,7 +1120,8 @@ mod tests {
                 "cross_model_review",
                 "cross_model_review_result",
                 "cross_model_review_status",
-                "cross_model_review_cancel"
+                "cross_model_review_cancel",
+                "cross_model_setup_profile"
             ]
         );
         for tool in tools {

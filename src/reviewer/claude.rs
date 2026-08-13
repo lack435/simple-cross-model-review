@@ -19,22 +19,21 @@ const DENIED_TOOLS: &str = "Edit,Write,NotebookEdit";
 pub struct ClaudeReviewer;
 
 impl Reviewer for ClaudeReviewer {
-    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure> {
-        let mut cmd = Command::new(bin);
-        // Isolated and run outside the project, like `invocation`. The stated policy is
-        // that the reviewer CLI never loads the reviewed repository's configuration, and
-        // this preflight -- which runs before every review and on every status call -- was
-        // the one invocation that broke it by construction, inheriting the project as its
-        // working directory with no isolation flags.
-        cmd.current_dir(super::neutral_dir(cfg));
-        if cfg.isolate_reviewer {
-            cmd.arg("--safe-mode");
-            cmd.arg("--strict-mcp-config");
-        }
-        cmd.arg("auth").arg("status");
-        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
-            errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
-        })?;
+    fn auth_check(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        spec: &ReviewerSpec,
+        cancel: &AtomicBool,
+    ) -> Result<String, Failure> {
+        // Profile: refuse an unauthorized non-ambient profile (the `?`), and for an authorized one run
+        // the check in a controlled environment against that home. This is only a *liveness* gate
+        // (signed-in), which is cacheable; the identity + auth-method assertion is NOT done here — it
+        // must re-run on every spawn (a cached subscription check could miss a later method downgrade),
+        // so it lives in the per-spawn preflight in the worker. Ambient leaves the environment
+        // untouched -- byte-for-byte today's behaviour.
+        let home = cfg.resolve_authorized_home(spec)?;
+        let out = run_auth_status(bin, cfg, home.as_deref(), cancel)?;
 
         // A cancelled probe reports CANCELLED, not a misclassified auth failure: `run` kills the
         // child on cancellation, leaving `success` false and the output partial, which the checks
@@ -95,6 +94,17 @@ impl Reviewer for ClaudeReviewer {
             None => (cfg.cwd.as_path(), &cfg.allowed_tools),
         };
         cmd.current_dir(cwd);
+        // Profile: for an authorized non-ambient profile, run in a controlled environment against
+        // that home (so the review bills the profile account, and no inherited provider-auth
+        // variable can override it). Ambient leaves the environment untouched. An unauthorized
+        // profile cannot reach here -- the review path is refused upstream by
+        // `resolve_authorized_home` -- but map its `Failure` defensively rather than panic.
+        if let Some(home) = cfg
+            .resolve_authorized_home(spec)
+            .map_err(|e| std::io::Error::other(e.summary))?
+        {
+            super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home);
+        }
         cmd.arg("-p");
         if cfg.chain_gates_on_usage() {
             // Armed: stream-json carries the `rate_limit_event` we read headroom from; its terminal
@@ -201,9 +211,171 @@ impl Reviewer for ClaudeReviewer {
     /// The logged-in account, read from the CLI's local account file `~/.claude.json`
     /// (`oauthAccount.accountUuid`, with the org uuid to disambiguate) — a local file, the
     /// account *identifier* only, never the credentials in `~/.claude/.credentials.json`.
-    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
-        claude_account_id(&claude_config_path()?)
+    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+        claude_account_id(&claude_config_path(cfg, spec)?)
     }
+
+    /// Read the account uuid straight from `home/.claude.json`, without the authorization seam.
+    fn fingerprint_at(&self, home: &Path) -> Option<String> {
+        claude_account_id(&home.join(".claude.json"))
+    }
+
+    /// The per-spawn identity+method probe: run `claude auth status` under the controlled environment
+    /// against `home` (for the method), and read the account from `home/.claude.json`. Runs on every
+    /// profile spawn, never cached. A cancelled probe reports CANCELLED; unrecognised output fails
+    /// closed.
+    fn resolve_home_identity(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        home: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let out = run_auth_status(bin, cfg, Some(home), cancel)?;
+        claude_identity_from_status(&out, &home.join(".claude.json"))
+    }
+
+    /// `claude auth login --claudeai` (subscription/browser OAuth), under the controlled environment
+    /// with `CLAUDE_CONFIG_DIR` pointed at the staging dir. Never `--console` (API billing).
+    fn login_command(&self, bin: &Path, home: &Path) -> Result<Command, Failure> {
+        let mut cmd = Command::new(bin);
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
+        cmd.arg("auth").arg("login").arg("--claudeai");
+        Ok(cmd)
+    }
+
+    /// Claude's `auth login` shows an authorization **code** the human pastes back into stdin (verified
+    /// by the no-token probe: the browser redirects to a hosted page, not a localhost callback), so it
+    /// needs the interactive code-paste flow.
+    fn login_mode(&self) -> super::LoginMode {
+        super::LoginMode::CodePaste
+    }
+
+    /// Claude writes the account file `.claude.json` (read handle-relative for the fingerprint) and the
+    /// OAuth secret `.credentials.json`. The account file is first (f-a5). Both are **required** by
+    /// setup (f6) as direct children of `CLAUDE_CONFIG_DIR`. NOTE: that `.credentials.json` lands as a
+    /// direct child (rather than under a `.claude/` subdir) is a **version-pinned assumption validated
+    /// by `smoke.ps1`** — if a supported Claude version places it elsewhere, provisioning fails closed
+    /// ("did not write .credentials.json") rather than authorizing an incomplete home, and this list is
+    /// the single place to correct it.
+    fn credential_files(&self) -> &'static [&'static str] {
+        &[".claude.json", ".credentials.json"]
+    }
+
+    /// Confirm identity for setup: the **method** from an isolated `claude auth status` run from the
+    /// owned scratch cwd (f-r2.6), the **account** from a **handle-relative** read of `.claude.json`
+    /// through the held home (f-a5).
+    fn confirm_setup_identity(
+        &self,
+        bin: &Path,
+        _cfg: &Config,
+        home: &crate::profile::SecuredProfileDir,
+        scratch_cwd: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<super::ResolvedIdentity, Failure> {
+        let mut cmd = Command::new(bin);
+        cmd.current_dir(scratch_cwd);
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home.path);
+        // Mandatory isolation for the setup probe (not conditional on cfg.isolate_reviewer).
+        cmd.arg("--safe-mode");
+        cmd.arg("--strict-mcp-config");
+        cmd.arg("auth").arg("status");
+        let out = super::run(cmd, "", Duration::from_secs(30), cancel).map_err(|e| {
+            errors::spawn_failed("claude", &bin.display().to_string(), e.to_string())
+        })?;
+        let status = claude_trustworthy_status(&out)?;
+        let bytes = home
+            .read_credential(std::ffi::OsStr::new(".claude.json"))
+            .map_err(|e| {
+                errors::profile_identity_mismatch(
+                    "claude",
+                    &format!("could not read the provisioned account file: {e}"),
+                )
+            })?;
+        let account = claude_account_from_bytes(&bytes).ok_or_else(|| {
+            errors::profile_identity_mismatch(
+                "claude",
+                "the provisioned config file has no oauth account uuid",
+            )
+        })?;
+        claude_resolve_identity_acct(&status, account)
+    }
+}
+
+/// Validate a `claude auth status` outcome and resolve the profile's identity, or fail closed.
+///
+/// Split from [`resolve_home_identity`](ClaudeReviewer::resolve_home_identity) so its trustworthiness
+/// guards are unit-testable without spawning the CLI. Identity is resolved **only** from output that
+/// is complete and successful: a cancelled, failed, timed-out, truncated, incomplete, or lossily
+/// decoded run — even one whose partial stdout happens to parse with plausible method/account fields —
+/// is refused (f2), as is a home that is not explicitly signed in (`loggedIn == true`, mirroring the
+/// liveness gate). Only then is the method/account read via [`claude_resolve_identity`].
+fn claude_identity_from_status(
+    out: &RunOutcome,
+    account_path: &Path,
+) -> Result<super::ResolvedIdentity, Failure> {
+    let status = claude_trustworthy_status(out)?;
+    claude_resolve_identity(&status, account_path)
+}
+
+/// The trustworthy-output guards on a `claude auth status` run, returning the parsed, signed-in status
+/// document. Shared by the review-path probe and the setup confirmation so both refuse a cancelled,
+/// failed, timed-out, truncated, or not-signed-in run identically (f2).
+fn claude_trustworthy_status(out: &RunOutcome) -> Result<Value, Failure> {
+    if out.cancelled {
+        return Err(errors::cancelled());
+    }
+    if !out.success
+        || out.timed_out
+        || out.stdout_truncated
+        || out.stdout_incomplete
+        || out.stdout_lossy
+    {
+        return Err(errors::profile_identity_mismatch(
+            "claude",
+            "the profile `auth status` did not complete with trustworthy output (it failed, timed \
+             out, was truncated, or decoded lossily); refusing to resolve identity from it",
+        ));
+    }
+    let status: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| {
+        errors::profile_identity_mismatch(
+            "claude",
+            "the profile `auth status` output was not valid JSON",
+        )
+    })?;
+    if status.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+        return Err(errors::profile_identity_mismatch(
+            "claude",
+            "the profile home is not signed in",
+        ));
+    }
+    Ok(status)
+}
+
+/// Run `claude auth status` for `home` (an authorized profile home, or `None` for ambient) under the
+/// same isolation and controlled environment a review uses, returning the raw outcome. Shared by the
+/// liveness gate in [`auth_check`](ClaudeReviewer::auth_check) and the per-spawn identity probe in
+/// [`resolve_home_identity`](ClaudeReviewer::resolve_home_identity) so both run the CLI identically.
+fn run_auth_status(
+    bin: &Path,
+    cfg: &Config,
+    home: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<RunOutcome, Failure> {
+    let mut cmd = Command::new(bin);
+    // Isolated and run outside the project, like `invocation`: the reviewer CLI must never load the
+    // reviewed repository's configuration, and this runs before every review and on every status call.
+    cmd.current_dir(super::neutral_dir(cfg));
+    if let Some(home) = home {
+        super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", home);
+    }
+    if cfg.isolate_reviewer {
+        cmd.arg("--safe-mode");
+        cmd.arg("--strict-mcp-config");
+    }
+    cmd.arg("auth").arg("status");
+    super::run(cmd, "", Duration::from_secs(30), cancel)
+        .map_err(|e| errors::spawn_failed("claude", &bin.display().to_string(), e.to_string()))
 }
 
 /// Turn a Claude result document — from the buffered `json` path or the terminal `result`
@@ -439,13 +611,26 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     ))
 }
 
-/// Path to Claude Code's account file: `$CLAUDE_CONFIG_DIR/.claude.json` when set, else
-/// `~/.claude.json` — the same resolution the CLI uses.
-fn claude_config_path() -> Option<std::path::PathBuf> {
+/// The *ambient* Claude config home: `$CLAUDE_CONFIG_DIR` when set, else `~` — the same resolution
+/// the CLI uses when no profile redirects it.
+fn ambient_claude_home() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+        let p = std::path::PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
     }
-    super::home_dir().map(|h| h.join(".claude.json"))
+    super::home_dir()
+}
+
+/// Path to Claude Code's account file `.claude.json` in the config home selected for `spec`.
+///
+/// Profile-aware: an authorized profile's home, else the ambient home. Threaded through
+/// [`super::home_for_reads`] so the fingerprint read cannot cross an account-authorization boundary —
+/// a non-ambient profile that is unauthorized yields `None` (fail open for accounting). `None` also
+/// when no home can be resolved at all.
+fn claude_config_path(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::PathBuf> {
+    super::home_for_reads(cfg, spec, ambient_claude_home).map(|h| h.join(".claude.json"))
 }
 
 /// Read a stable account identifier from `~/.claude.json`: the OAuth account uuid, combined with
@@ -453,7 +638,13 @@ fn claude_config_path() -> Option<std::path::PathBuf> {
 /// the gate fails open.
 fn claude_account_id(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    claude_account_from_bytes(&bytes)
+}
+
+/// Parse the `{org}/{account}` fingerprint from `.claude.json` **bytes**, so the same parse serves a
+/// by-path read (the review probe) and a handle-relative read (the setup confirmation, f-a5).
+fn claude_account_from_bytes(bytes: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
     let acct = v.get("oauthAccount")?;
     let uuid = acct.get("accountUuid").and_then(Value::as_str)?;
     let org = acct
@@ -461,6 +652,55 @@ fn claude_account_id(path: &Path) -> Option<String> {
         .and_then(Value::as_str)
         .unwrap_or("");
     Some(format!("{org}/{uuid}"))
+}
+
+/// Resolve a Claude profile home's account + auth method: the **method** from the `auth status` JSON
+/// already obtained (`authMethod == "claude.ai"` + `apiProvider == "firstParty"` is the subscription),
+/// the **account** (authoritative) from `.claude.json` via [`claude_account_id`]. As a CLI-side
+/// cross-check, the org the CLI reports (`orgId`) must match the org uuid in the file (the prefix of
+/// the fingerprint); a mismatch means the CLI resolved a different account than the file, so it
+/// **fails closed**. Verified against Claude Code `auth status` (keys `authMethod`, `subscriptionType`,
+/// `apiProvider`, `orgId`, `email`); version-pinned so an unrecognised shape refuses. See
+/// `docs/reviewer-account-profiles-impl.md`.
+fn claude_resolve_identity(
+    auth_status: &Value,
+    config_path: &Path,
+) -> Result<super::ResolvedIdentity, Failure> {
+    let account = claude_account_id(config_path).ok_or_else(|| {
+        errors::profile_identity_mismatch(
+            "claude",
+            "the profile config file has no oauth account uuid",
+        )
+    })?;
+    claude_resolve_identity_acct(auth_status, account)
+}
+
+/// The method-from-status + org-cross-check + build, given an already-resolved `account`. Factored so
+/// the setup confirmation can supply an account read **handle-relative** (f-a5) rather than by path,
+/// while the review path supplies one read from the config file.
+fn claude_resolve_identity_acct(
+    auth_status: &Value,
+    account: String,
+) -> Result<super::ResolvedIdentity, Failure> {
+    let method = match (
+        auth_status.get("authMethod").and_then(Value::as_str),
+        auth_status.get("apiProvider").and_then(Value::as_str),
+    ) {
+        (Some("claude.ai"), Some("firstParty")) => super::AuthMethod::Subscription,
+        _ => super::AuthMethod::Other,
+    };
+    // CLI-side org cross-check: the fingerprint is "{orgUuid}/{accountUuid}", so `orgId` from the
+    // CLI must be that prefix. Only enforced when both are present -- an absent orgId is not treated
+    // as a mismatch (the account equality remains the primary check upstream).
+    if let Some(cli_org) = auth_status.get("orgId").and_then(Value::as_str) {
+        if !account.starts_with(&format!("{cli_org}/")) {
+            return Err(errors::profile_identity_mismatch(
+                "claude",
+                "the organization the CLI reports does not match the profile config file",
+            ));
+        }
+    }
+    Ok(super::ResolvedIdentity { account, method })
 }
 
 /// The last `rate_limit_event.rate_limit_info` object in a `stream-json` stream, if any. Scans
@@ -614,7 +854,7 @@ mod tests {
 
     #[test]
     fn claude_account_id_combines_org_and_account_uuid() {
-        let dir = std::env::temp_dir().join(format!("cr-claude-id-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cr-claude-acctid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".claude.json");
         std::fs::write(
@@ -624,6 +864,107 @@ mod tests {
         .unwrap();
         assert_eq!(claude_account_id(&path), Some("org-1/acc-9".to_string()));
         assert_eq!(claude_account_id(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_resolve_identity_checks_method_and_org() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-claude-resolveid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(".claude.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"oauthAccount":{"accountUuid":"acc-9","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        let status = |json: &str| serde_json::from_str::<Value>(json).unwrap();
+        // Subscription (claude.ai / firstParty), org matches the file.
+        let id = claude_resolve_identity(
+            &status(r#"{"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-1"}"#),
+            &cfg_path,
+        )
+        .unwrap();
+        assert_eq!(id.account, "org-1/acc-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+        // An API-key method resolves to Other.
+        assert_eq!(
+            claude_resolve_identity(
+                &status(r#"{"authMethod":"apiKey","apiProvider":"firstParty","orgId":"org-1"}"#),
+                &cfg_path,
+            )
+            .unwrap()
+            .method,
+            AuthMethod::Other
+        );
+        // The CLI reporting a different org than the file fails closed.
+        assert_eq!(
+            claude_resolve_identity(
+                &status(r#"{"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-2"}"#),
+                &cfg_path,
+            )
+            .unwrap_err()
+            .code,
+            "PROFILE_IDENTITY_MISMATCH"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_identity_probe_refuses_untrustworthy_or_signed_out_status() {
+        use crate::reviewer::AuthMethod;
+        let dir = std::env::temp_dir().join(format!("cr-claude-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(".claude.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"oauthAccount":{"accountUuid":"acc-9","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        let good_stdout = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","orgId":"org-1"}"#;
+        // A RunOutcome builder defaulting to a clean, successful run; each test flips one field.
+        let outcome = |stdout: &str, mut f: Box<dyn FnMut(&mut RunOutcome)>| {
+            let mut out = RunOutcome {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                exit: Some(0),
+                success: true,
+                timed_out: false,
+                cancelled: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                stdout_lossy: false,
+                stdout_incomplete: false,
+                stdout_cap_hit: None,
+            };
+            f(&mut out);
+            out
+        };
+        let noop = || Box::new(|_: &mut RunOutcome| {}) as Box<dyn FnMut(&mut RunOutcome)>;
+
+        // A clean, successful, signed-in run resolves the subscription identity.
+        let id = claude_identity_from_status(&outcome(good_stdout, noop()), &cfg_path).unwrap();
+        assert_eq!(id.account, "org-1/acc-9");
+        assert_eq!(id.method, AuthMethod::Subscription);
+
+        // Each untrustworthy signal fails closed even with the same good stdout...
+        for flip in [
+            Box::new(|o: &mut RunOutcome| o.success = false) as Box<dyn FnMut(&mut RunOutcome)>,
+            Box::new(|o: &mut RunOutcome| o.timed_out = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_truncated = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_incomplete = true),
+            Box::new(|o: &mut RunOutcome| o.stdout_lossy = true),
+            Box::new(|o: &mut RunOutcome| o.cancelled = true),
+        ] {
+            assert!(
+                claude_identity_from_status(&outcome(good_stdout, flip), &cfg_path).is_err(),
+                "an untrustworthy run must fail closed"
+            );
+        }
+
+        // ...and a successful run that is not signed in is refused too.
+        let signed_out = r#"{"loggedIn":false,"authMethod":"claude.ai"}"#;
+        assert!(claude_identity_from_status(&outcome(signed_out, noop()), &cfg_path).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

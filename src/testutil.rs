@@ -43,6 +43,21 @@ pub fn temp_dir(root: &str) -> TempDir {
     TempDir { path }
 }
 
+/// Create a directory junction at `link` pointing at `target`, for tests that need a real reparse
+/// point. Junctions (unlike symlinks) need no special privilege, so this runs unprivileged on a dev
+/// box and on CI. Returns whether creation succeeded.
+pub fn make_junction(link: &Path, target: &Path) -> bool {
+    std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Owns one test's directory and removes it when the test ends.
 pub struct TempDir {
     path: PathBuf,

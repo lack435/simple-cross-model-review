@@ -9,7 +9,7 @@ pub mod codex;
 #[cfg(test)]
 mod argv_tests;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -275,6 +275,540 @@ pub fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// Environment variables carried through to a *controlled* reviewer child, by name.
+///
+/// A non-ambient child starts from a cleared environment ([`apply_controlled_env`]) and receives
+/// only these, each from the parent's current value, plus its config-home variable. Everything else —
+/// every provider-auth variable (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+/// `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, …) included — is simply absent, so an
+/// unknown inherited variable cannot override the profile's OAuth credentials. This list is the
+/// contract; the pre-spawn identity assertion (a later phase) is the backstop that catches anything it
+/// still misses. See `docs/reviewer-account-profiles-impl.md`.
+pub const CONTROLLED_ENV_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// Give `cmd` a controlled environment: clear the inherited environment, carry only
+/// [`CONTROLLED_ENV_ALLOWLIST`] (each from the parent's current value), then set `home_var` to
+/// `home`. Used for a non-ambient reviewer child. Ambient children are never passed here — they
+/// inherit the environment unchanged, exactly as before this feature existed.
+pub fn apply_controlled_env(cmd: &mut Command, home_var: &str, home: &Path) {
+    cmd.env_clear();
+    for key in CONTROLLED_ENV_ALLOWLIST {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.env(home_var, home.as_os_str());
+}
+
+/// Which interactive shape a reviewer's vendor login takes (#15 part 3b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the setup provisioning flow (#15 part 3b).
+pub enum LoginMode {
+    /// The login opens a browser that redirects to a localhost callback the CLI hosts; it completes on
+    /// its own with stdin closed and output discarded (Codex).
+    BrowserCallback,
+    /// The login shows a code the human must paste back into the CLI's stdin (Claude); needs the
+    /// interactive code-entry page + [`run_login_code_paste`].
+    CodePaste,
+}
+
+/// The outcome of a vendor login run — deliberately **carries no captured text** (redaction, f-r2.7):
+/// the child's stdout/stderr may echo OAuth tokens or the authorize URL, so they are discarded, never
+/// returned or logged. Only these control-flow signals are exposed, so a caller cannot accidentally
+/// surface a secret in a `Failure` or diagnostic.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub struct LoginOutcome {
+    pub success: bool,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub exit: Option<i32>,
+    /// The login job could not be proven quiesced (terminate failed or a member outlived the bounded
+    /// wait). A member may still be writing the staging dir, so the caller must **not** delete it now —
+    /// leave it for recovery, whose armed journal owns it (f8/f1-impl-round-3).
+    pub uncontained: bool,
+}
+
+/// How long to wait for in-job login helpers to exit after the login process itself does, before the
+/// caller verifies credentials / renames staging (f14). Generous: normal logins quiesce at once.
+const LOGIN_QUIESCE_BOUND: Duration = Duration::from_secs(10);
+
+/// Run a vendor login `command` to completion under strict containment and redaction (#15 part 3b).
+///
+/// - **Redaction:** stdin/stdout/stderr are all `null`, so nothing the child prints is captured; the
+///   result type has no text field.
+/// - **Isolation:** the child runs from `scratch_cwd`, an owned empty directory (never a repo-settable
+///   state dir), with the controlled environment already applied by the adapter's `login_command`.
+/// - **Containment (f10/f14/f-b1):** the child is created suspended and assigned to a
+///   `KILL_ON_JOB_CLOSE`, no-breakaway job *before* it runs (creation-time association), then resumed.
+///   On timeout or cancel the job is terminated and drained; on natural exit the runner waits for the
+///   job to quiesce (no in-job helper still writing the staging dir) before returning. If the job
+///   cannot be created/assigned, or does not quiesce, login **fails closed** (`success == false`). The
+///   browser the vendor opens is out-of-job and so never gated on or killed. Dropping the job at the
+///   end reaps any straggler — including if *this* process later crashes (f-b1).
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn run_login(
+    mut command: Command,
+    scratch_cwd: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> LoginOutcome {
+    command
+        .current_dir(scratch_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let fail = LoginOutcome {
+        success: false,
+        timed_out: false,
+        cancelled: false,
+        exit: None,
+        uncontained: false,
+    };
+
+    // Fail closed if we cannot obtain a containment job at all.
+    let Some(job) = crate::winjob::JobObject::new() else {
+        return fail;
+    };
+    let mut child = match job.spawn_in_job(&mut command) {
+        Ok(c) => c,
+        Err(_) => return fail,
+    };
+
+    let deadline = Instant::now() + timeout;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(_) => {
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    // Natural exit: wait for in-job helpers to quiesce before the caller verifies/renames staging. A
+    // lingering in-job writer that does not clear in time is reaped **and we then wait for the reaping
+    // to settle** before returning; if it still cannot be proven quiesced the outcome is marked
+    // **uncontained**, so the caller leaves staging for recovery rather than deleting it under a
+    // possibly-still-writing member (f8/f1-impl-round-3).
+    if !wait_quiescent(&job) {
+        let contained = terminate_and_settle(&job, &mut child);
+        return LoginOutcome {
+            exit: exit_code,
+            uncontained: !contained,
+            ..fail
+        };
+    }
+    LoginOutcome {
+        success: exit_code == Some(0),
+        timed_out: false,
+        cancelled: false,
+        exit: exit_code,
+        uncontained: false,
+    }
+}
+
+/// Abort a login job: terminate it, wait (bounded) for the direct child, then wait for the whole job
+/// to go quiet, so the caller never cleans up staging while a member is still writing (f8). The child
+/// wait is bounded rather than an unbounded `child.wait()` so a wedged process cannot hang the runner.
+///
+/// Returns **contained** only if `TerminateJobObject` was accepted **and** the job reached zero active
+/// processes — a failed terminate (even if quiescence then coincidentally reads zero) is *not*
+/// containment. The caller leaves staging for recovery whenever this is false.
+#[allow(dead_code)] // reached via run_login, whose caller lands with the setup provisioning flow.
+fn terminate_and_settle(job: &crate::winjob::JobObject, child: &mut Child) -> bool {
+    let terminated = job.terminate();
+    let deadline = Instant::now() + LOGIN_QUIESCE_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    terminated && wait_quiescent(job)
+}
+
+/// Wait (bounded) for the job's live process count to reach zero. `true` if it quiesced; `false` on
+/// timeout or an unqueryable job (treated as uncontained by the caller).
+#[allow(dead_code)] // reached via run_login, whose caller lands with the setup provisioning flow.
+fn wait_quiescent(job: &crate::winjob::JobObject) -> bool {
+    let deadline = Instant::now() + LOGIN_QUIESCE_BOUND;
+    loop {
+        match job.active_processes() {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run a vendor login that uses a **code-paste** flow (Claude's `auth login`): the browser shows an
+/// authorization code the human must paste back into the login's **stdin**, rather than redirecting to
+/// a localhost callback (#15 part 3b). Same containment/redaction posture as [`run_login`], plus the
+/// interactive plumbing:
+///
+/// - The child runs in the login job (creation-time association) with stdin/stdout/stderr **piped**.
+/// - Background scanners drain stdout+stderr (so the child never blocks on a full pipe) and extract the
+///   vendor's **authorization URL** — the *only* thing taken from that output; the raw stream is never
+///   logged or returned (it carries the URL's `state`/PKCE, redaction f-r2.7).
+/// - A loopback [`crate::codeentry::CodeEntryServer`] shows the human that URL and a field to paste the
+///   code; the submitted code is written to the child's stdin and never logged.
+/// - Cancellation, an overall timeout, quiescence, and `uncontained` are handled exactly as in
+///   [`run_login`]; on any abort the job is terminated-and-settled and staging is left for recovery.
+#[allow(dead_code)] // production caller lands with the setup provisioning flow (#15 part 3b).
+pub fn run_login_code_paste(
+    mut command: Command,
+    scratch_cwd: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> LoginOutcome {
+    command
+        .current_dir(scratch_cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let fail = LoginOutcome::default();
+
+    let Some(job) = crate::winjob::JobObject::new() else {
+        return fail;
+    };
+    let mut child = match job.spawn_in_job(&mut command) {
+        Ok(c) => c,
+        Err(_) => return fail,
+    };
+    let url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut scanners = Vec::new();
+    if let Some(o) = child.stdout.take() {
+        scanners.push(spawn_url_scanner(o, Arc::clone(&url)));
+    }
+    if let Some(e) = child.stderr.take() {
+        scanners.push(spawn_url_scanner(e, Arc::clone(&url)));
+    }
+    let mut stdin = child.stdin.take();
+    let deadline = Instant::now() + timeout;
+
+    // Phase 1: wait for the authorization URL to appear — or for the child to finish on its own. The
+    // Claude login is **hybrid**: a browser-callback account completes without ever needing a pasted
+    // code, so the child can exit here before (or instead of) any code page. Treat that exactly like a
+    // phase-2 completion — exit 0 after proven quiescence is a SUCCESS, not a failure (the
+    // callback-success contract; this same bug once lived in phase 2, f1). Only enter the code-entry
+    // phase when a URL actually arrives.
+    let auth_url = loop {
+        // The child finished on its own: a browser-callback login (success on exit 0), or a failure.
+        // Either way no code page is needed, and a URL still buffered in a scanner does not matter —
+        // the login is already over. Prove containment the same bounded way phase 2 does.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let exit_code = status.code();
+                let contained = wait_quiescent(&job) || terminate_and_settle(&job, &mut child);
+                drop(scanners);
+                return LoginOutcome {
+                    success: contained && exit_code == Some(0),
+                    exit: exit_code,
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+            Err(_) => {
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+            Ok(None) => {}
+        }
+        if let Some(u) = url.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            break u;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+
+    // Phase 2: show the URL + a code field on a loopback page and wait for the human's code.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let server = match crate::codeentry::CodeEntryServer::start(
+        "Finish signing in your reviewer profile",
+        &auth_url,
+        remaining,
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                uncontained: !contained,
+                ..fail
+            };
+        }
+    };
+    let _ = crate::approval::open_in_browser(server.url());
+    eprintln!(
+        "cross-review: if the sign-in shows a code to paste, paste it on this local page; if it \
+         completed in the browser you can ignore this page:\n  {}",
+        server.url()
+    );
+
+    // Wait for the login to finish. The Claude login is **hybrid**: some accounts complete on their
+    // own via a browser callback (no code, like Codex), others show a code the human must paste. So we
+    // watch the child **and** the code page at once — whichever finishes first:
+    //   - the child exits  -> the login is done (a callback login, or after a pasted code); check the
+    //     exit code (a code-less callback exiting 0 is a SUCCESS, not a failure — the earlier bug);
+    //   - a code is submitted -> feed it to stdin once (detached, so a non-reading child cannot block
+    //     us; the deadline reaps a wedged child, which closes the pipe).
+    // The code page timing out or being cancelled does NOT abort — a callback login may still be
+    // completing — only the overall deadline or a tool-call cancellation does (f2 preserved: the write
+    // is detached and never logs the code).
+    let mut code_fed = false;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(_) => {
+                server.cancel();
+                let contained = terminate_and_settle(&job, &mut child);
+                return LoginOutcome {
+                    uncontained: !contained,
+                    ..fail
+                };
+            }
+        }
+        if !code_fed {
+            if let Some(crate::codeentry::CodeOutcome::Submitted(c)) = server.poll() {
+                if let Some(mut si) = stdin.take() {
+                    let code_line = format!("{c}\n");
+                    std::thread::spawn(move || {
+                        let _ = si.write_all(code_line.as_bytes());
+                        let _ = si.flush();
+                    });
+                }
+                code_fed = true;
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            server.cancel();
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                cancelled: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        if Instant::now() >= deadline {
+            server.cancel();
+            let contained = terminate_and_settle(&job, &mut child);
+            return LoginOutcome {
+                timed_out: true,
+                uncontained: !contained,
+                ..fail
+            };
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    drop(server);
+
+    // The child has exited. Prove containment with the **bounded** quiescence/terminate path, then
+    // return. The scanner threads are **not** joined unboundedly (f1): a descendant that inherited a
+    // pipe could hold it open forever, so joining could wedge the runner (and setup). They exit on
+    // their own once the pipes close — which job termination guarantees — so we detach them.
+    let contained = wait_quiescent(&job) || terminate_and_settle(&job, &mut child);
+    drop(scanners);
+    LoginOutcome {
+        success: contained && exit_code == Some(0),
+        exit: exit_code,
+        uncontained: !contained,
+        ..fail
+    }
+}
+
+/// Drain `reader` (a child stdout/stderr pipe) so the child never blocks on a full pipe, scanning for
+/// the first `https://…` authorization URL and storing it in `url`. The buffered output is bounded and
+/// **never logged or returned** — only the extracted URL is surfaced.
+#[allow(dead_code)] // reached via run_login_code_paste, whose caller lands with the setup flow.
+fn spawn_url_scanner<R: Read + Send + 'static>(
+    mut reader: R,
+    url: Arc<Mutex<Option<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        // A **byte** accumulator, so bounding it trims at a byte offset (a `String::split_off` at an
+        // arbitrary byte would panic on non-ASCII output and stop the drain, f3).
+        let mut acc: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&chunk[..n]);
+                    {
+                        let mut slot = url.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            if let Some(found) = extract_https_url(&String::from_utf8_lossy(&acc)) {
+                                *slot = Some(found);
+                            }
+                        }
+                    }
+                    // Keep the buffer bounded: retain a tail large enough to hold a split URL.
+                    if acc.len() > 64 * 1024 {
+                        acc.drain(..acc.len() - 8192);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Extract the first `https://…` URL from `text`, ending at whitespace/control. `None` until a
+/// plausibly-complete one is present.
+fn extract_https_url(text: &str) -> Option<String> {
+    let start = text.find("https://")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c.is_control() || c == '"' || c == '<')
+        .unwrap_or(rest.len());
+    // Only accept a URL that has clearly ended (a delimiter followed), so we do not grab a prefix that
+    // is still being written; and require a minimum length.
+    if end < rest.len() && end > "https://a.b/".len() {
+        Some(rest[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// The config home an adapter should *read* an account from for `spec`, or `None` when it must read
+/// none. The single account-read seam, threaded through [`Config::resolve_authorized_home`]:
+///
+/// - `Ok(Some(home))` — an authorized profile: read that home.
+/// - `Ok(None)` — ambient: read the adapter's own ambient home via `ambient()`, today's behaviour.
+/// - `Err(_)` — a non-ambient profile that is unauthorized or unresolvable: `None`. Accounting reads
+///   (`account_fingerprint`, headroom observation) then fail open (`Unknown`); the *review* path
+///   never reaches an accounting read for such a spec, because `resolve_authorized_home` already
+///   refused the entry upstream.
+pub fn home_for_reads(
+    cfg: &Config,
+    spec: &ReviewerSpec,
+    ambient: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match cfg.resolve_authorized_home(spec) {
+        Ok(Some(home)) => Some(home),
+        Ok(None) => ambient(),
+        Err(_) => None,
+    }
+}
+
+/// Whether a profile home's authentication is the subscription OAuth — the only method a profile may
+/// use — or something else (an API key, an unrecognised method) that must be refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// Codex ChatGPT (`auth_mode == "chatgpt"`) / Claude claude.ai first-party subscription.
+    Subscription,
+    /// An API key or an unrecognised method: never valid for a profile.
+    Other,
+}
+
+/// The account and auth method a profile home resolves to, established **pre-spawn** from local
+/// surfaces (the auth file, the CLI's own `auth status` machine output) — never the model's prose.
+/// The fail-closed confirmation that the controlled environment routed the reviewer to the intended
+/// subscription account. See `docs/reviewer-account-profiles-impl.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    /// The account fingerprint the home resolves to (the same value `account_fingerprint` reads).
+    pub account: String,
+    /// Whether that home's auth is the subscription OAuth.
+    pub method: AuthMethod,
+}
+
+/// Assert a profile home's resolved identity is usable for `expected_account`: the method is the
+/// subscription OAuth, **and** the account matches exactly.
+///
+/// Fail-closed — a non-subscription method or any account mismatch refuses, so a review never runs
+/// under the wrong credential. `expected_account` is the account the routing already authorized: at
+/// the auth-check it is the profile home's own fingerprint (a method + self-consistency check); once
+/// the allowlist exists it is the *authorized* account from the allowlist entry, so a profile
+/// silently re-logged to a different account is caught here.
+pub fn assert_profile_identity(
+    reviewer: &str,
+    resolved: &ResolvedIdentity,
+    expected_account: &str,
+) -> Result<(), Failure> {
+    if resolved.method != AuthMethod::Subscription {
+        return Err(errors::profile_identity_mismatch(
+            reviewer,
+            "the profile home's authentication is not a subscription sign-in (it is an API key or \
+             an unrecognised method); a profile must be a subscription account",
+        ));
+    }
+    if resolved.account != expected_account {
+        return Err(errors::profile_identity_mismatch(
+            reviewer,
+            "the account the profile home resolves to is not the account authorized for this \
+             profile; it may have been re-logged to a different account",
+        ));
+    }
+    Ok(())
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = normalize_windows_path(path);
     let root = normalize_windows_path(root);
@@ -518,7 +1052,13 @@ pub trait Reviewer: Send + Sync {
     /// `cancel` interrupts the check: a fallback entry's preflight runs inside the review's walk,
     /// so a cancellation (or shutdown) must be able to stop a 30-second auth probe rather than
     /// wait it out. See `docs/reviewer-fallback-chain.md`.
-    fn auth_check(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Result<String, Failure>;
+    fn auth_check(
+        &self,
+        bin: &Path,
+        cfg: &Config,
+        spec: &ReviewerSpec,
+        cancel: &AtomicBool,
+    ) -> Result<String, Failure>;
 
     fn invocation(
         &self,
@@ -560,6 +1100,86 @@ pub trait Reviewer: Send + Sync {
     /// See `docs/usage-remaining-gate.md`.
     fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
         None
+    }
+
+    /// The same account identifier as [`account_fingerprint`](Self::account_fingerprint), but read
+    /// **directly from a given config home** rather than through the authorized-home seam.
+    ///
+    /// This is the account currently in `home`, used by
+    /// [`Config::resolve_authorized_home`](crate::config::Config::resolve_authorized_home) itself to
+    /// match the allowlist's fingerprint field. It cannot route through `account_fingerprint`, which
+    /// resolves the home via the very authorization being decided — that would recurse. `None` when
+    /// the home has no readable account (an unprovisioned or re-logging profile), which the caller
+    /// treats as unauthorized. See `docs/reviewer-account-profiles-impl.md` (`[f19]`).
+    fn fingerprint_at(&self, _home: &Path) -> Option<String> {
+        None
+    }
+
+    /// The per-spawn profile identity + auth-method probe: resolve the account and method a profile
+    /// `home` currently presents, from local surfaces (Codex `auth.json`; Claude `auth status` + the
+    /// account file). Runs **before every non-ambient spawn** and by the setup confirmation (#15) —
+    /// **never cached**, because a cached subscription assertion could miss a later same-account
+    /// auth-method downgrade (`[f2/f3]`). The caller passes the result to [`assert_profile_identity`]
+    /// against the authorized account. Default fails closed for an adapter with no probe.
+    fn resolve_home_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        _home: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<ResolvedIdentity, Failure> {
+        Err(errors::profile_identity_mismatch(
+            "reviewer",
+            "no profile identity probe is implemented for this reviewer",
+        ))
+    }
+
+    /// Build the vendor **login** command that signs a fresh subscription session into `home` (the
+    /// staging dir), with the controlled environment applied (`env_clear` + allowlist + the home var).
+    /// The caller adds the owned scratch cwd, stdio and containment. Never an api-key/token flow.
+    /// Default fails closed for an adapter with no login. (#15 part 3b)
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn login_command(&self, _bin: &Path, _home: &Path) -> Result<Command, Failure> {
+        Err(errors::bad_request(
+            "no vendor login is implemented for this reviewer",
+        ))
+    }
+
+    /// Which login flow this reviewer uses (#15 part 3b): a **browser callback** to a localhost server
+    /// (Codex — stdin closed, output discarded) or a **code paste** where the human pastes the
+    /// authorization code back into the login's stdin (Claude). The setup runner picks the matching
+    /// login executor. Default browser-callback.
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn login_mode(&self) -> LoginMode {
+        LoginMode::BrowserCallback
+    }
+
+    /// The credential files the vendor writes into a signed-in home, in the order to poll-for-arrival
+    /// and re-secure ([f20]). The **first** entry is the account file the confirmation reads
+    /// handle-relative (f-a5). Empty for an adapter with no login.
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn credential_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Confirm the just-provisioned `home`'s identity for the **setup** flow: read the account
+    /// fingerprint **handle-relative** through the held directory (f-a5) and establish the auth method
+    /// from an isolated probe run from `scratch_cwd` (f-r2.6). Distinct from
+    /// [`resolve_home_identity`](Self::resolve_home_identity), which reads by path on the review path.
+    /// Default fails closed. (#15 part 3b)
+    #[allow(dead_code)] // caller lands with the setup provisioning flow (#15 part 3b).
+    fn confirm_setup_identity(
+        &self,
+        _bin: &Path,
+        _cfg: &Config,
+        _home: &crate::profile::SecuredProfileDir,
+        _scratch_cwd: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<ResolvedIdentity, Failure> {
+        Err(errors::profile_identity_mismatch(
+            "reviewer",
+            "no setup identity confirmation is implemented for this reviewer",
+        ))
     }
 
     /// The stdout bounds the runner applies to this reviewer. Default is retain-and-drain at
@@ -1428,6 +2048,49 @@ mod drain_tests {
     }
 
     #[test]
+    fn code_paste_login_accepts_a_callback_exit_before_any_url() {
+        // f1: a browser-callback (code-less) Claude login completes on its own and exits without ever
+        // printing a URL — phase 1 must treat exit 0 as SUCCESS, not reject it for lack of a URL (the
+        // callback-success contract). Modeled with a child that exits 0 immediately and prints nothing,
+        // so phase 1 never reaches the code page.
+        let scratch = std::env::temp_dir().join(format!("cr-cp-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "exit", "0"]);
+        let outcome = run_login_code_paste(
+            cmd,
+            &scratch,
+            Duration::from_secs(20),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(outcome.success, "callback exit 0 must succeed: {outcome:?}");
+        assert_eq!(outcome.exit, Some(0));
+        assert!(!outcome.uncontained && !outcome.timed_out && !outcome.cancelled);
+    }
+
+    #[test]
+    fn code_paste_login_rejects_a_nonzero_exit_before_any_url() {
+        // The complement: a login that exits non-zero without a URL is a failure, never a false success.
+        let scratch = std::env::temp_dir().join(format!("cr-cp-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "exit", "3"]);
+        let outcome = run_login_code_paste(
+            cmd,
+            &scratch,
+            Duration::from_secs(20),
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !outcome.success,
+            "a non-zero exit must not succeed: {outcome:?}"
+        );
+        assert_eq!(outcome.exit, Some(3));
+    }
+
+    #[test]
     fn output_over_the_cap_is_bounded_and_flagged() {
         // Collection was bounded in time but not in size, so a reviewer emitting output
         // continuously was held in memory until it stopped.
@@ -1600,6 +2263,160 @@ mod drain_tests {
                 .contains("refused at least 2 shell command(s)"),
             "{}",
             failure.summary
+        );
+    }
+}
+
+#[cfg(test)]
+mod controlled_env_tests {
+    use super::*;
+
+    fn envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn controlled_env_sets_the_home_and_drops_provider_variables() {
+        let mut cmd = Command::new("x");
+        // Provider-auth variables explicitly present before the controlled env must be gone after —
+        // `env_clear` wipes the whole map, including prior explicit sets, so nothing inherited can
+        // override the profile OAuth.
+        cmd.env("ANTHROPIC_API_KEY", "secret");
+        cmd.env("OPENAI_API_KEY", "secret");
+        cmd.env("CODEX_ACCESS_TOKEN", "secret");
+        apply_controlled_env(&mut cmd, "CODEX_HOME", Path::new(r"C:\profiles\codex\work"));
+
+        let envs = envs(&cmd);
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "CODEX_HOME" && v.as_deref() == Some(r"C:\profiles\codex\work")),
+            "home var must be set to the profile home: {envs:?}"
+        );
+        // No provider-auth variable survives, by exact name or by shape.
+        for (k, _) in &envs {
+            assert!(
+                !k.contains("API_KEY") && !k.contains("ACCESS_TOKEN") && !k.contains("OAUTH_TOKEN"),
+                "provider-auth variable leaked into the controlled env: {k}"
+            );
+        }
+        // Every remaining key is on the allowlist or is the home var itself — nothing else leaks.
+        for (k, _) in &envs {
+            assert!(
+                k == "CODEX_HOME" || CONTROLLED_ENV_ALLOWLIST.contains(&k.as_str()),
+                "unexpected key in controlled env: {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_profile_identity_requires_subscription_and_matching_account() {
+        let sub = ResolvedIdentity {
+            account: "acct-1".to_string(),
+            method: AuthMethod::Subscription,
+        };
+        assert!(assert_profile_identity("codex", &sub, "acct-1").is_ok());
+        // A different account refuses.
+        let e = assert_profile_identity("codex", &sub, "acct-2").unwrap_err();
+        assert_eq!(e.code, "PROFILE_IDENTITY_MISMATCH");
+        // A non-subscription method refuses even with a matching account.
+        let apikey = ResolvedIdentity {
+            account: "acct-1".to_string(),
+            method: AuthMethod::Other,
+        };
+        let e = assert_profile_identity("codex", &apikey, "acct-1").unwrap_err();
+        assert_eq!(e.code, "PROFILE_IDENTITY_MISMATCH");
+    }
+
+    #[test]
+    fn the_allowlist_carries_no_provider_auth_variable() {
+        for key in CONTROLLED_ENV_ALLOWLIST {
+            assert!(
+                !key.contains("API_KEY")
+                    && !key.contains("ACCESS_TOKEN")
+                    && !key.contains("OAUTH")
+                    && !key.starts_with("ANTHROPIC")
+                    && !key.starts_with("OPENAI")
+                    && !key.starts_with("CODEX")
+                    && !key.starts_with("CLAUDE"),
+                "the controlled-env allowlist must not carry a provider/auth variable: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_login_reports_success_and_failure_exit_codes() {
+        let scratch = std::env::temp_dir();
+        // A "login" that exits 0 succeeds and reports its code.
+        let mut ok = Command::new("cmd.exe");
+        ok.args(["/C", "exit 0"]);
+        let out = run_login(
+            ok,
+            &scratch,
+            Duration::from_secs(20),
+            &AtomicBool::new(false),
+        );
+        assert!(out.success && out.exit == Some(0) && !out.timed_out && !out.cancelled);
+
+        // A non-zero exit is a failed login, not a success.
+        let mut bad = Command::new("cmd.exe");
+        bad.args(["/C", "exit 3"]);
+        let out = run_login(
+            bad,
+            &scratch,
+            Duration::from_secs(20),
+            &AtomicBool::new(false),
+        );
+        assert!(!out.success && out.exit == Some(3));
+    }
+
+    #[test]
+    fn extract_https_url_finds_a_complete_url_only() {
+        // A complete URL followed by a delimiter is extracted; a still-being-written prefix is not.
+        let claude = "Opening browser to sign in…\nIf the browser didn't open, visit: \
+                      https://claude.com/cai/oauth/authorize?code=true&state=abc\nPaste code here > ";
+        assert_eq!(
+            extract_https_url(claude).as_deref(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&state=abc")
+        );
+        // No delimiter yet (URL may still be streaming) -> None.
+        assert_eq!(
+            extract_https_url("visit: https://claude.com/cai/oauth"),
+            None
+        );
+        // No URL at all.
+        assert_eq!(extract_https_url("Opening browser to sign in…\n"), None);
+    }
+
+    #[test]
+    fn run_login_honours_cancellation() {
+        // A pre-cancelled run terminates the child promptly and reports cancelled, never success.
+        let scratch = std::env::temp_dir();
+        let mut slow = Command::new("cmd.exe");
+        // ping is a portable ~29s sleep; the runner must not wait it out once cancel is set. A generous
+        // bound (well under the child's own runtime) proves the short-circuit without flaking under
+        // heavy parallel test load, where terminate+quiesce can add a couple of seconds.
+        slow.args(["/C", "ping -n 30 127.0.0.1"]);
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        let out = run_login(slow, &scratch, Duration::from_secs(120), &cancel);
+        assert!(out.cancelled && !out.success);
+        // A normally-terminable child is proven contained (terminate accepted + job quiesced), so the
+        // caller may clean up staging rather than leaking it. (The `uncontained == true` path requires
+        // an OS terminate failure / non-quiescence, which is impractical to force in a unit test.)
+        assert!(
+            !out.uncontained,
+            "a killable login child must be reported contained"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "a cancelled login must not wait out the child"
         );
     }
 }

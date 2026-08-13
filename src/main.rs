@@ -11,8 +11,11 @@ compile_error!(
      share-mode locking."
 );
 
+mod allowlist;
+mod approval;
 mod cancel;
 mod changeset;
+mod codeentry;
 mod config;
 mod digest;
 mod errors;
@@ -21,16 +24,19 @@ mod findings;
 mod mcp;
 mod metrics;
 mod pathcmp;
+mod profile;
 mod prompt;
 mod registry;
 mod reviewer;
 mod session;
+mod setup;
 #[cfg(test)]
 mod testutil;
 mod tools;
 mod usage;
 mod vcs;
 mod winjob;
+mod winsec;
 
 use std::sync::Arc;
 

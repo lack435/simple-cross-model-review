@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -66,6 +67,55 @@ impl RawBin {
             (RawBin::Explicit(a), RawBin::Explicit(b)) => crate::pathcmp::identity_eq_str(a, b),
             _ => false,
         }
+    }
+}
+
+/// The account-profile selector a session was created under, persisted so a resume cannot cross an
+/// account. The session-side mirror of `config::ProfileSelector` (kept here, like [`RawBin`], because
+/// `config` imports `session` and not the reverse); the conversion is done at the call site.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileSelectorId {
+    Ambient,
+    Named(String),
+    ExplicitHome(String),
+}
+
+/// The account identity a session was created under.
+///
+/// Presence of this field distinguishes a **new** session (which always records `Some`, even for
+/// ambient) from a **legacy** record predating the field (`SessionRecord::profile_identity == None`),
+/// exactly as [`RawBin`] distinguishes a new PATH entry from a legacy one — a legacy record has no
+/// captured account and so is fail-closed non-resumable. The `selector`/`effective_home` pin *which*
+/// account home this ran under; `account_fingerprint` pins *which account* was in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIdentity {
+    pub selector: ProfileSelectorId,
+    /// The canonical resolved config home (a string path). `None` only for `Ambient`, which has no
+    /// profile home. Part of identity so the same `Named(name)` under a different base is a different
+    /// identity, not just a different account (f7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_home: Option<String>,
+    /// The account fingerprint captured at record time (Codex `tokens.account_id`, Claude
+    /// account/org uuid). `None` when it could not be read — which, by the uniform fail-closed
+    /// contract, makes the session non-resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
+}
+
+impl ProfileIdentity {
+    /// Whether a resume from `self` (stored) to `current` (freshly resolved/read) is allowed.
+    ///
+    /// The uniform fail-closed contract (f14): the selector and effective home must match, and a
+    /// captured account fingerprint must be **present on both sides and equal**. A missing fingerprint
+    /// on either side refuses — an unbindable session (none captured at record time) or a current
+    /// account that cannot be read now is not resumed under an assumed identity.
+    pub fn resume_matches(&self, current: &ProfileIdentity) -> bool {
+        self.selector == current.selector
+            && self.effective_home == current.effective_home
+            && matches!(
+                (&self.account_fingerprint, &current.account_fingerprint),
+                (Some(a), Some(b)) if a == b
+            )
     }
 }
 
@@ -171,6 +221,13 @@ pub struct SessionRecord {
     /// `docs/resume-cache-cwd-invalidation.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_cwd_mode: Option<String>,
+    /// The account identity this session was created under (selector, effective home, account
+    /// fingerprint). A resume whose freshly-resolved identity does not [`ProfileIdentity::resume_matches`]
+    /// the stored one is refused, so a session cannot resume under a different account or profile.
+    /// `None` on a record written before this field existed (legacy): fail-closed non-resumable, since
+    /// its account was never captured and cannot be verified. See `docs/reviewer-account-profiles.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<ProfileIdentity>,
 }
 
 /// The tri-state result of loading a session's findings ledger. A single record whose ledger is
@@ -264,6 +321,11 @@ pub struct TurnFacts<'a> {
     /// The working-directory mode the reviewer ran in this turn (`CWD_MODE_PROJECT` /
     /// `CWD_MODE_NEUTRAL`), stored so a later resume can detect a mode change it cannot survive.
     pub reviewer_cwd_mode: &'a str,
+    /// The account identity this turn ran under (selector, resolved home, account fingerprint),
+    /// recorded so a later resume can refuse an account/profile change. Always `Some` on the live
+    /// review path; `None` only leaves the record at the fail-closed legacy state (used by tests that
+    /// do not exercise profiles).
+    pub profile_identity: Option<ProfileIdentity>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -343,6 +405,7 @@ impl SessionStore {
             findings_ledger,
             terminal_reason,
             reviewer_cwd_mode,
+            profile_identity,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -370,6 +433,14 @@ impl SessionStore {
                 prior.and_then(|p| p.base_sha.clone()),
             ),
         };
+
+        // Profile identity: exactly this turn's, never a carry-forward. A turn that could not read
+        // the account fingerprint records `None`, which makes the session non-resumable -- the
+        // uniform fail-closed contract. Carrying a prior turn's fingerprint forward was removed
+        // (code-review f3): it could record a fingerprint the *current* turn did not verify, masking
+        // an account switch that a partial credential-file read left unseen. Tolerating a transient
+        // read failure instead belongs to the Phase 3 start-vs-final identity guard, which retains
+        // the account asserted at spawn and verifies the final one equals it before delivery.
 
         let record = match store.sessions.get(name) {
             // Same underlying session: another turn on it. The changelist binding is
@@ -409,6 +480,7 @@ impl SessionStore {
                 findings_ledger,
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
+                profile_identity: profile_identity.clone(),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -433,6 +505,7 @@ impl SessionStore {
                 findings_ledger,
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
+                profile_identity: profile_identity.clone(),
             },
         };
 
@@ -691,82 +764,148 @@ impl SessionStore {
     }
 }
 
-/// An exclusive cross-process lock, backed by the OS rather than by bookkeeping.
-///
-/// The in-process mutex cannot help across processes: two `cross-review` servers pointed
-/// at the same project share a state directory, and every mutation is a
-/// read-modify-write, so without a lock each can write back a snapshot taken before the
-/// other's change and silently drop it.
-///
-/// Exclusivity comes from opening the lock file with a share mode of zero: while one
-/// process holds that handle, every other process's open fails. Two properties fall out
-/// of letting Windows own it. The lock is released when the handle closes, *including*
-/// when the process dies, so there is no such thing as a stale lock to reason about. And
-/// nothing ever deletes the lock file, so there is no window in which one process removes
-/// a lock another has just acquired.
-///
-/// An earlier version tracked liveness itself: it stole any lock older than 60 seconds and
-/// wrote anyway on timeout. Both were wrong. A process merely paused could have its lock
-/// stolen, and on drop it would then delete the *new* owner's lock; writing anyway simply
-/// reinstated the lost-update race the lock existed to prevent.
+// Cross-process locks, backed by the OS rather than by bookkeeping.
+//
+// The in-process mutex cannot help across processes: two `cross-review` servers pointed at the same
+// project share a state directory, and every mutation is a read-modify-write, so without a lock each
+// can write back a snapshot taken before the other's change and silently drop it.
+//
+// Exclusion comes from a byte-range lock (`LockFileEx`) on a fixed range of the lock file, not from
+// the file open: every holder opens the file *with* sharing, so their handles coexist, and the
+// `LockFileEx` range provides the mutual exclusion. This lets an exclusive holder (setup) and one or
+// more shared holders (the review path) contend on the same lock path — an exclusive lock blocks while
+// any shared lock is held and vice-versa, while shared locks coexist ([f5]/f9). Two properties still
+// fall out of letting Windows own it: the lock releases when the handle closes, *including* when the
+// process dies (no stale lock to reason about), and nothing ever deletes the lock file (no window in
+// which one process removes a lock another just acquired).
+//
+// An earlier version opened the file with share-mode zero and tracked liveness itself (stealing any
+// lock older than 60 seconds, writing anyway on timeout). Both were wrong. A process merely paused
+// could have its lock stolen, and on drop it would then delete the *new* owner's lock; writing anyway
+// reinstated the lost-update race the lock existed to prevent.
+//
+// LockFileEx / the OVERLAPPED it requires. Closing the handle releases any locks it holds, so no
+// explicit UnlockFileEx is needed on drop.
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+const ERROR_SHARING_VIOLATION: i32 = 32;
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: *mut std::ffi::c_void,
+}
+
+extern "system" {
+    fn LockFileEx(
+        file: *mut std::ffi::c_void,
+        flags: u32,
+        reserved: u32,
+        bytes_low: u32,
+        bytes_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+}
+
+/// Take a byte-range lock (`exclusive` or shared) on `path`, retrying until `wait` elapses. The whole
+/// file is opened with read/write sharing so holders' handles coexist; a single fixed byte is locked
+/// so all holders contend on it.
+fn acquire_range_lock(path: &Path, exclusive: bool, wait: Duration) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0x1 | 0x2 | 0x4) // FILE_SHARE_READ | WRITE | DELETE
+        .open(path)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot open lock file {}: {e}", path.display()),
+            )
+        })?;
+    let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
+    if exclusive {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: std::ptr::null_mut(),
+        };
+        // SAFETY: `file` is a valid open handle held for the call; `overlapped` outlives it. We lock a
+        // single byte at offset 0, the range every holder contends on.
+        let ok = unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut overlapped) };
+        if ok != 0 {
+            return Ok(file);
+        }
+        let e = io::Error::last_os_error();
+        // A lock/sharing violation means someone holds a conflicting lock; anything else is a real
+        // error (denied ACL, bad path) that retrying would only stall on.
+        if !matches!(
+            e.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+        ) {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot lock {}: {e}", path.display()),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "another cross-review process is holding {} ({e})",
+                    path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// An exclusive hold on a lock path: blocks while any shared or exclusive holder is present.
 pub struct ExclusiveLock {
-    // Held purely for its side effect: dropping it releases the lock.
+    // Held purely for its side effect: dropping it (closing the handle) releases the lock.
     _file: File,
 }
 
 impl ExclusiveLock {
-    /// Take the lock, retrying until `wait` elapses. Failure is returned rather than
+    /// Take the lock exclusively, retrying until `wait` elapses. Failure is returned rather than
     /// ignored, so callers surface it instead of writing unprotected.
     pub fn acquire(path: &Path, wait: Duration) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let deadline = Instant::now() + wait;
-        loop {
-            match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .share_mode(0)
-                .open(path)
-            {
-                Ok(file) => return Ok(Self { _file: file }),
-                Err(e) => {
-                    // Only a sharing conflict means "someone else holds it". Retrying an
-                    // access-denied or bad-path error would stall for the whole wait and
-                    // then report contention, telling the caller to pick a different
-                    // session name -- which would fail identically.
-                    if !is_sharing_conflict(&e) {
-                        return Err(io::Error::new(
-                            e.kind(),
-                            format!("cannot open lock file {}: {e}", path.display()),
-                        ));
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            format!(
-                                "another cross-review process is holding {} ({e})",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-            }
-        }
+        Ok(Self {
+            _file: acquire_range_lock(path, true, wait)?,
+        })
     }
 }
 
-/// Windows reports a lock held elsewhere as a sharing or lock violation. Anything else --
-/// a denied ACL, a missing volume, a read-only disk -- is a real error, not contention.
-fn is_sharing_conflict(e: &io::Error) -> bool {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_LOCK_VIOLATION: i32 = 33;
-    matches!(
-        e.raw_os_error(),
-        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-    )
+/// A shared (reader) hold on a lock path: coexists with other shared holders, blocks only while an
+/// exclusive holder is present. The review path takes this across a whole attempt so a setup swap
+/// (which takes the exclusive side) cannot rename the home out from under a live review ([f5]).
+#[allow(dead_code)] // caller lands with the review-path lock wiring (#15 part 3b).
+pub struct SharedLock {
+    _file: File,
+}
+
+impl SharedLock {
+    #[allow(dead_code)] // caller lands with the review-path lock wiring (#15 part 3b).
+    pub fn acquire(path: &Path, wait: Duration) -> io::Result<Self> {
+        Ok(Self {
+            _file: acquire_range_lock(path, false, wait)?,
+        })
+    }
 }
 
 /// Lock path for a named review session, used to stop two server processes from
@@ -833,9 +972,120 @@ mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    profile_identity: None,
                 },
             )
             .expect("record turn")
+    }
+
+    fn ident(sel: ProfileSelectorId, home: Option<&str>, fp: Option<&str>) -> ProfileIdentity {
+        ProfileIdentity {
+            selector: sel,
+            effective_home: home.map(String::from),
+            account_fingerprint: fp.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resume_matches_requires_same_identity_and_a_matching_fingerprint() {
+        let amb = |fp| ident(ProfileSelectorId::Ambient, None, fp);
+        // Same account resumes.
+        assert!(amb(Some("acct-1")).resume_matches(&amb(Some("acct-1"))));
+        // A different account refuses.
+        assert!(!amb(Some("acct-1")).resume_matches(&amb(Some("acct-2"))));
+        // A missing fingerprint on either side refuses -- the uniform fail-closed contract.
+        assert!(!amb(None).resume_matches(&amb(Some("acct-1"))));
+        assert!(!amb(Some("acct-1")).resume_matches(&amb(None)));
+        assert!(!amb(None).resume_matches(&amb(None)));
+        // A different selector refuses even with a matching fingerprint.
+        let named = ident(
+            ProfileSelectorId::Named("work".into()),
+            Some(r"C:\h\work"),
+            Some("acct-1"),
+        );
+        assert!(!amb(Some("acct-1")).resume_matches(&named));
+        // Same named account but a different effective home refuses (f7): the same name under a
+        // different base is a different identity, not the same account in the same place.
+        let named_other_home = ident(
+            ProfileSelectorId::Named("work".into()),
+            Some(r"D:\h\work"),
+            Some("acct-1"),
+        );
+        assert!(!named.resume_matches(&named_other_home));
+    }
+
+    #[test]
+    fn profile_identity_round_trips_through_serde() {
+        for id in [
+            ident(ProfileSelectorId::Ambient, None, Some("a")),
+            ident(
+                ProfileSelectorId::Named("work".into()),
+                Some(r"C:\h\work"),
+                Some("a"),
+            ),
+            ident(
+                ProfileSelectorId::ExplicitHome(r"C:\x".into()),
+                Some(r"C:\x"),
+                None,
+            ),
+        ] {
+            let json = serde_json::to_string(&id).expect("serialize");
+            let back: ProfileIdentity = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(id, back);
+        }
+    }
+
+    fn ambient_facts(cli: &'static str, fp: Option<&'static str>) -> TurnFacts<'static> {
+        TurnFacts {
+            reviewer: "codex",
+            cli_session_id: cli,
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: r"C:\repo",
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: "project",
+            profile_identity: Some(ident(ProfileSelectorId::Ambient, None, fp)),
+        }
+    }
+
+    #[test]
+    fn a_turn_records_exactly_its_own_fingerprint_never_a_carry_forward() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        // Turn 1 captured the account.
+        store
+            .record_turn("s", ambient_facts("thread-1", Some("acct-1")))
+            .unwrap();
+        // Turn 2 on the same conversation could not read it: it records `None` (non-resumable), not
+        // the prior fingerprint. A fingerprint the current turn did not verify must never be
+        // recorded -- it could mask an account switch (code-review f3).
+        let rec = store
+            .record_turn("s", ambient_facts("thread-1", None))
+            .unwrap();
+        assert!(rec.profile_identity.unwrap().account_fingerprint.is_none());
+    }
+
+    #[test]
+    fn a_fresh_session_without_a_capturable_fingerprint_stays_unbound() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        // No prior turn to carry forward from: an unbindable new session records `None`, which the
+        // resume check treats as non-resumable (f14).
+        let rec = store
+            .record_turn("s", ambient_facts("thread-1", None))
+            .unwrap();
+        assert!(rec.profile_identity.unwrap().account_fingerprint.is_none());
     }
 
     #[test]
@@ -962,6 +1212,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("default", facts(turn_one))
@@ -1009,6 +1260,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("g", facts(Some("aaa1"), Some("base0")))
@@ -1064,6 +1316,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         // The old conversation establishes a complete baseline.
         store
@@ -1104,6 +1357,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         store
             .record_turn("p4", facts(Some(vec![43650, 43651])))
@@ -1143,6 +1397,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            profile_identity: None,
         };
         let full = PerforceBaseline::Full {
             schema: INVENTORY_SCHEMA,
@@ -1329,6 +1584,7 @@ mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    profile_identity: None,
                 },
             )
             .expect_err("record_turn must refuse a corrupt store");
@@ -1354,8 +1610,8 @@ mod tests {
         let path = dir.join("thing.lock");
 
         let held = ExclusiveLock::acquire(&path, Duration::from_millis(50)).expect("first acquire");
-        // Windows enforces this through the share mode, so the second open fails while
-        // the first handle is alive. No staleness heuristic is involved.
+        // Windows enforces this through the byte-range lock, so the second exclusive acquire fails
+        // while the first handle is alive. No staleness heuristic is involved.
         let blocked = ExclusiveLock::acquire(&path, Duration::from_millis(100));
         assert!(blocked.is_err(), "a second holder must be refused");
 
@@ -1364,6 +1620,39 @@ mod tests {
         // there is no window where one process removes another's lock.
         ExclusiveLock::acquire(&path, Duration::from_millis(500)).expect("acquire after release");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn shared_locks_coexist_but_exclude_the_exclusive_side() {
+        // [f5]/f9: many shared readers coexist on one path, while an exclusive holder blocks (and is
+        // blocked by) any shared holder. This is the review-vs-setup coupling that keeps a swap from
+        // renaming a home out from under a live review.
+        let dir = temp_dir();
+        let path = dir.join("home.lock");
+
+        let r1 = SharedLock::acquire(&path, Duration::from_millis(50)).expect("first shared");
+        let r2 =
+            SharedLock::acquire(&path, Duration::from_millis(50)).expect("second shared coexists");
+
+        // Setup's exclusive acquire is blocked while any shared reader is held.
+        assert!(
+            ExclusiveLock::acquire(&path, Duration::from_millis(100)).is_err(),
+            "an exclusive lock must be blocked while shared readers are held"
+        );
+
+        drop(r1);
+        drop(r2);
+        // With no shared readers, setup takes the exclusive side.
+        let ex = ExclusiveLock::acquire(&path, Duration::from_millis(500))
+            .expect("exclusive after readers");
+        // And while setup holds it exclusively, a review's shared acquire is blocked.
+        assert!(
+            SharedLock::acquire(&path, Duration::from_millis(100)).is_err(),
+            "a shared lock must be blocked while the exclusive side is held"
+        );
+        drop(ex);
+        SharedLock::acquire(&path, Duration::from_millis(500))
+            .expect("shared after exclusive release");
     }
 
     #[test]

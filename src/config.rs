@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::profile::ProfileSelector;
 use crate::reviewer::HeadroomLevel;
 use crate::vcs::DiffMode;
 
@@ -120,6 +121,11 @@ pub struct ReviewerSpec {
     /// so a duplicate that differs only by minimum is still a duplicate and editing a threshold
     /// between runs does not break resume. See `docs/usage-remaining-gate.md`.
     pub usage_minimum: UsageMinimum,
+    /// Which config home — and thus which account — this entry's reviewer runs under. Part of the
+    /// entry's *identity* (like `bin`, which can distinguish an account): a fallback entry carries
+    /// its own, duplicate detection and resume matching include it. `Ambient` is today's behaviour
+    /// (inherit the environment). See `docs/reviewer-account-profiles.md`.
+    pub profile: ProfileSelector,
 }
 
 impl ReviewerSpec {
@@ -134,6 +140,7 @@ impl ReviewerSpec {
         self.reviewer == other.reviewer
             && self.model == other.model
             && self.effort == other.effort
+            && self.profile == other.profile
             && self.raw_bin().identity_matches(&other.raw_bin())
     }
     /// This entry's binary *as configured*, tagged so a new PATH entry is distinguishable from a
@@ -193,6 +200,10 @@ struct PendingEntry {
     effort: Option<String>,
     bin: Option<PathBuf>,
     usage_minimum: Option<UsageMinimum>,
+    /// The account profile under construction. `None` becomes `ProfileSelector::Ambient` at
+    /// `finalize`. A profile flag and an explicit-home flag for the same family are mutually
+    /// exclusive on one entry, so a second setter call is an error, not a precedence contest.
+    profile: Option<ProfileSelector>,
 }
 
 impl PendingEntry {
@@ -203,7 +214,65 @@ impl PendingEntry {
             effort: None,
             bin: None,
             usage_minimum: None,
+            profile: None,
         }
+    }
+
+    /// The reviewer family a profile/home flag names, checked against this entry so a
+    /// `--codex-profile` on a Claude entry (or vice versa) is a clear error rather than silently
+    /// binding to the wrong reviewer.
+    fn check_profile_family(&self, flag: &str, family: ReviewerKind) -> Result<(), String> {
+        if self.reviewer != family {
+            return Err(format!(
+                "{flag} applies to a {} reviewer, but the --reviewer entry before it is '{}'",
+                family.as_str(),
+                self.reviewer.as_str()
+            ));
+        }
+        if self.profile.is_some() {
+            return Err(format!(
+                "a profile or home was given twice for the same --reviewer '{}' (a profile name and \
+                 an explicit home are mutually exclusive on one entry)",
+                self.reviewer.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_profile_name(
+        &mut self,
+        flag: &str,
+        family: ReviewerKind,
+        name: String,
+    ) -> Result<(), String> {
+        self.check_profile_family(flag, family)?;
+        crate::profile::validate_profile_name(&name)?;
+        self.profile = Some(ProfileSelector::Named(name));
+        Ok(())
+    }
+
+    fn set_profile_home(
+        &mut self,
+        flag: &str,
+        family: ReviewerKind,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.check_profile_family(flag, family)?;
+        if path.as_os_str().is_empty() {
+            return Err(format!("{flag} requires a non-empty path"));
+        }
+        // Must be absolute: a relative or drive-relative home would resolve against whatever working
+        // directory the reviewer child happened to run under, so the same config could bind different
+        // accounts and weaken authorization (code-review f4). Symlink canonicalization happens later,
+        // at provisioning, once the directory exists.
+        if !path.is_absolute() {
+            return Err(format!(
+                "{flag} requires an absolute path, got '{}'",
+                path.display()
+            ));
+        }
+        self.profile = Some(ProfileSelector::ExplicitHome(path));
+        Ok(())
     }
 
     /// Bind `--min-usage-remaining <1..=100>` to this entry. Codex only: Claude exposes no
@@ -319,6 +388,7 @@ impl PendingEntry {
             bin: self.bin,
             reviewer: self.reviewer,
             usage_minimum: self.usage_minimum.unwrap_or(UsageMinimum::None),
+            profile: self.profile.unwrap_or(ProfileSelector::Ambient),
         }
     }
 }
@@ -594,6 +664,18 @@ pub struct Config {
     /// Working root handed to the reviewer. Defaults to the server's cwd, which is
     /// the project root when a harness launches us from `.mcp.json`.
     pub cwd: PathBuf,
+    /// The immutable directory this process was launched from, canonicalized once at parse time
+    /// from `std::env::current_dir()` *before* any `--cwd` is applied.
+    ///
+    /// This is the key the Phase 3 authorization allowlist is keyed on — never [`Self::cwd`], which
+    /// `--cwd` can point anywhere (it is user- and repo-settable, and a reviewed repository's
+    /// committed config could set it). Keying authorization on `cwd` would let a repo redirect itself
+    /// into another root's approval; keying on the launch root, captured from the ambient environment
+    /// and independent of every flag, cannot be steered that way. When `--cwd` differs from the launch
+    /// root the difference is an out-of-band redirection that Phase 3 requires be confirmed on its own,
+    /// rather than inheriting the launch root's authorization. See
+    /// `docs/reviewer-account-profiles-impl.md` (Phase 3 → Allowlist store, `[f7]`).
+    pub launch_root: PathBuf,
     pub timeout: Duration,
     /// Refuse to resume a session idle longer than this. Zero disables the check. See
     /// `DEFAULT_RESUME_MAX_IDLE_SECS`. A tripped session is refused with
@@ -675,8 +757,31 @@ pub struct Config {
     pub max_concurrent_reviews: u32,
 }
 
+/// A resolved, authorized profile home together with the account the allowlist authorized it for.
+///
+/// The `account` is captured at authorization time and carried through the run: the pre-spawn identity
+/// probe asserts the home still resolves to it, and the post-review switch guard `[f4]` compares the
+/// final fingerprint against it. See [`Config::resolve_authorized_home_with_account`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedHome {
+    pub home: PathBuf,
+    pub account: String,
+}
+
 impl Config {
     pub fn from_args(args: &[String]) -> Result<Self, String> {
+        // The immutable launch root, captured from the ambient process cwd *before* any argument
+        // is read, so no flag — least of all `--cwd` — can influence it. This is the Phase 3
+        // authorization key (see the field doc). Canonicalized like `cwd` is below, via
+        // `normalize_dir`, so the same directory keys one allowlist entry regardless of spelling.
+        // A process whose current directory cannot be read is already broken (the `cwd` default
+        // relies on the same call); failing closed here is the honest outcome for an authorization
+        // key that cannot be established.
+        let launch_root = normalize_dir(
+            std::env::current_dir()
+                .map_err(|e| format!("cannot determine the launch directory: {e}"))?,
+        );
+
         // The chain is built as a list of entries. A repeated `--reviewer` starts a new entry;
         // the identity flags `--model`/`--effort`/`--bin` bind to the most recent `--reviewer`.
         // Argument order is fallback order. See `docs/reviewer-fallback-chain.md`.
@@ -747,6 +852,34 @@ impl Config {
                         .last_mut()
                         .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
                         .set_bin(PathBuf::from(v))?;
+                }
+                "--codex-profile" => {
+                    let v = take("--codex-profile")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--codex-profile must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_name("--codex-profile", ReviewerKind::Codex, v)?;
+                }
+                "--claude-profile" => {
+                    let v = take("--claude-profile")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--claude-profile must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_name("--claude-profile", ReviewerKind::Claude, v)?;
+                }
+                "--codex-home" => {
+                    let v = take("--codex-home")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--codex-home must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_home("--codex-home", ReviewerKind::Codex, PathBuf::from(v))?;
+                }
+                "--claude-config-dir" => {
+                    let v = take("--claude-config-dir")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--claude-config-dir must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_profile_home("--claude-config-dir", ReviewerKind::Claude, PathBuf::from(v))?;
                 }
                 "--min-usage-remaining" => {
                     let v = take("--min-usage-remaining")?;
@@ -900,6 +1033,7 @@ impl Config {
             reviewers,
             state_dir,
             cwd,
+            launch_root,
             timeout: Duration::from_secs(timeout_secs),
             resume_max_idle: Duration::from_secs(resume_max_idle_secs),
             resume_max_turns,
@@ -936,6 +1070,116 @@ impl Config {
         self.reviewers.iter().any(|s| s.usage_minimum.is_gating())
     }
 
+    /// Resolve an entry's authorized config home, or refuse.
+    ///
+    /// This is the single way any review-path code obtains a profile home: `Ambient` returns
+    /// `Ok(None)` (inherit the environment, today's behaviour); a named profile or explicit home is
+    /// resolved and then authorized, returning `Err(PROFILE_NOT_AUTHORIZED)` unless this working root
+    /// is approved for it. Home resolution and authorization are one operation so a caller cannot
+    /// obtain a home without passing the check. See `docs/reviewer-account-profiles-impl.md`.
+    ///
+    /// Authorization consults the per-machine allowlist store ([`crate::allowlist`]), keyed on the
+    /// immutable [`launch_root`](Self::launch_root), against the full `(effective_home +
+    /// reviewer_family + account_fingerprint)` tuple `[f19]`. The fingerprint is the account
+    /// *currently* in the profile home, so a profile silently re-logged to a different account is
+    /// refused until reauthorized. A profile is authorized only when the store holds an entry matching
+    /// all four; with no store (or no entry) every non-ambient profile is refused — the same
+    /// fail-closed default the earlier deny-all stub had, now driven by real data.
+    ///
+    /// Not fully atomic yet: the pre-spawn per-home lock + generation recheck `[f5]` — which makes
+    /// authorization→probe→spawn one critical section against a concurrent setup — land with the
+    /// setup tool (#15), which owns the other side of that per-home lock. The post-review
+    /// start-vs-final switch guard `[f4]` (the actual fail-closed backstop for an external re-login) is
+    /// wired in the worker: the account this returns is asserted pre-spawn and re-checked after the
+    /// review. Until #15 can write an entry the store is empty, so this check denies every non-ambient
+    /// profile and the race window authorizes nothing meanwhile.
+    pub fn resolve_authorized_home(
+        &self,
+        spec: &ReviewerSpec,
+    ) -> Result<Option<PathBuf>, crate::errors::Failure> {
+        Ok(self
+            .resolve_authorized_home_with_account(spec)?
+            .map(|authorized| authorized.home))
+    }
+
+    /// Resolve *and authorize* a profile home, returning both the home and the **authorized account**
+    /// — the account fingerprint the allowlist entry was matched on (equal to the account in the home
+    /// at this instant, since the tuple match requires it).
+    ///
+    /// This is the only place the authorized account is established, and it is captured here so it can
+    /// be carried forward: the pre-spawn identity probe asserts the home *still* resolves to this
+    /// account (not a fresh self-read, which would be tautological — the gotcha the switch was made to
+    /// fix), and the post-review switch guard `[f4]` compares the final fingerprint against this same
+    /// value, refusing a review whose account was swapped mid-flight before it is recorded or
+    /// delivered. `Ok(None)` for ambient (no account to bind).
+    pub fn resolve_authorized_home_with_account(
+        &self,
+        spec: &ReviewerSpec,
+    ) -> Result<Option<AuthorizedHome>, crate::errors::Failure> {
+        if spec.profile.is_ambient() {
+            return Ok(None);
+        }
+        let refuse = |detail: &str| {
+            crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
+                .with_detail(detail.to_string())
+        };
+
+        let base = crate::profile::profile_base();
+        let home = crate::profile::resolve_home(&spec.profile, spec.reviewer, base.as_deref())
+            .map_err(|e| refuse(&e))?
+            // `resolve_home` returns `None` only for `Ambient`, handled above.
+            .expect("a non-ambient selector resolves to a home");
+
+        match self.profile_authorized(spec, &home)? {
+            Some(account) => Ok(Some(AuthorizedHome { home, account })),
+            None => Err(refuse(
+                "no authorization on file for this launch root, profile home, and account. Run the \
+                 profile setup to authorize this repository for this profile.",
+            )),
+        }
+    }
+
+    /// The authorized account for `spec`'s (non-ambient) profile home `home`, or `None` if this
+    /// launch root is not authorized for it.
+    ///
+    /// Reads the account currently in `home` (directly, not through the authorization seam — see
+    /// [`crate::reviewer::Reviewer::fingerprint_at`]) and asks the allowlist store whether the full
+    /// four-field tuple is on file; on a match it returns that account. Fail-closed on every
+    /// uncertainty: no store base, an unreadable account in the home, or a store that is not on file
+    /// all yield `Ok(None)` (refuse), while an *untrusted/corrupt* store surfaces as
+    /// [`PROFILE_NOT_AUTHORIZED`](crate::errors::profile_not_authorized) with the underlying reason —
+    /// never a silent allow.
+    fn profile_authorized(
+        &self,
+        spec: &ReviewerSpec,
+        home: &Path,
+    ) -> Result<Option<String>, crate::errors::Failure> {
+        let refuse = |detail: String| {
+            crate::errors::profile_not_authorized(spec.reviewer.as_str(), &spec.profile.label())
+                .with_detail(detail)
+        };
+        // No resolvable base means nowhere an authorization could have been recorded: deny.
+        let Some(store) = crate::allowlist::AllowlistStore::current() else {
+            return Ok(None);
+        };
+        // The account currently in the home. A profile with no readable account (never provisioned,
+        // or mid re-login) cannot match any entry, so it is unauthorized — not an error.
+        let Some(fingerprint) = crate::reviewer::for_kind(spec.reviewer).fingerprint_at(home)
+        else {
+            return Ok(None);
+        };
+        let query = crate::allowlist::AllowEntry {
+            launch_root: self.launch_root.to_string_lossy().into_owned(),
+            effective_home: home.to_string_lossy().into_owned(),
+            reviewer_family: spec.reviewer.as_str().to_string(),
+            account_fingerprint: fingerprint.clone(),
+        };
+        let authorized = store
+            .is_authorized(&query)
+            .map_err(|e| refuse(format!("the authorization store could not be trusted: {e}")))?;
+        Ok(authorized.then_some(fingerprint))
+    }
+
     /// The chain index of the entry that matches a stored session's identity, if any.
     ///
     /// A resume must run the entry that *created* the session (which may be a fallback), not the
@@ -948,6 +1192,14 @@ impl Config {
             s.reviewer.as_str() == record.reviewer
                 && s.model == record.model
                 && s.effort == record.effort
+                // The profile is part of entry identity, so a resume binds to the entry with the
+                // *same* account, not merely the same reviewer/model/effort/bin. A legacy record has
+                // no stored selector, so it matches on the other fields (and is refused later by the
+                // fail-closed identity check); a new record's selector must match the entry's.
+                && match &record.profile_identity {
+                    Some(pi) => s.profile.matches_id(&pi.selector),
+                    None => true,
+                }
         };
         match &record.raw_bin {
             Some(raw) => self
@@ -1451,6 +1703,15 @@ OPTIONS:
                               claude: low|medium|high|xhigh|max          (default medium)
                               codex:  low|medium|high|xhigh|max|ultra    (default max)
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
+  --codex-profile <name>      Run the codex reviewer under a dedicated account profile (a named
+  --claude-profile <name>     config home under %CROSS_REVIEW_HOME% or %LOCALAPPDATA%\\cross-review),
+                              claude equivalent --claude-profile, so a review bills the intended
+                              account regardless of the desktop app. Name: letters, digits, '.',
+                              '_', '-'. Using a profile requires the working root to be authorized
+                              for it first; until then a review is refused (PROFILE_NOT_AUTHORIZED).
+  --codex-home <abs>          Run the reviewer under an explicit absolute config home instead of a
+  --claude-config-dir <abs>   named profile (local/trusted-only escape hatch). Mutually exclusive
+                              with the profile flag for the same reviewer; also authorization-gated.
   --min-usage-remaining <n>   Proactive gate (codex only): skip this entry when its
                               last-observed usage remaining is known and below n% (1..=100),
                               advancing to the next reviewer before spending a call. Optional;
@@ -1567,6 +1828,183 @@ mod tests {
     fn reviewer_is_required() {
         let err = Config::from_args(&args(&[])).unwrap_err();
         assert!(err.contains("--reviewer is required"), "{err}");
+    }
+
+    #[test]
+    fn profile_defaults_to_ambient() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.primary().profile, ProfileSelector::Ambient);
+    }
+
+    #[test]
+    fn codex_profile_binds_a_named_profile() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        assert_eq!(
+            cfg.primary().profile,
+            ProfileSelector::Named("work".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_config_dir_binds_an_explicit_home() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--claude-config-dir",
+            r"C:\homes\work",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.primary().profile,
+            ProfileSelector::ExplicitHome(PathBuf::from(r"C:\homes\work"))
+        );
+    }
+
+    #[test]
+    fn a_profile_flag_on_the_wrong_family_is_rejected() {
+        let err = Config::from_args(&args(&["--reviewer", "claude", "--codex-profile", "work"]))
+            .unwrap_err();
+        assert!(err.contains("applies to a codex reviewer"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_name_and_an_explicit_home_on_one_entry_conflict() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--codex-home",
+            r"C:\x",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_profile_name_is_rejected_at_parse() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "../evil",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.contains("invalid character") || err.contains("traversal"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_home_must_be_absolute() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-home",
+            r"relative\path",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn profiles_bind_per_chain_entry() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "personal",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.reviewers[0].profile,
+            ProfileSelector::Named("work".to_string())
+        );
+        assert_eq!(
+            cfg.reviewers[1].profile,
+            ProfileSelector::Named("personal".to_string())
+        );
+        // Same reviewer/model/effort but different profiles are not identity-duplicates.
+        assert!(!cfg.reviewers[0].same_reviewer_identity(&cfg.reviewers[1]));
+    }
+
+    #[test]
+    fn launch_root_is_captured_and_independent_of_cwd() {
+        // The launch root is the ambient process cwd, captured before any flag. A `--cwd` pointing
+        // elsewhere sets `cwd` but must not move `launch_root` — the Phase 3 authorization key must
+        // not be steerable by a flag a reviewed repo can set. (The path need not exist: `--cwd`
+        // accepts an arbitrary directory, and `normalize_dir` falls back to the given path when it
+        // cannot canonicalize, so the two simply differ.)
+        let expected = normalize_dir(std::env::current_dir().expect("cwd"));
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--cwd",
+            r"C:\some\other\root",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.launch_root, expected);
+        assert_ne!(
+            cfg.launch_root, cfg.cwd,
+            "a --cwd elsewhere must not move the launch root"
+        );
+
+        // With no --cwd, cwd defaults from the same process cwd, so the two coincide.
+        let plain = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(plain.launch_root, plain.cwd);
+    }
+
+    #[test]
+    fn ambient_profile_authorizes_to_no_home() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.resolve_authorized_home(cfg.primary()).unwrap(), None);
+        // The account-bearing variant is also `None` for ambient (no profile account to bind — the
+        // switch guard therefore never fires for an ambient review).
+        assert_eq!(
+            cfg.resolve_authorized_home_with_account(cfg.primary())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn with_account_denies_an_unauthorized_named_profile() {
+        // The account-bearing resolver refuses an unauthorized profile just like the home-only one:
+        // the profile home does not exist, so its account cannot be read and no allowlist entry can
+        // match, so no account is surfaced — it is refused, not silently returned.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        let err = cfg
+            .resolve_authorized_home_with_account(cfg.primary())
+            .unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
+    }
+
+    #[test]
+    fn a_named_profile_is_denied_in_phase_1() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
+            .expect("config");
+        let err = cfg.resolve_authorized_home(cfg.primary()).unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
+    }
+
+    #[test]
+    fn an_explicit_home_is_denied_in_phase_1() {
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--claude-config-dir",
+            r"C:\homes\work",
+        ]))
+        .expect("config");
+        let err = cfg.resolve_authorized_home(cfg.primary()).unwrap_err();
+        assert_eq!(err.code, "PROFILE_NOT_AUTHORIZED");
     }
 
     #[test]
@@ -1954,11 +2392,71 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         // Matches the fallback entry (index 1), not the primary.
         assert_eq!(cfg.resume_entry_index(&rec), Some(1));
         // A model the chain no longer has: no match.
         rec.model = "gpt-5.6-sol".into();
+        assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn resume_binds_to_the_entry_with_the_matching_profile() {
+        use crate::session::{ProfileIdentity, ProfileSelectorId, RawBin, SessionRecord};
+        // Two codex entries identical but for their profile.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "work",
+            "--reviewer",
+            "codex",
+            "--codex-profile",
+            "personal",
+        ]))
+        .expect("config");
+        let named = |name: &str| {
+            Some(ProfileIdentity {
+                selector: ProfileSelectorId::Named(name.into()),
+                effective_home: None,
+                account_fingerprint: None,
+            })
+        };
+        let mut rec = SessionRecord {
+            reviewer: "codex".into(),
+            cli_session_id: "t".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::PathSearch),
+            resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: None,
+            profile_identity: named("personal"),
+        };
+        // The selector is part of entry identity, so a record created under 'personal' binds to
+        // entry 1 and 'work' to entry 0 -- same reviewer/model/effort/bin never misbinds across
+        // profiles.
+        assert_eq!(cfg.resume_entry_index(&rec), Some(1));
+        rec.profile_identity = named("work");
+        assert_eq!(cfg.resume_entry_index(&rec), Some(0));
+        // A legacy record has no stored selector and matches on the other fields, but it is now
+        // ambiguous across the two same-identity entries, so the exact-one legacy rule refuses.
+        rec.raw_bin = None;
+        rec.profile_identity = None;
         assert_eq!(cfg.resume_entry_index(&rec), None);
     }
 
@@ -2001,6 +2499,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         assert_eq!(cfg.resume_entry_index(&rec), Some(0));
 
@@ -2054,6 +2553,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            profile_identity: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
         let ambiguous = Config::from_args(&args(&[
