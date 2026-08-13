@@ -2326,6 +2326,39 @@ impl Job {
                     .report_activity(&self.id, activity.output_bytes);
             },
         );
+        self.registry.set_phase(&self.id, Phase::Finalizing);
+
+        // The account must still be the pinned one now that this child has run — the same backstop
+        // the main run gets, for the same reason. Three things about the placement are deliberate:
+        //
+        // - It runs **before the parse is unwrapped**. A repair whose output was unreadable still
+        //   advanced the reviewer conversation, so a home that moved underneath it must not slip
+        //   past the guard merely because its answer could not be read.
+        // - It runs **before this run's headroom is observed and stored**. That store keys on the
+        //   account pinned for the attempt, while the reading is pulled from mutable profile state
+        //   under the home; recording first would let a reading taken after an A→B switch be
+        //   persisted under A and steer later entry selection with a figure no one verified.
+        // - It runs **only when a child could have started**. `RunError::Spawn` means no process
+        //   was ever created, so nothing was billed and nothing could have answered under another
+        //   account; treating that as a security refusal would turn an ordinary spawn failure into
+        //   a non-resumable session for no reason.
+        //
+        // And unlike every other repair-side failure this one is a *security refusal*, not a
+        // bookkeeping miss — `RepairFailure::refusal` is what stops the caller committing the turn
+        // as though nothing had happened.
+        let child_may_have_run = match &run {
+            Ok(_) => true,
+            Err(e) => !e.child_never_started(),
+        };
+        if child_may_have_run {
+            if let Err(failure) = switch_guard(self.spec.reviewer, authorized_start) {
+                if let Some(path) = &last_message_file {
+                    std::fs::remove_file(path).ok();
+                }
+                return Err(RepairFailure::refusal(failure));
+            }
+        }
+
         let parsed = match run {
             Ok(out) => {
                 if let Some(key) = usage_key {
@@ -2347,20 +2380,8 @@ impl Job {
                 e.to_string(),
             )),
         };
-        self.registry.set_phase(&self.id, Phase::Finalizing);
         if let Some(path) = &last_message_file {
             std::fs::remove_file(path).ok();
-        }
-
-        // The account must still be the pinned one now that this child has run — the same backstop
-        // the main run gets, for the same reason. Checked **before** the parse is unwrapped, and on
-        // every outcome of the run: a repair whose output failed to parse still advanced the
-        // reviewer conversation, so a home that moved underneath it must not slip past the guard
-        // just because its answer was unreadable. And unlike every other repair-side failure this
-        // one is a *security refusal*, not a bookkeeping miss — `RepairFailure::refusal` is what
-        // stops the caller from committing the turn as though nothing had happened.
-        if let Err(failure) = switch_guard(self.spec.reviewer, authorized_start) {
-            return Err(RepairFailure::refusal(failure));
         }
         let parsed = parsed.map_err(RepairFailure::ordinary)?;
 
@@ -3188,8 +3209,22 @@ impl Job {
             // only in the prose, which is exactly where the design tells a human to reconstruct
             // from. So the prose goes on the structured channel too, rather than leaving a
             // structured-only client an empty findings list and nothing to read.
-            crate::findings::not_durable_envelope(&self.session, turn, prior_snapshot.as_ref())
-                .with_prose(&turn_eval.review_prose)
+            {
+                let env = crate::findings::not_durable_envelope(
+                    &self.session,
+                    turn,
+                    prior_snapshot.as_ref(),
+                )
+                .with_prose(&turn_eval.review_prose);
+                // A repair was attempted on this turn even though the turn is not being recorded,
+                // and both the caller and the metrics record read that from the envelope. Rebuilding
+                // it from the pre-turn state would otherwise report "no repair attempted" for a turn
+                // that made a billed one.
+                match turn_eval.envelope.block_repair {
+                    Some(repair) => env.with_block_repair(repair),
+                    None => env,
+                }
+            }
         };
         // A durable but over-budget turn has persisted a sticky `terminal_reason`, so the next
         // resume will be refused: do not invite one. A durable turn whose findings marker could not

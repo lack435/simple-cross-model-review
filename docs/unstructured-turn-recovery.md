@@ -24,7 +24,13 @@ history below), and the implementation goes through the gate again as its own re
 > findings, all accepted: **f1 (`major`)** the post-repair switch-guard refusal was committed as an
 > ordinary repair failure, and the guard sat behind the parse; **f2** the cumulative usage fold
 > dropped the main run's per-invocation call count; **f3** the repair child reported as `Finalizing`;
-> **f4** the collect cap omitted the repair's pre-spawn probe. Each is marked in place above.
+> **f4** the collect cap omitted the repair's pre-spawn probe. Turn 2 confirmed all four resolved and
+> raised three more, all following from the f1 fix and all accepted: **f5 (`major`)** the repair's
+> headroom reading was observed and *stored* before the guard ran, so an A→B switch could persist an
+> unverified reading under A and steer later entry selection with it; **f6** a `RunError::Spawn` (no
+> child ever created) was classified as a security refusal; **f7** a refused, non-durable turn
+> rebuilt its envelope from pre-turn state and lost the fact that a repair had been attempted, so
+> both the caller and the metrics record reported none. Each is marked in place below.
 >
 > **This document did not receive an explicit APPROVE.** The session reached the configured
 > `--session-max-turns` limit of 10 on the turn that would have judged the final three fixes, and per
@@ -213,8 +219,20 @@ three policies undecided. The policy, stated once:
   f8 rule and it is about *who* clears: the clear happens in the one commit point, not on a
   repair-side path whose "nothing has advanced" premise is false by then.
 - **The one exception is a `switch_guard` trip after the repair**, which is a security refusal rather
-  than a repair failure: there the existing refusal semantics apply unchanged — do not record, leave
-  the marker set, session non-resumable — and the degraded review is still returned. It is the only
+  than a repair failure. Three things the implementation review made concrete. It must be **carried
+  in the type, not merely intended** — the first implementation returned it as one more `Failure`
+  down the same arm as a timeout, so the refusal was committed exactly like a failed retry, recorded
+  and marker cleared, the opposite of the contract (f1). It must run **before every side effect of
+  its own run**: before the parse is unwrapped, since an unreadable answer still advanced the
+  conversation, and before the headroom reading is stored, since that store keys on the pinned
+  account while the reading comes from mutable state under the home (f5). And it must run **only
+  when a child could have started** — `RunError::Spawn` means none ever was, so nothing was billed
+  and nothing could have answered under another account (f6). With those, the existing refusal
+  semantics apply unchanged — do not record, leave
+  the marker set, session non-resumable — and the degraded review is still returned. A refused turn
+  rebuilds its envelope from pre-turn state, so the repair status has to be carried across
+  explicitly or both the caller and the metrics record report that no repair was attempted on a turn
+  that made a billed one (f7). It is the only
   **repair-side** path that deliberately skips the single commit transaction. It is not the only way
   a marker can end up set: a main-run guard refusal returns before recording, and a failed
   `record_turn` or a failed `clear_findings_pending` leave it set too. Those are existing paths this
@@ -355,7 +373,10 @@ each is a unit test rather than a comment.
   turn budget *plus* `attempts × repair_timeout`, so the repair term is added to the single-entry
   budget **and** to each per-fallback term (a fallback entry's turn can degrade and repair too).
   Leaving this to documentation would mean a blocking collect that is advertised as covering a whole
-  review times out on exactly the turns this feature exists to rescue.
+  review times out on exactly the turns this feature exists to rescue. Each attempt's term is the
+  child's timeout **plus `PREFLIGHT_CAP_SECS`**: the pre-spawn identity probe in front of it is a
+  real CLI invocation with its own 30-second auth-status timeout, not a free check. (Implementation
+  review, f4.)
 - Attempts are consumed per turn, not per session.
 
 ### Accounting and plumbing
@@ -372,7 +393,12 @@ These are the details that make a second run inside one turn correct rather than
   repair run are routed through one shared helper that observes headroom under the active usage key,
   parses, and cleans up — with the repair's own failure handling layered on top of it.
 - **Usage folding.** Claude reports per-turn usage; Codex reports the conversation's running total.
-  So the two runs fold differently: `usage_is_cumulative ? take the later reading : sum the two`.
+  So the two runs fold differently: `usage_is_cumulative ? take the later reading : sum the two` —
+  **except the per-invocation counters, which are summed either way**. "Cumulative" is true of
+  Codex's token and cost readings, not of everything in `Usage`: `api_calls` counts the
+  `turn.completed` events seen in *that* invocation, so taking the later reading wholesale drops the
+  main run's model calls — the figure that exists to explain why a turn costs more than its prompt.
+  (Implementation review, f2.)
   This becomes a pure `metrics::fold_runs` with tests, next to `reconcile_cumulative`, rather than an
   inline conditional — mis-folding here reproduces exactly the bug that function already exists to
   prevent (a thread total recorded as a turn's cost). A repair run that reports no usage leaves the
