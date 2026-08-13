@@ -180,8 +180,9 @@ impl Reviewer for CodexReviewer {
                 crate::evidence::SERVER_NAME
             ),
             format!(
-                "mcp_servers.{}.tool_timeout_sec=30",
-                crate::evidence::SERVER_NAME
+                "mcp_servers.{}.tool_timeout_sec={}",
+                crate::evidence::SERVER_NAME,
+                crate::evidence::CODEX_TOOL_TIMEOUT_SECS
             ),
             format!(
                 "mcp_servers.{}.default_tools_approval_mode=\"approve\"",
@@ -1210,6 +1211,23 @@ mod tests {
             .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
             .expect("ordinary tool error does not invalidate transport");
         assert_eq!(parsed.text, "REQUEST CHANGES");
+    }
+
+    // A bounded evidence read that timed out returns an in-band `read_timeout` tool error
+    // (top-level error:null, status:completed) — the shape the #61 watchdog produces before Codex's
+    // 30s abandon. Like any ordinary tool error it must NOT invalidate an otherwise complete review
+    // (findings f6/f11); only a top-level transport error does (the test above).
+    #[test]
+    fn an_in_band_read_timeout_does_not_invalidate_the_review() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":{"content":[{"type":"text","text":"read_timeout: reading 'x' exceeded the evidence read budget"}],"is_error":true},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .expect("a timely in-band read_timeout does not invalidate the review");
+        assert_eq!(parsed.text, "APPROVE");
     }
 
     #[test]
