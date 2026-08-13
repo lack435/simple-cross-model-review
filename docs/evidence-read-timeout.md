@@ -60,11 +60,20 @@ The 30s in the error is **not our constant**. It is Codex's own MCP client-side
 **abandons the call at the transport level** and emits an `item.completed` for the `mcp_tool_call`
 carrying a non-null top-level `error` and `status: "failed"`.
 
-That top-level transport error is what is fatal. `parse` (`src/reviewer/codex.rs:239-248`)
-returns `EVIDENCE_UNAVAILABLE` — **even on an otherwise-complete review** — the moment
-`events.evidence_infrastructure_errors` is non-empty, and `parse_events`
-(`src/reviewer/codex.rs:691-704`) fills that vector only from a **non-null top-level
-`item.error`** on an evidence `mcp_tool_call`. Two existing tests pin exactly this line:
+That top-level transport error is what is fatal. `parse` returns `EVIDENCE_UNAVAILABLE` — **even on
+an otherwise-complete review** — the moment `events.evidence_infrastructure_errors` is non-empty, and
+`parse_events` fills that vector only from a **non-null top-level `item.error`** on an evidence
+`mcp_tool_call`. Two existing tests pin exactly this line:
+
+> **Amended by #71.** The rule above is no longer unconditional. One narrowly-specified shape — the
+> abandonment Codex reports as a failed tool call carrying its own `timed out awaiting tools/call`
+> phrase — is demoted to a `warnings` entry on a review that otherwise completed, **and only when at
+> least one other evidence call in the same turn completed**, which is the evidence that the service
+> was answering rather than absent. A turn that does not survive it fails as the separate
+> `EVIDENCE_CALL_ABANDONED`. Everything else that reaches `evidence_infrastructure_errors` is still
+> fatal exactly as described here, and the demotion deliberately matches an observed shape rather
+> than inferring a service's state from error prose — five review findings in a row landed on that
+> inference before it was removed.
 
 - `evidence_transport_error_invalidates_an_otherwise_completed_review`
   (`src/reviewer/codex.rs:1189-1200`) — a call with top-level `"error":"connection closed"`,
@@ -195,7 +204,8 @@ is a **pure function of its inputs**: none of it needs `&mut Core`. The one stat
   and *then* `current_stamp()` computes the drift stamp through a **single-attempt bounded walk**
   (`run_bounded_stamp` on the watchdog) and caches it in `observed_stamp`. Order and cache semantics
   match the original; both the read and — since `scope` also calls `current_stamp()` — `scope` are
-  now fully bounded. Only `list`/search-base `walk_files` remain the deferred sibling follow-up.
+  now fully bounded. `list`/search-base `walk_files` were the deferred sibling follow-up and are
+  bounded as of #71.
 - The request thread blocks on `recv_timeout(remaining_budget)`.
   - **Completed in time** → the main thread does the cheap CPU-bound post-processing exactly as
     today (UTF-8/binary/line-cap checks, response assembly) and caches the returned stamp into
@@ -309,16 +319,19 @@ this removes. So:
     client that is not reading. So the guarantee is "the read produces its result within budget,"
     not "the result reaches a client that has stopped listening." (Bounding the write would not
     help — there is nowhere for the bytes to go — so it is named and excluded, not attempted.)
-  - **Not bounded — the remaining sibling walks (f13; narrowed as implemented).** As implemented,
-    the `tree_stamp` drift walk *is* bounded — for both `repository_read` and `repository_scope`,
-    via the single-attempt `run_bounded_stamp` on `current_stamp()` (impl f4). What remains
-    unbounded is `repository_list`'s `walk_files` and `repository_search`'s own
-    `resolve_existing`/`walk_files` *before* its per-file reads: those can still stall and consume
-    the client clock. Applying the same helper to those two walks is the documented follow-up.
-  So the honest guarantee is narrow and exact: **`repository_read` and `repository_scope` are bounded
-  from receipt** (file I/O and the drift stamp), and `search`'s per-file reads are too. It is
-  explicitly **not** "the review can never see a transport abandon from any cause" — the output path
-  and the `list`/search-base walks are named exclusions, not silent gaps.
+  - **Bounded since #71 — the remaining sibling walks (f13).** This was the documented follow-up,
+    and it was not optional in the end: with only the read path bounded, two of three reviews on
+    this repository still died the #61 death, because the budget bounded one *stage* rather than the
+    *request*. Issue #71 closed it — `repository_list`'s enumeration and `repository_search`'s
+    `resolve_existing`/`walk_files` now run on the same watchdog (their own worker pool), the
+    cooperative `deadline()` takes the tighter of the per-operation timeout and the request budget,
+    the Git evidence commands derive their child timeout from the request's receipt instant rather
+    than starting a fresh one, and a request whose budget is already spent at dispatch is refused
+    in-band. See that issue and the change on `fix/evidence-operation-deadlines`.
+  So the guarantee this document describes was, as written, **`repository_read` and
+  `repository_scope` bounded from receipt** (file I/O and the drift stamp) plus `search`'s per-file
+  reads. #71 widened it to every operation. What remains excluded is the output path above: it is
+  explicitly **not** "the review can never see a transport abandon from any cause".
 - **The coupling is asserted, not just intended.** A `debug_assert` / `Limits::validate()` clause
   rejects any configuration where the derived read budget plus its margin is not safely below the
   emitted `tool_timeout_sec`. If a serialized `read_budget_ms` field is added to `Limits`, the
@@ -371,7 +384,7 @@ not. This is documented as a contract and locked by a new test (below), rather t
   content validation, through a single-attempt bounded walk (`run_bounded_stamp` via
   `current_stamp`) so `read` and `scope` are both bounded without the stamp preceding content errors
   (impl f3/f4). `search`'s per-file reads route through the same file-read watchdog (f9/f13); its
-  own walk and `list`'s stay follow-up.
+  own walk and `list`'s were the deferred follow-up and are bounded as of #71.
 - `src/evidence.rs` — the shared `CODEX_TOOL_TIMEOUT_SECS` ceiling constant (also emitted as
   `tool_timeout_sec` from `src/reviewer/codex.rs`); the receipt `Instant` stamped in `read_requests`
   and threaded through the **bounded** dispatch channel → `serve_requests` → `handle` →
@@ -451,3 +464,9 @@ alternative both named so the follow-up is deliberate, not forgotten.
    keeps the end-to-end "no call ever hits the abandon" claim honestly scoped.
    Is that the right cut, or should the directory-walk syscalls be wrapped in the same helper now so
    the stronger end-to-end guarantee holds in this change rather than after it?
+
+   **Answered by events (#71).** It was not the right cut. The narrow scope was honestly *stated*,
+   but a review does not care which stage held the loop, and two of three reviews on this repository
+   still died the same death with this change shipped. Bounding a stage is not bounding a request.
+   The follow-up was done as its own issue rather than in this one, which was the correct order —
+   but "documented follow-up" turned out to mean "the bug is still there and now has a footnote".

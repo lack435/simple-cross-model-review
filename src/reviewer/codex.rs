@@ -222,7 +222,43 @@ impl Reviewer for CodexReviewer {
                 detail = format!("{}\n\n{}", events.errors.join("\n"), detail);
             }
 
-            if evidence_startup_failure(&evidence) {
+            // Every evidence signal in the turn is collected before any of them is acted on, and
+            // the graver ones dominate (round-4 finding f10). Deciding on "is *any* message an
+            // abandoned call" let a timeout sitting beside a genuinely dead service — a
+            // `cross_review_evidence: connection closed` — be reported as the retryable one.
+            //
+            // **All three sources, at their own scoping.** The round-4 fix aggregated only the
+            // stream errors and stderr and missed the per-item errors entirely, so a dead service
+            // reported on an `mcp_tool_call` item beside a stream-level abandon was still masked —
+            // the same defect the finding named, one source further along, and the round-4 test
+            // passed only because it put the fatal error in a stream event rather than on an item
+            // (round-6, f10 held open). Item errors are server-scoped by the parser; stream errors
+            // and stderr are not and must name the server themselves.
+            let evidence_signals: Vec<EvidenceSignal> =
+                collect_evidence_signals(&events, &out.stderr, true)
+                    .into_iter()
+                    .map(|(signal, _)| signal)
+                    .collect();
+            let unusable = evidence_signals
+                .iter()
+                .any(|s| matches!(s, EvidenceSignal::StartupFailure | EvidenceSignal::Unusable));
+            if unusable {
+                return Err(errors::evidence_unavailable(detail));
+            }
+            // The turn died on an abandoned evidence call rather than a service that never came
+            // up. Nothing usable survives — the CLI exited non-zero, so there is no verdict to
+            // trust — but the caller is owed the true cause and its true remedy, which is to retry
+            // rather than to go looking at an executable and a state directory that are fine.
+            if evidence_signals.contains(&EvidenceSignal::AbandonedCall) {
+                // The same proof the completed path requires (round-4 finding f11): this code's
+                // own message tells the caller the service was running and answering, so it may
+                // only be used where something actually answered. A lone abandoned call with
+                // nothing successful beside it is a service that never demonstrably worked, and
+                // saying otherwise would be the failure code misreporting the reviewer's state —
+                // the very thing this change set out to stop doing.
+                if events.evidence_calls_succeeded > 0 {
+                    return Err(errors::evidence_call_abandoned(detail));
+                }
                 return Err(errors::evidence_unavailable(detail));
             }
             // An expired resume target is detected inside `classify`.
@@ -236,8 +272,50 @@ impl Reviewer for CodexReviewer {
             ));
         }
 
-        if !events.evidence_infrastructure_errors.is_empty() {
-            let errors = events.evidence_infrastructure_errors.join("\n");
+        // An evidence error that means the *service* is unusable still invalidates the review, even
+        // a complete one: everything it says may rest on evidence it could not get and does not know
+        // it missed. An abandoned *call* is different in kind — the service answered before and
+        // after, and the reviewer was handed the tool error in-band, so it could account for the gap
+        // exactly as it accounts for a refused shell command. That one is carried as a warning on a
+        // review that otherwise completed, in the same channel as a truncated capture: the caller is
+        // told the evidence was short, rather than losing a finished review to it (#71).
+        //
+        // The demotion is **conditional on proof, not on phrasing** (round-1 finding f3). The
+        // earlier draft's warning asserted that the service stayed up while checking nothing of the
+        // sort; here a turn qualifies only if at least one evidence call actually *succeeded*
+        // alongside the abandoned one. With no successful call there is no evidence the service was
+        // ever usable, so the fail-closed reading stands and the review is invalidated as before.
+        // Both branches classify through the same function, in the same order, for the reason
+        // round-2 finding f6 found the hard way: this path filtered on "is it an abandoned call"
+        // alone, so an item error carrying the decisive `required MCP servers failed to initialize`
+        // marker *and* a timeout phrase was demoted to a warning and the review returned. A
+        // startup failure must outrank an abandoned call wherever the two are told apart, not just
+        // where I happened to write the precedence first.
+        //
+        // Round-7 finding f15: this path read only the item errors, so a server-named failure
+        // arriving as a *stream* error on a turn that exited zero — `RunOutcome::success` is the
+        // process status, not the absence of error events — returned a verdict over unusable
+        // evidence. It now draws on the same collector as the failed branch.
+        let service_answered = events.evidence_calls_succeeded > 0;
+        let signals = collect_evidence_signals(&events, &out.stderr, false);
+        let demoted =
+            |signal: EvidenceSignal| service_answered && signal == EvidenceSignal::AbandonedCall;
+        let abandoned_evidence_calls: Vec<String> = signals
+            .iter()
+            .filter(|(signal, _)| demoted(*signal))
+            .map(|(_, message)| message.clone())
+            .collect();
+        let unusable_service: Vec<&String> = signals
+            .iter()
+            .filter(|(signal, _)| !demoted(*signal) && *signal != EvidenceSignal::Unrelated)
+            .map(|(_, message)| message)
+            .collect();
+        if !unusable_service.is_empty() {
+            let errors = unusable_service
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             let diagnostics = out.diagnostics();
             let detail = if diagnostics.trim().is_empty() {
                 errors
@@ -332,6 +410,21 @@ impl Reviewer for CodexReviewer {
             warnings.push(format!(
                 "The repository evidence service completed {} tool call(s) during this turn.",
                 events.evidence_calls
+            ));
+        }
+        if !abandoned_evidence_calls.is_empty() {
+            warnings.push(format!(
+                "{abandoned} repository evidence call(s) were abandoned by the reviewer CLI's own \
+                 per-call timeout, so the reviewer did not receive that evidence and the review \
+                 below may rest on less than it intended to read. {succeeded} other evidence \
+                 call(s) in this turn completed, which is why this is reported rather than treated \
+                 as an unusable service. Two limits on that, stated rather than implied: it shows \
+                 the service answered somewhere in the turn, not that it was healthy either side \
+                 of the abandoned call, and what the reviewer did about the gap it was told of \
+                 in-band is its own account to give and is not checked here. {detail}",
+                abandoned = abandoned_evidence_calls.len(),
+                succeeded = events.evidence_calls_succeeded,
+                detail = abandoned_evidence_calls.join("; ")
             ));
         }
 
@@ -650,6 +743,11 @@ struct Events {
     /// input is explained rather than read as a silent gap.
     input_inconsistent: bool,
     evidence_calls: u32,
+    /// Evidence calls that completed **without** a transport-level error — the positive proof that
+    /// the service was answering this turn. `evidence_calls` counts attempts, which cannot
+    /// distinguish "the service served us" from "every call died", so a demotion resting on the
+    /// attempt count would be resting on nothing (round-1 finding f3).
+    evidence_calls_succeeded: u32,
     evidence_infrastructure_errors: Vec<String>,
 }
 
@@ -700,6 +798,9 @@ fn parse_events(stdout: &str) -> Events {
                             Value::String(s) => s.clone(),
                             other => other.to_string(),
                         });
+                    } else {
+                        events.evidence_calls_succeeded =
+                            events.evidence_calls_succeeded.saturating_add(1);
                     }
                 }
             }
@@ -778,15 +879,108 @@ fn parse_events(stdout: &str) -> Events {
     events
 }
 
-fn evidence_startup_failure(evidence: &str) -> bool {
+const MCP_INIT_FAILURE_MARKER: &str = "required mcp servers failed to initialize";
+
+/// Whether a message is the **one abandonment shape this project has actually observed**.
+///
+/// Deliberately a conjunction over the observed text rather than an inference from it: Codex reports
+/// a call it gave up on as a *failed tool call* carrying its own timeout phrase, and both halves must
+/// be present. The earlier single-substring test, and the startup-word inference that grew up beside
+/// it to compensate, produced five findings in this one mechanism across five review rounds (f3, f6,
+/// f9, f10, f12) — every one of them a hole in guessing a service's state from prose. So the
+/// guessing is gone: this matches what was seen, and everything else about the evidence server is
+/// `Unusable` and fails closed.
+///
+/// The cost is stated rather than hidden. If a future Codex version phrases an abandon differently,
+/// this stops matching and such a turn fails as `EVIDENCE_UNAVAILABLE` — a worse message for the
+/// caller, but the safe direction, and a visible one that leads back here.
+fn is_evidence_call_abandoned(evidence: &str) -> bool {
     let lower = evidence.to_ascii_lowercase();
-    lower.contains("required mcp servers failed to initialize")
-        || (lower.contains(crate::evidence::SERVER_NAME)
-            && (lower.contains("failed")
-                || lower.contains("initialize")
-                || lower.contains("startup")
-                || lower.contains("configuration")
-                || lower.contains("unknown field")))
+    lower.contains("timed out awaiting tools/call") && lower.contains("tool call failed")
+}
+
+/// Every evidence signal in a turn, paired with the message it came from, collected from **all** the
+/// sources that can carry one, each at its correct scoping.
+///
+/// This exists because the same defect appeared four times in four places — a rule applied to one
+/// branch (f6), one half of a judgement (f9), or one of the sources (f10 on the failed path, f15 on
+/// the completed one). Each fix was correct and each left the next instance standing. One collector
+/// both branches call is what stops a fifth: a source added here is seen by everything.
+///
+/// - **Item errors** are scoped: `parse_events` records them only from an `mcp_tool_call` whose
+///   `server` field is this evidence server, so their text need not name it.
+/// - **Stream errors** are unscoped and must name the server themselves, or they are `Unrelated` —
+///   an ordinary `"stream disconnected before completion"` says nothing about the evidence service.
+/// - **stderr** participates only when `include_stderr` is set, which is the failed-turn path. On a
+///   *completed* turn stderr is ordinary CLI logging that may mention the server's name in passing,
+///   and reading a benign mention as "unusable" would fail every healthy review. That asymmetry is
+///   deliberate rather than another missed source: on a failed turn the text is being read to
+///   explain a failure that already happened, which is what `classify` reads it for too.
+fn collect_evidence_signals(
+    events: &Events,
+    stderr: &str,
+    include_stderr: bool,
+) -> Vec<(EvidenceSignal, String)> {
+    let stderr = stderr.trim();
+    events
+        .evidence_infrastructure_errors
+        .iter()
+        .map(|m| (evidence_message_signal(m, true), m.clone()))
+        .chain(
+            events
+                .errors
+                .iter()
+                .map(|m| (evidence_message_signal(m, false), m.clone())),
+        )
+        .chain(
+            Some(stderr)
+                .filter(|m| include_stderr && !m.is_empty())
+                .map(|m| (evidence_message_signal(m, false), m.to_string())),
+        )
+        .collect()
+}
+
+/// What one evidence error message is evidence *of*. One classifier, one precedence order, used by
+/// both `parse` branches — the alternative is what round-2 finding f6 caught: two places deciding
+/// the same question, one of them missing the decisive marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvidenceSignal {
+    /// The service could not start, by its own explicit marker. Outranks everything.
+    StartupFailure,
+    /// The observed abandonment shape, with the service otherwise answering.
+    AbandonedCall,
+    /// About this server, but not a shape we recognise. Fail closed.
+    Unusable,
+    /// Not about this server at all. Only reachable for an unscoped message; carries no claim
+    /// either way, so it neither condemns the evidence service nor excuses it.
+    Unrelated,
+}
+
+/// Classify one message. `server_scoped` says whether the caller already knows the message belongs
+/// to this evidence server: item errors do (the parser filters on the item's `server` field), while
+/// the failed-turn path's stream errors do not and must name the server themselves.
+///
+/// The scoping applies to **both** halves of the judgement (round-3 finding f9), and every branch
+/// that is not an explicitly recognised shape ends at `Unusable`, which is fatal. There is no
+/// inferred middle any more.
+fn evidence_message_signal(message: &str, server_scoped: bool) -> EvidenceSignal {
+    let lower = message.to_ascii_lowercase();
+    // The server's own explicit marker is decisive at either scoping.
+    if lower.contains(MCP_INIT_FAILURE_MARKER) {
+        return EvidenceSignal::StartupFailure;
+    }
+    // Is this message about our server at all? A scoped one is by construction; an unscoped one has
+    // to say so. Without this an unrelated stream error ("stream disconnected before completion")
+    // would read as an unusable evidence service.
+    let ours = server_scoped || lower.contains(&crate::evidence::SERVER_NAME.to_ascii_lowercase());
+    if !ours {
+        return EvidenceSignal::Unrelated;
+    }
+    if is_evidence_call_abandoned(message) {
+        EvidenceSignal::AbandonedCall
+    } else {
+        EvidenceSignal::Unusable
+    }
 }
 
 const POLICY_DENIAL_MARKER: &str = "rejected: blocked by policy";
@@ -1227,6 +1421,333 @@ mod tests {
             .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
             .expect("a timely in-band read_timeout does not invalidate the review");
         assert_eq!(parsed.text, "APPROVE");
+    }
+
+    // #71: the failure this repository lost two plan reviews to. Codex abandons one `tools/call` on
+    // its own 30s ceiling and reports it as a tool call that "failed" for `cross_review_evidence`,
+    // which the startup predicate matched on substrings alone — so a review nineteen minutes in was
+    // reported as a service that could not start and a review that "was not started".
+    #[test]
+    fn an_abandoned_evidence_call_is_not_reported_as_a_startup_failure() {
+        let abandoned = "tool call error: tool call failed for `cross_review_evidence/repository_read`\n\nCaused by:\n    timed out awaiting tools/call after 30s";
+        // The observed shape, at either scoping: a failed tool call carrying the timeout phrase.
+        assert!(is_evidence_call_abandoned(abandoned));
+        for scoped in [true, false] {
+            assert_eq!(
+                evidence_message_signal(abandoned, scoped),
+                EvidenceSignal::AbandonedCall
+            );
+            // The explicit startup marker outranks it, even in a message carrying both phrases.
+            assert_eq!(
+                evidence_message_signal(
+                    "required MCP servers failed to initialize: cross_review_evidence",
+                    scoped
+                ),
+                EvidenceSignal::StartupFailure
+            );
+            assert_eq!(
+                evidence_message_signal(
+                    "required MCP servers failed to initialize: cross_review_evidence (timed out awaiting tools/call)",
+                    scoped
+                ),
+                EvidenceSignal::StartupFailure
+            );
+        }
+        // A dead transport is not an abandoned call, and is no longer inferred about: anything
+        // about this server that is not a recognised shape fails closed (round-5 f12).
+        assert!(!is_evidence_call_abandoned(
+            "cross_review_evidence: connection closed"
+        ));
+        assert_eq!(
+            evidence_message_signal("cross_review_evidence: connection closed", false),
+            EvidenceSignal::Unusable
+        );
+    }
+
+    // A failed turn whose cause was an abandoned call gets its own code and its own remediation:
+    // "retry", not "check your executable and state directory", which are not the problem. It takes
+    // the same proof of availability the completed path takes (round-4 f11) — the real incident this
+    // models had many successful evidence calls before the abandon.
+    #[test]
+    fn an_abandoned_call_that_kills_the_turn_has_its_own_failure_code() {
+        let abandon = r#"{"type":"error","message":"tool call error: tool call failed for `cross_review_evidence/repository_read`\n\nCaused by:\n    timed out awaiting tools/call after 30s"}"#;
+        let served = r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_scope","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#;
+        let mut failed = outcome(&format!("{served}\n{abandon}"), false);
+        failed.stderr = String::new();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &failed, None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_CALL_ABANDONED");
+        assert!(error.summary.to_lowercase().contains("gave up"));
+        // The old text claimed the review never started, which was false for a 19-minute review.
+        assert!(!error.summary.contains("was not started"));
+
+        // Round-4 f11: with nothing successful beside it, there is no evidence the service was ever
+        // answering, so the code that says it was must not be used.
+        let mut alone = outcome(abandon, false);
+        alone.stderr = String::new();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &alone, None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+    }
+
+    // Round-4 f10: a timeout must not shield a genuinely dead service sitting beside it. The graver
+    // signal in the turn decides, not whichever one the branch happened to test for first.
+    #[test]
+    fn a_timeout_beside_a_dead_service_reports_the_dead_service() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_scope","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"error","message":"tool call error: tool call failed for `cross_review_evidence/repository_read`\n\nCaused by:\n    timed out awaiting tools/call after 30s"}"#,
+            "\n",
+            r#"{"type":"error","message":"cross_review_evidence: connection closed"}"#,
+        );
+        let mut failed = outcome(stream, false);
+        failed.stderr = String::new();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &failed, None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+
+        // An unrelated stream error is not evidence about our service either way, so it neither
+        // condemns it nor is mistaken for it.
+        assert_eq!(
+            evidence_message_signal("stream disconnected before completion", false),
+            EvidenceSignal::Unrelated
+        );
+    }
+
+    // Round-7 f15: the mirror of f10 on the completed path. `RunOutcome::success` is the process
+    // status, not the absence of error events, so a turn can exit zero with a server-named failure
+    // in a *stream* error — which that path did not read at all, and would have returned a verdict
+    // over unusable evidence.
+    #[test]
+    fn a_completed_turn_fails_on_a_stream_level_service_error() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_scope","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"error","message":"cross_review_evidence: connection closed"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+
+        // An unrelated stream error on a healthy turn is still not a failure, and — the reason
+        // stderr is excluded from this path — a *successful* run whose stderr merely mentions the
+        // server by name must still return its review.
+        let healthy = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_scope","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"error","message":"stream disconnected before completion"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let mut ok = outcome(healthy, true);
+        ok.stderr = "starting MCP server cross_review_evidence".into();
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &ok, None)
+            .expect("a benign mention must not fail a healthy review");
+        assert_eq!(parsed.text, "APPROVE");
+    }
+
+    // Round-6, f10 held open: the same masking, one source further along. A dead service reported on
+    // an evidence *item* rather than as a stream error must dominate a stream-level abandon just the
+    // same — and the round-4 test could not catch it, because it put the fatal error in a stream
+    // event. Note the item error need not name the server: the parser already scoped it.
+    #[test]
+    fn an_item_level_service_error_still_dominates_a_stream_level_abandon() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_scope","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_list","arguments":{},"result":null,"error":"connection closed","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"error","message":"tool call error: tool call failed for `cross_review_evidence/repository_read`\n\nCaused by:\n    timed out awaiting tools/call after 30s"}"#,
+        );
+        let mut failed = outcome(stream, false);
+        failed.stderr = String::new();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &failed, None)
+            .unwrap_err();
+        assert_eq!(
+            error.code, "EVIDENCE_UNAVAILABLE",
+            "an item-level dead service must not be masked by a stream-level abandon"
+        );
+    }
+
+    // A review that completed despite an abandoned call is returned, with the shortfall named —
+    // the same treatment a truncated capture gets. Losing a finished review to one late read is
+    // what made this failure expensive rather than merely annoying.
+    #[test]
+    fn an_abandoned_call_warns_but_does_not_discard_a_completed_review() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"tool call failed: timed out awaiting tools/call after 30s","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_list","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"REQUEST CHANGES"}}"#,
+        );
+        let parsed = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .expect("an abandoned call does not discard a completed review");
+        assert_eq!(parsed.text, "REQUEST CHANGES");
+        let warning = parsed
+            .warnings
+            .iter()
+            .find(|w| w.contains("abandoned"))
+            .expect("the shortfall is named");
+        assert!(warning.contains("may rest on less"));
+    }
+
+    // Round-1 f3, first half: the demotion must rest on proof that the service was answering, not
+    // on the wording of the error. With no successful evidence call in the turn there is nothing
+    // showing the service was ever usable, so the fail-closed reading stands.
+    #[test]
+    fn an_abandoned_call_with_no_successful_call_still_invalidates_the_review() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"tool call failed: timed out awaiting tools/call after 30s","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+    }
+
+    // Round-1 f3, second half: on the failed-turn path the text being classified is a blob of
+    // stderr plus every stream error event, so a timeout phrase that belongs to some *other* MCP
+    // server must not be read as ours. It also must not suppress the startup classification.
+    #[test]
+    fn another_servers_call_timeout_is_not_read_as_ours() {
+        let foreign = "tool call error: tool call failed for `some_other_server/do_thing`\n\nCaused by:\n    timed out awaiting tools/call after 30s";
+        // It is the abandonment *shape*, but not about our server, so unscoped it carries no claim
+        // about the evidence service at all.
+        assert!(is_evidence_call_abandoned(foreign));
+        assert_eq!(
+            evidence_message_signal(foreign, false),
+            EvidenceSignal::Unrelated,
+            "a timeout in another server's call is not evidence about ours"
+        );
+
+        let mut failed = outcome(
+            &format!(
+                r#"{{"type":"error","message":"{}"}}"#,
+                foreign.replace('\n', "\\n")
+            ),
+            false,
+        );
+        failed.stderr = "cross_review_evidence failed to initialize".into();
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &failed, None)
+            .unwrap_err();
+        assert_eq!(
+            error.code, "EVIDENCE_UNAVAILABLE",
+            "a foreign timeout must not shield a real evidence startup failure"
+        );
+    }
+
+    // Round-2 f6: the decisive startup marker must outrank the abandon demotion on the *completed*
+    // path too, not only on the failed-turn one. A successful call elsewhere in the turn must not
+    // buy a pass for a message that says the server failed to initialize.
+    #[test]
+    fn a_completed_turn_still_fails_on_a_startup_marker_beside_a_successful_call() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_list","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"required MCP servers failed to initialize: cross_review_evidence (timed out awaiting tools/call)","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+        // And the classifier itself ranks them, on both scopings.
+        let both = "required MCP servers failed to initialize: cross_review_evidence (timed out awaiting tools/call)";
+        assert_eq!(
+            evidence_message_signal(both, true),
+            EvidenceSignal::StartupFailure
+        );
+        assert_eq!(
+            evidence_message_signal(both, false),
+            EvidenceSignal::StartupFailure
+        );
+    }
+
+    // Round-3 f9: an item error is scoped to this server by `item.server`, so it need not repeat
+    // the server name in its own text. The startup classification must honour that scoping too —
+    // otherwise a message that plainly describes a service that never came up is demoted to an
+    // abandoned call because it did not name the server it was already known to be about.
+    #[test]
+    fn a_server_scoped_startup_failure_need_not_name_the_server() {
+        let no_name = "failed to initialize: timed out awaiting tools/call";
+        // Round-5 f12 deleted the startup-word inference, so this is no longer *labelled* a startup
+        // failure — it does not carry the explicit marker, and it is not the observed abandonment
+        // shape either. It lands in `Unusable`, which is what f9 actually required: it must not be
+        // demoted to a warning. The classification is now weaker and the outcome identical, which is
+        // the trade f12 asked for.
+        assert_eq!(
+            evidence_message_signal(no_name, true),
+            EvidenceSignal::Unusable,
+            "an item error is already scoped to this server and must fail closed"
+        );
+        // Unscoped, the same text could be about any server: it is not our startup failure, not our
+        // abandoned call, and not evidence that our service is unusable either.
+        assert_eq!(
+            evidence_message_signal(no_name, false),
+            EvidenceSignal::Unrelated
+        );
+
+        // End to end: a successful call beside it must not buy it a demotion to a warning.
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_list","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"failed to initialize: timed out awaiting tools/call","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+
+        // The ordinary abandoned call still reads as one: "failed" alone is too weak to outrank it.
+        assert_eq!(
+            evidence_message_signal(
+                "tool call failed: timed out awaiting tools/call after 30s",
+                true
+            ),
+            EvidenceSignal::AbandonedCall
+        );
+    }
+
+    // But a service that is actually unusable still invalidates the review, exactly as before: the
+    // widening above is one narrowly-matched case, not a general softening.
+    #[test]
+    fn a_mixed_stream_still_fails_on_the_unusable_service_error() {
+        let stream = concat!(
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_read","arguments":{"path":"x"},"result":null,"error":"tool call failed: timed out awaiting tools/call after 30s","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"cross_review_evidence","tool":"repository_list","arguments":{},"result":null,"error":"connection closed","status":"failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE"}}"#,
+        );
+        let error = CodexReviewer
+            .parse(&cfg(), cfg().primary(), &outcome(stream, true), None)
+            .unwrap_err();
+        assert_eq!(error.code, "EVIDENCE_UNAVAILABLE");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("connection closed"),
+            "the fatal cause is what is reported, not the abandoned call beside it"
+        );
     }
 
     #[test]

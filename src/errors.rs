@@ -404,6 +404,32 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// The reviewer CLI abandoned one repository-evidence call on its own per-call timeout and the turn
+/// did not survive it.
+///
+/// Deliberately not `EVIDENCE_UNAVAILABLE`. That code says the service could not be proved available
+/// and the review was never started, and its remediation sends the caller to look at the executable,
+/// the state directory and the strict-MCP configuration — all of which are fine here. This failure
+/// happens with the service demonstrably up, often many minutes into a review that was going well,
+/// and its remedy is simply to run the review again. Reporting one as the other is the class of bug
+/// `AGENTS.md` names: a failure code that misreports the reviewer's state.
+pub fn evidence_call_abandoned(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "EVIDENCE_CALL_ABANDONED",
+        "The reviewer CLI gave up on a repository-evidence call before it was answered, and the \
+         review did not survive it.",
+        "At least one other evidence call in the same turn completed, so the service was answering \
+         rather than absent — one call then took longer than the reviewer CLI's own per-call \
+         timeout, and the turn ended on it. (That is the whole of what was checked: some call \
+         succeeded somewhere in the turn, not that the service was healthy either side of the one \
+         that was abandoned.) Retry the review. If it recurs on most attempts, something on this \
+         machine is holding the evidence service up (an on-access antivirus scanner over the \
+         repository is the usual cause), and that is worth reporting against this project rather \
+         than working around. The review has NOT been performed.",
+    )
+    .with_detail(detail)
+}
+
 pub fn reviewer_crashed(reviewer: &str, exit: Option<i32>, detail: impl Into<String>) -> Failure {
     let exit_desc = match exit {
         Some(c) => format!("exit code {c}"),

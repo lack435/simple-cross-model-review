@@ -271,6 +271,20 @@ checks its identity and exact seven-tool closed-schema allow-list, and closes it
 starts the same entry with `required=true`; handshake, startup, transport, or strict-config
 failure returns `EVIDENCE_UNAVAILABLE`, never an evidence-thinned review.
 
+One case is deliberately outside that rule, and it is a narrow one. Codex applies its own
+per-call `tool_timeout_sec` to every evidence call, and abandons the call when it expires.
+A review that *completed* despite one is returned with the shortfall named in `warnings` --
+the same channel a truncated capture uses -- rather than discarded, on two conditions that
+are checked rather than assumed: the message must not carry a startup-failure marker, and
+**at least one other evidence call in the same turn must have completed**, which is what
+distinguishes a service that was answering from one that was never usable. Note the exact
+strength of that second check: it proves the service answered *somewhere* in the turn, not
+that it answered either side of the abandoned call, and nothing here verifies what the
+reviewer did about the gap it was told about in-band. A turn that did not survive the
+abandon fails as `EVIDENCE_CALL_ABANDONED`. Everything else -- a closed connection, a dead
+channel, or any abandon with no successful call beside it -- is still an unusable service
+and still invalidates the review whether or not it completed.
+
 The last two rows are one `--diff` value apart and are not the same thing, because that is
 git's own semantics: `A..B` and `A...B` compare two commits, while a bare `A` compares A to
 the working tree. So `--diff HEAD~3` carries your uncommitted edits and `--diff main...HEAD`
@@ -804,7 +818,10 @@ Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVA
 `RATE_LIMITED`, `REVIEWERS_EXHAUSTED` (every entry in a fallback chain hit a rate/usage
 limit), `INVALID_REVIEWER_CHAIN` (the configured chain is unusable, so every review is
 refused until it is fixed), `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
-`OUTPUT_TRUNCATED`, `EVIDENCE_UNAVAILABLE`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `CANCELLED`,
+`OUTPUT_TRUNCATED`, `EVIDENCE_UNAVAILABLE`, `EVIDENCE_CALL_ABANDONED` (the reviewer CLI gave up
+on one evidence call before it was answered and the turn did not survive it -- distinct from
+`EVIDENCE_UNAVAILABLE` because the service was up and the remedy is simply to retry),
+`SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `CANCELLED`,
 `SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad tool arguments, a session already busy, a
 session refused as not resumable, and too many reviews already running (`TOO_MANY_RUNNING`,
 the `--max-concurrent-reviews` backstop) get a plain correction instead, since each is the
