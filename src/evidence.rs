@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +22,11 @@ use serde_json::{json, Value};
 pub const SERVER_FLAG: &str = "--evidence-server";
 pub const SERVER_NAME: &str = "cross_review_evidence";
 pub const SCHEMA_VERSION: u32 = 1;
+/// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
+/// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
+/// it, and the evidence read watchdog (`src/evidence/core.rs`) derives its budget from it with a
+/// compile-time margin, so the two can never drift into inversion (issue #61, finding f4).
+pub const CODEX_TOOL_TIMEOUT_SECS: u64 = 30;
 const PROTOCOL: &str = "2025-06-18";
 const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BUNDLE_FILES: usize = 256;
@@ -419,7 +424,22 @@ pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceErro
     let cancel = Arc::new(AtomicBool::new(false));
     let cancellations = Arc::new(RequestCancellations::default());
     let core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
-    let (sender, receiver) = mpsc::sync_channel::<Result<Vec<u8>, EvidenceError>>(8);
+    // A *bounded* dispatch channel: admission control that caps buffered requests, so a client that
+    // pipelines faster than the serial dispatcher drains cannot grow the queue until the evidence
+    // process runs out of memory (issue #61, code-review finding f8). When it is full the reader
+    // blocks on `send`, which stops it draining stdin and backpressures the client through the OS
+    // pipe — the explicit ingress contract.
+    //
+    // Receipt/budget contract (finding f6): each request's watchdog budget is measured from the
+    // `Instant` stamped the moment its line is read off the wire (`read_requests`), and any wait in
+    // this channel before dispatch is subtracted from the remaining budget (elapsed keeps growing).
+    // The one residual is a request that sat in the OS pipe *un-read* while the reader was blocked
+    // on a full queue: its pre-read wait is not in its budget. That requires the client to pipeline
+    // enough concurrent requests to saturate this queue *and* stall the dispatcher — the real MCP
+    // client issues evidence calls serially (request → response), so it never does. The residual is
+    // the same unobservable class as raw transport latency (we cannot stamp a request before we
+    // read it) and is covered by the budget margin, not a silent gap.
+    let (sender, receiver) = mpsc::sync_channel::<(Instant, Result<Vec<u8>, EvidenceError>)>(8);
     let reader_cancel = Arc::clone(&cancel);
     let reader_cancellations = Arc::clone(&cancellations);
     let reader = std::thread::Builder::new()
@@ -495,7 +515,7 @@ impl RequestCancellations {
 
 fn read_requests(
     max_request: usize,
-    sender: mpsc::SyncSender<Result<Vec<u8>, EvidenceError>>,
+    sender: mpsc::SyncSender<(Instant, Result<Vec<u8>, EvidenceError>)>,
     cancel: Arc<AtomicBool>,
     cancellations: Arc<RequestCancellations>,
 ) {
@@ -508,13 +528,21 @@ fn read_requests(
             .take(max_request as u64 + 1)
             .read_until(b'\n', &mut bytes)
             .map_err(|e| EvidenceError::new("protocol_read_failed", e.to_string()));
+        // Stamp the receipt the moment the request is fully read off the wire, before it can wait
+        // in the dispatch channel behind an in-flight request. The read watchdog measures its
+        // budget from here so a queued read cannot receive a fresh budget after Codex's client-side
+        // timer has been running (issue #61, code-review finding f1).
+        let received = Instant::now();
         match result {
             Ok(0) => break,
             Ok(_) if bytes.len() > max_request || !bytes.ends_with(b"\n") => {
-                let _ = sender.send(Err(EvidenceError::new(
-                    "request_too_large",
-                    "MCP request exceeded its byte cap",
-                )));
+                let _ = sender.send((
+                    received,
+                    Err(EvidenceError::new(
+                        "request_too_large",
+                        "MCP request exceeded its byte cap",
+                    )),
+                ));
                 break;
             }
             Ok(_) => {
@@ -530,12 +558,12 @@ fn read_requests(
                     }
                     continue;
                 }
-                if sender.send(Ok(bytes)).is_err() {
+                if sender.send((received, Ok(bytes))).is_err() {
                     break;
                 }
             }
             Err(e) => {
-                let _ = sender.send(Err(e));
+                let _ = sender.send((received, Err(e)));
                 break;
             }
         }
@@ -547,14 +575,14 @@ fn read_requests(
 }
 
 fn serve_requests<W: Write>(
-    receiver: mpsc::Receiver<Result<Vec<u8>, EvidenceError>>,
+    receiver: mpsc::Receiver<(Instant, Result<Vec<u8>, EvidenceError>)>,
     mut writer: W,
     mut core: core::Core,
     max_response: usize,
     cancel: Arc<AtomicBool>,
     cancellations: Arc<RequestCancellations>,
 ) -> Result<(), EvidenceError> {
-    while let Ok(message) = receiver.recv() {
+    while let Ok((received_at, message)) = receiver.recv() {
         let bytes = message?;
         let request: Value = serde_json::from_slice(&bytes)
             .map_err(|e| EvidenceError::new("invalid_jsonrpc", format!("invalid JSON-RPC: {e}")))?;
@@ -562,7 +590,7 @@ fn serve_requests<W: Write>(
         if let Some(id) = &request_id {
             cancellations.begin(id.clone(), &cancel);
         }
-        let Some(response) = handle(&request, &mut core) else {
+        let Some(response) = handle(&request, &mut core, received_at) else {
             if request_id.is_some() {
                 cancellations.finish(&cancel);
             }
@@ -602,7 +630,7 @@ fn serve_requests<W: Write>(
     Ok(())
 }
 
-fn handle(request: &Value, core: &mut core::Core) -> Option<Value> {
+fn handle(request: &Value, core: &mut core::Core, received_at: Instant) -> Option<Value> {
     let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -621,7 +649,7 @@ fn handle(request: &Value, core: &mut core::Core) -> Option<Value> {
                 .unwrap_or("");
             let empty = json!({});
             let arguments = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
-            match core.call(name, arguments) {
+            match core.call_with_receipt(name, arguments, received_at) {
                 Ok(structured) => json!({
                     "content":[{"type":"text","text":"Repository evidence returned in structuredContent."}],
                     "structuredContent":structured,
@@ -1000,6 +1028,7 @@ mod tests {
         let listed = handle(
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
             &mut core,
+            Instant::now(),
         )
         .unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
@@ -1020,9 +1049,9 @@ mod tests {
     fn scope_accepts_omitted_arguments_and_unknown_tools_fail_in_band() {
         let dir = temp_dir("evidence-call");
         let mut core = core::Core::new(bundle(dir.as_path())).unwrap();
-        let scope = handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"repository_scope"}}), &mut core).unwrap();
+        let scope = handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"repository_scope"}}), &mut core, Instant::now()).unwrap();
         assert_eq!(scope["result"]["isError"], false);
-        let unknown = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{}}}), &mut core).unwrap();
+        let unknown = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{}}}), &mut core, Instant::now()).unwrap();
         assert_eq!(unknown["result"]["isError"], true);
     }
 
@@ -1075,6 +1104,7 @@ mod tests {
                 "params":{"name":"repository_change","arguments":{"limit_bytes":max_change}}
             }),
             &mut core,
+            Instant::now(),
         )
         .unwrap();
         let encoded = serde_json::to_vec(&response).unwrap();

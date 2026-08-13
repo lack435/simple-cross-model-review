@@ -1,17 +1,332 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::{Bundle, EvidenceError, Limits, VcsKind};
+use super::{Bundle, EvidenceError, Limits, VcsKind, CODEX_TOOL_TIMEOUT_SECS};
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+// --- Bounded read watchdog (issue #61) -------------------------------------------------------
+//
+// A `repository_read` (and the per-file read `repository_search` performs) can block indefinitely
+// inside a filesystem syscall — `File::open`, `read_to_end`, `canonicalize`,
+// `GetFinalPathNameByHandleW` — when an on-access AV scanner is holding the file, an oplock is
+// contended, or the path is slow/redirected. The cooperative `deadline()` cannot interrupt a
+// blocked syscall (it only fires between operations), so such a read stalls the single-threaded
+// request loop until Codex's client-side `tool_timeout_sec` abandons the call at the transport
+// level and fails the *whole* review. The fix runs the blocking read on a detached worker thread
+// bounded by a wall-clock budget: on timeout we stop waiting and return a fast in-band error the
+// review survives, converting the fatal transport abandon into an ordinary tool error.
+
+/// Total wall-clock budget for one `repository_read`, measured from request receipt and shared
+/// across both attempts. Derived from the Codex ceiling with a margin covering queue wait, worker
+/// spawn, the retry backoff, and response serialisation, so our in-band timeout always beats the
+/// transport abandon.
+const READ_CEILING_MARGIN_MS: u64 = 10_000;
+const READ_BUDGET_MS: u64 = CODEX_TOOL_TIMEOUT_SECS * 1000 - READ_CEILING_MARGIN_MS;
+/// Per-attempt wait cap; a retry is bounded by whatever budget remains, never a fresh full cap.
+const READ_ATTEMPT_MS: u64 = 9_000;
+const READ_RETRY_BACKOFF_MS: u64 = 500;
+const MAX_READ_ATTEMPTS: u32 = 2;
+/// Hard cap on concurrently-live read worker threads. The evidence server runs *outside* the
+/// reviewer job object, so an abandoned worker lives until its syscall returns or the evidence
+/// process exits; capping the live count turns unbounded thread growth into a deterministic
+/// in-band `read_unavailable` refusal (finding f3).
+const READ_WORKER_CAP: usize = 8;
+
+// Compile-time coupling guard (finding f4): the whole read budget plus its margin must sit under
+// the Codex ceiling. Deriving both from one constant means this can never drift into inversion —
+// a bad change fails to compile rather than shipping a budget that races the abandon.
+const _: () = assert!(READ_BUDGET_MS + READ_CEILING_MARGIN_MS <= CODEX_TOOL_TIMEOUT_SECS * 1000);
+const _: () = assert!(READ_ATTEMPT_MS <= READ_BUDGET_MS);
+
+/// Number of read worker threads currently alive (awaited plus abandoned). Bounded by
+/// `READ_WORKER_CAP`. A `WorkerGuard` decrements it when a worker thread exits, whether it was
+/// awaited or abandoned.
+static LIVE_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct WorkerGuard(&'static AtomicUsize);
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The watchdog's tunables, bundled so the timing and the worker-pool bound are injectable in
+/// tests (which drive a tiny budget and an isolated counter) while production uses `READ_WATCHDOG`.
+struct ReadWatchdog {
+    budget: Duration,
+    attempt_cap: Duration,
+    backoff: Duration,
+    max_attempts: u32,
+    live: &'static AtomicUsize,
+    cap: usize,
+}
+
+const READ_WATCHDOG: ReadWatchdog = ReadWatchdog {
+    budget: Duration::from_millis(READ_BUDGET_MS),
+    attempt_cap: Duration::from_millis(READ_ATTEMPT_MS),
+    backoff: Duration::from_millis(READ_RETRY_BACKOFF_MS),
+    max_attempts: MAX_READ_ATTEMPTS,
+    live: &LIVE_READ_WORKERS,
+    cap: READ_WORKER_CAP,
+};
+
+/// The drift-stamp walk gets a single attempt over the whole budget: retrying a timed-out
+/// repository-wide walk is pointless, so `max_attempts: 1` with the full budget as the per-attempt
+/// cap. Shares the live-worker pool and cap with reads.
+const STAMP_WATCHDOG: ReadWatchdog = ReadWatchdog {
+    budget: Duration::from_millis(READ_BUDGET_MS),
+    attempt_cap: Duration::from_millis(READ_BUDGET_MS),
+    backoff: Duration::from_millis(0),
+    max_attempts: 1,
+    live: &LIVE_READ_WORKERS,
+    cap: READ_WORKER_CAP,
+};
+
+/// A read failure that preserves whether the underlying OS error was a transient sharing/lock
+/// contention (retryable) rather than flattening every `io::Error` to `read_failed` and losing the
+/// raw code before the retry predicate can see it (finding f10/f14). The classification is made at
+/// the point of failure, at *every* blocking worker stage — resolve, `is_file`, verify, read.
+struct ReadFailure {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+impl ReadFailure {
+    fn fatal(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn into_evidence(self) -> EvidenceError {
+        EvidenceError::new(self.code, self.message)
+    }
+}
+
+/// Windows `ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33): the fast form a
+/// contended file (AV scan, another process's handle) surfaces as, distinct from a stall.
+fn is_transient_io(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+/// Map an `io::Error` from a blocking read stage to a `ReadFailure`, preserving transient
+/// sharing/lock contention as retryable while everything else stays fatal under `fatal_code`.
+fn classify_read_io(fatal_code: &'static str, context: &str, error: &io::Error) -> ReadFailure {
+    ReadFailure {
+        code: fatal_code,
+        message: format!("{context}: {error}"),
+        retryable: is_transient_io(error),
+    }
+}
+
+#[derive(Clone)]
+enum ReadTarget {
+    /// A caller-supplied relative path that the worker must validate and resolve (the `read` path).
+    Raw(String),
+    /// An already-resolved, in-root file (a `search` walk hit); the worker skips re-resolution.
+    Resolved(PathBuf),
+}
+
+/// Everything the blocking read worker needs, owned so the worker thread borrows nothing shared —
+/// which is why an abandoned worker can never strand `Core` state or a lock and deadlock the next
+/// request (the reason the whole `Core::call` dispatch is *not* bounded this way).
+///
+/// The worker bounds only the file I/O — resolve, `is_file`, open, verify, read. The drift stamp is
+/// deliberately *not* computed here: it is a repository-wide `tree_stamp` walk that belongs with the
+/// other deferred directory walks (`list`/`scope`), and doing it in the worker would (a) run the
+/// walk ahead of the main thread's content checks, reordering a prompt content error behind a
+/// repo-wide stamp (code-review finding f3), and (b) fold `tree_stamp`'s unclassified errors into
+/// the retry path (f2). The main thread computes it via `current_stamp()` after content validation,
+/// exactly as before this change.
+#[derive(Clone)]
+struct ReadJob {
+    target: ReadTarget,
+    root: PathBuf,
+    max_path_bytes: usize,
+    max_file_bytes: usize,
+}
+
+impl ReadJob {
+    fn path_label(&self) -> String {
+        match &self.target {
+            ReadTarget::Raw(raw) => raw.clone(),
+            ReadTarget::Resolved(path) => path.display().to_string(),
+        }
+    }
+}
+
+/// The materials the response needs, returned owned from the worker so the main thread never
+/// re-resolves the path (a second unbounded syscall) to build the response (finding f2).
+#[derive(Debug)]
+struct ReadOutput {
+    resolved: PathBuf,
+    bytes: Vec<u8>,
+}
+
+/// The pure blocking sequence: resolve → `is_file` → open → verify → stat → read. Runs entirely on
+/// the worker thread and carries raw-error classification through every stage.
+fn read_job(job: ReadJob) -> Result<ReadOutput, ReadFailure> {
+    let resolved = match &job.target {
+        ReadTarget::Raw(raw) => {
+            resolve_existing_bounded(&job.root, job.max_path_bytes, raw, false)?
+        }
+        ReadTarget::Resolved(path) => path.clone(),
+    };
+    if let ReadTarget::Raw(raw) = &job.target {
+        // Replace `Path::is_file()` (which silently discards the metadata error) with an explicit,
+        // classified metadata call so a sharing/lock violation here is retryable, not a false
+        // `not_file` (finding f14).
+        let meta = fs::metadata(&resolved)
+            .map_err(|e| classify_read_io("read_failed", &format!("cannot stat '{raw}'"), &e))?;
+        if !meta.is_file() {
+            return Err(ReadFailure::fatal(
+                "not_file",
+                format!("'{raw}' is not a file"),
+            ));
+        }
+    }
+    let bytes = read_file_bounded(&resolved, job.max_file_bytes, &job.root)?;
+    Ok(ReadOutput { resolved, bytes })
+}
+
+/// Run a read job under the production watchdog: a detached worker bounded by the receipt-anchored
+/// budget, one retry on a transient failure, and the live-worker cap. Returns a fast in-band error
+/// rather than ever blocking the request loop.
+fn run_bounded_read(job: ReadJob, received_at: Instant) -> Result<ReadOutput, EvidenceError> {
+    let label = job.path_label();
+    bounded_attempts(&READ_WATCHDOG, received_at, &label, move || {
+        let job = job.clone();
+        move || read_job(job)
+    })
+}
+
+/// Run the drift-stamp tree walk under the watchdog, so a first `repository_read` (or a
+/// `repository_scope`) whose `tree_stamp` stalls on a contended `read_dir`/`symlink_metadata`
+/// cannot hang the request loop past the budget either (code-review finding f4). A single attempt
+/// (no retry — re-walking the whole tree after a timeout is pointless) using the full budget; a
+/// `tree_stamp` error is fatal, not a transient to retry.
+fn run_bounded_stamp(
+    root: &Path,
+    limits: &Limits,
+    received_at: Instant,
+) -> Result<String, EvidenceError> {
+    let root = root.to_path_buf();
+    let limits = limits.clone();
+    bounded_attempts(&STAMP_WATCHDOG, received_at, "drift-stamp", move || {
+        let root = root.clone();
+        let limits = limits.clone();
+        move || tree_stamp(&root, &limits).map_err(|e| ReadFailure::fatal(e.code, e.message))
+    })
+}
+
+/// The watchdog loop, generic over the worker's output and over how each attempt's worker is built
+/// so tests can inject a slow or failing worker and a tiny budget. `make_worker` yields a fresh
+/// worker per attempt; each runs on a detached thread the loop stops waiting on at the deadline.
+fn bounded_attempts<T, M, W>(
+    watchdog: &ReadWatchdog,
+    received_at: Instant,
+    label: &str,
+    mut make_worker: M,
+) -> Result<T, EvidenceError>
+where
+    T: Send + 'static,
+    M: FnMut() -> W,
+    W: FnOnce() -> Result<T, ReadFailure> + Send + 'static,
+{
+    let mut last: Option<EvidenceError> = None;
+    for attempt in 0..watchdog.max_attempts {
+        let remaining = watchdog
+            .budget
+            .checked_sub(received_at.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        // Only the single request thread reaches here, so this load-then-add is not racing another
+        // spawn; abandoned workers only ever decrement.
+        if watchdog.live.load(Ordering::Acquire) >= watchdog.cap {
+            return Err(EvidenceError::new(
+                "read_unavailable",
+                "too many concurrent stalled reads; retry shortly",
+            ));
+        }
+        let wait = watchdog.attempt_cap.min(remaining);
+        let (tx, rx) = mpsc::channel();
+        let live = watchdog.live;
+        live.fetch_add(1, Ordering::AcqRel);
+        let worker = make_worker();
+        // Builder::spawn returns an error instead of panicking when the OS refuses a thread, so a
+        // thread-creation failure becomes an in-band refusal rather than aborting the whole
+        // evidence process (code-review finding f5).
+        let spawned = std::thread::Builder::new()
+            .name("evidence-read".to_string())
+            .spawn(move || {
+                let _guard = WorkerGuard(live); // decrements the live count when the thread exits
+                let _ = tx.send(worker()); // send fails harmlessly if we abandoned it
+            });
+        if spawned.is_err() {
+            // The worker never started, so its `WorkerGuard` will never run — undo our increment.
+            live.fetch_sub(1, Ordering::AcqRel);
+            return Err(EvidenceError::new(
+                "read_unavailable",
+                "cannot spawn a read worker thread; retry shortly",
+            ));
+        }
+        match rx.recv_timeout(wait) {
+            Ok(Ok(output)) => return Ok(output),
+            Ok(Err(failure)) => {
+                let retryable = failure.retryable;
+                last = Some(failure.into_evidence());
+                if retryable && attempt + 1 < watchdog.max_attempts {
+                    let backoff = watchdog.backoff.min(
+                        watchdog
+                            .budget
+                            .checked_sub(received_at.elapsed())
+                            .unwrap_or_default(),
+                    );
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+                return Err(last.unwrap());
+            }
+            // Timed out: abandon the worker (it decrements the counter when its syscall returns)
+            // and let the loop retry if a meaningful budget remains.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                last = Some(read_timeout_error(label));
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(EvidenceError::new(
+                    "read_failed",
+                    "read worker terminated unexpectedly",
+                ));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| read_timeout_error(label)))
+}
+
+fn read_timeout_error(path: &str) -> EvidenceError {
+    EvidenceError::new(
+        "read_timeout",
+        format!(
+            "reading '{path}' exceeded the {}ms evidence read budget",
+            READ_BUDGET_MS
+        ),
+    )
+}
 
 #[derive(Clone)]
 struct CursorPage {
@@ -67,7 +382,23 @@ impl Core {
         })
     }
 
+    /// Dispatch a call whose receipt clock starts now. Convenience for tests and any caller that
+    /// is not measuring against Codex's client-side timer.
+    #[cfg(test)]
     pub fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, EvidenceError> {
+        self.call_with_receipt(name, arguments, Instant::now())
+    }
+
+    /// Dispatch a call, measuring the read watchdog's budget from `received_at` — the instant the
+    /// request was read off the wire, *before* any wait in the dispatch channel (issue #61, finding
+    /// f1). The transport threads the true receipt through so a queued read cannot be handed a fresh
+    /// budget after Codex's 30s timer has already been running.
+    pub fn call_with_receipt(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         if self.cancel.load(Ordering::Acquire) {
             return Err(EvidenceError::new(
                 "cancelled",
@@ -90,7 +421,7 @@ impl Core {
         let result = match name {
             "repository_scope" => {
                 require_only(args, &[])?;
-                self.scope()
+                self.scope(received_at)
             }
             "repository_list" => {
                 require_only(args, &["path", "cursor", "limit"])?;
@@ -98,11 +429,11 @@ impl Core {
             }
             "repository_search" => {
                 require_only(args, &["query", "path", "cursor", "limit"])?;
-                self.search(args)
+                self.search(args, received_at)
             }
             "repository_read" => {
                 require_only(args, &["path", "start_line", "line_count"])?;
-                self.read(args)
+                self.read(args, received_at)
             }
             "repository_change" => {
                 require_only(args, &["cursor", "limit_bytes"])?;
@@ -143,8 +474,8 @@ impl Core {
         Ok(result)
     }
 
-    fn scope(&mut self) -> Result<Value, EvidenceError> {
-        let current_stamp = self.current_stamp()?;
+    fn scope(&mut self, received_at: Instant) -> Result<Value, EvidenceError> {
+        let current_stamp = self.current_stamp(received_at)?;
         let drifted = current_stamp != self.bundle.initial_stamp;
         Ok(json!({
             "schema_version": self.bundle.schema_version,
@@ -211,7 +542,11 @@ impl Core {
         self.first_page("repository_list", entries, limit, "entries", true)
     }
 
-    fn search(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn search(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         let limit = limit_arg(
             args,
             "limit",
@@ -230,9 +565,12 @@ impl Core {
             ));
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
-        let start = Instant::now();
+        // The base resolution and the tree walk below still carry only the cooperative
+        // `deadline()` — a blocked stat there remains the documented sibling follow-up. The
+        // per-file *reads*, however, go through the same watchdog as `repository_read` so a single
+        // contended candidate cannot stall the loop.
         let base = self.resolve_existing(&path, false)?;
-        let files = self.walk_files(&base, start)?;
+        let files = self.walk_files(&base, received_at)?;
         let mut matches = Vec::new();
         let mut source_complete = true;
         for file in files {
@@ -242,13 +580,17 @@ impl Core {
                     "evidence search was cancelled",
                 ));
             }
-            deadline(start, &self.bundle.limits)?;
-            let bytes = match read_bounded(
-                &file,
-                self.bundle.limits.max_file_bytes as usize,
-                &self.root,
+            deadline(received_at, &self.bundle.limits)?;
+            let bytes = match run_bounded_read(
+                ReadJob {
+                    target: ReadTarget::Resolved(file.clone()),
+                    root: self.root.clone(),
+                    max_path_bytes: self.bundle.limits.max_path_bytes as usize,
+                    max_file_bytes: self.bundle.limits.max_file_bytes as usize,
+                },
+                received_at,
             ) {
-                Ok(bytes) => bytes,
+                Ok(output) => output.bytes,
                 Err(_) => {
                     source_complete = false;
                     continue;
@@ -287,7 +629,11 @@ impl Core {
         )
     }
 
-    fn read(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
+    fn read(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
         let path = required_string(args, "path")?;
         let start_line = positive_arg(args, "start_line", 1, u32::MAX)? as usize;
         let line_count = positive_arg(
@@ -296,18 +642,20 @@ impl Core {
             self.bundle.limits.default_lines,
             self.bundle.limits.max_lines,
         )? as usize;
-        let resolved = self.resolve_existing(&path, false)?;
-        if !resolved.is_file() {
-            return Err(EvidenceError::new(
-                "not_file",
-                format!("'{path}' is not a file"),
-            ));
-        }
-        let bytes = read_bounded(
-            &resolved,
-            self.bundle.limits.max_file_bytes as usize,
-            &self.root,
+        // The blocking file I/O — resolve, is_file, open, verify, stat, read — runs on a
+        // watchdog-bounded worker so a contended file cannot stall the request loop past the read
+        // budget. The drift stamp is computed afterward on the main thread (below), preserving the
+        // original content-errors-before-stamp order (code-review finding f3).
+        let output = run_bounded_read(
+            ReadJob {
+                target: ReadTarget::Raw(path.clone()),
+                root: self.root.clone(),
+                max_path_bytes: self.bundle.limits.max_path_bytes as usize,
+                max_file_bytes: self.bundle.limits.max_file_bytes as usize,
+            },
+            received_at,
         )?;
+        let bytes = output.bytes;
         if bytes.contains(&0) {
             return Err(EvidenceError::new("binary", format!("'{path}' is binary")));
         }
@@ -328,10 +676,12 @@ impl Core {
         }
         let fingerprint = crate::digest::Fingerprint::of(&bytes)
             .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
-        let current_stamp = self.current_stamp()?;
+        // Only after the content is known good do we compute the (cached) drift stamp. The walk is
+        // watchdog-bounded (below) so a first read whose stamp stalls still cannot hang the loop.
+        let current_stamp = self.current_stamp(received_at)?;
         let drifted = current_stamp != self.bundle.initial_stamp;
         Ok(json!({
-            "path": relative_slash(&self.root, &resolved)?,
+            "path": relative_slash(&self.root, &output.resolved)?,
             "bytes": bytes.len(),
             "sha256": fingerprint.sha256,
             "total_lines": all.len(),
@@ -343,11 +693,14 @@ impl Core {
         }))
     }
 
-    fn current_stamp(&mut self) -> Result<String, EvidenceError> {
+    fn current_stamp(&mut self, received_at: Instant) -> Result<String, EvidenceError> {
         if let Some(stamp) = &self.observed_stamp {
             return Ok(stamp.clone());
         }
-        let current_stamp = tree_stamp(&self.root, &self.bundle.limits)?;
+        // The drift-stamp walk runs under the watchdog so a stalled `read_dir`/`symlink_metadata`
+        // cannot hang the request loop (finding f4). This bounds the walk for both `read` and
+        // `scope`; `list`/search-base `walk_files` remain the documented sibling follow-up.
+        let current_stamp = run_bounded_stamp(&self.root, &self.bundle.limits, received_at)?;
         self.observed_stamp = Some(current_stamp.clone());
         Ok(current_stamp)
     }
@@ -511,63 +864,18 @@ impl Core {
     }
 
     fn validate_relative(&self, raw: &str) -> Result<PathBuf, EvidenceError> {
-        if raw.len() > self.bundle.limits.max_path_bytes as usize {
-            return Err(EvidenceError::new("invalid_path", "path is too long"));
-        }
-        let path = Path::new(raw);
-        if path.is_absolute() || raw.contains(':') {
-            return Err(EvidenceError::new(
-                "invalid_path",
-                "absolute, device, and ADS paths are forbidden",
-            ));
-        }
-        let mut clean = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Normal(name) if !reserved_name(name) && !excluded_name(name) => {
-                    clean.push(name)
-                }
-                Component::CurDir => {}
-                _ => {
-                    return Err(EvidenceError::new(
-                        "invalid_path",
-                        "path contains a forbidden component",
-                    ))
-                }
-            }
-        }
-        Ok(clean)
+        validate_relative_path(self.bundle.limits.max_path_bytes as usize, raw)
+            .map_err(ReadFailure::into_evidence)
     }
 
     fn resolve_existing(&self, raw: &str, directory: bool) -> Result<PathBuf, EvidenceError> {
-        let clean = self.validate_relative(raw)?;
-        let mut current = self.root.clone();
-        for component in clean.components() {
-            current.push(component.as_os_str());
-            let meta = fs::symlink_metadata(&current)
-                .map_err(|_| EvidenceError::new("not_found", format!("'{raw}' does not exist")))?;
-            if metadata_is_reparse(&meta) {
-                return Err(EvidenceError::new(
-                    "link_forbidden",
-                    "links and reparse points are forbidden",
-                ));
-            }
-        }
-        let canonical = fs::canonicalize(&current)
-            .map_err(|e| EvidenceError::new("not_found", e.to_string()))?;
-        if !within(&canonical, &self.root) {
-            return Err(EvidenceError::new(
-                "path_escape",
-                "resolved path escaped the repository root",
-            ));
-        }
-        if directory && !canonical.is_dir() {
-            return Err(EvidenceError::new(
-                "not_directory",
-                format!("'{raw}' is not a directory"),
-            ));
-        }
-        Ok(canonical)
+        resolve_existing_bounded(
+            &self.root,
+            self.bundle.limits.max_path_bytes as usize,
+            raw,
+            directory,
+        )
+        .map_err(ReadFailure::into_evidence)
     }
 
     fn first_page(
@@ -738,32 +1046,116 @@ impl Core {
     }
 }
 
-fn read_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, EvidenceError> {
+/// Validate a caller-supplied relative path (length, absolute/device/ADS, forbidden components).
+/// Pure and non-blocking; every failure is fatal (`invalid_path`), never retryable.
+fn validate_relative_path(max_path_bytes: usize, raw: &str) -> Result<PathBuf, ReadFailure> {
+    if raw.len() > max_path_bytes {
+        return Err(ReadFailure::fatal("invalid_path", "path is too long"));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() || raw.contains(':') {
+        return Err(ReadFailure::fatal(
+            "invalid_path",
+            "absolute, device, and ADS paths are forbidden",
+        ));
+    }
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) if !reserved_name(name) && !excluded_name(name) => {
+                clean.push(name)
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(ReadFailure::fatal(
+                    "invalid_path",
+                    "path contains a forbidden component",
+                ))
+            }
+        }
+    }
+    Ok(clean)
+}
+
+/// Resolve a validated relative path to a canonical in-root path, classifying the raw OS error at
+/// each blocking stage (`symlink_metadata`, `canonicalize`) so a transient sharing/lock violation
+/// is retryable rather than a false `not_found` (finding f14). Runs on the read worker thread.
+fn resolve_existing_bounded(
+    root: &Path,
+    max_path_bytes: usize,
+    raw: &str,
+    directory: bool,
+) -> Result<PathBuf, ReadFailure> {
+    let clean = validate_relative_path(max_path_bytes, raw)?;
+    let mut current = root.to_path_buf();
+    for component in clean.components() {
+        current.push(component.as_os_str());
+        let meta = fs::symlink_metadata(&current).map_err(|e| {
+            if is_transient_io(&e) {
+                classify_read_io("read_failed", &format!("cannot stat '{raw}'"), &e)
+            } else {
+                ReadFailure::fatal("not_found", format!("'{raw}' does not exist"))
+            }
+        })?;
+        if metadata_is_reparse(&meta) {
+            return Err(ReadFailure::fatal(
+                "link_forbidden",
+                "links and reparse points are forbidden",
+            ));
+        }
+    }
+    let canonical = fs::canonicalize(&current).map_err(|e| {
+        if is_transient_io(&e) {
+            classify_read_io("read_failed", &format!("cannot resolve '{raw}'"), &e)
+        } else {
+            ReadFailure::fatal("not_found", e.to_string())
+        }
+    })?;
+    if !within(&canonical, root) {
+        return Err(ReadFailure::fatal(
+            "path_escape",
+            "resolved path escaped the repository root",
+        ));
+    }
+    if directory && !canonical.is_dir() {
+        return Err(ReadFailure::fatal(
+            "not_directory",
+            format!("'{raw}' is not a directory"),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Open, verify, and read a resolved in-root file, capped at `max`. Every blocking stage
+/// classifies its raw OS error so a transient sharing/lock violation is retryable (findings
+/// f10/f14). Runs on the read worker thread.
+fn read_file_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, ReadFailure> {
     let mut file = File::open(path).map_err(|e| {
-        EvidenceError::new(
+        classify_read_io(
             "read_failed",
-            format!("cannot open '{}': {e}", path.display()),
+            &format!("cannot open '{}'", path.display()),
+            &e,
         )
     })?;
     verify_open_file(&file, path, root)?;
     let len = file
         .metadata()
-        .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?
+        .map_err(|e| classify_read_io("read_failed", "cannot stat open file", &e))?
         .len();
     if len > max as u64 {
-        return Err(EvidenceError::new(
+        return Err(ReadFailure::fatal(
             "file_too_large",
             format!("file is {len} bytes; cap is {max}"),
         ));
     }
     file.seek(SeekFrom::Start(0))
-        .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
+        .map_err(|e| classify_read_io("read_failed", "cannot seek open file", &e))?;
     let mut bytes = Vec::with_capacity(len as usize);
     file.take(max as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
+        .map_err(|e| classify_read_io("read_failed", "cannot read open file", &e))?;
     if bytes.len() > max {
-        return Err(EvidenceError::new(
+        return Err(ReadFailure::fatal(
             "file_too_large",
             "file grew beyond the read cap",
         ));
@@ -772,7 +1164,7 @@ fn read_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, Evidenc
 }
 
 #[cfg(windows)]
-fn verify_open_file(file: &File, expected: &Path, root: &Path) -> Result<(), EvidenceError> {
+fn verify_open_file(file: &File, expected: &Path, root: &Path) -> Result<(), ReadFailure> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
     extern "system" {
@@ -786,31 +1178,41 @@ fn verify_open_file(file: &File, expected: &Path, root: &Path) -> Result<(), Evi
     let handle = file.as_raw_handle();
     let needed = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
     if needed == 0 {
-        return Err(EvidenceError::new(
+        // Classify the WinAPI failure via GetLastError so a sharing/lock contention here is
+        // retryable rather than a false fatal (finding f2).
+        return Err(classify_read_io(
             "read_failed",
             "cannot verify opened file path",
+            &io::Error::last_os_error(),
         ));
     }
     let mut buf = vec![0u16; needed as usize + 1];
     let written =
         unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0) };
-    if written == 0 || written as usize >= buf.len() {
-        return Err(EvidenceError::new(
+    if written == 0 {
+        return Err(classify_read_io(
+            "read_failed",
+            "cannot verify opened file path",
+            &io::Error::last_os_error(),
+        ));
+    }
+    if written as usize >= buf.len() {
+        return Err(ReadFailure::fatal(
             "read_failed",
             "cannot verify opened file path",
         ));
     }
     let actual = PathBuf::from(std::ffi::OsString::from_wide(&buf[..written as usize]));
-    let expected =
-        fs::canonicalize(expected).map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
+    let expected = fs::canonicalize(expected)
+        .map_err(|e| classify_read_io("read_failed", "cannot canonicalize expected path", &e))?;
     if !within(&actual, root) {
-        return Err(EvidenceError::new(
+        return Err(ReadFailure::fatal(
             "path_escape",
             "opened file resolved outside the repository root",
         ));
     }
     if !same_path(&actual, &expected) {
-        return Err(EvidenceError::new(
+        return Err(ReadFailure::fatal(
             "path_changed",
             "file path changed while it was opened",
         ));
@@ -1214,5 +1616,154 @@ mod tests {
         let second = core.call("repository_scope", &json!({})).unwrap();
         assert_eq!(second["current_stamp"], observed);
         assert_eq!(second["drifted"], true);
+    }
+
+    fn ok_output(bytes: &[u8]) -> ReadOutput {
+        ReadOutput {
+            resolved: PathBuf::from("x"),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    // The watchdog must stop waiting on a read that blocks past the budget, and — because the
+    // abandoned worker borrows no shared state — a later read on the same pool must still succeed.
+    #[test]
+    fn read_watchdog_fires_then_a_later_read_succeeds() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let watchdog = ReadWatchdog {
+            budget: Duration::from_millis(200),
+            attempt_cap: Duration::from_millis(60),
+            backoff: Duration::from_millis(5),
+            max_attempts: MAX_READ_ATTEMPTS,
+            live: &LIVE,
+            cap: READ_WORKER_CAP,
+        };
+        let stalled = bounded_attempts(&watchdog, Instant::now(), "slow", || {
+            || {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(ok_output(b""))
+            }
+        });
+        assert_eq!(stalled.unwrap_err().code, "read_timeout");
+        let fast = bounded_attempts(&watchdog, Instant::now(), "fast", || {
+            || Ok(ok_output(b"hi"))
+        });
+        assert_eq!(fast.unwrap().bytes, b"hi");
+    }
+
+    // A transient (retryable) failure on the first attempt recovers silently on the second, within
+    // the budget, and a fresh worker is built for the retry.
+    #[test]
+    fn read_retry_recovers_from_a_transient_failure() {
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        let watchdog = ReadWatchdog {
+            budget: Duration::from_millis(500),
+            attempt_cap: Duration::from_millis(200),
+            backoff: Duration::from_millis(5),
+            max_attempts: MAX_READ_ATTEMPTS,
+            live: &LIVE,
+            cap: READ_WORKER_CAP,
+        };
+        let mut built = 0u32;
+        let result = bounded_attempts(&watchdog, Instant::now(), "flaky", || {
+            built += 1;
+            let n = built;
+            move || {
+                if n == 1 {
+                    Err(ReadFailure {
+                        code: "read_failed",
+                        message: "sharing violation".into(),
+                        retryable: true,
+                    })
+                } else {
+                    Ok(ok_output(b"ok"))
+                }
+            }
+        });
+        assert_eq!(result.unwrap().bytes, b"ok");
+        assert_eq!(
+            built, 2,
+            "should build a fresh worker for exactly one retry"
+        );
+    }
+
+    // Raw sharing/lock OS errors classify as retryable; a genuine not-found does not (findings
+    // f10/f14). This is the classification `read_job` applies at every blocking stage.
+    #[test]
+    fn transient_os_errors_are_classified_retryable() {
+        assert!(is_transient_io(&io::Error::from_raw_os_error(32)));
+        assert!(is_transient_io(&io::Error::from_raw_os_error(33)));
+        assert!(!is_transient_io(&io::Error::from_raw_os_error(2)));
+        let sharing = classify_read_io(
+            "read_failed",
+            "cannot open",
+            &io::Error::from_raw_os_error(32),
+        );
+        assert!(sharing.retryable);
+        assert_eq!(sharing.code, "read_failed");
+        assert!(
+            !classify_read_io(
+                "read_failed",
+                "cannot open",
+                &io::Error::from_raw_os_error(2)
+            )
+            .retryable
+        );
+    }
+
+    // At the worker cap, a read refuses in-band without spawning another worker (finding f3).
+    #[test]
+    fn read_worker_cap_refuses_without_spawning() {
+        static LIVE: AtomicUsize = AtomicUsize::new(4);
+        let watchdog = ReadWatchdog {
+            budget: Duration::from_millis(500),
+            attempt_cap: Duration::from_millis(200),
+            backoff: Duration::from_millis(5),
+            max_attempts: MAX_READ_ATTEMPTS,
+            live: &LIVE,
+            cap: 4,
+        };
+        let mut built = 0u32;
+        let result = bounded_attempts(&watchdog, Instant::now(), "capped", || {
+            built += 1;
+            || Ok(ok_output(b""))
+        });
+        assert_eq!(result.unwrap_err().code, "read_unavailable");
+        assert_eq!(built, 0, "no worker is built once the cap is reached");
+        assert_eq!(
+            LIVE.load(Ordering::Acquire),
+            4,
+            "the live count is untouched"
+        );
+    }
+
+    // The read budget is coupled below the Codex ceiling, and even a worst-case max-attempt read
+    // finishes under it (finding f4). The `const _` assertions guarantee the raw-millisecond
+    // relationship at compile time; this exercises the live `READ_WATCHDOG` values a read actually
+    // uses, including the worst-case attempt sum.
+    #[test]
+    fn read_budget_stays_under_the_codex_ceiling() {
+        let ceiling = Duration::from_secs(CODEX_TOOL_TIMEOUT_SECS);
+        let watchdog = &READ_WATCHDOG;
+        assert!(watchdog.budget + Duration::from_millis(READ_CEILING_MARGIN_MS) <= ceiling);
+        assert!(watchdog.attempt_cap <= watchdog.budget);
+        assert!(watchdog.attempt_cap * watchdog.max_attempts + watchdog.backoff < ceiling);
+    }
+
+    // A read reached before any scope must still populate the drift cache, so the stamp is computed
+    // once and reused — the worker preserving `observed_stamp` semantics (finding f7).
+    #[test]
+    fn a_first_read_populates_the_drift_cache() {
+        let dir = temp_dir("evidence-read-first");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let _ = core
+            .call("repository_read", &json!({"path":"a.txt"}))
+            .unwrap();
+        // The read cached the stamp, so both later scopes report the same value it computed.
+        fs::write(dir.as_path().join("b.txt"), "new").unwrap();
+        let scope = core.call("repository_scope", &json!({})).unwrap();
+        let scope2 = core.call("repository_scope", &json!({})).unwrap();
+        assert_eq!(scope["current_stamp"], scope2["current_stamp"]);
     }
 }
