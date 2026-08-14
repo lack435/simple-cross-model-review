@@ -184,7 +184,10 @@ sites to convert:
   actual fail-closed backstop for the external-login race is the **post-review switch guard**: the
   identity asserted here is carried through the run and compared against the final fingerprint, so a
   review whose account was swapped mid-flight is **refused, never delivered** — a request may briefly
-  issue under a swapped account, but its result does not reach the caller. Attempting to hard-lock the
+  issue under a swapped account, but its result does not reach the caller. *(Since #69 that comparison
+  runs twice, in `Job::collect_run`: once before the run's usage headroom is persisted under the
+  pinned account — a store write that used to happen ahead of any verification — and once on the
+  delivery path, where it always was. See [`post-run-account-check.md`](post-run-account-check.md).)* Attempting to hard-lock the
   file against external writes for the whole review is rejected: it would also block the reviewer's own
   legitimate token refresh.
 

@@ -220,6 +220,11 @@ struct AttemptResult { outcome: Result<Parsed, Failure>, headroom: Headroom }
   error events, never the model's prose** ([errors.rs:558] discipline).
 - The **walk stores the observation after every attempt**, on both arms. A refusal with no
   parseable signal yields `Unknown` and writes nothing.
+- **Since #69, the write is downstream of the account check.** Both arms are still observed, but a
+  turn whose profile home re-logged to a different account while it ran is refused before its reading
+  reaches the store — see §5 and [`post-run-account-check.md`](post-run-account-check.md). Observing
+  before converting the `RunOutcome` and verifying before persisting are independent requirements;
+  `Job::collect_run` satisfies both by doing the check first and the observation second.
 - Produced **only when the chain is armed** (§4), so a non-gating chain pays nothing.
 
 ### 4. Observing costs nothing unless armed — and the armed reads are bounded and safe
@@ -351,6 +356,18 @@ detected):
   `~/.claude.json` (honouring `CLAUDE_CONFIG_DIR`/`HOME` as the CLI does). (Verified present;
   the account *identifier*, never the credentials in the separate `~/.claude/.credentials.json`,
   which this tool does not read.)
+
+**And the key's promise is enforced at write time, not just at read time (#69).** Keying on a
+launch-time fingerprint says "this reading belongs to account A"; only the switch guard can make that
+true, because the *reading* comes from mutable profile state under the home. The write therefore
+happens after `Job::collect_run` has re-read the home's account and confirmed it is still the pinned
+one — a home that re-logged A→B mid-review has its turn refused and stores nothing, rather than
+filing B's figure under A and steering later entry selection with it. **And the key follows the pinned
+account, not the selection-time read**: where the two disagree (a re-login to another *authorized*
+account between selection and launch, which every other check consistently accepts as B) the write is
+rebound to the pinned, verified account rather than the account the gate happened to decide on. The
+gate decision itself is still made on the selection-time key, which is transient and fail-open. See
+[`post-run-account-check.md`](post-run-account-check.md).
 
 **One read per review, at launch, carried through — no read-time/observe-time TOCTOU (round-5
 finding f4).** The fingerprint is read **once, at the start of the review (selection/launch)**,

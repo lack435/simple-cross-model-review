@@ -1,7 +1,8 @@
 # Nothing from a reviewer run is used before its account is verified — design
 
-Status: **planned, gate-approved.** This document is the plan. It went through this repository's own
-`cross-review` gate before implementation began, and the implementation goes through it again.
+Status: **implemented.** This document is the plan, and it describes the code as it now stands. It
+went through this repository's own `cross-review` gate before implementation began, and the
+implementation goes through the gate too.
 
 > **Review history.** Three rounds against this repository's own gate (Codex, gpt-5.6-luna,
 > effort=max), three findings, every one accepted and none disputed. Round 1 (REQUEST CHANGES): f1
@@ -22,6 +23,12 @@ Status: **planned, gate-approved.** This document is the plan. It went through t
 > security/configuration failure), the shared helper and the `RunFailure` type change are
 > proportionate, and the three unit tests plus the structural sole-writer argument are the right
 > coverage without a live `Job` harness.
+>
+> **Implementation review** (the diff, not the plan) then found one *major* the plan had not covered
+> and which this document now specifies: the ordering fix made the write verified, but the **key** it
+> is written under was still the selection-time one, so a re-login to a *different authorized* account
+> between selection and the attempt's pin filed a verified reading under the wrong account. See "The
+> key, not only the reading" below.
 
 Tracks issue #69 (the main review path persists a turn's usage headroom *before* the account switch
 guard verifies the account). Filed from the #63 implementation review, where the reviewer raised the
@@ -188,6 +195,67 @@ fn post_run_account_refusal<T>(
 check called directly in step 5, where there is no run to gate on because a child provably produced
 the answer being returned. It keeps its existing test.
 
+## The key, not only the reading
+
+Ordering the write after the account check makes the *reading* verified. It does not, on its own, make
+the **key** right, and the implementation review found the gap: the key comes from
+`usage_headroom_key`, which reads the account currently under the home during chain *selection*, while
+`resolve_authorized_home_with_account` pins the account independently at the top of the attempt. If
+the home re-logs A→B in between and **B is also authorized**, everything downstream is consistent
+about B — the pre-spawn probe asserts B, the run answers under B, the switch guard verifies B — and
+the write still says A. That is #69's defect in a different hat: a figure produced by B steering a
+later proactive gate for A.
+
+`write_usage_key` closes it by rebinding the write to `authorized_start.account` (and the attempt's
+resolved, preflighted binary). That account *is* the verified one — establishing that the live account
+still equals this pin is precisely what the switch guard does — so at the moment of the write they are
+the same value. Two cases pass through unchanged on purpose: no selection key still means no write (an
+unarmed or unkeyable entry gains no store traffic), and ambient keeps the selection key because it has
+no pinned account to bind to and is not guarded either.
+
+### The gate decision is a separate defect, and is left as a follow-up
+
+Rebinding the write does not touch the gate **decision**, which is still made against the account
+selection read. The implementation review raised that as f2 (*minor*), and it is real — but not by the
+mechanism the finding states, and the difference decides what fixing it would cost.
+
+**The decision is sound at the moment it is made.** `usage_headroom_key`'s fingerprint read and the
+`usage.get(key).clears(min)` that follows it are adjacent statements, in both gating sites
+(`gate_fresh_selection`, and the walk's per-fallback gate). The key *is* the account match: the next
+call keys afresh, so a snapshot filed under A stops being reachable once the home holds B. Not
+absolutely — a key already in hand still resolves, so an A→B switch landing between
+`usage_headroom_key` returning and `usage.get` running does gate B's entry on A's figure (the
+reviewer's qualification, and a microsecond window). Beyond that gap no snapshot gates an account it
+does not describe. What is unsound is the *inference* from the decision: that the account which was
+gated is the
+account that would have run. A re-login after the decision breaks that, and because a skipped entry
+never reaches an attempt, there is no pin later to compare it against. So the finding's suggested fix —
+"re-gate when the selection account differs from the attempt pin" — cannot reach the case that matters:
+the entry it would protect is the one that never launches.
+
+**What it costs.** A skipped entry the departed account would have failed and the arrived account would
+have served. In a multi-entry chain that is one entry passed over. In a single-entry chain, or when it
+is the last unexhausted entry, it is a refused review: `REVIEWERS_EXHAUSTED`, which names each entry's
+reason, including "usage below minimum". The next call re-reads the fingerprint, finds no snapshot for
+the arrived account, and runs ungated — so the failure states its cause and self-heals on retry, which
+is `AGENTS.md`'s "lost and re-run" case rather than a false approval.
+
+**The one variant with a genuinely wide window** is worth naming because it is not the obvious one.
+Where the read and the decision are adjacent, the race needs a re-login inside a gap of microseconds.
+But a *pre-start* skip is carried in `pre_start_gated_descs` and folded into a terminal
+`REVIEWERS_EXHAUSTED` that may be produced many minutes later, after another entry ran and was
+rate-limited. There the skip is genuinely stale by the time it is acted on. It still needs the
+conjunction of a gated entry, a re-login, and a later rate limit — and it still ends in a retryable
+refusal.
+
+**Why it is not fixed here.** Closing it means re-entering chain selection after the walk has already
+decided it is exhausted — control flow surgery on the walk, on the account-identity path, in a PR about
+the ordering of one store write. This repository's own precedent is the reason to file rather than fold:
+issue #69 exists because the same reviewer raised this defect's sibling against the block-repair path
+during #63, and the main-run instance was filed as its own issue — "scoped out of that PR deliberately,
+not overlooked". This is the same shape, so it gets the same treatment: recorded here in full, with the
+mechanism corrected, and filed as its own issue rather than bundled.
+
 ## The behaviour choice #69 asks to be made explicit
 
 Moving the check earlier makes combinations reachable that the guard never saw before: today a
@@ -283,6 +351,9 @@ live account read is exercised, not just a comparison):
 - **`post_run_account_refusal_passes_a_stable_or_ambient_account`** — the pinned account still in the
   home yields `None` on every run shape; `start: None` (ambient) yields `None` including on a home
   whose account cannot be read at all.
+- **`the_write_key_names_the_account_the_attempt_pinned`** — `write_usage_key` follows the pin when it
+  disagrees with the selection key, is identity when they agree, stays `None` when there was no
+  selection key, and passes the selection key through for ambient.
 
 Not asserted by a unit test, and stated rather than implied: that no store write happens on a
 refusal. `collect_run` needs a live `Job`, and building one in a unit test would be a mock harness
@@ -309,7 +380,7 @@ this change does not alter it — and every `findings`/repair test that goes thr
 
 | File | Change |
 | --- | --- |
-| `src/tools.rs` | `RepairFailure` → `RunFailure` (+ `child_never_started`); new `post_run_account_refusal` and `Job::collect_run` (pre-observation check **and** today's delivery-time check, in that sequence); `attempt` and `run_block_repair` rewired onto it; both inline post-run copies and the standalone line-2915 call site removed, the check itself retained inside the helper; three new tests |
+| `src/tools.rs` | `RepairFailure` → `RunFailure` (+ `child_never_started`); new `post_run_account_refusal` and `Job::collect_run` (pre-observation check **and** today's delivery-time check, in that sequence); new `write_usage_key`, binding the write to the attempt's pinned account; `attempt` and `run_block_repair` rewired onto the helper; both inline post-run copies and the standalone line-2915 call site removed, the check itself retained inside the helper; four new tests |
 | `docs/usage-remaining-gate.md` | §3/§5: the observation is recorded only once the account it is keyed under has been verified unchanged; a moved account records nothing |
 | `docs/unstructured-turn-recovery.md` | the "one shared post-run helper" the #63 plan described (line 613) is now real and shared; the repair's guard-ordering comment moves to the helper |
 | `docs/reviewer-account-profiles-impl.md` | note where the post-review guard runs now (before observe/parse, gated on a child having started) |
