@@ -104,6 +104,23 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
 - Never approve, merge, or tell the user a PR is ready to merge without that review having
   run and its findings either resolved or disputed with concrete evidence the reviewer has
   seen and answered.
+- **A finding the reviewer holds open against your argument is usually right.** On three
+  occasions across #71 and #62 an agent argued — with quoted code and a passing test it had
+  written for the purpose — that a held or regressed finding was resolved, and was wrong every
+  time. The error had the same shape each time: it fixed the defect it could see and assumed that
+  was the defect being named. Before disputing, go back to the code rather than to your reasoning
+  about the code. If you still disagree, **run a fresh control review** (`fresh: true`, no ledger
+  to anchor on, ideally pointed at the disputed area): a fresh reviewer that independently raises
+  the same thing tells you the finding is real, and one that does not is the evidence a dispute
+  needs — but only in one direction. A fresh reviewer that **does** raise it independently is
+  strong evidence the finding is real; one that **does not** is weak, because a fresh session
+  samples differently and can converge while abandoning concerns. Corroboration, not acquittal:
+  a dispute still has to answer the original finding.
+- **You may not be able to read the reviewer's prose.** On a structured turn `review_prose` is
+  `null` by design, and an MCP client that surfaces only `structuredContent` never shows the text
+  channel — so a reviewer that explains itself in prose looks exactly like one that said nothing
+  (issue #73). Until that is fixed, ask for reasons and paths to be stated *in findings*, and do
+  not read silence as absence of an answer.
 - If the review fails — `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `RATE_LIMITED`, any of the
   codes in the README — hand the user the remediation the tool returned, say the review did
   not run, and stop. Do not substitute your own read of the diff, and do not fall back to a
@@ -153,6 +170,39 @@ at. If any one of them is missing, stop and tell the user which one:
   and stop. A repair that cannot pass through the gate it claims to have fixed is a claim,
   not a repair.
 
+## How much rigor, and where
+
+This project is careful by default, and that is right in the places where being wrong is
+expensive. It is not right everywhere, and the difference is worth stating because the review
+gate will not state it for you.
+
+- **Rigor belongs where the blast radius is real**: account management and credentials, the
+  read-only and write boundaries, the isolation posture, anything that could route a review
+  through the wrong account or let a reviewer write. Those are the places to enumerate edge
+  cases and fail closed.
+- **For a review itself, the worst case is usually that it is lost and re-run** — some tokens and
+  some minutes. Avoid that; do not fortify against every edge case to prevent it. A protocol
+  change that adds a new way for a turn to degrade is usually paying more than the failure it
+  prevents. *Usually*, because one review failure is not merely retryable: a review that is
+  quietly thinner than it looks can produce a false approval rather than a lost review, which is
+  why the fail-closed rules elsewhere in this file stay exactly as they are.
+
+**Perfect is the enemy of good, and this tool will never be perfect.** A review that is
+occasionally lost and re-run is a working tool. A tool that spends a week of edge-case machinery
+per fix is not, however correct each piece of that machinery is. Any worst case can be escalated
+until it justifies anything; the question to ask is what the realistic cost is, and whether the
+machinery costs less than that.
+
+**The gate ratchets toward rigor, and you are the counterweight.** Iterating a design through
+review adds machinery every round: each round asks "what about this edge case", each honest
+answer adds something, and nothing in the loop ever argues for less. Issue #62's plan went
+through six rounds and ten findings — every finding correct — and arrived roughly ten times the
+size of the bug, with four of the ten existing only inside a chain of consequences from one early
+decision. When a finding's fix adds machinery, ask whether the machinery is proportionate to what
+it prevents, and be willing to answer a finding by **removing** the thing that made it reachable.
+Cutting scope in response to review is a legitimate resolution; say so plainly when you do it, so
+a shrinking plan is not mistaken for one that gave up.
+
 ## Before handing work back
 
 ```powershell
@@ -167,7 +217,12 @@ shipping a stale binary.
 - `cargo test` — unit tests only, no network and no model calls.
 - `smoke.ps1 -Reviewer codex|claude` — real end-to-end MCP round trip. It calls a model for
   real and costs tokens, so run it when the change touches the protocol, spawning, or
-  session handling, and mention the cost to the user.
+  session handling, and mention the cost to the user. **The evidence service is protocol**: a
+  change to it needs the round trip, specifically `-Reviewer codex` — the evidence assertions are
+  conditional on that direction, so the Claude run does not exercise it at all. `build.ps1`
+  passing is not a substitute either; it never starts a reviewer. `smoke.ps1` runs against
+  `target\release\` rather than `dist\`, so it needs a
+  `cargo build --release` but neither a restage nor a session restart.
 - CI is Windows-only by design and additionally re-verifies the `CLI_NOT_FOUND` failure
   contract against the shipped binary. Do not weaken that check.
 
@@ -178,6 +233,19 @@ shipping a stale binary.
 - **Pin models by full id** (`claude-opus-4-8`, `gpt-5.6-luna`). Aliases resolve to older
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
+- **A findings ledger is disposable; do not reach for migration machinery to preserve one.** If a
+  change makes old ledgers unreadable, the loader's existing fail-closed behaviour *is* the
+  migration story: `Invalid`, refuse the resume, and the caller rebaselines. No compatibility
+  types, no version dispatch, no provenance flags. Be accurate about what that costs, because it
+  is more than a re-run: the ledger holds stable ids, the immutable content of every finding, and
+  the dispositions, so a rebaseline means a human carrying the still-open findings into a fresh
+  session by hand. Bounded and occasional, and still cheaper than permanent machinery in the
+  loader — but say so plainly rather than implying nothing is lost. Note also that the resume
+  limits are *defaults*: `--session-max-turns` and `--session-max-idle-seconds` are configurable
+  and either can be set to `0` to disable, so do not assume a ledger is stale merely because it
+  is old. (None of this is licence to break the *session record* itself, which carries account
+  identity and binding state — see the rigor section above for which side of the line a thing
+  sits on.)
 - **The reviewer's isolation and read-only posture are security boundaries.** The tool
   policy, `--safe-mode`, the Codex sterile-root/evidence service plus
   `--ignore-user-config` / `--ignore-rules`, the path-scoped
