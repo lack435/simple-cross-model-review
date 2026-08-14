@@ -488,7 +488,7 @@ the changelist *numbers*, validated numeric.
 
 Sessions are named, and you choose the names. Calling `cross_model_review` again with
 the same `session` resumes that reviewer's conversation, so it still remembers what it
-told you and reports what is now resolved, what is still open, and what regressed.
+told you and reports what is now resolved and what is still open.
 
 ```
 cross_model_review(session: "auth-refactor", instructions: "First pass at the token
@@ -643,6 +643,35 @@ by a stale local `main`, and a reviewer that spent its turn on commands its poli
 as an ordinary successful review to a `structuredContent`-only client. A review that is quietly
 thinner than it looks produces a false approval rather than a lost review, which is the one failure
 here that is not merely retryable.
+
+### Which findings were actually re-examined
+
+On a resumed turn the reviewer is shown the findings it already raised. It reports a status for
+**the ones it re-examined**, and nothing more:
+
+- **An omitted finding is carried, not resolved.** Saying nothing about a finding leaves it exactly
+  as recorded — same status, same content — and is the correct report when the reviewer did not look
+  at it again. It is not an error and does not cost you the turn.
+- **`last_verified_turn` says when a finding was last actually looked at.** Compare it with `turn`:
+  equal means the reviewer examined it this turn, behind means it was carried. The server derives
+  this from whether the reviewer reported the id at all, so it is not something a reviewer can claim
+  without doing.
+
+That distinction is the fix for issue #62. Previously the protocol required a status for *every*
+finding every turn, so a reviewer with nothing new to say had to restate `open` regardless — and a
+finding it had genuinely re-checked was indistinguishable from one it had merely echoed. If a
+finding is stuck open, check `last_verified_turn` first: if it is behind, say so in your next
+`instructions` and name the id.
+
+**A resolved finding is closed.** It is never asked about again and cannot reopen. If a reviewer
+finds it broken again it raises a *new* finding, which may carry `regression_of` naming the closed
+id — advisory provenance only, dropped silently if it does not name a finding this session resolved.
+There is no `regressed` status.
+
+**`converged` does not mean everything was re-examined on the approving turn.** It means no finding
+is open and the reviewer approved. Every finding was examined on the turn it resolved — a status
+only moves when the reviewer reports it — but a session can converge without a final sweep, and a
+recurrence of something already closed can be missed the same way any defect can be missed.
 
 ## What the reviewer can and cannot do
 

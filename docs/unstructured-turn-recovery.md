@@ -127,10 +127,17 @@ handoff.
 | `Malformed` | yes | The body was not valid JSON for the schema; re-emit it, schema restated. |
 | `FieldTooLong` | yes | A `title`/`detail` exceeded its cap; **shorten the prose, do not drop findings.** |
 | `OverCap` | yes | The block or its `new_findings` count exceeded the cap; **shorten `detail` fields, do not drop findings.** |
-| `ReconcileError::MissingId(id)` | yes | Name the missing ids explicitly; restate total accounting. |
-| `ReconcileError::UnknownId(id)` | yes | Name the ids the ledger never issued. |
+| `ReconcileError::UnknownId(id)` | yes | Name the ids the ledger never issued or has already resolved. |
 | `ReconcileError::DuplicateId(id)` | yes | Name the duplicated ids. |
 | `ReconcileError::CounterExhausted` | **no** | A server-side ceiling. Re-asking cannot help; degrade. |
+
+> **Amended.** This table listed a seventh row, `ReconcileError::MissingId(id)` — "name the missing
+> ids explicitly; restate total accounting" — which no longer exists. Exact-set accounting was
+> deleted with the fix for issue #62: an id the reviewer does not restate is carried unchanged, so
+> there is nothing to repair and no call to spend repairing it. That row was also the most expensive
+> one in the table, because a reviewer that re-examined everything and dropped a single id out of
+> twenty-five lost its whole block, prose included, and bought it back with another model call. See
+> [`stale-open-findings-fix.md`](stale-open-findings-fix.md).
 
 The two cap cases carry an explicit "shorten, do not drop" clause. Without it the obvious way for a
 reviewer to satisfy a size cap is to drop findings — which is precisely the silent-loss failure the
@@ -145,7 +152,7 @@ A new pure renderer, `prompt::block_repair(cause, nonce, digest)`, which:
   given;
 - quotes the specific cause from the table above;
 - **reuses `machine_block_section` verbatim** for the markers, schema, and (on a resumed turn) the
-  prior-findings digest and total-accounting clause. Sharing the renderer is not a tidiness
+  prior-findings digest and the restatement contract. Sharing the renderer is not a tidiness
   preference: two independently-worded statements of the same contract are two things that drift,
   and a repair prompt that describes a slightly different schema than the turn prompt would produce
   blocks that fail for a new reason;
@@ -175,7 +182,7 @@ an already-broken session as structured-but-still-`rebaseline`.
 
 **Allowing a repaired turn to converge — where the rest of the conjunction already holds, and never
 otherwise — is a deliberate call, and here is the argument.** The block
-came from the same reviewer, in the same conversation, under the same total-accounting contract,
+came from the same reviewer, in the same conversation, under the same block contract,
 reconciled against the same ledger by the same fail-closed code. Every guarantee the structured path
 makes is intact. Refusing convergence would leave the caller exactly where it is today (escalate,
 rebaseline, re-review) while having spent the repair — the fix would buy nothing. The residual is
@@ -649,7 +656,7 @@ accepts both, so old records still read and old readers skip-and-count rather th
   coverage — on a session entering `whole_conversation` that means coverage stays whole; on one
   entering broken it stays broken (the sticky-arm case below). A second unusable block degrades with
   the original cause preserved and `block_repair: "failed"`.
-- Repair-prompt content: the cause, the exact nonce-bearing markers, the digest and total-accounting
+- Repair-prompt content: the cause, the exact nonce-bearing markers, the digest and the restatement
   clause on a resumed turn, the "do not re-review" framing, and the "shorten, do not drop" clause on
   both cap causes.
 - The pinned account reaches the child: an invocation built with a pinned `AuthorizedHome` applies
