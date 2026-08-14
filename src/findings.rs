@@ -202,6 +202,13 @@ pub enum NonConvergenceReason {
     TurnNotDurable,
     /// The ledger/digest exceeded the bounded budget. Escalate.
     LedgerTooLarge,
+    /// Findings are open and no finding has been minted or resolved for `--stagnant-session-turns`
+    /// turns: the session is producing nothing and is terminal. Escalate → rebaseline.
+    ///
+    /// This is **not** a claim that anything went unexamined — the server cannot observe that, which
+    /// is why issue #78's per-finding half was closed won't-fix. It says only that the record stopped
+    /// moving. See `docs/finding-liveness.md`.
+    SessionStagnant,
 }
 
 /// What the caller should **do next**, as a total function of [`NonConvergenceReason`].
@@ -236,9 +243,10 @@ impl Outcome {
             None => Outcome::Converged,
             Some(OpenFindings) | Some(VerdictContradiction) => Outcome::ChangesRequested,
             Some(ReviewerBlocked) | Some(ReviewerWithheldApprove) => Outcome::Escalate,
-            Some(LedgerUnavailable) | Some(TurnNotDurable) | Some(LedgerTooLarge) => {
-                Outcome::Rebaseline
-            }
+            Some(LedgerUnavailable)
+            | Some(TurnNotDurable)
+            | Some(LedgerTooLarge)
+            | Some(SessionStagnant) => Outcome::Rebaseline,
         }
     }
 }
@@ -259,16 +267,38 @@ impl NonConvergenceReason {
     /// The deterministic precedence order over the reasons a *completed envelope* can carry, most
     /// grave first (`state_corrupt`/`invalid` are pre-model refusals and never enter this order).
     /// Lower rank wins.
+    ///
+    /// The organising rule, which is what places `SessionStagnant`: **a sticky terminal reason
+    /// outranks an advisory one**, because reporting an advisory reason on a turn that also killed
+    /// the session would understate what happened. It yields to the three ledger/durability reasons
+    /// because those say the record itself is unusable, which is graver than a usable record that
+    /// stopped growing.
     fn rank(self) -> u8 {
         use NonConvergenceReason::*;
         match self {
             LedgerTooLarge => 0,
             LedgerUnavailable => 1,
             TurnNotDurable => 2,
-            ReviewerBlocked => 3,
-            VerdictContradiction => 4,
-            ReviewerWithheldApprove => 5,
-            OpenFindings => 6,
+            SessionStagnant => 3,
+            ReviewerBlocked => 4,
+            VerdictContradiction => 5,
+            ReviewerWithheldApprove => 6,
+            OpenFindings => 7,
+        }
+    }
+
+    /// Whether this reason is a **sticky terminal state**: one that is persisted to
+    /// `SessionRecord::terminal_reason` so every later resume of the session is refused.
+    ///
+    /// Only two reasons are sticky. `LedgerUnavailable` and `TurnNotDurable` are deliberately *not*,
+    /// even though both are grave and both yield `Outcome::Rebaseline`: they are recorded as ledger
+    /// coverage, and promoting them here would turn a single degraded or unpersisted turn into a
+    /// permanently dead session. The string is the persisted spelling, which matches the serde name.
+    pub fn sticky_terminal(self) -> Option<&'static str> {
+        match self {
+            NonConvergenceReason::LedgerTooLarge => Some("ledger_too_large"),
+            NonConvergenceReason::SessionStagnant => Some("session_stagnant"),
+            _ => None,
         }
     }
 }
@@ -340,6 +370,22 @@ impl Ledger {
     /// `count(all findings ever raised)`.
     pub fn total_count(&self) -> u64 {
         self.findings.len() as u64
+    }
+
+    /// The last turn a finding was **minted or resolved** — the ledger's liveness signal.
+    ///
+    /// Deliberately not "the last turn the ledger changed": an echoed restatement *does* change the
+    /// ledger, because it advances `last_verified_turn`, and that is precisely the movement this must
+    /// not count. `reconcile` leaves `last_status_change_turn` alone for a restatement that does not
+    /// move the status, so a reviewer cannot advance this by saying it looked — only by producing a
+    /// finding or closing one.
+    ///
+    /// `None` for a ledger that has never held a finding. See `docs/finding-liveness.md`.
+    pub fn last_movement_turn(&self) -> Option<u32> {
+        self.findings
+            .iter()
+            .map(|f| f.last_status_change_turn)
+            .max()
     }
 
     /// The size of the prior-findings digest injected into each prompt — the primary bounded-growth
@@ -788,14 +834,57 @@ pub struct Resolution {
     pub warnings: Vec<String>,
 }
 
+/// The session-liveness inputs for a turn: how long the ledger has gone without a mint or a
+/// resolution, and the threshold at which that ends the session.
+///
+/// This is the whole of issue #78's mechanism. It watches the *session*, not the reviewer — see
+/// `docs/finding-liveness.md` for why the per-finding version is not buildable, and why nothing
+/// about this reaches the prompt.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Liveness<'a> {
+    /// Turns since a finding was last minted or resolved. `None` for a ledger that has never held
+    /// one, which is never stagnant because there is nothing to be stagnant about.
+    pub stagnation: Option<u32>,
+    /// `--stagnant-session-turns`. `0` disables the gate entirely.
+    pub stagnant_after: u32,
+    /// The still-open findings, named in the warning so the human deciding what to carry into a
+    /// fresh session does not have to reconstruct the list.
+    pub open: &'a [Finding],
+}
+
+impl Liveness<'_> {
+    /// Whether this turn's ledger has stalled. False whenever the gate is disabled or nothing has
+    /// ever moved.
+    fn is_stagnant(&self) -> bool {
+        self.stagnant_after > 0 && self.stagnation.is_some_and(|s| s >= self.stagnant_after)
+    }
+
+    /// `f3 (last re-examined turn 4)`, comma-separated. `unknown` rather than a substituted turn for
+    /// a finding from a ledger written before `last_verified_turn` existed: a human reads this to
+    /// decide what to carry forward, and inventing a plausible turn number for one there is no
+    /// record of is the worse failure.
+    fn open_summary(&self) -> String {
+        self.open
+            .iter()
+            .map(|f| match f.last_verified_turn {
+                Some(t) => format!("{} (last re-examined turn {t})", f.id),
+                None => format!("{} (last re-examined unknown)", f.id),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Resolve convergence and verdict for a *structured* turn (a valid block, cleanly reconciled).
 /// `coverage` is the on-disk coverage this turn will persist; `over_budget` is the bounded-growth
-/// check. Degraded turns do not use this — they take the degraded path in `evaluate_turn`.
+/// check; `liveness` is the issue-#78 stagnation gate. Degraded turns do not use this — they take
+/// the degraded path in `evaluate_turn`.
 fn resolve_structured(
     verdict_detail: VerdictDetail,
     coverage: LedgerCoverage,
     open_count: u64,
     over_budget: bool,
+    liveness: Liveness<'_>,
 ) -> Resolution {
     let mut warnings = Vec::new();
 
@@ -849,6 +938,18 @@ fn resolve_structured(
         )
     {
         reasons.push(NonConvergenceReason::OpenFindings);
+    }
+    // Issue #78. Conditioned on `open_count > 0`, so it can only ever make an outcome graver: a
+    // session with nothing open is not stuck on a finding, and a stalled one that had converged
+    // would be a contradiction. Nothing here touches a finding's status.
+    if open_count > 0 && liveness.is_stagnant() {
+        warnings.push(format!(
+            "no finding has been raised or resolved for {} turn(s); the session is terminal and its \
+             still-open findings must be carried into a fresh review: {}",
+            liveness.stagnation.unwrap_or_default(),
+            liveness.open_summary()
+        ));
+        reasons.push(NonConvergenceReason::SessionStagnant);
     }
 
     let reason = reasons.into_iter().min_by_key(|r| r.rank());
@@ -1380,10 +1481,12 @@ pub struct TurnEvaluation {
     /// The ledger to persist for this turn (findings preserved/updated, coverage set).
     pub ledger: Ledger,
     /// The completed envelope, assuming the persist below succeeds.
+    ///
+    /// Its `non_convergence_reason` is also what decides the session's sticky `terminal_reason`, via
+    /// `NonConvergenceReason::sticky_terminal`. This struct used to carry a separate `over_budget`
+    /// flag for that, which enumerated the one sticky cause that existed at the time and would have
+    /// had to grow a sibling for every later one (issue #78 review, round 2).
     pub envelope: Envelope,
-    /// Whether this turn is over the bounded budget; the caller sets the session's sticky
-    /// `terminal_reason` when true.
-    pub over_budget: bool,
     /// The reviewer's prose with its machine block stripped, marker-neutralised, and with any
     /// block-repair notes appended — what the caller renders and stores. Returned here so
     /// composition has one owner: the caller used to strip and append on its own, which is two
@@ -1606,9 +1709,13 @@ pub fn evaluate_turn(
     prior: Option<PriorState>,
     budget: Budget,
 ) -> TurnEvaluation {
+    // The stagnation gate is disabled here: these tests predate it and drive the verdict/coverage
+    // truth table, not session liveness. The #78 gate is exercised against `finalize_turn` directly,
+    // which is where the threshold enters.
     finalize_turn(
         assess_turn(session, turn, nonce, review_text, prior),
         budget,
+        0,
     )
 }
 
@@ -1624,11 +1731,19 @@ pub fn evaluate_turn_for_test(
     finalize_turn(
         assess_turn(session, turn, nonce, review_text, None),
         Budget::default(),
+        0,
     )
 }
 
 /// Build the ledger to persist and the completed envelope from an assessment (pure).
-pub fn finalize_turn(assessment: TurnAssessment, budget: Budget) -> TurnEvaluation {
+///
+/// `stagnant_after` is `--stagnant-session-turns`: the number of turns a session may go without
+/// minting or resolving a finding before it is terminal, or `0` to disable that gate.
+pub fn finalize_turn(
+    assessment: TurnAssessment,
+    budget: Budget,
+    stagnant_after: u32,
+) -> TurnEvaluation {
     let TurnAssessment {
         session,
         turn,
@@ -1662,7 +1777,22 @@ pub fn finalize_turn(assessment: TurnAssessment, budget: Budget) -> TurnEvaluati
             };
             let over_budget = budget.is_over(&ledger);
             let open_count = ledger.open_count();
-            let res = resolve_structured(verdict_detail, coverage, open_count, over_budget);
+            // Stagnation is measured against the ledger *after* this turn's reconciliation, so a
+            // mint or a resolution on this turn puts the last movement at `turn` and the distance
+            // at zero. `saturating_sub` because a ledger can only hold turns already taken.
+            let open: Vec<Finding> = ledger
+                .findings
+                .iter()
+                .filter(|f| f.status.is_open())
+                .cloned()
+                .collect();
+            let liveness = Liveness {
+                stagnation: ledger.last_movement_turn().map(|m| turn.saturating_sub(m)),
+                stagnant_after,
+                open: &open,
+            };
+            let res =
+                resolve_structured(verdict_detail, coverage, open_count, over_budget, liveness);
             let envelope = Envelope {
                 schema_version: ENVELOPE_SCHEMA_VERSION,
                 session: session.to_string(),
@@ -1692,7 +1822,6 @@ pub fn finalize_turn(assessment: TurnAssessment, budget: Budget) -> TurnEvaluati
             TurnEvaluation {
                 ledger,
                 envelope,
-                over_budget,
                 // Filled in below, once for every arm.
                 review_prose: String::new(),
                 envelope_prose: CappedProse::whole(String::new()),
@@ -1720,7 +1849,6 @@ pub fn finalize_turn(assessment: TurnAssessment, budget: Budget) -> TurnEvaluati
             TurnEvaluation {
                 ledger,
                 envelope,
-                over_budget: false,
                 review_prose: String::new(),
                 envelope_prose: CappedProse::whole(String::new()),
             }
@@ -2645,6 +2773,7 @@ mod tests {
             LedgerCoverage::WholeConversation,
             0,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.verdict, MachineVerdict::Approve);
         assert!(r.converged);
@@ -2658,6 +2787,7 @@ mod tests {
             LedgerCoverage::WholeConversation,
             2,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.verdict, MachineVerdict::Changes);
         assert!(!r.converged);
@@ -2672,6 +2802,7 @@ mod tests {
             LedgerCoverage::WholeConversation,
             3,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.reason, Some(NonConvergenceReason::OpenFindings));
         assert!(!r.converged);
@@ -2684,6 +2815,7 @@ mod tests {
             LedgerCoverage::WholeConversation,
             0,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.reason, Some(NonConvergenceReason::VerdictContradiction));
     }
@@ -2695,6 +2827,7 @@ mod tests {
             LedgerCoverage::WholeConversation,
             0,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.verdict, MachineVerdict::Approve);
         assert_eq!(
@@ -2712,6 +2845,7 @@ mod tests {
                 LedgerCoverage::WholeConversation,
                 open,
                 false,
+                Liveness::default(),
             );
             assert_eq!(r.reason, Some(NonConvergenceReason::ReviewerBlocked));
         }
@@ -2726,6 +2860,7 @@ mod tests {
             LedgerCoverage::LegacyUncovered,
             0,
             false,
+            Liveness::default(),
         );
         assert!(!r.converged);
         assert_eq!(r.reason, Some(NonConvergenceReason::LedgerUnavailable));
@@ -2738,9 +2873,313 @@ mod tests {
             LedgerCoverage::WholeConversation,
             0,
             true,
+            Liveness::default(),
         );
         assert!(!r.converged);
         assert_eq!(r.reason, Some(NonConvergenceReason::LedgerTooLarge));
+    }
+
+    // --- issue #78: the session-stagnation watchdog -----------------------------------------
+
+    /// `Liveness` for a session `stagnation` turns past its last mint or resolution, gated at
+    /// `after`, holding `open` findings.
+    fn stalled(stagnation: u32, after: u32, open: &[Finding]) -> Liveness<'_> {
+        Liveness {
+            stagnation: Some(stagnation),
+            stagnant_after: after,
+            open,
+        }
+    }
+
+    /// Drive a real turn through the whole pure path against a prior ledger, at a given threshold.
+    fn turn_with_prior(
+        turn: u32,
+        nonce: &str,
+        body: &str,
+        prior: PriorState,
+        stagnant_after: u32,
+    ) -> TurnEvaluation {
+        let text = block(nonce, body);
+        finalize_turn(
+            assess_turn("s", turn, nonce, &text, Some(prior)),
+            Budget::default(),
+            stagnant_after,
+        )
+    }
+
+    fn prior_of(findings: Vec<Finding>, next_seq: u64) -> PriorState {
+        PriorState {
+            coverage: LedgerCoverage::WholeConversation,
+            findings,
+            next_seq,
+        }
+    }
+
+    #[test]
+    fn a_session_that_has_stopped_producing_findings_is_terminal() {
+        let open = [finding("f1", Status::Open, 1, 1)];
+        let r = resolve_structured(
+            VerdictDetail::RequestChanges,
+            LedgerCoverage::WholeConversation,
+            1,
+            false,
+            stalled(3, 3, &open),
+        );
+        assert_eq!(r.reason, Some(NonConvergenceReason::SessionStagnant));
+        assert!(!r.converged);
+        assert_eq!(
+            Outcome::from_reason(r.reason),
+            Outcome::Rebaseline,
+            "a stalled session cannot continue, so a person decides"
+        );
+        // The warning has to be enough for that person to act without reconstructing the list.
+        let w = r.warnings.join(" ");
+        assert!(w.contains("f1"), "the warning names the still-open finding");
+        assert!(w.contains("last re-examined turn 1"));
+    }
+
+    #[test]
+    fn one_turn_short_of_the_threshold_is_an_ordinary_re_review() {
+        let open = [finding("f1", Status::Open, 1, 1)];
+        let r = resolve_structured(
+            VerdictDetail::RequestChanges,
+            LedgerCoverage::WholeConversation,
+            1,
+            false,
+            stalled(2, 3, &open),
+        );
+        assert_eq!(r.reason, Some(NonConvergenceReason::OpenFindings));
+        assert_eq!(Outcome::from_reason(r.reason), Outcome::ChangesRequested);
+    }
+
+    #[test]
+    fn the_gate_never_fires_with_nothing_open_or_nothing_ever_raised_or_when_disabled() {
+        // Nothing open: the session is not stuck on a finding, whatever the last movement was.
+        let r = resolve_structured(
+            VerdictDetail::Approve,
+            LedgerCoverage::WholeConversation,
+            0,
+            false,
+            stalled(9, 3, &[]),
+        );
+        assert!(r.converged, "the gate can only ever make an outcome graver");
+
+        // `--stagnant-session-turns 0`.
+        let open = [finding("f1", Status::Open, 1, 1)];
+        let r = resolve_structured(
+            VerdictDetail::RequestChanges,
+            LedgerCoverage::WholeConversation,
+            1,
+            false,
+            stalled(99, 0, &open),
+        );
+        assert_eq!(r.reason, Some(NonConvergenceReason::OpenFindings));
+    }
+
+    #[test]
+    fn a_ledger_that_has_never_held_a_finding_has_nothing_to_be_stagnant_about() {
+        // Driven through `finalize_turn` rather than by handing `resolve_structured` a
+        // `stagnation: None` beside a non-empty open list, which is a state no real turn produces.
+        let prior = prior_of(Vec::new(), 1);
+        let ev = turn_with_prior(
+            9,
+            "rv-78-5",
+            r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
+            prior,
+            3,
+        );
+        assert_eq!(ev.ledger.last_movement_turn(), None);
+        assert!(ev.envelope.converged);
+        assert_eq!(ev.envelope.non_convergence_reason, None);
+    }
+
+    #[test]
+    fn a_stagnant_turn_leaves_every_finding_exactly_where_it_was() {
+        // The constraint issue #78 states most emphatically: nothing here may treat a carried
+        // finding as resolved. A held-open finding has been right every time it was disputed here.
+        let prior = prior_of(
+            vec![
+                finding("f1", Status::Open, 1, 1),
+                finding("f2", Status::Open, 1, 1),
+            ],
+            3,
+        );
+        let ev = turn_with_prior(
+            4,
+            "rv-78-1",
+            r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[]}"#,
+            prior,
+            3,
+        );
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::SessionStagnant)
+        );
+        assert!(ev
+            .envelope
+            .findings
+            .iter()
+            .all(|f| f.status == Status::Open));
+        assert_eq!(ev.envelope.open_count, Some(2));
+        assert_eq!(ev.envelope.total_count, Some(2));
+        assert!(ev.envelope.findings_trusted);
+        assert_eq!(ev.ledger.findings.len(), 2, "the record survives intact");
+    }
+
+    #[test]
+    fn an_echoed_restatement_does_not_reset_the_gate() {
+        // Round 1 of this change's own gate review killed a design that keyed on
+        // `last_verified_turn`, because echoing a status advances it without re-examining anything.
+        // This is that objection turned into a test: an echo moves the verification stamp and the
+        // watchdog is unmoved, because only a mint or a resolution counts as movement.
+        let prior = prior_of(vec![finding("f1", Status::Open, 1, 1)], 2);
+        let ev = turn_with_prior(
+            4,
+            "rv-78-2",
+            r#"{"verdict":"request_changes","prior_findings":[{"id":"f1","status":"open"}],"new_findings":[]}"#,
+            prior,
+            3,
+        );
+        assert_eq!(
+            ev.envelope.findings[0].last_verified_turn,
+            Some(4),
+            "the echo did advance the verification stamp"
+        );
+        assert_eq!(
+            ev.envelope.findings[0].last_status_change_turn, 1,
+            "but not the movement signal"
+        );
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::SessionStagnant),
+            "so the session is still terminal"
+        );
+    }
+
+    #[test]
+    fn a_resolution_or_a_fresh_finding_resets_the_gate() {
+        // Resolving one of two.
+        let prior = prior_of(
+            vec![
+                finding("f1", Status::Open, 1, 1),
+                finding("f2", Status::Open, 1, 1),
+            ],
+            3,
+        );
+        let ev = turn_with_prior(
+            4,
+            "rv-78-3",
+            r#"{"verdict":"request_changes","prior_findings":[{"id":"f1","status":"resolved"}],"new_findings":[]}"#,
+            prior,
+            3,
+        );
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::OpenFindings)
+        );
+
+        // Raising a new one while carrying every old one — output is output.
+        let prior = prior_of(vec![finding("f1", Status::Open, 1, 1)], 2);
+        let ev = turn_with_prior(
+            4,
+            "rv-78-4",
+            r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"minor","title":"t","detail":"d"}]}"#,
+            prior,
+            3,
+        );
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::OpenFindings)
+        );
+        assert_eq!(ev.ledger.last_movement_turn(), Some(4));
+    }
+
+    #[test]
+    fn a_finding_from_a_pre_verification_ledger_is_reported_as_unknown_not_invented() {
+        // `last_verified_turn` is absent on a ledger written before #77. The warning says so rather
+        // than substituting `first_seen_turn`: a human reads it to decide what to carry forward.
+        let mut legacy = finding("f1", Status::Open, 1, 1);
+        legacy.last_verified_turn = None;
+        let open = [legacy];
+        let r = resolve_structured(
+            VerdictDetail::RequestChanges,
+            LedgerCoverage::WholeConversation,
+            1,
+            false,
+            stalled(3, 3, &open),
+        );
+        assert!(r
+            .warnings
+            .join(" ")
+            .contains("f1 (last re-examined unknown)"));
+    }
+
+    #[test]
+    fn stagnation_yields_to_every_graver_reason_and_beats_the_advisory_ones() {
+        let open = [finding("f1", Status::Open, 1, 1)];
+        let cases = [
+            // (verdict, coverage, over_budget, expected)
+            (
+                VerdictDetail::RequestChanges,
+                LedgerCoverage::WholeConversation,
+                true,
+                NonConvergenceReason::LedgerTooLarge,
+            ),
+            (
+                VerdictDetail::RequestChanges,
+                LedgerCoverage::NeedsRebaseline,
+                false,
+                NonConvergenceReason::LedgerUnavailable,
+            ),
+            // Advisory reasons lose: a turn that killed the session must say so.
+            (
+                VerdictDetail::Blocked,
+                LedgerCoverage::WholeConversation,
+                false,
+                NonConvergenceReason::SessionStagnant,
+            ),
+            (
+                VerdictDetail::Approve,
+                LedgerCoverage::WholeConversation,
+                false,
+                NonConvergenceReason::SessionStagnant,
+            ),
+            (
+                VerdictDetail::RequestChanges,
+                LedgerCoverage::WholeConversation,
+                false,
+                NonConvergenceReason::SessionStagnant,
+            ),
+        ];
+        for (verdict, coverage, over, expected) in cases {
+            let r = resolve_structured(verdict, coverage, 1, over, stalled(3, 3, &open));
+            assert_eq!(r.reason, Some(expected), "{verdict:?} / {coverage:?}");
+        }
+        // `turn_not_durable` is applied by the caller after this returns and outranks it there;
+        // `reviewer_withheld_approve` cannot co-occur at all, since it requires `open_count == 0`.
+        assert!(
+            NonConvergenceReason::TurnNotDurable.rank()
+                < NonConvergenceReason::SessionStagnant.rank()
+        );
+    }
+
+    #[test]
+    fn only_the_two_sticky_reasons_are_persisted_as_a_terminal_state() {
+        use NonConvergenceReason::*;
+        assert_eq!(LedgerTooLarge.sticky_terminal(), Some("ledger_too_large"));
+        assert_eq!(SessionStagnant.sticky_terminal(), Some("session_stagnant"));
+        // Grave, and both rebaseline, but neither kills the session permanently: a degraded turn or
+        // one that failed to persist must not become an unresumable session.
+        for r in [
+            LedgerUnavailable,
+            TurnNotDurable,
+            ReviewerBlocked,
+            VerdictContradiction,
+            ReviewerWithheldApprove,
+            OpenFindings,
+        ] {
+            assert_eq!(r.sticky_terminal(), None, "{r:?}");
+        }
     }
 
     #[test]
@@ -2751,6 +3190,7 @@ mod tests {
             LedgerCoverage::NeedsRebaseline,
             4,
             false,
+            Liveness::default(),
         );
         assert_eq!(r.reason, Some(NonConvergenceReason::LedgerUnavailable));
     }
@@ -2839,7 +3279,6 @@ mod tests {
             r#"{"verdict":"approve","prior_findings":[],"new_findings":[{"severity":"minor","title":"t","detail":"d"}]}"#,
         );
         let ev = evaluate_turn("s", 1, "rv-9-1", &text, None, Budget::new(1, 1_000_000));
-        assert!(ev.over_budget);
         assert_eq!(
             ev.envelope.non_convergence_reason,
             Some(NonConvergenceReason::LedgerTooLarge)
@@ -3236,7 +3675,7 @@ mod repair_tests {
             repaired.review_prose, prose_before,
             "the review is the reviewer's original prose; a repair is transport"
         );
-        let ev = finalize_turn(repaired, Budget::default());
+        let ev = finalize_turn(repaired, Budget::default(), 0);
         assert!(ev.envelope.structured);
         assert_eq!(ev.envelope.block_repair, Some(BlockRepair::Recovered));
         assert!(ev.envelope.converged, "a clean approve with nothing open");
@@ -3254,7 +3693,7 @@ mod repair_tests {
         let a = assess_turn("s", 1, "rv-1-1", "prose only", None);
         let repaired = apply_repair(a, "still no block");
         assert!(!repaired.is_structured());
-        let ev = finalize_turn(repaired, Budget::default());
+        let ev = finalize_turn(repaired, Budget::default(), 0);
         assert_eq!(ev.envelope.block_repair, Some(BlockRepair::Failed));
         assert!(
             ev.envelope
@@ -3282,7 +3721,7 @@ mod repair_tests {
                 r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
             ),
         );
-        let ev = finalize_turn(repaired, Budget::default());
+        let ev = finalize_turn(repaired, Budget::default(), 0);
         assert!(ev.envelope.structured, "the block was valid and reconciled");
         assert_eq!(ev.envelope.open_count, Some(0), "counts are real");
         assert!(!ev.envelope.converged);
@@ -3304,7 +3743,7 @@ mod repair_tests {
                 r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"resolved"}],"new_findings":[]}"#,
             ),
         );
-        let ev = finalize_turn(repaired, Budget::default());
+        let ev = finalize_turn(repaired, Budget::default(), 0);
         assert!(ev.envelope.structured);
         assert_eq!(ev.envelope.open_count, Some(0));
         // A repair is part of turn N, not a new turn.
@@ -3323,12 +3762,13 @@ mod repair_tests {
             (Some(VerdictContradiction), Outcome::ChangesRequested),
             (Some(ReviewerBlocked), Outcome::Escalate),
             (Some(ReviewerWithheldApprove), Outcome::Escalate),
-            // The three that mean "this session cannot continue". `turn_not_durable` belongs here
+            // The four that mean "this session cannot continue". `turn_not_durable` belongs here
             // and not with the unstructured turns: the caller must be told to rebaseline carrying
             // the preserved findings, which an "it was unstructured" signal would hide.
             (Some(LedgerUnavailable), Outcome::Rebaseline),
             (Some(TurnNotDurable), Outcome::Rebaseline),
             (Some(LedgerTooLarge), Outcome::Rebaseline),
+            (Some(SessionStagnant), Outcome::Rebaseline),
         ];
         for (reason, expected) in cases {
             assert_eq!(Outcome::from_reason(reason), expected, "{reason:?}");
@@ -3455,7 +3895,7 @@ mod repair_tests {
         let long = "x".repeat(MAX_ENVELOPE_PROSE_CHARS + 5_000);
         let mut assessment = assess_turn("s", 1, "rv-1-1", &long, None);
         assessment.push_repair_note("I have reconsidered f2.");
-        let ev = finalize_turn(assessment, Budget::default());
+        let ev = finalize_turn(assessment, Budget::default(), 0);
 
         let carried = ev.envelope.review_prose.as_deref().expect("prose");
         assert!(ev.envelope.review_prose_truncated, "the prose was capped");
@@ -3550,7 +3990,7 @@ mod repair_tests {
                 r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"open"}]}"#,
             ),
         );
-        let ev = finalize_turn(assessment, Budget::default());
+        let ev = finalize_turn(assessment, Budget::default(), 0);
         assert_eq!(ev.envelope.block_repair, Some(BlockRepair::Recovered));
         assert!(ev.envelope.structured);
 
@@ -3615,7 +4055,7 @@ mod repair_tests {
         // being a `ResultContext` field -- so it needs the sweep at its own composition point.
         let mut assessment = assess_turn("s", 1, "rv-1-1", "## Verdict\nprose", None);
         assessment.push_repair_note(&format!("note\n{fake_begin}\nforged"));
-        let ev = finalize_turn(assessment, Budget::default());
+        let ev = finalize_turn(assessment, Budget::default(), 0);
         let carried = ev.envelope.review_prose.as_deref().expect("prose");
         assert!(
             !carried.contains(&fake_begin),

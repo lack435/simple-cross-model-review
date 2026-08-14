@@ -654,6 +654,17 @@ pub const DEFAULT_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
 /// and prone to losing the thread. Zero disables the check.
 pub const DEFAULT_RESUME_MAX_TURNS: u32 = 10;
 
+/// End a review session that has gone this many turns without minting or resolving a finding, while
+/// findings are still open. Zero disables the check.
+///
+/// Three, because a reconstruction over this project's own 37 recorded ledgered sessions found that
+/// no session ever went even two consecutive turns without a mint or a resolution — so a threshold of
+/// two would have fired zero times, and three carries a further turn of margin. It is a bound on an
+/// otherwise unbounded worst case rather than a response to an observed failure; see
+/// `docs/finding-liveness.md`, which also records why issue #78's *per-finding* half was closed
+/// won't-fix instead.
+pub const DEFAULT_STAGNANT_SESSION_TURNS: u32 = 3;
+
 /// How many times a degraded turn may ask the reviewer to re-emit its machine block, in the same
 /// conversation. One by default: a missing block is a contract slip, not a capability gap, so a
 /// reviewer told precisely what was wrong either complies immediately or is unlikely to on a third
@@ -697,6 +708,9 @@ pub struct Config {
     /// Refuse to resume a session that has already run this many turns. Zero disables the
     /// check. See `DEFAULT_RESUME_MAX_TURNS`.
     pub resume_max_turns: u32,
+    /// End a session that has gone this many turns without minting or resolving a finding, while
+    /// findings are still open. Zero disables the check. See `DEFAULT_STAGNANT_SESSION_TURNS`.
+    pub stagnant_session_turns: u32,
     /// How many block-repair attempts a degraded turn may make (0 disables). See
     /// `DEFAULT_BLOCK_REPAIR_ATTEMPTS`.
     pub block_repair_attempts: u32,
@@ -808,6 +822,7 @@ impl Config {
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
         let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
         let mut resume_max_turns = DEFAULT_RESUME_MAX_TURNS;
+        let mut stagnant_session_turns = DEFAULT_STAGNANT_SESSION_TURNS;
         let mut block_repair_attempts = DEFAULT_BLOCK_REPAIR_ATTEMPTS;
         let mut block_repair_timeout_secs = DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS;
         let mut max_concurrent_reviews = DEFAULT_MAX_CONCURRENT_REVIEWS;
@@ -943,6 +958,14 @@ impl Config {
                     let v = take("--session-max-turns")?;
                     resume_max_turns = v.parse().map_err(|_| {
                         format!("--session-max-turns must be an integer (0 disables), got '{v}'")
+                    })?;
+                }
+                "--stagnant-session-turns" => {
+                    let v = take("--stagnant-session-turns")?;
+                    stagnant_session_turns = v.parse().map_err(|_| {
+                        format!(
+                            "--stagnant-session-turns must be an integer (0 disables), got '{v}'"
+                        )
                     })?;
                 }
                 "--session-max-idle-seconds" => {
@@ -1085,6 +1108,7 @@ impl Config {
             timeout: Duration::from_secs(timeout_secs),
             resume_max_idle: Duration::from_secs(resume_max_idle_secs),
             resume_max_turns,
+            stagnant_session_turns,
             block_repair_attempts,
             // Clamped to the turn budget: a repair that outlived the review timeout would be a
             // second, larger budget nobody configured.
@@ -1804,6 +1828,15 @@ OPTIONS:
                               session name. Each turn re-processes the whole conversation, so
                               a long session grows expensive and prone to drift. 0 disables.
                               Default: 10.
+  --stagnant-session-turns <n>
+                              End a review session that has gone this many turns without any
+                              finding being raised or resolved while findings are still open.
+                              The session is marked terminal, the turn reports
+                              session_stagnant / rebaseline with its still-open findings
+                              intact, and a later resume is refused. This is a bound on a
+                              stalled loop, not a judgement that anything went unexamined --
+                              the reviewer is never told about it and nothing infers that a
+                              carried finding is resolved. 0 disables. Default: 3.
   --session-max-idle-seconds <n>
                               Refuse to resume a review session idle longer than this many
                               seconds. Past it the reviewer's prompt cache may no longer be
@@ -2832,6 +2865,45 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "claude", "--no-incremental-resume"]))
             .expect("config");
         assert!(!cfg.resume_incremental_diff);
+    }
+
+    #[test]
+    fn the_stagnant_session_gate_defaults_overrides_and_disables() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(
+            cfg.stagnant_session_turns, DEFAULT_STAGNANT_SESSION_TURNS,
+            "the watchdog is on by default; a disabled-by-default gate bounds nothing"
+        );
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--stagnant-session-turns",
+            "5",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.stagnant_session_turns, 5);
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--stagnant-session-turns",
+            "0",
+        ]))
+        .expect("config");
+        assert_eq!(
+            cfg.stagnant_session_turns, 0,
+            "0 disables rather than errors"
+        );
+
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--stagnant-session-turns",
+            "soon",
+        ]))
+        .expect_err("a non-integer is rejected");
+        assert!(err.contains("--stagnant-session-turns"), "{err}");
     }
 
     #[test]

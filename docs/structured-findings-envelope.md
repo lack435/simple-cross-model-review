@@ -145,6 +145,7 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.findings-pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
 | `state_corrupt` | The session store itself did not parse. Like `invalid`, this is caught at load, so it is a **pre-model `SESSION_NOT_RESUMABLE`-class refusal** carrying `state_corrupt` as its detail — **never a completed-envelope `non_convergence_reason`** (round 21); no review runs. | **Escalate to a human**; operator moves the corrupt store aside / uses `--state-dir`; do not silently start fresh (below). |
 | `ledger_too_large` | The ledger/digest exceeded the bounded budget, before *or* after this turn ran. | **Escalate to a human**; the session cannot keep growing (below). |
+| `session_stagnant` | `open_count > 0` and no finding has been minted or resolved for `--stagnant-session-turns` turns. The session is marked terminal and later resumes are refused. Added for issue #78; see [`finding-liveness.md`](finding-liveness.md). | **Escalate to a human**, who carries the still-open findings into a fresh session. Every finding is returned unchanged — this reason says the loop stopped producing, **not** that anything went unexamined and never that a carried finding is resolved. |
 
 `unstructured` is **not** a value of `non_convergence_reason` (round 8). "No valid block this turn"
 (missing/duplicate/extra id, malformed block, wrong nonce, …) is carried by `structured: false` and
@@ -168,7 +169,8 @@ run (round 17, the `invalid` note).
 11 closed that hole): `open_findings` and `verdict_contradiction` say re-review; **every other
 reason is a human-escalation outcome** — `reviewer_withheld_approve` (the reviewer will keep
 withholding), `reviewer_blocked` (the reviewer declared it cannot finish), `state_corrupt`,
-`ledger_too_large`, `turn_not_durable`, and **`ledger_unavailable`**. The last is the subtle one:
+`ledger_too_large`, `session_stagnant`, `turn_not_durable`, and **`ledger_unavailable`**. The last is
+the subtle one:
 telling an autonomous loop to blindly `fresh` on a coverage break re-introduces the silent drop the
 coverage rule exists to prevent — a `fresh` review of the current code can converge while the
 untracked prose finding that broke coverage is simply forgotten. So `ledger_unavailable` escalates
@@ -195,8 +197,22 @@ exists), so they never enter this ordering:
 
 `ledger_too_large` → `ledger_unavailable` (the completed-envelope readable-break states
 `legacy_uncovered` / `needs_rebaseline` — *not* a degraded turn whose own write failed, which is
-`turn_not_durable`) → `turn_not_durable` → `reviewer_blocked` → `verdict_contradiction` →
-`reviewer_withheld_approve` → `open_findings`.
+`turn_not_durable`) → `turn_not_durable` → `session_stagnant` → `reviewer_blocked` →
+`verdict_contradiction` → `reviewer_withheld_approve` → `open_findings`.
+
+`session_stagnant` sits where it does under a rule worth stating, because it is the one that will
+place the next reason added here: **a sticky terminal reason outranks an advisory one**, since
+reporting an advisory reason on a turn that also killed the session would understate what happened.
+It yields to the three ledger/durability reasons because those say the record itself is unusable,
+which is graver than a usable record that stopped growing. It must outrank `open_findings`, which
+always co-occurs with it, or it would be unreachable; `reviewer_withheld_approve` cannot co-occur at
+all, since that requires `open_count == 0`.
+
+Only two reasons are **sticky** — persisted to `SessionRecord::terminal_reason` so every later resume
+of that session is refused: `ledger_too_large` and `session_stagnant`
+(`NonConvergenceReason::sticky_terminal`). `ledger_unavailable` and `turn_not_durable` are grave and
+both rebaseline, but neither is sticky: they are recorded as ledger coverage, and promoting either
+would turn one degraded or unpersisted turn into a permanently dead session.
 
 A permanently-uncovered session therefore always reports `ledger_unavailable` (**escalate →
 rebaseline**), never `open_findings` ("re-review"), no matter how many findings it also has — so the
