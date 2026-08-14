@@ -620,9 +620,29 @@ Switch on `outcome`:
 | `rebaseline` | This session cannot continue — coverage is broken, the turn was not durable, or the ledger is over budget. | A person decides, then starts a fresh review carrying the still-open findings. |
 
 `structured: false` means there is no machine record for this turn: `findings` is empty because
-nothing is in it, not because nothing was wrong. On those turns the review itself is in
-`review_prose` (capped, with the whole thing in the text body) so a client reading only
-`structuredContent` still has something to read.
+nothing is in it, not because nothing was wrong.
+
+**`structuredContent` is never silently poorer than the text body.** A client that reads only the
+structured channel — several MCP clients do — gets everything the rendered text shows that bears on
+how much weight the review deserves:
+
+| Field | What it answers |
+| --- | --- |
+| `review_prose` | What the reviewer said outside its findings list: its reasoning, and why a finding is still open. Present on **every turn that ran**, whatever the outcome; `null` only when no reviewer ran. Capped at 16,000 characters with `review_prose_truncated` saying when the copy is short — the whole thing is always in the text body. |
+| `captured` | What change the reviewer was actually shown: the resolved range, the counts, whether the diff was truncated, whether the capture was complete. |
+| `denial_count`, `denial_count_is_floor`, `denials` | How many commands the reviewer was refused, and whether that number is exact or a lower bound. |
+| `warnings` | Everything qualifying the turn — a partial capture, a turn that could not be saved, an account that moved mid-review — as one list, in the order the text renders it. |
+| `resumable` | Whether calling `cross_model_review` again with this session continues it or starts over. |
+| `reviewer`, `resumed`, `usage`, `disposition` | Which entry ran, whether it continued an earlier review, what it cost, and what was sent this turn. `reviewer` is `null` when no reviewer ran. |
+
+This exists because the reverse cost a real review: `review_prose` used to be `null` on any turn with
+a clean machine record, so an `approve_with_comments` verdict — whose entire content *is* the
+comments — returned `outcome: escalate` ("a person decides") with nothing for that person to read
+(issue #73). The same gap hid the two failures this README warns about elsewhere: a capture widened
+by a stale local `main`, and a reviewer that spent its turn on commands its policy refused. Both read
+as an ordinary successful review to a `structuredContent`-only client. A review that is quietly
+thinner than it looks produces a false approval rather than a lost review, which is the one failure
+here that is not merely retryable.
 
 ## What the reviewer can and cannot do
 

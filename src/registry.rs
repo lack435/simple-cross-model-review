@@ -183,6 +183,30 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// A completed outcome for a turn in which **no reviewer ran** — the over-budget-on-entry
+    /// refusal. Every field that describes a reviewer's work is empty, and the caller fills in the
+    /// `review`/`envelope` that explain the refusal.
+    ///
+    /// Distinct from [`failed`](Self::failed): this is a completed result the caller must act on
+    /// (rebaseline the session), not an error. Spelled out as a constructor so "no turn ran" is one
+    /// decision rather than a field list a future edit can half-update.
+    pub fn no_turn() -> Self {
+        Self {
+            review: None,
+            failure: None,
+            denials: Vec::new(),
+            denial_count: 0,
+            denial_count_is_floor: false,
+            warnings: Vec::new(),
+            disposition: None,
+            capture_summary: None,
+            resumable: false,
+            usage: Usage::default(),
+            active: None,
+            envelope: None,
+        }
+    }
+
     pub fn failed(failure: Failure) -> Self {
         Self {
             review: None,

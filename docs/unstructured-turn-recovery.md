@@ -463,6 +463,18 @@ cover** is the two-run orchestration itself, and this document does not claim ot
 
 ## Decision B — the prose travels on the structured channel when the machine channel is incomplete
 
+> **Superseded by [`structured-channel-parity.md`](structured-channel-parity.md) (issue #73).** The
+> *condition* below — attach the prose only when the machine channel does not represent the turn —
+> was wrong, and the table of four situations no longer describes the code: `review_prose` is now
+> attached on **every turn that ran**, and is `null` only when no reviewer ran. The reasoning that
+> follows is kept as the record of #63, and its analysis of capping and marker safety still holds.
+>
+> Why it was wrong, in one line: it made a *content* decision (is there more to read?) a function of
+> the *action* axis, which [Decision C](#decision-c--one-field-a-caller-switches-on) below
+> deliberately separates from the content axis — so on a clean structured turn, everything the
+> reviewer said outside its findings list was unreachable to a `structuredContent`-only client. That
+> included `approve_with_comments`, a verdict whose entire content is the comments.
+
 The completed envelope gains:
 
 - **`review_prose`** — `string | null`. The reviewer's prose with its own machine block already
@@ -553,7 +565,9 @@ go to **2**. But `SCHEMA_VERSION` in `src/findings.rs` is currently *shared*: it
 the shared constant would mark every ledger on disk foreign, turning every in-flight session into a
 resume refusal — a fix for a reporting gap that breaks resume for everyone mid-flight.
 
-So the constant splits into `ENVELOPE_SCHEMA_VERSION` (→ 2) and `LEDGER_SCHEMA_VERSION` (stays 1).
+So the constant splits into `ENVELOPE_SCHEMA_VERSION` (→ 2; **3 since issue #73**, which is this
+decision paying off a second time — a second wire-format bump, again with no ledger on disk marked
+foreign) and `LEDGER_SCHEMA_VERSION` (stays 1).
 They describe different artifacts with different compatibility rules: one is a wire format
 renegotiated on every response, the other is persisted state that must survive an upgrade. That they
 were ever one constant is the latent bug here, and the fix is foundational rather than incidental.
@@ -659,12 +673,14 @@ accepts both, so old records still read and old readers skip-and-count rather th
   `outcome: rebaseline` — coverage is sticky and a repair does not heal it.
 - `review_prose` presence over all four rows of the Decision B table; truncation boundary and the
   truncation note; a lookalike `_OUT` marker inside the prose still yields exactly one parseable
-  block.
+  block. (Issue #73 replaced the Decision B condition — see the note on that section — so the
+  presence test now walks the whole outcome matrix instead of those four rows.)
 - Schema/renderer parity: the existing test that pins every emitted key against the advertised schema
   is extended to the new keys, both variants.
 - `fold_runs`: cumulative-reporter and per-turn-reporter folds, and a repair run reporting nothing.
 - Version split: an on-disk ledger written at `LEDGER_SCHEMA_VERSION` still loads while the envelope
-  reports version 2.
+  reports its own, higher version. That was 2 when this document was written and is **3** since issue
+  #73 — which is the split earning its keep a second time, exactly as intended.
 - Config: parsing, range rejection, and clamping of the repair timeout to `--timeout`.
 
 **End-to-end.** `smoke.ps1 -Reviewer codex|claude` exercises the normal path; it cannot *make* a real
