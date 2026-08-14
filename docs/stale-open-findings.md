@@ -1,7 +1,13 @@
 # Stale `open` findings on a resumed session — design
 
-Status: **proposal, revision 5.** Filed against issue #62 ("Resumed review session freezes findings
-at a stale `open` status (ledger not re-evaluated)").
+Status: **proposal, revision 5 — paused, not scheduled.** Filed against issue #62 ("Resumed review
+session freezes findings at a stale `open` status (ledger not re-evaluated)").
+
+**Two things to know before picking this up.** Revisions 1–4 were reviewed through this repository's
+own gate over six rounds; **revision 5 has not been reviewed at its current size**, because it is
+strictly a subset of what those rounds covered — do not read the history below as approval of what
+is specified now. And this plan **re-scopes #62 rather than closing it**: see
+[What this does not do](#what-this-does-not-do), and the comment on the issue proposing the split.
 
 > **This revision is deliberately much smaller than the four before it, and the reason is worth
 > recording because it is a lesson about the process rather than the problem.**
@@ -17,12 +23,10 @@ at a stale `open` status (ledger not re-evaluated)").
 > nothing in the loop ever argues for less. Second, one early decision (bumping the ledger schema
 > version) generated a chain of consequences that four of the ten findings lived inside.
 >
-> The maintainer supplied the missing counterweight, and it is recorded here as a standing principle
-> rather than an aside:
->
-> > **Rigor belongs where the blast radius is real — account management, credentials, the read-only
-> > and write boundaries. For a review, the worst case is that it is lost and re-run, costing tokens
-> > and time. Avoid that; do not fortify against every edge case to prevent it.**
+> The maintainer supplied the missing counterweight. It outgrew this document and now lives in
+> [`AGENTS.md`](../AGENTS.md) under "How much rigor, and where", which is the canonical statement —
+> rigor where the blast radius is real, proportion everywhere else, and *perfect is the enemy of
+> good*. It is referenced rather than restated here so the two cannot drift.
 
 ## What is actually broken
 
