@@ -329,7 +329,13 @@ Two cases need naming individually because they are not simple failures:
   Ambient (`authorized_start == None`) is unprobed and unguarded today and stays that way — the
   repair inherits the main run's posture rather than inventing one.
 
-  `switch_guard` runs after the main run and passes before the repair is considered. If it trips
+  > **Since #69** both runs go through `Job::collect_run`, which runs the account check twice: once
+> before the run's headroom reaches the store (the ordering this plan gave the repair, now the main
+> run's too) and once on the delivery path, where the main run's guard has always been. The residuals
+> named above are unchanged — the coverage is still "swaps still visible at a check", not an atomic
+> binding.
+
+`switch_guard` runs after the main run and passes before the repair is considered. If it trips
   after the *repair* run — the profile home re-logged to a different account mid-review — the repair
   response is discarded unread, the session is left unrecorded and
   non-resumable (the findings write-ahead marker stays set, exactly as the existing guard leaves
@@ -610,7 +616,7 @@ accepts both, so old records still read and old readers skip-and-count rather th
 | --- | --- |
 | `src/findings.rs` | `assess_turn` / `plan_repair` / `apply_repair` / `finalize_turn` split; `RepairAdvice`/`RepairKind`/`RepairRequest`; envelope fields `outcome`, `review_prose`, `review_prose_truncated`, `block_repair`; prose capping; `outcome` derivation; `output_schema()` updates; version constant split; `evaluate_turn` returns the stripped prose so `tools.rs` stops stripping separately. |
 | `src/prompt.rs` | `block_repair()` renderer reusing `machine_block_section`; the closing reminder. |
-| `src/tools.rs` | One shared post-run helper (observe headroom under the usage key → parse → clean up `last_message_file`) used by both runs; the repair run on top of it: invocation reuse, timeout, cancel check, switch guard, conversation-identity rules, usage fold, denial/warning merge, repair-note append; attach prose per Decision B to the degraded, not-durable, and over-budget envelopes; thread `block_repair` into the envelope and the metrics record. |
+| `src/tools.rs` | One shared post-run helper (observe headroom under the usage key → parse → clean up `last_message_file`) used by both runs; the repair run on top of it: invocation reuse, timeout, cancel check, switch guard, conversation-identity rules, usage fold, denial/warning merge, repair-note append. **The helper as implemented here was repair-only; the main run kept its own copy, and the two drifted — see [`docs/post-run-account-check.md`](post-run-account-check.md), which fixes that (#69) by making `Job::collect_run` genuinely shared and pinning the account checks inside it.**; attach prose per Decision B to the degraded, not-durable, and over-budget envelopes; thread `block_repair` into the envelope and the metrics record. |
 | `src/reviewer/mod.rs`, `codex.rs`, `claude.rs`, `argv_tests.rs` | `Reviewer::invocation` takes the attempt's pinned `AuthorizedHome`; both adapters apply it instead of calling `resolve_authorized_home` themselves. `argv_tests.rs` is compiled in and calls `.invocation` directly, so it is updated with the rest: its ambient cases pass an absent pin (unchanged behaviour), and new cases pass a pin and assert the controlled environment follows it. |
 | `src/metrics.rs` | `fold_runs`; the two record fields; record version handling. |
 | `src/config.rs` | `--block-repair-attempts`, `--block-repair-timeout-seconds`: parsing, validation, clamping, `--doctor` output, help text; **`max_wait_secs()` grows by the repair budget** in both the single-entry and per-fallback terms. |

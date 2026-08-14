@@ -24,29 +24,40 @@ use crate::vcs;
 /// How long to wait for another server process to release a named session.
 const SESSION_LEASE_WAIT: Duration = Duration::from_secs(3);
 
-/// Why a block repair did not produce a usable block, and whether that is a *security refusal*
-/// rather than a bookkeeping miss.
+/// Why a reviewer run did not yield a usable answer, carrying the two facts a caller cannot
+/// reconstruct from the `Failure` alone. Produced by [`Job::collect_run`], so it covers the main run
+/// and the block repair alike.
 ///
-/// The distinction is load-bearing. Almost every repair-side failure -- a spawn that failed, a
+/// **`account_refusal` is load-bearing.** Almost every run-side failure -- a spawn that failed, a
 /// timeout, a cancel, a second unusable block -- leaves the turn a plain degraded turn, which
 /// commits through the single finalize -> record -> clear transaction exactly as a degraded turn
 /// always has. A tripped account switch guard is not that: the profile home re-logged to a different
 /// account while the turn was running, and the contract for that is to record nothing and leave the
 /// findings write-ahead marker set, so the next call is refused a resume. Funnelling both down one
-/// error path (as the first implementation did) committed the refusal as though it were a timeout,
-/// which is the opposite of what the guard is for.
-struct RepairFailure {
+/// error path (as the first repair implementation did) committed the refusal as though it were a
+/// timeout, which is the opposite of what the guard is for.
+///
+/// **`child_never_started` is a durability boundary**, not bookkeeping: it is `RunError::Spawn`, so
+/// no child existed, no reviewer conversation could have advanced, and this turn's findings
+/// write-ahead marker may be withdrawn. It travels out here because `collect_run` flattens the
+/// `RunError` into a `Failure` and the caller can no longer ask. The repair caller ignores it -- a
+/// repair never withdraws the marker, for the reason on `run_block_repair`.
+struct RunFailure {
     failure: Failure,
     /// `true` only for a tripped switch guard: do not record this turn, and leave the marker set.
-    refusal: bool,
+    account_refusal: bool,
+    /// `true` only for `RunError::Spawn`: no child process was ever created.
+    child_never_started: bool,
 }
 
-impl RepairFailure {
-    /// A repair that simply did not work. The turn degrades and commits normally.
+impl RunFailure {
+    /// A run that simply did not work. A repair degrades and commits normally; a main run reports
+    /// the failure.
     fn ordinary(failure: Failure) -> Self {
         Self {
             failure,
-            refusal: false,
+            account_refusal: false,
+            child_never_started: false,
         }
     }
 
@@ -54,7 +65,18 @@ impl RepairFailure {
     fn refusal(failure: Failure) -> Self {
         Self {
             failure,
-            refusal: true,
+            account_refusal: true,
+            child_never_started: false,
+        }
+    }
+
+    /// The run never produced a child (`RunError::Spawn`) or died while being observed
+    /// (`RunError::Observe`); `child_never_started` distinguishes them for the marker decision.
+    fn launch(failure: Failure, child_never_started: bool) -> Self {
+        Self {
+            failure,
+            account_refusal: false,
+            child_never_started,
         }
     }
 }
@@ -220,13 +242,98 @@ fn switch_guard(
     Ok(())
 }
 
+/// The post-run account check for a *finished* run: `Some(refusal)` when the profile home's account
+/// moved out from under it, `None` when it is still the pinned one, when the review is ambient
+/// (unpinned, and never guarded), or when there is nothing to verify because no child was ever
+/// created.
+///
+/// Two things about it are deliberate, and both are the reasoning behind issue #69:
+///
+/// - **It is gated on a child having possibly started.** `RunError::Spawn` means no process was ever
+///   created, so nothing was billed and nothing could have answered under another account; treating
+///   that as a security refusal would turn an ordinary spawn failure into a non-resumable session
+///   for no reason. `RunError::Observe` means the child *was* running, so it is guarded.
+/// - **It is generic over -- and therefore blind to -- what the run produced.** Whether the turn
+///   succeeded, was cancelled, timed out, or was refused as rate-limited does not change whether the
+///   account has to be verified, and the refusal outranks the run's own failure code: a moved account
+///   means the turn is not recorded and the session cannot be resumed, which is the fact the caller
+///   needs, and one rule beats a carve-out per failure code.
+///
+/// [`Job::collect_run`] calls this before anything from the run is stored, parsed or returned, and
+/// calls [`switch_guard`] again on the delivery path (see there).
+fn post_run_account_refusal<T>(
+    reviewer: ReviewerKind,
+    start: Option<&crate::config::AuthorizedHome>,
+    run: &Result<T, reviewer::RunError>,
+) -> Option<Failure> {
+    let child_may_have_run = match run {
+        Ok(_) => true,
+        Err(e) => !e.child_never_started(),
+    };
+    if !child_may_have_run {
+        return None;
+    }
+    switch_guard(reviewer, start).err()
+}
+
+/// The key an attempt's headroom observation is **written** under: the *selection* key rebound to the
+/// account the attempt actually pinned and verified.
+///
+/// The two are not always the same account, and the difference is a real (narrow) hole rather than
+/// bookkeeping — implementation-review finding f1 against #69. `usage_headroom_key` reads the account
+/// currently under the home during selection; `resolve_authorized_home_with_account` pins the account
+/// independently, later, at the top of the attempt. If the home re-logs A→B in between *and B is also
+/// authorized*, everything downstream is consistent about B — the pre-spawn probe asserts B, the run
+/// answers under B, `switch_guard` verifies B — while the key still says A. The observation would then
+/// be filed under A and steer a later proactive gate for A using B's figure, which is the same defect
+/// #69 fixed for an unverified reading, wearing a different hat.
+///
+/// Binding the write to `start.account` closes it, because that account *is* the verified one: the
+/// switch guard's whole job is to establish that the live account still equals this pin, so at the
+/// moment of the write they are the same. The bin comes from the attempt's resolved, preflighted
+/// binary for the same reason.
+///
+/// Two cases pass through unchanged, deliberately:
+///
+/// - **No selection key** (unarmed chain, unresolvable bin, unreadable fingerprint) stays `None`. This
+///   never adds store traffic where there was none; the rule is still "no key, no write".
+/// - **Ambient** (`None` pin) keeps the selection key, because ambient has no pinned profile account
+///   to bind to and is not guarded either. It is the unchanged posture, not an oversight.
+///
+/// What this does *not* fix, and does not claim to: the gate *decision* for this entry was made
+/// against the selection-time account, and nothing re-checks it afterwards. The decision itself is
+/// sound — the fingerprint read and the store lookup are adjacent, and the key *is* the account match,
+/// so a snapshot never gates an account it does not belong to. What is not sound is the assumption that
+/// the account which was gated is the account that would have run: a re-login after the decision means
+/// an entry was skipped on the strength of the departed account's figure, and a skipped entry never
+/// reaches an attempt, so there is no later pin to compare against. Left as a follow-up rather than
+/// fixed here — see "The gate decision is a separate defect" in `docs/post-run-account-check.md` for
+/// the cost, the one variant with a genuinely wide window, and why closing it is walk surgery rather
+/// than a line.
+fn write_usage_key(
+    reviewer: ReviewerKind,
+    bin: &std::path::Path,
+    authorized_start: Option<&crate::config::AuthorizedHome>,
+    selection_key: Option<&str>,
+) -> Option<String> {
+    let selection_key = selection_key?;
+    match authorized_start {
+        Some(start) => Some(crate::usage::entry_key(
+            reviewer.as_str(),
+            bin,
+            &start.account,
+        )),
+        None => Some(selection_key.to_string()),
+    }
+}
+
 /// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
 /// so is never gated: the chain is not armed, the entry has no minimum, its binary cannot be
 /// resolved, or its account fingerprint cannot be read. Reads only cheap local sources — a
 /// PATH resolve and a local account file — so it neither auth-checks nor spawns; it is safe to
-/// call during selection, before any preflight. The account fingerprint is read *here*, once,
-/// so the gate decision and the later store write for this entry share one reading (no
-/// read-time/observe-time TOCTOU). See `docs/usage-remaining-gate.md`.
+/// call during selection, before any preflight. The account fingerprint is read *here*, once, and
+/// this key is what the gate *decision* uses; the write is rebound to the attempt's pinned account
+/// by [`write_usage_key`]. See `docs/usage-remaining-gate.md`.
 fn usage_headroom_key(cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
     if !cfg.chain_gates_on_usage() {
         return None;
@@ -2394,6 +2501,103 @@ impl Job {
         }
     }
 
+    /// Everything that happens between a reviewer child returning and its answer being usable, in the
+    /// one order that is safe. Shared by the main run and the block repair — they are the same
+    /// sequence, and while each had its own copy of it the two drifted: the repair verified the
+    /// account before recording headroom and the main run did not, which is issue #69.
+    ///
+    /// The order, and why each step is where it is:
+    ///
+    /// 1. **The pre-observation account check** (`post_run_account_refusal`), before anything from the
+    ///    run is stored, parsed or returned. The usage store keys on the account pinned at the top of
+    ///    the attempt while the *reading* comes from mutable profile state under the home, so
+    ///    recording first would let a reading taken after an A→B switch be persisted under A and steer
+    ///    later entry selection with a figure no one verified. It runs before the parse is unwrapped
+    ///    too: a run whose output was unreadable still advanced the reviewer's conversation, so a home
+    ///    that moved underneath it must not slip past the guard merely because its answer could not be
+    ///    read.
+    /// 2. **Observe and record this run's headroom**, from the raw `RunOutcome` before it becomes a
+    ///    `Parsed` or a `Failure`, so a rate-limited turn is observed exactly like a successful one
+    ///    (usage-gate round-1 finding f1). Read only when the entry is armed and keyable; store only a
+    ///    real reading. Best-effort — the store never fails a review.
+    /// 3. **The cancelled/timed-out branch, then `parse`.**
+    /// 4. **`last_message_file` cleanup**, which has to outlive the parse that reads it and be gone
+    ///    before this returns, either way.
+    /// 5. **The delivery-time account check** — switch guard [f4], part 2 of 2 — in the position it
+    ///    has always occupied: after the answer is read, before it is returned to be assessed and
+    ///    recorded. It is *kept*, not replaced by step 1. Neither subsumes the other: step 1 exists
+    ///    because a store write happens before the parse, and is the only check that runs on the
+    ///    failure arms; this one exists because the guard's coverage is "swaps still visible at the
+    ///    final read", and dropping it in favour of an earlier read would shorten that window by
+    ///    however long the parse takes. One extra local `fingerprint_at` read is cheaper than
+    ///    widening a race on a security path.
+    ///
+    /// Ambient reviews (`authorized_start == None`) are unguarded at both steps, exactly as before.
+    /// See `docs/post-run-account-check.md`.
+    fn collect_run(
+        &self,
+        run: Result<reviewer::RunOutcome, reviewer::RunError>,
+        authorized_start: Option<&crate::config::AuthorizedHome>,
+        usage_key: Option<&str>,
+        last_message_file: Option<&std::path::Path>,
+    ) -> Result<reviewer::Parsed, RunFailure> {
+        let cleanup = || {
+            if let Some(path) = last_message_file {
+                std::fs::remove_file(path).ok();
+            }
+        };
+
+        if let Some(refusal) = post_run_account_refusal(self.spec.reviewer, authorized_start, &run)
+        {
+            cleanup();
+            return Err(RunFailure::refusal(refusal));
+        }
+
+        let parsed = match run {
+            Ok(out) => {
+                if let Some(key) = usage_key {
+                    let headroom = self.reviewer.observe_headroom(&self.cfg, &self.spec, &out);
+                    if headroom != Headroom::Unknown {
+                        self.usage.record(key, headroom, now_unix());
+                    }
+                }
+                if out.cancelled || out.timed_out {
+                    Err(RunFailure::ordinary(reviewer::failure_for(
+                        &self.cfg, &self.spec, &out,
+                    )))
+                } else {
+                    self.reviewer
+                        .parse(&self.cfg, &self.spec, &out, last_message_file)
+                        .map_err(RunFailure::ordinary)
+                }
+            }
+            Err(e) => Err(RunFailure::launch(
+                errors::spawn_failed(
+                    self.spec.reviewer.as_str(),
+                    &self.bin.display().to_string(),
+                    e.to_string(),
+                ),
+                e.child_never_started(),
+            )),
+        };
+        cleanup();
+        let parsed = parsed?;
+
+        // Step 5: a profile home re-logged to a different account *while the review was running*
+        // taints this review — it may have been billed to, or answered under, an account this
+        // repository never authorized. Read the account again now and refuse to record or deliver if
+        // it no longer matches the account pinned at spawn (an unreadable account, mid re-login, fails
+        // closed too). This is the actual backstop for the external-`codex login` race that the
+        // pre-spawn checks cannot close: an external writer does not take our locks. Refusing here —
+        // after the reviewer conversation advanced — leaves the findings write-ahead marker set (it is
+        // cleared only in the caller's durable record arm), so the next call is refused and
+        // rebaselines fresh rather than resuming a conversation whose account moved.
+        if let Err(failure) = switch_guard(self.spec.reviewer, authorized_start) {
+            return Err(RunFailure::refusal(failure));
+        }
+        Ok(parsed)
+    }
+
     /// Run one block-repair child: resume `target`, send `prompt`, and return its text.
     ///
     /// This is the second run inside one turn, and everything that makes that safe lives here:
@@ -2404,11 +2608,11 @@ impl Job {
     ///   closes the deterministic case — a home re-logged while the main run was executing — so the
     ///   repair is not launched under a moved account. It is not atomic with process creation and
     ///   does not claim to be: an external login takes none of our locks, so a move inside the
-    ///   probe-to-spawn window can still incur a call, which is what the post-run `switch_guard`
-    ///   below (unchanged, and inherited from the main run) exists to catch.
-    /// - **Headroom is observed for this run too.** The proactive gate picks entries from that
-    ///   store, so a repair that consumed real headroom without being observed would leave the gate
-    ///   reading a stale figure.
+    ///   probe-to-spawn window can still incur a call, which is what the post-run account checks in
+    ///   `collect_run` (inherited from the main run, and now literally the same code) exist to catch.
+    /// - **Headroom is observed for this run too**, and only once `collect_run` has verified the
+    ///   account. The proactive gate picks entries from that store, so a repair that consumed real
+    ///   headroom without being observed would leave the gate reading a stale figure.
     /// - **Usage is folded, not overwritten** — `metrics::fold_runs` takes the later reading from a
     ///   cumulative reporter (Codex) and sums a per-turn one (Claude).
     /// - **It never touches the findings write-ahead marker.** `clear_findings_marker_after_pre_launch_failure`
@@ -2425,19 +2629,19 @@ impl Job {
         authorized_start: Option<&crate::config::AuthorizedHome>,
         usage_key: Option<&str>,
         main: &mut reviewer::Parsed,
-    ) -> Result<String, RepairFailure> {
+    ) -> Result<String, RunFailure> {
         // Pre-spawn identity + method probe, against the *pinned* home and account.
         if let Some(start) = authorized_start {
             let resolved = self
                 .reviewer
                 .resolve_home_identity(&self.bin, &self.cfg, &start.home, &self.cancel)
-                .map_err(RepairFailure::ordinary)?;
+                .map_err(RunFailure::ordinary)?;
             crate::reviewer::assert_profile_identity(
                 self.spec.reviewer.as_str(),
                 &resolved,
                 &start.account,
             )
-            .map_err(RepairFailure::ordinary)?;
+            .map_err(RunFailure::ordinary)?;
         }
 
         let invocation = self
@@ -2452,7 +2656,7 @@ impl Job {
                 authorized_start,
             )
             .map_err(|e| {
-                RepairFailure::ordinary(errors::spawn_failed(
+                RunFailure::ordinary(errors::spawn_failed(
                     self.spec.reviewer.as_str(),
                     &self.bin.display().to_string(),
                     e.to_string(),
@@ -2477,68 +2681,24 @@ impl Job {
         );
         self.registry.set_phase(&self.id, Phase::Finalizing);
 
-        // The account must still be the pinned one now that this child has run — the same backstop
-        // the main run gets, for the same reason. Three things about the placement are deliberate:
-        //
-        // - It runs **before the parse is unwrapped**. A repair whose output was unreadable still
-        //   advanced the reviewer conversation, so a home that moved underneath it must not slip
-        //   past the guard merely because its answer could not be read.
-        // - It runs **before this run's headroom is observed and stored**. That store keys on the
-        //   account pinned for the attempt, while the reading is pulled from mutable profile state
-        //   under the home; recording first would let a reading taken after an A→B switch be
-        //   persisted under A and steer later entry selection with a figure no one verified.
-        // - It runs **only when a child could have started**. `RunError::Spawn` means no process
-        //   was ever created, so nothing was billed and nothing could have answered under another
-        //   account; treating that as a security refusal would turn an ordinary spawn failure into
-        //   a non-resumable session for no reason.
-        //
-        // And unlike every other repair-side failure this one is a *security refusal*, not a
-        // bookkeeping miss — `RepairFailure::refusal` is what stops the caller committing the turn
-        // as though nothing had happened.
-        let child_may_have_run = match &run {
-            Ok(_) => true,
-            Err(e) => !e.child_never_started(),
-        };
-        if child_may_have_run {
-            if let Err(failure) = switch_guard(self.spec.reviewer, authorized_start) {
-                if let Some(path) = &last_message_file {
-                    std::fs::remove_file(path).ok();
-                }
-                return Err(RepairFailure::refusal(failure));
-            }
-        }
-
-        let parsed = match run {
-            Ok(out) => {
-                if let Some(key) = usage_key {
-                    let headroom = self.reviewer.observe_headroom(&self.cfg, &self.spec, &out);
-                    if headroom != Headroom::Unknown {
-                        self.usage.record(key, headroom, now_unix());
-                    }
-                }
-                if out.cancelled || out.timed_out {
-                    Err(reviewer::failure_for(&self.cfg, &self.spec, &out))
-                } else {
-                    self.reviewer
-                        .parse(&self.cfg, &self.spec, &out, last_message_file.as_deref())
-                }
-            }
-            Err(e) => Err(errors::spawn_failed(
-                self.spec.reviewer.as_str(),
-                &self.bin.display().to_string(),
-                e.to_string(),
-            )),
-        };
-        if let Some(path) = &last_message_file {
-            std::fs::remove_file(path).ok();
-        }
-        let parsed = parsed.map_err(RepairFailure::ordinary)?;
+        // The account must still be the pinned one now that this child has run, checked before
+        // anything from the run is stored, parsed or returned and again before its answer is
+        // delivered — the same backstop the main run gets, for the same reasons, and since #69
+        // literally the same code. Unlike every other repair-side failure a tripped guard is a
+        // *security refusal*, not a bookkeeping miss: `RunFailure::account_refusal` is what stops the
+        // caller committing the turn as though nothing had happened.
+        let parsed = self.collect_run(
+            run,
+            authorized_start,
+            usage_key,
+            last_message_file.as_deref(),
+        )?;
 
         // A repair that answered under a different conversation never saw the review it is meant to
         // be re-emitting a block for, so its block describes nothing. Discard it.
         if let Some(answered) = parsed.session_id.as_deref() {
             if !answered.is_empty() && answered != target {
-                return Err(RepairFailure::ordinary(Failure::new(
+                return Err(RunFailure::ordinary(Failure::new(
                     "BLOCK_REPAIR_SESSION_MISMATCH",
                     format!(
                         "the block-repair turn answered under session id '{answered}' rather than \
@@ -2569,9 +2729,11 @@ impl Job {
         captured: CaptureOutputs<'_>,
         capture_warnings: &[String],
         prompt_bytes: &mut usize,
-        // The store key for this attempt's entry (from the walk), or `None` when unarmed /
-        // identity unavailable. When `Some`, the observed headroom is recorded under it on both
-        // the success and failure paths. See `docs/usage-remaining-gate.md`.
+        // The *selection* store key for this attempt's entry (from the walk), or `None` when unarmed
+        // / identity unavailable. It is what the proactive gate decided on; the key this attempt
+        // *writes* under is rebound to the pinned account below (`write_usage_key`). When `Some`, the
+        // observed headroom is recorded on both the success and failure paths. See
+        // `docs/usage-remaining-gate.md` and `docs/post-run-account-check.md`.
         usage_key: Option<&str>,
     ) -> Result<Outcome, Failure> {
         let CaptureOutputs {
@@ -2595,6 +2757,17 @@ impl Job {
         // final fingerprint against — not a fresh self-read, which could not tell A→B from B→B. Ambient
         // has no profile account (`Ok(None)`) and is never guarded, so its behaviour is unchanged.
         let authorized_start = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
+
+        // The key this attempt's headroom observation is written under, bound to the account just
+        // pinned above rather than the one selection happened to read — see `write_usage_key`. The
+        // incoming `usage_key` remains the gate *decision*'s key and is not used for the write.
+        let usage_key = write_usage_key(
+            self.spec.reviewer,
+            &self.bin,
+            authorized_start.as_ref(),
+            usage_key,
+        );
+        let usage_key = usage_key.as_deref();
 
         // [f5]: hold the SHARED side of the per-home setup lock across the whole attempt — the probe,
         // the child's lifetime, and the switch guard — so a setup swap (which takes the exclusive side
@@ -2841,7 +3014,7 @@ impl Job {
 
         let last_message_file = invocation.last_message_file.clone();
 
-        let run = match reviewer::run_observed(
+        let run = reviewer::run_observed(
             invocation.command,
             &text,
             self.cfg.timeout,
@@ -2854,65 +3027,34 @@ impl Job {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);
             },
-        ) {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                // A `Spawn` failure means the child never started — same reasoning as the invocation
-                // failure above, so clear the (non-fresh) findings marker and keep the Perforce
-                // full-recapture path reachable. An `Observe` failure happened after the child was
-                // already running, so the conversation may have advanced: keep the marker set and
-                // let the findings gate refuse the next call.
-                if e.child_never_started() {
-                    self.clear_findings_marker_after_pre_launch_failure();
-                }
-                Err(errors::spawn_failed(
-                    self.spec.reviewer.as_str(),
-                    &self.bin.display().to_string(),
-                    e.to_string(),
-                ))
-            }
-        };
+        );
         self.registry.set_phase(&self.id, Phase::Finalizing);
 
-        let result = match run {
-            Ok(out) => {
-                // Observe usage headroom from the raw outcome BEFORE it is turned into a Parsed or
-                // a Failure, so a rate-limited turn is observed exactly like a successful one
-                // (round-1 finding f1). Read only when the entry is armed and keyable; store only
-                // a real reading. Best-effort — the store never fails a review.
-                if let Some(key) = usage_key {
-                    let headroom = self.reviewer.observe_headroom(&self.cfg, &self.spec, &out);
-                    if headroom != Headroom::Unknown {
-                        self.usage.record(key, headroom, now_unix());
-                    }
+        // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
+        // `collect_run`, which is also where the headroom observation and the parse happen, in that
+        // one order. See there for why the two account checks are not redundant — the short version is
+        // that the usage store is written before the parse and the review is delivered after it, so
+        // one check cannot cover both.
+        let mut parsed = match self.collect_run(
+            run,
+            authorized_start.as_ref(),
+            usage_key,
+            last_message_file.as_deref(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(f) => {
+                // A `Spawn` failure means the child never started — same reasoning as the invocation
+                // failure above, so clear the (non-fresh) findings marker and keep the Perforce
+                // full-recapture path reachable. Every other failure here happened after the child was
+                // already running, so the conversation may have advanced: keep the marker set and let
+                // the findings gate refuse the next call. That includes an account refusal, which is
+                // exactly how a moved account leaves the session non-resumable until it rebaselines.
+                if f.child_never_started {
+                    self.clear_findings_marker_after_pre_launch_failure();
                 }
-                if out.cancelled || out.timed_out {
-                    Err(reviewer::failure_for(&self.cfg, &self.spec, &out))
-                } else {
-                    self.reviewer
-                        .parse(&self.cfg, &self.spec, &out, last_message_file.as_deref())
-                }
+                return Err(f.failure);
             }
-            Err(failure) => Err(failure),
         };
-
-        if let Some(path) = &last_message_file {
-            std::fs::remove_file(path).ok();
-        }
-
-        let mut parsed = result?;
-
-        // Switch guard [f4], part 2 of 2: a profile home re-logged to a different account *while the
-        // review was running* taints this review — it may have been billed to, or answered under, an
-        // account this repository never authorized. Re-read the account now and refuse to record or
-        // deliver if it no longer matches the account pinned at spawn (an unreadable account, mid
-        // re-login, fails closed too). This is the actual backstop for the external-`codex login` race
-        // that the pre-spawn checks cannot close (an external writer does not take our locks). Refusing
-        // here — after the reviewer conversation advanced — leaves the findings write-ahead marker set
-        // (it is cleared only in the durable record arm below), so the next call is refused and
-        // rebaselines fresh rather than resuming a conversation whose account moved. Ambient is not
-        // guarded (`authorized_start` is `None`).
-        switch_guard(self.spec.reviewer, authorized_start.as_ref())?;
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
         // build the completed envelope (pure — see `findings::assess_turn`). The nonce is this
@@ -2988,10 +3130,16 @@ impl Job {
                     }
                     assessment = crate::findings::apply_repair(assessment, &repair_text);
                 }
-                Err(RepairFailure { failure, refusal }) => {
+                Err(RunFailure {
+                    failure,
+                    account_refusal,
+                    // A repair never withdraws the findings write-ahead marker (see
+                    // `run_block_repair`), so `child_never_started` has no bearing here.
+                    child_never_started: _,
+                }) => {
                     // A failed repair never fails the review: the prose in hand is good. Record why
                     // and fall through to the degraded envelope the turn would have had anyway.
-                    if refusal {
+                    if account_refusal {
                         // Except this one, which is a security refusal rather than a failed retry.
                         // The account moved while the turn was running, so the repair's answer is
                         // discarded unread *and* the turn must not be recorded -- leaving the
@@ -3818,6 +3966,130 @@ mod tests {
             account: "acct-1".to_string(),
         };
         assert!(switch_guard(ReviewerKind::Codex, Some(&gone)).is_err());
+    }
+
+    /// A temp `$CODEX_HOME` holding `account`, and a pin for a (possibly different) account under it.
+    /// Used by the `post_run_account_refusal` tests so they exercise the real account read.
+    fn home_pinned_to(root: &str, in_home: &str) -> (crate::testutil::TempDir, std::path::PathBuf) {
+        let dir = crate::testutil::temp_dir(root);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(
+            home.join("auth.json"),
+            format!(r#"{{"auth_mode":"chatgpt","tokens":{{"account_id":"{in_home}"}}}}"#),
+        )
+        .expect("write auth.json");
+        (dir, home)
+    }
+
+    fn pin(home: &std::path::Path, account: &str) -> crate::config::AuthorizedHome {
+        crate::config::AuthorizedHome {
+            home: home.to_path_buf(),
+            account: account.to_string(),
+        }
+    }
+
+    /// A run that never created a child process. The unit payload stands for a `RunOutcome`:
+    /// `post_run_account_refusal` is generic over it and never inspects it.
+    fn spawn_error() -> Result<(), reviewer::RunError> {
+        Err(reviewer::RunError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such binary",
+        )))
+    }
+
+    /// A run whose child started and then could not be observed to completion.
+    fn observe_error() -> Result<(), reviewer::RunError> {
+        Err(reviewer::RunError::Observe(std::io::Error::other(
+            "try_wait failed",
+        )))
+    }
+
+    #[test]
+    fn post_run_account_refusal_is_blind_to_what_the_run_produced() {
+        // #69: the account check happens before anything looks at what the run said, so a turn that
+        // was cancelled, timed out or refused as rate-limited on a *moved* account reports the
+        // refusal rather than its own failure code -- and, upstream of that, records no headroom.
+        let (_dir, home) = home_pinned_to("cross-review-post-run-guard-tests", "acct-2");
+        let moved = pin(&home, "acct-1");
+        for run in [
+            // Stands for every arm that carries a RunOutcome: success, cancelled, timed out, and
+            // every code `parse` classifies. This function cannot tell them apart, which is the
+            // property being asserted.
+            Ok(()),
+            observe_error(),
+        ] {
+            let refusal = post_run_account_refusal(ReviewerKind::Codex, Some(&moved), &run)
+                .expect("a moved account must be refused whatever the run produced");
+            assert_eq!(refusal.code, "PROFILE_IDENTITY_MISMATCH");
+        }
+    }
+
+    #[test]
+    fn post_run_account_refusal_skips_a_child_that_never_started() {
+        // A `Spawn` failure created no process, so nothing was billed and nothing could have answered
+        // under another account. Refusing there would turn an ordinary spawn failure into a
+        // non-resumable session. An `Observe` failure means the child *was* running, so it is guarded.
+        let (_dir, home) = home_pinned_to("cross-review-post-run-guard-tests", "acct-2");
+        let moved = pin(&home, "acct-1");
+        assert!(
+            post_run_account_refusal(ReviewerKind::Codex, Some(&moved), &spawn_error()).is_none()
+        );
+        assert!(
+            post_run_account_refusal(ReviewerKind::Codex, Some(&moved), &observe_error()).is_some()
+        );
+    }
+
+    #[test]
+    fn post_run_account_refusal_passes_a_stable_or_ambient_account() {
+        let (_dir, home) = home_pinned_to("cross-review-post-run-guard-tests", "acct-1");
+        let stable = pin(&home, "acct-1");
+        for run in [Ok(()), spawn_error(), observe_error()] {
+            assert!(
+                post_run_account_refusal(ReviewerKind::Codex, Some(&stable), &run).is_none(),
+                "the pinned account is still in the home"
+            );
+        }
+        // Ambient has no pinned account and is never guarded -- including when the home it would
+        // have used cannot be read at all.
+        assert!(post_run_account_refusal(ReviewerKind::Codex, None, &Ok(())).is_none());
+    }
+
+    #[test]
+    fn the_write_key_names_the_account_the_attempt_pinned() {
+        // Implementation-review f1 against #69: the selection key is built from whatever account was
+        // under the home when the chain was gated; the attempt pins (and the switch guard verifies) an
+        // account of its own. When a re-login to another *authorized* account lands in between, the
+        // observation must be filed under the account that actually ran, not the one selection saw.
+        let bin = std::path::Path::new("C:\\bin\\codex.exe");
+        let selection = crate::usage::entry_key("codex", bin, "acct-1");
+        let pinned = crate::config::AuthorizedHome {
+            home: std::path::PathBuf::from("C:\\home"),
+            account: "acct-2".to_string(),
+        };
+
+        assert_eq!(
+            write_usage_key(ReviewerKind::Codex, bin, Some(&pinned), Some(&selection)).as_deref(),
+            Some(crate::usage::entry_key("codex", bin, "acct-2").as_str()),
+            "the write must follow the pinned account, not the selection-time one"
+        );
+        // The common case: selection and the pin agree, so the key is unchanged.
+        let same = crate::config::AuthorizedHome {
+            home: std::path::PathBuf::from("C:\\home"),
+            account: "acct-1".to_string(),
+        };
+        assert_eq!(
+            write_usage_key(ReviewerKind::Codex, bin, Some(&same), Some(&selection)).as_deref(),
+            Some(selection.as_str())
+        );
+        // No selection key means the chain is unarmed or could not be keyed: still no store traffic,
+        // even though a pinned account is available to key it with.
+        assert!(write_usage_key(ReviewerKind::Codex, bin, Some(&pinned), None).is_none());
+        // Ambient has no pinned account to bind to, and is unguarded: the key passes through.
+        assert_eq!(
+            write_usage_key(ReviewerKind::Codex, bin, None, Some(&selection)).as_deref(),
+            Some(selection.as_str())
+        );
     }
 
     #[test]

@@ -220,7 +220,9 @@ family-specific and a mismatch is a startup error:
 It is **optional and fail-open**. An entry with no minimum is never gated; and an entry whose
 headroom is *unknown* — never observed, aged past its window reset, or an account whose
 identity can't be confirmed — is never gated either. The signal is observed during a turn and
-persisted per account, so the gate acts on the freshest prior observation; the first review
+persisted per account — and only once that account has been verified to be the one the turn was
+authorized for, so a profile home re-logged mid-review files nothing under the account it left. The
+gate therefore acts on the freshest prior *verified* observation; the first review
 against a never-seen account is ungated because there is nothing yet to gate on. Nothing
 proactive happens unless at least one entry sets a minimum: with none, Claude keeps its
 buffered output and no usage store is touched. If every entry is gated out (or rate-limited),
