@@ -1,13 +1,18 @@
 # Stale `open` findings on a resumed session — design
 
-Status: **proposal, revision 5 — paused, not scheduled.** Filed against issue #62 ("Resumed review
-session freezes findings at a stale `open` status (ledger not re-evaluated)").
+Status: **proposal, revision 5 — paused pending measurement.** Filed against issue #62 ("Resumed
+review session freezes findings at a stale `open` status (ledger not re-evaluated)"). It was paused
+behind #73; #73 has landed, and what it left is a question to measure before this is built at all —
+see [What #73 changed](#what-73-changed).
 
-**Two things to know before picking this up.** Revisions 1–4 were reviewed through this repository's
-own gate over six rounds; **revision 5 has not been reviewed at its current size**, because it is
-strictly a subset of what those rounds covered — do not read the history below as approval of what
-is specified now. And this plan **re-scopes #62 rather than closing it**: see
+**Three things to know before picking this up.** Revisions 1–4 were reviewed through this
+repository's own gate over six rounds; **revision 5 has not been reviewed at its current size**,
+because it is strictly a subset of what those rounds covered — do not read the history below as
+approval of what is specified now. This plan **re-scopes #62 rather than closing it**: see
 [What this does not do](#what-this-does-not-do), and the comment on the issue proposing the split.
+And **the thing this plan said to do first has since been done** — #73 landed in
+[#76](https://github.com/lack435/simple-cross-model-review/pull/76) — which changes what is left to
+justify here; see [What #73 changed](#what-73-changed).
 
 > **This revision is deliberately much smaller than the four before it, and the reason is worth
 > recording because it is a lesson about the process rather than the problem.**
@@ -52,12 +57,44 @@ there, and a fresh control review found the real defect the caller had missed. *
 held finding was correct and the caller's confidence was not.** Nothing here may let the caller or
 the server treat a stale-*looking* finding as resolved.
 
-**Part of the symptom is #73.** A structured turn returns `review_prose: null`, so a client
-surfacing only `structuredContent` never sees anything the reviewer said outside its findings list —
-the entire eight-round #71 review ran without the caller reading a line of prose. A reviewer that
-holds a finding open *and explains why* is indistinguishable from one that froze it silently. Some
-unknown share of #62 is an unread explanation rather than an absent one, and #73 is smaller than any
-version of this change.
+**Part of the symptom was #73, and #73 is now fixed.** A structured turn used to return
+`review_prose: null`, so a client surfacing only `structuredContent` never saw anything the reviewer
+said outside its findings list — the entire eight-round #71 review ran without the caller reading a
+line of prose. A reviewer that holds a finding open *and explains why* was indistinguishable from
+one that froze it silently, so some unknown share of #62 was an unread explanation rather than an
+absent one. That was the reason to do #73 first, and
+[#76](https://github.com/lack435/simple-cross-model-review/pull/76) did it. See
+[What #73 changed](#what-73-changed) for what that leaves.
+
+## What #73 changed
+
+#76 made `review_prose` unconditional on every turn that ran — attachment is enforced by
+construction rather than by a condition, so `null` now means exactly "no reviewer ran" — and carried
+`captured`, `denials`, `resumable` and the merged `warnings` onto the structured channel beside it.
+A caller reading `structuredContent` alone can now read why a reviewer is holding a finding open, if
+the reviewer said.
+
+That does not resolve what this plan addresses, and it does not leave it untouched:
+
+- **Still not answered.** Prose is unstructured and optional in practice. A reviewer that carries a
+  finding without re-examining it has no reason to volunteer that, and nothing in the prose channel
+  makes the omission visible. `basis` is a question the reviewer has to answer; prose is a place it
+  may answer. That is the whole gap this plan claims.
+- **The size of the problem is now unmeasured rather than unknown-but-large.** The argument for
+  revision 5 was written when the caller could not read a held finding's explanation at all. It can
+  now. How much of #62 that removes is an empirical question with no data yet.
+
+**And there is no data yet because the fix is not running.** `dist\cross-review.exe` was staged
+2026-08-13 15:14; the #73 fix was committed 21:49 the same day. Both MCP configs point at `dist\`,
+so **every review either direction has run through a pre-#73 binary**, including the review of #73's
+own implementation. Restaging needs open agent sessions unloaded first (`build.ps1` reports the
+blocking PIDs).
+
+So the next step for this plan is not to build it. It is to **restage `dist\` and let the next few
+real gate reviews run through the repaired channel**, then decide whether a reviewer that now
+explains itself in readable prose still needs to be asked `rechecked` or `carried` — and if it does,
+whether the answer is worth a protocol field. Deciding that from the pre-#73 evidence would be
+answering a question about a system that no longer exists.
 
 ## The change
 
