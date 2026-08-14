@@ -25,8 +25,16 @@ approval of what is specified now. And this plan **re-scopes #62 rather than clo
 >
 > Two things caused it. First, **iterating a design through a gate that optimises for rigor ratchets
 > toward rigor** — each round asks "what if this edge case", each honest answer adds machinery, and
-> nothing in the loop ever argues for less. Second, one early decision (bumping the ledger schema
-> version) generated a chain of consequences that four of the ten findings lived inside.
+> nothing in the loop ever argues for less.
+>
+> Second, and more specifically: **one edge case was accepted as needing to be handled, and
+> everything else followed from it.** The case was *the server is upgraded while a review is in
+> flight*, and the answer taken was to let the old ledger continue under a legacy status. That
+> required a schema version bump, which required a migration, which required a provenance flag, a
+> compatibility type, a load-order rule and a status-conversion rule — four of the ten findings lived
+> inside that chain, each of them correct about machinery that should not have existed. The right
+> answer was one sentence: **if the server is upgraded mid-review, you lose that review.** It is not
+> an edge case worth handling.
 >
 > The maintainer supplied the missing counterweight. It outgrew this document and now lives in
 > [`AGENTS.md`](../AGENTS.md) under "How much rigor, and where", which is the canonical statement —
@@ -171,18 +179,36 @@ this design is built to avoid.
 **No schema version bump and no migration**, because the new fields are additive and optional: an
 existing ledger loads unchanged and reports `null` for them.
 
-More importantly, as a standing decision beyond this change:
+That is a fact about this change. The standing decision behind it is the more important part,
+because it is where revisions 3 and 4 went wrong, and it is now settled in
+[`AGENTS.md`](../AGENTS.md) rather than here:
 
-> **A findings ledger is disposable.** A session is resumable for at most 10 turns and 55 idle
-> minutes, so any ledger older than about an hour is already unusable. If a future change does make
-> old ledgers unreadable, the loader's existing fail-closed behaviour *is* the migration story:
-> `Invalid`, refuse the resume, tell the caller to start fresh. No compatibility types, no version
-> dispatch, no provenance flags.
+> **A findings ledger is disposable.** If a change makes old ledgers unreadable, the loader's
+> existing fail-closed behaviour *is* the migration story: `Invalid`, refuse the resume, and the
+> caller rebaselines. No compatibility types, no version dispatch, no provenance flags.
 
-The cost of that policy is that someone mid-review when they upgrade loses accumulated findings and
-re-runs. That is minutes and tokens, avoidable by finishing first, and cheaper than permanent
-machinery in the loader to prevent it. Revisions 3 and 4 built that machinery; four of the ten gate
-findings existed only inside it.
+**The whole of the case being avoided is: the server is upgraded while a review is in flight, so a
+ledger written by the old build is loaded by the new one.** That is a real scenario. It is also one
+where **losing the review is the right outcome** — a re-run costs minutes and tokens, and the
+operator can avoid it entirely by finishing the review before upgrading.
+
+Revisions 3 and 4 took the other branch and let that ledger continue under a legacy status. Four of
+the ten gate findings existed only inside the machinery that followed: a schema version bump, a
+migration, a legacy-provenance flag, a v1 compatibility type, a load-order specification, and a
+status-conversion rule for findings the new build could not have minted. Every one of those findings
+was correct about the thing it named. None of them would have existed if the answer to "what if the
+server is upgraded mid-review" had been *then you lose that review*.
+
+Earlier revisions of this section argued the case away instead of accepting it — that a session is
+resumable for at most 10 turns and 55 idle minutes, so any ledger older than about an hour is
+already unusable. **That is not a safe premise:** both limits are defaults, `--session-max-turns`
+and `--session-max-idle-seconds` are configurable, and either can be set to `0` to disable it, so a
+long-lived ledger is possible. The decision does not need that argument and is better without it.
+
+Be accurate about what the policy costs, because it is more than a re-run: the ledger holds stable
+ids, the immutable content of every finding, and the dispositions, so a rebaseline means a human
+carrying the still-open findings into a fresh session by hand. Bounded and occasional, and still
+cheaper than permanent machinery in the loader.
 
 ## What this does not do
 
