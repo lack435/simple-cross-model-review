@@ -127,6 +127,11 @@ the single source of truth. There is no config file of our own to drift out of s
 --session-max-idle-seconds <n>
                             Refuse to resume a review session idle longer than this many
                             seconds. Default 3300 (55m). 0 disables.
+--stagnant-session-turns <n>
+                            End a session that has gone this many turns without raising or
+                            resolving a finding while findings are still open. The turn
+                            reports session_stagnant / rebaseline with its findings intact,
+                            and later resumes are refused. Default 3. 0 disables.
 --block-repair-attempts <n> When a reviewer answers without a usable machine-readable
                             findings block, ask it once more -- same conversation, block
                             only -- instead of discarding the turn. Costs up to n further
@@ -617,7 +622,18 @@ Switch on `outcome`:
 | `converged` | The machine contract passed. | Stop. (It certifies the structured contract, not that a human read the prose.) |
 | `changes_requested` | Findings are open, or the verdict and the count disagree. | Act on `findings`, re-review the same session. |
 | `escalate` | The reviewer blocked, or withheld a clean approve. | A person decides; re-reviewing will keep producing this. |
-| `rebaseline` | This session cannot continue — coverage is broken, the turn was not durable, or the ledger is over budget. | A person decides, then starts a fresh review carrying the still-open findings. |
+| `rebaseline` | This session cannot continue — coverage is broken, the turn was not durable, the ledger is over budget, or the session stalled. | A person decides, then starts a fresh review carrying the still-open findings. |
+
+**A stalled session ends.** If a session goes `--stagnant-session-turns` turns without any finding
+being raised or resolved while findings are still open, the turn reports
+`non_convergence_reason: session_stagnant` and `outcome: rebaseline`, and later resumes are refused.
+Read it as *this loop has stopped producing anything*, and nothing more: it is not a claim that
+anything went unexamined, and it changes no finding — every open finding is still open, `open_count`
+is unchanged, and the full ledger comes back with the turn so it can be carried into a fresh review.
+The reviewer is never told this gate exists, so it cannot be tempted to manufacture a resolution to
+stay alive. See [`docs/finding-liveness.md`](docs/finding-liveness.md), which also records why the
+*per-finding* version of this — forcing a re-examination of a specific carried finding — is not
+buildable and was closed won't-fix.
 
 `structured: false` means there is no machine record for this turn: `findings` is empty because
 nothing is in it, not because nothing was wrong.

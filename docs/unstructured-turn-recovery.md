@@ -522,7 +522,7 @@ The completed envelope gains **`outcome`**: what the caller should do next, as a
 | `converged` | `null` (converged) | Stop. (Still only the machine contract, not a human sign-off.) |
 | `changes_requested` | `open_findings`, `verdict_contradiction` | Act on `findings`, re-review the same session. |
 | `escalate` | `reviewer_blocked`, `reviewer_withheld_approve` | Stop; the reviewer's own judgement needs a person. Re-reviewing will keep producing this. |
-| `rebaseline` | `ledger_unavailable`, `turn_not_durable`, `ledger_too_large` | Stop; this session cannot continue. A human decides, then starts a fresh review carrying the preserved findings — and reads `review_prose` when it is non-null, because it holds what the machine record does not. |
+| `rebaseline` | `ledger_unavailable`, `turn_not_durable`, `ledger_too_large`, `session_stagnant` | Stop; this session cannot continue. A human decides, then starts a fresh review carrying the preserved findings — and reads `review_prose` when it is non-null, because it holds what the machine record does not. |
 
 Deriving it from the reason means the mapping is total and non-overlapping *by construction*: the
 reason is already chosen by a deterministic precedence over the whole conjunction, so `outcome` adds

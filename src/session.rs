@@ -208,8 +208,15 @@ pub struct SessionRecord {
     /// yet, or a record written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_ledger: Option<serde_json::Value>,
-    /// A sticky terminal escalation state — currently only `"ledger_too_large"`. Once set, a resume
-    /// is refused (the session outgrew a single review conversation) until it is restarted `fresh`.
+    /// A sticky terminal escalation state: `"ledger_too_large"` (the session outgrew a single review
+    /// conversation) or `"session_stagnant"` (it went `--stagnant-session-turns` turns without
+    /// raising or resolving a finding while findings were still open). Once set, a resume is refused
+    /// until the session is restarted `fresh`.
+    ///
+    /// Written from the turn's *selected* non-convergence reason, and only for the reasons
+    /// `NonConvergenceReason::sticky_terminal` names — `ledger_unavailable` and `turn_not_durable`
+    /// are grave but are recorded as ledger coverage, so neither lands here.
+    ///
     /// `None` for a healthy session or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
@@ -315,8 +322,10 @@ pub struct TurnFacts<'a> {
     /// new ledger already includes the prior findings) — never inherited from a prior turn. `None`
     /// for a turn that produced no ledger.
     pub findings_ledger: Option<serde_json::Value>,
-    /// The sticky terminal state this turn resolves to (`Some("ledger_too_large")` when the turn is
-    /// over budget), or `None`. Set on the record so a later resume is refused.
+    /// The sticky terminal state this turn resolves to, or `None`. Set on the record so a later
+    /// resume is refused. Derived from the turn's selected non-convergence reason, so it is exactly
+    /// the reasons `NonConvergenceReason::sticky_terminal` names: `"ledger_too_large"` and
+    /// `"session_stagnant"`.
     pub terminal_reason: Option<String>,
     /// The working-directory mode the reviewer ran in this turn (`CWD_MODE_PROJECT` /
     /// `CWD_MODE_NEUTRAL`), stored so a later resume can detect a mode change it cannot survive.

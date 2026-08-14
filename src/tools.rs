@@ -3029,13 +3029,14 @@ impl Job {
             }
         }
 
-        let turn_eval =
-            crate::findings::finalize_turn(assessment, crate::findings::Budget::default());
+        let turn_eval = crate::findings::finalize_turn(
+            assessment,
+            crate::findings::Budget::default(),
+            self.cfg.stagnant_session_turns,
+        );
         let findings_ledger_to_persist: Option<serde_json::Value> =
             Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
-        let terminal_reason_to_persist: Option<String> = turn_eval
-            .over_budget
-            .then(|| "ledger_too_large".to_string());
+        let terminal_reason_to_persist = terminal_reason_for(&turn_eval.envelope);
         // The prose we store and render, with the reviewer's own machine block (exact nonce)
         // already removed by the evaluation — one owner for "what prose does this turn have",
         // rather than stripping again here. Any *other* stray marker line (a wrong-nonce block, or
@@ -3341,11 +3342,11 @@ impl Job {
                 }
             }
         };
-        // A durable but over-budget turn has persisted a sticky `terminal_reason`, so the next
-        // resume will be refused: do not invite one. A durable turn whose findings marker could not
-        // be cleared will likewise be refused at the findings gate. Only a durable, in-budget turn
-        // whose marker was cleared is genuinely resumable.
-        let resumable = durable && !turn_eval.over_budget && findings_marker_cleared;
+        let resumable = turn_is_resumable(
+            durable,
+            terminal_reason_to_persist.as_deref(),
+            findings_marker_cleared,
+        );
 
         Ok(Outcome {
             review: Some(parsed.text),
@@ -3477,6 +3478,29 @@ fn resume_block(
         }
     }
 
+    // A sticky terminal state, before staleness: the session is dead for a specific reason, and a
+    // dead session that is also long or old should say why it is dead rather than that it is old.
+    // Same "the more specific thing wins" rule that puts turns before idle below. The caller must
+    // rebaseline into a fresh session carrying the still-open findings either way.
+    //
+    // Deliberately threshold-neutral for `session_stagnant`: the `--stagnant-session-turns` in force
+    // when the session died is not persisted, and this text may be read under a different one.
+    // Persisting the historical threshold to print one number is not worth a field.
+    if let Some(reason) = &record.terminal_reason {
+        let detail = match reason.as_str() {
+            "ledger_too_large" => "the findings ledger outgrew a single review conversation",
+            "session_stagnant" => {
+                "the review went several turns without raising or resolving a finding while \
+                 findings were still open"
+            }
+            _ => "the session cannot continue",
+        };
+        return Some(format!(
+            "it reached a terminal state ({reason}): {detail}. Start a fresh review (fresh: true) \
+             carrying the still-open findings into the new instructions."
+        ));
+    }
+
     // Then staleness. Turns before idle: when a session is both long and old, "it ran too
     // many turns" is the more specific thing to say.
     if cfg.resume_max_turns > 0 && record.turns >= cfg.resume_max_turns {
@@ -3499,17 +3523,6 @@ fn resume_block(
                 fmt_elapsed(cfg.resume_max_idle)
             ));
         }
-    }
-
-    // A sticky terminal escalation — currently `ledger_too_large` — is not resumable: the session
-    // outgrew a single review conversation, so continuing it would only grow the ledger further.
-    // The caller must rebaseline into a fresh session carrying the still-open findings.
-    if let Some(reason) = &record.terminal_reason {
-        return Some(format!(
-            "it reached a terminal state ({reason}): the findings ledger outgrew a single review \
-             conversation. Start a fresh review (fresh: true) carrying the still-open findings into \
-             the new instructions."
-        ));
     }
 
     // An unreadable or incompatible findings ledger cannot be injected into the resumed prompt, so
@@ -3539,6 +3552,40 @@ fn resume_block(
 /// unreadable is tagged whichever gate happens to fire first. `record` is `None` for the one refusal
 /// that can fire with no stored record (a leftover findings marker on a name with no record); it
 /// then carries no detail.
+/// The sticky terminal state this turn leaves on the session record, if any.
+///
+/// Derived from the envelope's *selected ranked reason*, never from a second independent condition,
+/// so the envelope, the sticky record and the resume refusal cannot disagree. Only the two sticky
+/// reasons map (`NonConvergenceReason::sticky_terminal`): `ledger_unavailable` and
+/// `turn_not_durable` are recorded as ledger coverage, and promoting either here would turn one
+/// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
+/// because an over-budget turn always reports it at rank 0.
+fn terminal_reason_for(envelope: &crate::findings::Envelope) -> Option<String> {
+    envelope
+        .non_convergence_reason
+        .and_then(|r| r.sticky_terminal())
+        .map(str::to_string)
+}
+
+/// Whether the session may be resumed after this turn — the answer the response advertises.
+///
+/// It must agree with what the resume gate will actually do, so it is stated as the three ways a
+/// turn can leave a session unresumable rather than as a list of causes. A turn that persisted a
+/// sticky `terminal_reason` is refused by `resume_block`; one whose findings marker could not be
+/// cleared is refused at the findings gate; one that was not durable did not record itself at all.
+///
+/// Keyed on the terminal *reason* rather than on the over-budget flag it used to read: that
+/// enumerated the single sticky cause that existed when it was written, so the first new one would
+/// have advertised `resumable: true` for a session the same turn had just killed (issue #78 review,
+/// round 2). Any future sticky state is covered by construction.
+fn turn_is_resumable(
+    durable: bool,
+    terminal_reason: Option<&str>,
+    findings_marker_cleared: bool,
+) -> bool {
+    durable && terminal_reason.is_none() && findings_marker_cleared
+}
+
 fn resume_refusal(
     session: &str,
     reason: String,
@@ -4031,6 +4078,163 @@ mod tests {
         let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
         assert!(reason.contains("terminal state"));
         assert!(reason.contains("ledger_too_large"));
+    }
+
+    /// The whole sticky chain for a stalled session, with no live reviewer: a real turn is evaluated
+    /// against a prior ledger, its terminal reason and resumability are derived by the same
+    /// functions production calls, the reason is written to the record by `record_turn`, and the
+    /// next resume is refused. The pure-helper tests above each pin one link; this pins that the
+    /// links are actually joined.
+    #[test]
+    fn a_stalled_session_persists_its_terminal_state_and_is_refused_next_time() {
+        use crate::findings::{Finding, LedgerCoverage, PriorState, Severity, Status};
+
+        let dir = crate::testutil::temp_dir("stagnant-chain");
+        let store = session::SessionStore::new(dir.as_ref());
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+
+        // Two findings open since turn 1; this is turn 4 and the reviewer reports nothing new and
+        // resolves nothing — three turns without movement, at the default threshold of 3.
+        let prior = PriorState {
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 3,
+            findings: (1..=2)
+                .map(|n| Finding {
+                    id: format!("f{n}"),
+                    severity: Severity::Major,
+                    status: Status::Open,
+                    title: format!("finding {n}"),
+                    file: None,
+                    line: None,
+                    detail: "d".into(),
+                    first_seen_turn: 1,
+                    last_status_change_turn: 1,
+                    last_verified_turn: Some(1),
+                    regression_of: None,
+                })
+                .collect(),
+        };
+        let nonce = "rv-chain-1";
+        let (b, e) = crate::findings::reviewer_block_markers(nonce);
+        let text = format!(
+            "{b}\n{{\"verdict\":\"request_changes\",\"prior_findings\":[],\"new_findings\":[]}}\n{e}"
+        );
+        let ev = crate::findings::finalize_turn(
+            crate::findings::assess_turn("stalled", 4, nonce, &text, Some(prior)),
+            crate::findings::Budget::default(),
+            cfg.stagnant_session_turns,
+        );
+
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(crate::findings::NonConvergenceReason::SessionStagnant)
+        );
+        assert_eq!(ev.envelope.outcome, crate::findings::Outcome::Rebaseline);
+        assert_eq!(ev.envelope.open_count, Some(2), "nothing was closed");
+
+        let terminal = terminal_reason_for(&ev.envelope);
+        assert_eq!(terminal.as_deref(), Some("session_stagnant"));
+        assert!(
+            !turn_is_resumable(true, terminal.as_deref(), true),
+            "the response must not invite a resume the gate will refuse"
+        );
+
+        let rec = store
+            .record_turn(
+                "stalled",
+                session::TurnFacts {
+                    reviewer: "codex",
+                    cli_session_id: "thread-1",
+                    model: "gpt-5.6-luna",
+                    effort: "max",
+                    cwd: &cfg.cwd.display().to_string(),
+                    cumulative_usage: None,
+                    changes: None,
+                    head_sha: None,
+                    base_sha: None,
+                    backend: None,
+                    include_shelved: None,
+                    capture_identity: None,
+                    perforce_baseline: None,
+                    raw_bin: session::RawBin::PathSearch,
+                    resolved_bin: String::new(),
+                    findings_ledger: Some(
+                        serde_json::to_value(&ev.ledger).expect("serialize ledger"),
+                    ),
+                    terminal_reason: terminal.clone(),
+                    reviewer_cwd_mode: crate::reviewer::CWD_MODE_PROJECT,
+                    profile_identity: None,
+                },
+            )
+            .expect("record the turn");
+        assert_eq!(rec.terminal_reason.as_deref(), Some("session_stagnant"));
+
+        let refusal = resume_block(&cfg, &rec, &[], now).expect("the next resume is refused");
+        assert!(refusal.contains("session_stagnant"), "{refusal}");
+        assert!(
+            refusal.contains("without raising or resolving a finding"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_killed_the_session_does_not_advertise_a_resume() {
+        // Every sticky reason, not just the one that existed first: the response and the resume
+        // gate have to agree, and `resume_block` refuses on *any* stored `terminal_reason`.
+        assert!(turn_is_resumable(true, None, true));
+        for reason in ["ledger_too_large", "session_stagnant"] {
+            assert!(
+                !turn_is_resumable(true, Some(reason), true),
+                "{reason} was advertised as resumable"
+            );
+        }
+        // The other two ways a turn leaves a session unresumable are unchanged.
+        assert!(!turn_is_resumable(false, None, true));
+        assert!(!turn_is_resumable(true, None, false));
+    }
+
+    #[test]
+    fn a_terminal_stagnant_session_is_refused_with_its_own_reason() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+        let mut rec = record_matching(&cfg, 1, now);
+        rec.terminal_reason = Some("session_stagnant".to_string());
+        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        assert!(reason.contains("session_stagnant"), "{reason}");
+        assert!(
+            reason.contains("without raising or resolving a finding"),
+            "the refusal explains this cause, not the ledger-size one: {reason}"
+        );
+        assert!(
+            !reason.contains("outgrew"),
+            "the `ledger_too_large` explanation must not be reused: {reason}"
+        );
+        // Deliberately threshold-neutral: the `--stagnant-session-turns` in force when the session
+        // died is not persisted, so quoting a number here could quote the wrong one.
+        assert!(!reason.contains("3 turn"), "{reason}");
+    }
+
+    #[test]
+    fn a_terminal_session_says_why_it_is_dead_not_merely_that_it_is_old() {
+        // The terminal check runs before the staleness checks. A session that is both dead and past
+        // `--session-max-turns` should report the specific cause, on the same "more specific thing
+        // wins" rule that already puts turns before idle.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--session-max-turns".into(),
+            "2".into(),
+        ])
+        .expect("config");
+        let now = 1_000_000;
+        // Past the turn limit *and* idle past the window, as well as terminal.
+        let mut rec = record_matching(&cfg, 9, now - cfg.resume_max_idle.as_secs() - 60);
+        rec.terminal_reason = Some("session_stagnant".to_string());
+        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        assert!(reason.contains("session_stagnant"), "{reason}");
+        assert!(!reason.contains("--session-max-turns"), "{reason}");
+        assert!(!reason.contains("--session-max-idle-seconds"), "{reason}");
     }
 
     #[test]
