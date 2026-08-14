@@ -886,8 +886,16 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  human decides, then starts a fresh review carrying the still-open findings). When \
                  `structured` is false the reviewer produced no machine-readable record this turn: \
                  `findings` is empty because there is nothing in it, not because there was nothing \
-                 wrong, and the review itself is in `review_prose` as well as the text body. Read \
-                 it rather than re-running blind.\n\n\
+                 wrong.\n\n\
+                 `review_prose` carries what the reviewer said outside its findings list -- its \
+                 reasoning, and why a finding is still open -- on every turn that ran, whatever the \
+                 outcome; it is null only when no reviewer ran. Read it: `findings` is the machine \
+                 record, not the whole review. Beside it, `captured` says what change the reviewer \
+                 was actually shown, `denial_count` how many commands it was refused (a lower bound \
+                 when `denial_count_is_floor` is true), `warnings` everything that qualifies the \
+                 turn, and `resumable` whether this session can be continued. A review run on a \
+                 truncated capture, or one that spent its turn on blocked commands, is thinner than \
+                 it looks -- those fields are how you tell.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \
                  says."
             ),

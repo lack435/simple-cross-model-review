@@ -116,11 +116,13 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   strong evidence the finding is real; one that **does not** is weak, because a fresh session
   samples differently and can converge while abandoning concerns. Corroboration, not acquittal:
   a dispute still has to answer the original finding.
-- **You may not be able to read the reviewer's prose.** On a structured turn `review_prose` is
-  `null` by design, and an MCP client that surfaces only `structuredContent` never shows the text
-  channel — so a reviewer that explains itself in prose looks exactly like one that said nothing
-  (issue #73). Until that is fixed, ask for reasons and paths to be stated *in findings*, and do
-  not read silence as absence of an answer.
+- **Read `review_prose`, not only `findings`.** The findings are the machine record; the prose is
+  where the reviewer explains itself, including why a finding it is holding open is still open. It
+  is present on every turn that ran (issue #73 — it used to be `null` whenever the machine record
+  was clean, which made a reviewer that explained itself indistinguishable from one that said
+  nothing, and cost two rounds of #71 and five of #73's own review). Read `captured` and
+  `denial_count` too, on the same response: a review run on a truncated capture, or one that spent
+  its turn on commands its policy refused, is thinner than it looks and does not read that way.
 - If the review fails — `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `RATE_LIMITED`, any of the
   codes in the README — hand the user the remediation the tool returned, say the review did
   not run, and stop. Do not substitute your own read of the diff, and do not fall back to a

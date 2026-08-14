@@ -375,10 +375,19 @@ no prose on that path. With that boundary:
   not be persisted (Decision 5, `turn_not_durable`) → the envelope still returns, but with
   `structured: false`, `open_count: null`, `verdict` **never `approve`** (it is reported as
   `unknown`), `converged: false`, and a warning naming which degradation occurred. The prose is
-  returned in full on the text channel regardless, exactly as today — and since issue #63 a capped
-  copy also rides the structured channel in `review_prose`, so a `structuredContent`-only client is
-  not left with an empty `findings` list and nothing to read. (An *unreadable ledger* is not in this list — it is
+  returned in full on the text channel regardless, exactly as today — and a capped copy rides the
+  structured channel in `review_prose`, so a `structuredContent`-only client is not left with an
+  empty `findings` list and nothing to read. (An *unreadable ledger* is not in this list — it is
   the pre-model resume refusal above, not a completed degraded envelope.)
+
+  **Since issue #73 that capped copy is on every turn that ran, not only degraded ones.** Issue #63
+  attached it iff the machine channel did not represent the turn, which left a clean structured
+  turn's `review_prose` `null` — so everything the reviewer said outside its findings list was
+  unreachable to a `structuredContent`-only client, most sharply on `approve_with_comments`, whose
+  entire content is the comments. `review_prose` is now `null` **iff no reviewer ran**, and the
+  envelope also carries the result-context group described in
+  [`structured-channel-parity.md`](structured-channel-parity.md). That document is authoritative for
+  both.
 
 The invariant round 1 demanded, made structural: **a numeric `open_count` and a `true`
 `converged` are reachable only through the fully-validated path.** No degraded path can
@@ -542,9 +551,17 @@ must not break the prose channel anything already depends on:
       "last_status_change_turn": 1   // open since turn 1, never changed
     }
   ],
-  "warnings": []                 // carries contradiction/degradation notes when they occur; empty on a clean structured turn
+  "warnings": []                 // the union both channels show: turn-evaluation notes (contradiction,
+                                 // degradation, block repair) first, then the run warnings that used to
+                                 // appear only in the rendered text. Empty on a clean, unqualified turn.
+                                 // Each states what was *observed*; the disposition is in `verdict`.
 }
 ```
+
+Since issue #73 the completed envelope also carries `review_prose` on every turn that ran, and a
+result-context group — `reviewer`, `resumed`, `resumable`, `usage`, `captured`, `disposition`,
+`denials`, `denial_count`, `denial_count_is_floor` — omitted from this example for brevity. See
+[`structured-channel-parity.md`](structured-channel-parity.md).
 
 This is a **completed, structured, non-convergent** example, and it is **internally consistent**:
 three findings ever raised (`total_count: 3`), two of them non-resolved (`open_count: 2`, matching
@@ -608,11 +625,22 @@ Notes on the shape:
   ledgers written before this still load). `outcome` is what a caller switches on — `converged` /
   `changes_requested` / `escalate` / `rebaseline` — derived totally from `non_convergence_reason`,
   so it adds no second precedence that could disagree with the first. `review_prose` carries the
-  reviewer's prose on the structured channel **only when the machine channel does not represent the
-  turn** (`structured: false`, or `turn_not_durable`), capped at 16,000 characters; it is
-  transported, never interpreted, and `verdict_source` is unaffected. `block_repair` records whether
-  the block was re-asked for and how that went. Full detail in
+  reviewer's prose on the structured channel, capped at 16,000 characters; it is transported, never
+  interpreted, and `verdict_source` is unaffected. `block_repair` records whether the block was
+  re-asked for and how that went. Full detail in
   [`unstructured-turn-recovery.md`](unstructured-turn-recovery.md).
+- **`review_prose` attaches on every turn that ran, and the result-context group** — `reviewer`,
+  `resumed`, `resumable`, `usage`, `captured`, `disposition`, `denials`, `denial_count`,
+  `denial_count_is_floor` — were added by issue #73 (envelope `schema_version` **3**; the ledger
+  version is again unchanged, which is what that split is for). #63 attached the prose only when the
+  machine channel did not represent the turn, and #73 is the record of why that was wrong. The
+  governing rule is now that `structuredContent` is **never silently poorer than the text body**:
+  every fact the text shows that bears on weighing the review is on the structured channel in full,
+  the prose is there up to a declared bound (`review_prose_truncated` says when the copy is short),
+  and both machine-readable copies — `structuredContent` and the `_OUT` block — are built from one
+  value, so they cannot diverge. `warnings` is the union of the turn-evaluation warnings and the run
+  warnings, in the order both channels render it. Full detail in
+  [`structured-channel-parity.md`](structured-channel-parity.md).
 - **`detail` is the reviewer's prose, captured when the finding was first raised**, and not
   rewritten on later turns (Decision 2). Nothing is lost by adopting the structure: the block
   is a spine, the prose is the body, and the human rendering is unchanged.

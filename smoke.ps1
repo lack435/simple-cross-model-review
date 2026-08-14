@@ -307,6 +307,27 @@ COUNTER=1
     Assert-That 'review body is delimited' ($resultText -match 'BEGIN REVIEW') $resultText
     Assert-That 'the wait emitted MCP progress notifications' `
         ($script:progressMessages.Count -gt $progressBefore)
+
+    # Issue #73: a client that reads only `structuredContent` must not be poorer than one reading the
+    # text. This is the end-to-end check that the envelope actually carries the review -- the unit
+    # tests pin the composition, but only a real turn proves the reviewer's own words arrive.
+    $sc = $collected.result.structuredContent
+    Assert-That 'the completed result carries structuredContent' ($null -ne $sc) $resultText
+    Assert-That 'the envelope is at the current schema version' ($sc.schema_version -eq 3) `
+        "schema_version=$($sc.schema_version)"
+    Assert-That 'a turn that ran carries its prose on the structured channel' `
+        ($sc.review_prose -is [string]) "review_prose=$($sc.review_prose)"
+    Assert-That 'the structured prose is the reviewer''s own words' `
+        ($sc.review_prose -match 'SMOKE-OK') $sc.review_prose
+    Assert-That 'the result-context group is present' `
+        (($sc.PSObject.Properties.Name -contains 'captured') -and
+         ($sc.PSObject.Properties.Name -contains 'denial_count') -and
+         ($sc.PSObject.Properties.Name -contains 'denial_count_is_floor') -and
+         ($sc.PSObject.Properties.Name -contains 'resumable') -and
+         ($sc.PSObject.Properties.Name -contains 'warnings')) `
+        ($sc.PSObject.Properties.Name -join ',')
+    Assert-That 'a turn that ran names the reviewer that ran it' `
+        ($sc.reviewer -is [string]) "reviewer=$($sc.reviewer)"
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
