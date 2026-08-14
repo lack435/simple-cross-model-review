@@ -4734,6 +4734,8 @@ mod tests {
                 detail: "d".into(),
                 first_seen_turn: 1,
                 last_status_change_turn: 1,
+                last_verified_turn: Some(1),
+                regression_of: None,
             })
             .collect();
         Job {

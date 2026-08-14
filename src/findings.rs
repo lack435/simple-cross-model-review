@@ -81,14 +81,19 @@ pub enum Severity {
     Minor,
 }
 
-/// A finding's lifecycle status. `regressed` is a resolved finding the reviewer now reopens; it
-/// counts as open (`open_count` is `count(status != resolved)`).
+/// A finding's lifecycle status. **A resolution is terminal**: a `resolved` finding is closed, is
+/// never asked for a status again, and is not restatable — restating one is `UnknownId`, on the same
+/// reasoning as any other id the reviewer does not own. A defect seen again after a resolution is a
+/// *new* finding carrying `regression_of`, because a recurrence at turn 9 of something fixed at turn
+/// 3 is new work with its own evidence, not the old finding changing its mind.
+///
+/// There is deliberately no `regressed` status; it was deleted with the exact-set accounting rule
+/// that required one. See `docs/stale-open-findings-fix.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Open,
     Resolved,
-    Regressed,
 }
 
 impl Status {
@@ -270,7 +275,9 @@ impl NonConvergenceReason {
 // --- Ledger types --------------------------------------------------------------------------
 
 /// One finding, server-owned. Its content (`severity`/`title`/`file`/`line`/`detail`) is captured
-/// when first raised and never rewritten; only `status` and `last_status_change_turn` move.
+/// when first raised and never rewritten; only `status`, `last_status_change_turn` and
+/// `last_verified_turn` move. `status` moves once and only one way — `Open` to `Resolved` — because
+/// a resolution is terminal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     /// Server-minted stable id, e.g. `"f3"`. Never reused across a conversation.
@@ -286,14 +293,34 @@ pub struct Finding {
     pub detail: String,
     /// The turn the id was minted.
     pub first_seen_turn: u32,
-    /// The last turn the status changed (raised, resolved, or regressed) — deliberately *not*
-    /// "last reported", since total-accounting reports every id every turn.
+    /// The last turn the status changed (raised or resolved) — deliberately *not* "last reported".
+    /// A re-examination that leaves the status where it was must not move this: it is the only
+    /// record of when a finding's state last actually changed.
     pub last_status_change_turn: u32,
+    /// The last turn the reviewer re-examined this finding: the turn it was minted, or the last turn
+    /// its id appeared in `prior_findings`.
+    ///
+    /// **Derived from presence in the block, never self-reported.** That is the whole point: a
+    /// reviewer cannot claim a re-examination it did not make, because the claim *is* the act of
+    /// reporting a status. A finding whose `last_verified_turn` trails the envelope's `turn` was
+    /// carried, not checked — which is the distinction issue #62 was unable to draw.
+    ///
+    /// Absent on a ledger written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_turn: Option<u32>,
+    /// For a finding raised as the recurrence of an earlier resolved one, that finding's id.
+    ///
+    /// Advisory provenance and nothing more: it is kept only when it names a finding this ledger
+    /// issued *and* resolved, and dropped silently otherwise. Nothing depends on it, so a dropped
+    /// reference costs a cross-reference rather than a review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_of: Option<String>,
 }
 
 /// The persisted findings ledger for a session: its coverage provenance, the next id counter, and
-/// every finding ever raised (any status; resolved findings are retained so a regression reattaches
-/// to its original id).
+/// every finding ever raised (any status). Resolved findings are retained — not so they can reopen,
+/// which terminal resolution forbids, but so `total_count` stays honest, a `regression_of`
+/// reference can be resolved, and the digest can carry them as a recurrence cue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     pub schema_version: u32,
@@ -315,17 +342,21 @@ impl Ledger {
         self.findings.len() as u64
     }
 
-    /// The serialized digest size — the primary bounded-growth budget (see `Budget`). This is the
-    /// size of the prior-findings digest injected into each prompt, approximated by the ledger's
-    /// JSON length.
+    /// The size of the prior-findings digest injected into each prompt — the primary bounded-growth
+    /// budget (see `Budget`).
+    ///
+    /// This measures the rendered digest rather than approximating it with the ledger's JSON length,
+    /// because since terminal resolution the two diverge: the ledger retains every finding forever
+    /// so `regression_of` can resolve, while the digest carries open findings in full and closed
+    /// ones as a one-line cue. Approximating the injected text with the retained record would bound
+    /// the wrong thing. `Budget::max_findings` still counts every finding, which is what bounds the
+    /// retained record.
     pub fn digest_bytes(&self) -> usize {
-        serde_json::to_vec(&self.findings)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
+        render_digest(&self.findings).len()
     }
 
     /// Whether the ledger is *structurally* sound, beyond merely deserializing at a compatible
-    /// version. A loader must reject a ledger that fails this: exact-set reconciliation and
+    /// version. A loader must reject a ledger that fails this: reconciliation and
     /// monotonic id assignment both assume it, so a persisted ledger with duplicate ids, or a
     /// `next_seq` that is not strictly greater than every existing `f<n>`, could mint a colliding id
     /// and eventually let a bad turn converge. Also rejects a stored `invalid` *or* `unestablished`
@@ -365,9 +396,11 @@ impl Ledger {
     }
 }
 
-/// The bounded-growth budget: finite and non-disableable. Serialized digest bytes are the primary
-/// guard; finding count is a secondary one. Neither can be zero (a zero would reinstate the
-/// slow-failure mode the budget exists to prevent), so `new` clamps up to 1.
+/// The bounded-growth budget: finite and non-disableable. **Rendered** digest bytes are the primary
+/// guard; finding count is a secondary one. The two bound different things since terminal
+/// resolution — the rendered digest is what a turn injects into the prompt and shrinks as findings
+/// close, while the finding count bounds the record, which only grows. Neither can be zero (a zero
+/// would reinstate the slow-failure mode the budget exists to prevent), so `new` clamps up to 1.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
     pub max_digest_bytes: usize,
@@ -393,6 +426,10 @@ impl Budget {
     }
 
     /// Whether a ledger is over budget (digest bytes OR finding count).
+    ///
+    /// The two caps bound different things and both still earn their place: `max_digest_bytes`
+    /// bounds what is injected into the prompt, which now shrinks as findings close, and
+    /// `max_findings` bounds the retained record, which does not.
     pub fn is_over(&self, ledger: &Ledger) -> bool {
         ledger.findings.len() > self.max_findings || ledger.digest_bytes() > self.max_digest_bytes
     }
@@ -422,9 +459,14 @@ struct NewFinding {
     #[serde(default)]
     line: Option<u64>,
     detail: String,
+    /// The resolved finding this one recurs from, if the reviewer recognised it as a recurrence.
+    /// Validated in `reconcile` and dropped when it does not name a resolved id this ledger issued.
+    #[serde(default)]
+    regression_of: Option<String>,
 }
 
-/// The reviewer's machine block: its own verdict, a status for every prior id, and any new findings.
+/// The reviewer's machine block: its own verdict, the statuses of the prior findings it re-examined
+/// this turn, and any new findings.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewerBlock {
@@ -458,10 +500,16 @@ pub enum ExtractError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum ReconcileError {
-    /// `prior_findings` named an id the ledger never issued.
+    /// `prior_findings` named an id the ledger never issued, or one it has already resolved.
+    /// A resolution is terminal, so a closed id is as unowned by the reviewer as one that never
+    /// existed.
+    ///
+    /// There is deliberately no `MissingId`. An id the reviewer does not restate is *carried
+    /// unchanged*, because a restatement is a claim and the protocol no longer demands one the
+    /// reviewer may have no grounds for. That demand was the cause of issue #62, and requiring it
+    /// also meant a reviewer that dropped one id out of twenty-five lost its whole block, prose
+    /// included — a way to lose a review, deleted rather than documented.
     UnknownId(String),
-    /// A prior ledger id was not accounted for exactly once.
-    MissingId(String),
     /// The same id appeared twice in `prior_findings`.
     DuplicateId(String),
     /// The id counter would overflow `u64` while minting new findings this turn. Degrading is the
@@ -612,7 +660,7 @@ fn strip_between(text: &str, (begin, end): &(String, String)) -> String {
 
 /// Reconcile a validly-parsed block against the prior findings, producing the new findings vector
 /// and the advanced id counter. Pure: `Decision 2` — the two-array split, immutable content, id
-/// assignment, status carry-over, and the exact-set total-accounting rule.
+/// assignment, status carry-over, and the subset restatement rule (issue #62).
 fn reconcile(
     prior: &[Finding],
     next_seq: u64,
@@ -629,35 +677,44 @@ fn reconcile(
         }
     }
 
-    // Every restated id must exist in the ledger (no minting).
+    // Every restated id must name an **open** finding this ledger issued. A resolved id fails here
+    // rather than in a variant of its own: terminal resolution means the reviewer no longer owns it,
+    // which is exactly what `UnknownId` already says.
     for id in restated.keys() {
-        if !prior.iter().any(|f| f.id == *id) {
+        if !prior.iter().any(|f| f.id == *id && f.status.is_open()) {
             return Err(ReconcileError::UnknownId((*id).to_string()));
         }
     }
-    // Every prior id must be accounted for exactly once (no silent omission).
-    for f in prior {
-        if !restated.contains_key(f.id.as_str()) {
-            return Err(ReconcileError::MissingId(f.id.clone()));
-        }
-    }
+    // An id the reviewer did not restate is *not* an error. It is carried unchanged, and its
+    // `last_verified_turn` is left where it was, so the omission is recorded rather than punished.
 
-    // Apply statuses; content is untouched. A changed status advances `last_status_change_turn`.
+    // Apply statuses; content is untouched. A changed status advances `last_status_change_turn`;
+    // being restated at all advances `last_verified_turn`, because the reviewer had to look to
+    // report one.
     let mut out: Vec<Finding> = prior
         .iter()
-        .map(|f| {
-            let new_status = restated.get(f.id.as_str()).copied().unwrap_or(f.status);
-            let changed = new_status != f.status;
-            Finding {
+        .map(|f| match restated.get(f.id.as_str()).copied() {
+            Some(new_status) => Finding {
                 status: new_status,
-                last_status_change_turn: if changed {
+                last_status_change_turn: if new_status != f.status {
                     turn
                 } else {
                     f.last_status_change_turn
                 },
+                last_verified_turn: Some(turn),
                 ..f.clone()
-            }
+            },
+            None => f.clone(),
         })
+        .collect();
+
+    // The ids a new finding may name in `regression_of`: everything closed as of this turn,
+    // including anything this turn's block just resolved. Snapshotted before the appends below so
+    // a new finding cannot reference another new finding.
+    let resolved_ids: std::collections::BTreeSet<String> = out
+        .iter()
+        .filter(|f| !f.status.is_open())
+        .map(|f| f.id.clone())
         .collect();
 
     // Append new findings with fresh monotonic ids, status Open. The counter is advanced with a
@@ -678,6 +735,16 @@ fn reconcile(
             detail: nf.detail.clone(),
             first_seen_turn: turn,
             last_status_change_turn: turn,
+            // Minting a finding is examining it.
+            last_verified_turn: Some(turn),
+            // Advisory: kept only when it names a finding this ledger issued and closed. A bad
+            // reference is dropped rather than degrading the turn — the finding itself is the
+            // review, and the cross-reference is a convenience on top of it.
+            regression_of: nf
+                .regression_of
+                .as_ref()
+                .filter(|r| resolved_ids.contains(*r))
+                .cloned(),
         });
         seq = match seq.checked_add(1) {
             Some(n) if n != u64::MAX => n,
@@ -1073,34 +1140,69 @@ impl Envelope {
     }
 }
 
-/// Render the prior-findings digest injected into a resumed prompt: every finding the server is
-/// tracking, by stable id, with severity, title, location, and current status, as quoted evidence
-/// the reviewer must account for. Empty string when there are no prior findings (the prompt then
-/// renders the first-turn form).
+/// Render the prior-findings digest injected into a resumed prompt, in two sections.
+///
+/// **Open findings** are the work list: stable id, severity, title, location, and the turn each was
+/// last re-examined — the statuses the reviewer may report on. **Resolved findings** follow as a cue
+/// only: id, title and location, with no severity and no status, because they are closed and not
+/// restatable. They are shown so a reviewer can recognise a recurrence and name the closed id in
+/// `regression_of`, not so it can report on them.
+///
+/// This is also what `Ledger::digest_bytes` measures, so the budget bounds the text that is actually
+/// injected rather than the record behind it. Empty string when there are no prior findings (the
+/// prompt then renders the first-turn form).
 pub fn render_digest(findings: &[Finding]) -> String {
+    fn loc_of(f: &Finding) -> String {
+        match (&f.file, f.line) {
+            (Some(file), Some(line)) => format!(" ({file}:{line})"),
+            (Some(file), None) => format!(" ({file})"),
+            _ => String::new(),
+        }
+    }
+
     let mut out = String::new();
-    for f in findings {
+
+    // Open findings: the work list. Each carries when it was last re-examined, so a reviewer being
+    // asked about a finding it has carried for three turns is being asked to that finding's face.
+    for f in findings.iter().filter(|f| f.status.is_open()) {
         let sev = match f.severity {
             Severity::Critical => "critical",
             Severity::Major => "major",
             Severity::Minor => "minor",
         };
-        let status = match f.status {
-            Status::Open => "open",
-            Status::Resolved => "resolved",
-            Status::Regressed => "regressed",
-        };
-        let loc = match (&f.file, f.line) {
-            (Some(file), Some(line)) => format!(" ({file}:{line})"),
-            (Some(file), None) => format!(" ({file})"),
-            _ => String::new(),
+        let seen = match f.last_verified_turn {
+            Some(t) => format!(", last re-examined turn {t}"),
+            None => String::new(),
         };
         out.push_str(&format!(
-            "- {id} [{sev}] {title}{loc} — currently {status}\n",
+            "- {id} [{sev}] {title}{loc} — currently open{seen}\n",
             id = f.id,
-            title = f.title
+            title = f.title,
+            loc = loc_of(f)
         ));
     }
+
+    // Closed findings: a cue, not a record. Title and location only — no severity, because how bad
+    // a finding was while open does not help anyone recognise it coming back, and no status to
+    // report, because these are not restatable.
+    let mut closed = findings.iter().filter(|f| !f.status.is_open()).peekable();
+    if closed.peek().is_some() {
+        out.push_str(
+            "\nAlready resolved and closed — do NOT report a status for these. If you find one of \
+             them broken again, raise it as a NEW finding and name the closed id in \
+             `regression_of`:\n",
+        );
+        for f in closed {
+            out.push_str(&format!(
+                "- {id} {title}{loc} — resolved turn {t}\n",
+                id = f.id,
+                title = f.title,
+                loc = loc_of(f),
+                t = f.last_status_change_turn
+            ));
+        }
+    }
+
     out
 }
 
@@ -1155,13 +1257,15 @@ pub fn output_schema() -> Value {
         "properties": {
             "id": {"type": "string"},
             "severity": {"enum": ["critical", "major", "minor"]},
-            "status": {"enum": ["open", "resolved", "regressed"]},
+            "status": {"enum": ["open", "resolved"]},
             "title": {"type": "string"},
             "file": {"type": "string"},
             "line": {"type": "integer"},
             "detail": {"type": "string"},
             "first_seen_turn": {"type": "integer"},
-            "last_status_change_turn": {"type": "integer"}
+            "last_status_change_turn": {"type": "integer"},
+            "last_verified_turn": {"type": "integer"},
+            "regression_of": {"type": "string"}
         },
         "required": ["id", "severity", "status", "title", "detail", "first_seen_turn", "last_status_change_turn"],
         "additionalProperties": false
@@ -1338,7 +1442,7 @@ struct Degradation {
 pub struct RepairRequest {
     /// What was wrong, phrased as an instruction to the reviewer.
     pub corrective: String,
-    /// The prior-findings digest to restate on a resumed turn, so total accounting is re-stated with
+    /// The prior-findings digest to restate on a resumed turn, so the restatement contract is re-stated with
     /// the same ids the reconciliation will check. `None` on a first turn.
     pub prior_digest: Option<String>,
 }
@@ -1684,15 +1788,14 @@ fn extract_corrective(e: &ExtractError) -> String {
 fn reconcile_corrective(e: &ReconcileError) -> Option<String> {
     let what = match e {
         ReconcileError::UnknownId(id) => format!(
-            "Your block reported a status for id `{id}`, which this session's ledger never issued. \
-             Report a status only for the ids listed below."
+            "Your block reported a status for id `{id}`, which this session's ledger never issued \
+             or has already resolved. Report a status only for the ids listed as currently open, \
+             and only for those you re-examined. A resolved finding is closed: if it is broken \
+             again, raise a NEW finding naming `{id}` in `regression_of`."
         ),
-        ReconcileError::MissingId(id) => format!(
-            "Your block did not account for id `{id}`. Every listed id needs a status, exactly once."
-        ),
-        ReconcileError::DuplicateId(id) => format!(
-            "Your block reported id `{id}` more than once. Report each listed id exactly once."
-        ),
+        ReconcileError::DuplicateId(id) => {
+            format!("Your block reported id `{id}` more than once. Report each id at most once.")
+        }
         ReconcileError::CounterExhausted => return None,
     };
     Some(what)
@@ -1714,8 +1817,9 @@ fn describe_extract(e: &ExtractError) -> String {
 /// A human-readable description of a reconciliation failure, for the degraded envelope's warning.
 fn describe_reconcile(e: &ReconcileError) -> String {
     let what = match e {
-        ReconcileError::UnknownId(id) => format!("status reported for unknown id {id}"),
-        ReconcileError::MissingId(id) => format!("prior id {id} was not accounted for"),
+        ReconcileError::UnknownId(id) => {
+            format!("status reported for unknown or already-resolved id {id}")
+        }
         ReconcileError::DuplicateId(id) => format!("id {id} was reported twice"),
         ReconcileError::CounterExhausted => "the finding id counter is exhausted".to_string(),
     };
@@ -1904,6 +2008,8 @@ mod tests {
 
     fn finding(id: &str, status: Status, first: u32, last: u32) -> Finding {
         Finding {
+            last_verified_turn: Some(last),
+            regression_of: None,
             id: id.to_string(),
             severity: Severity::Major,
             status,
@@ -2132,6 +2238,7 @@ mod tests {
                 file: None,
                 line: None,
                 detail: "d".into(),
+                regression_of: None,
             }],
         };
         assert_eq!(
@@ -2170,6 +2277,7 @@ mod tests {
                 file: Some("a.rs".into()),
                 line: Some(9),
                 detail: "d".into(),
+                regression_of: None,
             }],
         };
         let (findings, next) = reconcile(&[], 1, &b, 1).expect("clean");
@@ -2180,37 +2288,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_still_open_and_regressed_carry_status_and_change_turn() {
-        let prior = vec![
-            finding("f1", Status::Open, 1, 1),
-            finding("f2", Status::Resolved, 1, 2),
-        ];
+    fn resolving_advances_the_change_turn() {
+        let prior = vec![finding("f1", Status::Open, 1, 1)];
         let b = ReviewerBlock {
             verdict: VerdictDetail::RequestChanges,
-            prior_findings: vec![
-                PriorStatus {
-                    id: "f1".into(),
-                    status: Status::Resolved,
-                },
-                PriorStatus {
-                    id: "f2".into(),
-                    status: Status::Regressed,
-                },
-            ],
+            prior_findings: vec![PriorStatus {
+                id: "f1".into(),
+                status: Status::Resolved,
+            }],
             new_findings: vec![],
         };
         let (out, _) = reconcile(&prior, 3, &b, 3).expect("clean");
-        // f1 resolved this turn → status change turn advances.
         assert_eq!(out[0].status, Status::Resolved);
         assert_eq!(out[0].last_status_change_turn, 3);
-        // f2 regressed → reopens under its original id, change turn advances.
-        assert_eq!(out[1].status, Status::Regressed);
-        assert!(out[1].status.is_open());
-        assert_eq!(out[1].last_status_change_turn, 3);
+        assert_eq!(out[0].last_verified_turn, Some(3));
     }
 
     #[test]
-    fn an_unchanged_status_keeps_its_change_turn() {
+    fn an_unchanged_status_keeps_its_change_turn_but_advances_verification() {
+        // The regression test for issue #62's suggested "fix". Re-stamping
+        // `last_status_change_turn` every turn would destroy the only record of when a finding's
+        // state last moved; `last_verified_turn` is the field that advances on a re-examination.
         let prior = vec![finding("f1", Status::Open, 1, 1)];
         let b = ReviewerBlock {
             verdict: VerdictDetail::RequestChanges,
@@ -2222,21 +2320,230 @@ mod tests {
         };
         let (out, _) = reconcile(&prior, 2, &b, 5).expect("clean");
         assert_eq!(out[0].last_status_change_turn, 1);
+        assert_eq!(out[0].last_verified_turn, Some(5));
     }
 
     #[test]
-    fn a_missing_unknown_or_duplicate_id_degrades_the_turn() {
-        let prior = vec![finding("f1", Status::Open, 1, 1)];
-        // Missing: f1 not accounted for.
-        let miss = ReviewerBlock {
+    fn the_issue_62_reproduction_end_to_end() {
+        // The plan's headline test, at the envelope rather than at `reconcile`: two findings open
+        // since turn 4, one resolved on turn 5 and one silently carried. Before this change the
+        // protocol forced a status for both, so the carried one was recorded as a judgement and was
+        // indistinguishable from the checked one. Now the two are told apart by
+        // `last_verified_turn`, and the turn is structured rather than degraded.
+        let prior = PriorState {
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 3,
+            findings: vec![
+                finding("f1", Status::Open, 4, 4),
+                finding("f2", Status::Open, 4, 4),
+            ],
+        };
+        let text = block(
+            "rv-1-5",
+            r#"{"verdict":"request_changes","prior_findings":[{"id":"f1","status":"resolved"}]}"#,
+        );
+        let ev = evaluate_turn("s", 5, "rv-1-5", &text, Some(prior), Budget::default());
+
+        assert!(
+            ev.envelope.structured,
+            "an omission does not degrade a turn"
+        );
+        let f = &ev.ledger.findings;
+        // f1 was re-examined and closed on this turn.
+        assert_eq!(f[0].status, Status::Resolved);
+        assert_eq!(f[0].last_verified_turn, Some(5));
+        // f2 was carried: still open, still last verified on turn 4 against a turn-5 envelope.
+        assert_eq!(f[1].status, Status::Open);
+        assert_eq!(f[1].last_verified_turn, Some(4));
+        assert_eq!(ev.envelope.turn, 5);
+        // Which the caller can act on: exactly the findings the reviewer did not look at.
+        let carried: Vec<&str> = f
+            .iter()
+            .filter(|f| f.last_verified_turn != Some(ev.envelope.turn))
+            .map(|f| f.id.as_str())
+            .collect();
+        assert_eq!(carried, vec!["f2"]);
+
+        // And the carried finding still blocks convergence, so silence is never a route to
+        // approval -- the counts agree with the ledger.
+        assert_eq!(ev.envelope.open_count, Some(1));
+        assert_eq!(ev.envelope.total_count, Some(2));
+        assert!(!ev.envelope.converged);
+
+        // The next turn's digest shows the caller's view back to the reviewer: f2 as open work
+        // carrying its stale turn, f1 as a closed cue with no status to report.
+        let digest = render_digest(&ev.ledger.findings);
+        assert!(
+            digest.contains("- f2 [major] finding f2 — currently open, last re-examined turn 4")
+        );
+        assert!(digest.contains("- f1 finding f1 — resolved turn 5"));
+    }
+
+    #[test]
+    fn an_omitted_id_is_carried_unchanged_and_does_not_degrade_the_turn() {
+        // The heart of the fix for #62. Under the old exact-set rule this was `MissingId` and cost
+        // the reviewer its whole block; now it is the honest report of not having looked, and the
+        // finding's stale `last_verified_turn` is what says so.
+        let prior = vec![finding("f1", Status::Open, 1, 1), {
+            let mut f = finding("f2", Status::Open, 1, 1);
+            f.last_verified_turn = Some(1);
+            f
+        }];
+        let b = ReviewerBlock {
+            verdict: VerdictDetail::RequestChanges,
+            prior_findings: vec![PriorStatus {
+                id: "f1".into(),
+                status: Status::Open,
+            }],
+            new_findings: vec![],
+        };
+        let (out, _) = reconcile(&prior, 3, &b, 7).expect("an omission is not an error");
+        assert_eq!(out.len(), 2);
+        // f1 was re-examined this turn and is still open.
+        assert_eq!(out[0].status, Status::Open);
+        assert_eq!(out[0].last_verified_turn, Some(7));
+        // f2 was not mentioned: carried verbatim, still open, still last verified on turn 1. A
+        // caller comparing that against the envelope's turn can see it was carried, not checked --
+        // which is the entire claim of this change.
+        assert_eq!(out[1], prior[1]);
+        assert_eq!(out[1].last_verified_turn, Some(1));
+    }
+
+    #[test]
+    fn an_empty_prior_findings_carries_everything_and_blocks_convergence() {
+        // A reviewer that re-examined nothing says nothing, and every open finding survives -- so
+        // omission can never be a route to a false approval.
+        let prior = vec![
+            finding("f1", Status::Open, 1, 1),
+            finding("f2", Status::Open, 1, 1),
+        ];
+        let b = ReviewerBlock {
             verdict: VerdictDetail::Approve,
             prior_findings: vec![],
             new_findings: vec![],
         };
-        assert_eq!(
-            reconcile(&prior, 2, &miss, 2),
-            Err(ReconcileError::MissingId("f1".into()))
+        let (out, _) = reconcile(&prior, 3, &b, 4).expect("clean");
+        assert_eq!(out, prior);
+        assert!(out.iter().all(|f| f.status.is_open()));
+    }
+
+    #[test]
+    fn a_resolved_id_is_closed_and_restating_it_is_unknown() {
+        // Terminal resolution: a closed finding is as unowned by the reviewer as one that never
+        // existed, whatever status it tries to report for it.
+        let prior = vec![finding("f1", Status::Resolved, 1, 2)];
+        for status in [Status::Open, Status::Resolved] {
+            let b = ReviewerBlock {
+                verdict: VerdictDetail::RequestChanges,
+                prior_findings: vec![PriorStatus {
+                    id: "f1".into(),
+                    status,
+                }],
+                new_findings: vec![],
+            };
+            assert_eq!(
+                reconcile(&prior, 2, &b, 3),
+                Err(ReconcileError::UnknownId("f1".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn regression_of_is_kept_for_a_closed_id_and_dropped_otherwise() {
+        let prior = vec![
+            finding("f1", Status::Resolved, 1, 2),
+            finding("f2", Status::Open, 1, 1),
+        ];
+        let new = |r: Option<&str>| NewFinding {
+            severity: Severity::Major,
+            title: "t".into(),
+            file: None,
+            line: None,
+            detail: "d".into(),
+            regression_of: r.map(str::to_string),
+        };
+        let b = ReviewerBlock {
+            verdict: VerdictDetail::RequestChanges,
+            prior_findings: vec![],
+            // A real closed id is kept; a still-open id, an id never issued, and no reference at
+            // all all record `None`. None of them degrade the turn: the finding is the review and
+            // the cross-reference is a convenience on top of it.
+            new_findings: vec![
+                new(Some("f1")),
+                new(Some("f2")),
+                new(Some("f99")),
+                new(None),
+            ],
+        };
+        let (out, _) = reconcile(&prior, 3, &b, 4).expect("a bad reference is not an error");
+        assert_eq!(out[2].regression_of.as_deref(), Some("f1"));
+        assert_eq!(out[3].regression_of, None);
+        assert_eq!(out[4].regression_of, None);
+        assert_eq!(out[5].regression_of, None);
+        // And a newly minted finding counts as verified on the turn it was raised.
+        assert_eq!(out[2].last_verified_turn, Some(4));
+    }
+
+    #[test]
+    fn the_digest_is_a_work_list_of_open_findings_over_a_cue_of_closed_ones() {
+        let mut open = finding("f1", Status::Open, 1, 1);
+        open.file = Some("src/a.rs".into());
+        open.line = Some(88);
+        open.last_verified_turn = Some(4);
+        let mut closed = finding("f2", Status::Resolved, 1, 5);
+        closed.file = Some("src/b.rs".into());
+        closed.line = Some(12);
+
+        let d = render_digest(&[open, closed]);
+
+        // The open finding is the work list: severity, location, and when it was last actually
+        // looked at, so a reviewer carrying it for three turns is asked to its face.
+        assert!(d.contains(
+            "- f1 [major] finding f1 (src/a.rs:88) — currently open, last re-examined turn 4"
+        ));
+        // The closed one is a cue, not a record: title and location, no severity, no status to
+        // report, and an instruction that a recurrence is a new finding.
+        assert!(d.contains("do NOT report a status"));
+        assert!(d.contains("regression_of"));
+        assert!(d.contains("- f2 finding f2 (src/b.rs:12) — resolved turn 5"));
+        assert!(
+            !d.contains("f2 [major]"),
+            "closed findings carry no severity"
         );
+
+        // With nothing closed, the cue section is absent entirely.
+        let only_open = render_digest(&[finding("f1", Status::Open, 1, 1)]);
+        assert!(!only_open.contains("do NOT report a status"));
+    }
+
+    #[test]
+    fn closing_findings_shrinks_the_injected_digest_but_not_the_retained_record() {
+        // The two budget caps bound different things, which is why both survive: `digest_bytes`
+        // measures what is injected and falls as work is done, `max_findings` counts what is
+        // retained and does not.
+        let ledger = |status| Ledger {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            coverage: LedgerCoverage::WholeConversation,
+            next_seq: 21,
+            findings: (1..=20)
+                .map(|n| finding(&format!("f{n}"), status, 1, 1))
+                .collect(),
+        };
+        let all_open = ledger(Status::Open);
+        let all_closed = ledger(Status::Resolved);
+        assert!(
+            all_closed.digest_bytes() < all_open.digest_bytes(),
+            "closing findings must shrink the injected digest"
+        );
+        // But the record is the same size, and the cardinality cap still sees all twenty.
+        assert_eq!(all_closed.total_count(), 20);
+        assert_eq!(all_closed.open_count(), 0);
+        assert!(Budget::new(usize::MAX, 19).is_over(&all_closed));
+    }
+
+    #[test]
+    fn an_unknown_or_duplicate_id_degrades_the_turn() {
+        let prior = vec![finding("f1", Status::Open, 1, 1)];
         // Unknown: f9 not in ledger.
         let unknown = ReviewerBlock {
             verdict: VerdictDetail::Approve,
@@ -2279,20 +2586,19 @@ mod tests {
 
     #[test]
     fn ids_are_never_reused_across_turns() {
-        // Even after resolving f1, a new finding gets f2, not f1.
+        // Even after resolving f1, a new finding gets f2, not f1. f1 is closed, so it is not
+        // restated: the block carries only the new finding.
         let prior = vec![finding("f1", Status::Resolved, 1, 2)];
         let b = ReviewerBlock {
             verdict: VerdictDetail::RequestChanges,
-            prior_findings: vec![PriorStatus {
-                id: "f1".into(),
-                status: Status::Resolved,
-            }],
+            prior_findings: vec![],
             new_findings: vec![NewFinding {
                 severity: Severity::Minor,
                 title: "t".into(),
                 file: None,
                 line: None,
                 detail: "d".into(),
+                regression_of: None,
             }],
         };
         let (out, next) = reconcile(&prior, 2, &b, 3).expect("clean");
@@ -2766,6 +3072,8 @@ mod repair_tests {
             detail: "detail".to_string(),
             first_seen_turn: 1,
             last_status_change_turn: 1,
+            last_verified_turn: Some(1),
+            regression_of: None,
         }
     }
 
@@ -2818,35 +3126,45 @@ mod repair_tests {
             vec![open_finding("f1"), open_finding("f2")],
             LedgerCoverage::WholeConversation,
         );
-        // f2 is never accounted for.
+        // f2 is never mentioned. That is no longer a failure and there is nothing to repair: the
+        // turn is structured, f2 is carried, and no model call is spent asking for a status the
+        // reviewer had no grounds to give.
         let text = block(
             "rv-1-2",
             r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"resolved"}]}"#,
         );
         let a = assess_turn("s", 2, "rv-1-2", &text, Some(prior_state.clone()));
+        assert!(a.is_structured(), "an omission is not a degraded turn");
+        assert!(plan_repair(&a, 1, false).is_none(), "nothing to repair");
+
+        // An id the ledger never issued still is a failure, and the repair names it.
+        let text = block(
+            "rv-1-2",
+            r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"open"},{"id":"f2","status":"open"},{"id":"f9","status":"open"}]}"#,
+        );
+        let a = assess_turn("s", 2, "rv-1-2", &text, Some(prior_state.clone()));
         let request = plan_repair(&a, 1, false).expect("repairable");
         assert!(
-            request.corrective.contains("`f2`"),
+            request.corrective.contains("`f9`"),
             "{}",
             request.corrective
         );
-        // The digest goes with it, so total accounting is restated against the same ids the
-        // reconciliation will check.
+        // The digest goes with the repair, so the retry is checked against the same ids.
         let digest = request
             .prior_digest
             .expect("a resumed turn carries a digest");
         assert!(digest.contains("f1") && digest.contains("f2"));
 
-        // An id the ledger never issued.
+        // So is a duplicate.
         let text = block(
             "rv-1-2",
-            r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"open"},{"id":"f2","status":"open"},{"id":"f9","status":"open"}]}"#,
+            r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"open"},{"id":"f1","status":"open"}]}"#,
         );
         let a = assess_turn("s", 2, "rv-1-2", &text, Some(prior_state));
         assert!(plan_repair(&a, 1, false)
             .expect("repairable")
             .corrective
-            .contains("`f9`"));
+            .contains("`f1`"));
     }
 
     #[test]

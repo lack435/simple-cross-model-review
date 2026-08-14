@@ -196,7 +196,12 @@ already exists.
   its total-accounting requirement (round-1 `f4`, `:130`). Active sections updated; the historical
   review records in both documents are left as written.
 
-No change to `src/session.rs` or `src/tools.rs`.
+**No production wiring changes in `src/session.rs` or `src/tools.rs`** — but both are touched by
+tests: `src/session.rs` gains the ledger-compatibility test that pins the deliberate
+`Status::Regressed` break (a stored `"regressed"` must load as `Invalid` and refuse the resume,
+while an otherwise-legacy ledger must still load with the new fields absent), and `src/tools.rs` has
+a `Finding` fixture updated for the two new fields. The reconciliation, session and tool call paths
+themselves are unchanged.
 
 ## Testing
 

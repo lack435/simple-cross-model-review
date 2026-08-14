@@ -6,7 +6,7 @@ Status: **planned.** This document is the plan. It goes through this repository'
 Tracks issue #40. The issue asks for a machine-readable envelope so that an
 autonomous "re-review until converged" loop stops re-deriving structure the tool could
 provide: a top-level verdict, an `open_count`, stable finding IDs carried across a resumed
-session, and per-finding status (resolved / open / regressed) on a re-review.
+session, and per-finding status (resolved / open) on a re-review.
 
 > **Review history.** Twenty-two rounds against this repository's own gate (the 22nd returned APPROVE) (Codex, gpt-5.6-luna,
 > effort=max), each REQUEST CHANGES, each finding accepted and none disputed: round 1 (seven
@@ -34,6 +34,23 @@ session, and per-finding status (resolved / open / regressed) on a re-review.
 > block-as-sole-machine-source contract, bounded growth with atomic over-cap persistence and
 > deterministic reason precedence, and a discriminated running/completed `outputSchema` — were
 > rewritten rather than patched. This document reflects the post-round-6 design.
+
+> **⚠ Amended by issue #62 — two rules in this document no longer hold.**
+> See [`stale-open-findings-fix.md`](stale-open-findings-fix.md) for the change and its reasoning.
+>
+> 1. **Total accounting is gone.** `prior_findings` no longer carries a status for every prior id
+>    exactly once. It carries the **open** findings the reviewer re-examined this turn, and an
+>    omitted id is **carried unchanged rather than degrading the turn**. `ReconcileError::MissingId`
+>    no longer exists. `Finding` gains `last_verified_turn`, stamped from presence in the block.
+> 2. **A resolution is terminal, and `Status::Regressed` is deleted.** A resolved finding is closed,
+>    is not restatable (`UnknownId` if it reappears), and never reopens. A recurrence is a **new**
+>    finding optionally carrying `regression_of`.
+>
+> Decision 2 and the outcome truth table below carry the amendment inline. **Everything under
+> "Round N response" is a historical record and is deliberately left as written** — including the
+> round-2 argument for total accounting, which was correct about the hole it named and wrong about
+> the cost of closing it that way. Where this document still describes `regressed` or total
+> accounting outside those historical sections, this banner governs.
 
 ## Problem
 
@@ -85,8 +102,11 @@ convergence is `open_count == 0`" that was a round-2 self-contradiction and is n
 - the reviewer emitted exactly one valid, well-formed machine block this turn
   (`structured == true`), and
 - the session's finding ledger is present and readable at a compatible version, and
-- reconciliation completed without any fail-closed condition (below: unknown/duplicate id, a
-  schema violation, **or any prior id the reviewer failed to account for**), and
+- reconciliation completed without any fail-closed condition (below: an unknown or
+  already-resolved id, a duplicate id, or a schema violation). **A prior id the reviewer did not
+  restate is not one of them** (issue #62) — it is carried unchanged, and if it was open it stays
+  open, which blocks the next clause on its own. Omission needs no fail-closed condition to be safe,
+  because the carried status already does the work, and
 - every finding in the ledger has `status == resolved`, so `open_count == 0`, and
 - the reviewer's own `verdict_detail` is exactly `approve` — not `approve_with_comments`, not
   `request_changes`, not `blocked`. The reviewer's own top-level judgement must itself be a
@@ -210,9 +230,9 @@ the `## Findings` markdown.
 **The block contract is rendered on every turn, not once.** Round 3 caught a real bug in the
 round-2 draft: it put the block instructions in the *preamble*, which `src/prompt.rs` emits only
 on turn 1 (`resumed == false`). But the block must be emitted on *every* turn, the per-review
-nonce (Decision 4) *changes* every turn, and the "account for every prior id exactly once"
-contract (Decision 2) only exists *on* resumed turns — so the full block contract (current
-nonce, the two-array schema, exactly-one-block, total id accounting) is part of the **per-turn
+nonce (Decision 4) *changes* every turn, and the prior-findings contract (Decision 2) only exists
+*on* resumed turns — so the full block contract (current nonce, the two-array schema,
+exactly-one-block, and the restatement rules) is part of the **per-turn
 request section that renders on turn 1 and every resume alike**, not the once-only preamble. The
 role-setting preamble stays turn-1-only; the machine-block instructions do not.
 
@@ -279,17 +299,34 @@ The server keeps a **per-session findings ledger**, persisted in the session rec
 the existing resume state. Each ledger entry is **server-owned and immutable once created**:
 a stable id (`f1`, `f2`, … monotonic per session, never reused), the severity / title /
 location / `detail` **as captured on the turn it was first raised**, its current status, and
-the turns it was first and last seen on. The reviewer never rewrites any of those fields; it
-can only move a finding's *status*, and only for an id the server already owns.
+three turn stamps. The reviewer never rewrites any of the content fields; it can only move a
+finding's *status*, and only for an id the server already owns and has not resolved.
+
+The three stamps are distinct on purpose, and two of them move for different reasons:
+
+- **`first_seen_turn`** — the turn the id was minted. Never moves.
+- **`last_status_change_turn`** — the last turn the status actually *moved*. A re-examination that
+  leaves a finding open does **not** touch it, so it remains the record of when the state last
+  changed. (Issue #62 proposed re-stamping it every turn; that would have destroyed the only signal
+  it carries while changing no behaviour.)
+- **`last_verified_turn`** — the last turn the reviewer re-examined the finding, which **does** move
+  on a restatement that leaves the status unchanged. The server derives it from whether the id
+  appeared in `prior_findings` at all, so it records that the reviewer looked rather than that it
+  said so. Comparing it against the envelope's `turn` is how a caller distinguishes a finding that
+  was re-checked from one that was carried.
 
 The reviewer's block is therefore split into **two disjoint arrays**:
 
-- **`prior_findings`** — objects of exactly `{ "id": "f3", "status": "resolved" | "open" |
-  "regressed" }`. Status only. No title, no detail, no severity: the server already holds
-  those and renders its own copy. A `prior_findings` entry can carry *no* other field.
-- **`new_findings`** — objects of `{ "severity", "title", "file", "line?", "detail" }`, with
-  **no `status` field at all**. Every new finding is forced `open` by the server on creation.
-  The schema does not give a new finding anywhere to claim it is already resolved.
+- **`prior_findings`** — objects of exactly `{ "id": "f3", "status": "resolved" | "open" }`, for
+  the currently-open findings the reviewer re-examined this turn. Status only. No title, no detail,
+  no severity: the server already holds those and renders its own copy. A `prior_findings` entry can
+  carry *no* other field. (Issue #62: this list is no longer required to be exhaustive, and
+  `"regressed"` is no longer a status.)
+- **`new_findings`** — objects of `{ "severity", "title", "file", "line?", "detail",
+  "regression_of?" }`, with **no `status` field at all**. Every new finding is forced `open` by the
+  server on creation. The schema does not give a new finding anywhere to claim it is already
+  resolved. `regression_of` names a *closed* finding this one recurs from — advisory provenance,
+  dropped silently when it does not name a resolved id this ledger issued.
 
 Reconciliation, deterministic and fail-closed:
 
@@ -297,33 +334,51 @@ Reconciliation, deterministic and fail-closed:
 `new_findings` in block order, records them `open`, returns them.
 
 **Turn N (resumed session).** The server already holds the ledger. Before the review it
-injects into the prompt **every ledger finding that has ever been raised — open *and*
-resolved** — as `id`, `title`, `location`, `severity`, and current status, rendered as quoted
-evidence (see Decision 4). Resolved findings are included precisely so a regression can be
-reported as `f1: regressed` rather than being forced to appear as an unrelated new finding —
-round 1 caught that the earlier "inject only open findings" draft made the `regressed` status
-unreachable for anything already resolved. After the review, the server reconciles:
+injects into the prompt **every open finding** as `id`, `title`, `location`, `severity`, current
+status and the turn it was last re-examined, plus **every resolved finding as a one-line cue** —
+`id`, `title` and location, with no status and nothing to report — rendered as quoted evidence
+(see Decision 4). After the review, the server reconciles:
 
-- **`prior_findings` must account for every id the ledger owns — open *and* resolved — exactly
-  once.** This is the round-2 fix, and it is load-bearing. An earlier draft flagged only omitted
-  *open* findings and let omitted resolved ones keep `resolved` silently; that left a hole where
-  a finding regressed but unmentioned would keep every ledger entry resolved, the block would
-  validate, and `converged` could go true. So the contract is total: the resumed reviewer is
-  handed the full id list and must return a status for **each** one. A single missing id, or one
-  extra id the ledger never issued, or any id twice, degrades the whole turn (below). There is
-  no "the reviewer stayed silent on `f1`" path any more — silence on any id is a degraded turn,
-  never an implied status.
+> **Amended by the fix for issue #62** ([`stale-open-findings-fix.md`](stale-open-findings-fix.md)).
+> The three bullets below replace an exact-set accounting rule under which `prior_findings` had to
+> carry a status for **every** id the ledger owned, open and resolved, exactly once, and any
+> omission degraded the whole turn. The original reasoning is preserved in this document's review
+> history and was correct about the hole it named; what it missed is that the rule *manufactured*
+> the defect issue #62 reports. Requiring a status for a finding the reviewer had not re-examined
+> meant the cheapest way to comply was to echo the digest, and the server recorded that echo as a
+> judgement it could not distinguish from a real one.
+>
+> The hole the total rule guarded — a regression going unmentioned while every entry stayed
+> `resolved`, letting `converged` go true — is now closed at the other end, by terminal resolution:
+> a resolved finding cannot reopen at all, so there is no silent path back to `open` to guard. And
+> silence about an *open* finding carries it forward as open, which blocks convergence. Both
+> directions of the old hazard now fail safe, so the demand that created the ambiguity was removed
+> rather than policed.
+
+- **`prior_findings` carries the open findings the reviewer re-examined this turn, and only
+  those.** Each id at most once. **An omitted id is carried unchanged** — same status, same
+  content — because a restatement is a claim and the protocol no longer demands one the reviewer
+  may have no grounds for. An extra id the ledger never issued, an id it has already resolved, or
+  any id twice still degrades the whole turn (below).
+- **A restatement stamps `last_verified_turn` with the current turn.** It is derived from presence
+  in the block, never self-reported, so it records that the reviewer looked rather than that it
+  said it looked. A finding whose `last_verified_turn` trails the envelope's `turn` was carried,
+  which is precisely the distinction #62 could not draw. `last_status_change_turn` is untouched by
+  a re-examination that does not move the status.
+- **A resolution is terminal.** A resolved finding is closed: it is not restatable, `UnknownId` if
+  it reappears, and there is no `regressed` status. A defect seen again after a resolution is a
+  **new** finding, optionally carrying `regression_of` naming the closed id — advisory provenance,
+  kept only when it names a finding this ledger issued and resolved, dropped silently otherwise.
 - **Each `prior_findings` entry's** status is applied to its ledger entry; the entry's content
-  is untouched. A resolved entry the reviewer now reports `regressed` reopens under its original
-  id (this is why the digest includes resolved findings — round 1).
+  is untouched.
 - **`new_findings`** get fresh monotonic ids, `status: open`, and are appended.
 - **Fail-closed conditions that degrade the *entire* turn** (→ `structured: false`, and — being a
   degraded turn — a coverage break to `needs_rebaseline`/`legacy_uncovered` reported as
   `non_convergence_reason: ledger_unavailable` **when the on-disk break is persisted (this turn's, or
   an already-broken session), else `turn_not_durable`** — see Decision 3, the coverage rule, and the
-  persistence-first rule): the set of
-  ids in `prior_findings` is not *exactly* the ledger's id set (a missing id, an extra/unknown id,
-  or any duplicate); a `prior_findings` object carrying any field other than `id`/`status`; a
+  persistence-first rule): an id in `prior_findings` that the ledger never issued or has already
+  resolved, or any id twice (an *omitted* id is not a failure — see the amendment above);
+  a `prior_findings` object carrying any field other than `id`/`status`; a
   `new_findings` object carrying a `status`; any enum out of range. The block is trusted as a whole
   or not at all — a block the server had to *partially* discard is a block it cannot reason about,
   and round 1 was right that "ignore the bad entry with a warning" is exactly how a serious finding
@@ -521,12 +576,13 @@ must not break the prose channel anything already depends on:
     {
       "id": "f1",
       "severity": "minor",       // "critical" | "major" | "minor"
-      "status": "resolved",      // "open" | "resolved" | "regressed"
+      "status": "resolved",      // "open" | "resolved" — a resolution is terminal
       "title": "Missing rustdoc on the public refresh API",
       "file": "src/auth/mod.rs",
       "detail": "<the reviewer's prose for this finding, as first captured>",
       "first_seen_turn": 1,      // turn the id was minted
-      "last_status_change_turn": 2   // last turn the status changed (here: resolved on turn 2). NOT "last reported" — total-accounting reports every id every turn
+      "last_status_change_turn": 2,  // last turn the status changed (here: resolved on turn 2). NOT "last reported"
+      "last_verified_turn": 2        // last turn the reviewer re-examined it; behind `turn` means it was carried, not checked
     },
     {
       "id": "f2",
@@ -582,17 +638,23 @@ Notes on the shape:
   WITH COMMENTS / REQUEST CHANGES / BLOCKED`) so nuance is not lost — a reviewer can
   approve-with-comments and the loop still sees the `minor`s in the findings list. See the
   [verdict truth table](#verdict-truth-table) for the complete mapping.
-- **`open_count` is exactly `count(status != resolved)`** — i.e. `open` *and* `regressed` both
-  count (round-4 minor). Stated as a formula so an implementation cannot count only `open` and
-  report zero while a finding is `regressed`. `total_count` is `count(all findings ever raised)`.
+- **`open_count` is exactly `count(status != resolved)`.** Stated as a formula rather than as a
+  count of one enum variant so it cannot drift from the definition. (It was written when `regressed`
+  also counted as open; with that status deleted the formula is unchanged and now has one non-open
+  variant to count.) `total_count` is `count(all findings ever raised)`, closed ones included —
+  the ledger retains every finding so `regression_of` can resolve.
 - **`open_count` / `total_count` are `null`, not `0`, when unstructured.** This is the
   round-1 fix in the wire shape itself: absence is distinguishable from zero.
-- **`first_seen_turn` / `last_status_change_turn`** (round 17): `first_seen_turn` is the turn the id
-  was minted; `last_status_change_turn` is the last turn on which the reviewer *changed* this
-  finding's status (raised, resolved, or regressed). It is deliberately **not** "last turn reported"
-  — total-accounting (Decision 2) makes the reviewer restate *every* id *every* resumed turn, so a
-  "last reported" turn would always equal the current turn and carry no information; "last status
-  change" is the useful signal (e.g. how long a finding has sat open).
+- **`first_seen_turn` / `last_status_change_turn` / `last_verified_turn`.** `first_seen_turn` is the
+  turn the id was minted. `last_status_change_turn` is the last turn on which the finding's status
+  actually *moved* — deliberately **not** "last turn reported", and deliberately not re-stamped by a
+  re-examination that leaves the status where it was, because it is the only record of when the
+  state last changed (issue #62 proposed re-stamping it every turn; that would have destroyed the
+  signal while changing nothing about the behaviour). `last_verified_turn` is the last turn the
+  reviewer re-examined the finding, derived from whether its id appeared in `prior_findings` at all.
+  Comparing it with the envelope's `turn` is how a caller tells a finding that was re-checked from
+  one that was carried — which under the old total-accounting rule was not expressible, since every
+  id was reported every turn whether or not the reviewer had looked.
 - **`ledger_coverage` and `findings_trusted` are the rebaseline discriminator** (round 11 required
   the recovery handoff; round 12 required it be a *machine* field, not just prose). In a **completed
   envelope** `ledger_coverage` is one of **four** run-reachable states — `whole_conversation` |
@@ -738,7 +800,7 @@ value.
 The current builder splits the prompt into a **turn-1-only preamble** (role, ground rules,
 "Your access") and a **per-turn request section**. Round 3's finding is that the machine-block
 contract must live in the *per-turn* section, because it is needed on every turn, its nonce
-changes every turn, and its total-accounting clause only applies on resumes. So:
+changes every turn, and its prior-findings clause only applies on resumes. So:
 
 - **The role-setting preamble stays turn-1-only**, unchanged in spirit.
 - **A new per-turn "machine block" section renders on every turn** (turn 1 and every resume): the
@@ -752,12 +814,20 @@ changes every turn, and its total-accounting clause only applies on resumes. So:
   or a verdict mismatch, is a reviewer-side contract violation. This lives in the actual per-turn
   prompt, not only in the design prose, because that contract is the only control on the
   block/prose-disagreement residual.
-- **On a resumed turn only**, that section additionally carries the **prior-findings digest** —
-  **all** prior findings, open and resolved, with their ids, as quoted evidence — and the
-  total-accounting instruction: *report a status for **every** listed id **exactly once** (not
-  only the ones you changed); a missing or extra id fails the turn.* This replaces the round-2
-  wording "each id it addresses," which round 3 correctly flagged as contradicting the exact-set
-  contract in Decision 2. New concerns go in `new_findings`.
+  **Amended for terminal resolution (issue #62):** the completeness contract exempts findings that
+  are already resolved and closed. They have no legal block entry — a resolved id in
+  `prior_findings` is `UnknownId` and `new_findings` would misreport them — so a reviewer that
+  acknowledged one in prose ("f7 remains fixed") and then tried to satisfy completeness would lose
+  its turn. The prompt states the exemption explicitly rather than leaving the two rules to collide.
+- **On a resumed turn only**, that section additionally carries the **prior-findings digest**.
+  **Amended (issue #62):** the digest is now two sections — the **open** findings in full, each
+  carrying the turn it was last re-examined, and the **closed** ones as a one-line title-and-location
+  cue with no status to report. The instruction is *report a status for the open ids you re-examined
+  this turn, each at most once; omitting an id carries it unchanged and is not an error; an id the
+  ledger never issued or has already resolved, or any id twice, fails the turn.* This replaces the
+  round-3 total-accounting wording (*"report a status for every listed id exactly once"*), which was
+  the demand that made a forced echo indistinguishable from a judgement. New concerns go in
+  `new_findings`; a recurrence of a closed finding goes there too, naming it in `regression_of`.
 
 These are new `PromptParts` inputs — the nonce, the block-contract text, and (on resume) the
 prior-findings digest — rendered after the change and before the follow-up instruction, in the
@@ -773,8 +843,9 @@ Pure logic, no I/O, exhaustively unit-tested, in the spirit of `src/digest.rs`:
   malformed; enforce size/field caps; return a typed parse or a typed degradation reason.
 - **Reconciliation**: `(prior ledger, this turn's parsed block, turn number) → (new ledger,
   envelope)`, implementing Decision 2 exactly — the two-array split, immutable content, id
-  assignment, status carry-over, missing-id detection (any prior id unaccounted for → degrade), and the fail-closed conditions that
-  degrade the whole turn.
+  assignment, status carry-over, the resolved-is-closed rule, presence-driven `last_verified_turn`
+  stamping, and the fail-closed conditions that degrade the whole turn. (Issue #62 removed
+  missing-id detection: an unrestated prior id is carried, not a degradation.)
 - **Convergence + verdict resolution**: `(reviewer verdict, ledger, structured?) →
   (converged, machine verdict, warnings)`, implementing the truth table and the top-of-document
   `converged` definition.
@@ -1198,20 +1269,28 @@ make safely.
 
 ## Bounded growth and escalation outcomes
 
-Round 3's minor, which is really about not designing a slow failure. Total-accounting (Decision
-2) requires the reviewer to re-state a status for *every* prior id on *every* resumed turn, and
-resolved ids are never retired (retiring them would reopen the regression hole). So the ledger —
-and the prior-findings digest injected into each prompt — grows monotonically with the number of
-findings a long session accumulates. The existing turn ceiling (`--session-max-turns`, default
-10) bounds turns but can be set to 0 (disabled), and it does not bound *findings*. Left
-unbounded, a very long session would eventually push the digest past context/output limits and
-degrade every turn from then on — a session that can never converge and never says why.
+Round 3's minor, which is really about not designing a slow failure. Resolved ids are never
+retired from the ledger, so it grows monotonically with the number of findings a long session
+accumulates. The existing turn ceiling (`--session-max-turns`, default 10) bounds turns but can be
+set to 0 (disabled), and it does not bound *findings*. Left unbounded, a very long session would
+eventually push the digest past context/output limits and degrade every turn from then on — a
+session that can never converge and never says why.
+
+> **Amended (issue #62).** This section was written when total accounting required a status for
+> *every* prior id on *every* resumed turn, which made the injected digest and the retained ledger
+> the same thing growing at the same rate. They are now different things: a resolved finding is
+> retained in full but appears in the prompt as a one-line cue with no status to report, so **what
+> the reviewer must act on each turn shrinks as work is done** while the record still grows. The
+> bound below is therefore split rather than removed — `max_digest_bytes` measures the rendered
+> digest (`Ledger::digest_bytes`, which now renders it rather than serializing the whole ledger to
+> approximate it), and `max_findings` bounds the retained record. Both still exist, both are still
+> non-disableable, and the slow-failure argument below is unchanged.
 
 So the ledger and digest are **explicitly bounded, and the bound is an escalation, not a silent
 degradation**:
 
 - The reconciler enforces a **maximum ledger size with a finite, non-disableable default**
-  (round-4 guidance): **serialized digest bytes are the primary budget, finding count a secondary
+  (round-4 guidance): **rendered digest bytes are the primary budget, finding count a secondary
   guard**. It is finite by default and — unlike `--session-max-turns` — cannot be set to 0, because
   disabling it reinstates exactly the slow-failure mode it exists to prevent. A CLI knob may raise
   or lower it (`--max-findings` / a digest-byte budget), but not switch it off.
@@ -1280,9 +1359,11 @@ degradation**:
   is `open_findings`/`verdict_contradiction`, re-review; otherwise stop and escalate," and the
   reason field is what makes that expressible without string-matching.
 
-This is the honest counterpart to total-accounting: it is the safe choice for correctness, and
-its cost (an unbounded id list) is bounded here rather than allowed to become a slow, silent
-failure.
+This is the honest counterpart to a growing ledger: it is the safe choice for correctness, and its
+cost (an unbounded id list) is bounded here rather than allowed to become a slow, silent failure.
+Issue #62 reduced that cost without removing the bound — the digest now carries closed findings as a
+one-line cue rather than as restatable entries, so what the reviewer must *act on* each turn shrinks
+as work is done, while `Budget::max_findings` still bounds what is *retained*.
 
 ## What deliberately does not change
 
@@ -1312,14 +1393,15 @@ structured contract**, and is not overclaimed beyond it.
 | Reviewer emits no block | `structured:false`, `open_count:null`, `converged:false`, verdict `unknown` + warning; prose returned in full. Being a degraded turn it breaks coverage → `ledger_unavailable` when the on-disk break is persisted (this turn's, or already-broken session); `turn_not_durable` only if it entered `whole_conversation`/`unestablished` and its own write failed (persistence-first rule); both escalate → rebaseline (below). |
 | Reviewer emits more than one block | Fail-closed ambiguity → degrade as above; the server does not pick one. |
 | Block present but invalid JSON / wrong schema / over size cap | Degrade as above; the block is not partially trusted. |
-| `prior_findings` names an id the ledger never issued | Whole-turn degrade + warning; the reviewer cannot mint identity. |
+| `prior_findings` names an id the ledger never issued, **or one it has already resolved** | Whole-turn degrade + warning; the reviewer cannot mint identity, and a closed finding is as unowned as one that never existed. |
 | Same id twice in `prior_findings` | Whole-turn degrade + warning. |
 | `new_findings` object carries a `status` field | Whole-turn degrade + warning; new findings are server-forced `open`. |
 | Reviewer says `approve` but ledger has open findings | Machine verdict `changes`, `converged:false`, warning names the disagreement. |
 | Reviewer says `request_changes` with zero open | Machine verdict `changes`, `converged:false`, `verdict_contradiction`; uncertainty never converges. |
 | Reviewer says `blocked` (any open count) | Machine verdict `changes`, `converged:false`, `reviewer_blocked` — a **human-escalation** outcome, not re-review-and-hope. |
-| Prior id the reviewer failed to account for | Whole-turn degrade; every prior id must appear exactly once — silence on any id is never an implied status. Being a degraded turn it also breaks coverage → `ledger_unavailable` when the on-disk break is persisted (this turn's, or already-broken session); `turn_not_durable` only if it entered `whole_conversation`/`unestablished` and its own write fails (persistence-first rule). |
-| Regression of a previously resolved finding | Reviewer sends `f1: regressed` (resolved findings are in the injected digest, which lists every prior id); `f1` reopens, no new id. |
+| Prior open id the reviewer did not restate | **Carried unchanged, and not an error** (issue #62). Its `last_verified_turn` stays where it was, so the caller can see it was carried rather than re-checked; being still open it continues to block convergence. This row previously read "whole-turn degrade; every prior id must appear exactly once" — see the amendment under Decision 2 for why that demand was the defect rather than the safeguard. |
+| Prior open id the reviewer did restate | Status applied; `last_verified_turn` stamped with this turn from the fact of its presence, never from a self-report. |
+| Regression of a previously resolved finding | A **new** finding with a new id, optionally carrying `regression_of: "f1"`. Resolved findings appear in the digest as a one-line cue so the reviewer can recognise and name one; the reference is advisory and dropped silently if it does not name a resolved id. `f1` itself never reopens — there is no `regressed` status. |
 | One ledger *record* incompatible/undeserializable, store otherwise valid | Field-level tolerant load keeps the store and other sessions intact, but *this* session's ledger is unreadable → it is `invalid` → a **`SESSION_NOT_RESUMABLE` resume refusal** (pre-model, carrying `ledger_unavailable` as detail), **not** a completed envelope; record preserved, **not** reset to a fresh zero-open ledger (round 17). |
 | The whole `sessions.json` store fails to parse | Tri-state load returns `invalid`, **not** empty: **all reviews refused before the model call** (resume *and* `fresh`) as a `SESSION_NOT_RESUMABLE`-class refusal with `state_corrupt` detail — **no one-shot review, no completed envelope** (round 21); corrupt file preserved, operator told; never silently a clean fresh conversation. |
 | New session, or `fresh: true` **on a valid store** | `ledger_coverage = whole_conversation`, covers the conversation from turn 1 → convergeable normally (even with zero findings). `fresh` heals a poisoned *record* by resetting **all** durable non-convergent state — stale sidecar, `ledger_coverage` (`invalid`/`legacy_uncovered`/`needs_rebaseline`), **and `terminal_reason=ledger_too_large`** — in a valid store (round-9 minor #3). |
@@ -1372,8 +1454,14 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
 - **`src/findings.rs` unit tests** — extraction (one clean block bearing the review nonce; a
   block among other fences and quoted examples; a block with a *stale/foreign* nonce → not
   matched; zero blocks; two blocks → degrade; unterminated block; over-cap field);
-  reconciliation (turn-1 assignment; resolve; still-open; regressed-from-resolved; new finding
-  mid-session; **a prior id the reviewer omitted → whole-turn degrade**; unknown-id → degrade;
+  reconciliation (turn-1 assignment; resolve; still-open; new finding
+  mid-session; **a prior id the reviewer omitted → carried unchanged, turn still structured**
+  (issue #62 — this line previously required the opposite, a whole-turn degrade); an empty
+  `prior_findings` carries everything and cannot converge; **a resolved id restated → `UnknownId`**
+  whatever status it claims; `regression_of` kept for a closed id and dropped for an open,
+  unissued or absent one; `last_verified_turn` stamped on restatement and on mint but not on an
+  omission, while `last_status_change_turn` survives a status-preserving re-examination; the
+  digest's open/closed split; unknown-id → degrade;
   duplicate-id → degrade; `new_findings` with a status → degrade; monotonic non-reuse of ids
   across many turns); convergence + verdict (every row of the truth table; approve-with-open
   contradiction → `verdict_contradiction`; request-changes-with-none → `verdict_contradiction`;
@@ -1383,7 +1471,8 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   ledger_unavailable` **when the on-disk break is persisted (this turn's, or an already-broken
   session), else `turn_not_durable`** (entered `whole_conversation`/`unestablished`, own write
   failed — both tested; never `unstructured`, internal-only, round-8/round-15/round-19)); **`open_count`
-  counts a `regressed` finding** (`count(status != resolved)`, round-4 minor); **reason precedence**
+  is `count(status != resolved)`** as a formula rather than a count of one variant (round-4 minor;
+  it was written when `regressed` also counted); **reason precedence**
   (a `legacy_uncovered` session with open findings reports `ledger_unavailable`, not
   `open_findings`; `reviewer_blocked` outranks `verdict_contradiction`); **a zero-open but
   over-budget turn does *not* converge** (round-6 major #1: `ledger_too_large` is in the conjunction).

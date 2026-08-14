@@ -56,13 +56,13 @@ pub struct PromptParts<'a> {
     pub resumed_capture_note: Option<&'a str>,
     /// This review's nonce (derived from the review id). When `Some`, the machine-readable
     /// findings-block contract is rendered on **every** turn, carrying this nonce, so the reviewer
-    /// emits exactly the block the server extracts. The nonce changes each turn, and the total-
-    /// accounting clause only applies on resumes, so this lives in the per-turn section rather than
-    /// the turn-1-only preamble.
+    /// emits exactly the block the server extracts. The nonce changes each turn, and the
+    /// prior-findings clause only applies on resumes, so this lives in the per-turn section rather
+    /// than the turn-1-only preamble.
     pub nonce: Option<&'a str>,
-    /// The prior-findings digest (all prior ids with status and location as quoted evidence),
-    /// rendered inside the machine-block section only on a resumed turn. Built by the caller from
-    /// the persisted ledger; `None` on a first turn (there is nothing prior to account for).
+    /// The prior-findings digest, rendered inside the machine-block section only on a resumed turn:
+    /// the open findings with status, location and last-re-examined turn, then the resolved ones as
+    /// a one-line cue. Built by the caller from the persisted ledger; `None` on a first turn.
     pub prior_findings_digest: Option<&'a str>,
     /// Set only when the reviewer runs from a neutral working directory (see
     /// `claude_neutral_target`): its process cwd is *not* this project, so relative paths would
@@ -151,7 +151,7 @@ pub fn build(parts: &PromptParts) -> String {
     }
 
     // The machine-readable findings-block contract is rendered on every turn (the nonce changes
-    // each turn and the total-accounting clause only applies on resumes), after the change/context
+    // each turn and the prior-findings clause only applies on resumes), after the change/context
     // and before the closing follow-up instruction — so the last thing the reviewer reads is what
     // to do, and the block contract is fresh in view when it writes it.
     if let Some(nonce) = parts.nonce {
@@ -205,10 +205,18 @@ pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -
 }
 
 /// The machine-readable findings-block contract, carrying this turn's `nonce`. On a resumed turn the
-/// caller supplies `digest` — the prior findings the reviewer must account for — and this appends
-/// the total-accounting instruction. The block is declared the sole machine-authoritative source of
-/// findings, so the reviewer's prose and block cannot silently disagree (a control, not a guarantee:
-/// the server cannot detect a violation without re-introducing a prose parser).
+/// caller supplies `digest` — the open findings the reviewer *may* re-examine, plus the closed ones
+/// as a recurrence cue — and this appends the restatement instruction.
+///
+/// The reviewer is **not** required to account for every id in that digest: restating one is a claim
+/// that it looked, so an omitted id is carried unchanged rather than failing the turn (issue #62).
+/// Do not restore an exact-set demand here; it is what made a forced echo indistinguishable from a
+/// judgement.
+///
+/// The block is declared the sole machine-authoritative source of findings, so the reviewer's prose
+/// and block cannot silently disagree (a control, not a guarantee: the server cannot detect a
+/// violation without re-introducing a prose parser). That completeness rule exempts closed findings,
+/// which have no legal block entry at all.
 fn machine_block_section(nonce: &str, digest: Option<&str>) -> String {
     let (begin, end) = crate::findings::reviewer_block_markers(nonce);
     let mut s = String::new();
@@ -228,25 +236,33 @@ fn machine_block_section(nonce: &str, digest: Option<&str>) -> String {
         "- `\"new_findings\"`: an array of findings you are raising for the FIRST time this turn. \
          Each is `{\"severity\": \"critical\"|\"major\"|\"minor\", \"title\": <short title>, \
          \"file\": <path, optional>, \"line\": <number, optional>, \"detail\": <your prose for this \
-         finding>}`. Do NOT include an `id` or a `status`: the server assigns ids and every new \
-         finding starts open.\n",
+         finding>, \"regression_of\": <id, optional>}`. Do NOT include an `id` or a `status`: the \
+         server assigns ids and every new finding starts open. Use `\"regression_of\"` when what you \
+         are raising is a recurrence of a finding already resolved in this session, naming that \
+         finding's id — a resolved finding is closed and never reopens, so a recurrence is always a \
+         new finding.\n",
     );
     match digest {
         Some(digest) if !digest.trim().is_empty() => {
             s.push_str(
-                "- `\"prior_findings\"`: a status for every prior finding the server is tracking, \
-                 listed below.\n\n",
+                "- `\"prior_findings\"`: the findings listed below that you **re-examined this \
+                 turn**, with their current status.\n\n",
             );
             s.push_str(
                 "The server is tracking these findings from earlier turns by stable id:\n\n",
             );
             s.push_str(digest.trim_end());
             s.push_str(
-                "\n\nIn `\"prior_findings\"`, report a status for **every** id above, **exactly \
-                 once**, as `{\"id\": \"<id>\", \"status\": \"open\"|\"resolved\"|\"regressed\"}`. A \
-                 missing id, an extra id, or a duplicate fails the turn. Use `\"regressed\"` for a \
-                 previously-resolved finding you now see is broken again — it reopens under its \
-                 original id. Put genuinely new concerns in `\"new_findings\"`, never here.\n",
+                "\n\nIn `\"prior_findings\"`, report `{\"id\": \"<id>\", \"status\": \
+                 \"open\"|\"resolved\"}` for each open id above that you re-examined on this turn — \
+                 **only those**, and each at most once.\n\n\
+                 **Reporting a status is a claim that you looked.** Omitting an id is not an error \
+                 and does not fail the turn: it carries that finding forward exactly as recorded, \
+                 and is the correct, honest report when you did not re-examine it. Do not restate \
+                 an id merely to account for it. A short list you stand behind is worth more than a \
+                 complete one you do not, and the server records which is which.\n\n\
+                 Report `\"open\"` only for something you looked at and found still broken; say why \
+                 in your prose. Put genuinely new concerns in `\"new_findings\"`, never here.\n",
             );
         }
         _ => {
@@ -256,11 +272,20 @@ fn machine_block_section(nonce: &str, digest: Option<&str>) -> String {
             );
         }
     }
+    // The completeness rule and terminal resolution have to be reconciled explicitly. Without the
+    // exemption below they contradict each other: acknowledging a closed finding in prose ("f7
+    // remains fixed") would demand a block entry that has no legal form, since a resolved id in
+    // `prior_findings` is `UnknownId` and `new_findings` would be a lie. A reviewer resolving that
+    // contradiction the obvious way loses its whole turn -- a way to lose a review, created by the
+    // change that exists to remove one.
     s.push_str(
         "\nThis block is the **sole authoritative machine record** of your findings: every finding \
-         you mention anywhere in your prose must have a corresponding entry here, and the block's \
-         verdict must match your prose verdict. Emit exactly one block, bearing the token shown in \
-         the markers above.",
+         you mention anywhere in your prose must have a corresponding entry here — a \
+         `\"new_findings\"` entry if you are raising it, or a `\"prior_findings\"` entry if it is a \
+         currently-open finding you re-examined — and the block's verdict must match your prose \
+         verdict. **Findings already resolved and closed are the exception:** refer to them in your \
+         prose as freely as you like, and do not report a status for one. Emit exactly one block, \
+         bearing the token shown in the markers above.",
     );
     s
 }
@@ -548,8 +573,22 @@ mod tests {
             neutral_root: None,
         });
         assert!(text.contains(digest));
-        assert!(text.contains("report a status for **every** id above, **exactly once**"));
-        assert!(text.contains("regressed"));
+        // A restatement is a claim, so the contract asks only for what was re-examined and says
+        // plainly that an omission is not an error. Nothing here may re-create the total-accounting
+        // demand that caused #62.
+        assert!(text.contains("re-examined this turn"));
+        assert!(text.contains("Reporting a status is a claim that you looked."));
+        assert!(text.contains("Omitting an id is not an error"));
+        assert!(!text.contains("**every** id above"));
+        // A resolution is terminal, so there is no `regressed` status to offer; a recurrence is a
+        // new finding naming the closed id.
+        assert!(!text.contains("regressed"));
+        assert!(text.contains("regression_of"));
+        // The completeness contract must exempt closed findings, or the two rules contradict each
+        // other: a reviewer that writes "f7 remains fixed" in prose and then tries to give it a
+        // block entry has no legal way to do it -- a resolved id in `prior_findings` is
+        // `UnknownId`, and `new_findings` would be a lie -- so it would lose the whole turn.
+        assert!(text.contains("already resolved and closed are the exception"));
 
         // Without a digest (a first turn), the total-accounting instruction is absent and the
         // block asks for an empty prior_findings array.
@@ -663,15 +702,16 @@ mod repair_prompt_tests {
     }
 
     #[test]
-    fn a_resumed_repair_restates_the_digest_and_total_accounting() {
+    fn a_resumed_repair_restates_the_digest_and_the_block_contract() {
         let digest = "- f1 [major] Race (src/a.rs:1) - currently open";
         let text = block_repair(
-            "Your block did not account for id `f1`.",
+            "Your block reported a status for id `f9`, which this session's ledger never issued.",
             "rv-9-2",
             Some(digest),
         );
         assert!(text.contains(digest));
-        assert!(text.contains("report a status for **every** id above, **exactly once**"));
+        assert!(text.contains("re-examined this turn"));
+        assert!(text.contains("Omitting an id is not an error"));
     }
 
     #[test]

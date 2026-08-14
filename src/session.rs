@@ -1142,6 +1142,60 @@ mod tests {
     }
 
     #[test]
+    fn a_ledger_holding_the_deleted_regressed_status_refuses_the_resume() {
+        // Terminal resolution deleted `Status::Regressed`, and this is the one place that break is
+        // observable: a ledger written by an older build with a regressed finding fails typed
+        // deserialization and lands on `Invalid`, which refuses the resume before any model call.
+        //
+        // Deliberate, and no migration is owed -- but it costs more than a re-run, because the
+        // ledger holds the stable ids, the immutable finding content and every disposition. A
+        // refused resume means a human carries the still-open findings into a fresh session by
+        // hand. Asserted rather than discovered.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let mut rec = record(&store, "s", "thread-1");
+        rec.findings_ledger = Some(serde_json::json!({
+            "schema_version": crate::findings::LEDGER_SCHEMA_VERSION,
+            "coverage": "whole_conversation",
+            "next_seq": 2,
+            "findings": [{
+                "id": "f1",
+                "severity": "major",
+                "status": "regressed",
+                "title": "t",
+                "detail": "d",
+                "first_seen_turn": 1,
+                "last_status_change_turn": 2
+            }]
+        }));
+        assert!(matches!(rec.ledger_load(), LedgerLoad::Invalid));
+
+        // The same ledger with a status that still exists loads, and the two fields added alongside
+        // the deletion are absent rather than fatal -- so an ordinary older ledger resumes.
+        rec.findings_ledger = Some(serde_json::json!({
+            "schema_version": crate::findings::LEDGER_SCHEMA_VERSION,
+            "coverage": "whole_conversation",
+            "next_seq": 2,
+            "findings": [{
+                "id": "f1",
+                "severity": "major",
+                "status": "open",
+                "title": "t",
+                "detail": "d",
+                "first_seen_turn": 1,
+                "last_status_change_turn": 2
+            }]
+        }));
+        match rec.ledger_load() {
+            LedgerLoad::Valid(l) => {
+                assert_eq!(l.findings[0].last_verified_turn, None);
+                assert_eq!(l.findings[0].regression_of, None);
+            }
+            other => panic!("expected a valid legacy ledger, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn first_turn_creates_the_session() {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
