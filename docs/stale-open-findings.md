@@ -1,18 +1,18 @@
 # Stale `open` findings on a resumed session — design
 
-Status: **proposal, revision 5 — paused pending measurement.** Filed against issue #62 ("Resumed
-review session freezes findings at a stale `open` status (ledger not re-evaluated)"). It was paused
-behind #73; #73 has landed, and what it left is a question to measure before this is built at all —
-see [What #73 changed](#what-73-changed).
+Status: **proposal, revision 5 — paused.** Filed against issue #62 ("Resumed review session freezes
+findings at a stale `open` status (ledger not re-evaluated)").
 
-**Three things to know before picking this up.** Revisions 1–4 were reviewed through this
+**Why it is paused, in one line: the design was over-engineering itself, and stopping was the
+correction.** Not a dependency, not a blocked prerequisite — the plan was growing a schema bump, a
+migration and a compatibility type to fix a reviewer that restates `open` without looking. Revision
+5 is the cut-back. Read the blockquote below before anything else in this file; it is the point.
+
+**Two more things to know before picking this up.** Revisions 1–4 were reviewed through this
 repository's own gate over six rounds; **revision 5 has not been reviewed at its current size**,
 because it is strictly a subset of what those rounds covered — do not read the history below as
-approval of what is specified now. This plan **re-scopes #62 rather than closing it**: see
+approval of what is specified now. And this plan **re-scopes #62 rather than closing it**: see
 [What this does not do](#what-this-does-not-do), and the comment on the issue proposing the split.
-And **the thing this plan said to do first has since been done** — #73 landed in
-[#76](https://github.com/lack435/simple-cross-model-review/pull/76) — which changes what is left to
-justify here; see [What #73 changed](#what-73-changed).
 
 > **This revision is deliberately much smaller than the four before it, and the reason is worth
 > recording because it is a lesson about the process rather than the problem.**
@@ -64,39 +64,64 @@ line of prose. A reviewer that holds a finding open *and explains why* was indis
 one that froze it silently, so some unknown share of #62 was an unread explanation rather than an
 absent one. That was the reason to do #73 first, and
 [#76](https://github.com/lack435/simple-cross-model-review/pull/76) did it. See
-[What #73 changed](#what-73-changed) for what that leaves.
+[What has changed since the pause](#what-has-changed-since-the-pause-and-the-smaller-option-it-opens)
+for what that leaves — including a step smaller than anything specified below.
 
-## What #73 changed
+## What has changed since the pause, and the smaller option it opens
 
-#76 made `review_prose` unconditional on every turn that ran — attachment is enforced by
-construction rather than by a condition, so `null` now means exactly "no reviewer ran" — and carried
-`captured`, `denials`, `resumable` and the merged `warnings` onto the structured channel beside it.
-A caller reading `structuredContent` alone can now read why a reviewer is holding a finding open, if
-the reviewer said.
+#73 landed in [#76](https://github.com/lack435/simple-cross-model-review/pull/76). `review_prose` is
+now unconditional on every turn that ran — attachment is enforced by construction, so `null` means
+exactly "no reviewer ran" — with `captured`, `denials`, `resumable` and the merged `warnings` beside
+it. A caller reading `structuredContent` alone can now read why a reviewer is holding a finding
+open, if the reviewer said.
 
-That does not resolve what this plan addresses, and it does not leave it untouched:
+This plan named #73 as the better thing to do first. It has been done, and it does not close the
+gap: prose is a place a reviewer *may* explain itself, `basis` is a question it *has* to answer.
+But it changes the size of the gap from unknown-but-large to **unmeasured** — the case for revision
+5 was written for a caller who could not read a held finding's explanation at all, and that caller
+no longer exists.
 
-- **Still not answered.** Prose is unstructured and optional in practice. A reviewer that carries a
-  finding without re-examining it has no reason to volunteer that, and nothing in the prose channel
-  makes the omission visible. `basis` is a question the reviewer has to answer; prose is a place it
-  may answer. That is the whole gap this plan claims.
-- **The size of the problem is now unmeasured rather than unknown-but-large.** The argument for
-  revision 5 was written when the caller could not read a held finding's explanation at all. It can
-  now. How much of #62 that removes is an empirical question with no data yet.
+That reopens a question the pause was about, and it deserves the counterweight rather than another
+round of design:
 
-**And there is no data yet because the fix is not running.** `dist\cross-review.exe` was staged
-2026-08-13 15:14; the #73 fix was committed 21:49 the same day. Both MCP configs point at `dist\`,
-so **every review either direction has run through a pre-#73 binary**, including the review of #73's
-own implementation. Restaging needs open agent sessions unloaded first (`build.ps1` reports the
-blocking PIDs).
+> **Revision 5 is the cut-back from revisions 1–4. It has never been asked whether it is itself
+> proportionate.**
 
-So the next step for this plan is not to build it. It is to **restage `dist\` and let the next few
-real gate reviews run through the repaired channel**, then decide whether a reviewer that now
-explains itself in readable prose still needs to be asked `rechecked` or `carried` — and if it does,
-whether the answer is worth a protocol field. Deciding that from the pre-#73 evidence would be
-answering a question about a system that no longer exists.
+Applying the test from [`AGENTS.md`](../AGENTS.md), "How much rigor, and where":
 
-## The change
+- **What is the blast radius?** A finding held open when it should not be **blocks** an approval; it
+  does not produce a false one. By that document's own division, this is the cheap side of the line
+  — a review that is lost and re-run. The one branch that points the other way is a finding
+  *resolved* without a re-check, and revision 5's answer there is a warning the reviewer can satisfy
+  by relabelling, which this document already concedes.
+- **What does the machinery cost?** Two protocol fields, two ledger fields, a `Basis` type, a
+  warning path, `output_schema` changes, eight test cases, and amendments to `README.md` and
+  `docs/structured-findings-envelope.md` — the last of which means reopening Decision 2.
+
+**So there is a smaller step that was never on the table, because #73 had not landed when these
+revisions were written: change `src/prompt.rs` and nothing else.** Ask the reviewer, on every
+restatement, to say whether it re-examined the finding and why it is still open. Post-#76 that
+answer reaches the caller as prose, on the structured channel, with no new field, no ledger change,
+no schema surface, no `output_schema` edit, no Decision 2 amendment and no new way for a turn to
+degrade. It is a prompt change and a prompt test.
+
+It buys less than revision 5: prose cannot be filtered mechanically, and a reviewer that ignores the
+request leaves no machine-readable trace. Whether that matters is exactly the thing to find out —
+and it is cheap to find out, because a prompt change that proves insufficient is deleted, while a
+protocol field that proves insufficient is a published contract.
+
+**Neither should be decided from the current evidence, because no review has run through the
+repaired channel.** `dist\cross-review.exe` was staged 2026-08-13 15:14; the #73 fix was committed
+21:49 the same day, and both MCP configs point at `dist\` — so every gate review in either
+direction, including the review of #73's own implementation, ran through a pre-#73 binary. *(The
+binary was restaged on 2026-08-14; the reviews to learn from are the ones after that.)*
+
+The recommended order is therefore: **let a few real gate reviews run post-restage; then the prompt
+change if the reviewers are not volunteering their basis; then this plan, if the prompt change
+demonstrably is not enough.** Each step is only taken when the one before it has failed to be
+sufficient, which is the opposite of how revisions 1–4 were arrived at.
+
+## The change, if it is still wanted
 
 Three optional fields and a warning. No new failure mode, no schema version bump, no migration.
 
