@@ -243,7 +243,12 @@ try {
         'the reviewer CLI is missing or not signed in; the rest of the smoke test cannot run'
     if ($Reviewer -eq 'codex') {
         Assert-That 'Codex evidence handshake is ready' `
-            ($statusText -match 'evidence:\s+ready \(schema 1, 7 read-only tools; no-model handshake passed\)') `
+            ($statusText -match 'evidence:\s+ready \(schema 2, 7 read-only tools; no-model handshake passed;') `
+            $statusText
+        # A tree too large to scan no longer refuses the review (issue #86), so "ready" alone no
+        # longer says drift is being tracked. This checkout is small, so it must be.
+        Assert-That 'drift tracking is reported and available here' `
+            ($statusText -match 'drift tracking: on \(') `
             $statusText
     }
 

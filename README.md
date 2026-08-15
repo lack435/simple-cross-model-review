@@ -263,13 +263,31 @@ For an isolated Codex review, the capture is immutable evidence paged through
 runs from a sterile non-repository directory. Claude has a usable shell only when `--tools`
 puts Bash in the session *and* `--allow-tools` permits it. `--allow-reviewer-config` is the
 explicit Codex opt-out: it keeps the reviewed repository as process cwd and restores the
-old `auto` self-serve decision.
+old `auto` self-serve decision. It does **not** disable the evidence service, which stays
+required in both modes.
 
 The Codex evidence server also exposes `repository_scope`, `repository_list`, literal
 `repository_search`, numbered/digested `repository_read`, and bounded Git-only
 `repository_history`/`repository_revision` (the last two return `unsupported` for Perforce).
 Paths are repository-relative, absolute/parent/device/ADS paths are rejected, and traversal
 does not follow symlinks or junctions. Results carry completeness and pagination state.
+
+The recursive scans — the drift stamp and a directory search — cover what Git reports as
+tracked (submodule contents included) or untracked-and-not-ignored, rather than everything on
+disk. A repository can hold hundreds of thousands of ignored files that are not reviewable
+content, and walking them used to exhaust the scan's file budget and refuse the review
+outright. Every path Git returns is put through the same component, reparse-point and
+regular-file checks the filesystem walk applies, so the narrower scan is not a weaker one.
+`repository_read` still reads any file by path, and naming a file as a search `path` searches
+it whether or not Git ignores it; `repository_scope` reports the scan's scope in words.
+
+A scan that cannot be completed no longer fails the review. `drifted` is `null` — with
+`drift_unavailable` saying why — when there is no comparable stamp, and a listing or search
+that hits its file budget truncates with `complete: false` rather than erroring. Drift is an
+advisory signal, and losing it costs less than discarding a review. `--doctor` reports whether
+drift tracking is available, so a repository that is merely large is distinguishable from a
+service that is broken. What still fails a call is a scan that *timed out*: the watchdog
+abandons its worker, so there is no partial result to hand back.
 Complete page data is returned once in `structuredContent`, with only a concise text summary;
 an envelope that still exceeds the transport cap fails that call in-band and leaves the service
 available for a smaller-page retry.

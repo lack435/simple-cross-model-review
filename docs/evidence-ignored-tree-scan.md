@@ -554,7 +554,32 @@ Then, per AGENTS.md:
   is a slightly worse outcome than today's hard failure — but only in the repositories where today
   there is no review at all.
 
-## 9. Review history
+## 9. What the implementation added
+
+Five things the design missed, found by review of the code (session `issue-86-impl`). They are
+recorded here because each one is a rule this document states, made true:
+
+- **A dropped path is not the same as a missing one.** §4.1 has the checks clear a completeness
+  flag, and §4.2 has a short enumeration yield `Unavailable` — but the stamp discarded the flag, so
+  a scan that skipped an unreadable file still produced a stamp, and search still reported
+  `complete: true`. `accept_git_paths` now distinguishes `NotFound` (an observation: the file the
+  enumeration named is gone, and the stamp records that) from any other metadata error (a hole),
+  and a stamp over a set with a hole is refused exactly as a short enumeration is.
+- **Cancellation had two escapes.** `GitFailure::Cancelled` is now its own variant, so a cancelled
+  second command cannot be salvaged into a partial "successful" enumeration, and `tree_stamp` — the
+  filesystem walk, which never had a cancellation check at all — now checks it per directory. A
+  cancelled request leaves no observation for the next one to trust.
+- **`Path::starts_with` is case-sensitive; Windows is not.** The search base filter compares a path
+  built from Git's spelling against a canonicalised base, which can differ in case for the same
+  directory, so a subdirectory search could silently return nothing. It uses `within` now.
+- **The explicit-file contract must not depend on Git.** Resolving the base after the enumeration
+  meant a Git timeout took the explicitly-named-file case down with it. The base is resolved first,
+  which costs a second walk worker for a Git-scoped directory search — `WALK_WORKER_CAP` goes from
+  2 to 3 so the "one slot of headroom for an abandoned predecessor" property is preserved.
+- **`scan_scope` must name the scan that ran**, not the one the VCS implies: a Git bundle with no
+  Git binary falls back to the walk, and would otherwise have claimed Git scoping.
+
+## 10. Review history
 
 Round 1 (`gpt-5.6-luna`, session `issue-86-plan`) requested changes with four major findings, all
 accepted:

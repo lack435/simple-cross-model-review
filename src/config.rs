@@ -1583,7 +1583,9 @@ impl Config {
             let mut out = format!(
                 "Use the read-only repository evidence tools as the primary and complete \
                  interface to this project. Start with `repository_scope` when you need scope or \
-                 drift state. Use `repository_list`, `repository_search`, and `repository_read` \
+                 drift state: it also reports which files the recursive scans cover, and a null \
+                 `drifted` there means drift could not be determined rather than that nothing \
+                 changed. Use `repository_list`, `repository_search`, and `repository_read` \
                  for the live tree. {history} Use continuation cursors whenever \
                  a result is truncated. Their paths are relative to the reviewed repository root. \
                  {shell}"
