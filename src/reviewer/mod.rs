@@ -1383,11 +1383,81 @@ fn fallback_locations(kind: ReviewerKind) -> Vec<PathBuf> {
                 out.push(a.join("npm").join("codex.cmd"));
             }
             if let Some(l) = &local {
+                // The native installer's current layout, verified against codex-cli 0.147.0 put
+                // there by `winget install OpenAI.Codex`: `...\Programs\OpenAI\Codex\bin\codex.exe`.
+                // It is listed first because it is where a current install actually lands.
+                //
+                // The shorter `...\Programs\codex\codex.exe` is kept rather than replaced. Nothing
+                // observed here says when the layout changed or whether installs on the old one are
+                // still out there, and the cost of carrying it is a single `is_file` call on a path
+                // that will not exist -- reached only once the PATH scan has already failed.
+                out.push(
+                    l.join("Programs")
+                        .join("OpenAI")
+                        .join("Codex")
+                        .join("bin")
+                        .join("codex.exe"),
+                );
                 out.push(l.join("Programs").join("codex").join("codex.exe"));
             }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod fallback_location_tests {
+    use super::*;
+
+    /// The native installer's layout moved out from under this list: `winget install OpenAI.Codex`
+    /// put codex-cli 0.147.0 at `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`, while the only
+    /// `%LOCALAPPDATA%` entry here looked for `%LOCALAPPDATA%\Programs\codex\codex.exe`.
+    ///
+    /// That is invisible whenever PATH is intact, since the installer adds its `bin` directory and
+    /// the PATH scan resolves first -- which is why it went unnoticed. It bites exactly when the
+    /// fallback list is the only thing left, such as an agent launched from a GUI shell holding a
+    /// PATH snapshot from before the install (issue #64).
+    #[test]
+    fn codex_fallbacks_cover_the_current_installer_layout_without_dropping_the_old_one() {
+        let paths = fallback_locations(ReviewerKind::Codex);
+        let current = Path::new(r"Programs\OpenAI\Codex\bin\codex.exe");
+        let legacy = Path::new(r"Programs\codex\codex.exe");
+
+        let current_at = paths
+            .iter()
+            .position(|p| p.ends_with(current))
+            .unwrap_or_else(|| panic!("current installer layout is missing from {paths:?}"));
+        // Kept deliberately: nothing observed says when the layout changed, so an install on the
+        // older one must keep resolving.
+        let legacy_at = paths
+            .iter()
+            .position(|p| p.ends_with(legacy))
+            .unwrap_or_else(|| panic!("the older layout must not be dropped: {paths:?}"));
+
+        // Order is the point, not just membership: where an install lands today is tried first.
+        assert!(
+            current_at < legacy_at,
+            "current layout must precede the older one: {paths:?}"
+        );
+    }
+
+    /// The Claude arm has no `%LOCALAPPDATA%` entry at all, and this change does not invent one --
+    /// that install layout was not observed here, and guessing at it would put an unverified path
+    /// into a list whose entries are meant to be ones somebody has actually seen.
+    #[test]
+    fn the_claude_arm_is_left_alone() {
+        let paths = fallback_locations(ReviewerKind::Claude);
+        assert!(
+            paths.iter().all(|p| !p.ends_with("codex.exe")),
+            "claude fallbacks must not name the codex binary: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with(Path::new(r".claude\local\claude.exe"))),
+            "{paths:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
