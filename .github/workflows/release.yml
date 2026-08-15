@@ -38,6 +38,34 @@ jobs:
             throw "tag $tag does not match Cargo.toml version $crate. Bump Cargo.toml, or retag."
           }
 
+      # Read before the build, not at publish time: an undeclared or misspelled channel
+      # should cost seconds, not a full release build. Unconditioned, so a workflow_dispatch
+      # dry run checks it too -- that is most of what a dry run is for.
+      - name: Release channel is declared
+        shell: pwsh
+        run: |
+          # cargo rather than a line-oriented match on Cargo.toml: the value has to come
+          # from [package.metadata.release] specifically. A regex takes the first `channel`
+          # key in the file whatever table it sits under, so an unrelated table added above
+          # this one would decide the channel -- and the failure is a prerelease published
+          # as "Latest", which is the one outcome this step exists to prevent. cargo also
+          # handles inline comments and quoting, which a naive value pattern does not.
+          $json = cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+
+          $pkg = ($json | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'cross-review' }
+          if (-not $pkg) { throw 'cargo metadata reported no cross-review package' }
+
+          $channel = $pkg.metadata.release.channel
+          if (-not $channel) {
+            throw 'Cargo.toml declares no [package.metadata.release] channel. Add channel = "prerelease" or "stable".'
+          }
+          if ($channel -notin @('prerelease', 'stable')) {
+            throw "unrecognised release channel '$channel'. Expected 'prerelease' or 'stable'."
+          }
+          Write-Host "release channel: $channel"
+          "RELEASE_CHANNEL=$channel" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # build.ps1 rather than a bare cargo invocation, deliberately: it is the single
       # definition of how this binary is built, including the --remap-path-prefix flags
       # that keep the builder's home directory out of a published artifact. It also runs
@@ -111,7 +139,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $notes = @"
+          $preamble = ''
+          if ($env:RELEASE_CHANNEL -eq 'prerelease') {
+            # Two blank lines, not one: a here-string drops the newline immediately before
+            # its terminator, and a single one leaves the next paragraph lazily continuing
+            # the blockquote -- the install instructions render inside the warning.
+            $preamble = @"
+          > **Provisional release.** Published so it can be tried out in other projects.
+          > Expect rough edges; it is not being called generally ready.
+
+
+          "@
+          }
+
+          $notes = $preamble + @"
           Windows x86_64. Single self-contained executable: no Node, no Python, no DLLs.
 
           **Install:** download ``cross-review.exe``, commit it into your project at
@@ -123,9 +164,18 @@ jobs:
 
           Built from ${{ github.sha }}.
           "@
-          gh release create '${{ github.ref_name }}' `
-            'dist\cross-review.exe' `
-            'dist\SHA256SUMS.txt' `
-            --title 'cross-review ${{ github.ref_name }}' `
-            --notes $notes `
-            --verify-tag
+
+          # Splatted rather than written inline: --prerelease has to be present or absent,
+          # and gh treats an empty string argument as a value, not as nothing.
+          $argv = @(
+            'release', 'create', '${{ github.ref_name }}',
+            'dist\cross-review.exe',
+            'dist\SHA256SUMS.txt',
+            '--title', 'cross-review ${{ github.ref_name }}',
+            '--notes', $notes,
+            '--verify-tag'
+          )
+          if ($env:RELEASE_CHANNEL -eq 'prerelease') { $argv += '--prerelease' }
+
+          gh @argv
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
