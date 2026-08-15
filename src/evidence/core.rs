@@ -1612,6 +1612,20 @@ enum Ancestor {
     Hole,
 }
 
+impl Ancestor {
+    fn of(path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if metadata_is_reparse(&meta) => Self::Hole,
+            Ok(_) => Self::Usable,
+            // A deleted directory is the same class of event as a deleted file: the enumeration
+            // named something that is gone, which the stamp records as `missing`. Collapsing it
+            // into a hole would make a removed directory produce *unavailable* drift, not drift.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Hole,
+        }
+    }
+}
+
 /// One path from Git's answer that survived every check the filesystem walk applies.
 #[derive(Debug)]
 struct Accepted {
@@ -1676,19 +1690,9 @@ fn accept_git_paths(
             current.push(component.as_os_str());
             key.push_str(&component.as_os_str().to_string_lossy());
             key.push('/');
-            let state =
-                *ancestors.entry(key.clone()).or_insert_with(|| {
-                    match fs::symlink_metadata(&current) {
-                        Ok(meta) if metadata_is_reparse(&meta) => Ancestor::Hole,
-                        Ok(_) => Ancestor::Usable,
-                        // A deleted directory is the same class of event as a deleted file: the
-                        // enumeration named something that is gone, which the stamp records as
-                        // `missing`. Collapsing it into a hole would make a removed directory produce
-                        // *unavailable* drift instead of drift.
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => Ancestor::Missing,
-                        Err(_) => Ancestor::Hole,
-                    }
-                });
+            let state = *ancestors
+                .entry(key.clone())
+                .or_insert_with(|| Ancestor::of(&current));
             match state {
                 Ancestor::Usable => {}
                 Ancestor::Missing => {
