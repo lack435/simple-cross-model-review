@@ -941,6 +941,19 @@ failure contract against the exact binary being shipped, and publishes it to the
 page with `SHA256SUMS.txt`. It refuses to publish if the tag and the `Cargo.toml` version
 disagree. `workflow_dispatch` runs everything except the publish, as a dry run.
 
+Whether a release is marked "Latest" is declared in `Cargo.toml`, not inferred from the
+tag, so an ordinary semver tag can still be published provisionally:
+
+```toml
+[package.metadata.release]
+channel = "prerelease"   # or "stable"
+```
+
+Set it in the same edit as `version`. A `prerelease` release stays off "Latest" and its
+notes carry a provisional banner. The workflow refuses to publish when the channel is
+missing or unrecognised rather than defaulting: a prerelease that reached the Releases
+page as "Latest" would be picked up by every project that vendors the binary.
+
 Released binaries report their provenance: `cross-review 0.1.0 (<commit sha>)`. A local
 build says `(local build)` rather than implying a provenance it does not have — the
 version alone cannot distinguish two builds, since it is pinned in `Cargo.toml`.

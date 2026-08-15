@@ -1,11 +1,22 @@
 [package]
 name = "cross-review"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.79"
 description = "MCP server that sends work to a different model for an independent review"
 license = "MIT"
 publish = false
+
+# Which GitHub release channel a tag cut from this commit publishes to. It lives here
+# rather than being inferred from the tag name so that a plain semver tag can still be
+# published as a prerelease, and it sits next to `version` so the two are bumped in one
+# edit. The release workflow refuses to publish when it is missing or unrecognised: a
+# prerelease that reached the Releases page as "Latest" by omission would be handed to
+# every project that vendors this binary, so the default is an error rather than a guess.
+#   "prerelease" -> published, but not marked Latest
+#   "stable"     -> published as Latest
+[package.metadata.release]
+channel = "prerelease"
 
 [[bin]]
 name = "cross-review"
