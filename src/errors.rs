@@ -124,8 +124,38 @@ pub fn profile_not_authorized(reviewer: &str, profile: &str) -> Failure {
 
 pub fn cli_not_found(reviewer: &str, tried: &[String]) -> Failure {
     let install = match reviewer {
-        "codex" => "npm install -g @openai/codex   (or install the Codex desktop app)",
+        "codex" => "npm install -g @openai/codex",
         _ => "npm install -g @anthropic-ai/claude-code",
+    };
+    // This used to offer "or install the Codex desktop app" as an alternative to the CLI. It is not
+    // one, and saying so sent a user who had the app round a loop with no exit: install the thing
+    // the error suggests, get the same error (issue #64).
+    //
+    // Observed on one machine: Windows 11 Pro 26200, package OpenAI.Codex 26.810.4967.0, desktop app
+    // installed and signed in, CLI absent. The package registered no execution alias -- its manifest
+    // declares only `ChatGPT.exe` -- so nothing reached PATH. The full `codex.exe` it bundles under
+    // `%ProgramFiles%\WindowsApps\...` returned "Access is denied" from each of the three launch
+    // mechanisms tried: the PowerShell call operator, `cmd /c`, and `Start-Process`. Two controls
+    // narrow what that denial is not. `winget.exe` ran from its own WindowsApps package directory,
+    // and the command runner the app copies to `%USERPROFILE%\.codex\.sandbox-bin` ran from there
+    // while the byte-identical copy inside the package did not. That copy is no substitute anyway:
+    // it is a pipe-driven helper with no `exec` surface.
+    //
+    // What denies the launch was not identified. ACLs (execute is granted to Users), the
+    // Authenticode signature (valid), Defender ASR (no rules configured) and Smart App Control
+    // (evaluation, not enforcing) were each ruled out, and no mechanism is asserted in their place.
+    // None of the above speaks to app versions or launch routes that were not tried.
+    //
+    // The remediation below states the requirement flatly regardless, because someone reading an
+    // error needs to know the CLI is required -- not how confident this project is about MSIX
+    // internals. Dropping the suggestion without saying that much would still leave a user who has
+    // the app with no way to explain why Codex is reported missing.
+    let desktop_app_note = if reviewer == "codex" {
+        "\n\nThe Codex desktop app does not satisfy this. It installs no CLI that can be \
+         invoked, so the install above is still required even if the desktop app is already \
+         present and signed in."
+    } else {
+        ""
     };
     Failure::new(
         "CLI_NOT_FOUND",
@@ -138,7 +168,7 @@ pub fn cli_not_found(reviewer: &str, tried: &[String]) -> Failure {
              \x20 2. Or point the MCP server at an existing install by adding\n\
              \x20    --bin \"C:\\full\\path\\to\\{reviewer}.exe\" to the cross-review args\n\
              \x20    in this project's MCP configuration.\n\n\
-             Then restart the MCP server (restart the agent session) and retry."
+             Then restart the MCP server (restart the agent session) and retry.{desktop_app_note}"
         ),
     )
     .with_detail(format!("Looked for:\n{}", tried.join("\n")))
@@ -881,6 +911,59 @@ mod fallback_tests {
         assert_eq!(f.code, "RATE_LIMITED");
         assert!(f.remediation.contains("fresh: true"), "{}", f.remediation);
         assert!(f.summary.contains("codex"), "{}", f.summary);
+    }
+
+    #[test]
+    fn codex_cli_not_found_rules_the_desktop_app_out_instead_of_offering_it() {
+        // Issue #64. The desktop app installs no invocable CLI, so a remediation that offered it as
+        // an alternative sent the user round a loop: install what the error suggests, get the same
+        // error. Two properties, and the second is the one that matters -- merely dropping the
+        // suggestion would still leave a user who *has* the app unable to explain the failure.
+        let f = cli_not_found("codex", &["PATH entries".to_string()]);
+        assert_eq!(f.code, "CLI_NOT_FOUND");
+        assert!(
+            f.remediation.contains("npm install -g @openai/codex"),
+            "{}",
+            f.remediation
+        );
+        // Both halves: the subject and the claim about it. Asserting only the claim would pass on a
+        // message that said some *other* existing install does not satisfy this and never mentioned
+        // the desktop app, which is the whole point of the sentence.
+        assert!(
+            f.remediation.contains("Codex desktop app"),
+            "codex remediation must name the desktop app as the subject: {}",
+            f.remediation
+        );
+        assert!(
+            f.remediation.contains("does not satisfy this"),
+            "codex remediation must say the desktop app is not sufficient: {}",
+            f.remediation
+        );
+        // The dead end is never presented as a way to fix this.
+        assert!(
+            !f.remediation.contains("or install the Codex desktop app"),
+            "codex remediation must not offer the desktop app as an install option: {}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn claude_cli_not_found_carries_no_desktop_app_note() {
+        // The note is Codex-specific: there is no equivalent Claude desktop-app confusion, and a
+        // remediation that mentioned one would be advice about a product the user is not installing.
+        let f = cli_not_found("claude", &["PATH entries".to_string()]);
+        assert_eq!(f.code, "CLI_NOT_FOUND");
+        assert!(
+            f.remediation
+                .contains("npm install -g @anthropic-ai/claude-code"),
+            "{}",
+            f.remediation
+        );
+        assert!(
+            !f.remediation.to_lowercase().contains("desktop app"),
+            "claude remediation must not mention a desktop app: {}",
+            f.remediation
+        );
     }
 
     #[test]
