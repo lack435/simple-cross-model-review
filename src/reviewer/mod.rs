@@ -238,11 +238,39 @@ impl SterileDir {
 
 impl Drop for SterileDir {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir(&self.path) {
-            eprintln!(
-                "cross-review: warning: could not remove sterile Codex directory {}: {e}",
-                self.path.display()
-            );
+        // `remove_dir` can be refused with a transient sharing violation when an external process --
+        // an antivirus real-time scan or the search indexer, most likely under heavy filesystem load
+        // -- momentarily holds a handle to the just-emptied directory without `FILE_SHARE_DELETE`.
+        // The delete is *refused*, not scheduled, so a single attempt leaves the directory fully
+        // present until that handle closes and someone retries. This is the confirmed mechanism
+        // behind issue #72's flaky test: the directory lingered and the next assertion still saw it.
+        //
+        // Retry on a short bounded budget so a passing external scan does not leak a sterile
+        // directory. A directory that is *genuinely* stuck -- a permanent handle, an ACL that denies
+        // deletion -- still surfaces the warning once the budget is spent, so a real cleanup failure
+        // is not hidden; only a transient refusal is absorbed. The common, uncontended case succeeds
+        // on the first attempt and never sleeps.
+        const RETRY_BUDGET: Duration = Duration::from_secs(1);
+        const RETRY_INTERVAL: Duration = Duration::from_millis(20);
+        let deadline = Instant::now() + RETRY_BUDGET;
+        loop {
+            match std::fs::remove_dir(&self.path) {
+                Ok(()) => return,
+                // Already gone -- a concurrent reaper, or a delete that has completed. Nothing to do.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "cross-review: warning: could not remove sterile Codex directory {} \
+                             after retrying for {}s: {e}",
+                            self.path.display(),
+                            RETRY_BUDGET.as_secs()
+                        );
+                        return;
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+            }
         }
     }
 }

@@ -372,6 +372,45 @@ fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
 }
 
 #[test]
+fn sterile_dir_drop_retries_past_a_transient_sharing_violation() {
+    // Issue #72, made deterministic. An external process (an AV scan / the search indexer under
+    // load) can hold a handle to the just-emptied sterile directory WITHOUT `FILE_SHARE_DELETE`, so
+    // `SterileDir::drop`'s `remove_dir` is refused with a sharing violation and, on a single attempt,
+    // leaves the directory present -- which is what made `..._is_empty_outside_and_stable_across_turns`
+    // flake. Here a handle is held exactly that way and released shortly after, well inside drop's
+    // retry budget, so drop must spin past the refusal and still remove the directory.
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::Duration;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let root = crate::testutil::temp_dir("codex-sterile-drop-retry-root");
+    let state = crate::testutil::temp_dir("codex-sterile-drop-retry-state");
+    let cfg = config_at(root.as_path(), Some(state.as_path()), &["codex"]);
+    let guard = crate::reviewer::codex_sterile_dir(&cfg, "session-drop-retry").expect("sterile");
+    let path = guard.path().to_path_buf();
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(1 | 2) // READ | WRITE, deliberately no DELETE -- refuses the removal.
+        .open(&path)
+        .expect("open blocking handle");
+    // Confirm the precondition: with this handle held, a one-shot removal really is refused.
+    assert!(
+        std::fs::remove_dir(&path).is_err(),
+        "precondition: a non-share-delete handle must refuse the removal"
+    );
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(handle); // release the sharing violation, well within drop's 1s budget
+    });
+    drop(guard); // must retry past the refusal until the handle is released, then remove
+    releaser.join().unwrap();
+    assert!(
+        !path.exists(),
+        "drop must remove the directory once the blocking handle is released"
+    );
+}
+
+#[test]
 fn sterile_dir_name_keys_on_state_dir_and_session() {
     // The name-derivation invariant, tested pure so it does not depend on the shared process temp
     // root the filesystem path reaps (that concurrency is issue #87's problem, not this one's).
