@@ -1548,16 +1548,18 @@ impl App {
             .any(|spec| spec.reviewer == crate::config::ReviewerKind::Codex)
         {
             match crate::evidence::readiness(&self.cfg) {
-                Ok(()) => out.push_str(&format!(
-                    "evidence:      ready (schema {}, {} read-only tools; no-model handshake passed)\n",
+                // The drift-tracking state earns its place on this line: since issue #86 a tree too
+                // large to scan degrades to unknown drift instead of refusing the review, so a
+                // large repository and a broken service are otherwise indistinguishable here.
+                Ok(drift) => out.push_str(&format!(
+                    "evidence:      ready (schema {}, {} read-only tools; no-model handshake \
+                     passed; drift tracking: {drift})\n",
                     crate::evidence::SCHEMA_VERSION,
                     crate::evidence::TOOLS.len()
                 )),
                 Err(e) => {
                     all_ready = false;
-                    out.push_str(&format!(
-                        "evidence:      NO - EVIDENCE_UNAVAILABLE ({e})\n"
-                    ));
+                    out.push_str(&format!("evidence:      NO - EVIDENCE_UNAVAILABLE ({e})\n"));
                 }
             }
         }

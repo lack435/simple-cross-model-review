@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::{Bundle, EvidenceError, Limits, VcsKind, CODEX_TOOL_TIMEOUT_SECS};
+use super::{Bundle, Drift, EvidenceError, Limits, StampMethod, VcsKind, CODEX_TOOL_TIMEOUT_SECS};
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
@@ -74,8 +74,14 @@ static LIVE_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// The drift stamp deliberately stays on the *read* pool where #61 put it: `read` computes it
 /// inline, so moving it here would let two stalled walks make every first read of a turn refuse —
 /// re-introducing exactly the cross-operation coupling this separation exists to remove.
+///
+/// The cap is three because a Git-scoped search spends two walk workers in sequence — one to
+/// resolve the base (which decides the explicit-file short-circuit, so it cannot be folded into
+/// the second) and one to check the enumeration against the filesystem — leaving one slot of
+/// headroom for the abandoned predecessor of a retry that is not coming. It is still much smaller
+/// than the read cap, for the reasons above.
 static LIVE_WALK_WORKERS: AtomicUsize = AtomicUsize::new(0);
-const WALK_WORKER_CAP: usize = 2;
+const WALK_WORKER_CAP: usize = 3;
 
 /// Child-process operations (`repository_history`, `repository_revision`) get a third pool, for the
 /// same reason walks got the second: a wedged Git command must not spend capacity reads need.
@@ -283,14 +289,44 @@ fn run_bounded_read(job: ReadJob, received_at: Instant) -> Result<ReadOutput, Ev
 fn run_bounded_stamp(
     root: &Path,
     limits: &Limits,
+    source: Option<Vec<String>>,
+    cancel: &Arc<AtomicBool>,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
     let root = root.to_path_buf();
     let limits = limits.clone();
+    let cancel = Arc::clone(cancel);
     bounded_attempts(&STAMP_WATCHDOG, received_at, "drift-stamp", move || {
         let root = root.clone();
         let limits = limits.clone();
-        move || tree_stamp(&root, &limits).map_err(|e| ReadFailure::fatal(e.code, e.message))
+        let cancel = Arc::clone(&cancel);
+        let source = source.clone();
+        move || {
+            let stamp = match &source {
+                Some(paths) => {
+                    accept_git_paths(&root, paths, limits.max_path_bytes as usize, &cancel)
+                        .and_then(|(accepted, dropped)| {
+                            // A stamp over a set that lost paths is not comparable with one that
+                            // did not: the next scan may lose a different set, and the difference
+                            // would read as drift. Same rule as a short enumeration.
+                            if dropped {
+                                return Err(EvidenceError::new(
+                                    "read_failed",
+                                    "some enumerated paths could not be examined, so no \
+                                     comparable stamp could be taken",
+                                ));
+                            }
+                            let rows: Vec<String> = accepted
+                                .iter()
+                                .map(|entry| stamp_row(&entry.relative, entry.meta.as_ref()))
+                                .collect();
+                            digest_rows(&rows)
+                        })
+                }
+                None => tree_stamp(&root, &limits, &cancel),
+            };
+            stamp.map_err(|e| ReadFailure::fatal(e.code, e.message))
+        }
     })
 }
 
@@ -444,7 +480,14 @@ pub struct Core {
     next_cursor: u64,
     calls: u32,
     returned_bytes: u64,
-    observed_stamp: Option<String>,
+    /// The turn's single drift observation, successful or not. `Option<String>` could not hold the
+    /// second case, so a failed scan was re-run on every read; `Drift::Unavailable` is cached like
+    /// any other answer.
+    observed_stamp: Option<Drift>,
+    /// Which scan the turn's observation actually used. Not derivable from `bundle.vcs`: a Git
+    /// bundle with no Git binary falls back to the filesystem walk, and `repository_scope` must
+    /// describe the scan that ran rather than the one the VCS implies.
+    observed_method: Option<StampMethod>,
     cancel: Arc<AtomicBool>,
     /// The watchdog the walk-bearing routes (`repository_list`, `repository_search`) run under.
     ///
@@ -487,6 +530,7 @@ impl Core {
             calls: 0,
             returned_bytes: 0,
             observed_stamp: None,
+            observed_method: None,
             cancel,
             walk_watchdog: &WALK_WATCHDOG,
         })
@@ -599,8 +643,20 @@ impl Core {
     }
 
     fn scope(&mut self, received_at: Instant) -> Result<Value, EvidenceError> {
-        let current_stamp = self.current_stamp(received_at)?;
-        let drifted = current_stamp != self.bundle.initial_stamp;
+        let observed = self.current_stamp(received_at)?;
+        let (drifted, reason) =
+            crate::evidence::compare_drift(&self.bundle.initial_stamp, &observed);
+        // Which file set the recursive scans cover, in words. Without it a reviewer that searches
+        // for a vendored symbol, finds nothing, and concludes the code does not exist has no way
+        // to know it was looking at a smaller tree than it thought. Taken from the scan that
+        // actually ran, since a Git bundle with no Git binary falls back to the walk.
+        let scan_scope = self
+            .observed_method
+            .unwrap_or(match self.bundle.vcs {
+                VcsKind::Git => StampMethod::Git,
+                VcsKind::Perforce => StampMethod::Filesystem,
+            })
+            .scan_scope();
         Ok(json!({
             "schema_version": self.bundle.schema_version,
             "nonce": self.bundle.nonce,
@@ -610,9 +666,11 @@ impl Core {
             "status_summary": self.bundle.status_summary,
             "limits": self.bundle.limits,
             "excluded_directory_names": [".git", ".hg", ".svn", "target", "dist"],
-            "initial_stamp": self.bundle.initial_stamp,
-            "current_stamp": current_stamp,
+            "initial_stamp": self.bundle.initial_stamp.sha256(),
+            "current_stamp": observed.sha256(),
             "drifted": drifted,
+            "drift_unavailable": reason,
+            "scan_scope": scan_scope,
             "complete": true,
             "truncated": false,
             "cursor": Value::Null,
@@ -644,7 +702,7 @@ impl Core {
         let max_path_bytes = self.bundle.limits.max_path_bytes as usize;
         let max_files = self.bundle.limits.max_files as usize;
         let raw = path.clone();
-        let mut entries = run_bounded_walk(
+        let (mut entries, complete) = run_bounded_walk(
             self.walk_watchdog,
             &format!("list '{path}'"),
             received_at,
@@ -675,18 +733,17 @@ impl Core {
                     };
                     let relative = relative_slash(&root, &child)?;
                     entries.push(json!({"path": relative, "type": kind, "bytes": meta.len()}));
-                    if entries.len() > max_files {
-                        return Err(EvidenceError::new(
-                            "limit_exceeded",
-                            "listing exceeded file budget",
-                        ));
+                    // As in `walk_files`: a directory bigger than the budget is truncated with the
+                    // completeness flag cleared, not refused.
+                    if entries.len() >= max_files {
+                        return Ok((entries, false));
                     }
                 }
-                Ok(entries)
+                Ok((entries, true))
             },
         )?;
         entries.sort_by_key(value_path);
-        self.first_page("repository_list", entries, limit, "entries", true)
+        self.first_page("repository_list", entries, limit, "entries", complete)
     }
 
     fn search(
@@ -715,9 +772,9 @@ impl Core {
         // Base resolution and the tree walk run together on a bounded worker (#71); the per-file
         // reads below go through the same watchdog as `repository_read` (#61). Every stage of this
         // operation now derives its wait from the one request budget.
-        let files = self.resolve_and_walk(&path, received_at)?;
+        let (files, walk_complete) = self.resolve_and_walk(&path, received_at)?;
         let mut matches = Vec::new();
-        let mut source_complete = true;
+        let mut source_complete = walk_complete;
         for file in files {
             if self.cancel.load(Ordering::Acquire) {
                 return Err(EvidenceError::new(
@@ -823,8 +880,9 @@ impl Core {
             .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
         // Only after the content is known good do we compute the (cached) drift stamp. The walk is
         // watchdog-bounded (below) so a first read whose stamp stalls still cannot hang the loop.
-        let current_stamp = self.current_stamp(received_at)?;
-        let drifted = current_stamp != self.bundle.initial_stamp;
+        // The reason travels with the verdict here as well as in `repository_scope`, because scope
+        // is recommended to the reviewer rather than required and a bare null explains nothing.
+        let (drifted, drift_unavailable) = self.drift(received_at)?;
         Ok(json!({
             "path": relative_slash(&self.root, &output.resolved)?,
             "bytes": bytes.len(),
@@ -835,10 +893,23 @@ impl Core {
             "truncated": end < all.len(),
             "cursor": Value::Null,
             "drifted": drifted,
+            "drift_unavailable": drift_unavailable,
         }))
     }
 
-    fn current_stamp(&mut self, received_at: Instant) -> Result<String, EvidenceError> {
+    /// This turn's drift verdict as the wire carries it: `(drifted, reason)`, where a null verdict
+    /// always has a reason beside it.
+    fn drift(&mut self, received_at: Instant) -> Result<(Value, Value), EvidenceError> {
+        let observed = self.current_stamp(received_at)?;
+        let (drifted, reason) =
+            crate::evidence::compare_drift(&self.bundle.initial_stamp, &observed);
+        Ok((
+            drifted.map(Value::from).unwrap_or(Value::Null),
+            reason.map(Value::from).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn current_stamp(&mut self, received_at: Instant) -> Result<Drift, EvidenceError> {
         if let Some(stamp) = &self.observed_stamp {
             return Ok(stamp.clone());
         }
@@ -847,9 +918,17 @@ impl Core {
         // `scope`, and stays on the *read* pool: `read` computes it inline, so moving it to the
         // small walk pool would let two stalled walks refuse every first read of a turn.
         // `list`/search-base `walk_files` are no longer the exception here -- they are bounded on
-        // their own pool as of #71.
-        let current_stamp = run_bounded_stamp(&self.root, &self.bundle.limits, received_at)?;
+        // their own pool as of #71. Since #86 the Git enumeration that precedes it runs on the
+        // child pool instead, sequentially, so neither stage waits on the other's pool.
+        let (current_stamp, method) = observe_drift(
+            &self.root,
+            &self.bundle.limits,
+            self.bundle.vcs,
+            &self.cancel,
+            received_at,
+        )?;
         self.observed_stamp = Some(current_stamp.clone());
+        self.observed_method = Some(method);
         Ok(current_stamp)
     }
 
@@ -969,22 +1048,106 @@ impl Core {
         &self,
         path: &str,
         received_at: Instant,
-    ) -> Result<Vec<PathBuf>, EvidenceError> {
+    ) -> Result<(Vec<PathBuf>, bool), EvidenceError> {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
         let max_path_bytes = self.bundle.limits.max_path_bytes as usize;
         let raw = path.to_string();
-        run_bounded_walk(
+        // Resolve first, in its own bounded worker, because an explicitly named file is answerable
+        // without any enumeration at all -- and must be, or the documented contract ("naming a
+        // file searches it, ignored or not") would be at the mercy of a Git timeout. A Git-scoped
+        // directory search therefore spends two walk workers in sequence, which is what
+        // `WALK_WORKER_CAP` is sized for.
+        let (base, base_is_file) = {
+            let root = root.clone();
+            let raw = raw.clone();
+            run_bounded_walk(
+                self.walk_watchdog,
+                &format!("search base '{path}'"),
+                received_at,
+                move || {
+                    let base = resolve_existing_bounded(&root, max_path_bytes, &raw, false)
+                        .map_err(ReadFailure::into_evidence)?;
+                    // Decided *inside* the worker, and from a classified metadata call rather than
+                    // `Path::is_file()`: on the request thread this syscall is unbounded, which
+                    // would defeat the watchdog the rest of the search runs under, and `is_file()`
+                    // silently turns an error into "not a file".
+                    let meta = fs::metadata(&base).map_err(|e| {
+                        classify_read_io("read_failed", "cannot stat the search base", &e)
+                            .into_evidence()
+                    })?;
+                    Ok((base, meta.is_file()))
+                },
+            )?
+        };
+        // An explicitly named file is searched whether or not Git ignores it: naming a file is the
+        // same opt-in as reading it, it cannot cost more than one file, and the alternative would
+        // make `repository_search` weaker than `repository_read` for no benefit. Scoping applies to
+        // directory bases, where the cost is unbounded and the noise is the problem.
+        if base_is_file {
+            return Ok((vec![base], true));
+        }
+        let source = if self.bundle.vcs == VcsKind::Git {
+            let root = root.clone();
+            let limits = limits.clone();
+            let cancel = Arc::clone(&cancel);
+            let outcome =
+                run_bounded_walk(&CHILD_WATCHDOG, "git ls-files", received_at, move || {
+                    Ok(super::git::reviewable_paths(
+                        &root,
+                        &limits,
+                        &cancel,
+                        received_at,
+                    ))
+                })?;
+            match scan_source(outcome) {
+                ScanSource::Refused(e) => return Err(e),
+                other => other,
+            }
+        } else {
+            ScanSource::Filesystem
+        };
+        // Git does not descend a submodule boundary for `--others`, so untracked files inside a
+        // submodule are not in this list although the filesystem walk would have seen them. A
+        // search that never looked at them must not report itself whole: "no matches" is what a
+        // reviewer turns into "this code does not exist".
+        let (paths, mut complete) = match source {
+            ScanSource::Git(paths, complete) => {
+                let submodules = paths.iter().any(|p| p == ".gitmodules");
+                (Some(paths), complete && !submodules)
+            }
+            _ => (None, true),
+        };
+        let walk_root = root.clone();
+        let (files, dropped) = run_bounded_walk(
             self.walk_watchdog,
             &format!("search '{path}'"),
             received_at,
             move || {
-                let base = resolve_existing_bounded(&root, max_path_bytes, &raw, false)
-                    .map_err(ReadFailure::into_evidence)?;
-                walk_files(&root, &base, &limits, &cancel, received_at)
+                let Some(paths) = &paths else {
+                    return walk_files(&walk_root, &base, &limits, &cancel, received_at)
+                        .map(|(files, complete)| (files, !complete));
+                };
+                let (accepted, dropped) =
+                    accept_git_paths(&walk_root, paths, max_path_bytes, &cancel)?;
+                let files = accepted
+                    .into_iter()
+                    // A path that vanished between the enumeration and the stat has nothing to read.
+                    .filter(|entry| entry.meta.is_some())
+                    .map(|entry| entry.path)
+                    // `within`, not `Path::starts_with`: the latter compares components
+                    // case-sensitively, and these two paths reach here by different routes -- Git's
+                    // spelling joined onto the root, against a canonicalised base. On Windows those
+                    // can differ in case for the same directory, which would silently return no
+                    // matches for a subdirectory search.
+                    .filter(|candidate| within(candidate, &base))
+                    .collect();
+                Ok((files, dropped))
             },
-        )
+        )?;
+        complete = complete && !dropped;
+        Ok((files, complete))
     }
 
     fn validate_relative(&self, raw: &str) -> Result<PathBuf, EvidenceError> {
@@ -1001,10 +1164,10 @@ fn walk_files(
     limits: &Limits,
     cancel: &AtomicBool,
     start: Instant,
-) -> Result<Vec<PathBuf>, EvidenceError> {
+) -> Result<(Vec<PathBuf>, bool), EvidenceError> {
     {
         if base.is_file() {
-            return Ok(vec![base.to_path_buf()]);
+            return Ok((vec![base.to_path_buf()], true));
         }
         if !base.is_dir() {
             return Err(EvidenceError::new(
@@ -1056,17 +1219,18 @@ fn walk_files(
                     queue.push_back(child);
                 } else if meta.is_file() {
                     files.push(child);
-                    if files.len() > limits.max_files as usize {
-                        return Err(EvidenceError::new(
-                            "limit_exceeded",
-                            "walk exceeded file budget",
-                        ));
+                    // Truncate rather than refuse: the response already has a completeness flag,
+                    // and "the tree was bigger than the budget" and "there is nothing here" must
+                    // not be the same answer to a reviewer (issue #86).
+                    if files.len() >= limits.max_files as usize {
+                        files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+                        return Ok((files, false));
                     }
                 }
             }
         }
         files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
-        Ok(files)
+        Ok((files, true))
     }
 }
 
@@ -1413,11 +1577,203 @@ fn verify_open_file(file: &File, expected: &Path, root: &Path) -> Result<(), Rea
     Ok(())
 }
 
-fn tree_stamp(root: &Path, limits: &Limits) -> Result<String, EvidenceError> {
+/// What a Git enumeration outcome means for the scan that asked for it.
+enum ScanSource {
+    /// Git answered; the flag says whether its answer was the whole of what was asked for.
+    Git(Vec<String>, bool),
+    /// No Git binary to ask — the one condition that is verified rather than inferred, and the
+    /// only route to the filesystem walk.
+    Filesystem,
+    /// Git is here and did not answer. Walking the tree is the expensive wrong reply to that: it
+    /// is the 400,000-file scan issue #86 exists to avoid, and it would run for a timeout, a
+    /// corrupt index or a permissions failure alike.
+    Refused(EvidenceError),
+}
+
+fn scan_source(outcome: Result<super::git::Enumeration, super::git::GitFailure>) -> ScanSource {
+    match outcome {
+        Ok(enumeration) => ScanSource::Git(enumeration.paths, enumeration.complete),
+        Err(super::git::GitFailure::NoGit) => ScanSource::Filesystem,
+        // Cancellation arrives here as `Refused` with the `cancelled` code, which every caller
+        // re-raises rather than degrading: a cancelled request must not leave an observation
+        // behind for the next one to trust.
+        Err(other) => ScanSource::Refused(other.into_evidence()),
+    }
+}
+
+/// What an ancestor directory of an enumerated path turned out to be. Memoised per directory, so
+/// the three cases have to be distinguishable: a *missing* ancestor is an observation about a whole
+/// subtree, and collapsing it into a hole would turn "this directory was deleted" — ordinary drift —
+/// into unavailable drift.
+#[derive(Clone, Copy, PartialEq)]
+enum Ancestor {
+    Usable,
+    Missing,
+    Hole,
+}
+
+impl Ancestor {
+    fn of(path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if metadata_is_reparse(&meta) => Self::Hole,
+            Ok(_) => Self::Usable,
+            // A deleted directory is the same class of event as a deleted file: the enumeration
+            // named something that is gone, which the stamp records as `missing`. Collapsing it
+            // into a hole would make a removed directory produce *unavailable* drift, not drift.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Hole,
+        }
+    }
+}
+
+/// One path from Git's answer that survived every check the filesystem walk applies.
+#[derive(Debug)]
+struct Accepted {
+    relative: String,
+    path: PathBuf,
+    /// `None` when the path vanished between the enumeration and the `stat`. A race this change
+    /// introduces, and one the stamp records rather than aborting on: the absence *is* the
+    /// observation. Search skips these, since there is nothing to read.
+    meta: Option<fs::Metadata>,
+}
+
+/// Turn Git's answer into the file set this service will actually look at.
+///
+/// Git's output is untrusted input. `walk_files` guarantees that a scan never yields a path under
+/// an excluded directory name, never follows a reparse point (its own or an ancestor's), and never
+/// yields anything but a regular file — and its results are handed to reads as already-`Resolved`
+/// targets, which skip the `is_file` guard. Every one of those checks is reapplied here, or a
+/// tracked symlink, an in-root junction, a file under a tracked `dist/`, or a corrupt index entry
+/// would widen what a scan reaches (issue #86, finding f2).
+///
+/// A path that fails is *skipped*, not fatal: Git listing something this service will not look at
+/// is not an error, and one bad index entry must not lose the whole scan. The returned flag says
+/// whether anything was dropped, so a scan that lost paths cannot report itself whole.
+fn accept_git_paths(
+    root: &Path,
+    paths: &[String],
+    max_path_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<(Vec<Accepted>, bool), EvidenceError> {
+    let cancelled = || {
+        cancel
+            .load(Ordering::Acquire)
+            .then(|| EvidenceError::new("cancelled", "the evidence enumeration was cancelled"))
+    };
+    // Checked before the loop as well as inside it: an empty enumeration would otherwise skip the
+    // check entirely and hand back a "successful" empty answer for a cancelled request.
+    if let Some(e) = cancelled() {
+        return Err(e);
+    }
+    let mut accepted = Vec::with_capacity(paths.len());
+    let mut dropped = false;
+    // Ancestor directories are memoised: the path list is sorted, so siblings share ancestors, and
+    // a per-file check alone would still let `root/junction/file` through.
+    let mut ancestors: HashMap<String, Ancestor> = HashMap::new();
+    'paths: for raw in paths {
+        if let Some(e) = cancelled() {
+            return Err(e);
+        }
+        let Ok(clean) = validate_relative_path(max_path_bytes, raw) else {
+            dropped = true;
+            continue;
+        };
+        let components: Vec<_> = clean.components().collect();
+        if components.is_empty() {
+            dropped = true;
+            continue;
+        }
+        let mut current = root.to_path_buf();
+        let mut key = String::new();
+        let mut ancestor_missing = false;
+        for component in &components[..components.len() - 1] {
+            current.push(component.as_os_str());
+            key.push_str(&component.as_os_str().to_string_lossy());
+            key.push('/');
+            let state = *ancestors
+                .entry(key.clone())
+                .or_insert_with(|| Ancestor::of(&current));
+            match state {
+                Ancestor::Usable => {}
+                Ancestor::Missing => {
+                    ancestor_missing = true;
+                    break;
+                }
+                Ancestor::Hole => {
+                    dropped = true;
+                    continue 'paths;
+                }
+            }
+        }
+        // Joined from `clean` rather than continuing to push onto `current`, which stops at
+        // whichever ancestor ended the loop early.
+        let current = root.join(&clean);
+        let relative = clean.to_string_lossy().replace('\\', "/");
+        if ancestor_missing {
+            accepted.push(Accepted {
+                relative,
+                path: current,
+                meta: None,
+            });
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if metadata_is_reparse(&meta) || !meta.is_file() => dropped = true,
+            Ok(meta) => accepted.push(Accepted {
+                relative,
+                path: current,
+                meta: Some(meta),
+            }),
+            // An absent file is an observation, not a loss: the enumeration named it and it is
+            // gone, which is exactly what the stamp should record. Any *other* metadata error --
+            // a sharing violation, a permissions failure -- means the path could not be looked at,
+            // which is a hole in the scan and has to clear the completeness flag instead.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => accepted.push(Accepted {
+                relative,
+                path: current,
+                meta: None,
+            }),
+            Err(_) => dropped = true,
+        }
+    }
+    Ok((accepted, dropped))
+}
+
+fn stamp_row(relative: &str, meta: Option<&fs::Metadata>) -> String {
+    match meta {
+        None => format!("{relative}\0missing"),
+        Some(meta) => {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{relative}\0{}\0{modified}", meta.len())
+        }
+    }
+}
+
+fn digest_rows(rows: &[String]) -> Result<String, EvidenceError> {
+    let joined = rows.join("\n");
+    let fp = crate::digest::Fingerprint::of(joined.as_bytes())
+        .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
+    Ok(fp.sha256)
+}
+
+fn tree_stamp(root: &Path, limits: &Limits, cancel: &AtomicBool) -> Result<String, EvidenceError> {
     let start = Instant::now();
     let mut queue = VecDeque::from([root.to_path_buf()]);
     let mut rows = Vec::new();
     while let Some(dir) = queue.pop_front() {
+        // Checked here as `walk_files` does, so a cancelled request cannot finish a scan and cache
+        // an observation nobody is waiting for.
+        if cancel.load(Ordering::Acquire) {
+            return Err(EvidenceError::new(
+                "cancelled",
+                "the drift scan was cancelled",
+            ));
+        }
         deadline(start, limits)?;
         let mut children = Vec::new();
         for entry in
@@ -1436,33 +1792,103 @@ fn tree_stamp(root: &Path, limits: &Limits) -> Result<String, EvidenceError> {
             if metadata_is_reparse(&meta) {
                 continue;
             }
+            if meta.is_dir() {
+                queue.push_back(child);
+                // Directories do not get rows, and do not count against the budget: an empty
+                // directory appearing is not drift worth reporting, every directory that holds
+                // anything is already represented by its files, and charging them to `max_files`
+                // spends a budget meant for reviewable content on the tree's shape.
+                continue;
+            }
             let relative = relative_slash(root, &child)?;
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            rows.push(format!("{relative}\0{}\0{modified}", meta.len()));
+            rows.push(stamp_row(&relative, Some(&meta)));
             if rows.len() > limits.max_files as usize {
                 return Err(EvidenceError::new(
                     "limit_exceeded",
                     "drift scan exceeded file budget",
                 ));
             }
-            if meta.is_dir() {
-                queue.push_back(child);
-            }
         }
     }
-    let joined = rows.join("\n");
-    let fp = crate::digest::Fingerprint::of(joined.as_bytes())
-        .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
-    Ok(fp.sha256)
+    digest_rows(&rows)
 }
 
-pub fn initial_stamp(root: &Path, limits: &Limits) -> Result<String, EvidenceError> {
-    tree_stamp(root, limits)
+/// The capture-time drift baseline, from the parent process.
+///
+/// Runs the same two bounded stages the service does, anchored at `Instant::now()` rather than a
+/// request receipt. Before issue #86 this path had no watchdog at all — only the cooperative
+/// `deadline()` between directories — so a stalled `read_dir` could hang a review before it
+/// started, and a tree over `max_files` refused it outright. Both now end in `Drift::Unavailable`.
+pub fn initial_stamp(root: &Path, limits: &Limits, vcs: VcsKind) -> Drift {
+    let cancel = Arc::new(AtomicBool::new(false));
+    match observe_drift(root, limits, vcs, &cancel, Instant::now()) {
+        Ok((drift, _)) => drift,
+        // Unreachable in practice: nothing cancels a capture-time scan. Kept total rather than
+        // unwrapped so a future caller with a real flag cannot panic here.
+        Err(e) => Drift::unavailable(e.to_string()),
+    }
+}
+
+/// Observe the tree once: enumerate on the child pool, then stamp on the read pool.
+///
+/// Sequential, never nested — no worker waits on another pool's worker, so a wedged Git child can
+/// only ever cost the child pool. Every failure becomes `Drift::Unavailable` with the reason
+/// attached; the one exception is cancellation, which is not an observation and stays an error.
+fn observe_drift(
+    root: &Path,
+    limits: &Limits,
+    vcs: VcsKind,
+    cancel: &Arc<AtomicBool>,
+    received_at: Instant,
+) -> Result<(Drift, StampMethod), EvidenceError> {
+    let enumeration = if vcs == VcsKind::Git {
+        let owned_root = root.to_path_buf();
+        let owned_limits = limits.clone();
+        let owned_cancel = Arc::clone(cancel);
+        // The inner `Result` is deliberate: the watchdog must only report *its own* failure, so
+        // the enumeration's classification survives to the match below instead of being flattened.
+        let outcome = run_bounded_walk(&CHILD_WATCHDOG, "git ls-files", received_at, move || {
+            Ok(super::git::reviewable_paths(
+                &owned_root,
+                &owned_limits,
+                &owned_cancel,
+                received_at,
+            ))
+        });
+        match outcome {
+            Ok(inner) => scan_source(inner),
+            Err(e) if e.code == "cancelled" => return Err(e),
+            // The Git method was the one attempted, so it is the one to report even though no
+            // stamp came of it: a later request would attempt the same thing.
+            Err(e) => return Ok((Drift::unavailable(e.to_string()), StampMethod::Git)),
+        }
+    } else {
+        ScanSource::Filesystem
+    };
+
+    let (method, source) = match enumeration {
+        // A hash of an arbitrary prefix of the tree is not a stamp: two scans truncating at
+        // different points would compare unequal and report drift that never happened.
+        ScanSource::Git(_, false) => {
+            return Ok((
+                Drift::unavailable(
+                    "the Git file enumeration was short of the whole tree, so no comparable \
+                     stamp could be taken",
+                ),
+                StampMethod::Git,
+            ))
+        }
+        ScanSource::Git(paths, true) => (StampMethod::Git, Some(paths)),
+        ScanSource::Filesystem => (StampMethod::Filesystem, None),
+        ScanSource::Refused(e) if e.code == "cancelled" => return Err(e),
+        ScanSource::Refused(e) => return Ok((Drift::unavailable(e.to_string()), StampMethod::Git)),
+    };
+
+    match run_bounded_stamp(root, limits, source, cancel, received_at) {
+        Ok(sha256) => Ok((Drift::Stamp { method, sha256 }, method)),
+        Err(e) if e.code == "cancelled" => Err(e),
+        Err(e) => Ok((Drift::unavailable(e.to_string()), method)),
+    }
 }
 
 /// The cooperative between-steps check, against **both** ceilings: the per-operation timeout the
@@ -1677,7 +2103,19 @@ mod tests {
     use super::*;
     use crate::testutil::temp_dir;
 
+    /// A bundle over a plain temp directory. `VcsKind::Perforce` because these fixtures are not
+    /// Git repositories: the filesystem walk is the scan they are testing, and a Git bundle here
+    /// would (correctly, since issue #86) refuse rather than walk a root Git does not recognise.
+    /// `git_bundle` covers the other side.
     fn bundle(root: &Path) -> Bundle {
+        bundle_for(root, VcsKind::Perforce)
+    }
+
+    fn git_bundle(root: &Path) -> Bundle {
+        bundle_for(root, VcsKind::Git)
+    }
+
+    fn bundle_for(root: &Path, vcs: VcsKind) -> Bundle {
         let limits = Limits::default();
         Bundle {
             schema_version: super::super::SCHEMA_VERSION,
@@ -1686,12 +2124,12 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
-            vcs: VcsKind::Git,
+            vcs,
             change_label: "working tree".into(),
             status_summary: "clean".into(),
             change: Some("abcdef".into()),
             limits: limits.clone(),
-            initial_stamp: initial_stamp(root, &limits).unwrap(),
+            initial_stamp: initial_stamp(root, &limits, vcs),
         }
     }
 
@@ -1819,6 +2257,430 @@ mod tests {
         let second = core.call("repository_scope", &json!({})).unwrap();
         assert_eq!(second["current_stamp"], observed);
         assert_eq!(second["drifted"], true);
+    }
+
+    /// A walk pool of this test module's own, with headroom. The production pool is capped at two
+    /// because the service is serial: one worker to serve the turn and one of headroom. A test
+    /// harness is not serial, so tests that only *use* a walk (rather than testing the pool) draw
+    /// on this instead, or they refuse each other with `read_unavailable` — the cross-test
+    /// interference `a_stalled_walk_cannot_starve_reads` already warns about.
+    static ISOLATED_WALK_LIVE: AtomicUsize = AtomicUsize::new(0);
+    static ISOLATED_WALK: ReadWatchdog = ReadWatchdog {
+        budget: Duration::from_millis(REQUEST_BUDGET_MS),
+        attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
+        backoff: Duration::ZERO,
+        max_attempts: 1,
+        live: &ISOLATED_WALK_LIVE,
+        cap: 64,
+    };
+
+    fn junction(link: &Path, target: &Path) -> bool {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::process::Command::new(format!(r"{system}\System32\cmd.exe"))
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    // Git's answer is untrusted input. `walk_files` never yields a path under an excluded
+    // directory name, never follows a reparse point (its own or an ancestor's), and never yields
+    // anything but a regular file -- and its results are read without re-resolution. Every one of
+    // those checks has to survive the move to an enumeration (issue #86, finding f2).
+    #[test]
+    fn git_paths_keep_every_check_the_walk_applies() {
+        let dir = temp_dir("evidence-accept");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+        fs::create_dir(root.join("dist")).unwrap();
+        fs::write(root.join("dist").join("excluded.txt"), "no").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("nested.txt"), "yes").unwrap();
+        fs::create_dir(root.join("plain-dir")).unwrap();
+
+        let outside = temp_dir("evidence-accept-outside");
+        fs::write(outside.as_path().join("secret.txt"), "secret").unwrap();
+        let linked = junction(&root.join("link"), outside.as_path());
+
+        let mut listed = vec![
+            "keep.txt".to_string(),
+            "sub/nested.txt".to_string(),
+            // Nothing stops a repository tracking files under an excluded directory name.
+            "dist/excluded.txt".to_string(),
+            // A gitlink for an uninitialised submodule, and a plain directory: neither is a file.
+            "plain-dir".to_string(),
+            // A corrupt index entry.
+            "../escape.txt".to_string(),
+            // Enumerated, then deleted before the stat.
+            "vanished.txt".to_string(),
+        ];
+        if linked {
+            listed.push("link/secret.txt".to_string());
+        }
+        listed.sort();
+
+        let cancel = AtomicBool::new(false);
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        let kept: Vec<&str> = accepted.iter().map(|a| a.relative.as_str()).collect();
+        assert_eq!(kept, ["keep.txt", "sub/nested.txt", "vanished.txt"]);
+        assert!(dropped, "dropping paths must clear the completeness flag");
+        assert!(
+            accepted
+                .iter()
+                .any(|a| a.relative == "vanished.txt" && a.meta.is_none()),
+            "a path that disappeared before the stat is recorded, not fatal"
+        );
+        if !linked {
+            eprintln!("note: junction could not be created; the ancestor check was not exercised");
+        }
+    }
+
+    #[test]
+    fn a_stamp_over_an_enumeration_tracks_only_what_it_enumerated() {
+        let dir = temp_dir("evidence-git-stamp");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("tracked.txt"), "one").unwrap();
+        fs::write(root.join("ignored.txt"), "one").unwrap();
+        let listed = ["tracked.txt".to_string()];
+        let cancel = AtomicBool::new(false);
+        let stamp = |root: &Path| {
+            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel).unwrap();
+            let rows: Vec<String> = accepted
+                .iter()
+                .map(|a| stamp_row(&a.relative, a.meta.as_ref()))
+                .collect();
+            digest_rows(&rows).unwrap()
+        };
+        let before = stamp(&root);
+
+        fs::write(root.join("ignored.txt"), "a much longer body").unwrap();
+        assert_eq!(
+            stamp(&root),
+            before,
+            "a file outside the enumeration is not drift"
+        );
+
+        fs::write(root.join("tracked.txt"), "a much longer body").unwrap();
+        assert_ne!(stamp(&root), before, "an enumerated file changing is drift");
+    }
+
+    // The rule that decides whether a scan may fall back to walking the whole tree. Only a missing
+    // binary may: every other failure means Git is here and did not answer, and the walk is the
+    // 400,000-file scan issue #86 exists to avoid -- for a timeout, a corrupt index and a
+    // permissions failure alike.
+    #[test]
+    fn only_a_missing_git_binary_sends_a_scan_to_the_filesystem() {
+        assert!(matches!(
+            scan_source(Err(super::super::git::GitFailure::NoGit)),
+            ScanSource::Filesystem
+        ));
+        for failure in [
+            super::super::git::GitFailure::Failed(EvidenceError::new(
+                "provider_failed",
+                "exit 128",
+            )),
+            super::super::git::GitFailure::OutOfTime(EvidenceError::new(
+                "deadline_exceeded",
+                "slow",
+            )),
+        ] {
+            assert!(matches!(scan_source(Err(failure)), ScanSource::Refused(_)));
+        }
+        assert!(matches!(
+            scan_source(Ok(super::super::git::Enumeration {
+                paths: vec!["a".into()],
+                complete: false,
+            })),
+            ScanSource::Git(_, false)
+        ));
+    }
+
+    // A tree bigger than the budget used to refuse the whole review here.
+    #[test]
+    fn a_tree_over_the_file_budget_yields_unknown_drift_rather_than_an_error() {
+        let dir = temp_dir("evidence-stamp-budget");
+        fs::write(dir.as_path().join("a.txt"), "a").unwrap();
+        fs::write(dir.as_path().join("b.txt"), "b").unwrap();
+        let limits = Limits {
+            max_files: 1,
+            ..Default::default()
+        };
+        let drift = initial_stamp(dir.as_path(), &limits, VcsKind::Perforce);
+        assert!(matches!(drift, Drift::Unavailable { .. }), "{drift:?}");
+    }
+
+    // Unknown drift must reach the reviewer as unknown, with a reason, on both tools that carry
+    // it -- `repository_scope` is recommended to the reviewer, not required, so a read that says
+    // only `null` explains nothing. The Git bundle over a non-repository is the realistic way to
+    // reach an unavailable observation without a git repository in the test.
+    #[test]
+    fn an_unobservable_stamp_reads_as_unknown_and_is_observed_once() {
+        let dir = temp_dir("evidence-unknown-drift");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        core.walk_watchdog = &ISOLATED_WALK;
+
+        let read = core
+            .call("repository_read", &json!({"path":"a.txt"}))
+            .unwrap();
+        assert_eq!(read["drifted"], Value::Null);
+        assert!(read["drift_unavailable"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
+        assert!(
+            core.observed_stamp.is_some(),
+            "an unavailable observation is cached like any other, not re-run on every read"
+        );
+
+        let scope = core.call("repository_scope", &json!({})).unwrap();
+        assert_eq!(scope["drifted"], Value::Null);
+        assert_eq!(scope["initial_stamp"], Value::Null);
+        assert_eq!(scope["current_stamp"], Value::Null);
+        assert!(scope["drift_unavailable"].as_str().is_some());
+        assert!(scope["scan_scope"]
+            .as_str()
+            .is_some_and(|s| s.contains("Git")));
+    }
+
+    // Git present, root not a work tree: the scan refuses rather than quietly walking a tree the
+    // caller declared to be Git. Surfacing the misconfiguration beats scanning the wrong thing.
+    #[test]
+    fn a_git_root_git_rejects_refuses_the_search_rather_than_walking_it() {
+        if crate::reviewer::on_path("git").is_none() {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        }
+        let dir = temp_dir("evidence-not-a-worktree");
+        fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
+        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        core.walk_watchdog = &ISOLATED_WALK;
+        // Any refusal is the point. The failure this guards against is the opposite: a *successful*
+        // search, which here could only come from having walked the filesystem after Git declined.
+        let result = core.call("repository_search", &json!({"query":"hello"}));
+        assert!(
+            result.is_err(),
+            "a Git root Git rejects must not silently fall back to the walk: {result:?}"
+        );
+    }
+
+    // A path that is *gone* is an observation; a path that could not be looked at is a hole. The
+    // first belongs in the stamp, the second must clear completeness -- and a stamp taken over a
+    // set that lost paths is not comparable with one that did not, so it is refused outright.
+    #[test]
+    fn an_unreadable_path_is_a_hole_and_a_missing_one_is_an_observation() {
+        let dir = temp_dir("evidence-dropped");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("here.txt"), "here").unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let listed = ["here.txt".to_string(), "gone.txt".to_string()];
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert!(
+            !dropped,
+            "a file the enumeration named and that is absent is an observation, not a lost path"
+        );
+
+        // A directory in the file's place: `symlink_metadata` succeeds but it is not a regular
+        // file, which is the same class of hole as an unreadable one.
+        fs::create_dir(root.join("wrong-kind")).unwrap();
+        let listed = ["here.txt".to_string(), "wrong-kind".to_string()];
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(dropped);
+
+        // And a stamp over a set with a hole in it is refused rather than hashed.
+        let stamped = run_bounded_stamp(
+            &root,
+            &Limits::default(),
+            Some(listed.to_vec()),
+            &Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+        );
+        assert_eq!(stamped.unwrap_err().code, "read_failed");
+    }
+
+    // A cancelled request must not leave an observation behind -- not a stamp, and not an
+    // `Unavailable` the next request would trust as "we looked and could not tell".
+    #[test]
+    fn a_cancelled_scan_is_an_error_rather_than_an_observation() {
+        let dir = temp_dir("evidence-cancelled-scan");
+        fs::write(dir.as_path().join("a.txt"), "a").unwrap();
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        // The filesystem walk had no cancellation check at all before issue #86.
+        assert_eq!(
+            tree_stamp(&root, &Limits::default(), &cancel)
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+        assert_eq!(
+            accept_git_paths(&root, &["a.txt".to_string()], 4096, &cancel)
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+        assert_eq!(
+            observe_drift(
+                &root,
+                &Limits::default(),
+                VcsKind::Perforce,
+                &cancel,
+                Instant::now()
+            )
+            .unwrap_err()
+            .code,
+            "cancelled"
+        );
+    }
+
+    // `Path::starts_with` is component-wise but case-sensitive, and these two paths arrive by
+    // different routes: Git's spelling joined onto the root, against a canonicalised base.
+    #[test]
+    fn base_containment_is_case_insensitive_like_the_filesystem() {
+        let dir = temp_dir("evidence-case");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        let base = root.join("Src");
+        assert!(within(&root.join("src").join("a.txt"), &base));
+        assert!(!within(&root.join("srcx").join("a.txt"), &base));
+        assert!(
+            !Path::new("src/a.txt").starts_with("Src"),
+            "the bug this guards"
+        );
+    }
+
+    // A deleted *directory* is the same event as a deleted file, one level up. Collapsing it into a
+    // hole would turn ordinary drift -- someone removed a directory mid-review -- into unavailable
+    // drift, which is the opposite of what the reviewer needs to hear.
+    #[test]
+    fn a_missing_ancestor_is_recorded_as_missing_not_as_a_hole() {
+        let dir = temp_dir("evidence-missing-ancestor");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("kept.txt"), "kept").unwrap();
+        let cancel = AtomicBool::new(false);
+        let listed = ["gone-dir/a.txt".to_string(), "kept.txt".to_string()];
+
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        assert!(
+            !dropped,
+            "a removed directory is an observation, not a hole"
+        );
+        let missing = accepted
+            .iter()
+            .find(|a| a.relative == "gone-dir/a.txt")
+            .expect("the vanished path is still recorded");
+        assert!(missing.meta.is_none());
+        assert_eq!(
+            missing.path,
+            root.join("gone-dir").join("a.txt"),
+            "the recorded path must be the whole path, not the prefix the ancestor walk stopped at"
+        );
+
+        // And it is drift: the stamp moves when the directory goes away.
+        fs::create_dir(root.join("gone-dir")).unwrap();
+        fs::write(root.join("gone-dir").join("a.txt"), "here").unwrap();
+        let stamp = |root: &Path| {
+            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel).unwrap();
+            digest_rows(
+                &accepted
+                    .iter()
+                    .map(|a| stamp_row(&a.relative, a.meta.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let present = stamp(&root);
+        fs::remove_dir_all(root.join("gone-dir")).unwrap();
+        assert_ne!(stamp(&root), present);
+    }
+
+    // Directories are the tree's shape, not its content: an empty directory appearing is not drift
+    // worth reporting, and charging directories to `max_files` spends a budget meant for reviewable
+    // content -- which is the budget this whole change is about.
+    #[test]
+    fn the_filesystem_stamp_hashes_files_not_directories() {
+        let dir = temp_dir("evidence-stamp-dirs");
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        let cancel = AtomicBool::new(false);
+        let before = tree_stamp(&root, &Limits::default(), &cancel).unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        assert_eq!(
+            tree_stamp(&root, &Limits::default(), &cancel).unwrap(),
+            before
+        );
+
+        // Three directories and one file fit a one-file budget, because only the file is counted.
+        fs::create_dir(root.join("empty").join("deeper")).unwrap();
+        fs::create_dir(root.join("another")).unwrap();
+        let tight = Limits {
+            max_files: 1,
+            ..Default::default()
+        };
+        assert!(tree_stamp(&root, &tight, &cancel).is_ok());
+    }
+
+    // "Naming a file searches it, ignored or not" cannot be at the mercy of the enumeration, so the
+    // base is resolved before Git is asked. This fixture is a Git bundle over a directory Git will
+    // refuse, which is exactly the case that used to take the explicit file down with it.
+    #[test]
+    fn naming_a_file_searches_it_even_when_the_enumeration_fails() {
+        let dir = temp_dir("evidence-explicit-file");
+        fs::write(dir.as_path().join("a.txt"), "needle\n").unwrap();
+        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        core.walk_watchdog = &ISOLATED_WALK;
+        let searched = core
+            .call(
+                "repository_search",
+                &json!({"query":"needle","path":"a.txt"}),
+            )
+            .unwrap();
+        assert_eq!(searched["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(searched["complete"], true);
+        // ... while the directory search in the same repository still refuses.
+        assert!(core
+            .call("repository_search", &json!({"query":"needle"}))
+            .is_err());
+    }
+
+    // `scan_scope` must describe the scan that ran. A Git bundle whose scan fell back to the walk
+    // would otherwise tell the reviewer its searches were Git-scoped when they were not.
+    #[test]
+    fn scan_scope_reports_the_scan_that_ran_not_the_vcs() {
+        let dir = temp_dir("evidence-scan-scope");
+        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        core.observed_stamp = Some(Drift::unavailable("stubbed"));
+        core.observed_method = Some(StampMethod::Filesystem);
+        let scope = core.call("repository_scope", &json!({})).unwrap();
+        assert_eq!(scope["scan_scope"], StampMethod::Filesystem.scan_scope());
+        assert_ne!(scope["scan_scope"], StampMethod::Git.scan_scope());
+    }
+
+    // Both ceilings truncate with the completeness flag cleared instead of refusing the call.
+    #[test]
+    fn the_file_budget_truncates_a_listing_and_a_walk() {
+        let dir = temp_dir("evidence-budget-truncates");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(dir.as_path().join(name), "hello\n").unwrap();
+        }
+        let mut small = bundle(dir.as_path());
+        small.limits.max_files = 2;
+        let mut core = Core::new(small).unwrap();
+        core.walk_watchdog = &ISOLATED_WALK;
+
+        let listed = core.call("repository_list", &json!({})).unwrap();
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["complete"], false);
+
+        let searched = core
+            .call("repository_search", &json!({"query":"hello"}))
+            .unwrap();
+        assert_eq!(searched["complete"], false);
+        assert!(!searched["matches"].as_array().unwrap().is_empty());
     }
 
     fn ok_output(bytes: &[u8]) -> ReadOutput {

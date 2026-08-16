@@ -21,7 +21,11 @@ use serde_json::{json, Value};
 
 pub const SERVER_FLAG: &str = "--evidence-server";
 pub const SERVER_NAME: &str = "cross_review_evidence";
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 by issue #86: `drifted` and the two stamps became nullable, and `repository_scope`
+/// gained `drift_unavailable` and `scan_scope`. There is no migration to write — one binary writes
+/// and reads the bundle within one process tree, and the file is deleted when the review ends — so
+/// this is the reviewer-visible declaration that the contract changed, not a compatibility switch.
+pub const SCHEMA_VERSION: u32 = 2;
 /// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
 /// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
 /// it, and the evidence read watchdog (`src/evidence/core.rs`) derives its budget from it with a
@@ -148,6 +152,133 @@ impl Limits {
     }
 }
 
+/// Cap on a stored unavailability reason, in characters. Comfortably under the 1,024-*byte* limit
+/// `Drift::validate` enforces even for multi-byte text, so truncation at construction cannot be
+/// undone by encoding.
+const MAX_DRIFT_REASON_CHARS: usize = 240;
+
+/// Which scan produced a drift stamp. Two stamps are comparable only when this matches: the Git
+/// enumeration and the filesystem walk cover different file sets, so comparing one against the
+/// other would report drift that never happened (issue #86).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StampMethod {
+    Git,
+    Filesystem,
+}
+
+impl StampMethod {
+    /// What the reviewer is told the scan covered, in words, since "no matches" and "not scanned"
+    /// are answers a model will otherwise conflate.
+    pub fn scan_scope(self) -> &'static str {
+        match self {
+            Self::Git => {
+                "files Git reports as tracked (including submodule contents) or untracked \
+                          and not ignored"
+            }
+            Self::Filesystem => {
+                "every file under the repository root except the excluded \
+                                 directory names"
+            }
+        }
+    }
+}
+
+/// A drift observation, or the reason there is not one.
+///
+/// `Option<String>` cannot express this: it conflates "not observed yet" with "observed and
+/// unavailable", and carries no method to compare against. Both distinctions are load-bearing —
+/// without the first the service re-runs an enumeration that already failed on every read, and
+/// without the second a method change between capture and read time reads as drift.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Drift {
+    Stamp { method: StampMethod, sha256: String },
+    Unavailable { reason: String },
+}
+
+impl Drift {
+    /// The reason is bounded here rather than at the call sites, because every one of them is a
+    /// formatted error and one of them carries a child process's diagnostics. Unbounded, a
+    /// sufficiently chatty Git failure would fail `validate` and take down the very
+    /// `Bundle::create` that was degrading gracefully.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        let mut reason = reason.into();
+        if reason.chars().count() > MAX_DRIFT_REASON_CHARS {
+            reason = reason
+                .chars()
+                .take(MAX_DRIFT_REASON_CHARS)
+                .collect::<String>()
+                + "…";
+        }
+        Self::Unavailable { reason }
+    }
+
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::Stamp { sha256, .. } => Some(sha256),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EvidenceError> {
+        match self {
+            Self::Stamp { sha256, .. } => {
+                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(EvidenceError::new(
+                        "invalid_bundle",
+                        "initial drift stamp is invalid",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Unavailable { reason } => {
+                if reason.is_empty() || reason.len() > 1024 {
+                    return Err(EvidenceError::new(
+                        "invalid_bundle",
+                        "drift unavailability reason is missing or too long",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Compare a capture-time baseline against a live observation: `(drifted, reason)`, where a `None`
+/// verdict always carries a reason. Total by construction — every way of not knowing produces
+/// `None` rather than a default `false`, which is the failure mode that would matter.
+pub fn compare_drift(baseline: &Drift, observed: &Drift) -> (Option<bool>, Option<String>) {
+    match (baseline, observed) {
+        (
+            Drift::Stamp {
+                method: a,
+                sha256: before,
+            },
+            Drift::Stamp {
+                method: b,
+                sha256: now,
+            },
+        ) if a == b => (Some(before != now), None),
+        (Drift::Stamp { .. }, Drift::Stamp { .. }) => (
+            None,
+            Some(
+                "the drift baseline and this observation were produced by different scan methods, \
+                 so they are not comparable"
+                    .to_string(),
+            ),
+        ),
+        (Drift::Unavailable { reason }, _) => (
+            None,
+            Some(format!("no drift baseline was captured: {reason}")),
+        ),
+        (_, Drift::Unavailable { reason }) => (
+            None,
+            Some(format!("the live tree could not be scanned: {reason}")),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bundle {
@@ -159,7 +290,7 @@ pub struct Bundle {
     pub status_summary: String,
     pub change: Option<String>,
     pub limits: Limits,
-    pub initial_stamp: String,
+    pub initial_stamp: Drift,
 }
 
 impl Bundle {
@@ -176,7 +307,10 @@ impl Bundle {
             EvidenceError::new("invalid_root", format!("cannot canonicalize root: {e}"))
         })?;
         let limits = Limits::default();
-        let initial_stamp = core::initial_stamp(&canonical, &limits)?;
+        // Deliberately not `?`: a stamp that cannot be computed is an advisory signal lost, not a
+        // review to refuse. Before issue #86 a working root with more than `max_files` entries --
+        // a vendored engine tree is enough -- failed here and took the whole review with it.
+        let initial_stamp = core::initial_stamp(&canonical, &limits, vcs.into());
         let bundle = Self {
             schema_version: SCHEMA_VERSION,
             nonce: nonce.to_string(),
@@ -215,14 +349,7 @@ impl Bundle {
                 "captured change exceeds bundle cap",
             ));
         }
-        if self.initial_stamp.len() != 64
-            || !self.initial_stamp.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(EvidenceError::new(
-                "invalid_bundle",
-                "initial drift stamp is invalid",
-            ));
-        }
+        self.initial_stamp.validate()?;
         self.limits.validate()
     }
 }
@@ -744,8 +871,12 @@ pub fn handshake(exe: &Path, bundle_file: &Path, nonce: &str) -> Result<(), Evid
     Ok(())
 }
 
-/// Full no-model readiness check used by `cross_model_review_status`.
-pub fn readiness(cfg: &crate::config::Config) -> Result<(), EvidenceError> {
+/// Full no-model readiness check used by `cross_model_review_status`. Reports how drift tracking
+/// came out as well as whether the service works: since issue #86 a tree too large to scan no
+/// longer fails a review, so "ready, but drift is unknown here" is a state a caller can be in
+/// without ever seeing it in a review, and a large repository must be distinguishable from a
+/// broken service without paying for a model call to find out.
+pub fn readiness(cfg: &crate::config::Config) -> Result<String, EvidenceError> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -773,14 +904,20 @@ pub fn readiness(cfg: &crate::config::Config) -> Result<(), EvidenceError> {
     let result = handshake(&exe, &file.path, &nonce);
     drop(file);
     drop(sterile);
-    result
+    result?;
+    Ok(match &bundle.initial_stamp {
+        Drift::Stamp { method, .. } => format!("on ({})", method.scan_scope()),
+        Drift::Unavailable { reason } => format!("unavailable - {reason}"),
+    })
 }
 
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "repository_scope",
-            "Return repository identity, selected change, limits, and drift state.",
+            "Return repository identity, selected change, limits, which files the scans cover, \
+             and drift state. A null 'drifted' means drift could not be determined, not that \
+             nothing changed; 'drift_unavailable' says why.",
             &[],
             &[],
         ),
@@ -796,7 +933,9 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "repository_search",
-            "Search UTF-8 files for a literal string.",
+            "Search UTF-8 files for a literal string. Searching a directory covers only the files \
+             'scan_scope' describes, so files Git ignores are not searched; naming an ignored file \
+             as 'path' searches it anyway. Check 'complete' before reading no matches as absence.",
             &[
                 ("query", "string"),
                 ("path", "string"),
@@ -907,13 +1046,14 @@ fn output_schema(name: &str) -> Value {
                 "schema_version":{"type":"integer"},"nonce":{"type":"string"},
                 "root":{"type":"string"},"vcs":{"type":"string"},
                 "change_label":{"type":"string"},"status_summary":{"type":"string"},
-                "limits":limits_schema(),"initial_stamp":{"type":"string"},
+                "limits":limits_schema(),"initial_stamp":{"type":["string","null"]},
                 "excluded_directory_names":{"type":"array","items":{"type":"string"}},
-                "current_stamp":{"type":"string"},"drifted":{"type":"boolean"},
+                "current_stamp":{"type":["string","null"]},"drifted":{"type":["boolean","null"]},
+                "drift_unavailable":{"type":["string","null"]},"scan_scope":{"type":"string"},
                 "complete":{"type":"boolean"},"truncated":{"type":"boolean"},
                 "cursor":{"type":"null"}
             },
-            "required":["schema_version","nonce","root","vcs","change_label","status_summary","limits","excluded_directory_names","initial_stamp","current_stamp","drifted","complete","truncated","cursor"],
+            "required":["schema_version","nonce","root","vcs","change_label","status_summary","limits","excluded_directory_names","initial_stamp","current_stamp","drifted","drift_unavailable","scan_scope","complete","truncated","cursor"],
             "additionalProperties":false
         }),
         "repository_list" => page(
@@ -935,9 +1075,10 @@ fn output_schema(name: &str) -> Value {
                 "path":{"type":"string"},"bytes":{"type":"integer"},"sha256":{"type":"string"},
                 "total_lines":{"type":"integer"},
                 "lines":{"type":"array","items":{"type":"object","properties":{"line":{"type":"integer"},"text":{"type":"string"}},"required":["line","text"],"additionalProperties":false}},
-                "complete":{"type":"boolean"},"truncated":{"type":"boolean"},"cursor":{"type":"null"},"drifted":{"type":"boolean"}
+                "complete":{"type":"boolean"},"truncated":{"type":"boolean"},"cursor":{"type":"null"},
+                "drifted":{"type":["boolean","null"]},"drift_unavailable":{"type":["string","null"]}
             },
-            "required":["path","bytes","sha256","total_lines","lines","complete","truncated","cursor","drifted"],
+            "required":["path","bytes","sha256","total_lines","lines","complete","truncated","cursor","drifted","drift_unavailable"],
             "additionalProperties":false
         }),
         "repository_change" => json!({
@@ -1053,6 +1194,112 @@ mod tests {
         assert_eq!(scope["result"]["isError"], false);
         let unknown = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{}}}), &mut core, Instant::now()).unwrap();
         assert_eq!(unknown["result"]["isError"], true);
+    }
+
+    fn stamp(method: StampMethod, byte: char) -> Drift {
+        Drift::Stamp {
+            method,
+            sha256: std::iter::repeat_n(byte, 64).collect(),
+        }
+    }
+
+    // Every way of not knowing has to produce `None` with a reason. A default `false` here is the
+    // one outcome that would matter: it tells a reviewer the tree held still when nobody looked.
+    #[test]
+    fn drift_is_only_reported_when_two_comparable_stamps_exist() {
+        let git_a = stamp(StampMethod::Git, 'a');
+        let git_b = stamp(StampMethod::Git, 'b');
+        let walk_a = stamp(StampMethod::Filesystem, 'a');
+        let missing = Drift::unavailable("the tree was too large to scan");
+
+        assert_eq!(compare_drift(&git_a, &git_a), (Some(false), None));
+        assert_eq!(compare_drift(&git_a, &git_b).0, Some(true));
+        // Same digest, different scan: the file sets are not the same file set.
+        let (verdict, reason) = compare_drift(&git_a, &walk_a);
+        assert_eq!(verdict, None);
+        assert!(reason.unwrap().contains("different scan methods"));
+        for pair in [(&missing, &git_a), (&git_a, &missing)] {
+            let (verdict, reason) = compare_drift(pair.0, pair.1);
+            assert_eq!(verdict, None);
+            assert!(reason.is_some_and(|r| r.contains("too large")));
+        }
+    }
+
+    // The reasons are formatted errors, and one of them carries a child process's diagnostics.
+    // Unbounded, a chatty Git failure would fail validation and take down the `Bundle::create` that
+    // was degrading gracefully -- turning the fix for issue #86 back into the bug.
+    #[test]
+    fn an_unavailability_reason_cannot_grow_past_what_a_bundle_accepts() {
+        let shouty = Drift::unavailable("é".repeat(10_000));
+        let Drift::Unavailable { reason } = &shouty else {
+            panic!("expected an unavailable drift");
+        };
+        assert!(reason.len() <= 1024, "{} bytes", reason.len());
+        shouty.validate().unwrap();
+        let short = Drift::unavailable("no git");
+        assert_eq!(
+            match &short {
+                Drift::Unavailable { reason } => reason.as_str(),
+                _ => unreachable!(),
+            },
+            "no git",
+            "a reason under the cap is stored verbatim"
+        );
+    }
+
+    #[test]
+    fn a_bundle_carries_an_unavailable_stamp_and_still_validates() {
+        let dir = temp_dir("evidence-unavailable-bundle");
+        let mut bundle = bundle(dir.as_path());
+        bundle.initial_stamp = Drift::unavailable("no reviewable file list");
+        bundle.validate().unwrap();
+        // Round-trips through the capability file the reviewer's service reads.
+        let encoded = serde_json::to_value(&bundle).unwrap();
+        let decoded: Bundle = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(decoded.initial_stamp, Drift::Unavailable { .. }));
+
+        bundle.initial_stamp = Drift::Stamp {
+            method: StampMethod::Git,
+            sha256: "not-a-digest".into(),
+        };
+        assert!(bundle.validate().is_err());
+        bundle.initial_stamp = Drift::unavailable("");
+        assert!(bundle.validate().is_err());
+    }
+
+    // Codex validates `structuredContent` against the declared output schema, so a null drift
+    // verdict has to be declared as well as produced.
+    #[test]
+    fn the_declared_schemas_admit_an_unknown_drift_verdict() {
+        for (tool, fields) in [
+            (
+                "repository_scope",
+                vec![
+                    "drifted",
+                    "initial_stamp",
+                    "current_stamp",
+                    "drift_unavailable",
+                ],
+            ),
+            ("repository_read", vec!["drifted", "drift_unavailable"]),
+        ] {
+            let schema = output_schema(tool);
+            let required = schema["required"].as_array().unwrap();
+            for field in fields {
+                let declared = &schema["properties"][field]["type"];
+                assert!(
+                    declared
+                        .as_array()
+                        .is_some_and(|t| t.contains(&json!("null"))),
+                    "{tool}.{field} must admit null, got {declared}"
+                );
+                assert!(
+                    required.iter().any(|r| r == field),
+                    "{tool}.{field} missing"
+                );
+            }
+            assert_eq!(schema["additionalProperties"], false);
+        }
     }
 
     #[test]
