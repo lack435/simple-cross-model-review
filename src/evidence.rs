@@ -871,6 +871,15 @@ pub fn handshake(exe: &Path, bundle_file: &Path, nonce: &str) -> Result<(), Evid
     Ok(())
 }
 
+/// The internal session name for the status preflight's lease and sterile directory.
+///
+/// The leading NUL puts it in the control-character space that user session names are forbidden
+/// from (`start_review` rejects any control character), so a real review can never pick a name that
+/// collides with the status lease or its sterile directory. It is only ever hashed (into the sterile
+/// dir name and the lock filename), never used as a path component, so the NUL reaches no filesystem
+/// call.
+const STATUS_SESSION: &str = "\u{0}cross-review-status";
+
 /// Full no-model readiness check used by `cross_model_review_status`. Reports how drift tracking
 /// came out as well as whether the service works: since issue #86 a tree too large to scan no
 /// longer fails a review, so "ready, but drift is unknown here" is a state a caller can be in
@@ -882,9 +891,28 @@ pub fn readiness(cfg: &crate::config::Config) -> Result<String, EvidenceError> {
         .unwrap_or_default()
         .as_nanos();
     let nonce = format!("status-{}-{nanos}", std::process::id());
+    // The status preflight's sterile root uses a fixed name, so two concurrent status calls would
+    // otherwise alias onto one directory and reap or drop it from under each other. Take the same
+    // per-session lease the review path holds, keyed on the same `(state_dir, name)` pair the
+    // sterile directory is named for (`STATUS_SESSION`), so a shared directory is always a
+    // serialized one. Held for the whole preflight: declared before `sterile` so it outlives it.
+    // Unlike a review this never resumes, but the lease costs nothing (a local file lock, no model
+    // call) and keeps one rule.
+    const STATUS_LEASE_WAIT: Duration = Duration::from_secs(3);
+    let _status_lease = if cfg.isolate_reviewer {
+        Some(
+            crate::session::ExclusiveLock::acquire(
+                &crate::session::session_lock_path(&cfg.state_dir, STATUS_SESSION),
+                STATUS_LEASE_WAIT,
+            )
+            .map_err(|e| EvidenceError::new("sterile_root_unavailable", e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let sterile = if cfg.isolate_reviewer {
         Some(
-            crate::reviewer::codex_sterile_dir(cfg, "cross-review-status")
+            crate::reviewer::codex_sterile_dir(cfg, STATUS_SESSION)
                 .map_err(|e| EvidenceError::new("sterile_root_unavailable", e.to_string()))?,
         )
     } else {
@@ -1149,6 +1177,19 @@ fn validate_nonce(nonce: &str) -> Result<(), EvidenceError> {
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+
+    #[test]
+    fn status_session_name_is_unreachable_by_user_sessions() {
+        // The status preflight's lease and sterile directory key on STATUS_SESSION. `start_review`
+        // rejects any control character in a user-chosen session name, so a control character here
+        // guarantees no user session can ever equal it -- and thus none can contend for the status
+        // lease or alias onto its sterile directory. If this ever became control-free, a review
+        // named "cross-review-status" would collide.
+        assert!(
+            STATUS_SESSION.chars().any(char::is_control),
+            "STATUS_SESSION must live in the control-character namespace users are forbidden from"
+        );
+    }
 
     fn bundle(root: &Path) -> Bundle {
         Bundle::create(

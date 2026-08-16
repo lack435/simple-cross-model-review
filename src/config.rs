@@ -1004,7 +1004,25 @@ impl Config {
                         );
                     }
                 }
-                "--state-dir" => state_dir = Some(PathBuf::from(take("--state-dir")?)),
+                "--state-dir" => {
+                    let dir = PathBuf::from(take("--state-dir")?);
+                    // Must be absolute, for the same reason a reviewer home must be (see
+                    // `check_profile_home`): a relative state dir resolves against whatever working
+                    // directory each process happens to run under, so two callers passing the same
+                    // relative `--state-dir` from different launch directories would key their
+                    // per-session lease (`session::session_lock_path`) and their Codex sterile
+                    // directory (`reviewer::sterile_dir_name`) on the same text but resolve to
+                    // *different* actual locks -- letting them share and stomp one sterile directory.
+                    // Requiring absolute keeps the lease and the sterile name on one unambiguous
+                    // identity. The default state dir is always absolute.
+                    if !dir.is_absolute() {
+                        return Err(format!(
+                            "--state-dir requires an absolute path, got '{}'",
+                            dir.display()
+                        ));
+                    }
+                    state_dir = Some(dir);
+                }
                 "--sandbox" => sandbox = take("--sandbox")?,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
                 "--tools" => tools = Some(take("--tools")?),
@@ -1099,6 +1117,19 @@ impl Config {
             None => scoped_claude_rules(),
         };
         let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
+        // Backstop the explicit `--state-dir` check above for the *derived* default: `default_state_dir`
+        // joins `%LOCALAPPDATA%` (or, without it, `cwd`), and a relative `LOCALAPPDATA` -- or a relative
+        // `cwd` reaching the fallback -- would yield a relative state dir that resolves against each
+        // process's launch directory. Two callers would then key the per-session lease and the Codex
+        // sterile directory on one text but open different locks, letting them stomp one sterile
+        // directory. The state dir must be absolute however it was arrived at; fail closed if it is not.
+        if !state_dir.is_absolute() {
+            return Err(format!(
+                "the state directory resolved to a relative path ('{}'); set an absolute --state-dir, \
+                 or an absolute %LOCALAPPDATA% and --cwd",
+                state_dir.display()
+            ));
+        }
 
         Ok(Self {
             reviewers,
@@ -1945,6 +1976,23 @@ mod tests {
     fn reviewer_is_required() {
         let err = Config::from_args(&args(&[])).unwrap_err();
         assert!(err.contains("--reviewer is required"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_state_dir_is_rejected() {
+        // A relative `--state-dir` resolves against each process's launch directory, so two callers
+        // passing the same relative text from different directories would key the per-session lease
+        // and the Codex sterile directory on one name but resolve to different locks -- letting them
+        // stomp one sterile directory. It is rejected at the door, like a relative reviewer home.
+        let err = Config::from_args(&args(&["--reviewer", "codex", "--state-dir", ".state"]))
+            .unwrap_err();
+        assert!(
+            err.contains("--state-dir requires an absolute path"),
+            "{err}"
+        );
+        // An absolute one is accepted.
+        Config::from_args(&args(&["--reviewer", "codex", "--state-dir", "C:\\state"]))
+            .expect("absolute state dir");
     }
 
     #[test]
