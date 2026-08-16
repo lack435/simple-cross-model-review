@@ -341,6 +341,44 @@ pub fn reviewers_exhausted_mixed(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// A terminal exhaustion was about to be reported, but a usage-gated skip in it was decided on an
+/// account the profile home no longer presents — it changed, or is no longer readable (a mid re-login
+/// or transient miss) — so the chain is not actually exhausted and the skip's "usage below minimum"
+/// would be a misreport (issue #81). Retryable. `a_reviewer_ran` is the mixed case: a later entry did
+/// run and was rate-limited, so its per-turn state (billing, the findings marker) stands as for any
+/// rate-limited turn — and because the marker is set, the retry must be a **fresh** one; the
+/// pre-start-only case ran nothing, so a plain retry re-gates.
+pub fn reviewer_account_changed(detail: impl Into<String>, a_reviewer_ran: bool) -> Failure {
+    let remediation = if a_reviewer_ran {
+        // A reviewer ran and left the findings write-ahead marker set, so a plain same-session retry
+        // is refused at the resume gate; the escape hatch is `fresh: true` (f15).
+        "The cross-model review was refused as exhausted, but a reviewer that was skipped for low \
+         usage remaining was measured on an account this profile home no longer presents — it \
+         changed, or is no longer readable — so the chain is not actually out of capacity. A later \
+         reviewer did run and was rate-limited (its turn is billed and it set the findings marker); \
+         the per-entry reasons are below.\n\n\
+         Nothing is broken. Because a reviewer ran, retry with `fresh: true` (or a new session name), \
+         carrying any still-open findings into the new instructions; the fresh review re-checks usage \
+         against the account now in the home.\n\n\
+         The review has NOT been performed."
+    } else {
+        "The cross-model review was refused as exhausted, but the reviewer(s) skipped for low usage \
+         remaining were measured on an account this profile home no longer presents — it changed, or \
+         is no longer readable — so the chain is not actually out of capacity. No reviewer ran and \
+         nothing was billed.\n\n\
+         Nothing is broken. Retry: the next review re-checks usage against the account now in the \
+         home.\n\n\
+         The review has NOT been performed."
+    };
+    Failure::new(
+        "REVIEWER_ACCOUNT_CHANGED",
+        "A reviewer skipped for low usage remaining was measured on an account this profile home no \
+         longer presents (it changed or is unreadable), so the chain is not actually exhausted; retry.",
+        remediation,
+    )
+    .with_detail(detail)
+}
+
 pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failure {
     Failure::new(
         "TIMEOUT",
@@ -911,6 +949,44 @@ mod fallback_tests {
         assert_eq!(f.code, "RATE_LIMITED");
         assert!(f.remediation.contains("fresh: true"), "{}", f.remediation);
         assert!(f.summary.contains("codex"), "{}", f.summary);
+    }
+
+    #[test]
+    fn reviewer_account_changed_is_retryable_and_words_its_two_subcases() {
+        // Issue #81. The code carries the detail and, in both sub-cases, tells the caller to retry
+        // (the next call re-gates against the current account). The two remediations differ by
+        // whether a reviewer actually ran -- billing is per-attempt and never a property of this
+        // Failure, so the contract asserted here is retryability + accurate sub-case wording.
+        let pre_start = reviewer_account_changed("codex (account changed)", false);
+        assert_eq!(pre_start.code, "REVIEWER_ACCOUNT_CHANGED");
+        assert!(pre_start.detail.as_deref().unwrap().contains("codex"));
+        assert!(
+            pre_start.remediation.contains("Retry"),
+            "{}",
+            pre_start.remediation
+        );
+        // Pre-start-only: nothing ran, so it says so and must not claim a reviewer was billed.
+        assert!(
+            pre_start.remediation.contains("No reviewer ran"),
+            "{}",
+            pre_start.remediation
+        );
+
+        let mixed = reviewer_account_changed("codex (account changed); rate-limited: claude", true);
+        assert_eq!(mixed.code, "REVIEWER_ACCOUNT_CHANGED");
+        // Mixed: a reviewer did run and was rate-limited, so the wording acknowledges it rather than
+        // claiming nothing happened -- and, because that run left the findings marker set, the retry
+        // must be a fresh one (f15), not a plain same-session retry that the resume gate would refuse.
+        assert!(
+            mixed.remediation.contains("A later reviewer did run"),
+            "{}",
+            mixed.remediation
+        );
+        assert!(
+            mixed.remediation.contains("fresh: true"),
+            "the mixed remediation must direct to a fresh retry: {}",
+            mixed.remediation
+        );
     }
 
     #[test]

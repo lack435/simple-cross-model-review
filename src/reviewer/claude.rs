@@ -1,6 +1,6 @@
 //! Claude Code adapter (`claude -p`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -207,14 +207,19 @@ impl Reviewer for ClaudeReviewer {
             .unwrap_or(Headroom::Unknown)
     }
 
-    /// The logged-in account, read from the CLI's local account file `~/.claude.json`
-    /// (`oauthAccount.accountUuid`, with the org uuid to disambiguate) — a local file, the
-    /// account *identifier* only, never the credentials in `~/.claude/.credentials.json`.
-    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
-        claude_account_id(&claude_config_path(cfg, spec)?)
+    /// The effective read home is the config-home *directory* selected for `spec` — an authorized
+    /// profile's home, else the ambient home, `None` for an unauthorized/unresolvable profile. It is
+    /// the directory (not the `.claude.json` file): `fingerprint_at` appends `.claude.json` itself, so
+    /// the default `account_fingerprint` and the gate's reread both land on `<home>/.claude.json` once,
+    /// never a doubled `.claude.json/.claude.json` (issue #81). Threaded through
+    /// [`super::home_for_reads`] so the read cannot cross an account-authorization boundary.
+    fn effective_read_home(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<PathBuf> {
+        super::home_for_reads(cfg, spec, ambient_claude_home)
     }
 
-    /// Read the account uuid straight from `home/.claude.json`, without the authorization seam.
+    /// Read the account uuid straight from `home/.claude.json`, without the authorization seam — the
+    /// `oauthAccount.accountUuid` (with the org uuid to disambiguate), never the credentials in
+    /// `~/.claude/.credentials.json`.
     fn fingerprint_at(&self, home: &Path) -> Option<String> {
         claude_account_id(&home.join(".claude.json"))
     }
@@ -622,16 +627,6 @@ fn ambient_claude_home() -> Option<std::path::PathBuf> {
     super::home_dir()
 }
 
-/// Path to Claude Code's account file `.claude.json` in the config home selected for `spec`.
-///
-/// Profile-aware: an authorized profile's home, else the ambient home. Threaded through
-/// [`super::home_for_reads`] so the fingerprint read cannot cross an account-authorization boundary —
-/// a non-ambient profile that is unauthorized yields `None` (fail open for accounting). `None` also
-/// when no home can be resolved at all.
-fn claude_config_path(cfg: &Config, spec: &ReviewerSpec) -> Option<std::path::PathBuf> {
-    super::home_for_reads(cfg, spec, ambient_claude_home).map(|h| h.join(".claude.json"))
-}
-
 /// Read a stable account identifier from `~/.claude.json`: the OAuth account uuid, combined with
 /// the organization uuid so two accounts in different orgs never collide. `None` on any miss so
 /// the gate fails open.
@@ -833,6 +828,37 @@ mod tests {
             }
             other => panic!("expected Level, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn effective_read_home_is_the_directory_and_preserves_the_home_for_reads_contract() {
+        // Ambient: the ambient config *directory* (the ambient fallback is preserved).
+        let ambient = cfg();
+        let home = ClaudeReviewer.effective_read_home(&ambient, ambient.primary());
+        assert!(home.is_some());
+        // It is the directory, not the `.claude.json` file: `fingerprint_at` appends `.claude.json`
+        // itself, so the seam must hand it the containing dir, never the file (issue #81, f6).
+        assert!(
+            !home.unwrap().ends_with(".claude.json"),
+            "effective_read_home must be the config directory, not the config file"
+        );
+
+        // A named profile is deny-all in Phase 1: unauthorized resolves to None through the seam, and
+        // the composed account_fingerprint (fingerprint_at over it) is None too -- never keyed, never
+        // gated, so the unauthorized-profile contract is preserved (issue #81, f10).
+        let profiled = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--claude-profile".into(),
+            "work".into(),
+        ])
+        .expect("config");
+        assert!(ClaudeReviewer
+            .effective_read_home(&profiled, profiled.primary())
+            .is_none());
+        assert!(ClaudeReviewer
+            .account_fingerprint(&profiled, profiled.primary())
+            .is_none());
     }
 
     #[test]

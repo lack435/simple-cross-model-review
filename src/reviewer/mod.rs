@@ -1107,13 +1107,29 @@ pub trait Reviewer: Send + Sync {
         Headroom::Unknown
     }
 
+    /// The config-home *directory* an accounting read should use for `spec` — the profile's
+    /// authorized home, the adapter's ambient home for an ambient spec, or `None` for an
+    /// unauthorized/unresolvable profile. This is exactly [`home_for_reads`] with the adapter's own
+    /// ambient fallback, so it preserves that three-way contract (authorized / ambient / `None`) by
+    /// construction; nothing here re-derives it. It is the single directory both
+    /// [`account_fingerprint`](Self::account_fingerprint) (via [`fingerprint_at`](Self::fingerprint_at))
+    /// and the proactive gate's fold-time reread go through, so the gate key and the reread cannot
+    /// drift to a different home-path shape (issue #81). `None` for an adapter with no profile concept.
+    fn effective_read_home(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<PathBuf> {
+        None
+    }
+
     /// A cheap, *current*, local account identifier for this reviewer — the one the store keys a
     /// usage observation under, so a snapshot cannot cross an account switch. Read from the CLI's
     /// own local account file (Codex `$CODEX_HOME/auth.json`, Claude `~/.claude.json`), never via
     /// a CLI call and never a secret; `None` when it cannot be read (the gate then fails open).
-    /// See `docs/usage-remaining-gate.md`.
-    fn account_fingerprint(&self, _cfg: &Config, _spec: &ReviewerSpec) -> Option<String> {
-        None
+    ///
+    /// Defined as [`fingerprint_at`](Self::fingerprint_at) over
+    /// [`effective_read_home`](Self::effective_read_home), so there is exactly one definition of "the
+    /// account under the effective home" — shared by this read and the gate's fold-time reread — and
+    /// the two cannot disagree on where to look (issue #81). See `docs/usage-remaining-gate.md`.
+    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+        self.fingerprint_at(&self.effective_read_home(cfg, spec)?)
     }
 
     /// The same account identifier as [`account_fingerprint`](Self::account_fingerprint), but read
