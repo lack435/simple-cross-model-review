@@ -2666,7 +2666,10 @@ impl Job {
                         self.usage.record(key, headroom, now_unix());
                     }
                 }
-                if out.cancelled || out.timed_out {
+                if out.cancelled || out.timed_out || out.policy_stalled {
+                    // policy_stalled (issue #68) is terminal and routed BEFORE the parse — there is
+                    // no recovery path (the f9/f10 scope cut), so a killed turn never reaches the
+                    // adapter's success parser.
                     Err(RunFailure::ordinary(reviewer::failure_for(
                         &self.cfg, &self.spec, &out,
                     )))
@@ -2779,6 +2782,9 @@ impl Job {
             self.cfg.block_repair_timeout,
             &self.cancel,
             self.reviewer.output_limits(&self.cfg),
+            // Same policy fail-fast arming as the main run; at default settings the block-repair
+            // timeout is shorter than the idle window, so timeout simply wins first.
+            reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
             |activity| {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);
@@ -3128,6 +3134,8 @@ impl Job {
             // byte/line bound; every other path keeps the retain-and-drain default. See
             // docs/usage-remaining-gate.md.
             self.reviewer.output_limits(&self.cfg),
+            // Policy fail-fast (issue #68): Codex-only, disabled when --max-policy-denials is 0.
+            reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
             |activity| {
                 self.registry
                     .report_activity(&self.id, activity.output_bytes);

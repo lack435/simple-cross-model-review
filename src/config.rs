@@ -678,6 +678,19 @@ pub const MAX_BLOCK_REPAIR_ATTEMPTS: u32 = 3;
 /// reviewer has already computed; one that cannot do so in three minutes is not going to.
 pub const DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS: u64 = 180;
 
+/// How many `blocked by policy` shell refusals a Codex turn may accumulate before it becomes
+/// eligible for a fail-fast kill (issue #68). `0` disables the fail-fast entirely. The default
+/// matches the real incident, which stalled after four composed-command refusals.
+pub const DEFAULT_MAX_POLICY_DENIALS: usize = 4;
+/// How long a Codex turn's raw stdout may stay silent, once it has passed the denial threshold,
+/// before the fail-fast concludes it is stuck and terminates it (issue #68). Deliberately
+/// conservative: `codex exec --json` emits nothing to stdout while the model is reasoning, and a
+/// measurement of 45 real max-effort turns put the largest legitimate silent gap at ~110s (p95
+/// ~98s, none over 120s), so 300s clears observed reality with wide margin. Lower it (via
+/// `--max-policy-idle-seconds`) for setups that want faster fails, e.g. at lower effort where
+/// reasoning gaps are shorter. See `docs/` and the issue-68 plan.
+pub const DEFAULT_MAX_POLICY_IDLE_SECS: u64 = 300;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The reviewer chain, in fallback order. Always non-empty; `reviewers[0]` is the primary
@@ -787,6 +800,16 @@ pub struct Config {
     /// `DEFAULT_MAX_CONCURRENT_REVIEWS`. Enforced in `Registry::try_start` under the state lock, so
     /// two concurrent starts cannot both slip past it.
     pub max_concurrent_reviews: u32,
+    /// Fail-fast threshold for a Codex reviewer stuck on policy-refused shell commands (issue #68):
+    /// the number of `blocked by policy` refusals a turn may accumulate before it becomes eligible
+    /// to be killed. `0` disables the fail-fast. Codex-only — the Claude reviewer has no such
+    /// command router. See `DEFAULT_MAX_POLICY_DENIALS`.
+    pub max_policy_denials: usize,
+    /// The idle window that pairs with `max_policy_denials`: once a Codex turn is over the denial
+    /// threshold, its raw stdout must stay silent for this long before the fail-fast terminates it.
+    /// A turn that keeps producing stdout is making progress and is never killed on this path. See
+    /// `DEFAULT_MAX_POLICY_IDLE_SECS`.
+    pub max_policy_idle: Duration,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -826,6 +849,8 @@ impl Config {
         let mut block_repair_attempts = DEFAULT_BLOCK_REPAIR_ATTEMPTS;
         let mut block_repair_timeout_secs = DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS;
         let mut max_concurrent_reviews = DEFAULT_MAX_CONCURRENT_REVIEWS;
+        let mut max_policy_denials = DEFAULT_MAX_POLICY_DENIALS;
+        let mut max_policy_idle_secs = DEFAULT_MAX_POLICY_IDLE_SECS;
         let mut state_dir: Option<PathBuf> = None;
         let mut sandbox = "read-only".to_string();
         let mut allowed_tools: Option<String> = None;
@@ -953,6 +978,23 @@ impl Config {
                             "--max-concurrent-reviews must be an integer (0 disables), got '{v}'"
                         )
                     })?;
+                }
+                "--max-policy-denials" => {
+                    let v = take("--max-policy-denials")?;
+                    max_policy_denials = v.parse().map_err(|_| {
+                        format!("--max-policy-denials must be an integer (0 disables), got '{v}'")
+                    })?;
+                }
+                "--max-policy-idle-seconds" => {
+                    let v = take("--max-policy-idle-seconds")?;
+                    max_policy_idle_secs = v.parse().map_err(|_| {
+                        format!("--max-policy-idle-seconds must be a positive integer, got '{v}'")
+                    })?;
+                    if max_policy_idle_secs == 0 {
+                        return Err("--max-policy-idle-seconds must be greater than 0; use \
+                             --max-policy-denials 0 to disable the policy fail-fast"
+                            .to_string());
+                    }
                 }
                 "--session-max-turns" => {
                     let v = take("--session-max-turns")?;
@@ -1157,6 +1199,8 @@ impl Config {
             vcs,
             resume_incremental_diff,
             max_concurrent_reviews,
+            max_policy_denials,
+            max_policy_idle: Duration::from_secs(max_policy_idle_secs),
         })
     }
 
@@ -1607,7 +1651,7 @@ impl Config {
                 Vcs::Perforce => "`repository_history` and `repository_revision` report unsupported because this service performs no new Perforce network calls.",
             };
             let shell = if self.isolate_reviewer {
-                "Your process shell runs from a sterile non-repository directory, so repo-relative shell commands are not a source of evidence. Exceptional absolute-path reads may still work, subject to the CLI command policy, and writes remain blocked by the sandbox."
+                "Your process shell runs from a sterile non-repository directory, so repo-relative shell commands are not a source of evidence -- the evidence tools above are the intended way to read and search this project, and they cover it completely. Do not reach for the shell to read or grep files. Any exceptional absolute-path read must be a single, simple command: composed shell (a pipeline with `|`, a `;`-separated pair, `Select-String`, or a `$var`/expression form) is refused non-interactively by the CLI command policy, and that refusal is final -- do not retry it as a variant, just use the evidence tools instead. Writes remain blocked by the sandbox."
             } else {
                 "Configuration isolation was explicitly disabled, so your shell runs from the reviewed repository and may self-serve additional context. The evidence tools remain the preferred bounded interface; writes remain subject to the configured sandbox."
             };
@@ -1953,6 +1997,17 @@ OPTIONS:
                               usage-<machine>.jsonl in the state directory. On by
                               default; the data is local and is what makes "where did
                               the usage go?" answerable.
+  --max-policy-denials N      Fail a Codex review fast once it has been refused N
+                              shell commands "by policy" AND its stdout then goes
+                              silent (see --max-policy-idle-seconds), instead of
+                              letting it burn the whole turn to TIMEOUT. Reported as
+                              POLICY_BLOCKED. Default 4; 0 disables. Codex-only.
+  --max-policy-idle-seconds S The stdout-silence window that pairs with
+                              --max-policy-denials: a past-threshold Codex turn is
+                              killed only after S seconds with no stdout progress, so
+                              a turn still emitting output is never cut. Default 300
+                              (max-effort Codex reasons silently for up to ~110s of
+                              observed real turns); lower it for faster fails.
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
@@ -1993,6 +2048,66 @@ mod tests {
         // An absolute one is accepted.
         Config::from_args(&args(&["--reviewer", "codex", "--state-dir", "C:\\state"]))
             .expect("absolute state dir");
+    }
+
+    #[test]
+    fn policy_fail_fast_flags_default_parse_and_validate() {
+        // Defaults (issue #68): 4 denials, 300s idle window.
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.max_policy_denials, DEFAULT_MAX_POLICY_DENIALS);
+        assert_eq!(cfg.max_policy_denials, 4);
+        assert_eq!(cfg.max_policy_idle, Duration::from_secs(300));
+
+        // Both parse.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-policy-denials",
+            "6",
+            "--max-policy-idle-seconds",
+            "120",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.max_policy_denials, 6);
+        assert_eq!(cfg.max_policy_idle, Duration::from_secs(120));
+
+        // 0 disables the denial threshold (the whole fail-fast).
+        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--max-policy-denials", "0"]))
+            .expect("config");
+        assert_eq!(cfg.max_policy_denials, 0);
+
+        // Non-integer values are rejected for both.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-policy-denials",
+            "lots",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--max-policy-denials"), "{err}");
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-policy-idle-seconds",
+            "soon",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--max-policy-idle-seconds"), "{err}");
+
+        // A zero idle window is nonsensical (it would kill instantly): rejected, pointing at the
+        // real disable switch.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--max-policy-idle-seconds",
+            "0",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--max-policy-denials 0"), "{err}");
+
+        // Documented in --help.
+        assert!(USAGE.contains("--max-policy-denials"));
+        assert!(USAGE.contains("--max-policy-idle-seconds"));
     }
 
     #[test]
@@ -3209,6 +3324,12 @@ mod tests {
         // back rather than abandon the review.
         assert!(text.contains("sterile non-repository directory"), "{text}");
         assert!(text.contains("repository_search"), "{text}");
+        // Fix 2 (issue #68): the isolated-Codex capability text steers firmly at the evidence
+        // tools and warns that composed shell is refused non-interactively, so a single refusal
+        // does not send the reviewer hunting through variants (the behaviour that burned the turn).
+        assert!(text.contains("intended way to read and search"), "{text}");
+        assert!(text.contains("Select-String"), "{text}");
+        assert!(text.contains("refusal is final"), "{text}");
     }
 
     /// The prompt the reviewer itself reads must not claim a boundary the mechanism does

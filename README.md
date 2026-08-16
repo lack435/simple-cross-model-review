@@ -915,7 +915,11 @@ usage against the current account. In the mixed sub-case a later reviewer did ru
 rate-limited, so that turn is billed and it set the findings marker -- a plain same-session retry is
 then refused at the resume gate, so retry with `fresh: true` (or a new session)),
 `INVALID_REVIEWER_CHAIN` (the configured chain is unusable, so every review is
-refused until it is fixed), `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
+refused until it is fixed), `TIMEOUT`, `POLICY_BLOCKED` (a Codex turn was refused enough shell
+commands "by policy" and then went silent on stdout, so it was ended early rather than left to burn
+the whole budget to a misleading `TIMEOUT`; the remedy is the read-only evidence tools or the other
+reviewer direction, never a wider allow-rule -- see `--max-policy-denials`), `SPAWN_FAILED`,
+`REVIEWER_FAILED`, `EMPTY_REVIEW`,
 `OUTPUT_TRUNCATED`, `EVIDENCE_UNAVAILABLE`, `EVIDENCE_CALL_ABANDONED` (the reviewer CLI gave up
 on one evidence call before it was answered and the turn did not survive it -- distinct from
 `EVIDENCE_UNAVAILABLE` because the service was up and the remedy is simply to retry),
@@ -926,10 +930,18 @@ the `--max-concurrent-reviews` backstop) get a plain correction instead, since e
 agent's own call to make and not something to escalate; so does a tool call the server could
 not start a thread for -- neither says anything about the reviewer's state.
 
-When a Codex timeout includes repeated command-policy refusals, it remains `TIMEOUT` but the
-message names the refusal count and advises against simply raising the budget. Successful
-Codex reviews surface refused commands as a note, so a review that completed after missing
-evidence is not presented as fully checked.
+A Codex turn that accumulates repeated command-policy refusals is handled two ways, by how far it
+gets. If it passes the `--max-policy-denials` threshold (default 4) and then produces no stdout for
+`--max-policy-idle-seconds` (default 300), the server terminates it early and reports
+`POLICY_BLOCKED` rather than letting it run out the clock -- nothing timed out, the reviewer was
+blocked, and the remedy differs. The long idle window is deliberate: `codex exec --json` emits
+nothing to stdout while the model is reasoning, and measured max-effort turns stay silent for up to
+~110s legitimately, so a shorter window would kill working reviews. Set `--max-policy-denials 0` to
+disable the fail-fast, or lower the window for faster fails at lower effort. If instead the turn
+reaches the hard `--timeout-seconds` deadline first, it remains `TIMEOUT`, but the message names the
+refusal count and advises against simply raising the budget. Successful Codex reviews surface
+refused commands as a note, so a review that completed after missing evidence is not presented as
+fully checked.
 
 A stale session is refused rather than silently restarted. Before a review is resumed the
 server checks that the named session still matches this reviewer, model and working root and
