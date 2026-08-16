@@ -550,6 +550,15 @@ fn toml_path(path: &Path) -> std::io::Result<String> {
 /// The *ambient* Codex home: `$CODEX_HOME`, or `~/.codex` when unset — the same resolution the CLI
 /// uses for its session and auth state when no profile redirects it.
 fn ambient_codex_home() -> Option<std::path::PathBuf> {
+    // A `#[cfg(test)]` seam so a call-site test can point the ambient home at a seeded temp dir
+    // *without* mutating the process-wide `$CODEX_HOME`. The codebase deliberately keeps env
+    // mutation out of tests (so ambient reads like `codex_home_reads_ambient_…` stay parallel-safe);
+    // a thread-local override is per-test-thread, so it races nothing (issue #81 follow-up, f17). It
+    // compiles out of the release binary entirely.
+    #[cfg(test)]
+    if let Some(home) = test_ambient_home_override() {
+        return Some(home);
+    }
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         let p = std::path::PathBuf::from(h);
         if !p.as_os_str().is_empty() {
@@ -557,6 +566,37 @@ fn ambient_codex_home() -> Option<std::path::PathBuf> {
         }
     }
     super::home_dir().map(|h| h.join(".codex"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`ambient_codex_home`]. Set for the duration of a call-site test via
+    /// [`AmbientHomeGuard`]; `None` (the default) leaves the real `$CODEX_HOME`/`~/.codex` resolution.
+    static TEST_AMBIENT_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_ambient_home_override() -> Option<PathBuf> {
+    TEST_AMBIENT_HOME.with(|o| o.borrow().clone())
+}
+
+/// RAII guard that points [`ambient_codex_home`] at `home` on this thread until it drops. Scoped so a
+/// test cannot leak the override into a sibling test sharing the thread (they do not, but the guard
+/// makes it structural). Restores the previous value on drop, so nesting is well-behaved.
+#[cfg(test)]
+pub(crate) struct AmbientHomeGuard(Option<PathBuf>);
+
+#[cfg(test)]
+pub(crate) fn override_ambient_home(home: PathBuf) -> AmbientHomeGuard {
+    let prev = TEST_AMBIENT_HOME.with(|o| o.replace(Some(home)));
+    AmbientHomeGuard(prev)
+}
+
+#[cfg(test)]
+impl Drop for AmbientHomeGuard {
+    fn drop(&mut self) {
+        TEST_AMBIENT_HOME.with(|o| *o.borrow_mut() = self.0.take());
+    }
 }
 
 /// The Codex home to read an account from for `spec`: an authorized profile's home, else the ambient

@@ -4363,6 +4363,256 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Call-site coverage of the gate → GateIdentity → GatedSkip → finalize_exhaustion threading
+    // (issue #81 follow-up, f17). The wording/relabel logic of `finalize_exhaustion` is covered
+    // directly above; these drive the *real* `gate_fresh_selection` pipeline so the account read,
+    // the store key, and the recorded skip identity are exercised together, not stubbed.
+    //
+    // The ambient Codex home is redirected to a seeded temp dir via a `#[cfg(test)]` thread-local
+    // seam (no `$CODEX_HOME` mutation — the codebase keeps env out of tests so ambient reads stay
+    // parallel-safe). The only thing stubbed is *which* directory is ambient; everything downstream
+    // is the production path.
+    //
+    // Two windows exist and only one is unit-reachable. `gate_fresh_selection` reads the fingerprint
+    // *fresh* each call and keys the gate on it, so an account that moves *between* calls is simply
+    // re-gated against the new account — the all-gated return can only relabel on a sub-microsecond
+    // race the design explicitly accepts. The load-bearing (wide) window is the fallback walk: a
+    // `GatedSkip` captured at selection, then minutes pass while another entry runs, then the
+    // terminal fold re-reads and finds the move.
+    //
+    // What these cover, precisely, and what they do NOT. The third test drives the real selection
+    // pipeline to *produce* the `pre_start_gated` vector, then hands that vector to
+    // `finalize_exhaustion` itself — so it proves the selection→finalizer data shape (the skip the
+    // pipeline builds is the one the fold relabels on a move). It does **not** execute the worker's
+    // own fold: the `std::mem::take(&mut self.pre_start_gated)` seed ([tools.rs:2208]) and the
+    // terminal `finalize_exhaustion` call after a rate-limited attempt ([tools.rs:2368]) are not
+    // driven here, so a regression that dropped `pre_start_gated` on the way into the walk, or
+    // bypassed the fold, would not be caught by this test — only by one that runs the walk. Reaching
+    // that fold needs a live rate-limited spawn (and the mixed case's `billed: true` + findings
+    // marker are set by the attempt path, upstream of `finalize_exhaustion`), which `cargo test`
+    // forbids. `smoke.ps1` does not cover it either — it runs a single reviewer with no gate or
+    // account switch — so the walk's live terminal fold remains genuinely uncovered by automated
+    // tests: the residual half of f17, recorded here rather than papered over.
+
+    /// Seed `home/auth.json` with a Codex ChatGPT account id (the identifier the gate fingerprints).
+    fn write_codex_account(home: &std::path::Path, account: &str) {
+        std::fs::write(
+            home.join("auth.json"),
+            format!(r#"{{"auth_mode":"chatgpt","tokens":{{"account_id":"{account}"}}}}"#),
+        )
+        .expect("write auth.json");
+    }
+
+    /// A resolvable stub `--bin` (an existing file is all `resolve_bin` requires; it is never run).
+    fn stub_bin(dir: &std::path::Path, name: &str) -> PathBuf {
+        let bin = dir.join(name);
+        std::fs::write(&bin, b"stub").expect("write stub bin");
+        bin
+    }
+
+    /// A `Headroom::Fraction` below any `--min-usage-remaining`, actionable at `now`, so the entry
+    /// it is recorded for gates.
+    fn below_minimum(now: u64) -> Headroom {
+        Headroom::Fraction {
+            remaining_pct: 1.0,
+            resets_at: Some(now + 3600),
+        }
+    }
+
+    #[test]
+    fn gate_fresh_selection_all_gated_returns_real_exhaustion_through_the_pipeline() {
+        // A single armed Codex entry whose store observation is below its minimum: the whole
+        // gate_fresh_selection pipeline runs, records a GatedSkip carrying the seeded home+account,
+        // and finalize_exhaustion re-reads that home and finds it *unchanged* -> today's exhaustion.
+        // This is the call-site proof that the recorded skip's `home` is the directory (not the
+        // `.claude.json`/`auth.json` file) and its fingerprint matches, so the fold-time reread
+        // round-trips rather than spuriously reading None (the double-append / path-shape trap).
+        let now = 1_000_000;
+        let dir = crate::testutil::temp_dir("cross-review-gate-callsite-allgated");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        write_codex_account(&home, "acct-1");
+        let bin = stub_bin(&dir, "codex.exe");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--bin".into(),
+            bin.to_string_lossy().into_owned(),
+            "--min-usage-remaining".into(),
+            "50".into(),
+            "--state-dir".into(),
+            dir.to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let app = App::new(cfg);
+        let _guard = reviewer::codex::override_ambient_home(home.clone());
+
+        // The entry's real gate identity — one fingerprint read of the seeded ambient home.
+        let id = usage_headroom_key(app.cfg(), app.cfg().primary())
+            .expect("armed + resolvable bin + readable account => Some");
+        assert_eq!(id.home, home, "the identity home is the config *directory*");
+        assert_eq!(id.fingerprint, "acct-1");
+        // Seed the store below the minimum for exactly that key, so the sole entry gates.
+        app.usage.record(&id.key, below_minimum(now), now);
+
+        // Match rather than `expect_err`, which would require `FreshSelection: Debug` — a production
+        // derive added only for a test.
+        let err = match app.gate_fresh_selection(now) {
+            Ok(_) => panic!("the only entry is gated => terminal exhaustion"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "REVIEWERS_EXHAUSTED");
+        // The exact exhaustion wording is asserted byte-for-byte in the finalize_exhaustion tests
+        // (which control `describe`); here the point is that the pipeline reached the pure-gated
+        // exhaustion arm and re-added the "(usage below minimum)" suffix for the real entry.
+        let detail = err.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with("every configured reviewer was skipped for low usage remaining"),
+            "{detail}"
+        );
+        assert!(detail.contains("(usage below minimum)"), "{detail}");
+    }
+
+    #[test]
+    fn a_cleared_entry_is_selected_so_the_pipeline_never_gates_it() {
+        // The complement: the same armed entry with an *ample* observation clears the gate and is
+        // selected, so no skip is recorded. Guards against a threading regression that gated on a
+        // key the store never matched (e.g. a home/fingerprint the record was not filed under).
+        let now = 2_000_000;
+        let dir = crate::testutil::temp_dir("cross-review-gate-callsite-clears");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        write_codex_account(&home, "acct-1");
+        let bin = stub_bin(&dir, "codex.exe");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--bin".into(),
+            bin.to_string_lossy().into_owned(),
+            "--min-usage-remaining".into(),
+            "50".into(),
+            "--state-dir".into(),
+            dir.to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let app = App::new(cfg);
+        let _guard = reviewer::codex::override_ambient_home(home.clone());
+
+        let id = usage_headroom_key(app.cfg(), app.cfg().primary()).expect("Some");
+        app.usage.record(
+            &id.key,
+            Headroom::Fraction {
+                remaining_pct: 90.0,
+                resets_at: Some(now + 3600),
+            },
+            now,
+        );
+
+        let sel = app
+            .gate_fresh_selection(now)
+            .expect("an entry that clears its minimum is selected, not gated");
+        assert_eq!(sel.start_index, 0);
+        assert!(sel.pre_start_gated.is_empty());
+        // Both skip vectors the gate populates must be empty — `pre_start_gated` (the account-carrying
+        // relabel input) *and* `pre_start_skips` (the non-billed metrics records). Asserting only the
+        // former would pass even if a metrics skip were wrongly recorded for a cleared entry (f2).
+        assert!(sel.pre_start_skips.is_empty());
+        assert_eq!(sel.start_usage_key.as_deref(), Some(id.key.as_str()));
+    }
+
+    #[test]
+    fn pre_start_gated_skip_threads_the_account_the_walk_folds_and_relabels_on_move() {
+        // The wide window, deterministically and spawn-free. A two-entry chain: entry 0 (codex/binA)
+        // is armed and below its minimum, so selection skips it; entry 1 (codex/binB, no minimum)
+        // clears and is chosen. The FreshSelection therefore carries a *pipeline-built* GatedSkip for
+        // entry 0, recorded on the account under the home at selection time.
+        let now = 3_000_000;
+        let dir = crate::testutil::temp_dir("cross-review-gate-callsite-prestart");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        write_codex_account(&home, "acct-1");
+        let bin_a = stub_bin(&dir, "codex-a.exe");
+        let bin_b = stub_bin(&dir, "codex-b.exe");
+        // Two Codex entries with distinct bins are not identity-duplicates (validate_chain compares
+        // the bin), so this is a legal fallback chain that shares the one ambient home.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--bin".into(),
+            bin_a.to_string_lossy().into_owned(),
+            "--min-usage-remaining".into(),
+            "50".into(),
+            "--reviewer".into(),
+            "codex".into(),
+            "--bin".into(),
+            bin_b.to_string_lossy().into_owned(),
+            "--state-dir".into(),
+            dir.to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let app = App::new(cfg);
+        let _guard = reviewer::codex::override_ambient_home(home.clone());
+
+        // Gate entry 0 by seeding its key below minimum; entry 1 has no minimum and always clears.
+        let id0 = usage_headroom_key(app.cfg(), &app.cfg().reviewers[0]).expect("Some");
+        app.usage.record(&id0.key, below_minimum(now), now);
+
+        let sel = app
+            .gate_fresh_selection(now)
+            .expect("entry 1 clears and is selected");
+        assert_eq!(
+            sel.start_index, 1,
+            "the gated primary is skipped for the fallback"
+        );
+        assert_eq!(
+            sel.pre_start_gated.len(),
+            1,
+            "entry 0's skip is carried to the walk"
+        );
+        // The gate records the same skip in both vectors: the metrics `Attempt` (non-billed) and the
+        // account-carrying GatedSkip the fold relabels on. Assert both, so a regression that populated
+        // one but not the other is caught.
+        assert_eq!(sel.pre_start_skips.len(), 1, "entry 0's metrics skip");
+        let skip = &sel.pre_start_gated[0];
+        assert_eq!(skip.reviewer, ReviewerKind::Codex);
+        assert_eq!(
+            skip.home, home,
+            "the skip stores the read *directory* for the fold-time reread"
+        );
+        assert_eq!(
+            skip.fingerprint, "acct-1",
+            "the account the skip was decided on"
+        );
+
+        // NOTE: this folds `sel.pre_start_gated` directly, which proves the selection→finalizer data
+        // shape but NOT the worker's own fold (the `mem::take` seed at [tools.rs:2208] and the terminal
+        // call at [tools.rs:2368]); see the module comment above for why that path needs a live spawn
+        // and is left uncovered. Account unchanged => real exhaustion, mixed wording (a reviewer ran).
+        let stable = finalize_exhaustion(&["codex (rate-limited)".into()], &sel.pre_start_gated);
+        assert_eq!(stable.code, "REVIEWERS_EXHAUSTED");
+
+        // Now the wide window fires: minutes have passed (the fallback ran), and the profile home has
+        // re-logged to a different, healthy account. The *same* pipeline-built skip is stale at the
+        // fold, so the chain is not truly exhausted -> retryable relabel, mixed remediation.
+        write_codex_account(&home, "acct-2");
+        let moved = finalize_exhaustion(&["codex (rate-limited)".into()], &sel.pre_start_gated);
+        assert_eq!(moved.code, "REVIEWER_ACCOUNT_CHANGED");
+        assert!(
+            moved
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("account changed or no longer readable"),
+            "{moved:?}"
+        );
+        assert!(
+            moved.remediation.contains("A later reviewer did run"),
+            "a reviewer ran, so the remediation directs to a fresh retry: {}",
+            moved.remediation
+        );
+    }
+
     #[test]
     fn a_gated_skip_attempt_is_non_billed() {
         let spec = Config::from_args(&["--reviewer".into(), "codex".into()])
