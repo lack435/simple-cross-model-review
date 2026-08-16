@@ -139,6 +139,17 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   fresh session; do not treat the stop as licence to drop one. When `structured` is false there is no machine record for that turn:
   the empty `findings` list means nothing was recorded, not that nothing was wrong, and the review
   is in `review_prose` and the text body. Read it; do not re-run blind.
+- **`changes_requested` with `non_convergence_reason: verdict_contradiction` and `verdict_detail:
+  approve` may be a *deferral*, not a demand — the one case where `outcome` alone is not enough.** The
+  reviewer approved the diff but held a finding open because it is real and belongs in another PR.
+  `open_count > 0` under an `approve` verdict correctly fails closed to `changes_requested`, because the
+  machine record cannot distinguish a *deferred* finding from an *ignored* one (issue #82). So in
+  exactly that combination, read `review_prose`: if the reviewer calls the open finding a tracked,
+  out-of-scope follow-up rather than a blocker, there is nothing to act on — note where it belongs and
+  proceed, rather than spending a round asking it to restate what it already said. Do **not** work
+  around this by getting the reviewer to mark a genuinely-deferred finding `resolved` — that corrupts
+  the record. If that temptation recurs, that is the signal to revisit #82 (a reviewer-set deferral
+  disposition, which removes the ambiguity rather than annotating it) instead of documenting around it.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
   and what is still disputed. Keep findings the reviewer has confirmed resolved separate
   from ones you argued against — they are not the same claim.
