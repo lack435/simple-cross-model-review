@@ -225,8 +225,14 @@ authorized for, so a profile home re-logged mid-review files nothing under the a
 gate therefore acts on the freshest prior *verified* observation; the first review
 against a never-seen account is ungated because there is nothing yet to gate on. Nothing
 proactive happens unless at least one entry sets a minimum: with none, Claude keeps its
-buffered output and no usage store is touched. If every entry is gated out (or rate-limited),
-the review is refused with `REVIEWERS_EXHAUSTED`, naming each entry's reason. `status` /
+buffered output and no usage store is touched. A gate *skip* is likewise provisional on the
+account it was measured for: if the chain would be reported exhausted but a skipped reviewer's
+profile home now presents a different account, or none that can be read, the skip is stale and the
+review is refused as the retryable `REVIEWER_ACCOUNT_CHANGED` rather than a false
+`REVIEWERS_EXHAUSTED` (retry re-checks against the current account — plain if nothing ran, with
+`fresh: true` if a reviewer had already run; see the failure-code list). If every entry is gated out
+(or rate-limited) and no skip is stale, the review is refused with `REVIEWERS_EXHAUSTED`, naming each
+entry's reason. `status` /
 `--doctor` show each entry's minimum and last-observed headroom. Full design, including the
 verified spike that found these signals, is in
 [docs/usage-remaining-gate.md](docs/usage-remaining-gate.md).
@@ -901,7 +907,14 @@ Report this to the user:
 
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `REVIEWERS_EXHAUSTED` (every entry in a fallback chain hit a rate/usage
-limit), `INVALID_REVIEWER_CHAIN` (the configured chain is unusable, so every review is
+limit), `REVIEWER_ACCOUNT_CHANGED` (a chain would have been reported exhausted, but a reviewer
+skipped by the proactive usage gate was measured on an account the profile home no longer
+presents -- it changed or is no longer readable, so the chain is not actually out of capacity;
+**retryable**. In the pre-start-only sub-case nothing ran or was billed, so a plain retry re-checks
+usage against the current account. In the mixed sub-case a later reviewer did run and was
+rate-limited, so that turn is billed and it set the findings marker -- a plain same-session retry is
+then refused at the resume gate, so retry with `fresh: true` (or a new session)),
+`INVALID_REVIEWER_CHAIN` (the configured chain is unusable, so every review is
 refused until it is fixed), `TIMEOUT`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`,
 `OUTPUT_TRUNCATED`, `EVIDENCE_UNAVAILABLE`, `EVIDENCE_CALL_ABANDONED` (the reviewer CLI gave up
 on one evidence call before it was answered and the turn did not survive it -- distinct from

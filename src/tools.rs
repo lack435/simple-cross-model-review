@@ -300,16 +300,12 @@ fn post_run_account_refusal<T>(
 /// - **Ambient** (`None` pin) keeps the selection key, because ambient has no pinned profile account
 ///   to bind to and is not guarded either. It is the unchanged posture, not an oversight.
 ///
-/// What this does *not* fix, and does not claim to: the gate *decision* for this entry was made
-/// against the selection-time account, and nothing re-checks it afterwards. The decision itself is
-/// sound — the fingerprint read and the store lookup are adjacent, and the key *is* the account match,
-/// so a snapshot never gates an account it does not belong to. What is not sound is the assumption that
-/// the account which was gated is the account that would have run: a re-login after the decision means
-/// an entry was skipped on the strength of the departed account's figure, and a skipped entry never
-/// reaches an attempt, so there is no later pin to compare against. Left as a follow-up rather than
-/// fixed here — see "The gate decision is a separate defect" in `docs/post-run-account-check.md` for
-/// the cost, the one variant with a genuinely wide window, and why closing it is walk surgery rather
-/// than a line.
+/// What this does not touch — a separate concern, now handled elsewhere: the gate *decision* for a
+/// *skipped* entry was made against the selection-time account. A re-login after the decision means an
+/// entry was skipped on the departed account's figure, and a skipped entry never reaches an attempt, so
+/// there is no later pin to compare against. That is handled not here but at the terminal exhaustion, by
+/// [`finalize_exhaustion`], which re-reads each gated skip and relabels to `REVIEWER_ACCOUNT_CHANGED`
+/// when the account has moved (issue #81; see `docs/gate-decision-account-read.md`).
 fn write_usage_key(
     reviewer: ReviewerKind,
     bin: &std::path::Path,
@@ -327,33 +323,110 @@ fn write_usage_key(
     }
 }
 
-/// The usage-headroom store key for a chain entry, or `None` when the entry cannot be keyed and
+/// The usage-headroom identity for a chain entry: the store key, and the home directory and account
+/// fingerprint the key was built from — **one** fingerprint read, exposed so the gate decision, the
+/// carried store key, and a gated skip's recorded identity all come from that single read and cannot
+/// disagree (issue #81). `home` is the effective read *directory* (via
+/// [`Reviewer::effective_read_home`](crate::reviewer::Reviewer::effective_read_home)), so a later
+/// `fingerprint_at(home)` compares like-for-like without a path-shape mismatch.
+#[derive(Clone)]
+struct GateIdentity {
+    key: String,
+    home: PathBuf,
+    fingerprint: String,
+}
+
+/// The usage-headroom identity for a chain entry, or `None` when the entry cannot be keyed and
 /// so is never gated: the chain is not armed, the entry has no minimum, its binary cannot be
 /// resolved, or its account fingerprint cannot be read. Reads only cheap local sources — a
 /// PATH resolve and a local account file — so it neither auth-checks nor spawns; it is safe to
-/// call during selection, before any preflight. The account fingerprint is read *here*, once, and
-/// this key is what the gate *decision* uses; the write is rebound to the attempt's pinned account
-/// by [`write_usage_key`]. See `docs/usage-remaining-gate.md`.
-fn usage_headroom_key(cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
+/// call during selection, before any preflight. The account fingerprint is read *here, once*: the
+/// key is built from it and the same value is what a gated skip records, so the gate decision and
+/// the fold-time reread cannot drift. See `docs/usage-remaining-gate.md`.
+fn usage_headroom_key(cfg: &Config, spec: &ReviewerSpec) -> Option<GateIdentity> {
     if !cfg.chain_gates_on_usage() {
         return None;
     }
     let bin = reviewer::resolve_bin(spec).ok()?;
-    let account = reviewer::for_kind(spec.reviewer).account_fingerprint(cfg, spec)?;
-    Some(crate::usage::entry_key(
-        spec.reviewer.as_str(),
-        &bin,
-        &account,
-    ))
+    let adapter = reviewer::for_kind(spec.reviewer);
+    let home = adapter.effective_read_home(cfg, spec)?;
+    let fingerprint = adapter.fingerprint_at(&home)?;
+    let key = crate::usage::entry_key(spec.reviewer.as_str(), &bin, &fingerprint);
+    Some(GateIdentity {
+        key,
+        home,
+        fingerprint,
+    })
 }
 
-/// The terminal `REVIEWERS_EXHAUSTED` failure, worded for the actual cause (round-6 finding f7):
-/// pure rate-limited (today's exact detail, so the single-reviewer path is unchanged), pure
-/// proactive-gate, or a mix. `rate` holds `describe_with_bin` strings of rate-limited entries;
-/// `gated` holds already-reasoned describe strings of gated entries. See
-/// `docs/usage-remaining-gate.md`.
-fn exhaustion_failure(rate: &[String], gated: &[String]) -> Failure {
-    if gated.is_empty() {
+/// A proactive-gate skip, carrying the account its skip was *decided on* so a terminal exhaustion can
+/// re-verify it (issue #81). `home` is the effective read directory and `fingerprint` the account then
+/// under it; `describe` is the bare `spec.describe()` (the "(usage below minimum)" wording is added at
+/// exhaustion time, so it is not baked in and stays correct if the skip turns out to be stale).
+#[derive(Clone)]
+struct GatedSkip {
+    describe: String,
+    reviewer: crate::config::ReviewerKind,
+    home: PathBuf,
+    fingerprint: String,
+}
+
+/// The single, sole constructor of a terminal exhaustion outcome (issue #81 — folds in the former
+/// `exhaustion_failure` and `gate_fresh_selection`'s direct return, so both terminal returns are one
+/// code path and the wiring is structural, not test-policed).
+///
+/// A usage-gate skip is honest only while the account it was decided on is still the account under the
+/// home. Each `GatedSkip` is re-read here (a local `fingerprint_at`, no spawn/auth/lease, so this is
+/// safe on `gate_fresh_selection`'s pre-lease path); a skip whose account has **moved or become
+/// unreadable** is *stale* — unreadable counts as stale to match the gate's own fail-open posture
+/// (an unreadable identity is never gated in the first place). If any skip is stale the chain is not
+/// exhausted, so this returns the retryable [`errors::reviewer_account_changed`] naming the moved
+/// reviewer(s) — `rate.is_empty()` selecting the pre-start-only vs mixed remediation — rather than a
+/// false "usage below minimum". Only when **every** skip is still valid does it fall through to today's
+/// exhaustion wording (pure-rate / pure-gated / mixed), byte-for-byte unchanged. `rate` holds
+/// `describe_with_bin` strings of rate-limited entries.
+fn finalize_exhaustion(rate: &[String], gated: &[GatedSkip]) -> Failure {
+    let stale: Vec<&GatedSkip> = gated
+        .iter()
+        .filter(|s| {
+            reviewer::for_kind(s.reviewer)
+                .fingerprint_at(&s.home)
+                .as_deref()
+                != Some(s.fingerprint.as_str())
+        })
+        .collect();
+    if !stale.is_empty() {
+        // "Stale" is a changed fingerprint *or* an unreadable one (mid re-login / transient): both mean
+        // the skip is not evidence of current low usage, but only the first is a proven account change,
+        // so the wording says "changed or no longer readable" rather than asserting a re-login (f16).
+        let moved = stale
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} (account changed or no longer readable since it was measured)",
+                    s.describe
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (detail, a_reviewer_ran) = if rate.is_empty() {
+            (moved, false)
+        } else {
+            (
+                format!("{moved}; also rate-limited this turn: {}", rate.join("; ")),
+                true,
+            )
+        };
+        return errors::reviewer_account_changed(detail, a_reviewer_ran);
+    }
+
+    // Every gated skip is still valid: reconstruct today's exact wording. The "(usage below minimum)"
+    // suffix is re-added here so the exhaustion detail is byte-for-byte what it was before #81.
+    let gated_descs: Vec<String> = gated
+        .iter()
+        .map(|s| format!("{} (usage below minimum)", s.describe))
+        .collect();
+    if gated_descs.is_empty() {
         errors::reviewers_exhausted(format!(
             "every configured reviewer reported a rate/usage limit, in order: {}",
             rate.join("; ")
@@ -361,11 +434,11 @@ fn exhaustion_failure(rate: &[String], gated: &[String]) -> Failure {
     } else if rate.is_empty() {
         errors::reviewers_exhausted_gated(format!(
             "every configured reviewer was skipped for low usage remaining, in order: {}",
-            gated.join("; ")
+            gated_descs.join("; ")
         ))
     } else {
         let mut parts: Vec<String> = rate.iter().map(|d| format!("{d} (rate-limited)")).collect();
-        parts.extend(gated.iter().cloned());
+        parts.extend(gated_descs.iter().cloned());
         errors::reviewers_exhausted_mixed(format!(
             "every configured reviewer was exhausted (rate limit or usage minimum): {}",
             parts.join("; ")
@@ -375,12 +448,13 @@ fn exhaustion_failure(rate: &[String], gated: &[String]) -> Failure {
 
 /// The result of the fresh-review proactive gate selection: the entry to start on, the
 /// non-billed skips recorded before it, and that entry's usage-store key (one fingerprint
-/// reading, carried so the later store write matches the gate decision). See
+/// reading, carried so the later store write matches the gate decision). `pre_start_gated`
+/// carries each skip's decided-on account for the terminal reread (issue #81). See
 /// `docs/usage-remaining-gate.md`.
 struct FreshSelection {
     start_index: usize,
     pre_start_skips: Vec<metrics::Attempt>,
-    pre_start_gated_descs: Vec<String>,
+    pre_start_gated: Vec<GatedSkip>,
     start_usage_key: Option<String>,
 }
 
@@ -498,19 +572,25 @@ impl App {
     /// `docs/usage-remaining-gate.md`.
     fn gate_fresh_selection(&self, now: u64) -> Result<FreshSelection, Failure> {
         let mut pre_start_skips: Vec<metrics::Attempt> = Vec::new();
-        let mut pre_start_gated_descs: Vec<String> = Vec::new();
+        let mut pre_start_gated: Vec<GatedSkip> = Vec::new();
         for (i, spec) in self.cfg.reviewers.iter().enumerate() {
-            // The key resolves the bin (a cheap PATH scan, no auth) and reads the account
-            // fingerprint from a local file; `None` when the chain is unarmed or identity cannot
-            // be established, in which case the entry is never gated (fail-open).
-            let key = usage_headroom_key(&self.cfg, spec);
+            // The identity resolves the bin (a cheap PATH scan, no auth) and reads the account
+            // fingerprint from a local file *once*; `None` when the chain is unarmed or identity
+            // cannot be established, in which case the entry is never gated (fail-open).
+            let identity = usage_headroom_key(&self.cfg, spec);
             if spec.usage_minimum.is_gating() {
-                if let Some(k) = &key {
-                    if !self.usage.get(k, now).clears(&spec.usage_minimum) {
+                if let Some(id) = &identity {
+                    if !self.usage.get(&id.key, now).clears(&spec.usage_minimum) {
                         pre_start_skips
                             .push(gated_skip_attempt(spec, reviewer::resolve_bin(spec).ok()));
-                        pre_start_gated_descs
-                            .push(format!("{} (usage below minimum)", spec.describe()));
+                        // Record the account this skip was decided on, so a terminal exhaustion can
+                        // re-verify it (issue #81).
+                        pre_start_gated.push(GatedSkip {
+                            describe: spec.describe(),
+                            reviewer: spec.reviewer,
+                            home: id.home.clone(),
+                            fingerprint: id.fingerprint.clone(),
+                        });
                         continue;
                     }
                 }
@@ -518,14 +598,16 @@ impl App {
             return Ok(FreshSelection {
                 start_index: i,
                 pre_start_skips,
-                pre_start_gated_descs,
-                start_usage_key: key,
+                pre_start_gated,
+                // Only the key is carried forward — the start entry cleared the gate and is never
+                // skip-recorded, so its home/fingerprint are not needed downstream.
+                start_usage_key: identity.map(|id| id.key),
             });
         }
-        Err(errors::reviewers_exhausted_gated(format!(
-            "every configured reviewer was skipped for low usage remaining, in order: {}",
-            pre_start_gated_descs.join("; ")
-        )))
+        // Every entry was gated: sole-constructor terminal exhaustion, which re-verifies each skip's
+        // account and relabels to REVIEWER_ACCOUNT_CHANGED if any has moved (issue #81). The reread is
+        // a local `fingerprint_at`, so the pre-lease/no-spawn contract holds.
+        Err(finalize_exhaustion(&[], &pre_start_gated))
     }
 
     // -----------------------------------------------------------------------
@@ -751,7 +833,7 @@ impl App {
         let FreshSelection {
             start_index,
             pre_start_skips,
-            pre_start_gated_descs,
+            pre_start_gated,
             start_usage_key,
         } = match &prior {
             Some(record) => {
@@ -759,8 +841,9 @@ impl App {
                 FreshSelection {
                     start_index: idx,
                     pre_start_skips: Vec::new(),
-                    pre_start_gated_descs: Vec::new(),
-                    start_usage_key: usage_headroom_key(&self.cfg, &self.cfg.reviewers[idx]),
+                    pre_start_gated: Vec::new(),
+                    start_usage_key: usage_headroom_key(&self.cfg, &self.cfg.reviewers[idx])
+                        .map(|id| id.key),
                 }
             }
             None => match pre_lease_fresh_sel.take() {
@@ -868,7 +951,7 @@ impl App {
             metrics: Arc::clone(&self.metrics),
             usage: Arc::clone(&self.usage),
             pre_start_skips,
-            pre_start_gated_descs,
+            pre_start_gated,
             start_usage_key,
             bin: ready.bin,
             id: id.clone(),
@@ -1438,7 +1521,7 @@ impl App {
         let now = now_unix();
         let observed = match usage_headroom_key(&self.cfg, spec) {
             None => "unknown (identity unavailable)".to_string(),
-            Some(key) => match self.usage.observation(&key, now) {
+            Some(id) => match self.usage.observation(&id.key, now) {
                 None => "none recorded yet".to_string(),
                 Some(o) => {
                     let value = match o.headroom {
@@ -1704,9 +1787,10 @@ struct Job {
     /// Non-billed `Attempt`s for entries the proactive gate skipped during pre-start selection,
     /// seeded into the walk's metrics history so a pre-start skip is still recorded on the turn.
     pre_start_skips: Vec<metrics::Attempt>,
-    /// Describe strings of the pre-start-gated entries, prepended to a terminal
-    /// `REVIEWERS_EXHAUSTED` detail so an exhaustion names every entry and its reason.
-    pre_start_gated_descs: Vec<String>,
+    /// The pre-start-gated entries, each carrying the account its skip was decided on, prepended to a
+    /// terminal exhaustion so it names every entry and its reason — and so `finalize_exhaustion` can
+    /// re-verify each skip's account and relabel to `REVIEWER_ACCOUNT_CHANGED` if it moved (issue #81).
+    pre_start_gated: Vec<GatedSkip>,
     /// The store key for the start entry, computed at selection from one fingerprint reading, so
     /// this entry's observation is written under the same identity the gate read (no TOCTOU).
     /// `None` when unarmed or identity could not be established.
@@ -2117,10 +2201,11 @@ impl Job {
         let mut disposition = disposition;
         // Describe strings of every rate-limited entry, for the REVIEWERS_EXHAUSTED detail.
         let mut rate_limited_attempts: Vec<String> = Vec::new();
-        // Describe strings of every entry the proactive gate skipped (pre-start + in-walk), for a
-        // terminal REVIEWERS_EXHAUSTED detail. Seeded from the pre-start selection so an exhaustion
-        // names entries skipped before the walk too. See `docs/usage-remaining-gate.md`.
-        let mut gated_descs: Vec<String> = std::mem::take(&mut self.pre_start_gated_descs);
+        // Every entry the proactive gate skipped (pre-start + in-walk), each carrying the account its
+        // skip was decided on, for a terminal exhaustion. Seeded from the pre-start selection so an
+        // exhaustion names entries skipped before the walk too, and so `finalize_exhaustion` can
+        // re-verify each one's account. See `docs/usage-remaining-gate.md`.
+        let mut gated: Vec<GatedSkip> = std::mem::take(&mut self.pre_start_gated);
         // The earlier attempts, for the metrics record's `attempts` history (the terminal attempt
         // is the record itself, so it is not repeated here). Seeded with the pre-start gated skips
         // (non-billed), so a skip selected before the walk is still recorded on the turn.
@@ -2132,13 +2217,19 @@ impl Job {
 
         for (pos, &i) in walk.iter().enumerate() {
             let entry = chain[i].clone();
-            // The active entry's usage-store key: the start entry's was computed at selection (one
-            // fingerprint reading, carried in), a fallback's is computed here at its own launch.
-            // `None` when unarmed or identity could not be established.
+            // The active entry's usage identity. The start entry's store key was carried from
+            // selection (one fingerprint reading — it cleared the gate and is never skip-recorded, so
+            // only the key is needed); a fallback's full identity (key + the account it was measured
+            // on) is computed here at its own launch, because a gated fallback must record that
+            // account for the terminal reread (issue #81). `None` when unarmed or identity could not
+            // be established.
+            let fallback_identity = (i != self.start_index)
+                .then(|| usage_headroom_key(&self.cfg, &entry))
+                .flatten();
             let active_usage_key = if i == self.start_index {
                 self.start_usage_key.clone()
             } else {
-                usage_headroom_key(&self.cfg, &entry)
+                fallback_identity.as_ref().map(|id| id.key.clone())
             };
             // Proactive gate for a *fallback* entry, checked as the first thing in the iteration —
             // before `set_active` (so a skipped entry is never published as the active reviewer)
@@ -2146,21 +2237,31 @@ impl Job {
             // start entry was already gate-selected in `start_review`, so it is not re-gated here.
             // See `docs/usage-remaining-gate.md`.
             if i != self.start_index && entry.usage_minimum.is_gating() {
-                let gated = active_usage_key
-                    .as_ref()
-                    .is_some_and(|k| !self.usage.get(k, now_unix()).clears(&entry.usage_minimum));
-                if gated {
+                let gated_now = fallback_identity.as_ref().is_some_and(|id| {
+                    !self
+                        .usage
+                        .get(&id.key, now_unix())
+                        .clears(&entry.usage_minimum)
+                });
+                if gated_now {
+                    let id = fallback_identity.expect("gated_now requires a resolved identity");
                     metrics_attempts.push(gated_skip_attempt(
                         &entry,
                         reviewer::resolve_bin(&entry).ok(),
                     ));
-                    gated_descs.push(format!("{} (usage below minimum)", entry.describe()));
+                    gated.push(GatedSkip {
+                        describe: entry.describe(),
+                        reviewer: entry.reviewer,
+                        home: id.home,
+                        fingerprint: id.fingerprint,
+                    });
                     if pos == walk.len() - 1 {
-                        // The last entry was gated: the chain is exhausted. Set the terminal
-                        // outcome explicitly rather than falling through to WORKER_PANICKED.
-                        outcome = Some(Outcome::failed(exhaustion_failure(
+                        // The last entry was gated: the chain is exhausted. Sole-constructor terminal
+                        // outcome, which re-verifies each skip and relabels to REVIEWER_ACCOUNT_CHANGED
+                        // if any skip's account moved (issue #81), rather than falling to WORKER_PANICKED.
+                        outcome = Some(Outcome::failed(finalize_exhaustion(
                             &rate_limited_attempts,
-                            &gated_descs,
+                            &gated,
                         )));
                         break;
                     }
@@ -2261,10 +2362,12 @@ impl Job {
                         rate_limited_attempts.push(self.spec.describe_with_bin(&self.bin));
                         if is_last {
                             // Cause-worded: pure rate-limited keeps today's exact detail; a chain
-                            // that also gated some entries reports the mix (round-6 finding f7).
-                            outcome = Some(Outcome::failed(exhaustion_failure(
+                            // that also gated some entries reports the mix (round-6 finding f7), and a
+                            // gated skip whose account has since moved relabels to
+                            // REVIEWER_ACCOUNT_CHANGED (issue #81).
+                            outcome = Some(Outcome::failed(finalize_exhaustion(
                                 &rate_limited_attempts,
-                                &gated_descs,
+                                &gated,
                             )));
                             break;
                         }
@@ -4094,38 +4197,169 @@ mod tests {
         );
     }
 
+    /// A Codex `GatedSkip` backed by a real temp `$CODEX_HOME`, so `finalize_exhaustion`'s fold-time
+    /// `fingerprint_at` read is exercised for real. The home currently holds `home_account`
+    /// (`None` leaves no `auth.json`, i.e. unreadable); the skip was decided on `decided`. Equal ⇒
+    /// still-gated, different or unreadable ⇒ stale. The `TempDir` must be kept alive by the caller.
+    fn codex_gated_skip(
+        describe: &str,
+        home_account: Option<&str>,
+        decided: &str,
+    ) -> (crate::testutil::TempDir, GatedSkip) {
+        let dir = crate::testutil::temp_dir("cross-review-finalize-exhaustion-tests");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        if let Some(acct) = home_account {
+            std::fs::write(
+                home.join("auth.json"),
+                format!(r#"{{"auth_mode":"chatgpt","tokens":{{"account_id":"{acct}"}}}}"#),
+            )
+            .expect("write auth.json");
+        }
+        let skip = GatedSkip {
+            describe: describe.to_string(),
+            reviewer: ReviewerKind::Codex,
+            home,
+            fingerprint: decided.to_string(),
+        };
+        (dir, skip)
+    }
+
     #[test]
-    fn exhaustion_failure_words_itself_by_cause() {
-        // Pure rate-limited keeps today's exact single-reviewer detail (byte-for-byte contract).
-        let rate_only = exhaustion_failure(&["a".into(), "b".into()], &[]);
+    fn pure_rate_exhaustion_is_unchanged() {
+        // No gated skips: today's exact single-reviewer rate wording, asserted *byte-for-byte* so a
+        // reworded exhaustion string cannot slip through (f17).
+        let rate_only = finalize_exhaustion(&["a".into(), "b".into()], &[]);
         assert_eq!(rate_only.code, "REVIEWERS_EXHAUSTED");
-        assert!(
-            rate_only
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("rate/usage limit, in order: a; b"),
-            "{rate_only:?}"
+        assert_eq!(
+            rate_only.detail.as_deref(),
+            Some("every configured reviewer reported a rate/usage limit, in order: a; b")
         );
-        assert!(rate_only.summary.contains("rate or usage limit"));
+        assert_eq!(
+            rate_only,
+            errors::reviewers_exhausted(rate_only.detail.clone().unwrap())
+        );
+    }
 
-        // All-gated names the usage minimum, not a rate limit.
-        let gated_only = exhaustion_failure(&[], &["x (usage below minimum)".into()]);
-        assert!(
-            gated_only.summary.contains("below its configured minimum"),
-            "{gated_only:?}"
+    #[test]
+    fn all_still_gated_is_todays_exhaustion_verbatim() {
+        // Every gated skip's account is unchanged since it was measured, so the outcome is today's
+        // exhaustion wording verbatim -- the relabel path does not fire. Asserted byte-for-byte against
+        // the exhaustion constructors, so a wording drift on the unchanged path fails (f17 regression).
+        let (_dir, gated) = codex_gated_skip("x", Some("acct-1"), "acct-1");
+
+        let gated_only = finalize_exhaustion(&[], std::slice::from_ref(&gated));
+        assert_eq!(gated_only.code, "REVIEWERS_EXHAUSTED");
+        assert_eq!(
+            gated_only.detail.as_deref(),
+            Some(
+                "every configured reviewer was skipped for low usage remaining, in order: \
+                 x (usage below minimum)"
+            )
+        );
+        assert_eq!(
+            gated_only,
+            errors::reviewers_exhausted_gated(gated_only.detail.clone().unwrap())
         );
 
-        // Mixed names both causes.
-        let mixed = exhaustion_failure(&["a".into()], &["x (usage below minimum)".into()]);
-        assert!(
-            mixed.summary.contains("rate-limited or skipped"),
-            "{mixed:?}"
+        let mixed = finalize_exhaustion(&["a".into()], std::slice::from_ref(&gated));
+        assert_eq!(mixed.code, "REVIEWERS_EXHAUSTED");
+        assert_eq!(
+            mixed.detail.as_deref(),
+            Some(
+                "every configured reviewer was exhausted (rate limit or usage minimum): \
+                 a (rate-limited); x (usage below minimum)"
+            )
         );
-        let d = mixed.detail.as_deref().unwrap();
+        assert_eq!(
+            mixed,
+            errors::reviewers_exhausted_mixed(mixed.detail.clone().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_gated_skip_whose_account_moved_yields_account_changed() {
+        // The skip was decided on acct-1, but the home now holds acct-2: the chain is not actually
+        // exhausted, so relabel to the retryable code, with the pre-start-only (nothing-ran) wording.
+        let (_dir, gated) = codex_gated_skip("codex-x", Some("acct-2"), "acct-1");
+        let f = finalize_exhaustion(&[], std::slice::from_ref(&gated));
+        assert_eq!(f.code, "REVIEWER_ACCOUNT_CHANGED");
+        assert!(f.detail.as_deref().unwrap().contains("codex-x"), "{f:?}");
         assert!(
-            d.contains("a (rate-limited)") && d.contains("usage below minimum"),
+            f.remediation.contains("No reviewer ran"),
+            "{}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn a_stale_skip_beside_a_rate_limit_still_yields_account_changed() {
+        // Mixed: a rate-limited entry plus a stale gated skip. The chain is still not exhausted (the
+        // gated entry may now be runnable), so relabel -- retaining the rate-limited entry in the
+        // detail, and using the mixed (a-reviewer-ran) remediation (f2/f7).
+        let (_dir, gated) = codex_gated_skip("codex-x", Some("acct-2"), "acct-1");
+        let f = finalize_exhaustion(&["ratelimited-entry".into()], std::slice::from_ref(&gated));
+        assert_eq!(f.code, "REVIEWER_ACCOUNT_CHANGED");
+        let d = f.detail.as_deref().unwrap();
+        assert!(
+            d.contains("codex-x") && d.contains("ratelimited-entry"),
             "{d}"
+        );
+        assert!(
+            f.remediation.contains("A later reviewer did run"),
+            "{}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn an_unreadable_fold_time_account_yields_account_changed() {
+        // The home's account file is gone at fold time (mid re-login): unreadable is stale, matching
+        // the gate's own fail-open posture, rather than a spurious "usage below minimum" (f3).
+        let (_dir, gated) = codex_gated_skip("codex-x", None, "acct-1");
+        let f = finalize_exhaustion(&[], std::slice::from_ref(&gated));
+        assert_eq!(f.code, "REVIEWER_ACCOUNT_CHANGED");
+    }
+
+    #[test]
+    fn a_moved_claude_account_is_detected_not_double_appended() {
+        // Claude's fingerprint_at appends `.claude.json` to the home *directory*. If GatedSkip.home
+        // held the config-file path instead, the reread would target `.claude.json/.claude.json`,
+        // read None, and mark every Claude skip stale. Storing the directory, a stable account must
+        // stay still-gated (proving no double-append) and a moved one must go stale (f6).
+        let dir = crate::testutil::temp_dir("cross-review-finalize-claude-tests");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let write_account = |uuid: &str| {
+            std::fs::write(
+                home.join(".claude.json"),
+                format!(
+                    r#"{{"oauthAccount":{{"accountUuid":"{uuid}","organizationUuid":"org-1"}}}}"#
+                ),
+            )
+            .expect("write .claude.json");
+        };
+        write_account("uuid-1");
+        let live = reviewer::for_kind(ReviewerKind::Claude)
+            .fingerprint_at(&home)
+            .expect("the seeded account is readable -- home is the directory, not the file");
+        let skip = GatedSkip {
+            describe: "claude-x".to_string(),
+            reviewer: ReviewerKind::Claude,
+            home: home.clone(),
+            fingerprint: live,
+        };
+        // Unchanged account: still-gated (today's exhaustion), which only holds if the reread found
+        // the account -- i.e. `home` was not double-appended.
+        assert_eq!(
+            finalize_exhaustion(&[], std::slice::from_ref(&skip)).code,
+            "REVIEWERS_EXHAUSTED"
+        );
+        // Re-login to a different account: stale, so relabel.
+        write_account("uuid-2");
+        assert_eq!(
+            finalize_exhaustion(&[], std::slice::from_ref(&skip)).code,
+            "REVIEWER_ACCOUNT_CHANGED"
         );
     }
 
@@ -5227,7 +5461,7 @@ mod tests {
             metrics: Arc::clone(&app.metrics),
             usage: Arc::clone(&app.usage),
             pre_start_skips: Vec::new(),
-            pre_start_gated_descs: Vec::new(),
+            pre_start_gated: Vec::new(),
             start_usage_key: None,
             bin: std::path::PathBuf::from("never-spawned.exe"),
             id: id.to_string(),

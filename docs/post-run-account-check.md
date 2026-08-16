@@ -213,7 +213,20 @@ the same value. Two cases pass through unchanged on purpose: no selection key st
 unarmed or unkeyable entry gains no store traffic), and ambient keeps the selection key because it has
 no pinned account to bind to and is not guarded either.
 
-### The gate decision is a separate defect, and is left as a follow-up
+### The gate decision is a separate defect — now fixed as issue #81
+
+> **Update (issue #81, [`gate-decision-account-read.md`](gate-decision-account-read.md)).** The
+> follow-up below has landed. The gate *decision*'s divergence was found to be harmful only on
+> *skipped* entries (a launched entry runs on its verified pin and is unaffected), and only where the
+> skip becomes load-bearing — a terminal exhaustion. So the fix does not unify the reads (that would
+> churn the account path for no gain on the filed harm); it makes a gate skip **provisional**: both
+> terminal exhaustion returns go through one `finalize_exhaustion`, which re-reads each skip's account
+> and, if it has **moved or become unreadable**, returns the retryable `REVIEWER_ACCOUNT_CHANGED`
+> instead of a false `REVIEWERS_EXHAUSTED`. The **wide** window this closes is a pre-start skip folded
+> into a terminal exhaustion minutes later (after another entry ran); the **microsecond** windows (the
+> in-walk gate adjacent to its attempt, and the all-gated selection's immediate return) are accepted,
+> exactly as the analysis below anticipated. The rest of this section is the original follow-up
+> reasoning, preserved.
 
 Rebinding the write does not touch the gate **decision**, which is still made against the account
 selection read. The implementation review raised that as f2 (*minor*), and it is real — but not by the

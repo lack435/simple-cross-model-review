@@ -1,6 +1,6 @@
 //! Codex adapter (`codex exec`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -468,13 +468,16 @@ impl Reviewer for CodexReviewer {
         }
     }
 
-    /// The logged-in ChatGPT account id, read from `$CODEX_HOME/auth.json` — a local file, the
-    /// account *identifier* (never the OAuth tokens beside it), and no CLI call. Profile-aware.
-    fn account_fingerprint(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<String> {
-        codex_account_id(&codex_home(cfg, spec)?)
+    /// The effective read home is `$CODEX_HOME` selected for `spec` — the profile's authorized home,
+    /// the ambient `$CODEX_HOME` for an ambient spec, or `None` for an unauthorized profile. This is
+    /// the same directory the rollout read above uses, and the one `account_fingerprint` (the default
+    /// `fingerprint_at` over this) and the gate's reread share. Profile-aware.
+    fn effective_read_home(&self, cfg: &Config, spec: &ReviewerSpec) -> Option<PathBuf> {
+        codex_home(cfg, spec)
     }
 
-    /// Read `tokens.account_id` straight from `home/auth.json`, without the authorization seam.
+    /// Read `tokens.account_id` straight from `home/auth.json`, without the authorization seam. The
+    /// logged-in ChatGPT account *identifier* (never the OAuth tokens beside it), no CLI call.
     fn fingerprint_at(&self, home: &Path) -> Option<String> {
         codex_account_id(home)
     }
@@ -1188,9 +1191,15 @@ mod tests {
 
     #[test]
     fn codex_home_reads_ambient_for_ambient_and_refuses_a_denied_profile() {
+        use crate::reviewer::Reviewer;
         // Ambient entry: reads the ambient home ($CODEX_HOME or ~/.codex).
         let ambient = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         assert!(codex_home(&ambient, ambient.primary()).is_some());
+        // `effective_read_home` (issue #81) is exactly `codex_home`, preserving the ambient fallback.
+        assert_eq!(
+            CodexReviewer.effective_read_home(&ambient, ambient.primary()),
+            codex_home(&ambient, ambient.primary())
+        );
 
         // A named profile is deny-all in Phase 1, so the account read fails open to None rather
         // than falling back to the ambient home (which would read the wrong account).
@@ -1202,6 +1211,15 @@ mod tests {
         ])
         .expect("config");
         assert!(codex_home(&profiled, profiled.primary()).is_none());
+        // The unauthorized-profile contract is preserved through the seam and its composition:
+        // effective_read_home is None, so the default account_fingerprint (fingerprint_at over it)
+        // is None too -- an unauthorized entry is never keyed and so never gated (issue #81, f10).
+        assert!(CodexReviewer
+            .effective_read_home(&profiled, profiled.primary())
+            .is_none());
+        assert!(CodexReviewer
+            .account_fingerprint(&profiled, profiled.primary())
+            .is_none());
     }
 
     #[test]

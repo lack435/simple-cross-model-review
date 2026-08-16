@@ -423,10 +423,24 @@ f17, f18 together pin the exact placement:
 - **A gated skip spawns nothing and bills nothing.**
 - **Terminal handling never falls through to `WORKER_PANICKED` (finding f7).** When the *last*
   entry in the walk is gated (whether earlier entries were rate-limited or gated), the walk
-  sets the terminal `REVIEWERS_EXHAUSTED` outcome explicitly rather than leaving `outcome =
+  sets the terminal exhaustion outcome explicitly rather than leaving `outcome =
   None` and hitting the panic fallback ([tools.rs:1584]). The terminal outcome's active
   attribution names the last entry that actually ran (or, for an all-gated chain, carries no
   active entry — the failure detail enumerates the gated entries).
+- **A gate skip is provisional on the account it was measured for, re-verified at the terminal
+  exhaustion (issue #81).** Both terminal returns — the all-gated selection return and the walk's
+  terminal fold — go through the single `finalize_exhaustion`, which re-reads each gated skip's
+  account (a local `fingerprint_at`, so the pre-lease/no-spawn contract holds). A skip whose home
+  has since re-logged to a **different** account, or whose account is now **unreadable** (stale, to
+  match this gate's own fail-open posture), means the chain is not actually exhausted: the outcome
+  is the retryable `REVIEWER_ACCOUNT_CHANGED` — naming the reviewer(s) whose account changed or is no
+  longer readable, retaining any rate-limited entries in the detail — instead of a false "usage below
+  minimum". The retry is plain when nothing ran, or `fresh: true` when a reviewer had already run and
+  set the findings marker. Only when *every* skip is still on the account it was decided on is
+  `REVIEWERS_EXHAUSTED` reported, byte-for-byte as before. This is why the skip carries the account it was decided on (one fingerprint read, shared
+  with the gate key), and it does not touch billing, the findings marker, or session state — those
+  are whatever the turn already produced. The narrow window it closes and the microsecond windows it
+  accepts are in [`post-run-account-check.md`](post-run-account-check.md).
 - **The gate applies to fresh walks only, never a resume** ([reviewer-fallback-chain.md,
   Sessions and resume]); a resumed entry that is genuinely out still hits the reactive
   `RATE_LIMITED` whose remediation points at `fresh: true`.
