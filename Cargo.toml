@@ -1,6 +1,6 @@
 [package]
 name = "cross-review"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.79"
 description = "MCP server that sends work to a different model for an independent review"
