@@ -372,6 +372,64 @@ fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
 }
 
 #[test]
+fn sterile_dir_name_keys_on_state_dir_and_session() {
+    // The name-derivation invariant, tested pure so it does not depend on the shared process temp
+    // root the filesystem path reaps (that concurrency is issue #87's problem, not this one's).
+    use std::path::Path;
+    let name = |state: &str, session: &str| {
+        super::sterile_dir_name(Path::new(state), session).expect("digest available")
+    };
+    // Deterministic and stable across turns: same inputs, same name -- what resume relies on.
+    assert_eq!(
+        name("C:\\state", "session-a"),
+        name("C:\\state", "session-a")
+    );
+    // Same session name under two state dirs must not alias. Two processes with different
+    // `--state-dir` do not share the per-session lease, so a shared directory would let one reap or
+    // drop it from under the other; folding `state_dir` in gives them distinct directories.
+    assert_ne!(
+        name("C:\\state-a", "session"),
+        name("C:\\state-b", "session")
+    );
+    // Different sessions under one state dir stay distinct, as before.
+    assert_ne!(
+        name("C:\\state", "session-a"),
+        name("C:\\state", "session-b")
+    );
+    // Length-prefixing keeps `(state_dir, session)` from colliding with a differently-split pair:
+    // ("C:\\a", "bc") and ("C:\\ab", "c") share the concatenation but not the framed encoding.
+    assert_ne!(name("C:\\a", "bc"), name("C:\\ab", "c"));
+    // A control-char-namespaced internal name (like the status preflight's) is distinct from the
+    // bare user string, so a user session cannot hash onto the internal sterile directory.
+    assert_ne!(
+        name("C:\\state", "\u{0}cross-review-status"),
+        name("C:\\state", "cross-review-status")
+    );
+}
+
+#[test]
+fn sterile_dir_name_hashes_raw_path_units_not_the_lossy_string() {
+    // `to_string_lossy` is not injective: two paths with distinct unpaired surrogates both render
+    // as the U+FFFD replacement string, so hashing the lossy form would give them one name while
+    // the lease (which keeps the raw `PathBuf`) keeps them on distinct lock files -- the dangerous
+    // "shared name, unshared lease" direction. Hashing the raw UTF-16 units keeps them distinct.
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    let p1 = std::path::PathBuf::from(OsString::from_wide(&[0xD800]));
+    let p2 = std::path::PathBuf::from(OsString::from_wide(&[0xD801]));
+    assert_eq!(
+        p1.to_string_lossy(),
+        p2.to_string_lossy(),
+        "precondition: the lossy strings must collide for this test to mean anything"
+    );
+    assert_ne!(
+        super::sterile_dir_name(&p1, "s").expect("digest"),
+        super::sterile_dir_name(&p2, "s").expect("digest"),
+        "raw-unit hashing must distinguish paths the lossy string cannot"
+    );
+}
+
+#[test]
 fn codex_sterile_directory_refuses_any_existing_entry() {
     let root = crate::testutil::temp_dir("codex-sterile-dirty-root");
     let state = crate::testutil::temp_dir("codex-sterile-dirty-state");

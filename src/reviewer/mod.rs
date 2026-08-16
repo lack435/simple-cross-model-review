@@ -958,13 +958,47 @@ pub fn verified_non_git_dir(dir: &Path) -> bool {
     true
 }
 
+/// The sterile directory's entry name for `(state_dir, session)`.
+///
+/// The name keys on the same `(state_dir, session)` pair the per-session lease keys on
+/// (`session::session_lock_path`), so two callers share a sterile directory *iff* they share that
+/// lease. A shared directory is therefore always serialized by the lease and can never be reaped or
+/// dropped out from under a concurrent owner. Folding `state_dir` in is what closes the gap the
+/// lease does not: two processes with different `--state-dir` but the same session name do not
+/// contend on the lease, and without this would alias onto one directory under the shared process
+/// temp root. `state_dir` is constant across a session's turns (its store lives there and the lease
+/// already relies on that), so the path stays stable across resume.
+///
+/// Hash the raw `state_dir` exactly as the lease consumes it, never a canonicalized form: two
+/// distinct raw paths that canonicalize to the same directory would then share a *name* without
+/// sharing a lease file, which is the one pairing the invariant must exclude. `--state-dir` is
+/// required to be absolute (see `config`), so the raw path the lease opens is already unambiguous.
+///
+/// Hash the OS path's raw UTF-16 code units, not a `to_string_lossy` string: the lossy form is not
+/// injective (distinct paths with unpaired surrogates collapse to the same replacement string),
+/// which would again share a *name* without sharing a lease. Length-prefix each field so
+/// `(state_dir, session)` cannot collide with a differently-split pair. Returns `None` only if the
+/// digest is unavailable (fail-closed, as the caller treats it).
+fn sterile_dir_name(state_dir: &Path, session: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    let state_units: Vec<u16> = state_dir.as_os_str().encode_wide().collect();
+    let mut seed = Vec::with_capacity(16 + state_units.len() * 2 + session.len());
+    seed.extend_from_slice(&(state_units.len() as u64).to_le_bytes());
+    for unit in state_units {
+        seed.extend_from_slice(&unit.to_le_bytes());
+    }
+    seed.extend_from_slice(&(session.len() as u64).to_le_bytes());
+    seed.extend_from_slice(session.as_bytes());
+    let fingerprint = crate::digest::Fingerprint::of(&seed)?;
+    Some(fingerprint.sha256[..24].to_string())
+}
+
 /// Create and verify the stable empty directory used as an isolated Codex process cwd.
 pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<SterileDir> {
     const MAX_STERILE_DIRS: usize = 256;
     const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-    let fingerprint = crate::digest::Fingerprint::of(session.as_bytes())
+    let name = sterile_dir_name(&cfg.state_dir, session)
         .ok_or_else(|| std::io::Error::other("SHA-256 unavailable for sterile directory name"))?;
-    let name = &fingerprint.sha256[..24];
     // Use the process temp root unconditionally. A user-selected state directory can move or
     // become writable between turns; choosing between it and temp dynamically would let one
     // Codex session resume under a different cwd. One deterministic base makes that impossible.
@@ -1012,7 +1046,7 @@ pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<Sterile
                 "sterile Codex directory reached its bounded live-entry limit",
             ));
         }
-        let path = parent.join(name);
+        let path = parent.join(&name);
         match std::fs::create_dir(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
