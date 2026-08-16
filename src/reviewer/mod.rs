@@ -993,8 +993,111 @@ fn sterile_dir_name(state_dir: &Path, session: &str) -> Option<String> {
     Some(fingerprint.sha256[..24].to_string())
 }
 
+/// Whether an entry under the shared sterile parent counts toward the live-entry bound.
+#[derive(Debug)]
+enum SterileEntry {
+    /// Proven gone -- the entry's own path no longer exists, or we removed it: do not count it.
+    Reaped,
+    /// May still occupy a slot -- live, or present-but-un-inspectable: count it toward the bound and
+    /// leave it untouched.
+    Retained,
+}
+
+/// Classify one entry (already yielded by the parent's directory stream) as reaped or retained,
+/// removing it if it is a stale empty directory.
+///
+/// The parent (`cross-review-codex-cwd`) is process-global, so a concurrent caller can reap or drop
+/// an entry between our `read_dir` and our inspection of it. That benign race must not fail the turn
+/// (issue #87): a review refused with an I/O error because *another* caller cleaned up first is a
+/// spurious loss.
+///
+/// The bound (`MAX_STERILE_DIRS`) is the thing this must not undercount, so `Reaped` is returned
+/// **only on proof of absence** -- the entry's own path is gone (`symlink_metadata` `NotFound`), or
+/// `remove_dir` succeeded (or reported it already gone). Every uncertain case fails closed to
+/// `Retained` (counted, untouched): a `PermissionDenied` on any step, an inner `read_dir` that fails
+/// (which describes the *contents*, not whether the entry itself is present -- a dangling reparse can
+/// stat as a directory yet fail to enumerate), or a `remove_dir` we could not complete. Genuinely
+/// unexpected errors still propagate. Iterator-level stream errors are handled by the caller (fatal),
+/// not here -- they describe no single entry. None of this touches the caller's own-directory
+/// emptiness refusal, which is separate; this governs only the GC sweep over *other* callers' entries.
+fn classify_sterile_entry(
+    entry: &std::fs::DirEntry,
+    now: std::time::SystemTime,
+    stale_age: Duration,
+) -> std::io::Result<SterileEntry> {
+    let metadata = match std::fs::symlink_metadata(entry.path()) {
+        Ok(metadata) => metadata,
+        // The entry's own path is gone: a concurrent caller reaped it. Proven absent.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SterileEntry::Reaped),
+        // Present but un-stat-able (delete-pending / ACL): it may still occupy a slot. Fail closed.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(SterileEntry::Retained)
+        }
+        Err(e) => return Err(e),
+    };
+    let stale = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= stale_age);
+    if !stale || !metadata.is_dir() {
+        return Ok(SterileEntry::Retained);
+    }
+    // Emptiness. An error here describes the entry's *contents*, and we already know the entry itself
+    // is present, so no error proves it gone -- fail closed to Retained rather than skipping a slot.
+    let empty = match std::fs::read_dir(entry.path()) {
+        Ok(mut contents) => match contents.next().transpose() {
+            Ok(first) => first.is_none(),
+            Err(e) => return contents_error_disposition(e),
+        },
+        Err(e) => return contents_error_disposition(e),
+    };
+    if !empty {
+        return Ok(SterileEntry::Retained);
+    }
+    // Stale and empty: reap. `Reaped` only once the entry is actually gone; a removal we could not
+    // complete (sharing violation, a file that appeared) leaves it present, so count it.
+    match std::fs::remove_dir(entry.path()) {
+        Ok(()) => Ok(SterileEntry::Reaped),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SterileEntry::Reaped),
+        Err(_) => Ok(SterileEntry::Retained),
+    }
+}
+
+/// Disposition for an I/O error inspecting the *contents* of an entry already known to be present.
+/// No such error proves the entry gone, so a benign race (`NotFound` -- contents vanished;
+/// `PermissionDenied` -- delete-pending / ACL) retains it (counts it, fails closed on the bound);
+/// anything else is a genuinely unexpected error and propagates. Split out so the policy is
+/// unit-testable without provoking a live filesystem race.
+fn contents_error_disposition(e: std::io::Error) -> std::io::Result<SterileEntry> {
+    match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            Ok(SterileEntry::Retained)
+        }
+        _ => Err(e),
+    }
+}
+
 /// Create and verify the stable empty directory used as an isolated Codex process cwd.
 pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<SterileDir> {
+    // A coarse circuit-breaker against runaway accumulation of *leaked* sterile directories -- ones a
+    // process left behind because it was killed before `SterileDir::drop` ran. Reaching it refuses
+    // the turn; that is a hard stop, not advisory. It is deliberately *not* a security boundary: the
+    // properties that matter (each directory empty, outside the repo, not a reparse point) are
+    // verified per-directory below and do not depend on this count.
+    //
+    // The sweep, this check, and the `create_dir` are not one atomic step across processes, so N
+    // concurrent callers can each pass at the threshold and push the total up to N over it. That
+    // slop is intentional and immaterial. In normal use `retained` is a handful -- roughly the
+    // number of turns in flight at once, since each drops its directory when its turn ends -- so the
+    // threshold has enormous headroom. Reaching it needs ~256 *distinct* sessions (the name is a hash
+    // of `(state_dir, session)`, so re-runs reuse a path and do not stack) leaked inside the 24h
+    // stale window: a pathological state where refusing is the intended alarm, and tripping a few
+    // early or late does not change that. The refusal names the limit and clears by removing the
+    // stale directories, so it is recoverable, not data loss. An exact global bound would need a
+    // machine-wide lock held across the whole sweep-and-create -- a new serialization point and a new
+    // way for a review to fail, bought for a harmless overcount of a canary. See AGENTS.md, "How much
+    // rigor, and where".
     const MAX_STERILE_DIRS: usize = 256;
     const STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
     let name = sterile_dir_name(&cfg.state_dir, session)
@@ -1023,22 +1126,13 @@ pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<Sterile
         let now = std::time::SystemTime::now();
         let mut retained = 0usize;
         for entry in std::fs::read_dir(&parent)? {
+            // An iterator-level stream error describes no single entry -- it is a failure to
+            // enumerate the parent, so it stays fatal (as before #87): swallowing it could stop the
+            // sweep early and undercount the bound. Only errors inspecting a yielded entry are races.
             let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())?;
-            let stale = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age >= STALE_AGE);
-            let empty_dir = metadata.is_dir()
-                && std::fs::read_dir(entry.path())?
-                    .next()
-                    .transpose()?
-                    .is_none();
-            if stale && empty_dir {
-                let _ = std::fs::remove_dir(entry.path());
-            } else {
-                retained = retained.saturating_add(1);
+            match classify_sterile_entry(&entry, now, STALE_AGE)? {
+                SterileEntry::Retained => retained = retained.saturating_add(1),
+                SterileEntry::Reaped => {}
             }
         }
         if retained >= MAX_STERILE_DIRS {

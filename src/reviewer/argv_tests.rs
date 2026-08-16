@@ -430,6 +430,82 @@ fn sterile_dir_name_hashes_raw_path_units_not_the_lossy_string() {
 }
 
 #[test]
+fn contents_error_disposition_retains_races_and_propagates_the_rest() {
+    // An error reading a present entry's contents never proves it gone, so a benign race retains it
+    // (counts it toward the bound -- fail closed -- rather than skipping a slot that may still
+    // exist), while a genuinely unexpected error stays fatal instead of being silently swept under.
+    use std::io::{Error, ErrorKind};
+    assert!(matches!(
+        super::contents_error_disposition(Error::from(ErrorKind::NotFound)),
+        Ok(super::SterileEntry::Retained)
+    ));
+    assert!(matches!(
+        super::contents_error_disposition(Error::from(ErrorKind::PermissionDenied)),
+        Ok(super::SterileEntry::Retained)
+    ));
+    let fatal = super::contents_error_disposition(Error::from(ErrorKind::Other));
+    assert_eq!(
+        fatal.expect_err("a non-race error must stay fatal").kind(),
+        ErrorKind::Other
+    );
+}
+
+#[test]
+fn reaper_reaps_stale_empty_dirs_only() {
+    use std::time::{Duration, SystemTime};
+    let parent = crate::testutil::temp_dir("codex-reaper-logic");
+    let empty = parent.as_path().join("empty");
+    let full = parent.as_path().join("full");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::create_dir(&full).unwrap();
+    std::fs::write(full.join("f"), "x").unwrap();
+    // `stale_age = 0` makes every entry "stale", isolating the emptiness gate: the empty directory
+    // is reaped, the non-empty one retained. (The non-empty case is the security-relevant one -- a
+    // contaminated directory must never be swept.)
+    let now = SystemTime::now();
+    for entry in std::fs::read_dir(parent.as_path()).unwrap() {
+        let entry = entry.unwrap();
+        let is_empty = entry.file_name() == "empty";
+        let d = super::classify_sterile_entry(&entry, now, Duration::ZERO).unwrap();
+        assert_eq!(matches!(d, super::SterileEntry::Reaped), is_empty);
+    }
+    assert!(!empty.exists(), "a stale empty dir is removed");
+    assert!(full.exists(), "a non-empty dir is retained");
+
+    // The staleness gate: an empty dir younger than `stale_age` is retained, not reaped.
+    let fresh = parent.as_path().join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    let entry = std::fs::read_dir(parent.as_path())
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|e| e.file_name() == "fresh")
+        .unwrap();
+    let d = super::classify_sterile_entry(&entry, now, Duration::from_secs(24 * 60 * 60)).unwrap();
+    assert!(matches!(d, super::SterileEntry::Retained));
+    assert!(fresh.exists(), "a fresh empty dir is not reaped");
+}
+
+#[test]
+fn reaper_treats_a_vanished_entry_as_reaped_not_an_error() {
+    // The #87 race made concrete: an entry removed by a concurrent caller between our `read_dir` and
+    // our `symlink_metadata` must classify as reaped, not fail the whole turn with a `NotFound`.
+    use std::time::{Duration, SystemTime};
+    let parent = crate::testutil::temp_dir("codex-reaper-vanish");
+    let victim = parent.as_path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    let entry = std::fs::read_dir(parent.as_path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    // Simulate the concurrent reaper winning the race: the entry is gone before we inspect it.
+    std::fs::remove_dir(&victim).unwrap();
+    let d = super::classify_sterile_entry(&entry, SystemTime::now(), Duration::ZERO)
+        .expect("a vanished entry must not fail the sweep");
+    assert!(matches!(d, super::SterileEntry::Reaped));
+}
+
+#[test]
 fn codex_sterile_directory_refuses_any_existing_entry() {
     let root = crate::testutil::temp_dir("codex-sterile-dirty-root");
     let state = crate::testutil::temp_dir("codex-sterile-dirty-state");
