@@ -512,6 +512,27 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// The section-7 runtime evidence gate for an in-scope Claude review: the reviewer **ran**, but the
+/// captured change was empty or incomplete AND it obtained no successful content evidence call, so
+/// the review would rest on less than the intended change. Keeps the `EVIDENCE_UNAVAILABLE` code
+/// (the caller's action -- stop, do not self-review, re-run -- is the same) but with a message
+/// accurate to the runtime case: the startup `evidence_unavailable` wording ("Codex", "was not
+/// started") would misreport this, which is the class of bug AGENTS.md names.
+pub fn evidence_review_too_thin(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "EVIDENCE_UNAVAILABLE",
+        "The review ran, but the captured change was empty or incomplete and the reviewer read no \
+         change through the repository evidence tools, so it would rest on less than the intended \
+         change and was not accepted.",
+        "The captured change was empty or incomplete (for example an uncommitted or empty range), \
+         and the reviewer did not read the change through its read-only repository evidence tools, \
+         so the review cannot be trusted. Re-run once the change is committed or the range is \
+         non-empty (and the evidence service is healthy). The review has NOT been accepted; do not \
+         substitute your own read of the change.",
+    )
+    .with_detail(detail)
+}
+
 /// The reviewer CLI abandoned one repository-evidence call on its own per-call timeout and the turn
 /// did not survive it.
 ///

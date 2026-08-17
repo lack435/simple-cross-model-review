@@ -395,7 +395,7 @@ COUNTER=2
     $doomed = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of poll cancellation. Wait quietly; the poll will be cancelled.'
+            instructions = 'Smoke test of poll cancellation. Call repository_change, then wait quietly; the poll will be cancelled.'
             session      = 'smoke-cancel'
             fresh        = $true
         }
@@ -461,7 +461,7 @@ COUNTER=2
     $doomedB = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of explicit cancellation. Wait quietly; this will be cancelled.'
+            instructions = 'Smoke test of explicit cancellation. Call repository_change, then wait quietly; this will be cancelled.'
             session      = 'smoke-cancel-b'
             fresh        = $true
         }

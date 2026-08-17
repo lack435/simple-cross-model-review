@@ -3441,11 +3441,9 @@ impl Job {
         // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
         // false), so the common review pays nothing.
         if capture_thin && !content_evidence_succeeded {
-            return Err(errors::evidence_unavailable(
+            return Err(errors::evidence_review_too_thin(
                 "the captured change was empty or incomplete and the reviewer obtained no successful \
-                 content evidence call, so the review would rest on less than the intended change. \
-                 Re-run once the change is committed (or the range is non-empty) and the evidence \
-                 service is healthy.",
+                 content evidence call, so the review would rest on less than the intended change",
             ));
         }
 
