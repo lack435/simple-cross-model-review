@@ -2913,11 +2913,18 @@ mod drain_tests {
 
     #[test]
     fn stdout_progress_prevents_the_policy_kill() {
-        // Four refusals, but stdout keeps advancing faster than the idle window, so the turn is
-        // making progress and must never be killed on this path.
+        // Four refusals, but stdout keeps advancing with gaps well under the idle window, so the
+        // turn is making progress and must never be killed on this path. Emit the first stdout byte
+        // immediately (before the refusals) and use a window generously larger than process startup
+        // — this test spawns a real PowerShell, and under parallel test load its cold start plus
+        // first write can be seconds, so a launch-relative window that is too tight is flaky (it
+        // was 500ms and failed in CI). The window (4s) comfortably exceeds startup, while the run
+        // (30 ticks × 200ms ≈ 6s) exceeds the window, so survival genuinely proves that advancing
+        // stdout keeps resetting the idle timer rather than the run merely being short.
         let cmd = powershell(
-            "1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
-             1..8 | % { Write-Output ('tick' + $_); Start-Sleep -Milliseconds 200 }",
+            "Write-Output start; \
+             1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             1..30 | % { Write-Output ('tick' + $_); Start-Sleep -Milliseconds 200 }",
         );
         let out = run_observed(
             cmd,
@@ -2925,7 +2932,7 @@ mod drain_tests {
             Duration::from_secs(120),
             &AtomicBool::new(false),
             StdoutLimits::default_retain(),
-            Some(stall(4, 500)),
+            Some(stall(4, 4000)),
             |_| {},
         )
         .expect("observe");
