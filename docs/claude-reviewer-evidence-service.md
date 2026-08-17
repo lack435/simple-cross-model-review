@@ -1,10 +1,14 @@
 # Claude reviewer evidence service
 
-Status: approved plan (cross-review session `plan-claude-evidence-service`, converged turn 6/7),
-on `plan/claude-evidence-service`. **Phase 0 complete** — all gates cleared against claude 2.1.233;
-see "Phase 0 results". Two amendments folded in (MCP allow-list entry in §1; Claude does not
-fail closed on a broken evidence server, so §7's parent-side handshake is mandatory). Next: Phase 1
-(the claude.rs/tools.rs/config.rs wiring; evidence core is reused unchanged).
+Status: approved plan (cross-review session `plan-claude-evidence-service`), on
+`plan/claude-evidence-service`. **Phase 0 complete** — all gates cleared against claude 2.1.233
+(see "Phase 0 results"); two amendments folded in (MCP allow-list entry in §1; Claude does not fail
+closed on a broken evidence server, so §7's parent-side handshake is mandatory). **Phase 1 re-gate
+(turn 8): chose option (a)** — evidence is scoped to **shell-less** isolated Claude (the single
+predicate `claude_neutral_target(...).is_some()`, §0), because the existing code deliberately keeps
+shell-enabled Claude on the repo cwd + shell + `--safe-mode`. f7 requires that one predicate gate
+every hook together; the earlier `supplies_change_of` change is dropped (a shell-less isolated
+Claude already captures under `--diff auto`). Now implementing Phase 1 under that scope.
 
 Design-review turn 1 (session `plan-claude-evidence-service`) raised four findings, folded in
 below with `fN` markers: **f1** narrowed the recovery claim (no range-diff op exists — scope
@@ -147,9 +151,10 @@ that moves, and why the move is safe:
 
 ## Goals
 
-1. An isolated Claude reviewer can list, read, search, page the captured change, and (for Git)
-   walk history and read revisions through the evidence service, without a shell and without
-   losing OAuth/profile auth.
+1. An **in-scope** Claude reviewer — the shell-less, `evidence_enabled` path of §0, which is the
+   dogfood direction — can list, read, search, page the captured change, and (for Git) walk history
+   and read revisions through the evidence service, without a shell and without losing OAuth/profile
+   auth. (A shell-enabled / non-qualifying isolated Claude is out of scope and unchanged.)
 2. A thin, empty, or stale in-prompt capture is **mitigated, not eliminated** (corrected per
    review f1). The evidence tools let the reviewer read the **live working tree**
    (`repository_read` / `repository_list` / `repository_search`) and walk **history**
@@ -163,7 +168,7 @@ that moves, and why the move is safe:
    change*, not a range it picks itself. The authoritative selected change stays
    `repository_change` / the in-prompt capture; a wrong capture is fixed by the `--diff` config,
    not by reviewer reconstruction.
-3. The default Claude review keeps its isolation posture (§"What boundary moves"),
+3. The `evidence_enabled` Claude review keeps its isolation posture (§"What boundary moves"),
    fail-closed auth, no-write boundary, and stdout-as-protocol-only.
 4. The evidence server is reused **unchanged**. No new evidence tools, no schema bump, no
    per-reviewer tool-set customization.
@@ -181,35 +186,61 @@ that moves, and why the move is safe:
   exactly as today. De-duplicating (evidence-first, dropping the in-prompt paste, as Codex did)
   is an optional later simplification, out of scope to keep this diff minimal.
 - Do not overhaul the `--allow-reviewer-config` / `--allow-reviewer-mcp` flag semantics.
-  Evidence injection happens on the isolated (default) path; opting out of isolation remains the
-  caller's own responsibility, as today.
+  Evidence injection happens only on the `evidence_enabled` path (shell-less, §0); opting out of
+  isolation remains the caller's own responsibility, as today.
 - Do not add migration or compatibility machinery for the capability bundle. It is per-turn and
   deleted at turn end; a schema mismatch fails the turn and the review re-runs.
 
 ## Concrete changes
 
+### 0. Scope: one predicate gates the entire new treatment (Phase 1 re-gate, option a, review f7)
+
+Implementation surfaced an interaction the earlier plan left open: the existing
+`claude_neutral_target` (`mod.rs:927-977`) deliberately moves **only shell-less** isolated Claude
+out of the repo, and keeps a **shell-enabled** Claude on the repo cwd (with `--safe-mode` and its
+working shell) so it can self-serve via git — see the rationale at `mod.rs:947-954`. The
+cross-review gate chose **option (a)**: the evidence service is given to Claude *exactly when
+`claude_neutral_target(cfg, reviewer).is_some()`* — i.e. shell-less, git, default rules, cwd is
+the git toplevel. Shell-enabled / non-qualifying isolated Claude is **unchanged**: it keeps
+`--safe-mode`, the repo cwd, and its shell. It gets no evidence, so no missing-evidence
+false-approval risk arises for it.
+
+**f7 is the load-bearing discipline: that single predicate must gate *every* new hook together** —
+evidence setup, the sterile cwd, the granular-flag swap, the evidence preamble, the runtime
+evidence gate (§7), and the capture handling. If any one of them applied on a *broader* condition
+(e.g. dropping `--safe-mode` for all isolated Claude while giving the sterile cwd only to the
+shell-less subset), a shell-enabled Claude would get partial treatment and re-open the f2
+config-contamination hole. So the code defines one eligibility value and threads it through all of
+them; there is no second, looser condition.
+
+Consequence: the earlier §7 `supplies_change_of` change is **dropped** — a shell-less isolated
+Claude already captures under `--diff auto` (`!reviewer_has_shell_of` is already true), so the
+capture is guaranteed for the in-scope path with no config change. The revert is in this branch.
+
 ### 1. `src/reviewer/claude.rs` — argv
 
-In the `if cfg.isolate_reviewer` block (currently `claude.rs:131-147`), replace
-`cmd.arg("--safe-mode")` with:
+Compute the §0 predicate once — call it `evidence_enabled` (= the `evidence` argument being
+`Some`, which the parent sets exactly when `claude_neutral_target(cfg, spec.reviewer).is_some()`,
+which already implies `isolate_reviewer`). **The flag swap keys on `evidence_enabled`, NOT on a
+bare `if cfg.isolate_reviewer` — that broader condition is the f7 trap** (it would strip
+`--safe-mode` from a shell-enabled Claude that stays on the repo cwd). Three branches:
 
-```rust
-cmd.args(["--settings", "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}"]);
-cmd.arg("--disable-slash-commands");
-// (keep) --strict-mcp-config
-```
-
-Then, when the `evidence` argument is `Some` (stop discarding it — it is `_evidence` today at
-`claude.rs:81`), add the evidence server **and allow-list it**:
-
-```rust
-cmd.args(["--mcp-config", evidence_config_path]);
-// Phase 0 finding: under --permission-mode dontAsk the evidence MCP tools are DENIED
-// unless allow-listed. A server-level entry (the reserved server name) allows all seven
-// repository_* tools; it goes in --allowed-tools alongside the scoped Read/Grep/Glob rules.
-cmd.arg("--allowed-tools");
-cmd.arg("mcp__cross_review_evidence");
-```
+- **`evidence_enabled` (in scope, shell-less):** replace `--safe-mode` with the granular flags and
+  attach the allow-listed evidence server (and run from the sterile cwd, §2/§6):
+  ```rust
+  cmd.args(["--settings", "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}"]);
+  cmd.arg("--disable-slash-commands");
+  cmd.arg("--strict-mcp-config");
+  cmd.args(["--mcp-config", evidence_config_path]);
+  // Phase 0 finding: under --permission-mode dontAsk the evidence MCP tools are DENIED
+  // unless allow-listed. The server-level entry allows all seven repository_* tools;
+  // it goes in --allowed-tools alongside the scoped Read/Grep/Glob rules.
+  cmd.arg("--allowed-tools");
+  cmd.arg("mcp__cross_review_evidence");
+  ```
+- **`cfg.isolate_reviewer && !evidence_enabled` (shell-enabled / non-qualifying):** keep today's
+  `--safe-mode` + `--strict-mcp-config` exactly as now — no granular flags, no evidence, repo cwd.
+- **`!cfg.isolate_reviewer`:** unchanged.
 
 Without that entry the reviewer connects to the server, discovers the tools, and then has
 every call refused with "denied because Claude Code is running in don't ask mode" — a review
@@ -227,12 +258,20 @@ rather than the `--safe-mode` rationale it documents today.
 ### 2. Parent-side: build and pass the `EvidenceInvocation` for Claude
 
 Today the bundle is captured and the `EvidenceInvocation` constructed only for the Codex path
-(`src/tools.rs:~3305`; `mod.rs:246-247`). Extend that so the same capability bundle is written
-and an `EvidenceInvocation` is constructed for an **isolated Claude** review as well, reusing
-the identical capture→bundle machinery. `EvidenceInvocation.sterile_dir` is Codex-specific (its
-empty working root) and is `None` for Claude — only `executable`, `bundle_file`, and `nonce` are used to render the config
-in §3. (The sterile *cwd* Claude now needs, per f2/§6, is a separate concern from this Codex
-`sterile_dir` field, which is the Codex evidence server's own working root.)
+(`src/tools.rs:~3305`; `mod.rs:246-247`, gated at `tools.rs:3190`). Extend that gate to also fire
+for the **in-scope Claude path** — i.e. when `claude_neutral_target(cfg, reviewer).is_some()` (the
+§0 predicate), so a shell-enabled Claude is excluded — reusing the identical capture→bundle
+machinery.
+
+**`EvidenceInvocation.sterile_dir` IS set for in-scope Claude (corrected per f8), and is what wires
+the verified-empty cwd into the child.** It carries the `codex_sterile_dir` path (§6), and Claude's
+`invocation` uses it as `current_dir` in place of today's `neutral_dir(cfg)` — that swap is exactly
+how the verified-empty directory reaches the child process and replaces the possibly-non-empty
+neutral dir that reopened f2. The owning `SterileDir` lives in the `evidence_setup` tuple for the
+whole turn (as Codex's already does), so the directory stays alive through the child and is dropped
+when the turn ends. So `executable`, `bundle_file`, `nonce`, and `sterile_dir` are all used for
+Claude; the read-scope rules still come from `claude_neutral_target` (absolute, pinned to the repo
+root) so Read/Grep/Glob keep reaching the repo from the sterile cwd.
 
 **Do not trip the in-prompt capture suppression (review f3).** The parent currently sets
 `prompt_change = None` whenever `evidence_setup.is_some()` (`src/tools.rs:3273-3279`), because
@@ -261,12 +300,13 @@ client specifically.
 
 ### 4. Prompt / preamble
 
-Tell the reviewer the evidence tools exist and are the way to look **past** the captured change
-— read the live working tree, search, and walk history — and that the captured change is also
-in the prompt and remains the authoritative selected change (f1). One safety line (§7, f4): if
-the reviewer has **neither** a non-empty captured change **nor** working evidence tools, the
-review is inconclusive and must not be approved. Keep this short; the tool descriptions carry
-the detail, as they do for Codex.
+**On the `evidence_enabled` path only** (§0 — the shell-enabled / non-qualifying path keeps its
+current preamble and gets no evidence guidance): tell the reviewer the evidence tools exist and are
+the way to look **past** the captured change — read the live working tree, search, and walk history
+— and that the captured change is also in the prompt and remains the authoritative selected change
+(f1). One safety line (§7, f4): if the reviewer has **neither** a non-empty captured change **nor**
+working evidence tools, the review is inconclusive and must not be approved. Keep this short; the
+tool descriptions carry the detail, as they do for Codex.
 
 ### 5. Documentation
 
@@ -291,41 +331,36 @@ granular flag replaces it. So the isolated Claude path must run from a **verifie
 non-repository** directory — the same guarantee Codex's sterile root already gives — instead of
 the current possibly-repo, possibly-non-empty cwd:
 
-- Reuse the existing `SterileDir` machinery rather than inventing a second mechanism.
-- **Add a separate `verified_empty_sterile_dir` check (review f5); do NOT change
-  `verified_non_git_dir`.** That helper (`mod.rs:998-1014`) only asserts non-Git ancestry and is
-  shared with callers that operate on deliberately non-empty directories — the system temp root
-  and evidence-bundle dirs (`mod.rs:1174-1218`, `evidence.rs:428-454`). Making it require
-  emptiness globally would break Codex sterile-dir creation and bundle setup. So the new check is
-  the union — non-Git (reuse `verified_non_git_dir`) **plus** empty **plus** no `.claude` layer —
-  applied only to the Claude sterile cwd.
-- Ensure the isolated Claude path never takes the repository-cwd fallback (`claude.rs:93-97`);
-  an isolated run with no available sterile cwd must refuse, not fall back into the repo.
-- Test adversarially: a reviewed repo carrying `.claude/settings.json` (hook), a plugin, and a
-  `CLAUDE.md` must influence the review in **no** way.
+- **Reuse `codex_sterile_dir` (`mod.rs:1138`) — it *is* the verified-empty helper.** Phase 1
+  confirmed it already creates a directory verified empty (it refuses any existing entry), non-Git,
+  and outside the repo, keyed on `(state_dir, session)` and stable across a session's turns. Its
+  emptiness check is **separate** from the shared `verified_non_git_dir`, so f5's concern (do not
+  make the shared helper require emptiness) is already satisfied — no new helper is needed. Empty
+  subsumes "no `.claude` layer / no `CLAUDE.md`": an empty dir has neither. (Rename it from
+  `codex_`-prefixed to a reviewer-neutral name when it gains a second caller.)
+- In-scope (per §0) means the reviewer already runs from a neutral cwd today via
+  `claude_neutral_target`; this swaps that neutral dir for the verified-empty sterile dir. The
+  out-of-scope shell-enabled path keeps the repo cwd and `--safe-mode` unchanged, so the
+  "never fall back to repo cwd" concern does not arise — there is no in-scope run without a sterile
+  cwd (the same `state_dir`/`session` that names the sterile dir is always present).
+- Test adversarially: for the in-scope shell-less path, a reviewed repo carrying
+  `.claude/settings.json` (hook), a plugin, and a `CLAUDE.md` must influence the review in **no**
+  way.
 
-This is scoped to the isolated path only; `--allow-reviewer-config` runs are the caller's own
-choice, as today.
+### 7. Runtime availability — capture already guaranteed in scope, plus a scoped fail-closed gate (review f4)
 
-### 7. Runtime availability — capture guaranteed, plus a scoped fail-closed gate (review f4, turns 2–3)
-
-Turn 2 correctly refuted my turn-1 "additive, not load-bearing" argument: it was not universal.
-`supplies_change_of` (`config.rs:1704-1718`) **omits** the capture for a *shelled* Claude under
-`--diff auto` — only `reviewer == Codex && isolate_reviewer` currently forces it — so an
-isolated Claude with a shell enabled would have **no** in-prompt capture, and a missing evidence
-server there is a genuine false-approval risk, not a lost improvement. The right response is not
-runtime `EVIDENCE_UNAVAILABLE` machinery; it is to **make the premise hold by construction**:
-
-- **Extend the capture guarantee to isolated Claude** (`config.rs:1714-1717`): under `--diff
-  auto`, isolated Claude captures the change regardless of shell, exactly mirroring the existing
-  Codex `isolate_reviewer` clause. After this plan every isolated Claude has evidence, so the
-  clause becomes symmetric — isolated ⟹ capture — for both reviewers. Combined with f3 (the
-  in-prompt capture is retained for Claude, not nulled), **every isolated Claude review with a
-  configured change now always has the authoritative captured change in its prompt.** The
-  evidence server is then additive *by construction*, not "usually": missing at startup or dying
-  mid-turn, Claude still reviews the full captured change — today's baseline — never thinner.
-  `--diff off` is the one explicit no-change config and is reported as such, as the Codex plan
-  already does.
+Turns 2–3 correctly refuted a "purely additive, never load-bearing" argument in the general case,
+because `supplies_change_of` (`config.rs:1704-1718`) **omits** the capture for a *shelled* Claude
+under `--diff auto`. Option (a) (§0) resolves that not by changing `supplies_change_of` but by
+**scope**: the evidence service is given only to **shell-less** isolated Claude, for which
+`!reviewer_has_shell_of(reviewer)` is already true, so `supplies_change_of` **already returns
+true** and the change is captured with no code change. Combined with f3 (the in-prompt capture is
+retained for Claude, not nulled), **every in-scope Claude review with a configured change already
+has the authoritative captured change in its prompt.** The evidence server is therefore additive
+*by construction*: missing at startup or dying mid-turn, Claude still reviews the full captured
+change — today's baseline — never thinner. (The shelled Claude that had no capture is out of scope
+entirely and keeps its shell + `--safe-mode`.) `--diff off` is the one explicit no-change config,
+reported as such.
 
 That leaves one residual, which turn 3 pinned precisely and which **is** a real silent
 false-approval path: if the captured change is **empty or incomplete** (a truncated capture, or
@@ -497,17 +532,17 @@ amendments folded back above.
 - **f3 test:** an isolated Claude review keeps `prompt_change` populated (the in-prompt capture
   is preserved) even though evidence setup is present — the Codex-only suppression at
   `tools.rs:3273-3279` does not fire for Claude.
-- **f2 / f5 test:** the isolated Claude cwd is a verified-empty non-repo dir. The **new**
-  `verified_empty_sterile_dir` rejects a non-empty dir and one containing a `.claude` layer,
-  while `verified_non_git_dir` is left unchanged and its existing non-empty callers still pass
-  (regression). The isolated path refuses rather than falling back to the repo cwd when no
-  sterile cwd is available. The adversarial project-config end-to-end case (reviewed repo
-  carrying a hook/plugin/`CLAUDE.md`) is proved in Phase 0 / smoke, since it needs a real
+- **f7 scoping test (the load-bearing one):** the single `claude_neutral_target(...).is_some()`
+  predicate gates the whole treatment together. A **shell-less** qualifying isolated Claude gets
+  the granular flags, `--mcp-config`, the allow-list, the sterile cwd, and the `EvidenceInvocation`.
+  A **shell-enabled** isolated Claude gets **none** of them — it still contains `--safe-mode`, runs
+  from the repo cwd, and has no evidence server (no partial treatment). `--allow-reviewer-config`
+  drops isolation entirely as today.
+- **f2 / f5 test:** the in-scope Claude cwd is `codex_sterile_dir`'s verified-empty non-repo dir
+  (its existing emptiness/non-git tests already cover it); `verified_non_git_dir` is left unchanged
+  and its non-empty callers still pass. The adversarial project-config end-to-end case (reviewed
+  repo carrying a hook/plugin/`CLAUDE.md`) is proved in Phase 0 / smoke, since it needs a real
   `claude` run.
-- **f4 test (capture guarantee):** `supplies_change_of` returns true for an isolated Claude under
-  `--diff auto` *with a shell enabled* (the case that previously omitted the capture), so the
-  in-prompt capture is present for every isolated-Claude-with-configured-change combination;
-  `--diff off` still reports no change.
 - **f4 test (scoped gate):** feeding synthesized turn observations to the gate, assert — for an
   empty/incomplete capture — `EVIDENCE_UNAVAILABLE` when the handshake failed, when any evidence
   call hit a transport error/disconnect, or when only `repository_scope` succeeded (no content
@@ -555,16 +590,20 @@ identifies a false-approval (not lost-review) risk.
   results — both **success and transport error** — from the stream (`:157-183` today parses only
   the final result), feeding the gate's health check (f4); auto-memory disable key in the
   `--settings` blob, or **pre-launch** scrub-and-verify of `CLAUDE_CONFIG_DIR` (`:105`) per §8 (f6).
-- `src/reviewer/mod.rs` / `src/tools.rs` — construct + pass `EvidenceInvocation` for the
-  isolated Claude path (`mod.rs:246-247`; `tools.rs:~3305`); generate + clean the per-turn
-  `--mcp-config` JSON; **gate the in-prompt capture suppression on Codex** (`tools.rs:3273-3279`,
-  f3); **verified-empty sterile cwd for isolated Claude** — reuse `SterileDir`, add a new
-  `verified_empty_sterile_dir` helper (leaving shared `verified_non_git_dir`, `mod.rs:998-1014`,
-  unchanged — f5), and remove the repo-cwd fallback on the isolated path (`claude.rs:93-97`,
-  `mod.rs:313-318`, f2); **the §7 scoped gate** — when the capture is empty/incomplete and no
-  evidence call succeeded, return `EVIDENCE_UNAVAILABLE` instead of a verdict (f4).
-- `src/config.rs` — extend `supplies_change_of` (`:1704-1718`) so isolated Claude captures under
-  `--diff auto` regardless of shell, mirroring the Codex `isolate_reviewer` clause (f4).
+- **The single eligibility predicate** `claude_neutral_target(cfg, reviewer).is_some()` (§0, f7)
+  gates every hook below; there is no second, looser condition. Shell-enabled / non-qualifying
+  isolated Claude keeps `--safe-mode`, the repo cwd, its shell, and gets no evidence.
+- `src/reviewer/mod.rs` / `src/tools.rs` — construct + pass `EvidenceInvocation` for the **in-scope
+  shell-less** Claude path (`mod.rs:246-247`; `tools.rs:~3305`, gated on the predicate at
+  `tools.rs:3190`); generate + clean the per-turn `--mcp-config` JSON; **gate the in-prompt capture
+  suppression on Codex** (`tools.rs:3273-3279`, f3); **verified-empty sterile cwd** — reuse
+  `codex_sterile_dir` (`mod.rs:1138`; rename reviewer-neutral), which is already the verified-empty
+  helper, leaving shared `verified_non_git_dir` untouched (f5); **the §7 scoped gate** — when the
+  capture is empty/incomplete and the evidence service was not healthy, return `EVIDENCE_UNAVAILABLE`
+  instead of a verdict (f4).
+- `src/config.rs` — **no change to `supplies_change_of`** (reverted): a shell-less isolated Claude
+  already captures under `--diff auto`, so the in-scope capture is guaranteed with no code change
+  (§0/§7, f7).
 - `src/setup.rs` / `src/tools.rs` — **only if §8 Q3 is reached:** the scrub-fallback path takes the
   **exclusive** side of the per-home review lock (`tools.rs:3095-3124`, `acquire_review_home_lock`),
   instead of today's shared side, so concurrent same-profile reviews serialize (f6, turn 5).
