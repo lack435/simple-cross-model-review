@@ -168,16 +168,29 @@ refuse every non-default-level resume.
 
 ### 6. Fallback / gate-selected entry + levels (scope boundary)
 
-For the common single-entry dogfood configs this never arises. To avoid over-building, the
-requested level resolves against whichever entry is **actually selected to run**, and any
-selected entry that does not declare an advertised-but-requested level uses its own base
-`model/effort` + a stderr diagnostic. This one rule covers both switch points:
-- the **proactive usage gate** picking a fallback as the fresh start entry (§4, f5);
-- a **rate-limit fallback** advancing mid-run to a later entry.
+For the common single-entry dogfood configs this never arises. **One policy, no exceptions
+(resolves f7): the level override is applied to the START entry only.** The two switch points
+differ in timing, and that difference is the whole rule:
+- The **proactive usage gate** runs *before* the review and *chooses* `start_index`. So the
+  gate-selected entry **is** the start entry, and the override applies to it (§4, f5). A
+  gate-selected start entry that does not declare an advertised-but-requested level uses its own
+  base pair + a stderr diagnostic.
+- A **rate-limit fallback** advances *mid-run* to a later entry (`i != start_index`). It
+  **always runs at its own base pair** — the override is never carried to it, even if that
+  entry happens to declare the same level name. It emits a diagnostic naming the actual pair.
+
+So a rate-limit fallback never uses "its level pair"; there is no such thing on the run path.
 Do not add cross-entry level-consistency machinery, per-level fallback chains, or persisted
 level names in v1 — the reviewer confirmed that would be disproportionate to the lost-review
 failure mode. The only requirement is that the metric/display report the *actual* pair that ran
 (§4, §4b), never the advertised one.
+
+**Resume consequence (documented, not engineered around):** if a session's *first* turn
+rate-limit-fell-back, its persisted pair is the fallback's base pair, not the requested level's.
+Re-passing the original `level` on resume then trips §4a (undeclared on, or differing from, the
+now-bound fallback entry) and is rejected with clear guidance — omit `level`, or use
+`fresh:true`. This is a rare multi-entry edge whose worst case is a clear, self-correcting error,
+not a false approval; that is an acceptable cost versus persisting level names.
 
 ### 7. Dogfood configs + docs (separate follow-up commit, NOT bundled with code)
 
