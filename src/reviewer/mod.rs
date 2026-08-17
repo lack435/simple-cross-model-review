@@ -419,6 +419,11 @@ pub struct LoginOutcome {
 /// caller verifies credentials / renames staging (f14). Generous: normal logins quiesce at once.
 const LOGIN_QUIESCE_BOUND: Duration = Duration::from_secs(10);
 
+/// After a code-paste login succeeds, how long to keep the code page's server alive so a browser that
+/// is polling `/status` can pick up the `done` signal and swap to "sign-in complete" (#97). Returns
+/// early the moment the page has been told; this is only the ceiling for when no page is polling.
+const CODE_PAGE_DISMISS_GRACE: Duration = Duration::from_secs(3);
+
 /// Run a vendor login `command` to completion under strict containment and redaction (#15 part 3b).
 ///
 /// - **Redaction:** stdin/stdout/stderr are all `null`, so nothing the child prints is captured; the
@@ -734,6 +739,14 @@ pub fn run_login_code_paste(
         }
         std::thread::sleep(Duration::from_millis(150));
     };
+    // The child exited. If it succeeded, tell the code page so a browser-callback account's page
+    // auto-dismisses to "sign-in complete" instead of lingering with a code field it never needed
+    // (#97), and give a polling page a brief, bounded window to observe that before the server stops.
+    // If no page is polling (headless, or the tab was closed) this simply waits out the short grace.
+    if exit_code == Some(0) {
+        server.complete();
+        server.wait_page_dismissed(CODE_PAGE_DISMISS_GRACE);
+    }
     drop(server);
 
     // The child has exited. Prove containment with the **bounded** quiescence/terminate path, then
