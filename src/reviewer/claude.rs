@@ -78,7 +78,7 @@ impl Reviewer for ClaudeReviewer {
         bin: &Path,
         resume: Option<&str>,
         _tmp_id: &str,
-        _evidence: Option<&super::EvidenceInvocation<'_>>,
+        evidence: Option<&super::EvidenceInvocation<'_>>,
         pinned_home: Option<&crate::config::AuthorizedHome>,
     ) -> std::io::Result<Invocation> {
         let mut cmd = Command::new(bin);
@@ -89,10 +89,29 @@ impl Reviewer for ClaudeReviewer {
         // outside the repo removes that context so a resume stays cache-read-cheap. When it
         // switches, the read scope moves from the relative `./**` (which would now point at the
         // neutral dir) to absolute rules pinned to `cfg.cwd`.
+        // An in-scope Claude (evidence present -- the parent sets it only when
+        // `claude_neutral_target` qualifies) runs from the verified-empty sterile directory the
+        // parent built, reading the repo through absolute rules pinned to `cfg.cwd`. Without
+        // evidence, the existing neutral-cwd optimisation or the project cwd applies. Fail closed
+        // rather than run a granular-flag Claude in the project cwd, which would re-open the f2
+        // configuration-contamination risk.
         let neutral = super::claude_neutral_target(cfg, spec.reviewer);
-        let (cwd, allowed_tools): (&Path, &[String]) = match &neutral {
-            Some((dir, rules)) => (dir.as_path(), rules),
-            None => (cfg.cwd.as_path(), &cfg.allowed_tools),
+        let (cwd, allowed_tools): (&Path, &[String]) = match (evidence, &neutral) {
+            (Some(ev), Some((_, rules))) => {
+                let dir = ev.sterile_dir.ok_or_else(|| {
+                    std::io::Error::other(
+                        "in-scope Claude evidence is missing its sterile working directory",
+                    )
+                })?;
+                (dir, rules.as_slice())
+            }
+            (Some(_), None) => {
+                return Err(std::io::Error::other(
+                    "in-scope Claude evidence present without a neutral target (inconsistent state)",
+                ));
+            }
+            (None, Some((dir, rules))) => (dir.as_path(), rules.as_slice()),
+            (None, None) => (cfg.cwd.as_path(), &cfg.allowed_tools),
         };
         cmd.current_dir(cwd);
         // Profile: for an authorized non-ambient profile, run in a controlled environment against
@@ -127,22 +146,44 @@ impl Reviewer for ClaudeReviewer {
         for rule in allowed_tools {
             cmd.arg(rule);
         }
+        // In scope, allow-list the evidence server in the SAME --allowed-tools list. Under
+        // --permission-mode dontAsk the MCP tools are otherwise denied even though they connect
+        // (verified in Phase 0); a server-level entry allows all seven repository_* tools.
+        if evidence.is_some() {
+            cmd.arg(format!("mcp__{}", crate::evidence::SERVER_NAME));
+        }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);
-        if cfg.isolate_reviewer {
-            // The tool allow-list is not the only way a repository can get code to run.
-            // A committed `.claude/settings.json` can define a hook, and Claude executes
-            // that shell command automatically -- no tool call, so no allow-list check.
-            // Verified: a `SessionStart` hook committed to a project ran on a plain
-            // `claude -p` invocation and created a file. Reviewing a repository would
-            // otherwise mean executing whatever that repository chose to define.
-            //
-            // --safe-mode disables hooks along with settings, plugins, skills, commands
-            // and MCP servers, while leaving auth, model selection and permissions
-            // working normally. --bare would also do it but redefines authentication
-            // (API key only, no OAuth), which would break subscription sign-in.
+        // Isolation posture. The whole thing keys on `evidence` (the plan's `evidence_enabled`
+        // predicate, set by the parent only for the in-scope shell-less path), NOT on a bare
+        // `cfg.isolate_reviewer` -- gating the flag swap on the broader condition would strip
+        // --safe-mode from a shell-enabled Claude still sitting in the project cwd (plan f7).
+        if let Some(ev) = evidence {
+            // In scope: replace --safe-mode with granular flags (--safe-mode would disable MCP;
+            // --bare would break OAuth) and attach the evidence server. The sterile cwd removes the
+            // reviewed repo's config surface, so disabling hooks, slash-commands/skills and auto-
+            // memory, plus strict MCP, is the equivalent isolation for the properties that matter.
+            cmd.args([
+                "--settings",
+                "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}",
+            ]);
+            cmd.arg("--disable-slash-commands");
+            cmd.arg("--strict-mcp-config");
+            let mcp = ev.mcp_config_file.ok_or_else(|| {
+                std::io::Error::other("in-scope Claude evidence is missing its --mcp-config file")
+            })?;
+            cmd.arg("--mcp-config");
+            cmd.arg(mcp);
+        } else if cfg.isolate_reviewer {
+            // Out of scope (shell-enabled / non-qualifying isolated Claude): keep today's behaviour.
+            // The tool allow-list is not the only way a repository can get code to run: a committed
+            // `.claude/settings.json` hook runs automatically with no tool call. --safe-mode disables
+            // hooks, settings, plugins, skills, commands and MCP servers while leaving auth, model
+            // selection and the shell working, so this reviewer self-serves via git from the project
+            // cwd as before. (--bare would also do it but redefines auth to API-key-only, breaking
+            // subscription sign-in, which is why the in-scope path uses granular flags instead.)
             cmd.arg("--safe-mode");
-            // Redundant under --safe-mode, kept so MCP isolation does not silently
-            // depend on one flag's exact scope.
+            // Redundant under --safe-mode, kept so MCP isolation does not silently depend on one
+            // flag's exact scope.
             cmd.arg("--strict-mcp-config");
         }
         if let Some(session_id) = resume {

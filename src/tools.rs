@@ -3187,45 +3187,67 @@ impl Job {
         // Codex runs outside the repository and receives repository context through a mandatory
         // per-turn evidence capability. Build and handshake it before the findings write-ahead
         // marker: any failure here starts no reviewer process and advances no conversation.
-        let evidence_setup = if self.spec.reviewer == crate::config::ReviewerKind::Codex {
-            let executable = std::env::current_exe().map_err(|e| {
-                errors::evidence_unavailable(format!(
-                    "cannot resolve the running cross-review executable: {e}"
-                ))
-            })?;
-            let sterile = if self.cfg.isolate_reviewer {
-                Some(
-                    crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
-                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+        // Evidence is built for Codex (always) and for an in-scope shell-less Claude -- the single
+        // `claude_neutral_target(...).is_some()` predicate (plan section 0), which also implies
+        // isolate_reviewer. A shell-enabled or otherwise non-qualifying Claude gets no evidence and
+        // keeps --safe-mode + the project cwd + its shell.
+        let claude_in_scope = self.spec.reviewer == crate::config::ReviewerKind::Claude
+            && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some();
+        let evidence_setup =
+            if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
+                let executable = std::env::current_exe().map_err(|e| {
+                    errors::evidence_unavailable(format!(
+                        "cannot resolve the running cross-review executable: {e}"
+                    ))
+                })?;
+                let sterile = if self.cfg.isolate_reviewer {
+                    Some(
+                        crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
+                            .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                let change_label = summary
+                    .map(crate::vcs::CaptureSummary::summary)
+                    .unwrap_or_else(|| "no selected change was captured".to_string());
+                let status_summary = if capture_warnings.is_empty() {
+                    change_label.clone()
+                } else {
+                    format!("{}\n{}", change_label, capture_warnings.join("\n"))
+                };
+                let bundle = crate::evidence::Bundle::create(
+                    &self.cfg.cwd,
+                    self.cfg.vcs,
+                    &self.id,
+                    change_label,
+                    status_summary,
+                    change.map(str::to_string),
                 )
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                // An in-scope Claude reaches the server through a generated --mcp-config file; Codex
+                // injects it through its own -c overrides and needs none.
+                let mcp_config_file = if claude_in_scope {
+                    Some(
+                        crate::evidence::write_claude_mcp_config(
+                            &self.cfg,
+                            &executable,
+                            &bundle_file.path,
+                            &self.id,
+                        )
+                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Some((executable, sterile, bundle_file, mcp_config_file))
             } else {
                 None
             };
-            let change_label = summary
-                .map(crate::vcs::CaptureSummary::summary)
-                .unwrap_or_else(|| "no selected change was captured".to_string());
-            let status_summary = if capture_warnings.is_empty() {
-                change_label.clone()
-            } else {
-                format!("{}\n{}", change_label, capture_warnings.join("\n"))
-            };
-            let bundle = crate::evidence::Bundle::create(
-                &self.cfg.cwd,
-                self.cfg.vcs,
-                &self.id,
-                change_label,
-                status_summary,
-                change.map(str::to_string),
-            )
-            .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            Some((executable, sterile, bundle_file))
-        } else {
-            None
-        };
 
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
         // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
@@ -3272,7 +3294,12 @@ impl Job {
             };
         // The isolated Codex change is available through repository_change. Do not duplicate it
         // into the prompt (or let prompt size become the service's effective pagination limit).
-        let prompt_change = if evidence_setup.is_some() {
+        // Suppress it only for Codex, whose sole delivery is repository_change; an in-scope Claude
+        // keeps its captured change in the prompt (Non-goals / f3), which is what makes the evidence
+        // service additive rather than load-bearing for it.
+        let prompt_change = if evidence_setup.is_some()
+            && self.spec.reviewer == crate::config::ReviewerKind::Codex
+        {
             None
         } else {
             change
@@ -3299,16 +3326,18 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let evidence_invocation = evidence_setup
-            .as_ref()
-            .map(
-                |(executable, sterile, bundle)| crate::reviewer::EvidenceInvocation {
-                    executable,
-                    bundle_file: &bundle.path,
-                    nonce: &self.id,
-                    sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
-                },
-            );
+        let evidence_invocation =
+            evidence_setup
+                .as_ref()
+                .map(|(executable, sterile, bundle, mcp_config)| {
+                    crate::reviewer::EvidenceInvocation {
+                        executable,
+                        bundle_file: &bundle.path,
+                        nonce: &self.id,
+                        sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
+                        mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
+                    }
+                });
         let invocation = match self.reviewer.invocation(
             &self.cfg,
             &self.spec,
