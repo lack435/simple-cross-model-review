@@ -5,7 +5,8 @@
       "args": [
         "--reviewer", "codex",
         "--model", "gpt-5.6-luna",
-        "--effort", "max"
+        "--effort", "max",
+        "--codex-profile", "work"
       ],
       "timeout": 2400000
     }
