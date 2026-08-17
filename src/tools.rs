@@ -930,7 +930,13 @@ impl App {
         // the refusal covers exactly the stale-ledger case, and the Perforce full-recapture path
         // survives for the not-stale ones.
         if let Some(record) = &prior {
-            if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
+            if let Some(reason) = resume_block(
+                &self.cfg,
+                record,
+                &changes_canonical,
+                session::KIND_REVIEW,
+                now_unix(),
+            ) {
                 return Err(resume_refusal(&session, reason, Some(record)));
             }
         }
@@ -3730,6 +3736,8 @@ impl Job {
                             model: &self.spec.model,
                             effort: &self.spec.effort,
                             cwd: &self.cfg.cwd.to_string_lossy(),
+                            // This is the review Job; the consult path records under KIND_CONSULT.
+                            kind: session::KIND_REVIEW,
                             cumulative_usage: baseline_to_persist,
                             // Bind the session to the changelist set (Perforce only), canonicalised
                             // so a re-review naming the same changelists in another order resumes.
@@ -3955,8 +3963,22 @@ fn resume_block(
     cfg: &Config,
     record: &session::SessionRecord,
     requested_changes: &[u64],
+    expected_kind: &str,
     now: u64,
 ) -> Option<String> {
+    // Kind first: a session belongs to the start path that created it. A `cross_model_review` resume
+    // must never continue a consult conversation (nor a consult a review), because the two are shaped
+    // for different protocols — a review reconciles a findings ledger the consult conversation never
+    // built. Refuse cross-kind before any other check, so the message names the real mismatch rather
+    // than a downstream symptom. Legacy records read as KIND_REVIEW (see SessionRecord::kind).
+    if record.kind() != expected_kind {
+        return Some(format!(
+            "it is a '{}' session, but this is a '{}' request; the two use different protocols and \
+             cannot share a conversation. Use the matching tool, or start fresh.",
+            record.kind(),
+            expected_kind
+        ));
+    }
     // A stored session id that normalizes to absent (empty or whitespace-only) is not a real
     // resume handle: `--resume ""` would try to continue a conversation no reviewer holds. Newly
     // reported ids are normalized away at the adapter boundary (`reviewer::normalize_session_id`),
@@ -5072,6 +5094,7 @@ mod tests {
             model: cfg.primary().model.clone(),
             effort: cfg.primary().effort.clone(),
             cwd: cfg.cwd.to_string_lossy().to_string(),
+            kind: Some(crate::session::KIND_REVIEW.to_string()),
             turns,
             created_unix: 0,
             updated_unix,
@@ -5098,7 +5121,36 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
-        assert!(resume_block(&cfg, &ok, &[], now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
+    }
+
+    #[test]
+    fn a_resume_that_crosses_session_kind_is_refused() {
+        // A cross_model_review resume must never continue a consult conversation (and vice versa):
+        // the two are shaped for different protocols. The kind check fires before every other
+        // identity check, so a consult session that is otherwise a perfect match is still refused.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+
+        let mut consult = record_matching(&cfg, 1, now);
+        consult.kind = Some(session::KIND_CONSULT.to_string());
+        let reason = resume_block(&cfg, &consult, &[], session::KIND_REVIEW, now)
+            .expect("a review must not resume a consult session");
+        assert!(reason.contains("consult"), "{reason}");
+        assert!(reason.contains("different protocols"), "{reason}");
+
+        // The converse: a review session cannot be resumed as a consult.
+        let review = record_matching(&cfg, 1, now);
+        let reason = resume_block(&cfg, &review, &[], session::KIND_CONSULT, now)
+            .expect("a consult must not resume a review session");
+        assert!(reason.contains("review"), "{reason}");
+
+        // A legacy record (no `kind`) reads as a review, so a review resume of it is not blocked on
+        // kind — the pre-`kind` sessions on disk keep resuming.
+        let mut legacy = record_matching(&cfg, 1, now);
+        legacy.kind = None;
+        assert_eq!(legacy.kind(), session::KIND_REVIEW);
+        assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5118,14 +5170,15 @@ mod tests {
             .to_ascii_uppercase()
             .replace('\\', "/");
         assert!(
-            resume_block(&cfg, &variant, &[], now).is_none(),
+            resume_block(&cfg, &variant, &[], session::KIND_REVIEW, now).is_none(),
             "a case/separator-only cwd difference should resume"
         );
 
         // A genuinely different working root still invalidates.
         let mut moved = record_matching(&cfg, 1, now);
         moved.cwd = "C:\\somewhere\\else".to_string();
-        let reason = resume_block(&cfg, &moved, &[], now).expect("a different cwd is refused");
+        let reason = resume_block(&cfg, &moved, &[], session::KIND_REVIEW, now)
+            .expect("a different cwd is refused");
         assert!(reason.contains("working root"), "{reason}");
     }
 
@@ -5135,7 +5188,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("ledger_too_large".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("terminal state"));
         assert!(reason.contains("ledger_too_large"));
     }
@@ -5209,6 +5263,7 @@ mod tests {
                     model: "gpt-5.6-luna",
                     effort: "max",
                     cwd: &cfg.cwd.display().to_string(),
+                    kind: session::KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
@@ -5230,7 +5285,8 @@ mod tests {
             .expect("record the turn");
         assert_eq!(rec.terminal_reason.as_deref(), Some("session_stagnant"));
 
-        let refusal = resume_block(&cfg, &rec, &[], now).expect("the next resume is refused");
+        let refusal = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+            .expect("the next resume is refused");
         assert!(refusal.contains("session_stagnant"), "{refusal}");
         assert!(
             refusal.contains("without raising or resolving a finding"),
@@ -5260,7 +5316,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(
             reason.contains("without raising or resolving a finding"),
@@ -5291,7 +5348,8 @@ mod tests {
         // Past the turn limit *and* idle past the window, as well as terminal.
         let mut rec = record_matching(&cfg, 9, now - cfg.resume_max_idle.as_secs() - 60);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(!reason.contains("--session-max-turns"), "{reason}");
         assert!(!reason.contains("--session-max-idle-seconds"), "{reason}");
@@ -5306,14 +5364,14 @@ mod tests {
         for blank in ["", "   ", "\t"] {
             let mut rec = record_matching(&cfg, 1, now);
             rec.cli_session_id = blank.to_string();
-            let reason =
-                resume_block(&cfg, &rec, &[], now).expect("a blank session id is refused resume");
+            let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+                .expect("a blank session id is refused resume");
             assert!(reason.contains("blank"), "{reason}");
         }
         // A real id still resumes (no blank-id refusal).
         let ok = record_matching(&cfg, 1, now);
         assert!(!ok.cli_session_id.trim().is_empty());
-        assert!(resume_block(&cfg, &ok, &[], now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5323,7 +5381,8 @@ mod tests {
         let mut rec = record_matching(&cfg, 1, now);
         // A ledger value that is not a compatible ledger -> LedgerLoad::Invalid -> refused.
         rec.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
-        let reason = resume_block(&cfg, &rec, &[], now).expect("invalid ledger is refused");
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+            .expect("invalid ledger is refused");
         assert!(reason.contains("unreadable or at an incompatible version"));
         // The refusal is tagged machine-readably as `ledger_unavailable`, so a caller can tell an
         // unreadable-ledger refusal from a policy one (turns/idle/mismatch, which carry no detail).
@@ -5338,7 +5397,8 @@ mod tests {
         let mut invalid_and_stale = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         invalid_and_stale.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
         let compound_reason =
-            resume_block(&cfg, &invalid_and_stale, &[], now).expect("too many turns is refused");
+            resume_block(&cfg, &invalid_and_stale, &[], session::KIND_REVIEW, now)
+                .expect("too many turns is refused");
         assert!(compound_reason.contains("turn"));
         let compound = resume_refusal("default", compound_reason, Some(&invalid_and_stale));
         assert_eq!(compound.detail.as_deref(), Some("ledger_unavailable"));
@@ -5347,8 +5407,8 @@ mod tests {
         // refusal with no record at all (a leftover findings marker on a name with no record).
         let mut healthy = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         healthy.findings_ledger = None;
-        let policy_reason =
-            resume_block(&cfg, &healthy, &[], now).expect("too many turns is refused");
+        let policy_reason = resume_block(&cfg, &healthy, &[], session::KIND_REVIEW, now)
+            .expect("too many turns is refused");
         assert_eq!(
             resume_refusal("default", policy_reason, Some(&healthy)).detail,
             None
@@ -5373,7 +5433,7 @@ mod tests {
         );
         let mut rec = record_matching(&cfg, 1, now);
         rec.findings_ledger = Some(serde_json::to_value(&ev.ledger).expect("serialize"));
-        assert!(resume_block(&cfg, &rec, &[], now).is_none());
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5385,6 +5445,7 @@ mod tests {
             &cfg,
             &record_matching(&cfg, cfg.resume_max_turns - 1, now),
             &[],
+            session::KIND_REVIEW,
             now
         )
         .is_none());
@@ -5392,6 +5453,7 @@ mod tests {
             &cfg,
             &record_matching(&cfg, cfg.resume_max_turns, now),
             &[],
+            session::KIND_REVIEW,
             now,
         )
         .expect("at the cap it is refused");
@@ -5405,9 +5467,22 @@ mod tests {
         let now = 1_000_000;
         let idle = cfg.resume_max_idle.as_secs();
         // Exactly at the window still resumes; one second past it does not.
-        assert!(resume_block(&cfg, &record_matching(&cfg, 1, now - idle), &[], now).is_none());
-        let reason = resume_block(&cfg, &record_matching(&cfg, 1, now - idle - 1), &[], now)
-            .expect("past the window it is refused");
+        assert!(resume_block(
+            &cfg,
+            &record_matching(&cfg, 1, now - idle),
+            &[],
+            session::KIND_REVIEW,
+            now
+        )
+        .is_none());
+        let reason = resume_block(
+            &cfg,
+            &record_matching(&cfg, 1, now - idle - 1),
+            &[],
+            session::KIND_REVIEW,
+            now,
+        )
+        .expect("past the window it is refused");
         assert!(reason.contains("resume window"), "{reason}");
         assert!(reason.contains("--session-max-idle-seconds"), "{reason}");
     }
@@ -5421,26 +5496,32 @@ mod tests {
 
         let mut wrong_reviewer = record_matching(&cfg, 1, now);
         wrong_reviewer.reviewer = "claude".to_string();
-        assert!(resume_block(&cfg, &wrong_reviewer, &[], now)
-            .expect("refused")
-            .contains("reviewer"));
+        assert!(
+            resume_block(&cfg, &wrong_reviewer, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("reviewer")
+        );
 
         let mut wrong_model = record_matching(&cfg, 1, now);
         wrong_model.model = "gpt-5.6-sol".to_string();
-        assert!(resume_block(&cfg, &wrong_model, &[], now)
-            .expect("refused")
-            .contains("model"));
+        assert!(
+            resume_block(&cfg, &wrong_model, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("model")
+        );
 
         let mut wrong_cwd = record_matching(&cfg, 1, now);
         wrong_cwd.cwd = "C:\\somewhere\\else".to_string();
-        assert!(resume_block(&cfg, &wrong_cwd, &[], now)
-            .expect("refused")
-            .contains("working root"));
+        assert!(
+            resume_block(&cfg, &wrong_cwd, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("working root")
+        );
 
         // A case-only difference in the working root is the same root on Windows.
         let mut cased = record_matching(&cfg, 1, now);
         cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
-        assert!(resume_block(&cfg, &cased, &[], now).is_none());
+        assert!(resume_block(&cfg, &cased, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5459,15 +5540,19 @@ mod tests {
 
         let mut git_record = record_matching(&git, 1, now);
         git_record.backend = Some("git".into());
-        assert!(resume_block(&p4, &git_record, &[42], now)
-            .expect("refused")
-            .contains("backend"));
+        assert!(
+            resume_block(&p4, &git_record, &[42], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("backend")
+        );
 
         let mut p4_record = record_matching(&p4, 1, now);
         p4_record.backend = Some("perforce".into());
-        assert!(resume_block(&git, &p4_record, &[], now)
-            .expect("refused")
-            .contains("backend"));
+        assert!(
+            resume_block(&git, &p4_record, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("backend")
+        );
     }
 
     #[test]
@@ -5484,7 +5569,7 @@ mod tests {
         .expect("config");
         let now = 1_000_000;
         let ancient_and_long = record_matching(&cfg, 999, 0);
-        assert!(resume_block(&cfg, &ancient_and_long, &[], now).is_none());
+        assert!(resume_block(&cfg, &ancient_and_long, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5629,16 +5714,17 @@ mod tests {
         record.changes = Some(vec![43650, 43651]);
 
         // Same set (any order, canonicalised by the caller) resumes.
-        assert!(resume_block(&cfg, &record, &[43650, 43651], now).is_none());
+        assert!(resume_block(&cfg, &record, &[43650, 43651], session::KIND_REVIEW, now).is_none());
         // A different set is refused, naming both sets and the escape hatch.
-        let reason = resume_block(&cfg, &record, &[43650], now).expect("refused");
+        let reason =
+            resume_block(&cfg, &record, &[43650], session::KIND_REVIEW, now).expect("refused");
         assert!(reason.contains("43650, 43651"), "{reason}");
         assert!(reason.contains("fresh: true"), "{reason}");
 
         // A record with no binding (legacy or git) is treated as unbound and resumes.
         let mut unbound = record.clone();
         unbound.changes = None;
-        assert!(resume_block(&cfg, &unbound, &[99999], now).is_none());
+        assert!(resume_block(&cfg, &unbound, &[99999], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -6322,6 +6408,7 @@ mod tests {
                     model: &app.cfg.reviewers[0].model,
                     effort: &app.cfg.reviewers[0].effort,
                     cwd: &app.cfg.cwd.to_string_lossy(),
+                    kind: crate::session::KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
