@@ -739,11 +739,16 @@ pub fn run_login_code_paste(
         }
         std::thread::sleep(Duration::from_millis(150));
     };
-    // The child exited. If it succeeded, tell the code page so a browser-callback account's page
-    // auto-dismisses to "sign-in complete" instead of lingering with a code field it never needed
-    // (#97), and give a polling page a brief, bounded window to observe that before the server stops.
-    // If no page is polling (headless, or the tab was closed) this simply waits out the short grace.
-    if exit_code == Some(0) {
+    // The child exited. If it succeeded on a browser callback (no code was pasted), tell the code page
+    // so its lingering "paste a code" form auto-dismisses to "sign-in complete" (#97), and give the
+    // polling page a brief, bounded window to observe that before the server stops. If no page is
+    // polling (headless, or the tab was closed) this simply waits out the short grace.
+    //
+    // Only the code-less callback path needs this. When a code *was* pasted, submitting it already
+    // stopped the server (it recorded an outcome) and navigated the page to "Code received", so there
+    // is no live `/status` listener to deliver `done` and nothing polling to receive it — waiting would
+    // just burn the whole grace for nothing (f1).
+    if exit_code == Some(0) && !code_fed {
         server.complete();
         server.wait_page_dismissed(CODE_PAGE_DISMISS_GRACE);
     }

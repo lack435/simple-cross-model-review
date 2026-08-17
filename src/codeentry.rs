@@ -83,12 +83,15 @@ fn set_terminal(shared: &(Mutex<Shared>, Condvar), outcome: CodeOutcome, also_st
     }
 }
 
-/// Atomically record a submitted code, or refuse it (server stopping, an outcome already set, or the
-/// deadline passed). Returns whether it was recorded.
+/// Atomically record a submitted code, or refuse it (server stopping, the login already completed, an
+/// outcome already set, or the deadline passed). Returns whether it was recorded. The `completed` check
+/// closes a race in the callback path (f2): once the login has succeeded, the server lingers briefly so
+/// the page can observe `done` (#97), and a stale `/submit` arriving in that window must not record a
+/// code the caller will never feed — nor stop the status listener out from under the polling page.
 fn try_submit(shared: &(Mutex<Shared>, Condvar), deadline: Instant, code: String) -> bool {
     let (lock, cvar) = shared;
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.stop || guard.outcome.is_some() || Instant::now() >= deadline {
+    if guard.stop || guard.completed || guard.outcome.is_some() || Instant::now() >= deadline {
         return false;
     }
     guard.outcome = Some(CodeOutcome::Submitted(code));
@@ -795,6 +798,30 @@ mod tests {
             ),
             "done"
         );
+    }
+
+    #[test]
+    fn a_submit_after_completion_is_refused() {
+        // f2: once the login has succeeded (complete()), the server lingers briefly so the page can see
+        // `done`. A stale /submit arriving in that window must be refused, not recorded — the caller has
+        // already stopped feeding stdin, and recording an outcome would stop the status listener.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+        server.complete();
+        let body = "code=late";
+        let resp = raw(
+            port,
+            &format!(
+                "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // Refused as a spent/expired link, and nothing was recorded as Submitted.
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        assert!(!matches!(server.poll(), Some(CodeOutcome::Submitted(_))));
+        // /status still reports the login as done.
+        assert_eq!(status_body(port, &token), "done");
     }
 
     #[test]
