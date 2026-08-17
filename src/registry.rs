@@ -49,6 +49,18 @@ pub enum IdState {
     Unknown,
 }
 
+/// Which start path created a job. A waiter and the result tools switch on this so a review id and a
+/// consult id can never be collected through the wrong envelope. See `docs/cross-model-consult-plan.md`
+/// (f9).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JobKind {
+    Review,
+    // Constructed by `start_consult` in a later slice; until then only `Review` jobs exist, so the
+    // variant is unconstructed in the binary. Remove the allow when `start_consult` lands.
+    #[allow(dead_code)]
+    Consult,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Running,
@@ -95,6 +107,9 @@ impl Phase {
 pub struct Review {
     pub id: String,
     pub session: String,
+    /// Which start path created this job. A consult id collected through the review result tool (or
+    /// the reverse) is refused on this, so the two protocols never share an envelope.
+    pub kind: JobKind,
     pub turn: u32,
     pub resumed: bool,
     pub status: Status,
@@ -359,6 +374,7 @@ impl Registry {
     pub fn try_start(
         &self,
         session: &str,
+        kind: JobKind,
         turn: u32,
         resumed: bool,
     ) -> Result<(String, Arc<AtomicBool>), StartRefused> {
@@ -404,6 +420,7 @@ impl Registry {
             Review {
                 id: id.clone(),
                 session: session.to_string(),
+                kind,
                 turn,
                 resumed,
                 status: Status::Running,
@@ -708,6 +725,10 @@ impl Registry {
 pub struct Snapshot {
     pub id: String,
     pub session: String,
+    /// Which start path created this job; see [`Review::kind`]. Read by the result tools in a later
+    /// slice to refuse a cross-kind collect; the `allow` goes when `cross_model_consult_result` lands.
+    #[allow(dead_code)]
+    pub kind: JobKind,
     pub turn: u32,
     pub resumed: bool,
     pub status: Status,
@@ -746,6 +767,7 @@ impl Snapshot {
         Self {
             id: review.id.clone(),
             session: review.session.clone(),
+            kind: review.kind,
             turn: review.turn,
             resumed: review.resumed,
             status: review.status,
@@ -779,17 +801,21 @@ mod tests {
     fn a_session_admits_only_one_running_review() {
         let registry = Registry::new();
         let (first, _cancel) = registry
-            .try_start("default", 1, false)
+            .try_start("default", JobKind::Review, 1, false)
             .expect("first start");
         // The check and insert are atomic, so the second claim must be refused and must
         // name the review already holding the session.
-        let refused = registry.try_start("default", 2, true).unwrap_err();
+        let refused = registry
+            .try_start("default", JobKind::Review, 2, true)
+            .unwrap_err();
         assert_eq!(refused, StartRefused::Busy(first));
     }
 
     /// Start and immediately finish a review on `session`, returning its id.
     fn run_one(registry: &Registry, session: &str, turn: u32) -> String {
-        let (id, _c) = registry.try_start(session, turn, turn > 1).expect("start");
+        let (id, _c) = registry
+            .try_start(session, JobKind::Review, turn, turn > 1)
+            .expect("start");
         registry.finish(&id, Outcome::completed("done"));
         id
     }
@@ -846,7 +872,9 @@ mod tests {
         // One is by definition still owed to a caller; removing it would strand a poll on
         // an id that has no terminal state left to reach.
         let registry = Registry::new();
-        let (running, _c) = registry.try_start("busy", 1, false).expect("start");
+        let (running, _c) = registry
+            .try_start("busy", JobKind::Review, 1, false)
+            .expect("start");
 
         // Enough finished reviews elsewhere to push well past every cap.
         for turn in 1..=MAX_TERMINAL_PER_SESSION as u32 + 3 {
@@ -869,7 +897,9 @@ mod tests {
         // still holding the id it was handed, could collect it. Recency has to be the
         // primary key; the counter is only a tiebreaker.
         let registry = Registry::new();
-        let (slow, _c) = registry.try_start("slow", 1, false).expect("start");
+        let (slow, _c) = registry
+            .try_start("slow", JobKind::Review, 1, false)
+            .expect("start");
 
         // Enough traffic elsewhere, all of it started *and* finished after `slow` began,
         // to fill the process-wide cap.
@@ -896,7 +926,9 @@ mod tests {
         // arrivals whose only advantage was a tiebreaker. Completion order is assigned
         // under the lock, so there are no ties to break and the clock is not consulted.
         let registry = Registry::new();
-        let (slow, _c) = registry.try_start("slow", 1, false).expect("start");
+        let (slow, _c) = registry
+            .try_start("slow", JobKind::Review, 1, false)
+            .expect("start");
         for n in 0..MAX_TERMINAL_TOTAL {
             run_one(&registry, &format!("busy-{n}"), 1);
         }
@@ -991,31 +1023,45 @@ mod tests {
     #[test]
     fn different_sessions_do_not_block_each_other() {
         let registry = Registry::new();
-        registry.try_start("one", 1, false).expect("one");
-        registry.try_start("two", 1, false).expect("two");
+        registry
+            .try_start("one", JobKind::Review, 1, false)
+            .expect("one");
+        registry
+            .try_start("two", JobKind::Review, 1, false)
+            .expect("two");
     }
 
     #[test]
     fn a_session_is_reusable_once_its_review_finishes() {
         let registry = Registry::new();
-        let (first, _c) = registry.try_start("default", 1, false).expect("first");
+        let (first, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("first");
         registry.finish(&first, Outcome::completed("done"));
-        let (second, _c) = registry.try_start("default", 2, true).expect("second turn");
+        let (second, _c) = registry
+            .try_start("default", JobKind::Review, 2, true)
+            .expect("second turn");
         assert_ne!(second, first);
     }
 
     #[test]
     fn ids_are_unique() {
         let registry = Registry::new();
-        let (a, _) = registry.try_start("a", 1, false).expect("a");
-        let (b, _) = registry.try_start("b", 1, false).expect("b");
+        let (a, _) = registry
+            .try_start("a", JobKind::Review, 1, false)
+            .expect("a");
+        let (b, _) = registry
+            .try_start("b", JobKind::Review, 1, false)
+            .expect("b");
         assert_ne!(a, b);
     }
 
     #[test]
     fn wait_returns_immediately_once_finished() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.finish(&id, Outcome::failed(crate::errors::cancelled()));
         // Already terminal: must not burn the timeout.
         let started = Instant::now();
@@ -1030,7 +1076,9 @@ mod tests {
     fn wait_is_woken_by_a_finish_on_another_thread() {
         // Guards the condvar pairing: the waiter must not sleep out its full timeout.
         let registry = Arc::new(Registry::new());
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
 
         let worker = {
             let registry = Arc::clone(&registry);
@@ -1057,7 +1105,9 @@ mod tests {
     #[test]
     fn wait_on_a_still_running_review_reports_running() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         let snapshot = registry
             .wait(&id, Duration::from_millis(50), &|| false)
             .expect("snapshot");
@@ -1067,7 +1117,9 @@ mod tests {
     #[test]
     fn snapshots_expose_observed_phase_liveness_and_output() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
 
         let preparing = registry.snapshot(&id).expect("snapshot");
         assert_eq!(preparing.phase, Phase::Preparing);
@@ -1091,11 +1143,42 @@ mod tests {
     }
 
     #[test]
+    fn a_jobs_kind_rides_through_to_its_snapshot() {
+        // The result tools switch on this to refuse a cross-kind collect, so it must survive the
+        // Review -> Snapshot copy for both kinds.
+        let registry = Registry::new();
+        let (review, _cr) = registry
+            .try_start("r", JobKind::Review, 1, false)
+            .expect("review start");
+        let (consult, _cc) = registry
+            .try_start("c", JobKind::Consult, 1, false)
+            .expect("consult start");
+
+        assert_eq!(
+            registry.snapshot(&review).expect("snapshot").kind,
+            JobKind::Review
+        );
+        assert_eq!(
+            registry.snapshot(&consult).expect("snapshot").kind,
+            JobKind::Consult
+        );
+
+        // And it survives to the terminal wait snapshot too.
+        registry.finish(&consult, Outcome::completed("done"));
+        let done = registry
+            .wait(&consult, Duration::ZERO, &|| false)
+            .expect("snapshot");
+        assert_eq!(done.kind, JobKind::Consult);
+    }
+
+    #[test]
     fn shutdown_wakes_a_parked_waiter() {
         // The regression: `serve` joins in-flight handlers, so a poll parked here with a
         // 300s budget used to hold the process open for the rest of it after stdin closed.
         let registry = Arc::new(Registry::new());
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
 
         let closer = {
             let registry = Arc::clone(&registry);
@@ -1134,7 +1217,9 @@ mod tests {
     #[test]
     fn a_provably_parked_waiter_is_freed_by_the_notify() {
         let registry = Arc::new(Registry::new());
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
 
         let poller = {
             let registry = Arc::clone(&registry);
@@ -1170,7 +1255,9 @@ mod tests {
     #[test]
     fn a_cancelled_poll_frees_the_waiter_without_stopping_the_review() {
         let registry = Arc::new(Registry::new());
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         let cancelled = Arc::new(AtomicBool::new(false));
 
         let poller = {
@@ -1218,20 +1305,30 @@ mod tests {
     #[test]
     fn the_concurrency_cap_refuses_starts_past_the_limit() {
         let registry = Registry::with_max_concurrent(2);
-        let (a, _ca) = registry.try_start("a", 1, false).expect("first");
-        let (_b, _cb) = registry.try_start("b", 1, false).expect("second");
+        let (a, _ca) = registry
+            .try_start("a", JobKind::Review, 1, false)
+            .expect("first");
+        let (_b, _cb) = registry
+            .try_start("b", JobKind::Review, 1, false)
+            .expect("second");
         assert_eq!(
-            registry.try_start("c", 1, false).unwrap_err(),
+            registry
+                .try_start("c", JobKind::Review, 1, false)
+                .unwrap_err(),
             StartRefused::TooManyRunning { limit: 2 }
         );
         // A running session still reports the specific, actionable Busy rather than the cap.
         assert!(matches!(
-            registry.try_start("a", 2, true).unwrap_err(),
+            registry
+                .try_start("a", JobKind::Review, 2, true)
+                .unwrap_err(),
             StartRefused::Busy(_)
         ));
         // Finishing a review frees its slot.
         registry.finish(&a, Outcome::completed("done"));
-        registry.try_start("c", 1, false).expect("a slot freed up");
+        registry
+            .try_start("c", JobKind::Review, 1, false)
+            .expect("a slot freed up");
     }
 
     #[test]
@@ -1239,7 +1336,7 @@ mod tests {
         let registry = Registry::with_max_concurrent(0);
         for name in ["a", "b", "c", "d", "e"] {
             registry
-                .try_start(name, 1, false)
+                .try_start(name, JobKind::Review, 1, false)
                 .unwrap_or_else(|_| panic!("start {name}"));
         }
     }
@@ -1253,7 +1350,9 @@ mod tests {
         let registry = Registry::new();
         registry.begin_shutdown();
         assert_eq!(
-            registry.try_start("default", 1, false).unwrap_err(),
+            registry
+                .try_start("default", JobKind::Review, 1, false)
+                .unwrap_err(),
             StartRefused::ShuttingDown
         );
     }
@@ -1261,7 +1360,9 @@ mod tests {
     #[test]
     fn a_wait_begun_after_shutdown_does_not_park_at_all() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.begin_shutdown();
 
         let started = Instant::now();
@@ -1278,7 +1379,9 @@ mod tests {
         // Ordering inside `wait`: a review completing in the same moment stdin closes must
         // hand back its text, not a running snapshot that discards it.
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.begin_shutdown();
         registry.finish(&id, Outcome::completed("just in time"));
 
@@ -1292,7 +1395,9 @@ mod tests {
     #[test]
     fn cancel_only_applies_to_running_reviews() {
         let registry = Registry::new();
-        let (id, cancel) = registry.try_start("default", 1, false).expect("start");
+        let (id, cancel) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         assert!(registry.cancel(&id));
         assert!(cancel.load(Ordering::SeqCst));
 
@@ -1310,7 +1415,9 @@ mod tests {
     #[test]
     fn warnings_survive_to_the_snapshot() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.finish(
             &id,
             Outcome {
@@ -1339,7 +1446,9 @@ mod tests {
         let registry = Registry::new();
 
         // An incremental delta carries through with its detail intact.
-        let (id, _c) = registry.try_start("default", 2, true).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 2, true)
+            .expect("start");
         registry.finish(
             &id,
             Outcome {
@@ -1367,7 +1476,9 @@ mod tests {
         );
 
         // A by-design full capture carries through and does not warn.
-        let (id2, _c2) = registry.try_start("other", 2, true).expect("start");
+        let (id2, _c2) = registry
+            .try_start("other", JobKind::Review, 2, true)
+            .expect("start");
         registry.finish(
             &id2,
             Outcome {
@@ -1385,7 +1496,9 @@ mod tests {
         assert!(!snap2.disposition.unwrap().warns());
 
         // A failed turn carries no disposition (it sent no reviewable change).
-        let (id3, _c3) = registry.try_start("third", 2, true).expect("start");
+        let (id3, _c3) = registry
+            .try_start("third", JobKind::Review, 2, true)
+            .expect("start");
         registry.finish(&id3, Outcome::failed(crate::errors::cancelled()));
         let snap3 = registry
             .wait(&id3, Duration::ZERO, &|| false)
@@ -1398,7 +1511,9 @@ mod tests {
     #[test]
     fn denial_count_survives_to_the_snapshot_separately_from_examples() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.finish(
             &id,
             Outcome {
@@ -1421,7 +1536,9 @@ mod tests {
     #[test]
     fn a_persisted_review_is_marked_resumable() {
         let registry = Registry::new();
-        let (id, _c) = registry.try_start("default", 1, false).expect("start");
+        let (id, _c) = registry
+            .try_start("default", JobKind::Review, 1, false)
+            .expect("start");
         registry.finish(&id, Outcome::completed("ok"));
         let snapshot = registry
             .wait(&id, Duration::ZERO, &|| false)

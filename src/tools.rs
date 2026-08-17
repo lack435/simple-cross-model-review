@@ -1097,7 +1097,7 @@ impl App {
         // on the other side of that could never be collected.
         let (id, cancel) = self
             .registry
-            .try_start(&session, turn, resumed)
+            .try_start(&session, crate::registry::JobKind::Review, turn, resumed)
             .map_err(|refused| match refused {
                 StartRefused::Busy(existing) => errors::session_busy(&session, &existing),
                 StartRefused::TooManyRunning { limit } => errors::too_many_running(limit),
@@ -5832,7 +5832,10 @@ mod tests {
     fn render_completed_for(capture_summary: Option<crate::vcs::CaptureSummary>) -> String {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, _c) = app.registry().try_start("default", 2, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 2, true)
+            .expect("start");
         app.registry()
             .finish(&id, completed_outcome(capture_summary));
         app.review_result(
@@ -5897,7 +5900,10 @@ mod tests {
     fn render_both_for(outcome: Outcome) -> (String, Option<Value>) {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, _c) = app.registry().try_start("default", 2, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 2, true)
+            .expect("start");
         app.registry().finish(&id, outcome);
         app.review_result_both(
             &json!({"review_id": id, "wait_seconds": 0}),
@@ -6327,7 +6333,7 @@ mod tests {
         seed_resumable_record(&app, "p4-session");
         let (id, _c) = app
             .registry()
-            .try_start("p4-session", 4, true)
+            .try_start("p4-session", crate::registry::JobKind::Review, 4, true)
             .expect("start");
 
         over_budget_job(&app, "p4-session", &id).run(Some("cli-1".to_string()));
@@ -6368,7 +6374,10 @@ mod tests {
         .expect("config");
         let app = App::new(cfg);
         seed_resumable_record(&app, "default");
-        let (id, _c) = app.registry().try_start("default", 4, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 4, true)
+            .expect("start");
 
         // A real resume id, since this refusal only ever arises on a resume.
         over_budget_job(&app, "default", &id).run(Some("cli-1".to_string()));
@@ -6440,7 +6449,10 @@ mod tests {
         .expect("config");
         let app = App::new(cfg);
         seed_resumable_record(&app, "default");
-        let (id, _c) = app.registry().try_start("default", 4, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 4, true)
+            .expect("start");
         // As `run` does before the capture, and as `Registry::finish` then preserves. The relocated
         // check returns before this in production; setting it here anyway means the assertions
         // below are about the *rendered* result rather than about one of the four places `active`
@@ -6549,7 +6561,7 @@ mod tests {
         for turn in 1..=MAX_TERMINAL_PER_SESSION as u32 + 1 {
             let (id, _c) = app
                 .registry()
-                .try_start(session, turn, turn > 1)
+                .try_start(session, crate::registry::JobKind::Review, turn, turn > 1)
                 .expect("start");
             app.registry()
                 .finish(&id, Outcome::failed(errors::cancelled()));
@@ -6599,7 +6611,10 @@ mod tests {
         // A session whose only review was evicted by the process-wide cap.
         for n in 0..=MAX_TERMINAL_TOTAL {
             let session = format!("session-{n}");
-            let (id, _c) = app.registry().try_start(&session, 1, false).expect("start");
+            let (id, _c) = app
+                .registry()
+                .try_start(&session, crate::registry::JobKind::Review, 1, false)
+                .expect("start");
             app.registry()
                 .finish(&id, Outcome::failed(errors::cancelled()));
         }
@@ -6640,7 +6655,10 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
         // Registered directly: starting one for real would need a reviewer CLI.
-        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         let request = RequestCancel::new();
         // Cancelled before the poll named its review: nothing is bound yet, so there is nothing
@@ -6667,7 +6685,10 @@ mod tests {
     fn a_live_result_call_detaches_rather_than_owns_its_review() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         let request = RequestCancel::new();
         let out = app
@@ -6690,7 +6711,10 @@ mod tests {
     fn shutdown_ends_a_long_poll_and_says_why() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = Arc::new(App::new(cfg));
-        let (id, _cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, _cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         // A budget far longer than this test needs, so only the shutdown can end the poll
         // in time for the assertions below to hold.

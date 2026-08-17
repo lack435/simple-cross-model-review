@@ -1441,7 +1441,7 @@ mod tests {
         let app = app();
         let (review_id, reviewer_cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         // `attach_owned` is the start call's binding: its review_id was never delivered, so a
@@ -1470,7 +1470,7 @@ mod tests {
         let app = app();
         let (review_id, reviewer_cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         let request = Arc::new(RequestCancel::new());
@@ -1531,7 +1531,7 @@ mod tests {
         let app = app();
         let (id, _cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         let handle = {
@@ -1649,7 +1649,7 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("progress", 1, false)
+            .try_start("progress", crate::registry::JobKind::Review, 1, false)
             .expect("start");
         app.registry().report_activity(&review_id, 4096);
 
@@ -1711,7 +1711,12 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("cancel-progress", 1, false)
+            .try_start(
+                "cancel-progress",
+                crate::registry::JobKind::Review,
+                1,
+                false,
+            )
             .expect("start");
         let recorder = Recorder::default();
         let writer = recorder.writer();
@@ -1749,7 +1754,7 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("progress", 1, false)
+            .try_start("progress", crate::registry::JobKind::Review, 1, false)
             .expect("start");
         let recorder = Recorder::default();
         let writer = recorder.writer();
