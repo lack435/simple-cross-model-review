@@ -18,12 +18,32 @@
 # into %USERPROFILE%\.codex\config.toml. Until that exists this file is ignored silently,
 # and `codex mcp list` will not show the server either way -- it reports only global
 # config. Verify from inside a session with cross_model_review_status.
+#
+# Account profile: --claude-profile work pins the Claude reviewer to a dedicated per-user
+# config home rather than whatever ~/.claude happens to be signed into, so a review is
+# billed to the account authorized for this repo, not the desktop app's ambient login. If
+# that home is re-logged to a different account mid-review, the switch guard fails the
+# review closed rather than delivering it under the wrong account -- it cannot undo billing
+# that already happened. "work" is only a label; it resolves to a private directory under
+# %CROSS_REVIEW_HOME% / %LOCALAPPDATA%\cross-review, so this line is identical on every
+# machine and commits no per-person state.
+#
+# Each machine sets the label up once, from a chat session in this checkout. To provision a
+# new home -- or to switch which account it holds -- sign in through the vendor login:
+#     cross_model_setup_profile { reviewer: "claude", profile: "work", login: true }
+# If the home already exists and is signed in, authorize it without a login (login: true is
+# only for deliberate provisioning or an account switch, since it re-runs the vendor OAuth):
+#     cross_model_setup_profile { reviewer: "claude", profile: "work" }
+# Until a machine authorizes the label, a review from here fails closed with
+# PROFILE_NOT_AUTHORIZED rather than silently falling back to the ambient account. The
+# forward direction (.mcp.json) pins the Codex reviewer to its own "work" profile the same way.
 
 [mcp_servers.cross_review]
 command = "dist\\cross-review.exe"
 args = [
     "--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium",
     "--diff", "main...HEAD",
+    "--claude-profile", "work",
 ]
 
 # The Claude reviewer has no shell, so the server captures the change for it. The default
