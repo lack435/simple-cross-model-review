@@ -164,15 +164,28 @@ impl CodeEntryServer {
         set_terminal(&self.shared, CodeOutcome::Cancelled, true);
     }
 
-    /// Signal that the login finished successfully (the child exited 0). A page polling `/status`
-    /// picks this up and swaps to a "sign-in complete" message instead of lingering with a code field
-    /// a browser-callback account never needs (#97). This does not stop the server or set an
-    /// `outcome`; the caller drops the server after giving the page a moment to observe it.
-    pub fn complete(&self) {
+    /// Signal that the login finished successfully (the child exited 0), and report whether a polling
+    /// page can still be told. A page polling `/status` picks `completed` up and swaps to a "sign-in
+    /// complete" message instead of lingering with a code field a browser-callback account never needs
+    /// (#97). This does not stop the server or set an `outcome`; the caller drops the server after
+    /// giving the page a moment to observe it.
+    ///
+    /// Returns `false` — meaning there is nothing to wait for — when an `outcome` is already set or the
+    /// server is stopping: recording a submitted code (or a cancel/timeout) stops the accept loop, so no
+    /// `/status` request can be served after that point. The check-and-set is atomic under the lock and
+    /// mirrors [`try_submit`]'s `completed` check, so exactly one of the two wins a race: either this
+    /// marks `completed` (and later submits are refused) or a submit has already set `outcome` (and this
+    /// returns `false`). That closes the submit/child-exit race where the caller would otherwise wait
+    /// the full grace against an already-dead listener (f3).
+    pub fn complete(&self) -> bool {
         let (lock, cvar) = &*self.shared;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.outcome.is_some() || guard.stop {
+            return false;
+        }
         guard.completed = true;
         cvar.notify_all();
+        true
     }
 
     /// Block until a `/status` request has served `done` to the polling page — i.e. the page has been
@@ -738,7 +751,10 @@ mod tests {
         let (port, token) = split_url(server.url());
 
         assert_eq!(status_body(port, &token), "pending");
-        server.complete();
+        assert!(
+            server.complete(),
+            "fresh server has a live listener to signal"
+        );
         assert_eq!(status_body(port, &token), "done");
         // The wait returns promptly now that a /status GET has delivered `done` to the page.
         server.wait_page_dismissed(Duration::from_secs(5));
@@ -801,6 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn complete_reports_no_wait_once_an_outcome_is_recorded() {
+        // f3: gating the caller's grace on complete()'s return closes the submit/child-exit race.
+        // Once a code has been submitted, the server has stopped, so there is no live /status listener
+        // to deliver `done` — complete() must report false so the caller does not wait for nothing.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+        let body = "code=abc";
+        let post = format!(
+            "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(raw(port, &post).starts_with("HTTP/1.1 200"));
+        assert!(matches!(server.poll(), Some(CodeOutcome::Submitted(_))));
+        assert!(
+            !server.complete(),
+            "an already-submitted session has no live listener to wait on"
+        );
+    }
+
+    #[test]
     fn a_submit_after_completion_is_refused() {
         // f2: once the login has succeeded (complete()), the server lingers briefly so the page can see
         // `done`. A stale /submit arriving in that window must be refused, not recorded — the caller has
@@ -808,7 +845,7 @@ mod tests {
         let server =
             CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
         let (port, token) = split_url(server.url());
-        server.complete();
+        assert!(server.complete());
         let body = "code=late";
         let resp = raw(
             port,
@@ -839,7 +876,7 @@ mod tests {
         // own bound rather than hang. complete() is set but done_delivered never will be.
         let server =
             CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
-        server.complete();
+        assert!(server.complete());
         let start = Instant::now();
         server.wait_page_dismissed(Duration::from_millis(200));
         assert!(start.elapsed() >= Duration::from_millis(150));

@@ -744,12 +744,13 @@ pub fn run_login_code_paste(
     // polling page a brief, bounded window to observe that before the server stops. If no page is
     // polling (headless, or the tab was closed) this simply waits out the short grace.
     //
-    // Only the code-less callback path needs this. When a code *was* pasted, submitting it already
-    // stopped the server (it recorded an outcome) and navigated the page to "Code received", so there
-    // is no live `/status` listener to deliver `done` and nothing polling to receive it — waiting would
-    // just burn the whole grace for nothing (f1).
-    if exit_code == Some(0) && !code_fed {
-        server.complete();
+    // Only the code-less callback path needs this, and `complete()` decides that atomically: it returns
+    // false when an outcome is already recorded, which is exactly when a code was pasted (or the wait
+    // was cancelled/timed out) — that submission already stopped the accept loop, so no `/status`
+    // listener survives to deliver `done` and waiting would burn the whole grace for nothing (f1/f3).
+    // Gating on its return rather than on `code_fed` also covers the race where the child exits right
+    // after a submit, before the loop polled it.
+    if exit_code == Some(0) && server.complete() {
         server.wait_page_dismissed(CODE_PAGE_DISMISS_GRACE);
     }
     drop(server);
