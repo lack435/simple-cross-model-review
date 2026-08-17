@@ -235,8 +235,10 @@ shipping a stale binary.
 - `smoke.ps1 -Reviewer codex|claude` — real end-to-end MCP round trip. It calls a model for
   real and costs tokens, so run it when the change touches the protocol, spawning, or
   session handling, and mention the cost to the user. **The evidence service is protocol**: a
-  change to it needs the round trip, specifically `-Reviewer codex` — the evidence assertions are
-  conditional on that direction, so the Claude run does not exercise it at all. `build.ps1`
+  change to it needs the round trip. It is now exercised in **both** directions — `-Reviewer codex`
+  (the isolated Codex evidence path) and `-Reviewer claude` (the in-scope shell-less Claude evidence
+  path added for the Claude direction) — so a change touching the evidence service or the Claude
+  reviewer's isolation/spawn needs the Claude round trip too, not only Codex. `build.ps1`
   passing is not a substitute either; it never starts a reviewer. `smoke.ps1` runs against
   `target\release\` rather than `dist\`, so it needs a
   `cargo build --release` but neither a restage nor a session restart.
