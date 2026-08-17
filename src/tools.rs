@@ -3959,6 +3959,39 @@ fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) 
 /// Every branch refuses rather than silently starting a new session. A resume that quietly
 /// became a fresh review is the one outcome this tool must not produce: the caller asked
 /// for continuity and would act on the answer as though it had it.
+/// Whether a single reviewer entry can provide the read-only evidence service a consult requires.
+/// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a
+/// profile-pinned, shell-less, git-top-level, isolated Claude ([`claude_evidence_enabled`]). An
+/// ambient or shell-enabled Claude has no evidence service, so a consult must not run on it.
+// Consumed by `start_consult` in a later slice; dead in the binary until then.
+#[allow(dead_code)]
+fn entry_provides_evidence(cfg: &Config, spec: &crate::config::ReviewerSpec) -> bool {
+    spec.reviewer == crate::config::ReviewerKind::Codex
+        || crate::reviewer::claude::claude_evidence_enabled(cfg, spec)
+}
+
+/// The consult evidence-eligibility gate over the *reachable* chain (f3). A fresh consult starting at
+/// `start_index` can fall through, on a rate limit, to any later entry, so **every** entry from the
+/// start onward must be evidence-capable — otherwise a fall-through could land on an evidence-less
+/// reviewer and run a consult with no way to read the code, silently breaking its core guarantee.
+///
+/// Evaluated ignoring the proactive usage gate on purpose: that gate only ever *removes* entries from
+/// play, so the static suffix `reviewers[start_index..]` is a sound superset of what can actually run,
+/// and needs no atomic re-check against a moving selection. Returns the index of the first ineligible
+/// reachable entry, so the caller can name it in an `EVIDENCE_UNAVAILABLE`. A resume binds to one
+/// entry, so the caller passes that entry's index as both start and (implicitly) the only element it
+/// cares about — a later entry it can never fall through to does not gate it.
+// Consumed by `start_consult` in a later slice; dead in the binary until then.
+#[allow(dead_code)]
+fn first_evidence_incapable_entry(cfg: &Config, start_index: usize) -> Option<usize> {
+    cfg.reviewers
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .find(|(_, spec)| !entry_provides_evidence(cfg, spec))
+        .map(|(i, _)| i)
+}
+
 fn resume_block(
     cfg: &Config,
     record: &session::SessionRecord,
@@ -5151,6 +5184,49 @@ mod tests {
         legacy.kind = None;
         assert_eq!(legacy.kind(), session::KIND_REVIEW);
         assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, now).is_none());
+    }
+
+    #[test]
+    fn the_consult_evidence_gate_covers_the_whole_reachable_chain() {
+        // Codex always provides the evidence service; an ambient Claude never does (no profile, so
+        // claude_evidence_enabled is false). A consult can fall through to any later chain entry, so
+        // the gate must reject a chain whose suffix contains an evidence-less entry.
+        let codex_only = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        assert_eq!(first_evidence_incapable_entry(&codex_only, 0), None);
+
+        // Two capable Codex entries (distinct models, so not identity-equivalent): still all capable.
+        let two_codex = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+            "--reviewer".into(),
+            "codex".into(),
+            "--model".into(),
+            "gpt-5.6-sol".into(),
+        ])
+        .expect("config");
+        assert_eq!(first_evidence_incapable_entry(&two_codex, 0), None);
+
+        // A fresh consult on codex that could fall through to an ambient Claude is refused, and the
+        // gate names the ineligible entry (index 1) so EVIDENCE_UNAVAILABLE can point at it.
+        let fallthrough = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--reviewer".into(),
+            "claude".into(),
+        ])
+        .expect("config");
+        assert_eq!(first_evidence_incapable_entry(&fallthrough, 0), Some(1));
+
+        // But a resume bound to the codex entry (start_index 0) never reaches entry 1, and a resume
+        // bound to entry 1 would be the ambient Claude itself — so from index 1 the gate reports it.
+        assert_eq!(first_evidence_incapable_entry(&fallthrough, 1), Some(1));
+
+        // A single ambient Claude is incapable from the start.
+        let claude_only =
+            Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config");
+        assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
     }
 
     #[test]
