@@ -76,11 +76,15 @@ rate-limit fallback walk and must not gain level rows.
 
 ### 3. MCP tool schema — `src/mcp.rs` (`cross_model_review`, ~lines 831-863)
 
-- When the active reviewer declares >=1 level, inject an optional `level` property:
-  `{ "type": "string", "enum": [<declared names>], "description": "<name -> model/effort, and which is default>" }`.
-  Build the enum + description from config so the calling agent sees the menu.
+- The **advertised** level set is the **primary** entry's declared level names (the schema is
+  generated once from server config, `src/mcp.rs:680`, before any per-call gate runs). When the
+  primary declares >=1 level, inject an optional `level` property:
+  `{ "type": "string", "enum": [<primary's declared names>], "description": "<name -> model/effort, and which is default>" }`.
 - When no levels are declared, omit the property entirely — with `additionalProperties:false`
   this means old configs behave exactly as today and a stray `level` is rejected.
+- **The schema is advertisement, not validation** (`src/mcp.rs:553` — MCP clients may send
+  anything). Runtime validation in `start_review` is the real gate; §4/§4a define it. A name
+  outside the advertised set is `INVALID_LEVEL` (fresh) / `INVALID_LEVEL_ON_RESUME` (resume).
 
 ### 4. Effective-spec lifecycle — `src/tools.rs` `start_review` (~617-659), Job build (~943-947), `Job::run` (~2040-2380)
 
@@ -89,13 +93,21 @@ is materialized in `Job::run`.
 
 **Resolve (in `start_review`):**
 - Parse optional `level` from request args alongside `instructions`/`session`/`fresh`.
+- **Resolve against the *selected* start entry, after the proactive gate runs.** The gate
+  (`gate_fresh_selection`, `tools.rs:573`) can pick a fallback as the fresh start entry before
+  the level is resolved, so resolution must key on the gate-chosen `start_index`, not the
+  primary. Two cases follow (f5):
+  - requested name **not in the advertised (primary) set** -> `INVALID_LEVEL`, no model call;
+  - requested name **in the advertised set but not declared on the gate-selected start entry**
+    -> use that entry's base pair + a stderr diagnostic (same rule as §6; the caller asked for a
+    valid level, the gate moved them — degrade honestly rather than error on a decision the
+    caller cannot see).
 - **Fresh start** (new session, or `fresh:true`): compute the effective pair:
-  - explicit `level` present -> must exist in the selected entry's `levels` (else fail fast
-    with a clear `INVALID_LEVEL`-style error, no model call);
-  - absent -> entry's `default_level` if set, else today's `--model`/`--effort`.
+  - explicit `level` present and declared on the selected entry -> its `LevelOverride`;
+  - absent -> selected entry's `default_level` if set, else today's `--model`/`--effort`.
 - **Resume** (existing session, `fresh:false`): the effective pair is the session's persisted
-  `(record.model, record.effort)` — not a `level` arg. See section 4a for how an explicit
-  `level` on a resume is handled.
+  `(record.model, record.effort)` — not a `level` arg. See §4a for how an explicit `level` on a
+  resume is handled.
 - Carry the resolved pair on the `Job` as `start_spec_override: Option<LevelOverride>` (the
   effective `(model, effort)` for `start_index` only). `None` means "use the entry's base pair"
   (backward-compatible: no levels, no override).
@@ -118,11 +130,27 @@ is materialized in `Job::run`.
 Ignoring `level` on resume silently can mislead a caller into believing they got a
 fast/thorough pass when the session kept its original pair. Guard cheaply rather than error on
 every re-review (agents naturally re-pass the same args):
-- On resume, if `level` is **present and resolves to a pair that differs** from the session's
+- On resume, if `level` is **present but not declared** by the bound entry (unresolvable):
+  fail fast with `INVALID_LEVEL_ON_RESUME` (f4). Schema advertisement is not validation, so a
+  direct caller can still send an unknown name — reject it explicitly rather than fall through.
+- If `level` is **present, declared, and resolves to a pair that differs** from the session's
   persisted `(model, effort)`: fail fast with a clear error — session is pinned to
   `model=…/effort=…`; pass `fresh:true` to start a new session at the requested level.
 - If `level` is absent, or resolves to the **same** pair the session already uses: proceed.
 - Surface the effective session level in the response/diagnostic either way.
+
+### 4b. Report the effective pair, not just the base (f6)
+
+`start_review`'s response and `status` output use `Config::describe_reviewer()`
+(`tools.rs:1033`, `tools.rs:1565`), which renders each entry's **base** `ReviewerSpec`. With a
+`default_level` different from the base — exactly the planned Luna config (base effort vs
+`standard`/`xhigh`) — an operator would be told one effort is pinned while a review runs at
+another. That violates the project's "claim only what was verified" discipline. Cheap fix:
+- start response: include the **effective starting pair** (the resolved `(model, effort)`)
+  alongside/instead of the base describe;
+- `status`: list each entry's configured `levels` and its `default_level`, so the menu and the
+  default are visible;
+- any place that still shows the base describe must be labeled as the base configuration.
 
 ### 5. Resume matching — `src/config.rs` `resume_entry_index` (1343-1375)
 
@@ -138,13 +166,18 @@ refuse every non-default-level resume.
   remaps its `(model, effort)`, a session pinned to the old pair no longer matches -> refuse ->
   rebaseline. That is correct.
 
-### 6. Fallback-chain + levels (scope boundary)
+### 6. Fallback / gate-selected entry + levels (scope boundary)
 
-For the common single-entry dogfood configs this never arises. To avoid over-building:
-resolve the requested level against the **selected** entry only; if a rate-limit fallback
-advances to an entry that does not declare that level, that entry uses its own base
-`model/effort` and emits a stderr diagnostic. Document this; do not add cross-entry level
-consistency machinery in v1.
+For the common single-entry dogfood configs this never arises. To avoid over-building, the
+requested level resolves against whichever entry is **actually selected to run**, and any
+selected entry that does not declare an advertised-but-requested level uses its own base
+`model/effort` + a stderr diagnostic. This one rule covers both switch points:
+- the **proactive usage gate** picking a fallback as the fresh start entry (§4, f5);
+- a **rate-limit fallback** advancing mid-run to a later entry.
+Do not add cross-entry level-consistency machinery, per-level fallback chains, or persisted
+level names in v1 — the reviewer confirmed that would be disproportionate to the lost-review
+failure mode. The only requirement is that the metric/display report the *actual* pair that ran
+(§4, §4b), never the advertised one.
 
 ### 7. Dogfood configs + docs (separate follow-up commit, NOT bundled with code)
 
@@ -171,10 +204,13 @@ consistency machinery in v1.
 ## Critical files
 
 - `src/config.rs` — `ReviewerSpec`, `LevelOverride`, `from_args`/`PendingEntry`, `resume_entry_index`, validation.
-- `src/tools.rs` — `start_review` level resolution (~617-659); `Job.start_spec_override` field +
-  build (~943-947); **application in `Job::run`** at the start-entry materialization (~2219-2281),
-  the pre-capture display (~2045), and the rate-limited-attempt metric (~2378); §4a resume guard.
-- `src/mcp.rs` — `cross_model_review` schema `level` property.
+- `src/tools.rs` — `start_review` level resolution against the gate-selected entry (~617-659,
+  gate at ~573); `Job.start_spec_override` field + build (~943-947); **application in `Job::run`**
+  at the start-entry materialization (~2219-2281), the pre-capture display (~2045), and the
+  rate-limited-attempt metric (~2378); §4a resume guard; effective-pair reporting in the start
+  response and `status` (~1033, ~1565, f6).
+- `src/mcp.rs` — `cross_model_review` schema `level` property (primary's names; ~680); schema is
+  advertisement, runtime validation is in `start_review` (~553).
 - `.mcp.json`, `.codex/config.toml`, `README.md`, `AGENTS.md` — follow-up commit.
 
 ## Verification
@@ -183,7 +219,13 @@ consistency machinery in v1.
   `--default-level` unknown -> reject, level->spec resolution on fresh start, `level` omitted ->
   default, unknown `level` on call -> fast error, **resume matching against a level pair**
   (start at `thorough`, persist, resume -> `resume_entry_index` finds the entry), and the §4a
-  resume guard (differing `level` on resume -> rejected; matching/absent -> accepted).
+  resume guard: differing declared `level` on resume -> rejected; **unknown/undeclared `level`
+  on resume -> `INVALID_LEVEL_ON_RESUME`** (f4); matching/absent -> accepted.
+- **f5 test:** a fresh review where the proactive gate selects a fallback lacking the requested
+  (advertised) level -> runs at that entry's base pair with a diagnostic, not an error; an
+  entirely unknown name -> `INVALID_LEVEL`.
+- **f6 test:** with `default_level` != base, the start response / status report the effective
+  pair (or clearly label the base), not a bare base describe that misstates the running effort.
 - **f1/f2 regression tests:** assert the resolved pair actually reaches the built CLI argv on a
   **fresh** level start AND after a **resume** (the effective spec survives `Job::run`'s
   `self.spec = entry.clone()`), and that a rate-limited start-entry attempt metric records the
