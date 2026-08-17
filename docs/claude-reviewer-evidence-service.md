@@ -15,11 +15,12 @@ startup handshake + no mid-turn transport error + ≥1 successful *content* call
 pushback bought the *scoping* (gate fires only on the empty/incomplete sliver), not the absence of
 the gate. **f5**: §6 adds a separate `verified_empty_sterile_dir` check, leaving the shared helper
 untouched. Turn 5 resolved f4 and left only **f6**, which turn 5 refined again (concurrency): the
-profile `CLAUDE_CONFIG_DIR` must not persist auto-memory/`CLAUDE.md` across reviews. §8 now gates
-the machinery behind Phase 0 — Q1 (does headless `claude -p` even write auto-memory? likely not →
-f6 closed by assertion), Q2 (a `--settings` disable key?), Q3 (only then a crash-safe **and**
-concurrency-safe scrub: pre-launch verify-or-refuse plus the **exclusive** side of the per-home
-lock so concurrent same-profile reviews serialize instead of racing).
+profile `CLAUDE_CONFIG_DIR` must not persist auto-memory/`CLAUDE.md` across reviews. §8 gates the
+machinery behind Phase 0 — Q1 (does headless `claude -p` even write auto-memory? likely not → f6
+closed by assertion), Q2 (disable it via the confirmed key `autoMemoryEnabled: false` in the
+settings blob — the expected path), Q3 (a crash-safe **and** concurrency-safe scrub via the
+**exclusive** per-home lock — a documented contingency that should not be reached now the key is
+known).
 
 ## Context
 
@@ -82,7 +83,8 @@ Both were re-verified empirically during planning (claude 2.1.233), not taken fr
 So the **granular** path is the only combination that yields {OAuth auth} + {one trusted MCP
 server} + {isolation}, and it is verified end-to-end above. Replace `--safe-mode` with:
 
-- `--settings '{"disableAllHooks":true}'` — disables all hooks, including plugin-provided ones;
+- `--settings '{"disableAllHooks":true,"autoMemoryEnabled":false}'` — disables all hooks
+  (including plugin-provided ones) and auto-memory (the §8/f6 preferred path — key confirmed);
 - `--disable-slash-commands` — disables all skills and custom commands;
 - keep `--strict-mcp-config` (already passed today) — only `--mcp-config` servers load, no
   ambient/plugin/project MCP;
@@ -188,7 +190,7 @@ In the `if cfg.isolate_reviewer` block (currently `claude.rs:131-147`), replace
 `cmd.arg("--safe-mode")` with:
 
 ```rust
-cmd.args(["--settings", "{\"disableAllHooks\":true}"]);
+cmd.args(["--settings", "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}"]);
 cmd.arg("--disable-slash-commands");
 // (keep) --strict-mcp-config
 ```
@@ -370,9 +372,17 @@ answers three questions in order, and each "no" collapses the rest:
   f6 is closed by a Phase 0 assertion plus a regression check that the config home stays clean
   after a review — no disable, no scrub, no lock. This is the likely, cheapest outcome, and the
   counterweight: do not build the scrub/lock machinery below speculatively.
-- **Q2 (only if Q1 writes) — is there a `--settings` key that disables auto-memory + `CLAUDE.md`
-  loading?** Fold it into the same blob that carries `disableAllHooks`. Nothing is written, so no
-  scrub, no lock, no crash window, no concurrency window. Preferred whenever it exists.
+- **Q2 (only if Q1 writes) — disable auto-memory via the settings key, now known to exist:**
+  `--settings '{"disableAllHooks":true,"autoMemoryEnabled":false}'` — `autoMemoryEnabled: false`
+  folds into the same blob that already carries `disableAllHooks`. Nothing is written, so no scrub,
+  no lock, no crash window, no concurrency window. This is the preferred path and, because the key
+  is confirmed, the **expected** one — so Q3 below is a documented contingency that should not be
+  reached. Phase 0 still (a) confirms the installed CLI accepts the key and that it actually
+  suppresses auto-memory writes in headless mode, and (b) checks the one residual the reviewer
+  named — a `CLAUDE.md` in the config home. That residual is already closed in practice: the
+  reviewed-repo `CLAUDE.md` is out of reach via the sterile cwd (§6), and the controlled profile
+  home is provisioned by cross-review with only the credential — it has no `CLAUDE.md` and a review
+  writes none once auto-memory is off. Phase 0 verifies the home stays `CLAUDE.md`-free.
 - **Q3 (only if it writes AND no key) — the crash-safe *and* concurrency-safe scrub fallback.**
   Two properties, because turns 4–5 found the scrub needs both:
   - *Crash-safe:* the scrub runs **pre-launch** (verify clean, scrub if not, **refuse** if it
@@ -417,8 +427,9 @@ must also settle what the findings turned up:
   when no sterile cwd is available.
 - **Config-home auto-memory (f6).** §8's Q1→Q2→Q3: does `claude -p` under the granular flags write
   auto-memory to a scratch `CLAUDE_CONFIG_DIR` at all (if not, f6 is closed by assertion); if so,
-  does a `--settings` key suppress it; only if neither, the crash-safe + concurrency-safe scrub
-  fallback is built and its concurrent-start test must pass.
+  confirm `--settings '{"autoMemoryEnabled":false}'` is accepted by the installed CLI and
+  suppresses the write, and that the home stays `CLAUDE.md`-free — the expected Q2 path. Q3's
+  scrub/lock fallback is reached only if that key does not suppress the write.
 - **Child reaping.** Confirm the evidence child is terminated when that `claude` exits.
 
 If any fails, stop and amend this plan; do not ship a Claude evidence path that a billed review
@@ -431,7 +442,8 @@ reuse.
 ## Verification
 
 - `cargo test` — add argv tests (mirroring `argv_tests.rs:280-298`): an isolated Claude
-  invocation contains `--settings {"disableAllHooks":true}`, `--disable-slash-commands`,
+  invocation contains `--settings {"disableAllHooks":true,"autoMemoryEnabled":false}`,
+  `--disable-slash-commands`,
   `--strict-mcp-config`, and `--mcp-config <file>`, and does **not** contain `--safe-mode`;
   `--disallowed-tools` and `--permission-mode dontAsk` remain present; `--allow-reviewer-config`
   drops the three isolation flags (as it drops `--safe-mode` today). One test that the Claude
