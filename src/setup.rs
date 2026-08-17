@@ -636,6 +636,10 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
         bin: None,
         usage_minimum: UsageMinimum::None,
         profile: selector.clone(),
+        // Setup provisions/authorizes an account; levels are a per-review selection knob with no
+        // bearing on that, so this synthetic spec declares none.
+        levels: std::collections::BTreeMap::new(),
+        default_level: None,
     };
     let bin = crate::reviewer::resolve_bin(&spec)?;
     let adapter = crate::reviewer::for_kind(reviewer);

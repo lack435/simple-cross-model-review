@@ -42,6 +42,12 @@
 command = "dist\\cross-review.exe"
 args = [
     "--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium",
+    # Review levels (a caller-selectable model+effort preset; see README "Review levels").
+    # standard == the base --effort, so an omitted `level` is unchanged from before.
+    "--level", "fast:claude-opus-4-8:low",
+    "--level", "standard:claude-opus-4-8:medium",
+    "--level", "thorough:claude-opus-4-8:high",
+    "--default-level", "standard",
     "--diff", "main...HEAD",
     "--claude-profile", "work",
 ]

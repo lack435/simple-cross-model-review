@@ -717,6 +717,37 @@ pub fn bad_request(summary: impl Into<String>) -> Failure {
     }
 }
 
+/// The `level` on a fresh review names no level this reviewer advertises. Agent-correctable: fix
+/// the argument. Distinct from `BAD_REQUEST` only so a calling agent can tell "unknown level" from
+/// a malformed request. See `docs/review-levels-plan.md`.
+pub fn invalid_level(summary: impl Into<String>) -> Failure {
+    let summary = summary.into();
+    Failure {
+        code: "INVALID_LEVEL",
+        remediation: format!("{summary} Correct the 'level' argument and call it again."),
+        summary,
+        detail: None,
+    }
+}
+
+/// A `level` on a *resume* that the session cannot honour — either undeclared on the entry it
+/// resumes on, or resolving to a different `(model, effort)` than the one the session was pinned to
+/// at start. The level is fixed when a session starts; changing it means a new session. See
+/// `docs/review-levels-plan.md` §4a.
+pub fn invalid_level_on_resume(summary: impl Into<String>) -> Failure {
+    let summary = summary.into();
+    Failure {
+        code: "INVALID_LEVEL_ON_RESUME",
+        remediation: format!(
+            "{summary} Omit 'level' to continue this session at its pinned model/effort, or pass \
+             fresh: true to start a new session at the requested level (carry any still-open \
+             findings into the new instructions)."
+        ),
+        summary,
+        detail: None,
+    }
+}
+
 /// The worker thread unwound without recording a result.
 pub fn worker_panicked(review_id: &str) -> Failure {
     Failure::new(

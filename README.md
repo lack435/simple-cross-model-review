@@ -107,6 +107,12 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
+--level NAME:MODEL:EFFORT    Declare a named review-depth preset the caller can pick per review
+                            (e.g. fast:gpt-5.6-luna:high). Repeatable; binds to the --reviewer
+                            before it. The caller selects one with the `level` tool argument at
+                            start; it is fixed for the session. See "Review levels" below.
+--default-level NAME        Which declared --level applies when a review omits `level`. Optional;
+                            unset falls back to this entry's --model/--effort.
 --min-usage-remaining <n>   Proactive gate (codex only): skip this entry when its last-observed
                             usage remaining is known and below n% (1..=100), before spending a
                             call. Optional; unset never gates. See the usage-remaining gate below.
@@ -195,6 +201,38 @@ primary, and never falls through — the reviewer's memory lives on one specific
 rate-limited resume is reported as such and the caller chooses `fresh: true` to restart chain
 selection. The full design is in
 [docs/reviewer-fallback-chain.md](docs/reviewer-fallback-chain.md).
+
+### Review levels
+
+Declare named `(model, effort)` presets with `--level NAME:MODEL:EFFORT`, and the caller can
+pick one per review with the `level` tool argument — a fast/standard/thorough knob without an
+operator editing config and restarting. Each server entry drives one reviewer direction, so each
+config declares that direction's levels:
+
+```
+--reviewer codex --model gpt-5.6-luna --effort xhigh \
+  --level fast:gpt-5.6-luna:high \
+  --level standard:gpt-5.6-luna:xhigh \
+  --level thorough:gpt-5.6-luna:max \
+  --default-level standard
+```
+
+When levels are declared, `cross_model_review` advertises a `level` argument (an enum of the
+declared names). The level is resolved **at start** and **fixed for the session**: `--default-level`
+(or, unset, the entry's `--model`/`--effort`) applies when `level` is omitted, and a review omitting
+`level` is unaffected. Collecting and re-reviewing never take `level`; a re-review keeps the level the
+session started on. Passing a *different* `level` on a resume is refused (`INVALID_LEVEL_ON_RESUME`) —
+use `fresh: true` to start a new session at another level. An unknown level on a fresh review is
+`INVALID_LEVEL`. The start response and `--doctor`/status name the effective pair and the level menu,
+so an omitted-level default that differs from the base `--effort` is never silently misreported.
+
+Levels are a per-review selection knob, not reviewer identity: two entries differing only in their
+level menu are still one identity, and a session started at a non-default level still resumes (its
+persisted pair binds back to the entry that produced it). A level's effort is validated the same way
+`--effort` is (a warning, then passed through). On a multi-entry chain, a level applies to the entry
+that **starts** the review — which the proactive usage gate may select. A mid-run **rate-limit
+fallback always runs at its own base `--effort`**, never the requested level (even if that fallback
+happens to declare the same level name); the response and metrics report the pair that actually ran.
 
 ### Proactive usage-remaining gate
 

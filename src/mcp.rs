@@ -1054,6 +1054,40 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     }
 
+    // The review "level" preset is advertised only when the primary entry declares at least one
+    // level. A server with no levels behaves exactly as before: no `level` property, and
+    // additionalProperties:false rejects a stray one. The advertised menu is the primary's — the
+    // runtime (start_review) is the real validator and also handles a gate-selected fallback that
+    // lacks a level. See `docs/review-levels-plan.md` §3.
+    let primary = cfg.primary();
+    if !primary.levels.is_empty() {
+        let menu = primary
+            .levels
+            .iter()
+            .map(|(name, lv)| format!("{name} = model={}/effort={}", lv.model, lv.effort))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let default_hint = match &primary.default_level {
+            Some(d) => format!("Omit to use the default level '{d}'."),
+            None => "Omit to use the reviewer's base model/effort.".to_string(),
+        };
+        let names = primary.level_names();
+        if let Some(props) = tools[0]["inputSchema"]["properties"].as_object_mut() {
+            props.insert(
+                "level".to_string(),
+                json!({
+                    "type": "string",
+                    "enum": names,
+                    "description": format!(
+                        "Optional review depth preset. Chosen at start and fixed for the session: a \
+                         resume/re-review keeps the session's original level (pass fresh:true to \
+                         change it). Levels: {menu}. {default_hint}"
+                    )
+                }),
+            );
+        }
+    }
+
     tools
 }
 
@@ -1189,6 +1223,47 @@ mod tests {
         let tool = &response["result"]["tools"][0];
         assert_eq!(tool["inputSchema"]["required"][0], "instructions");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn level_property_is_advertised_only_when_levels_are_configured() {
+        // No levels: the property is absent, so additionalProperties:false rejects a stray `level`
+        // and the schema reads exactly as before.
+        let plain = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
+        assert!(
+            plain["result"]["tools"][0]["inputSchema"]["properties"]
+                .get("level")
+                .is_none(),
+            "{plain}"
+        );
+
+        // With levels declared on the primary, `level` is advertised as an enum of the declared
+        // names, and is optional (never in `required`).
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "fast:gpt-5.6-luna:high".into(),
+            "--level".into(),
+            "thorough:gpt-5.6-luna:max".into(),
+            "--default-level".into(),
+            "thorough".into(),
+        ])
+        .expect("cfg");
+        let leveled = Arc::new(App::new(cfg));
+        let resp = handle_sync(&leveled, "tools/list", &Value::Null, &json!(2));
+        let schema = &resp["result"]["tools"][0]["inputSchema"];
+        assert_eq!(
+            schema["properties"]["level"]["enum"],
+            json!(["fast", "thorough"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        let required = schema["required"].as_array().expect("required array");
+        assert!(!required.iter().any(|v| v == "level"), "{schema}");
+        assert!(schema["properties"]["level"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("thorough"));
     }
 
     /// The caller is told what `--diff` actually captures. A description hardcoded to the
