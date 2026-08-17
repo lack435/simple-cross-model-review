@@ -2433,6 +2433,9 @@ mod tests {
 
     #[test]
     fn with_account_denies_an_unauthorized_named_profile() {
+        // Isolate the allowlist store so this is hermetic regardless of what the developer machine
+        // has genuinely authorized (issue #99).
+        let _base = crate::profile::isolate_profile_base();
         // The account-bearing resolver refuses an unauthorized profile just like the home-only one:
         // the profile home does not exist, so its account cannot be read and no allowlist entry can
         // match, so no account is surfaced — it is refused, not silently returned.
@@ -2446,6 +2449,8 @@ mod tests {
 
     #[test]
     fn a_named_profile_is_denied_in_phase_1() {
+        // Hermetic store: deny regardless of the developer machine's real allowlist (issue #99).
+        let _base = crate::profile::isolate_profile_base();
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--codex-profile", "work"]))
             .expect("config");
         let err = cfg.resolve_authorized_home(cfg.primary()).unwrap_err();

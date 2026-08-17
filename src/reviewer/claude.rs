@@ -834,6 +834,9 @@ mod tests {
 
     #[test]
     fn effective_read_home_is_the_directory_and_preserves_the_home_for_reads_contract() {
+        // Isolate the allowlist store so the denied-profile assertions hold regardless of what the
+        // developer machine has genuinely authorized (issue #99).
+        let _base = crate::profile::isolate_profile_base();
         // Ambient: the ambient config *directory* (the ambient fallback is preserved).
         let ambient = cfg();
         let home = ClaudeReviewer.effective_read_home(&ambient, ambient.primary());
