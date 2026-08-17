@@ -47,6 +47,13 @@ pub enum CodeOutcome {
 struct Shared {
     outcome: Option<CodeOutcome>,
     stop: bool,
+    /// The login finished successfully (the child exited 0), so the page should stop asking for a code
+    /// and show a "sign-in complete" message. Independent of `outcome`: a browser-callback account
+    /// completes without ever submitting a code, so this is set by the caller, not by a page request.
+    completed: bool,
+    /// A `/status` request has served `done` to the page at least once, so the polling page has been
+    /// told to dismiss. Lets the caller stop waiting the moment the page has been updated (#97).
+    done_delivered: bool,
 }
 
 struct ServerCtx {
@@ -76,12 +83,15 @@ fn set_terminal(shared: &(Mutex<Shared>, Condvar), outcome: CodeOutcome, also_st
     }
 }
 
-/// Atomically record a submitted code, or refuse it (server stopping, an outcome already set, or the
-/// deadline passed). Returns whether it was recorded.
+/// Atomically record a submitted code, or refuse it (server stopping, the login already completed, an
+/// outcome already set, or the deadline passed). Returns whether it was recorded. The `completed` check
+/// closes a race in the callback path (f2): once the login has succeeded, the server lingers briefly so
+/// the page can observe `done` (#97), and a stale `/submit` arriving in that window must not record a
+/// code the caller will never feed — nor stop the status listener out from under the polling page.
 fn try_submit(shared: &(Mutex<Shared>, Condvar), deadline: Instant, code: String) -> bool {
     let (lock, cvar) = shared;
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.stop || guard.outcome.is_some() || Instant::now() >= deadline {
+    if guard.stop || guard.completed || guard.outcome.is_some() || Instant::now() >= deadline {
         return false;
     }
     guard.outcome = Some(CodeOutcome::Submitted(code));
@@ -117,6 +127,8 @@ impl CodeEntryServer {
                 Mutex::new(Shared {
                     outcome: None,
                     stop: false,
+                    completed: false,
+                    done_delivered: false,
                 }),
                 Condvar::new(),
             )),
@@ -150,6 +162,50 @@ impl CodeEntryServer {
     /// Ask the server to stop and record `Cancelled` if no outcome is set yet.
     pub fn cancel(&self) {
         set_terminal(&self.shared, CodeOutcome::Cancelled, true);
+    }
+
+    /// Signal that the login finished successfully (the child exited 0), and report whether a polling
+    /// page can still be told. A page polling `/status` picks `completed` up and swaps to a "sign-in
+    /// complete" message instead of lingering with a code field a browser-callback account never needs
+    /// (#97). This does not stop the server or set an `outcome`; the caller drops the server after
+    /// giving the page a moment to observe it.
+    ///
+    /// Returns `false` — meaning there is nothing to wait for — when an `outcome` is already set or the
+    /// server is stopping: recording a submitted code (or a cancel/timeout) stops the accept loop, so no
+    /// `/status` request can be served after that point. The check-and-set is atomic under the lock and
+    /// mirrors [`try_submit`]'s `completed` check, so exactly one of the two wins a race: either this
+    /// marks `completed` (and later submits are refused) or a submit has already set `outcome` (and this
+    /// returns `false`). That closes the submit/child-exit race where the caller would otherwise wait
+    /// the full grace against an already-dead listener (f3).
+    pub fn complete(&self) -> bool {
+        let (lock, cvar) = &*self.shared;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.outcome.is_some() || guard.stop {
+            return false;
+        }
+        guard.completed = true;
+        cvar.notify_all();
+        true
+    }
+
+    /// Block until a `/status` request has served `done` to the polling page — i.e. the page has been
+    /// told the login is complete — or `max` elapses. Bounded and best-effort: if no browser page is
+    /// polling (headless, or the human closed the tab), it simply waits out `max` and returns. Call
+    /// after [`complete`](Self::complete).
+    pub fn wait_page_dismissed(&self, max: Duration) {
+        let (lock, cvar) = &*self.shared;
+        let deadline = Instant::now() + max;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !guard.done_delivered {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (g, _) = cvar
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        }
     }
 }
 
@@ -276,6 +332,15 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
         );
         return;
     }
+    // The page polls this to auto-dismiss (#97): `done` once the login has succeeded, `expired` once it
+    // is over any other way, `pending` while a code may still be needed. Served *before* the terminal
+    // 409 below so a timed-out/cancelled server still answers the poller with a status it understands,
+    // not the 409 HTML page. Coarse and secret-free.
+    if method == "GET" && path == "/status" {
+        let status = page_status(&ctx.shared, ctx.deadline);
+        respond(&mut stream, "200 OK", "text/plain; charset=utf-8", status);
+        return;
+    }
     if is_terminal(&ctx.shared, ctx.deadline) {
         respond(
             &mut stream,
@@ -357,6 +422,32 @@ fn handle_connection(mut stream: TcpStream, ctx: &ServerCtx) {
             "text/plain; charset=utf-8",
             "Not found.\n",
         ),
+    }
+}
+
+/// The coarse status the polling page reads from `/status`. `done` when the login has succeeded
+/// (serving it also records [`done_delivered`](Shared::done_delivered) so the caller can stop waiting),
+/// `expired` once the wait is over any other way, `pending` while a code may still be submitted.
+fn page_status(shared: &(Mutex<Shared>, Condvar), deadline: Instant) -> &'static str {
+    let (lock, cvar) = shared;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.completed {
+        if !guard.done_delivered {
+            guard.done_delivered = true;
+            cvar.notify_all();
+        }
+        return "done";
+    }
+    let expired = guard.stop
+        || matches!(
+            guard.outcome,
+            Some(CodeOutcome::TimedOut) | Some(CodeOutcome::Cancelled)
+        )
+        || Instant::now() >= deadline;
+    if expired {
+        "expired"
+    } else {
+        "pending"
     }
 }
 
@@ -460,6 +551,8 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str)
 }
 
 fn render_page(title: &str, auth_url: &str, token: &str) -> String {
+    // `token` is a hex CSPRNG string (`random_hex_token`), so it is safe to embed directly in the JS
+    // string literal below; it cannot break out of the quotes.
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -468,19 +561,38 @@ fn render_page(title: &str, auth_url: &str, token: &str) -> String {
          a{{word-break:break-all}}input{{font-family:ui-monospace,monospace;font-size:1rem;padding:.5rem;width:100%;box-sizing:border-box}}\
          button{{font-size:1rem;padding:.6rem 1.4rem;margin-top:.8rem;border:0;border-radius:.4rem;background:#0a5;color:#fff;cursor:pointer}}\
          .caution{{background:#fff6e0;border:1px solid #e0b400;border-radius:.4rem;padding:.6rem .8rem}}\
+         .code-step{{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #ddd;color:#444}}\
          </style></head><body>\
+         <div id=\"main\">\
          <h1>{title}</h1>\
          <p class=\"caution\">Only continue if you started this profile setup.</p>\
-         <ol><li>Sign in in the browser tab that opened (or open <a href=\"{url}\">this sign-in link</a>).</li>\
-         <li><strong>If the sign-in shows an authorization code</strong>, copy it and paste it below. \
-         If the sign-in completed in the browser without showing a code, you can just close this page.</li></ol>\
+         <p><strong>A Claude sign-in tab was opened behind this page.</strong> Finish signing in there \
+         (or open <a href=\"{url}\">the sign-in link</a> again). If it shows <em>Sign in successful</em>, \
+         you're done — this page will update on its own; you can then close it.</p>\
+         <div class=\"code-step\">\
+         <p>Most sign-ins finish in that tab with nothing to do here. <strong>Only</strong> if the sign-in \
+         shows you an authorization code to copy, paste it below:</p>\
          <form method=\"post\" action=\"/submit?token={token}\">\
-         <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Paste the code here (only if shown)\" autofocus>\
-         <br><button type=\"submit\">Submit</button></form>\
+         <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"Authorization code (only if the sign-in shows one)\">\
+         <br><button type=\"submit\">Submit code</button></form>\
          <p>Any code is sent only to this local page and passed straight to the sign-in; nothing is authorized until sign-in completes and you approve.</p>\
+         </div></div>\
+         <script>(function(){{\
+         var t={token:?};var done=false;var fails=0;\
+         function show(h,b){{done=true;document.getElementById('main').innerHTML='<h1>'+h+'</h1><p>'+b+'</p>';}}\
+         function over(){{show('This page is no longer needed','The sign-in is over. You can close this tab.');}}\
+         function poll(){{if(done)return;\
+         fetch('/status?token='+encodeURIComponent(t),{{cache:'no-store'}})\
+         .then(function(r){{return r.text();}}).then(function(s){{fails=0;s=(s||'').trim();\
+         if(s==='done'){{show('Sign-in complete','Your reviewer profile finished signing in. You can close this tab.');try{{window.close();}}catch(e){{}}}}\
+         else if(s==='expired'){{over();}}\
+         else{{setTimeout(poll,1000);}}}})\
+         .catch(function(){{fails++;if(fails>=3){{over();}}else{{setTimeout(poll,1000);}}}});}}\
+         setTimeout(poll,1000);}})();</script>\
          </body></html>",
         title = escape(title),
         url = escape(auth_url),
+        token = token,
     )
 }
 
@@ -619,5 +731,155 @@ mod tests {
     #[test]
     fn percent_decode_handles_plus_and_hex() {
         assert_eq!(percent_decode("a+b%2Dc%2f"), "a b-c/");
+    }
+
+    fn status_body(port: u16, token: &str) -> String {
+        let resp = raw(
+            port,
+            &format!("GET /status?token={token} HTTP/1.1\r\nHost: x\r\n\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        resp.rsplit("\r\n\r\n").next().unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn status_reports_pending_then_done_after_complete() {
+        // #97: the page polls /status to auto-dismiss. Fresh it is `pending`; once the caller signals a
+        // successful callback login via complete(), it flips to `done` — with no code ever submitted.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+
+        assert_eq!(status_body(port, &token), "pending");
+        assert!(
+            server.complete(),
+            "fresh server has a live listener to signal"
+        );
+        assert_eq!(status_body(port, &token), "done");
+        // The wait returns promptly now that a /status GET has delivered `done` to the page.
+        server.wait_page_dismissed(Duration::from_secs(5));
+        // complete() is independent of the code-wait outcome: no code was submitted.
+        assert!(!matches!(server.poll(), Some(CodeOutcome::Submitted(_))));
+    }
+
+    #[test]
+    fn page_status_maps_each_terminal_state() {
+        // The status logic itself. cancel()/timeout stop the *server*, so `expired` cannot be observed
+        // over HTTP (the listener is gone by then — the polling page handles that as repeated fetch
+        // failures instead); exercise the mapping directly here.
+        let future = Instant::now() + Duration::from_secs(30);
+        let mk = |outcome, stop, completed| {
+            (
+                Mutex::new(Shared {
+                    outcome,
+                    stop,
+                    completed,
+                    done_delivered: false,
+                }),
+                Condvar::new(),
+            )
+        };
+
+        assert_eq!(page_status(&mk(None, false, false), future), "pending");
+        // A submitted code is still in-flight (waiting on the child), not expired.
+        assert_eq!(
+            page_status(
+                &mk(Some(CodeOutcome::Submitted("x".into())), false, false),
+                future
+            ),
+            "pending"
+        );
+        assert_eq!(page_status(&mk(None, false, true), future), "done");
+        assert_eq!(
+            page_status(&mk(Some(CodeOutcome::Cancelled), true, false), future),
+            "expired"
+        );
+        assert_eq!(
+            page_status(&mk(Some(CodeOutcome::TimedOut), false, false), future),
+            "expired"
+        );
+        // Past the deadline is expired even with no recorded outcome yet.
+        assert_eq!(
+            page_status(
+                &mk(None, false, false),
+                Instant::now() - Duration::from_secs(1)
+            ),
+            "expired"
+        );
+        // `done` wins over an also-expired condition.
+        assert_eq!(
+            page_status(
+                &mk(None, true, true),
+                Instant::now() - Duration::from_secs(1)
+            ),
+            "done"
+        );
+    }
+
+    #[test]
+    fn complete_reports_no_wait_once_an_outcome_is_recorded() {
+        // f3: gating the caller's grace on complete()'s return closes the submit/child-exit race.
+        // Once a code has been submitted, the server has stopped, so there is no live /status listener
+        // to deliver `done` — complete() must report false so the caller does not wait for nothing.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+        let body = "code=abc";
+        let post = format!(
+            "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(raw(port, &post).starts_with("HTTP/1.1 200"));
+        assert!(matches!(server.poll(), Some(CodeOutcome::Submitted(_))));
+        assert!(
+            !server.complete(),
+            "an already-submitted session has no live listener to wait on"
+        );
+    }
+
+    #[test]
+    fn a_submit_after_completion_is_refused() {
+        // f2: once the login has succeeded (complete()), the server lingers briefly so the page can see
+        // `done`. A stale /submit arriving in that window must be refused, not recorded — the caller has
+        // already stopped feeding stdin, and recording an outcome would stop the status listener.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, token) = split_url(server.url());
+        assert!(server.complete());
+        let body = "code=late";
+        let resp = raw(
+            port,
+            &format!(
+                "POST /submit?token={token} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // Refused as a spent/expired link, and nothing was recorded as Submitted.
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        assert!(!matches!(server.poll(), Some(CodeOutcome::Submitted(_))));
+        // /status still reports the login as done.
+        assert_eq!(status_body(port, &token), "done");
+    }
+
+    #[test]
+    fn status_requires_the_token() {
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        let (port, _t) = split_url(server.url());
+        let resp = raw(port, "GET /status?token=nope HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    }
+
+    #[test]
+    fn wait_page_dismissed_returns_when_no_page_polls() {
+        // Headless / closed-tab case: nothing ever fetches /status, so the wait must fall through on its
+        // own bound rather than hang. complete() is set but done_delivered never will be.
+        let server =
+            CodeEntryServer::start("t", "https://v/a", Duration::from_secs(30)).expect("start");
+        assert!(server.complete());
+        let start = Instant::now();
+        server.wait_page_dismissed(Duration::from_millis(200));
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 }

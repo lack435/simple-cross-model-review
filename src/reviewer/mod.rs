@@ -419,6 +419,11 @@ pub struct LoginOutcome {
 /// caller verifies credentials / renames staging (f14). Generous: normal logins quiesce at once.
 const LOGIN_QUIESCE_BOUND: Duration = Duration::from_secs(10);
 
+/// After a code-paste login succeeds, how long to keep the code page's server alive so a browser that
+/// is polling `/status` can pick up the `done` signal and swap to "sign-in complete" (#97). Returns
+/// early the moment the page has been told; this is only the ceiling for when no page is polling.
+const CODE_PAGE_DISMISS_GRACE: Duration = Duration::from_secs(3);
+
 /// Run a vendor login `command` to completion under strict containment and redaction (#15 part 3b).
 ///
 /// - **Redaction:** stdin/stdout/stderr are all `null`, so nothing the child prints is captured; the
@@ -734,6 +739,20 @@ pub fn run_login_code_paste(
         }
         std::thread::sleep(Duration::from_millis(150));
     };
+    // The child exited. If it succeeded on a browser callback (no code was pasted), tell the code page
+    // so its lingering "paste a code" form auto-dismisses to "sign-in complete" (#97), and give the
+    // polling page a brief, bounded window to observe that before the server stops. If no page is
+    // polling (headless, or the tab was closed) this simply waits out the short grace.
+    //
+    // Only the code-less callback path needs this, and `complete()` decides that atomically: it returns
+    // false when an outcome is already recorded, which is exactly when a code was pasted (or the wait
+    // was cancelled/timed out) — that submission already stopped the accept loop, so no `/status`
+    // listener survives to deliver `done` and waiting would burn the whole grace for nothing (f1/f3).
+    // Gating on its return rather than on `code_fed` also covers the race where the child exits right
+    // after a submit, before the loop polled it.
+    if exit_code == Some(0) && server.complete() {
+        server.wait_page_dismissed(CODE_PAGE_DISMISS_GRACE);
+    }
     drop(server);
 
     // The child has exited. Prove containment with the **bounded** quiescence/terminate path, then
