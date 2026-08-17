@@ -2993,7 +2993,7 @@ impl Job {
             prompt,
             self.cfg.block_repair_timeout,
             &self.cancel,
-            self.reviewer.output_limits(&self.cfg),
+            self.reviewer.output_limits(&self.cfg, &self.spec),
             // Same policy fail-fast arming as the main run; at default settings the block-repair
             // timeout is shorter than the idle window, so timeout simply wins first.
             reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
@@ -3151,9 +3151,11 @@ impl Job {
         // configured, so a diff that could not be produced is never announced.
         // Rendered for the *active* entry, so a mixed-family fallback is told the truth about its
         // own shell/self-serve ability rather than the primary's.
-        let capabilities = self
-            .cfg
-            .reviewer_capabilities_of(self.spec.reviewer, change.is_some());
+        let capabilities = self.cfg.reviewer_capabilities_of(
+            self.spec.reviewer,
+            change.is_some(),
+            crate::reviewer::claude::claude_evidence_enabled(&self.cfg, &self.spec),
+        );
         let capabilities = if self.cfg.no_preamble {
             None
         } else {
@@ -3187,12 +3189,23 @@ impl Job {
         // Codex runs outside the repository and receives repository context through a mandatory
         // per-turn evidence capability. Build and handshake it before the findings write-ahead
         // marker: any failure here starts no reviewer process and advances no conversation.
-        // Evidence is built for Codex (always) and for an in-scope shell-less Claude -- the single
-        // `claude_neutral_target(...).is_some()` predicate (plan section 0), which also implies
-        // isolate_reviewer. A shell-enabled or otherwise non-qualifying Claude gets no evidence and
-        // keeps --safe-mode + the project cwd + its shell.
-        let claude_in_scope = self.spec.reviewer == crate::config::ReviewerKind::Claude
-            && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some();
+        // Evidence is built for Codex (always) and for an in-scope Claude.
+        // THE eligibility decision (reviews f2/f3): a profile-pinned, shell-less, git-top-level,
+        // default-rules, isolated Claude. The same predicate gates evidence setup here and is keyed
+        // on by invocation, parse, output_limits, and the capability preamble, so none of them
+        // disagree. Requiring a profile (f2) keeps an ambient Claude -- whose ~/.claude user config
+        // the granular flags do not disable and the project-only sterile cwd does not cover -- on the
+        // existing --safe-mode + neutral-cwd path with no evidence. A named profile that reached here
+        // is authorized (an unauthorized one was refused above), so this matches authorized_start.
+        let claude_in_scope =
+            crate::reviewer::claude::claude_evidence_enabled(&self.cfg, &self.spec);
+        debug_assert_eq!(
+            claude_in_scope,
+            authorized_start.is_some()
+                && self.spec.reviewer == crate::config::ReviewerKind::Claude
+                && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some(),
+            "claude evidence eligibility must match the authorized-profile form"
+        );
         // Section-7 (f4): whether the captured change is too thin to stand on its own -- empty
         // (nothing to review, e.g. an uncommitted `main...HEAD`) or incomplete (truncated). Keyed on
         // the CaptureSummary's reported counts, NOT the raw change text, which is non-empty even for a
@@ -3386,7 +3399,7 @@ impl Job {
             // The armed Claude path raises the stdout cap and terminates a runaway stream at the
             // byte/line bound; every other path keeps the retain-and-drain default. See
             // docs/usage-remaining-gate.md.
-            self.reviewer.output_limits(&self.cfg),
+            self.reviewer.output_limits(&self.cfg, &self.spec),
             // Policy fail-fast (issue #68): Codex-only, disabled when --max-policy-denials is 0.
             reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
             |activity| {
@@ -3398,11 +3411,13 @@ impl Job {
 
         // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json` output
         // before `run` is consumed by collect_run. Only meaningful on the in-scope Claude path (whose
-        // invocation forced stream-json); false everywhere else. A failed run has no Ok outcome to
-        // read -- collect_run below returns its error first, so the gate is never reached for it.
-        let content_evidence_succeeded = capture_thin
+        // invocation forced stream-json); false everywhere else. `is_ok()` requires BOTH a successful
+        // content call AND no evidence-call error, so a success followed by a later transport failure
+        // does not pass. A failed run has no Ok outcome to read -- collect_run below returns its error
+        // first, so the gate is never reached for it.
+        let evidence_ok = capture_thin
             && run.as_ref().ok().is_some_and(|o| {
-                crate::reviewer::claude::claude_content_evidence_succeeded(&o.stdout)
+                crate::reviewer::claude::claude_evidence_health(&o.stdout).is_ok()
             });
 
         // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
@@ -3440,10 +3455,11 @@ impl Job {
         // than resuming onto a rejected turn. Fail closed to a lost (re-runnable) review, never a
         // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
         // false), so the common review pays nothing.
-        if capture_thin && !content_evidence_succeeded {
+        if capture_thin && !evidence_ok {
             return Err(errors::evidence_review_too_thin(
-                "the captured change was empty or incomplete and the reviewer obtained no successful \
-                 content evidence call, so the review would rest on less than the intended change",
+                "the captured change was empty or incomplete and the reviewer did not obtain healthy \
+                 content evidence (no successful content call, or an evidence call errored), so the \
+                 review would rest on less than the intended change",
             ));
         }
 

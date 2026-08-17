@@ -867,8 +867,9 @@ fetching it — see [the change under review is fetched for you](#the-change-und
 The reviewer is told which of the two situations it is in, so it never claims to have seen
 a diff it was not shown, or reports one missing that is sitting in its prompt.
 
-On the evidence path, a shell-less Claude additionally gets the **same read-only repository
-evidence service the Codex reviewer has** — `repository_scope`/`list`/`search`/`read`/`change`,
+On the evidence path — a shell-less, git-top-level, **profile-pinned** Claude (an ambient Claude
+with no profile keeps `--safe-mode`, since only a profile gives it a controlled config home) — a
+Claude additionally gets the **same read-only repository evidence service the Codex reviewer has** — `repository_scope`/`list`/`search`/`read`/`change`,
 plus Git `history`/`revision` — reached through a generated `--mcp-config` (allow-listed under
 `--permission-mode dontAsk`, which otherwise denies MCP tools). It is still shell-less and still
 write-denied; the tools are read-only and path-scoped exactly as for Codex. Unlike Codex, the
@@ -891,8 +892,9 @@ at code you are unsure about.
 So the reviewer runs configuration-isolated by default:
 
 - **Claude reviewer** — isolation depends on whether the review is on the evidence path (a
-  shell-less, git-top-level, default-rules Claude — the dogfood direction):
-  - *Off the evidence path* (a shell-enabled or otherwise non-qualifying Claude): `--safe-mode`,
+  **profile-pinned**, shell-less, git-top-level, default-rules Claude — the dogfood direction; an
+  ambient Claude has no controlled config home, so it stays off the evidence path):
+  - *Off the evidence path* (a shell-enabled, ambient, or otherwise non-qualifying Claude): `--safe-mode`,
     which disables hooks, settings, plugins, skills, commands and MCP servers while leaving auth,
     model selection and permissions working normally, and the reviewer runs from the project cwd.
   - *On the evidence path*: `--safe-mode` would also disable the evidence MCP server, and `--bare`

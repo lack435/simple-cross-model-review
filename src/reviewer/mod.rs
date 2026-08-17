@@ -1413,7 +1413,7 @@ pub trait Reviewer: Send + Sync {
     /// review text more than once and a runaway stream must not hold the worker until timeout).
     /// This is the single truncation contract on raw bytes/lines read — overrun before the
     /// terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
-    fn output_limits(&self, _cfg: &Config) -> StdoutLimits {
+    fn output_limits(&self, _cfg: &Config, _spec: &ReviewerSpec) -> StdoutLimits {
         StdoutLimits::default_retain()
     }
 }

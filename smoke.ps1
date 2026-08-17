@@ -29,6 +29,9 @@ param(
     # Path to the reviewer CLI, when it is not on PATH.
     [string]$ReviewerBin,
 
+    # Profile label for the Claude evidence path (see review f2). Must be authorized on this machine.
+    [string]$ClaudeProfile = 'work',
+
     [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe'),
 
     # Prove the block-repair path against a real reviewer (issue #63). Builds an instrumented
@@ -67,6 +70,11 @@ if (-not (Test-Path $Exe)) {
 $serverArgs = @('--reviewer', $Reviewer, '--effort', $Effort, '--timeout-seconds', '600')
 if ($Model) { $serverArgs += @('--model', $Model) }
 if ($ReviewerBin) { $serverArgs += @('--bin', $ReviewerBin) }
+# The Claude evidence path requires a pinned profile home (an ambient Claude keeps --safe-mode and
+# gets no evidence, review f2), so the Claude smoke pins the dogfood "work" profile to exercise it.
+# This assumes the profile is authorized on this machine (cross_model_setup_profile). Override with
+# -ClaudeProfile to use a different label.
+if ($Reviewer -eq 'claude') { $serverArgs += @('--claude-profile', $ClaudeProfile) }
 
 # Keep smoke-test sessions out of the real per-project state.
 $stateDir = Join-Path ([System.IO.Path]::GetTempPath()) "cross-review-smoke-$PID"

@@ -1814,7 +1814,9 @@ impl Config {
     /// with the active entry.
     #[cfg(test)]
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
-        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied)
+        let evidence_enabled =
+            crate::reviewer::claude::claude_evidence_enabled(self, self.primary());
+        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied, evidence_enabled)
     }
 
     /// `reviewer_capabilities`, rendered for a specific chain entry.
@@ -1822,7 +1824,12 @@ impl Config {
     /// This is rendered per *active* entry at turn time, from the captured change, so a
     /// mixed-family fallback is told the truth about *its* shell and self-serve ability — the
     /// captured block itself is capability-neutral. See `docs/reviewer-fallback-chain.md`.
-    pub fn reviewer_capabilities_of(&self, reviewer: ReviewerKind, diff_supplied: bool) -> String {
+    pub fn reviewer_capabilities_of(
+        &self,
+        reviewer: ReviewerKind,
+        diff_supplied: bool,
+        evidence_enabled: bool,
+    ) -> String {
         if reviewer == ReviewerKind::Codex {
             let history = match self.vcs {
                 Vcs::Git => "Use `repository_history` and `repository_revision` for commit history and revisions.",
@@ -1862,9 +1869,7 @@ impl Config {
         // tools are for looking *past* it. Self-contained (early return): it states its own
         // no-shell boundary and diff handling, so it does not fall through to the shared shell-based
         // block below.
-        if reviewer == ReviewerKind::Claude
-            && crate::reviewer::claude_neutral_target(self, reviewer).is_some()
-        {
+        if reviewer == ReviewerKind::Claude && evidence_enabled {
             let history = match self.vcs {
                 Vcs::Git => " `repository_history` and `repository_revision` walk commit history and read revisions.",
                 Vcs::Perforce => " `repository_history` and `repository_revision` report unsupported (this service makes no new Perforce network calls).",
@@ -3640,10 +3645,12 @@ mod tests {
         // And it must be told to say so rather than guess at the change.
         assert!(text.contains("Do not guess"), "{text}");
 
-        // In scope (the dogfood default: git top-level, shell-less, default rules), it has the
-        // read-only evidence tools instead, is still told it has no shell, and is NOT told it cannot
-        // run git -- because it can, through repository_history/revision.
-        let claude_evidence = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        // In scope (profile-pinned, git top-level, shell-less, default rules), it has the read-only
+        // evidence tools instead, is still told it has no shell, and is NOT told it cannot run git --
+        // because it can, through repository_history/revision.
+        let claude_evidence =
+            Config::from_args(&args(&["--reviewer", "claude", "--claude-profile", "test"]))
+                .expect("config");
         assert!(!claude_evidence.reviewer_has_shell());
         let text = claude_evidence.reviewer_capabilities(false);
         assert!(text.contains("repository_scope"), "{text}");

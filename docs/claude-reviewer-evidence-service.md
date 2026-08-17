@@ -4,8 +4,8 @@ Status: approved plan (cross-review session `plan-claude-evidence-service`), on
 `plan/claude-evidence-service`. **Phase 0 complete** — all gates cleared against claude 2.1.233
 (see "Phase 0 results"); two amendments folded in (MCP allow-list entry in §1; Claude does not fail
 closed on a broken evidence server, so §7's parent-side handshake is mandatory). **Phase 1 re-gate
-(turn 8): chose option (a)** — evidence is scoped to **shell-less** isolated Claude (the single
-predicate `claude_neutral_target(...).is_some()`, §0), because the existing code deliberately keeps
+(turn 8): chose option (a)** — evidence is scoped to **profile-pinned, shell-less** isolated Claude
+(the single `claude_evidence_enabled(cfg, spec)` predicate, §0), because the existing code keeps
 shell-enabled Claude on the repo cwd + shell + `--safe-mode`. f7 requires that one predicate gate
 every hook together; the earlier `supplies_change_of` change is dropped (a shell-less isolated
 Claude already captures under `--diff auto`). Now implementing Phase 1 under that scope.
@@ -199,11 +199,21 @@ Implementation surfaced an interaction the earlier plan left open: the existing
 `claude_neutral_target` (`mod.rs:927-977`) deliberately moves **only shell-less** isolated Claude
 out of the repo, and keeps a **shell-enabled** Claude on the repo cwd (with `--safe-mode` and its
 working shell) so it can self-serve via git — see the rationale at `mod.rs:947-954`. The
-cross-review gate chose **option (a)**: the evidence service is given to Claude *exactly when
-`claude_neutral_target(cfg, reviewer).is_some()`* — i.e. shell-less, git, default rules, cwd is
-the git toplevel. Shell-enabled / non-qualifying isolated Claude is **unchanged**: it keeps
-`--safe-mode`, the repo cwd, and its shell. It gets no evidence, so no missing-evidence
-false-approval risk arises for it.
+cross-review gate chose **option (a)**: the evidence service is given to Claude *exactly when the
+centralized `claude_evidence_enabled(cfg, spec)` predicate holds* — a **profile-pinned** (impl f2,
+below), shell-less, git, default-rules Claude whose cwd is the git toplevel (the
+`claude_neutral_target` conditions **plus** a pinned profile). Shell-enabled, ambient, or otherwise
+non-qualifying Claude is **unchanged**: it keeps `--safe-mode`, the repo cwd (or neutral cwd), and
+its shell. It gets no evidence, so no missing-evidence false-approval risk arises for it.
+
+**The evidence path also requires a pinned profile home (impl review f2).** `claude_neutral_target`
+qualifies an *ambient* Claude (no `--claude-profile`) too, but for ambient runs `CLAUDE_CONFIG_DIR`
+is never set, so a granular-flag Claude would load the user's `~/.claude` settings/plugins/`CLAUDE.md`
+— which `--safe-mode` blocked and the sterile cwd (project-only) does not. Ambient Claude can't use a
+controlled config home (its credentials live in `~/.claude`), so evidence is gated on
+`authorized_start.is_some()`: ambient Claude keeps `--safe-mode` + the neutral cwd and gets no
+evidence; only a profile-pinned Claude (the dogfood, `--claude-profile work`) takes the evidence
+path. The `smoke.ps1 -Reviewer claude` run pins the `work` profile for this reason.
 
 **f7 is the load-bearing discipline: that single predicate must gate *every* new hook together** —
 evidence setup, the sterile cwd, the granular-flag swap, the evidence preamble, the runtime
@@ -220,8 +230,8 @@ capture is guaranteed for the in-scope path with no config change. The revert is
 ### 1. `src/reviewer/claude.rs` — argv
 
 Compute the §0 predicate once — call it `evidence_enabled` (= the `evidence` argument being
-`Some`, which the parent sets exactly when `claude_neutral_target(cfg, spec.reviewer).is_some()`,
-which already implies `isolate_reviewer`). **The flag swap keys on `evidence_enabled`, NOT on a
+`Some`, which the parent sets exactly when `claude_evidence_enabled(cfg, spec)` holds — a pinned
+profile plus the `claude_neutral_target` conditions, which already imply `isolate_reviewer`). **The flag swap keys on `evidence_enabled`, NOT on a
 bare `if cfg.isolate_reviewer` — that broader condition is the f7 trap** (it would strip
 `--safe-mode` from a shell-enabled Claude that stays on the repo cwd). Three branches:
 
@@ -259,9 +269,9 @@ rather than the `--safe-mode` rationale it documents today.
 
 Today the bundle is captured and the `EvidenceInvocation` constructed only for the Codex path
 (`src/tools.rs:~3305`; `mod.rs:246-247`, gated at `tools.rs:3190`). Extend that gate to also fire
-for the **in-scope Claude path** — i.e. when `claude_neutral_target(cfg, reviewer).is_some()` (the
-§0 predicate), so a shell-enabled Claude is excluded — reusing the identical capture→bundle
-machinery.
+for the **in-scope Claude path** — i.e. when `claude_evidence_enabled(cfg, spec)` holds (the §0
+predicate: a pinned profile plus the `claude_neutral_target` conditions), so a shell-enabled or
+ambient Claude is excluded — reusing the identical capture→bundle machinery.
 
 **`EvidenceInvocation.sterile_dir` IS set for in-scope Claude (corrected per f8), and is what wires
 the verified-empty cwd into the child.** It carries the `codex_sterile_dir` path (§6), and Claude's
@@ -532,7 +542,7 @@ amendments folded back above.
 - **f3 test:** an isolated Claude review keeps `prompt_change` populated (the in-prompt capture
   is preserved) even though evidence setup is present — the Codex-only suppression at
   `tools.rs:3273-3279` does not fire for Claude.
-- **f7 scoping test (the load-bearing one):** the single `claude_neutral_target(...).is_some()`
+- **f7 scoping test (the load-bearing one):** the single `claude_evidence_enabled(cfg, spec)`
   predicate gates the whole treatment together. A **shell-less** qualifying isolated Claude gets
   the granular flags, `--mcp-config`, the allow-list, the sterile cwd, and the `EvidenceInvocation`.
   A **shell-enabled** isolated Claude gets **none** of them — it still contains `--safe-mode`, runs
@@ -590,7 +600,8 @@ identifies a false-approval (not lost-review) risk.
   results — both **success and transport error** — from the stream (`:157-183` today parses only
   the final result), feeding the gate's health check (f4); auto-memory disable key in the
   `--settings` blob, or **pre-launch** scrub-and-verify of `CLAUDE_CONFIG_DIR` (`:105`) per §8 (f6).
-- **The single eligibility predicate** `claude_neutral_target(cfg, reviewer).is_some()` (§0, f7)
+- **The single eligibility predicate** `claude_evidence_enabled(cfg, spec)` (§0, f7; profile + the
+  `claude_neutral_target` conditions)
   gates every hook below; there is no second, looser condition. Shell-enabled / non-qualifying
   isolated Claude keeps `--safe-mode`, the repo cwd, its shell, and gets no evidence.
 - `src/reviewer/mod.rs` / `src/tools.rs` — construct + pass `EvidenceInvocation` for the **in-scope

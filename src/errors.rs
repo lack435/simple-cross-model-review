@@ -521,14 +521,15 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
 pub fn evidence_review_too_thin(detail: impl Into<String>) -> Failure {
     Failure::new(
         "EVIDENCE_UNAVAILABLE",
-        "The review ran, but the captured change was empty or incomplete and the reviewer read no \
-         change through the repository evidence tools, so it would rest on less than the intended \
-         change and was not accepted.",
+        "The review ran, but the captured change was empty or incomplete and the reviewer did not \
+         obtain healthy content evidence -- either it made no successful content evidence call, or \
+         an evidence call failed -- so the review would rest on less than the intended change and \
+         was not accepted.",
         "The captured change was empty or incomplete (for example an uncommitted or empty range), \
-         and the reviewer did not read the change through its read-only repository evidence tools, \
-         so the review cannot be trusted. Re-run once the change is committed or the range is \
-         non-empty (and the evidence service is healthy). The review has NOT been accepted; do not \
-         substitute your own read of the change.",
+         and the reviewer did not read the whole change through a healthy evidence service (no \
+         successful content call, or an evidence call errored), so the review cannot be trusted. \
+         Re-run once the change is committed or the range is non-empty and the evidence service is \
+         healthy. The review has NOT been accepted; do not substitute your own read of the change.",
     )
     .with_detail(detail)
 }

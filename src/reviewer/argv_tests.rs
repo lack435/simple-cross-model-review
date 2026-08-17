@@ -44,9 +44,9 @@ fn test_claude_evidence<'a>() -> EvidenceInvocation<'a> {
 fn evidence_for(cfg: &Config) -> Option<EvidenceInvocation<'_>> {
     match cfg.primary().reviewer {
         crate::config::ReviewerKind::Codex => Some(test_evidence(cfg)),
+        // Mirror the parent's real gating: an in-scope Claude needs a pinned profile too (f2/f3).
         crate::config::ReviewerKind::Claude => {
-            crate::reviewer::claude_neutral_target(cfg, crate::config::ReviewerKind::Claude)
-                .is_some()
+            crate::reviewer::claude::claude_evidence_enabled(cfg, cfg.primary())
                 .then(test_claude_evidence)
         }
     }
@@ -170,7 +170,16 @@ fn claude_runs_in_the_working_root_when_it_is_not_a_git_toplevel() {
 
 #[test]
 fn claude_argv_carries_the_pinned_model_and_effort() {
-    let cfg = config(&["claude", "--model", "claude-opus-4-8", "--effort", "xhigh"]);
+    // A profile makes this the in-scope evidence path (streams); model/effort are unaffected.
+    let cfg = config(&[
+        "claude",
+        "--claude-profile",
+        "test",
+        "--model",
+        "claude-opus-4-8",
+        "--effort",
+        "xhigh",
+    ]);
     let args = argv(&ClaudeReviewer, &cfg, None);
     assert_eq!(
         value_after(&args, "--model").as_deref(),
@@ -247,7 +256,8 @@ fn claude_in_scope_runs_from_the_sterile_cwd_with_absolute_read_scope_and_eviden
     // A `.git` entry (a file here, as a worktree/submodule has) makes this a git top-level.
     std::fs::write(repo.join(".git"), b"gitdir: elsewhere").expect("mark git toplevel");
     let state = crate::testutil::temp_dir("cross-review-argv-neutral-state");
-    let cfg = config_at(&repo, Some(&state), &["claude"]);
+    // A pinned profile is required for the evidence path (f2).
+    let cfg = config_at(&repo, Some(&state), &["claude", "--claude-profile", "test"]);
 
     // Runs from the sterile cwd the parent's evidence carries, which is outside the repo.
     let cwd = cwd_of(&ClaudeReviewer, &cfg);
@@ -324,17 +334,17 @@ fn claude_stays_in_the_working_root_when_a_gate_is_not_met() {
 
 #[test]
 fn claude_evidence_is_scoped_to_the_shell_less_path_f7() {
-    // Plan f7: the single `claude_neutral_target(...).is_some()` predicate gates the WHOLE
-    // treatment together, so no reviewer gets it partially. A shell-less isolated Claude (in scope)
-    // drops --safe-mode for the granular flags + evidence server; a shell-ENABLED isolated Claude
-    // (out of scope) keeps --safe-mode, gets no evidence and no granular flags, and stays in the
+    // Plan f7 (+ f2/f3): one profile-aware predicate gates the WHOLE treatment together, so no
+    // reviewer gets it partially. A profile-pinned shell-less isolated Claude (in scope) drops
+    // --safe-mode for the granular flags + evidence server; a shell-ENABLED one AND an AMBIENT one
+    // (both out of scope) keep --safe-mode, get no evidence and no granular flags, and stay in the
     // repo cwd -- exactly today's behaviour.
     let repo = crate::testutil::temp_dir("cross-review-argv-f7-repo");
     std::fs::write(repo.join(".git"), b"gitdir: elsewhere").expect("mark git toplevel");
     let state = crate::testutil::temp_dir("cross-review-argv-f7-state");
 
-    // In scope: shell-less. Granular isolation + evidence, no --safe-mode.
-    let in_scope = config_at(&repo, Some(&state), &["claude"]);
+    // In scope: profile-pinned, shell-less. Granular isolation + evidence, no --safe-mode.
+    let in_scope = config_at(&repo, Some(&state), &["claude", "--claude-profile", "test"]);
     let a = argv(&ClaudeReviewer, &in_scope, None);
     assert!(
         !a.iter().any(|x| x == "--safe-mode"),
@@ -344,12 +354,35 @@ fn claude_evidence_is_scoped_to_the_shell_less_path_f7() {
     assert!(a.iter().any(|x| x == "--mcp-config"), "{a:?}");
     assert!(a.iter().any(|x| x == "mcp__cross_review_evidence"), "{a:?}");
 
-    // Out of scope: shell enabled. Keeps --safe-mode, no evidence, no granular flags, repo cwd.
+    // Out of scope by AMBIENT (no profile, f2): keeps --safe-mode, no evidence, repo cwd -- an
+    // ambient Claude's ~/.claude config is not covered by the sterile cwd, so it must not drop
+    // --safe-mode.
+    let ambient = config_at(&repo, Some(&state), &["claude"]);
+    let amb = argv(&ClaudeReviewer, &ambient, None);
+    assert!(
+        amb.iter().any(|x| x == "--safe-mode"),
+        "ambient (no profile) Claude keeps --safe-mode: {amb:?}"
+    );
+    assert!(
+        !amb.iter().any(|x| x == "--mcp-config"),
+        "ambient Claude gets no evidence: {amb:?}"
+    );
+    // Ambient shell-less at a git top-level still uses the existing neutral-cwd optimisation (a
+    // non-repo dir), under --safe-mode -- unchanged from before this feature.
+    assert_ne!(
+        cwd_of(&ClaudeReviewer, &ambient),
+        ambient.cwd,
+        "ambient shell-less Claude runs from the neutral dir, not the repo"
+    );
+
+    // Out of scope by SHELL (even with a profile): keeps --safe-mode, no evidence, repo cwd.
     let out = config_at(
         &repo,
         Some(&state),
         &[
             "claude",
+            "--claude-profile",
+            "test",
             "--tools",
             "Read,Grep,Glob,Bash",
             "--allow-tools",
