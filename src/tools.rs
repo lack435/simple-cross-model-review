@@ -3193,6 +3193,13 @@ impl Job {
         // keeps --safe-mode + the project cwd + its shell.
         let claude_in_scope = self.spec.reviewer == crate::config::ReviewerKind::Claude
             && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some();
+        // Section-7 (f4): whether the captured change is too thin to stand on its own -- empty
+        // (nothing to review, e.g. an uncommitted `main...HEAD`) or incomplete (truncated). Computed
+        // now, before `summary` is consumed below. When thin AND the in-scope reviewer obtained no
+        // successful content evidence, the runtime gate (after collect_run) fails the review closed.
+        let capture_thin = claude_in_scope
+            && (change.map_or(true, |c| c.trim().is_empty())
+                || summary.as_ref().is_some_and(|s| !s.is_complete()));
         let evidence_setup =
             if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
                 let executable = std::env::current_exe().map_err(|e| {
@@ -3384,6 +3391,15 @@ impl Job {
         );
         self.registry.set_phase(&self.id, Phase::Finalizing);
 
+        // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json` output
+        // before `run` is consumed by collect_run. Only meaningful on the in-scope Claude path (whose
+        // invocation forced stream-json); false everywhere else. A failed run has no Ok outcome to
+        // read -- collect_run below returns its error first, so the gate is never reached for it.
+        let content_evidence_succeeded = capture_thin
+            && run.as_ref().ok().is_some_and(|o| {
+                crate::reviewer::claude::claude_content_evidence_succeeded(&o.stdout)
+            });
+
         // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
         // `collect_run`, which is also where the headroom observation and the parse happen, in that
         // one order. See there for why the two account checks are not redundant — the short version is
@@ -3409,6 +3425,24 @@ impl Job {
                 return Err(f.failure);
             }
         };
+
+        // Section-7 (f4) evidence gate. When the captured change was empty or incomplete, an in-scope
+        // Claude review is trustworthy only if the reviewer actually obtained real change/tree
+        // evidence. The pre-review handshake already proved the server could start; this catches the
+        // server dying between that and the first content call, or the reviewer touching only
+        // `repository_scope`. The child ran, so its conversation advanced: leave the findings marker
+        // set (as the collect_run non-spawn error arm above does) so the next call rebaselines rather
+        // than resuming onto a rejected turn. Fail closed to a lost (re-runnable) review, never a
+        // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
+        // false), so the common review pays nothing.
+        if capture_thin && !content_evidence_succeeded {
+            return Err(errors::evidence_unavailable(
+                "the captured change was empty or incomplete and the reviewer obtained no successful \
+                 content evidence call, so the review would rest on less than the intended change. \
+                 Re-run once the change is committed (or the range is non-empty) and the evidence \
+                 service is healthy.",
+            ));
+        }
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
         // build the completed envelope (pure — see `findings::assess_turn`). The nonce is this

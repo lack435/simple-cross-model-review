@@ -124,12 +124,11 @@ impl Reviewer for ClaudeReviewer {
             super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home.home);
         }
         cmd.arg("-p");
-        if cfg.chain_gates_on_usage() {
-            // Armed: stream-json carries the `rate_limit_event` we read headroom from; its terminal
-            // `result` event otherwise carries the same fields the buffered document does.
-            // `--verbose` is required with `-p` + `stream-json`. Nothing else is added (in
-            // particular not `--include-partial-messages`, verified unnecessary). See
-            // `docs/usage-remaining-gate.md`.
+        // stream-json is used when the usage gate is armed (to read the rate_limit_event) OR for an
+        // in-scope evidence review (so the section-7 gate can observe evidence tool-call success from
+        // the CLI's own structured events). Its terminal `result` event carries the same review the
+        // buffered document does. `--verbose` is required with `-p` + `stream-json`.
+        if cfg.chain_gates_on_usage() || evidence.is_some() {
             cmd.args(["--output-format", "stream-json", "--verbose"]);
         } else {
             cmd.args(["--output-format", "json"]);
@@ -202,10 +201,11 @@ impl Reviewer for ClaudeReviewer {
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
-        // Armed (usage-observing) runs use `--output-format stream-json`, a JSONL event stream
-        // rather than one buffered document, so they take the JSONL path below. A disarmed run is
-        // byte-for-byte the buffered `json` path this reviewer has always used.
-        if cfg.chain_gates_on_usage() {
+        // Armed (usage-observing) runs and in-scope evidence runs use `--output-format stream-json`,
+        // a JSONL event stream rather than one buffered document, so they take the JSONL path below.
+        // A disarmed, non-evidence run is byte-for-byte the buffered `json` path this reviewer has
+        // always used.
+        if cfg.chain_gates_on_usage() || claude_evidence_enabled(cfg, spec) {
             return parse_stream_json(spec, out);
         }
         // The review is stdout-only for this reviewer, so a stdout that hit the cap is
@@ -227,7 +227,13 @@ impl Reviewer for ClaudeReviewer {
     /// once), add a line cap, and terminate the child at either bound. Disarmed keeps the
     /// historic retain-and-drain default.
     fn output_limits(&self, cfg: &Config) -> super::StdoutLimits {
-        if cfg.chain_gates_on_usage() {
+        // The evidence path also streams (it must, for the section-7 gate), so it takes the raised
+        // caps too. This is `ClaudeReviewer::output_limits`, so the active reviewer is Claude; the
+        // Claude predicate on `cfg` therefore answers "is this Claude run evidence-enabled" whether
+        // Claude is the primary or a fallback entry.
+        let streams = cfg.chain_gates_on_usage()
+            || super::claude_neutral_target(cfg, crate::config::ReviewerKind::Claude).is_some();
+        if streams {
             super::StdoutLimits {
                 max_bytes: super::MAX_ARMED_STREAM_BYTES,
                 max_lines: super::MAX_ARMED_STREAM_LINES,
@@ -551,6 +557,78 @@ fn from_result_document(
 /// `rejected` rate-limit event is mapped to `RATE_LIMITED` so the reactive chain still advances;
 /// classification never runs raw stdout through the generic classifier. See
 /// `docs/usage-remaining-gate.md`.
+/// Whether this Claude turn is the in-scope evidence path (plan section 0): the same
+/// `claude_neutral_target(...).is_some()` predicate the parent gates evidence setup on. Used by
+/// `parse` to route the stream and derivable from `(cfg, spec)` so it stays in lock-step with the
+/// parent's decision without a side channel.
+fn claude_evidence_enabled(cfg: &Config, spec: &ReviewerSpec) -> bool {
+    spec.reviewer == crate::config::ReviewerKind::Claude
+        && super::claude_neutral_target(cfg, spec.reviewer).is_some()
+}
+
+/// Whether the reviewer's `stream-json` output shows at least one **successful content** evidence
+/// call -- any `repository_*` tool other than `repository_scope`, whose `tool_result` was not an
+/// error. This is the section-7 (f4) health signal: when the captured change is empty or incomplete,
+/// a review is trustworthy only if the reviewer actually pulled real change/tree evidence, so the
+/// absence of any successful content call fails the review closed. Reads only the CLI's structured
+/// `tool_use`/`tool_result` events (never reviewer prose): `tool_use` carries the tool `name` and an
+/// `id`; the matching `tool_result` carries that `id` as `tool_use_id` and `is_error` (absent on
+/// success). A `repository_scope`-only or all-errored turn returns false.
+pub(crate) fn claude_content_evidence_succeeded(stdout: &str) -> bool {
+    use std::collections::HashSet;
+    let content_prefix = format!("mcp__{}__repository_", crate::evidence::SERVER_NAME);
+    let scope_tool = format!("mcp__{}__repository_scope", crate::evidence::SERVER_NAME);
+    // ids of content tool_use calls seen so far; a later tool_result referencing one, without an
+    // error, is a successful content call.
+    let mut content_ids: HashSet<String> = HashSet::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array);
+        let Some(content) = content else { continue };
+        match value.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                for item in content {
+                    if item.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    if name.starts_with(&content_prefix) && name != scope_tool {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            content_ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                for item in content {
+                    if item.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let is_error = item
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let id = item.get("tool_use_id").and_then(Value::as_str);
+                    if !is_error && id.is_some_and(|id| content_ids.contains(id)) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
     // The armed reader terminated the child the moment a raw byte/line bound was overrun and
     // recorded which; that is authoritative, so report OUTPUT_TRUNCATED naming the bound before
@@ -834,7 +912,17 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config {
-        Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config")
+        // A non-git working root keeps Claude off the evidence path (`claude_neutral_target` requires
+        // a git top-level), so these tests exercise the buffered `json` parse used off the evidence
+        // path. The in-scope stream path is covered by the `stream_json`/usage-gate tests.
+        let dir = crate::testutil::temp_dir("cross-review-claude-parse");
+        Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--cwd".into(),
+            dir.to_string_lossy().into_owned(),
+        ])
+        .expect("config")
     }
 
     fn outcome(stdout: &str, success: bool) -> RunOutcome {
@@ -1259,6 +1347,42 @@ mod tests {
             Some("3d759777-4801-4e26-b6c5-4fbdb70adbbf")
         );
         assert!(parsed.denials.is_empty());
+    }
+
+    #[test]
+    fn content_evidence_success_is_read_from_the_stream() {
+        // A successful content call (repository_change) counts.
+        let ok = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__cross_review_evidence__repository_change"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#,
+        ]
+        .join("\n");
+        assert!(claude_content_evidence_succeeded(&ok));
+
+        // Only repository_scope succeeded -> not content evidence (it proves nothing about the change).
+        let scope_only = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"s1","name":"mcp__cross_review_evidence__repository_scope"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]}}"#,
+        ]
+        .join("\n");
+        assert!(!claude_content_evidence_succeeded(&scope_only));
+
+        // A content call that errored (a dead server surfaces here) does not count.
+        let errored = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"mcp__cross_review_evidence__repository_read"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","is_error":true}]}}"#,
+        ]
+        .join("\n");
+        assert!(!claude_content_evidence_succeeded(&errored));
+
+        // A content call whose result is never seen (server died after the call) does not count.
+        let no_result = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"n1","name":"mcp__cross_review_evidence__repository_read"}]}}"#;
+        assert!(!claude_content_evidence_succeeded(no_result));
+
+        // No evidence calls at all.
+        assert!(!claude_content_evidence_succeeded(
+            r#"{"type":"result","result":"APPROVE"}"#
+        ));
     }
 
     #[test]

@@ -75,6 +75,17 @@ pub enum CaptureSummary {
 }
 
 impl CaptureSummary {
+    /// Whether the capture was whole -- no truncation, short streams, dropped files, or unrun
+    /// commands. The section-7 evidence gate treats an incomplete (or empty) capture as "thin" and
+    /// then requires a successful content evidence call before trusting the review.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            CaptureSummary::Git { complete, .. } | CaptureSummary::Perforce { complete, .. } => {
+                *complete
+            }
+        }
+    }
+
     /// The informational `captured:` line body for the caller.
     pub fn summary(&self) -> String {
         match self {

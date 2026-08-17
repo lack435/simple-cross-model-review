@@ -181,9 +181,12 @@ fn claude_argv_carries_the_pinned_model_and_effort() {
         args.iter().any(|a| a == "-p"),
         "must run non-interactively: {args:?}"
     );
+    // This config (git top-level cwd, shell-less, default rules) is in scope for evidence, so it
+    // streams -- the section-7 gate needs per-call events. The off-evidence buffered `json` path is
+    // covered by the parse tests.
     assert_eq!(
         value_after(&args, "--output-format").as_deref(),
-        Some("json")
+        Some("stream-json")
     );
 }
 
