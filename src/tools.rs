@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
+use crate::config::{Config, LevelOverride, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 use crate::metrics::{self, MetricsLog};
 use crate::prompt::{self, PromptParts, DEFAULT_PREAMBLE};
@@ -610,6 +610,147 @@ impl App {
         Err(finalize_exhaustion(&[], &pre_start_gated))
     }
 
+    /// Reject a fresh-review `level` naming nothing in the advertised (primary) menu. Called *before*
+    /// each fresh usage-gate selection so a fully-gated chain's `REVIEWERS_EXHAUSTED` cannot mask an
+    /// `INVALID_LEVEL` for a mistyped name (impl-review f2). `resolve_start_level` re-checks, so this
+    /// is a pre-gate guard, not the sole one. A resume validates against its bound entry instead, so
+    /// this is never called on the resume path.
+    fn reject_unadvertised_fresh_level(&self, level: Option<&str>) -> Result<(), Failure> {
+        if let Some(name) = level {
+            let primary = self.cfg.primary();
+            if primary.resolve_level(name).is_none() {
+                let advertised = primary.level_names();
+                let advertised = if advertised.is_empty() {
+                    "none".to_string()
+                } else {
+                    advertised.join(", ")
+                };
+                return Err(errors::invalid_level(format!(
+                    "unknown level '{name}'. This reviewer advertises: {advertised}."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the review `level` argument to an effective `(model, effort)` override for the start
+    /// entry, plus an optional human line for the start response. Pure — no spawning, no billing.
+    ///
+    /// Returns `(override, report_line)`. `override = None` means "run the entry's base pair"; a
+    /// `Some` overwrites the start entry's model/effort in `Job::run` (start entry only — a mid-run
+    /// rate-limit fallback keeps its own base pair). See `docs/review-levels-plan.md` §4/§4a/§6.
+    ///
+    /// Fresh review (`prior` is `None`): resolve against the gate-selected `start_index`.
+    /// - explicit `level` not in the advertised (primary) set → `INVALID_LEVEL`;
+    /// - explicit `level` advertised but not declared on the gate-selected start entry → base pair
+    ///   + a stderr diagnostic (the gate moved the caller; degrade honestly, do not error);
+    /// - explicit `level` declared on the start entry → that level's pair;
+    /// - omitted → the start entry's `default_level` if set, else its base pair.
+    ///
+    /// Resume (`prior` is `Some`): the effective pair is always the session's persisted one; an
+    /// explicit `level` is validated only — undeclared on, or differing from, the pinned pair →
+    /// `INVALID_LEVEL_ON_RESUME` — and the pinned pair is reported (impl-review f3).
+    fn resolve_start_level(
+        &self,
+        level: Option<&str>,
+        prior: Option<&session::SessionRecord>,
+        start_index: usize,
+        session: &str,
+    ) -> Result<(Option<LevelOverride>, Option<String>), Failure> {
+        let selected = &self.cfg.reviewers[start_index];
+
+        if let Some(record) = prior {
+            // Resume: the pair is fixed at what the session started on. Validate a present `level`
+            // for consistency; never change the pair from it.
+            if let Some(name) = level {
+                match selected.resolve_level(name) {
+                    None => {
+                        return Err(errors::invalid_level_on_resume(format!(
+                            "session '{session}' resumes at model={}/effort={}, but level '{name}' \
+                             is not declared on the entry it resumes on.",
+                            record.model, record.effort
+                        )));
+                    }
+                    Some(lv) => {
+                        if lv.model != record.model || lv.effort != record.effort {
+                            return Err(errors::invalid_level_on_resume(format!(
+                                "session '{session}' is pinned to model={}/effort={} (set when it \
+                                 started), but level '{name}' resolves to model={}/effort={}.",
+                                record.model, record.effort, lv.model, lv.effort
+                            )));
+                        }
+                    }
+                }
+            }
+            // Report the pinned pair, so a resumed non-default-level session is never shown running
+            // at the base effort (impl-review f3).
+            return Ok((
+                Some(LevelOverride {
+                    model: record.model.clone(),
+                    effort: record.effort.clone(),
+                }),
+                Some(format!(
+                    "level:     resumed at session pin (model={}, effort={})",
+                    record.model, record.effort
+                )),
+            ));
+        }
+
+        // Fresh review.
+        match level {
+            Some(name) => {
+                // The advertised menu is the primary's — that is what the MCP schema exposes — so an
+                // unknown name is a caller error regardless of which entry the gate selected. (The
+                // same check runs before the usage gate so exhaustion cannot mask it — impl f2.)
+                self.reject_unadvertised_fresh_level(Some(name))?;
+                match selected.resolve_level(name) {
+                    Some(lv) => Ok((
+                        Some(lv.clone()),
+                        Some(format!(
+                            "level:     {name} (model={}, effort={})",
+                            lv.model, lv.effort
+                        )),
+                    )),
+                    None => {
+                        // Advertised on the primary, but the proactive gate selected a fallback that
+                        // does not declare it: run that entry's base pair, and say so on both stderr
+                        // and the response, rather than error on a switch the caller cannot see (§6).
+                        eprintln!(
+                            "cross-review: level '{name}' is not declared on the gate-selected \
+                             fallback {}; running at its base model={}/effort={}.",
+                            selected.describe(),
+                            selected.model,
+                            selected.effort
+                        );
+                        Ok((
+                            None,
+                            Some(format!(
+                                "level:     {name} unavailable on fallback, using base (model={}, effort={})",
+                                selected.model, selected.effort
+                            )),
+                        ))
+                    }
+                }
+            }
+            None => match &selected.default_level {
+                Some(dl) => {
+                    // `finalize` guarantees the default names a declared level on this entry.
+                    let lv = selected.resolve_level(dl).expect(
+                        "--default-level is validated at finalize to name a declared level",
+                    );
+                    Ok((
+                        Some(lv.clone()),
+                        Some(format!(
+                            "level:     {dl} (default) (model={}, effort={})",
+                            lv.model, lv.effort
+                        )),
+                    ))
+                }
+                None => Ok((None, None)),
+            },
+        }
+    }
+
     // -----------------------------------------------------------------------
     // cross_model_review
     // -----------------------------------------------------------------------
@@ -638,6 +779,21 @@ impl App {
         }
         let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
         let context_paths = string_array_arg(args, "context_paths");
+        // Parse `level` strictly rather than via `string_arg`: a JSON null (or absence) is "omitted",
+        // but a present-but-malformed value — empty/whitespace string, or a non-string — is rejected
+        // rather than silently coerced to "omitted", which would drop the caller's intent (a fresh
+        // call would fall to the default, a resume would bypass the INVALID_LEVEL_ON_RESUME guard).
+        // Impl-review f4. Mirrors the strict `include_shelved` parse below.
+        let level_arg: Option<String> = match args.get("level") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Some(Value::String(_)) => {
+                return Err(errors::bad_request(
+                    "'level' must be a non-empty level name; omit it to use the default level.",
+                ))
+            }
+            Some(_) => return Err(errors::bad_request("'level' must be a string level name.")),
+        };
 
         // Perforce changelists are named per call, and validated here -- before the preflight
         // and the session lease -- so a malformed or backend-mismatched request costs nothing.
@@ -683,6 +839,9 @@ impl App {
         // (for a genuinely new session) waits until the store read below confirms there is no
         // prior; reading before the lease would be the stale-read race the lease exists to prevent.
         let mut pre_lease_fresh_sel = if fresh {
+            // Validate a mistyped level before the gate, so a fully-gated chain's REVIEWERS_EXHAUSTED
+            // does not mask INVALID_LEVEL (impl-review f2). `fresh: true` is definitely a fresh review.
+            self.reject_unadvertised_fresh_level(level_arg.as_deref())?;
             Some(self.gate_fresh_selection(now_unix())?)
         } else {
             None
@@ -848,9 +1007,20 @@ impl App {
             }
             None => match pre_lease_fresh_sel.take() {
                 Some(sel) => sel,
-                None => self.gate_fresh_selection(now_unix())?,
+                None => {
+                    // A non-fresh call on a genuinely new session is also a fresh review; validate a
+                    // mistyped level before this gate too, for the same reason (impl-review f2).
+                    self.reject_unadvertised_fresh_level(level_arg.as_deref())?;
+                    self.gate_fresh_selection(now_unix())?
+                }
             },
         };
+        // Resolve the review `level` against the *selected* start entry, now that the gate (or the
+        // resume matcher) has chosen it. Pure and cheap: an unknown level fails fast here, before any
+        // preflight, auth check, or billing. On resume the level is validated only — the effective
+        // pair stays the session's pinned one. See `docs/review-levels-plan.md` §4/§4a/§6.
+        let (start_spec_override, level_report_line) =
+            self.resolve_start_level(level_arg.as_deref(), prior.as_ref(), start_index, &session)?;
         // A `notifications/cancelled` that arrived before the review is even registered still
         // stops setup here; the flag below then interrupts the (bounded) auth check itself.
         if request.is_cancelled() {
@@ -945,6 +1115,7 @@ impl App {
             reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
             spec: self.cfg.reviewers[start_index].clone(),
             start_index,
+            start_spec_override,
             preflight: Arc::clone(&self.preflight),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
@@ -1031,6 +1202,11 @@ impl App {
             }
         ));
         out.push_str(&format!("reviewer:  {}\n", self.cfg.describe_reviewer()));
+        // Report the effective starting level/pair when one is in play, so the response never
+        // understates the effort a review actually runs at (docs/review-levels-plan.md §4b / f6).
+        if let Some(line) = &level_report_line {
+            out.push_str(&format!("{line}\n"));
+        }
         if !changes.is_empty() {
             out.push_str(&format!(
                 "changelists: {}{}\n",
@@ -1565,6 +1741,14 @@ impl App {
             "reviewer:      {}\n",
             self.cfg.describe_reviewer()
         ));
+        // The level menu each entry offers, and which level (or base pair) is its default, so an
+        // operator can see that an omitted `level` may resolve to a level's effort rather than the
+        // base `--effort` (docs/review-levels-plan.md §4b / f6). Silent when no entry declares levels.
+        for spec in &self.cfg.reviewers {
+            if let Some(line) = spec.describe_levels() {
+                out.push_str(&format!("               {line}\n"));
+            }
+        }
 
         // A semantically invalid chain is reported here first: the reviewer CLIs may be fine, but
         // no review can run until the configuration is fixed.
@@ -1775,6 +1959,12 @@ struct Job {
     /// resume-matched entry (which runs alone, no fall-through). Its bin is already in `self.bin`,
     /// preflighted in `start_review`, so the walk does not re-resolve it.
     start_index: usize,
+    /// The effective `(model, effort)` for the **start** entry, resolved from the review `level` at
+    /// start (`resolve_start_level`). Applied only to `start_index`, and only in `effective_entry`,
+    /// so it reaches the invocation, the metrics, and the session record consistently while a mid-run
+    /// rate-limit fallback keeps its own base pair. `None` = no level in play (base pair). See
+    /// `docs/review-levels-plan.md` §4/§6.
+    start_spec_override: Option<LevelOverride>,
     /// The `App`'s per-entry preflight cache, shared so the walk's fallback preflights reuse (and
     /// populate) the same cache the selected-entry check and `status` use.
     preflight: PreflightCache,
@@ -1951,6 +2141,23 @@ fn assemble_disposition(
 }
 
 impl Job {
+    /// The effective entry to run at chain index `i`: the configured entry, with the start entry's
+    /// resolved level override applied when `i` is the start index. A mid-run rate-limit fallback
+    /// (`i != start_index`) is never overridden — it runs at its own base `(model, effort)`
+    /// (`docs/review-levels-plan.md` §6). Because the override rides on the returned entry, every
+    /// downstream read (the `self.spec` clone, the invocation, the rate-limit attempt metric, and
+    /// `record_turn`) sees the resolved pair with no separate plumbing.
+    fn effective_entry(&self, i: usize) -> ReviewerSpec {
+        let mut entry = self.cfg.reviewers[i].clone();
+        if i == self.start_index {
+            if let Some(ov) = &self.start_spec_override {
+                entry.model = ov.model.clone();
+                entry.effort = ov.effort.clone();
+            }
+        }
+        entry
+    }
+
     /// Combine the backend's disposition with the framing only this layer can supply.
     ///
     /// A disposition exists only on a **resumed** turn that **sent a change** -- the two gates the
@@ -2044,7 +2251,10 @@ impl Job {
         // the executable that will actually run, not merely the provider configuration.
         self.registry.set_active(
             &self.id,
-            self.cfg.reviewers[self.start_index].describe_with_bin(&self.bin),
+            // Through `effective_entry`, so a level-overridden start entry names the pair that will
+            // actually run — not the base config (docs/review-levels-plan.md §4b / f6).
+            self.effective_entry(self.start_index)
+                .describe_with_bin(&self.bin),
         );
         if self.cfg.chain_needs_capture() {
             self.registry.set_phase(&self.id, Phase::Capturing);
@@ -2216,7 +2426,9 @@ impl Job {
         let mut outcome: Option<Outcome> = None;
 
         for (pos, &i) in walk.iter().enumerate() {
-            let entry = chain[i].clone();
+            // `effective_entry` applies the start entry's level override (a no-op for a mid-run
+            // fallback). Everything downstream that reads model/effort follows this `entry`.
+            let entry = self.effective_entry(i);
             // The active entry's usage identity. The start entry's store key was carried from
             // selection (one fingerprint reading — it cleared the gate and is never skip-recorded, so
             // only the key is needed); a fallback's full identity (key + the account it was measured
@@ -5713,6 +5925,7 @@ mod tests {
             reviewer: Arc::from(reviewer::for_kind(app.cfg.reviewers[0].reviewer)),
             spec: app.cfg.reviewers[0].clone(),
             start_index: 0,
+            start_spec_override: None,
             preflight: app.preflight.clone(),
             registry: Arc::clone(&app.registry),
             sessions: Arc::clone(&app.sessions),
@@ -5744,6 +5957,176 @@ mod tests {
             findings_marker_absent_on_entry: true,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
+        }
+    }
+
+    #[test]
+    fn resolve_start_level_fresh_selects_reports_and_rejects_unknown() {
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "fast:gpt-5.6-luna:high".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:xhigh".into(),
+            "--level".into(),
+            "thorough:gpt-5.6-luna:max".into(),
+            "--default-level".into(),
+            "standard".into(),
+        ])
+        .expect("cfg");
+        let app = App::new(cfg);
+
+        // Explicit level resolves to its pair and reports it.
+        let (ov, line) = app
+            .resolve_start_level(Some("thorough"), None, 0, "s")
+            .expect("ok");
+        let ov = ov.expect("override present");
+        assert_eq!(
+            (ov.model.as_str(), ov.effort.as_str()),
+            ("gpt-5.6-luna", "max")
+        );
+        assert!(line.unwrap().contains("thorough"));
+
+        // Omitted uses the entry's default level, not the base pair.
+        let (ov, line) = app.resolve_start_level(None, None, 0, "s").expect("ok");
+        assert_eq!(ov.expect("default override").effort, "xhigh");
+        assert!(line.unwrap().contains("default"));
+
+        // An unknown level fails fast with the dedicated code, before anything is billed.
+        let err = app
+            .resolve_start_level(Some("ludicrous"), None, 0, "s")
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_LEVEL");
+    }
+
+    #[test]
+    fn resolve_start_level_resume_pins_the_pair_and_guards_a_differing_level() {
+        // Base effort is xhigh; thorough is a *different* pair (max), so an omitted level on resume
+        // must run at the session's pinned pair, not the base.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--effort".into(),
+            "xhigh".into(),
+            "--level".into(),
+            "fast:gpt-5.6-luna:high".into(),
+            "--level".into(),
+            "thorough:gpt-5.6-luna:max".into(),
+        ])
+        .expect("cfg");
+        let app = App::new(cfg);
+        // A session pinned to the thorough pair (max) when it started.
+        let mut rec = record_matching(&app.cfg, 1, 0);
+        rec.effort = "max".into();
+
+        // Omitted level: run at the pinned pair (max), not the base (xhigh); the response reports the
+        // pinned pair so a resumed non-default-level session is not shown at the base effort (f3).
+        let (ov, line) = app
+            .resolve_start_level(None, Some(&rec), 0, "s")
+            .expect("ok");
+        assert_eq!(ov.expect("pinned override").effort, "max");
+        assert!(
+            line.unwrap().contains("effort=max"),
+            "reports the pinned pair"
+        );
+
+        // Re-passing the level the session already runs at is fine (the natural re-review pattern).
+        assert!(app
+            .resolve_start_level(Some("thorough"), Some(&rec), 0, "s")
+            .is_ok());
+
+        // A *different* declared level on resume is rejected, pointing the caller at fresh:true.
+        let err = app
+            .resolve_start_level(Some("fast"), Some(&rec), 0, "s")
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_LEVEL_ON_RESUME");
+
+        // An undeclared level on resume is likewise rejected explicitly (schema is not validation).
+        let err = app
+            .resolve_start_level(Some("ultra"), Some(&rec), 0, "s")
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_LEVEL_ON_RESUME");
+    }
+
+    #[test]
+    fn effective_entry_applies_the_override_only_to_the_start_entry() {
+        // Two-entry chain: codex primary (declares thorough), claude fallback. The override must
+        // reach the start entry (feeding invocation/metrics/record via one seam) but never a
+        // mid-run rate-limit fallback, which keeps its own base pair (f1/f2, §6).
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--effort".into(),
+            "xhigh".into(),
+            "--level".into(),
+            "thorough:gpt-5.6-luna:max".into(),
+            "--reviewer".into(),
+            "claude".into(),
+        ])
+        .expect("cfg");
+        let app = App::new(cfg);
+        let mut job = over_budget_job(&app, "s", "id");
+        job.start_spec_override = Some(LevelOverride {
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+        });
+
+        // Start entry (index 0) runs at the resolved level pair.
+        let start = job.effective_entry(0);
+        assert_eq!(
+            (start.model.as_str(), start.effort.as_str()),
+            ("gpt-5.6-luna", "max")
+        );
+        // The fallback (index 1) is untouched by the override — its own base pair.
+        let fb = job.effective_entry(1);
+        assert_eq!(fb.model, app.cfg.reviewers[1].model);
+        assert_eq!(fb.effort, app.cfg.reviewers[1].effort);
+        assert_ne!(fb.effort, "max");
+    }
+
+    #[test]
+    fn reject_unadvertised_fresh_level_guards_before_the_gate() {
+        // The pre-gate guard (impl f2): a mistyped level is INVALID_LEVEL; an advertised name, or
+        // none, passes. This is what stops a fully-gated chain's REVIEWERS_EXHAUSTED from masking it.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "fast:gpt-5.6-luna:high".into(),
+        ])
+        .expect("cfg");
+        let app = App::new(cfg);
+        assert!(app.reject_unadvertised_fresh_level(None).is_ok());
+        assert!(app.reject_unadvertised_fresh_level(Some("fast")).is_ok());
+        let err = app
+            .reject_unadvertised_fresh_level(Some("nope"))
+            .unwrap_err();
+        assert_eq!(err.code, "INVALID_LEVEL");
+    }
+
+    #[test]
+    fn start_review_rejects_a_malformed_level_argument() {
+        // A present-but-malformed `level` — empty, whitespace, or non-string — is a request error,
+        // not silently coerced to "omitted" (impl f4). It returns before the session lease.
+        let app = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "git".into(),
+            ])
+            .expect("cfg"),
+        );
+        for bad in [json!(""), json!("   "), json!(123), json!(true)] {
+            let err = app
+                .start_review(
+                    &json!({"instructions": "look", "level": bad}),
+                    &RequestCancel::new(),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, "BAD_REQUEST", "level={bad:?}");
+            assert!(err.summary.contains("level"), "{}", err.summary);
         }
     }
 

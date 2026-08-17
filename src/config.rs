@@ -2,6 +2,7 @@
 //! so a project's `.mcp.json` / `config.toml` is the single source of truth and there
 //! is no machine-level config file to drift out of sync.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -98,6 +99,16 @@ impl ReviewerKind {
     }
 }
 
+/// A named review "level": a `(model, effort)` preset the caller can select per review at start
+/// time. Declared per entry with `--level NAME:MODEL:EFFORT`. Resolving a level overwrites the
+/// running entry's `model`/`effort` for that review only; it is deliberately **not** part of the
+/// reviewer's identity (see [`ReviewerSpec`]). See `docs/review-levels-plan.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelOverride {
+    pub model: String,
+    pub effort: String,
+}
+
 /// One reviewer entry in the fallback chain: the identity of a reviewer the server may run.
 ///
 /// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
@@ -126,6 +137,18 @@ pub struct ReviewerSpec {
     /// its own, duplicate detection and resume matching include it. `Ambient` is today's behaviour
     /// (inherit the environment). See `docs/reviewer-account-profiles.md`.
     pub profile: ProfileSelector,
+    /// Named review levels declared for this entry (`--level NAME:MODEL:EFFORT`). Selecting one at
+    /// review start overwrites this entry's `model`/`effort` for that review. A *menu*, deliberately
+    /// **not** part of identity — excluded from [`same_reviewer_identity`](Self::same_reviewer_identity)
+    /// and [`validate_chain`](Config::validate_chain) (like `usage_minimum`), so two entries differing
+    /// only in their level menu are still one identity, and editing the menu between runs does not by
+    /// itself break resume. Empty means the entry offers no levels (today's behaviour: the fixed
+    /// `model`/`effort` is used). See `docs/review-levels-plan.md`.
+    pub levels: BTreeMap<String, LevelOverride>,
+    /// Which declared level applies when a review omits `level`. `None` falls back to this entry's
+    /// fixed `model`/`effort` (backward-compatible). Validated at `finalize` to name a declared
+    /// level. Also identity-excluded.
+    pub default_level: Option<String>,
 }
 
 impl ReviewerSpec {
@@ -187,6 +210,52 @@ impl ReviewerSpec {
         out.push(')');
         out
     }
+
+    /// The `(model, effort)` a declared level resolves to, or `None` if this entry declares no
+    /// level of that name. The single lookup point for level resolution.
+    pub fn resolve_level(&self, name: &str) -> Option<&LevelOverride> {
+        self.levels.get(name)
+    }
+
+    /// Declared level names, sorted (the map is a `BTreeMap`). Used to advertise the level menu in
+    /// the MCP schema and in `status`.
+    pub fn level_names(&self) -> Vec<&str> {
+        self.levels.keys().map(String::as_str).collect()
+    }
+
+    /// Whether this entry can *produce* the given `(model, effort)` — either as its fixed base pair
+    /// or via one of its declared levels. Resume matching uses this instead of a bare
+    /// `model == … && effort == …` so a session that started at a non-default level (whose
+    /// persisted pair is the level's, not the base's) still binds back to its creating entry. A
+    /// level menu is not identity, so a pair reachable two ways still names one entry; `reviewer`,
+    /// `profile`, and bin still constrain the match (see `resume_entry_index`).
+    pub fn produces_pair(&self, model: &str, effort: &str) -> bool {
+        (self.model == model && self.effort == effort)
+            || self
+                .levels
+                .values()
+                .any(|lv| lv.model == model && lv.effort == effort)
+    }
+
+    /// A one-line render of this entry's level menu for `status`, or `None` when it declares no
+    /// levels. Names the default (or the fixed base pair when no `--default-level` is set), so an
+    /// operator can see that, e.g., the default effort is a level's, not the base `--effort` (f6).
+    pub fn describe_levels(&self) -> Option<String> {
+        if self.levels.is_empty() {
+            return None;
+        }
+        let menu = self
+            .levels
+            .iter()
+            .map(|(name, lv)| format!("{name}={}/{}", lv.model, lv.effort))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let default = match &self.default_level {
+            Some(d) => format!("default level '{d}'"),
+            None => format!("default = base {}/{}", self.model, self.effort),
+        };
+        Some(format!("levels: {menu} ({default})"))
+    }
 }
 
 /// A chain entry under construction during argument parsing.
@@ -204,6 +273,11 @@ struct PendingEntry {
     /// `finalize`. A profile flag and an explicit-home flag for the same family are mutually
     /// exclusive on one entry, so a second setter call is an error, not a precedence contest.
     profile: Option<ProfileSelector>,
+    /// Declared `--level` presets for this entry, keyed by name. A `BTreeMap` so a repeated name is
+    /// caught (and the menu renders in a stable order).
+    levels: BTreeMap<String, LevelOverride>,
+    /// `--default-level`, validated at `finalize` to name a declared level.
+    default_level: Option<String>,
 }
 
 impl PendingEntry {
@@ -215,6 +289,8 @@ impl PendingEntry {
             bin: None,
             usage_minimum: None,
             profile: None,
+            levels: BTreeMap::new(),
+            default_level: None,
         }
     }
 
@@ -376,9 +452,69 @@ impl PendingEntry {
         Ok(())
     }
 
-    /// Fill per-entry defaults, mirroring the single-reviewer defaults exactly.
-    fn finalize(self) -> ReviewerSpec {
-        ReviewerSpec {
+    /// Declare `--level NAME:MODEL:EFFORT` on this entry. Unlike the identity flags, `--level`
+    /// repeats — each call adds one named preset — but a *duplicate name* on one entry is an error
+    /// (which of two mappings would win is a guess, and almost always a typo). Model ids and effort
+    /// names carry no colons, so the value is exactly three colon-separated non-empty parts. The
+    /// effort is validated (warn-not-fail) at `finalize`, mirroring `--effort`.
+    fn set_level(&mut self, v: &str) -> Result<(), String> {
+        let parts: Vec<&str> = v.split(':').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            return Err(format!(
+                "--level must be NAME:MODEL:EFFORT with three non-empty, colon-separated parts, \
+                 got '{v}'"
+            ));
+        }
+        let (name, model, effort) = (parts[0], parts[1], parts[2]);
+        if self.levels.contains_key(name) {
+            return Err(format!(
+                "--level '{name}' declared twice for the same --reviewer '{}' (did you forget a \
+                 --reviewer before the second one, or repeat a name?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.levels.insert(
+            name.to_string(),
+            LevelOverride {
+                model: model.to_string(),
+                effort: effort.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind `--default-level NAME` to this entry. Validated at `finalize` (the levels it may name
+    /// can be declared after it on the command line).
+    fn set_default_level(&mut self, v: String) -> Result<(), String> {
+        if self.default_level.is_some() {
+            return Err(format!(
+                "--default-level given twice for the same --reviewer '{}' (did you forget a \
+                 --reviewer before the second one?)",
+                self.reviewer.as_str()
+            ));
+        }
+        self.default_level = Some(v);
+        Ok(())
+    }
+
+    /// Fill per-entry defaults, mirroring the single-reviewer defaults exactly. Fallible only for
+    /// the one cross-field rule that cannot be checked at parse time: `--default-level` must name a
+    /// level that was declared, and the `--level` it names may appear after it on the command line.
+    fn finalize(self) -> Result<ReviewerSpec, String> {
+        if let Some(dl) = &self.default_level {
+            if !self.levels.contains_key(dl) {
+                return Err(format!(
+                    "--default-level '{dl}' for --reviewer '{}' names no declared --level (declared: {})",
+                    self.reviewer.as_str(),
+                    if self.levels.is_empty() {
+                        "none".to_string()
+                    } else {
+                        self.levels.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                ));
+            }
+        }
+        Ok(ReviewerSpec {
             model: self
                 .model
                 .unwrap_or_else(|| self.reviewer.default_model().to_string()),
@@ -389,7 +525,9 @@ impl PendingEntry {
             reviewer: self.reviewer,
             usage_minimum: self.usage_minimum.unwrap_or(UsageMinimum::None),
             profile: self.profile.unwrap_or(ProfileSelector::Ambient),
-        }
+            levels: self.levels,
+            default_level: self.default_level,
+        })
     }
 }
 
@@ -913,6 +1051,20 @@ impl Config {
                         .ok_or("--bin must follow a --reviewer (it binds to the reviewer entry before it)")?
                         .set_bin(PathBuf::from(v))?;
                 }
+                "--level" => {
+                    let v = take("--level")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--level must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_level(&v)?;
+                }
+                "--default-level" => {
+                    let v = take("--default-level")?;
+                    entries
+                        .last_mut()
+                        .ok_or("--default-level must follow a --reviewer (it binds to the reviewer entry before it)")?
+                        .set_default_level(v)?;
+                }
                 "--codex-profile" => {
                     let v = take("--codex-profile")?;
                     entries
@@ -1123,23 +1275,30 @@ impl Config {
             }
         };
 
-        // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. The
-        // unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
-        // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer.
-        let reviewers: Vec<ReviewerSpec> = entries.into_iter().map(|e| e.finalize()).collect();
-        for spec in &reviewers {
-            if !spec
-                .reviewer
-                .known_efforts()
-                .contains(&spec.effort.as_str())
-            {
+        // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. `finalize` is
+        // fallible only for the `--default-level` cross-check (a level name must be declared).
+        let reviewers: Vec<ReviewerSpec> = entries
+            .into_iter()
+            .map(|e| e.finalize())
+            .collect::<Result<_, _>>()?;
+        // The unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
+        // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer — and now also
+        // covers each declared level's effort, since a level's effort reaches the reviewer the same
+        // way the base one does.
+        let warn_effort = |effort: &str, reviewer: ReviewerKind, whence: &str| {
+            if !reviewer.known_efforts().contains(&effort) {
                 eprintln!(
-                    "cross-review: warning: effort '{}' is not one of the known levels for {} \
-                     ({}). Passing it through anyway.",
-                    spec.effort,
-                    spec.reviewer.as_str(),
-                    spec.reviewer.known_efforts().join(", ")
+                    "cross-review: warning: effort '{effort}'{whence} is not one of the known \
+                     levels for {} ({}). Passing it through anyway.",
+                    reviewer.as_str(),
+                    reviewer.known_efforts().join(", ")
                 );
+            }
+        };
+        for spec in &reviewers {
+            warn_effort(&spec.effort, spec.reviewer, "");
+            for (name, lv) in &spec.levels {
+                warn_effort(&lv.effort, spec.reviewer, &format!(" for --level '{name}'"));
             }
         }
 
@@ -1336,15 +1495,20 @@ impl Config {
     /// The chain index of the entry that matches a stored session's identity, if any.
     ///
     /// A resume must run the entry that *created* the session (which may be a fallback), not the
-    /// primary. Matching is on the full raw identity: reviewer, model, effort, and raw bin. A
-    /// legacy record with no stored raw bin (`raw_bin` is `None`) matches on reviewer/model/effort
-    /// alone, and only if *exactly one* entry matches — an ambiguous legacy record is refused
-    /// rather than bound to a guessed executable. See `docs/reviewer-fallback-chain.md`.
+    /// primary. Matching is on the full raw identity: reviewer, the *produced* `(model, effort)`
+    /// pair (base or a declared level — see [`ReviewerSpec::produces_pair`]), profile, and raw bin.
+    /// A match must be *unique*: a legacy record with no stored raw bin (`raw_bin` is `None`) matches
+    /// on reviewer/pair/profile alone, and a modern record additionally on raw bin — either way,
+    /// only if *exactly one* entry matches, so an ambiguous record is refused rather than bound to a
+    /// guessed entry. See `docs/reviewer-fallback-chain.md` and `docs/review-levels-plan.md`.
     pub fn resume_entry_index(&self, record: &crate::session::SessionRecord) -> Option<usize> {
         let base_match = |s: &ReviewerSpec| {
             s.reviewer.as_str() == record.reviewer
-                && s.model == record.model
-                && s.effort == record.effort
+                // The persisted pair is what actually ran, which may be a *level's* pair rather than
+                // the entry's fixed base pair. Match either, so a session started at a non-default
+                // level still binds back to its creating entry (levels are a menu, not identity;
+                // reviewer/profile/bin below still constrain the match). See `docs/review-levels-plan.md`.
+                && s.produces_pair(&record.model, &record.effort)
                 // The profile is part of entry identity, so a resume binds to the entry with the
                 // *same* account, not merely the same reviewer/model/effort/bin. A legacy record has
                 // no stored selector, so it matches on the other fields (and is refused later by the
@@ -1355,10 +1519,24 @@ impl Config {
                 }
         };
         match &record.raw_bin {
-            Some(raw) => self
-                .reviewers
-                .iter()
-                .position(|s| base_match(s) && s.raw_bin().identity_matches(raw)),
+            Some(raw) => {
+                // Require *exactly one* match, not merely the first. Without levels this is a no-op
+                // (`validate_chain` forbids two entries of identical reviewer/model/effort/profile/bin,
+                // so at most one ever matched). With levels, two entries of the same
+                // reviewer/profile/bin can both *produce* the persisted pair — one via its base pair,
+                // another via a declared level. They would invoke identically, so binding to the first
+                // is harmless in effect, but guessing is still refused: an ambiguous resume rebaselines
+                // rather than silently picking one. Fail-closed, matching the legacy branch (impl f1).
+                let mut matches = self
+                    .reviewers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| base_match(s) && s.raw_bin().identity_matches(raw));
+                match (matches.next(), matches.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            }
             None => {
                 // Legacy record: match on the fields it carries, but only if unambiguous.
                 let mut matches = self
@@ -2704,6 +2882,110 @@ mod tests {
         // A model the chain no longer has: no match.
         rec.model = "gpt-5.6-sol".into();
         assert_eq!(cfg.resume_entry_index(&rec), None);
+    }
+
+    #[test]
+    fn levels_parse_with_defaults_and_reject_bad_input() {
+        // A valid menu populates the entry (sorted by the BTreeMap), and the default names one.
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "fast:gpt-5.6-luna:high",
+            "--level",
+            "standard:gpt-5.6-luna:xhigh",
+            "--default-level",
+            "standard",
+        ]))
+        .expect("config");
+        let p = cfg.primary();
+        assert_eq!(p.level_names(), vec!["fast", "standard"]);
+        let std = p.resolve_level("standard").expect("declared");
+        assert_eq!(
+            (std.model.as_str(), std.effort.as_str()),
+            ("gpt-5.6-luna", "xhigh")
+        );
+        assert_eq!(p.default_level.as_deref(), Some("standard"));
+
+        // A duplicate level name on one entry is a mistake, not a precedence contest.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "fast:gpt-5.6-luna:high",
+            "--level",
+            "fast:gpt-5.6-luna:max",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+
+        // Malformed value: not three colon-separated parts.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "fast:gpt-5.6-luna",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("NAME:MODEL:EFFORT"), "{err}");
+
+        // --default-level must name a level that was declared.
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "fast:gpt-5.6-luna:high",
+            "--default-level",
+            "thorough",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("names no declared --level"), "{err}");
+    }
+
+    #[test]
+    fn resume_entry_index_matches_a_level_pair_not_only_the_base() {
+        use crate::session::{RawBin, SessionRecord};
+        // Base pair is (claude-opus-4-8, medium); the entry also declares thorough=(…, high).
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "claude",
+            "--effort",
+            "medium",
+            "--level",
+            "thorough:claude-opus-4-8:high",
+        ]))
+        .expect("config");
+        let rec = |effort: &str| SessionRecord {
+            reviewer: "claude".into(),
+            cli_session_id: "t".into(),
+            model: "claude-opus-4-8".into(),
+            effort: effort.into(),
+            cwd: String::new(),
+            turns: 1,
+            created_unix: 0,
+            updated_unix: 0,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: None,
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            raw_bin: Some(RawBin::PathSearch),
+            resolved_bin: None,
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: None,
+            profile_identity: None,
+        };
+        // A session persisted at the base pair binds back.
+        assert_eq!(cfg.resume_entry_index(&rec("medium")), Some(0));
+        // A session persisted at the *level's* pair — what actually ran when it started at
+        // `thorough` — also binds back. This is exactly the regression a base-only match would miss.
+        assert_eq!(cfg.resume_entry_index(&rec("high")), Some(0));
+        // A pair the entry can produce neither way does not match.
+        assert_eq!(cfg.resume_entry_index(&rec("low")), None);
     }
 
     #[test]
