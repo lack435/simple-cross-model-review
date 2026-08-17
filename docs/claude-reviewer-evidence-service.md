@@ -1,6 +1,10 @@
 # Claude reviewer evidence service
 
-Status: draft plan, on `plan/claude-evidence-service`. Not yet implemented.
+Status: approved plan (cross-review session `plan-claude-evidence-service`, converged turn 6/7),
+on `plan/claude-evidence-service`. **Phase 0 complete** — all gates cleared against claude 2.1.233;
+see "Phase 0 results". Two amendments folded in (MCP allow-list entry in §1; Claude does not
+fail closed on a broken evidence server, so §7's parent-side handshake is mandatory). Next: Phase 1
+(the claude.rs/tools.rs/config.rs wiring; evidence core is reused unchanged).
 
 Design-review turn 1 (session `plan-claude-evidence-service`) raised four findings, folded in
 below with `fN` markers: **f1** narrowed the recovery claim (no range-diff op exists — scope
@@ -196,11 +200,21 @@ cmd.arg("--disable-slash-commands");
 ```
 
 Then, when the `evidence` argument is `Some` (stop discarding it — it is `_evidence` today at
-`claude.rs:81`), add the evidence server:
+`claude.rs:81`), add the evidence server **and allow-list it**:
 
 ```rust
 cmd.args(["--mcp-config", evidence_config_path]);
+// Phase 0 finding: under --permission-mode dontAsk the evidence MCP tools are DENIED
+// unless allow-listed. A server-level entry (the reserved server name) allows all seven
+// repository_* tools; it goes in --allowed-tools alongside the scoped Read/Grep/Glob rules.
+cmd.arg("--allowed-tools");
+cmd.arg("mcp__cross_review_evidence");
 ```
+
+Without that entry the reviewer connects to the server, discovers the tools, and then has
+every call refused with "denied because Claude Code is running in don't ask mode" — a review
+that looks wired but cannot read anything. Verified in Phase 0: with the entry, `repository_scope`
+and `repository_change` both returned real data; without it, both were denied.
 
 The prompt is delivered on **stdin**, not as a positional arg (confirmed: no `cmd.arg(prompt)`
 in `invocation`), so the variadic `--mcp-config` cannot swallow it. (A planning run *did* hit
@@ -335,8 +349,11 @@ reviewer's own scoping:
      the unrelated usage gate is armed), so per-call MCP events — success *and* error — are
      observable at all.
   2. **A pre-review no-model handshake** proved the evidence server initialised — covers the
-     dead-before-any-call path even when Claude makes no call. This is an *additional* startup
-     check, not a replacement for (3).
+     dead-before-any-call path even when Claude makes no call. **Phase 0 makes this mandatory, not
+     a nice-to-have:** Claude Code does **not** fail closed on a broken evidence server — pointed
+     at a nonexistent command, `claude -p` proceeded to a normal verdict without it (exit 0). So
+     there is no CLI-level startup gate to lean on; the parent-side handshake is the *only* thing
+     that catches an evidence server that cannot start. It is not a replacement for (3).
   3. **No evidence tool call ended in a transport error / disconnect** during the turn — covers
      success-then-death and mid-call death.
   4. **At least one *content* evidence call succeeded** (`repository_read`/`list`/`search`/
@@ -419,8 +436,8 @@ must also settle what the findings turned up:
   Confirm a *dead* server surfaces as a visible tool-call error, not a silent empty result
   (silent empties would mean even a non-empty capture's augmentation could mislead, and would
   widen the gate).
-- **Fail-closed startup (f4).** A deliberately-broken evidence command in `--mcp-config` must
-  make `claude -p` fail, not silently succeed without the server.
+- **Fail-closed startup (f4).** Tested: a deliberately-broken evidence command does **not** make
+  `claude -p` fail — it proceeds without the server. Hence §7's mandatory parent-side handshake.
 - **Sterile-cwd isolation (f2).** With the granular flags and a reviewed repo carrying
   `.claude/settings.json` (hook), a plugin, and a `CLAUDE.md`, confirm none influence a run made
   from the verified-empty cwd, and that the run refuses rather than falling back to the repo cwd
@@ -439,12 +456,39 @@ This is the whole of the up-front rigor beyond §"What boundary moves": the auth
 boundary (now including the sterile cwd, f2), and this one protocol proof. Everything else is
 reuse.
 
+### Phase 0 results (run against claude 2.1.233 + `target/debug/cross-review.exe`, evidence schema 2)
+
+Executed with a real emitted evidence bundle and live `claude -p` runs. All gates cleared; two
+amendments folded back above.
+
+- **MCP client connects — PASS.** Claude's `-p` MCP client spawned `cross-review --evidence-server`,
+  completed `initialize`/`tools/list`, and exposed all seven `repository_*` tools.
+- **Tools callable + allow-list — PASS, with an amendment.** Under `--permission-mode dontAsk` the
+  tools were **denied** until allow-listed. Adding server-level `--allowed-tools
+  mcp__cross_review_evidence` let `repository_scope` and `repository_change` return real data
+  (the change page carried the bundle's marker line). Folded into §1.
+- **Evidence-event observability — PASS.** `stream-json` emits per-call `tool_use` (with the tool
+  name) and `tool_result` (with `is_error`), so §7's gate can tell a content call from
+  `repository_scope` and a success from a denial/error. (Exact *dead-server* transport-error event
+  shape to be pinned during implementation via the smoke.)
+- **Fail-closed startup — FINDING (amended §7).** Claude does **not** fail closed: pointed at a
+  nonexistent evidence command, `claude -p` proceeded to a normal verdict (exit 0) without the
+  server. So the parent-side handshake in §7's gate is mandatory, not a fallback — corrected there.
+- **Child reaping — PASS.** No orphaned evidence-server process after `claude` exited.
+- **Config-home auto-memory (f6) — PASS via Q2.** Headless `-p` **does** write auto-memory
+  (`projects/<slug>/memory/…` appeared); `--settings '{"autoMemoryEnabled":false}'` **suppressed**
+  it (nothing written). Q1=writes, Q2=disabled → the scrub/lock fallback (Q3) is not needed.
+- **`CLAUDE.md` from cwd (f2) — CONFIRMED.** A project `CLAUDE.md` loads under the granular flags
+  (it altered the reply), confirming the sterile empty cwd — not the flags — is the isolation
+  mechanism. Full adversarial isolation is proved once §6's sterile cwd is wired.
+
 ## Verification
 
 - `cargo test` — add argv tests (mirroring `argv_tests.rs:280-298`): an isolated Claude
   invocation contains `--settings {"disableAllHooks":true,"autoMemoryEnabled":false}`,
   `--disable-slash-commands`,
-  `--strict-mcp-config`, and `--mcp-config <file>`, and does **not** contain `--safe-mode`;
+  `--strict-mcp-config`, `--mcp-config <file>`, and `--allowed-tools mcp__cross_review_evidence`
+  (the Phase 0 allow-list entry), and does **not** contain `--safe-mode`;
   `--disallowed-tools` and `--permission-mode dontAsk` remain present; `--allow-reviewer-config`
   drops the three isolation flags (as it drops `--safe-mode` today). One test that the Claude
   path constructs and passes an `EvidenceInvocation` rather than discarding it, and that the
