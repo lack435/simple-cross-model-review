@@ -74,6 +74,34 @@ impl StdoutLimits {
     }
 }
 
+/// Arming for the policy fail-fast in [`run_observed`] (issue #68). `Some` only for a Codex run
+/// with the feature enabled; `None` (every other run — Claude, status/liveness probes) means the
+/// loop never terminates a child on this path, exactly as before. When armed, a turn is killed once
+/// it has accumulated `max_denials` `blocked by policy` refusals on stderr AND its raw stdout has
+/// then stayed silent for `idle` — with cancellation, timeout, and the output cap all outranking it
+/// (rechecked at the instant of the decision), so a genuinely stuck turn fails fast while a working
+/// one that is merely reasoning silently is never cut.
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyStall {
+    pub max_denials: usize,
+    pub idle: Duration,
+}
+
+impl PolicyStall {
+    /// Arm the policy fail-fast for a run, or `None` to leave it off. Codex-only: the Claude
+    /// reviewer has no non-interactive command router, so `blocked by policy` never appears and the
+    /// guard would be dead weight. `--max-policy-denials 0` disables it for Codex too.
+    pub fn for_run(cfg: &Config, spec: &ReviewerSpec) -> Option<Self> {
+        if spec.reviewer != ReviewerKind::Codex || cfg.max_policy_denials == 0 {
+            return None;
+        }
+        Some(Self {
+            max_denials: cfg.max_policy_denials,
+            idle: cfg.max_policy_idle,
+        })
+    }
+}
+
 use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
 use crate::errors::{self, Failure};
 
@@ -1636,6 +1664,7 @@ mod fallback_location_tests {
 // Running a child process
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct RunOutcome {
     pub stdout: String,
     pub stderr: String,
@@ -1643,6 +1672,16 @@ pub struct RunOutcome {
     pub success: bool,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// The policy fail-fast terminated this turn (issue #68): it passed the denial threshold and
+    /// then went silent on stdout past the idle window. Mutually exclusive with `cancelled`,
+    /// `timed_out`, and the output-cap kill by construction — the poll loop checks those first and
+    /// only latches this in their absence. Routed to POLICY_BLOCKED before any parse.
+    pub policy_stalled: bool,
+    /// `blocked by policy` refusals counted across the whole stderr stream, before retention (issue
+    /// #68 gate f3). Exact rather than a floor — the streaming counter does not lose refusals past
+    /// the 8 MiB cap — so the POLICY_BLOCKED diagnostic reports from this rather than recounting the
+    /// truncated `stderr`. `0` on any run that did not count denials (non-Codex, or disabled).
+    pub policy_denials: usize,
     /// stdout hit the size cap. Kept apart from stderr because both adapters read the
     /// review itself from stdout, so only this one makes a review unrecoverable.
     pub stdout_truncated: bool,
@@ -1768,6 +1807,8 @@ pub fn run(
         timeout,
         cancel,
         StdoutLimits::default_retain(),
+        // Status/liveness probes are never Codex review turns and have no policy fail-fast.
+        None,
         |_| {},
     )
     .map_err(RunError::into_io)
@@ -1787,6 +1828,9 @@ pub fn run_observed(
     // Claude path raises the byte cap and terminates at it; every other path keeps the historic
     // retain-and-drain (see StdoutLimits). stderr always uses MAX_OUTPUT_BYTES retention.
     stdout_limits: StdoutLimits,
+    // Arming for the policy fail-fast (issue #68). `None` on every non-Codex or disabled run, which
+    // leaves the loop's termination behaviour exactly as it was.
+    policy_stall: Option<PolicyStall>,
     mut on_activity: impl FnMut(Activity),
 ) -> Result<RunOutcome, RunError> {
     command
@@ -1833,17 +1877,28 @@ pub fn run_observed(
     let stdout_buf = drain(
         child.stdout.take().expect("stdout was piped"),
         stdout_limits,
+        // stdout carries the review, not policy refusals, and scanning it for the marker would be
+        // wasted work on the large stream.
+        false,
     );
-    // stderr is never the review, so it keeps the historic retain-and-drain (no early kill).
+    // stderr is never the review, so it keeps the historic retain-and-drain (no early kill). It is
+    // where the `blocked by policy` refusals appear, so this is the drain that counts them for the
+    // fail-fast (issue #68), across the whole stream rather than only the retained prefix.
     let stderr_buf = drain(
         child.stderr.take().expect("stderr was piped"),
         StdoutLimits::default_retain(),
+        policy_stall.is_some(),
     );
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut policy_stalled = false;
     let mut next_activity = Instant::now();
+    // Idle tracking for the policy fail-fast: the last raw stdout byte-count we saw, and when it
+    // last changed. Seeded now so the window is measured from launch, not from the first byte.
+    let mut last_raw_stdout = stdout_buf.raw_len();
+    let mut last_stdout_advance = Instant::now();
 
     let status = loop {
         match child.try_wait().map_err(RunError::Observe)? {
@@ -1855,6 +1910,12 @@ pub fn run_observed(
                         output_bytes: stdout_buf.len() + stderr_buf.len(),
                     });
                     next_activity = now + Duration::from_secs(5);
+                }
+                // Track raw stdout progress (retention-independent) for the idle guard below.
+                let raw = stdout_buf.raw_len();
+                if raw != last_raw_stdout {
+                    last_raw_stdout = raw;
+                    last_stdout_advance = now;
                 }
                 // The armed stdout reader stops and flags which bound it overran; kill the child
                 // it left blocked on a full pipe.
@@ -1870,6 +1931,26 @@ pub fn run_observed(
                     // the worker until the timeout (round-1-impl finding f2). `stdout_truncated`
                     // (byte cap) and the retained line count let the parser name which bound
                     // tripped and return OUTPUT_TRUNCATED. Not flagged as timed_out/cancelled.
+                    true
+                } else if policy_stall_tripped(
+                    &policy_stall,
+                    now,
+                    last_stdout_advance,
+                    last_raw_stdout,
+                    &stdout_buf,
+                    &stderr_buf,
+                ) {
+                    // Cancellation, timeout, and the output cap are all checked above and therefore
+                    // outrank this (issue #68 f8): a turn that is also timed-out/over-cap is reported
+                    // as such, never as POLICY_BLOCKED. Cancellation can be set externally at any
+                    // instant, so re-read it here at the latch — it still wins (gate f1). Only a turn
+                    // that is none of those, past the denial threshold, and silent on stdout for the
+                    // whole idle window latches here — terminal, no recovery (f9/f10 scope cut).
+                    if cancel.load(Ordering::SeqCst) {
+                        cancelled = true;
+                    } else {
+                        policy_stalled = true;
+                    }
                     true
                 } else {
                     false
@@ -1915,10 +1996,45 @@ pub fn run_observed(
         stdout: stdout.text,
         stderr: stderr.text,
         exit: status.and_then(|s| s.code()),
-        success: status.map(|s| s.success()).unwrap_or(false) && !timed_out && !cancelled,
+        success: status.map(|s| s.success()).unwrap_or(false)
+            && !timed_out
+            && !cancelled
+            && !policy_stalled,
         timed_out,
         cancelled,
+        policy_stalled,
+        // The exact, retention-independent refusal count (0 unless this run counted denials).
+        policy_denials: stderr_buf.denial_count(),
     })
+}
+
+/// Whether the policy fail-fast should terminate the turn *now* (issue #68). False unless armed
+/// (`Some`), the raw stdout has been silent for the whole idle window, and the live stderr shows at
+/// least `max_denials` `blocked by policy` refusals. Denials are only counted once the cheap idle
+/// check has already passed, so the stderr snapshot is taken rarely rather than every poll tick.
+fn policy_stall_tripped(
+    policy_stall: &Option<PolicyStall>,
+    now: Instant,
+    last_stdout_advance: Instant,
+    last_raw_stdout: usize,
+    stdout_buf: &Drain,
+    stderr_buf: &Drain,
+) -> bool {
+    let Some(ps) = policy_stall else {
+        return false;
+    };
+    if now.duration_since(last_stdout_advance) < ps.idle {
+        return false;
+    }
+    // Re-sample stdout at the decision point: if a byte arrived between the loop's sample and now,
+    // the turn is progressing after all, so do not kill it (issue #68 gate f1). This is the same
+    // retention-independent counter the loop tracks, read one last time immediately before latching.
+    if stdout_buf.raw_len() != last_raw_stdout {
+        return false;
+    }
+    // Denials are counted by the stderr reader across the whole stream, so a stuck turn that
+    // flooded stderr past the retention cap before its refusals is still caught (issue #68 gate f2).
+    stderr_buf.denial_count() >= ps.max_denials
 }
 
 /// Progress of one output pipe: the bytes so far, whether the reader reached EOF, and
@@ -1935,11 +2051,33 @@ struct Drain {
     /// overran — at which point it stops reading, so the child blocks and the poll loop kills it.
     /// `0` none, `1` bytes, `2` lines. `None` shape via [`Drain::cap_hit`].
     cap_hit: Arc<std::sync::atomic::AtomicU8>,
+    /// Total raw bytes the reader has pulled off the pipe, counted *before* the retention cap and
+    /// never reset — unlike `buffer.len()`, which stops growing once retention is full. This is the
+    /// progress signal the policy fail-fast idle guard reads (issue #68 f6): "stdout advanced"
+    /// must mean the child produced output, not that our retained buffer happened to have room.
+    raw_read: Arc<std::sync::atomic::AtomicUsize>,
+    /// `blocked by policy` refusal lines seen so far, counted by the reader across the *whole*
+    /// stream as it arrives — before the retention cap discards anything (issue #68 gate f2). The
+    /// fail-fast reads this rather than scanning the retained buffer, so a stuck turn that floods
+    /// stderr past the cap before (or while) it is refused still trips the threshold. `0` on any
+    /// drain not asked to count (every stdout drain, and the status/liveness probes).
+    denials: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drain {
     fn len(&self) -> usize {
         self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Raw bytes read off the pipe so far, retention-independent. See the field doc.
+    fn raw_len(&self) -> usize {
+        self.raw_read.load(Ordering::SeqCst)
+    }
+
+    /// Policy-refusal lines seen across the whole stream so far, retention-independent. See the
+    /// field doc. Always `0` unless the drain was created with `count_denials`.
+    fn denial_count(&self) -> usize {
+        self.denials.load(Ordering::SeqCst)
     }
 
     fn cap_hit(&self) -> Option<StreamCapKind> {
@@ -1964,21 +2102,38 @@ impl Drain {
 /// raw-byte or raw-line overrun**, records which bound it was, and returns: the pipe then fills,
 /// the child blocks, and the poll loop terminates it — so raw input is bounded to the cap plus at
 /// most one chunk rather than read to completion (round-2-impl finding f10).
-fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) -> Drain {
+fn drain(
+    mut pipe: impl std::io::Read + Send + 'static,
+    limits: StdoutLimits,
+    // Count `blocked by policy` refusal lines across the whole stream, before retention discards
+    // any (issue #68 gate f2). Set for the reviewer's stderr; false for stdout and probes.
+    count_denials: bool,
+) -> Drain {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let truncated = Arc::new(AtomicBool::new(false));
     let errored = Arc::new(AtomicBool::new(false));
     let cap_hit = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let raw_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let denials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let writer_buf = Arc::clone(&buffer);
     let writer_done = Arc::clone(&done);
     let writer_truncated = Arc::clone(&truncated);
     let writer_errored = Arc::clone(&errored);
     let writer_cap_hit = Arc::clone(&cap_hit);
+    let writer_raw = Arc::clone(&raw_read);
+    let writer_denials = Arc::clone(&denials);
     std::thread::spawn(move || {
         let mut raw_bytes: usize = 0;
         let mut raw_lines: usize = 0;
+        // Denial counting is line-based (like `codex::policy_denial_count`), so a refusal split
+        // across two reads is still seen: complete lines are counted as they close and the trailing
+        // partial is carried to the next chunk. Bounded so a stream with no newlines cannot grow it
+        // without limit — a refusal line is short, far under this bound.
+        let mut denial_total: usize = 0;
+        let mut line_tail: Vec<u8> = Vec::new();
+        const LINE_TAIL_MAX: usize = 64 * 1024;
         loop {
             let mut chunk = [0u8; 8192];
             match pipe.read(&mut chunk) {
@@ -1991,8 +2146,28 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) ->
                 }
                 Ok(n) => {
                     raw_bytes = raw_bytes.saturating_add(n);
+                    // Published every read, before the retention cap below, so the idle guard sees
+                    // progress even once `buffer` is full (issue #68 f6).
+                    writer_raw.store(raw_bytes, Ordering::SeqCst);
                     let newlines = chunk[..n].iter().filter(|&&b| b == b'\n').count();
                     raw_lines = raw_lines.saturating_add(newlines);
+                    if count_denials {
+                        line_tail.extend_from_slice(&chunk[..n]);
+                        while let Some(nl) = line_tail.iter().position(|&b| b == b'\n') {
+                            let line: Vec<u8> = line_tail.drain(..=nl).collect();
+                            if crate::reviewer::codex::is_policy_denial(&String::from_utf8_lossy(
+                                &line,
+                            )) {
+                                denial_total = denial_total.saturating_add(1);
+                            }
+                        }
+                        // A pathological line with no newline must not accumulate unbounded. A
+                        // refusal line is short, so a tail this large cannot be one: drop it.
+                        if line_tail.len() > LINE_TAIL_MAX {
+                            line_tail.clear();
+                        }
+                        writer_denials.store(denial_total, Ordering::SeqCst);
+                    }
                     {
                         let mut buffer = writer_buf.lock().unwrap_or_else(|e| e.into_inner());
                         let room = limits.max_bytes.saturating_sub(buffer.len());
@@ -2018,6 +2193,14 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) ->
                 }
             }
         }
+        // A final line with no trailing newline still counts (the stream can end mid-line).
+        if count_denials
+            && !line_tail.is_empty()
+            && crate::reviewer::codex::is_policy_denial(&String::from_utf8_lossy(&line_tail))
+        {
+            denial_total = denial_total.saturating_add(1);
+            writer_denials.store(denial_total, Ordering::SeqCst);
+        }
         writer_done.store(true, Ordering::SeqCst);
     });
 
@@ -2027,6 +2210,8 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, limits: StdoutLimits) ->
         truncated,
         errored,
         cap_hit,
+        raw_read,
+        denials,
     }
 }
 
@@ -2100,6 +2285,22 @@ pub fn failure_for(cfg: &Config, spec: &ReviewerSpec, out: &RunOutcome) -> Failu
     let reviewer = spec.reviewer.as_str();
     if out.cancelled {
         return errors::cancelled();
+    }
+    // The policy fail-fast (issue #68). Distinct terminal code from TIMEOUT: nothing timed out, the
+    // reviewer was blocked and made no progress, and the remedy differs. Mutually exclusive with the
+    // other flags by construction (the poll loop checks cancel/timeout/cap first), so its position
+    // here is not load-bearing, but it is placed above the timeout for clarity.
+    if out.policy_stalled {
+        return errors::policy_blocked(
+            reviewer,
+            // The stream-wide count carried on the outcome, not a recount of the retained stderr:
+            // it is exact even when refusals landed past the retention cap (issue #68 gate f3), so
+            // it is never reported as a floor.
+            out.policy_denials,
+            false,
+            cfg.max_policy_idle.as_secs(),
+            out.diagnostics(),
+        );
     }
     if out.timed_out {
         if spec.reviewer == ReviewerKind::Codex {
@@ -2228,7 +2429,11 @@ mod drain_tests {
     use super::*;
 
     fn drained(bytes: Vec<u8>) -> Collected {
-        let drain = drain(std::io::Cursor::new(bytes), StdoutLimits::default_retain());
+        let drain = drain(
+            std::io::Cursor::new(bytes),
+            StdoutLimits::default_retain(),
+            false,
+        );
         collect(&drain, Instant::now() + Duration::from_secs(5))
     }
 
@@ -2250,7 +2455,7 @@ mod drain_tests {
             max_lines: usize::MAX,
             terminate_at_cap: true,
         };
-        let bytes_drain = drain(std::io::Cursor::new(vec![b'x'; 64]), limits);
+        let bytes_drain = drain(std::io::Cursor::new(vec![b'x'; 64]), limits, false);
         let _ = collect(&bytes_drain, Instant::now() + Duration::from_secs(5));
         assert_eq!(bytes_drain.cap_hit(), Some(StreamCapKind::Bytes));
 
@@ -2263,6 +2468,7 @@ mod drain_tests {
         let d = drain(
             std::io::Cursor::new(b"a\nb\nc\nd\ne\n".to_vec()),
             line_limits,
+            false,
         );
         let _ = collect(&d, Instant::now() + Duration::from_secs(5));
         assert_eq!(d.cap_hit(), Some(StreamCapKind::Lines));
@@ -2274,6 +2480,7 @@ mod drain_tests {
                 max_lines: 10,
                 terminate_at_cap: true,
             },
+            false,
         );
         let _ = collect(&ok, Instant::now() + Duration::from_secs(5));
         assert_eq!(ok.cap_hit(), None);
@@ -2292,6 +2499,7 @@ mod drain_tests {
             Duration::from_secs(5),
             &std::sync::atomic::AtomicBool::new(false),
             StdoutLimits::default_retain(),
+            None,
             |_| {},
         );
         match result {
@@ -2400,6 +2608,7 @@ mod drain_tests {
                 taken: Arc::clone(&taken),
             },
             StdoutLimits::default_retain(),
+            false,
         );
         let collected = collect(&drain, Instant::now() + Duration::from_secs(10));
 
@@ -2427,6 +2636,8 @@ mod drain_tests {
             success: false,
             timed_out: false,
             cancelled: false,
+            policy_stalled: false,
+            policy_denials: 0,
             stdout_truncated: true,
             stderr_truncated: false,
             stdout_lossy: false,
@@ -2458,6 +2669,8 @@ mod drain_tests {
             success: true,
             timed_out: false,
             cancelled: false,
+            policy_stalled: false,
+            policy_denials: 0,
             stdout_truncated: true,
             stderr_truncated: false,
             stdout_lossy: false,
@@ -2490,6 +2703,8 @@ mod drain_tests {
             success: false,
             timed_out: true,
             cancelled: false,
+            policy_stalled: false,
+            policy_denials: 0,
             stdout_truncated: false,
             stderr_truncated: false,
             stdout_lossy: false,
@@ -2520,6 +2735,279 @@ mod drain_tests {
             "{}",
             failure.summary
         );
+    }
+
+    // ---- issue #68: policy fail-fast ----
+
+    #[test]
+    fn denials_are_counted_across_the_whole_stream_past_the_retention_cap() {
+        // Retention caps at 64 bytes, but the refusals appear only after far more filler than that.
+        // The streaming counter must still see all four (issue #68 gate f2), and a split across
+        // read chunks must not lose one.
+        let mut data = Vec::new();
+        for _ in 0..50 {
+            data.extend_from_slice(b"filler line well past the retention cap\n");
+        }
+        for _ in 0..4 {
+            data.extend_from_slice(b"router: error=`x` rejected: blocked by policy\n");
+        }
+        let limits = StdoutLimits {
+            max_bytes: 64,
+            max_lines: usize::MAX,
+            terminate_at_cap: false,
+        };
+        let d = drain(std::io::Cursor::new(data), limits, true);
+        let collected = collect(&d, Instant::now() + Duration::from_secs(5));
+        assert!(
+            collected.truncated,
+            "retention should have capped the buffer"
+        );
+        assert_eq!(d.denial_count(), 4, "all refusals counted despite the cap");
+
+        // A drain not asked to count reports zero even when refusals are present.
+        let mut plain = Vec::new();
+        for _ in 0..4 {
+            plain.extend_from_slice(b"rejected: blocked by policy\n");
+        }
+        let d2 = drain(
+            std::io::Cursor::new(plain),
+            StdoutLimits::default_retain(),
+            false,
+        );
+        let _ = collect(&d2, Instant::now() + Duration::from_secs(5));
+        assert_eq!(d2.denial_count(), 0);
+    }
+
+    #[test]
+    fn a_policy_stalled_outcome_routes_to_policy_blocked_not_timeout() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        // The exact count is carried on the outcome (policy_denials), not recomputed from stderr.
+        // Here the retained stderr shows only one refusal and is even flagged truncated, but the
+        // stream-wide count was 5 -- the diagnostic must report 5, exactly, not "at least 1" or
+        // "at least 5" (issue #68 gate f3).
+        let out = RunOutcome {
+            stdout: String::new(),
+            stderr: "router: error=`a` rejected: blocked by policy\n".to_string(),
+            exit: None,
+            success: false,
+            timed_out: false,
+            cancelled: false,
+            policy_stalled: true,
+            policy_denials: 5,
+            stdout_truncated: false,
+            stderr_truncated: true,
+            stdout_lossy: false,
+            stdout_incomplete: false,
+            stdout_cap_hit: None,
+        };
+        let failure = failure_for(&cfg, cfg.primary(), &out);
+        assert_eq!(failure.code, "POLICY_BLOCKED");
+        assert!(
+            failure.summary.contains("refused 5 shell command(s)"),
+            "{}",
+            failure.summary
+        );
+        assert!(
+            !failure.summary.contains("at least"),
+            "the stream-wide count is exact, never a floor: {}",
+            failure.summary
+        );
+        // Steers at the evidence tools, and never at an allow-rule (plan f3 / gate f2 remediation).
+        assert!(failure.remediation.contains("repository evidence tools"));
+        assert!(!failure
+            .remediation
+            .to_ascii_lowercase()
+            .contains("allow rule"));
+
+        // Cancellation outranks a policy stall at the routing layer too.
+        let cancelled = RunOutcome {
+            cancelled: true,
+            ..out
+        };
+        assert_eq!(
+            failure_for(&cfg, cfg.primary(), &cancelled).code,
+            "CANCELLED"
+        );
+    }
+
+    #[test]
+    fn policy_stall_is_armed_only_for_codex_and_only_when_enabled() {
+        // Codex with the default threshold: armed.
+        let codex = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        assert!(PolicyStall::for_run(&codex, codex.primary()).is_some());
+        // Codex with the fail-fast disabled: off.
+        let disabled = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--max-policy-denials".into(),
+            "0".into(),
+        ])
+        .expect("cfg");
+        assert!(PolicyStall::for_run(&disabled, disabled.primary()).is_none());
+        // Claude has no command router, so it is never armed even at the default threshold.
+        let claude = Config::from_args(&["--reviewer".into(), "claude".into()]).expect("cfg");
+        assert!(PolicyStall::for_run(&claude, claude.primary()).is_none());
+    }
+
+    // Short windows so the fail-fast fires within the test rather than the 300s default.
+    fn stall(max_denials: usize, idle_ms: u64) -> PolicyStall {
+        PolicyStall {
+            max_denials,
+            idle: Duration::from_millis(idle_ms),
+        }
+    }
+
+    fn powershell(script: &str) -> Command {
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", script]);
+        cmd
+    }
+
+    #[test]
+    fn a_silent_codex_turn_past_the_denial_threshold_fails_fast() {
+        // Four refusals on stderr, no stdout, then a long sleep: the loop must terminate it as
+        // policy_stalled long before the sleep ends, rather than waiting out the timeout.
+        let cmd = powershell(
+            "1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             Start-Sleep -Seconds 30",
+        );
+        let start = Instant::now();
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_secs(120),
+            &AtomicBool::new(false),
+            StdoutLimits::default_retain(),
+            Some(stall(4, 500)),
+            |_| {},
+        )
+        .expect("observe");
+        assert!(out.policy_stalled, "should fail fast: {out:?}");
+        assert!(!out.timed_out && !out.cancelled && !out.success);
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "must not wait out the child"
+        );
+    }
+
+    #[test]
+    fn below_the_denial_threshold_is_not_policy_killed() {
+        // Silent, but only three refusals -- under the threshold, so the loop leaves it to exit.
+        let cmd = powershell(
+            "1..3 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             Start-Sleep -Seconds 2",
+        );
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_secs(120),
+            &AtomicBool::new(false),
+            StdoutLimits::default_retain(),
+            Some(stall(4, 300)),
+            |_| {},
+        )
+        .expect("observe");
+        assert!(!out.policy_stalled, "3 < 4 denials must not trip: {out:?}");
+        assert!(out.success);
+    }
+
+    #[test]
+    fn stdout_progress_prevents_the_policy_kill() {
+        // Four refusals, but stdout keeps advancing with gaps well under the idle window, so the
+        // turn is making progress and must never be killed on this path. Emit the first stdout byte
+        // immediately (before the refusals) and use a window generously larger than process startup
+        // — this test spawns a real PowerShell, and under parallel test load its cold start plus
+        // first write can be seconds, so a launch-relative window that is too tight is flaky (it
+        // was 500ms and failed in CI). The window (4s) comfortably exceeds startup, while the run
+        // (30 ticks × 200ms ≈ 6s) exceeds the window, so survival genuinely proves that advancing
+        // stdout keeps resetting the idle timer rather than the run merely being short.
+        let cmd = powershell(
+            "Write-Output start; \
+             1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             1..30 | % { Write-Output ('tick' + $_); Start-Sleep -Milliseconds 200 }",
+        );
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_secs(120),
+            &AtomicBool::new(false),
+            StdoutLimits::default_retain(),
+            Some(stall(4, 4000)),
+            |_| {},
+        )
+        .expect("observe");
+        assert!(
+            !out.policy_stalled,
+            "advancing stdout must not be killed: {out:?}"
+        );
+        assert!(out.success);
+    }
+
+    #[test]
+    fn cancellation_outranks_the_policy_kill_in_the_loop() {
+        let cmd = powershell(
+            "1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             Start-Sleep -Seconds 30",
+        );
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_secs(120),
+            &AtomicBool::new(true),
+            StdoutLimits::default_retain(),
+            Some(stall(4, 500)),
+            |_| {},
+        )
+        .expect("observe");
+        assert!(
+            out.cancelled && !out.policy_stalled,
+            "cancel must win: {out:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_outranks_the_policy_kill_when_the_deadline_is_shorter() {
+        // A denial-laden turn that reaches the hard deadline before the idle window is a TIMEOUT,
+        // not POLICY_BLOCKED: the deadline is checked ahead of the policy stall at the same instant.
+        let cmd = powershell(
+            "1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             Start-Sleep -Seconds 30",
+        );
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_millis(400),
+            &AtomicBool::new(false),
+            StdoutLimits::default_retain(),
+            Some(stall(4, 10_000)),
+            |_| {},
+        )
+        .expect("observe");
+        assert!(
+            out.timed_out && !out.policy_stalled,
+            "timeout must win: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unarmed_run_never_policy_stalls() {
+        // `None` (every non-Codex or disabled run) leaves the loop's behaviour exactly as before:
+        // four refusals and silence do not terminate it.
+        let cmd = powershell(
+            "1..4 | % { [Console]::Error.WriteLine('rejected: blocked by policy') }; \
+             Start-Sleep -Seconds 2",
+        );
+        let out = run_observed(
+            cmd,
+            "",
+            Duration::from_secs(120),
+            &AtomicBool::new(false),
+            StdoutLimits::default_retain(),
+            None,
+            |_| {},
+        )
+        .expect("observe");
+        assert!(!out.policy_stalled && out.success);
     }
 }
 

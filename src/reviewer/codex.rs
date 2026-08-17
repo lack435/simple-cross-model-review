@@ -1036,7 +1036,7 @@ pub(crate) fn policy_denial_count(stderr: &str) -> usize {
     stderr.lines().filter(|line| is_policy_denial(line)).count()
 }
 
-fn is_policy_denial(line: &str) -> bool {
+pub(crate) fn is_policy_denial(line: &str) -> bool {
     line.to_ascii_lowercase().contains(POLICY_DENIAL_MARKER)
 }
 
@@ -1397,6 +1397,8 @@ mod tests {
             success,
             timed_out: false,
             cancelled: false,
+            policy_stalled: false,
+            policy_denials: 0,
             stdout_truncated: false,
             stderr_truncated: false,
             stdout_lossy: false,
@@ -1982,6 +1984,8 @@ ordinary diagnostic
             success: false,
             timed_out: false,
             cancelled: false,
+            policy_stalled: false,
+            policy_denials: 0,
             stdout_truncated: false,
             stderr_truncated: false,
             stdout_lossy: false,

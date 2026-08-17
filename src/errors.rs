@@ -422,9 +422,49 @@ pub fn timed_out_after_policy_denials(
         format!(
             "The cross-model review was cancelled after {secs} seconds. The reviewer encountered \
              non-interactive command-policy refusals, so increasing the timeout is unlikely to \
-             help. Use the direct read commands the reviewer was told to prefer, configure a \
-             narrowly scoped allow rule for commands you trust, or use the other reviewer \
-             direction. The review has NOT been performed."
+             help. The reviewer has read-only repository evidence tools -- scoped search and paged \
+             reads that need no shell -- which are the intended way to read the tree; or use the \
+             other reviewer direction. (Widening the trusted command set with an allow rule is not \
+             advised: it moves the reviewer's read-only sandbox boundary.) The review has NOT been \
+             performed."
+        ),
+    )
+    .with_detail(detail)
+}
+
+/// A Codex turn ended early by the policy fail-fast (issue #68): it accumulated enough
+/// `blocked by policy` shell refusals AND then went silent on stdout past the idle window, so it
+/// was terminated rather than left to burn the whole turn to a misleading TIMEOUT. Distinct from
+/// TIMEOUT precisely because the cause and the remedy differ: nothing timed out, the reviewer was
+/// blocked. The remediation never suggests an allow-rule -- widening the trusted command set moves
+/// the reviewer's read-only sandbox boundary, which this project treats as a security boundary.
+pub fn policy_blocked(
+    reviewer: &str,
+    count: usize,
+    count_is_floor: bool,
+    idle_secs: u64,
+    detail: impl Into<String>,
+) -> Failure {
+    let count_phrase = if count_is_floor {
+        format!("at least {count}")
+    } else {
+        count.to_string()
+    };
+    Failure::new(
+        "POLICY_BLOCKED",
+        format!(
+            "The '{reviewer}' reviewer was stopped after its CLI refused {count_phrase} shell \
+             command(s) by policy and then stopped making progress."
+        ),
+        format!(
+            "The reviewer's non-interactive CLI refused {count_phrase} shell command(s) 'by \
+             policy' and then produced no output for {idle_secs} seconds, so the review was ended \
+             early rather than run out its full budget (which used to surface as a misleading \
+             TIMEOUT). Composed shell commands (pipelines, ';'-separated pairs, Select-String, \
+             variable expressions) are refused non-interactively, and retrying them cannot \
+             succeed. The reviewer has read-only repository evidence tools -- scoped search and \
+             paged reads that need no shell -- which are the intended way to read the tree; or use \
+             the other reviewer direction. The review has NOT been performed."
         ),
     )
     .with_detail(detail)
