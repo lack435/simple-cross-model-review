@@ -123,10 +123,25 @@ pub fn validate_profile_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Test-only override of the profile base (issue #99). Thread-local so parallel tests never collide,
+// and so a test that isolates its base cannot leak that base into another test on the same thread
+// past the guard's drop. See `isolate_profile_base`.
+#[cfg(test)]
+thread_local! {
+    static PROFILE_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The base directory profiles live under: `%CROSS_REVIEW_HOME%` when set, else
 /// `%LOCALAPPDATA%\cross-review`. Deliberately independent of `--state-dir`, which is user- and
 /// repo-settable and must never determine a credential home. `None` when neither is set.
 pub fn profile_base() -> Option<PathBuf> {
+    // A test that isolates its base (issue #99) wins over the real machine environment, so
+    // authorization is deterministic regardless of the developer's real store.
+    #[cfg(test)]
+    if let Some(base) = PROFILE_BASE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(base);
+    }
     if let Some(h) = std::env::var_os("CROSS_REVIEW_HOME") {
         let p = PathBuf::from(h);
         if !p.as_os_str().is_empty() {
@@ -137,6 +152,72 @@ pub fn profile_base() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("cross-review"))
+}
+
+/// Restores the previous [`profile_base`] override when dropped. Held for the duration of a test that
+/// needs a deterministic (empty) store; see [`isolate_profile_base`].
+#[cfg(test)]
+#[must_use]
+pub(crate) struct ProfileBaseGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for ProfileBaseGuard {
+    fn drop(&mut self) {
+        PROFILE_BASE_OVERRIDE.with(|c| *c.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Point [`profile_base`] (and therefore the allowlist store and every resolved profile home) at a
+/// unique, non-existent directory for the current thread, so authorization is deterministic
+/// regardless of the developer machine's real store (issue #99). Nothing is created on disk: an
+/// absent store reads as "nothing authorized", which is exactly the empty state these tests assert
+/// against. The returned guard restores the prior base on drop.
+///
+/// The candidate must be verified *absent*, not merely process-unique: the pid+counter names collide
+/// across process runs (pids are reused), so a leftover directory from an earlier run — or anything
+/// else that happens to sit at that path — could carry `auth`/`profiles` data and reintroduce the very
+/// machine-dependence this exists to remove (cross-review f1). So we advance the nonce until the path
+/// does not exist, and treat an *inconclusive* `try_exists` (a permission error) as "unusable" and
+/// skip it too — only a definite `Ok(false)` is accepted.
+///
+/// The search is bounded: if `%TEMP%` itself is inaccessible or misconfigured, *every* `try_exists`
+/// returns `Err` and an unbounded loop would spin until the counter wrapped — a hang, not a failure.
+/// So after a small number of attempts we panic with the last error rather than skip forever
+/// (cross-review f2). A working temp directory yields an absent candidate on the first or second try,
+/// so the bound is never approached in practice.
+#[cfg(test)]
+pub(crate) fn isolate_profile_base() -> ProfileBaseGuard {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let tmp = std::env::temp_dir();
+    let mut last_err = None;
+    let mut base = None;
+    for _ in 0..16 {
+        let candidate = tmp.join(format!(
+            "cross-review-test-base-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match candidate.try_exists() {
+            Ok(false) => {
+                base = Some(candidate);
+                break;
+            }
+            Ok(true) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let base = base.unwrap_or_else(|| {
+        panic!(
+            "isolate_profile_base: no absent candidate under {} after 16 attempts (last error: {:?})",
+            tmp.display(),
+            last_err
+        )
+    });
+    let previous = PROFILE_BASE_OVERRIDE.with(|c| c.borrow_mut().replace(base));
+    ProfileBaseGuard { previous }
 }
 
 /// The per-reviewer profile root under `base`: `{base}\profiles\{reviewer}`.

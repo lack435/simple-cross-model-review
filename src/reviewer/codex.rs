@@ -1232,6 +1232,9 @@ mod tests {
     #[test]
     fn codex_home_reads_ambient_for_ambient_and_refuses_a_denied_profile() {
         use crate::reviewer::Reviewer;
+        // Isolate the allowlist store so the denied-profile assertions hold regardless of what the
+        // developer machine has genuinely authorized (issue #99).
+        let _base = crate::profile::isolate_profile_base();
         // Ambient entry: reads the ambient home ($CODEX_HOME or ~/.codex).
         let ambient = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         assert!(codex_home(&ambient, ambient.primary()).is_some());
