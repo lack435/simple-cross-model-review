@@ -3194,12 +3194,17 @@ impl Job {
         let claude_in_scope = self.spec.reviewer == crate::config::ReviewerKind::Claude
             && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some();
         // Section-7 (f4): whether the captured change is too thin to stand on its own -- empty
-        // (nothing to review, e.g. an uncommitted `main...HEAD`) or incomplete (truncated). Computed
-        // now, before `summary` is consumed below. When thin AND the in-scope reviewer obtained no
-        // successful content evidence, the runtime gate (after collect_run) fails the review closed.
+        // (nothing to review, e.g. an uncommitted `main...HEAD`) or incomplete (truncated). Keyed on
+        // the CaptureSummary's reported counts, NOT the raw change text, which is non-empty even for a
+        // clean tree (it carries a `git status` line and headers) -- an early bug that left the gate
+        // inert on empty captures, caught by the Claude smoke. A `None` summary means nothing was
+        // captured, which is also thin. Computed before `summary` is consumed below. When thin AND the
+        // in-scope reviewer obtained no successful content evidence, the runtime gate (after
+        // collect_run) fails the review closed.
         let capture_thin = claude_in_scope
-            && (change.map_or(true, |c| c.trim().is_empty())
-                || summary.as_ref().is_some_and(|s| !s.is_complete()));
+            && summary
+                .as_ref()
+                .map_or(true, |s| s.is_empty() || !s.is_complete());
         let evidence_setup =
             if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
                 let executable = std::env::current_exe().map_err(|e| {

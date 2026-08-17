@@ -257,8 +257,10 @@ try {
     }
 
     Write-Host "`n=== 4. a real review ===" -ForegroundColor Cyan
-    if ($Reviewer -eq 'codex') {
-        $firstInstructions = @'
+    # Both reviewers now have the read-only evidence service, so both are asked to exercise it. For
+    # Claude this also satisfies the section-7 gate on the smoke's empty capture: the gate requires a
+    # successful content evidence call before an empty-capture review is trusted.
+    $firstInstructions = @'
 This is an automated smoke test of a review tool. Do not review any code. Do not use the shell.
 Call repository_scope, repository_list for the repository root, repository_search for the literal
 "cross-review", and repository_change. These calls test the repository evidence service.
@@ -266,15 +268,6 @@ After they complete, reply with exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=1
 '@
-    }
-    else {
-        $firstInstructions = @'
-This is an automated smoke test of a review tool. Do not review any code.
-Reply with exactly two lines and nothing else:
-SMOKE-OK
-COUNTER=1
-'@
-    }
     $start = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
@@ -336,22 +329,12 @@ COUNTER=1
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
-    if ($Reviewer -eq 'codex') {
-        $resumeInstructions = @'
+    $resumeInstructions = @'
 Still the smoke test. Call repository_scope and repository_read for README.md lines 1-5; do not
 use the shell. Then increment the counter you reported before and reply with exactly two lines:
 SMOKE-OK
 COUNTER=2
 '@
-    }
-    else {
-        $resumeInstructions = @'
-Still the smoke test. Increment the counter you reported before.
-Reply with exactly two lines and nothing else:
-SMOKE-OK
-COUNTER=2
-'@
-    }
     $resume = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
