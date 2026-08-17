@@ -107,6 +107,15 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
+--claude-profile <name>     Pin the reviewer to a named account/config home (a controlled
+--codex-profile <name>      directory under %CROSS_REVIEW_HOME%/%LOCALAPPDATA%, provisioned once
+                            with cross_model_setup_profile) rather than the ambient login, so the
+                            review bills that account and loads none of the user's config. Binds to
+                            the --reviewer before it. A non-ambient home (this, or the explicit
+                            --claude-config-dir below) is required to put a Claude reviewer on the
+                            evidence path (see "the Claude reviewer's read-only evidence service"
+                            below). --claude-config-dir / --codex-home take an explicit home path
+                            instead of a managed label.
 --level NAME:MODEL:EFFORT    Declare a named review-depth preset the caller can pick per review
                             (e.g. fast:gpt-5.6-luna:high). Repeatable; binds to the --reviewer
                             before it. The caller selects one with the `level` tool argument at
@@ -153,7 +162,8 @@ the single source of truth. There is no config file of our own to drift out of s
                             Perforce. Filesystem-only — it never runs p4 to decide.
 --diff <spec>               git only. What to capture as "the change".
                             auto|none|staged|HEAD|<rev>. Default auto: supply a diff to a
-                            shell-less reviewer and to an isolated Codex evidence service.
+                            shell-less reviewer (in its prompt) and to an isolated evidence
+                            service (Codex, or a profile-pinned Claude — see below).
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -168,6 +178,32 @@ Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 > Pin models by full id, not an alias. `--model opus` resolves to whatever the provider
 > currently maps that alias to and can move as releases ship — verified once as
 > `claude-opus-4-8`. Pinning the exact id keeps the reviewer fixed to the one you chose.
+
+### The Claude reviewer's read-only evidence service
+
+A Claude reviewer normally sees only the change captured into its prompt. On the **evidence path** it
+additionally gets the same read-only repository evidence tools the Codex reviewer has —
+`repository_scope`/`list`/`search`/`read`/`change`, plus Git `history`/`revision` — so it can read the
+live tree and walk history to look *past* the captured diff rather than being blind to everything
+outside it. It stays shell-less and write-denied; the tools are read-only and path-scoped.
+
+There is no flag to turn this on: it applies automatically when the review qualifies, which needs
+**all** of:
+
+- **a pinned profile** — any non-ambient home, whether a named `--claude-profile <name>` or an
+  explicit `--claude-config-dir <path>`; an ambient Claude keeps its `~/.claude`, which has no
+  controlled config home, so it stays on `--safe-mode` with no evidence;
+- **no shell** (the default `--tools Read,Grep,Glob`; a shell needs `Bash` both in `--tools` and
+  permitted by `--allow-tools`, and adding it that way opts out);
+- **default read rules** (no custom `--allow-tools`), **a git top-level** working root, and
+  **configuration isolation on** (not `--allow-reviewer-config`).
+
+The dogfood `.codex/config.toml` entry already meets these. When the capture is empty or incomplete,
+a runtime gate requires the reviewer to actually read the change through the evidence tools before the
+review is trusted, else it fails closed with `EVIDENCE_UNAVAILABLE`. What moves at the isolation
+boundary versus `--safe-mode` is detailed under
+[what the reviewer can and cannot do](#what-the-reviewer-can-and-cannot-do); the full design is in
+[`docs/claude-reviewer-evidence-service.md`](docs/claude-reviewer-evidence-service.md).
 
 ### Reviewer fallback chain
 
