@@ -29,6 +29,9 @@ param(
     # Path to the reviewer CLI, when it is not on PATH.
     [string]$ReviewerBin,
 
+    # Profile label for the Claude evidence path (see review f2). Must be authorized on this machine.
+    [string]$ClaudeProfile = 'work',
+
     [string]$Exe = (Join-Path $PSScriptRoot 'target\release\cross-review.exe'),
 
     # Prove the block-repair path against a real reviewer (issue #63). Builds an instrumented
@@ -67,6 +70,11 @@ if (-not (Test-Path $Exe)) {
 $serverArgs = @('--reviewer', $Reviewer, '--effort', $Effort, '--timeout-seconds', '600')
 if ($Model) { $serverArgs += @('--model', $Model) }
 if ($ReviewerBin) { $serverArgs += @('--bin', $ReviewerBin) }
+# The Claude evidence path requires a pinned profile home (an ambient Claude keeps --safe-mode and
+# gets no evidence, review f2), so the Claude smoke pins the dogfood "work" profile to exercise it.
+# This assumes the profile is authorized on this machine (cross_model_setup_profile). Override with
+# -ClaudeProfile to use a different label.
+if ($Reviewer -eq 'claude') { $serverArgs += @('--claude-profile', $ClaudeProfile) }
 
 # Keep smoke-test sessions out of the real per-project state.
 $stateDir = Join-Path ([System.IO.Path]::GetTempPath()) "cross-review-smoke-$PID"
@@ -257,8 +265,10 @@ try {
     }
 
     Write-Host "`n=== 4. a real review ===" -ForegroundColor Cyan
-    if ($Reviewer -eq 'codex') {
-        $firstInstructions = @'
+    # Both reviewers now have the read-only evidence service, so both are asked to exercise it. For
+    # Claude this also satisfies the section-7 gate on the smoke's empty capture: the gate requires a
+    # successful content evidence call before an empty-capture review is trusted.
+    $firstInstructions = @'
 This is an automated smoke test of a review tool. Do not review any code. Do not use the shell.
 Call repository_scope, repository_list for the repository root, repository_search for the literal
 "cross-review", and repository_change. These calls test the repository evidence service.
@@ -266,15 +276,6 @@ After they complete, reply with exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=1
 '@
-    }
-    else {
-        $firstInstructions = @'
-This is an automated smoke test of a review tool. Do not review any code.
-Reply with exactly two lines and nothing else:
-SMOKE-OK
-COUNTER=1
-'@
-    }
     $start = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
@@ -336,22 +337,12 @@ COUNTER=1
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
-    if ($Reviewer -eq 'codex') {
-        $resumeInstructions = @'
+    $resumeInstructions = @'
 Still the smoke test. Call repository_scope and repository_read for README.md lines 1-5; do not
 use the shell. Then increment the counter you reported before and reply with exactly two lines:
 SMOKE-OK
 COUNTER=2
 '@
-    }
-    else {
-        $resumeInstructions = @'
-Still the smoke test. Increment the counter you reported before.
-Reply with exactly two lines and nothing else:
-SMOKE-OK
-COUNTER=2
-'@
-    }
     $resume = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
@@ -412,7 +403,7 @@ COUNTER=2
     $doomed = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of poll cancellation. Wait quietly; the poll will be cancelled.'
+            instructions = 'Smoke test of poll cancellation. Call repository_change, then wait quietly; the poll will be cancelled.'
             session      = 'smoke-cancel'
             fresh        = $true
         }
@@ -478,7 +469,7 @@ COUNTER=2
     $doomedB = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of explicit cancellation. Wait quietly; this will be cancelled.'
+            instructions = 'Smoke test of explicit cancellation. Call repository_change, then wait quietly; this will be cancelled.'
             session      = 'smoke-cancel-b'
             fresh        = $true
         }

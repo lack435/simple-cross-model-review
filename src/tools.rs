@@ -2993,7 +2993,7 @@ impl Job {
             prompt,
             self.cfg.block_repair_timeout,
             &self.cancel,
-            self.reviewer.output_limits(&self.cfg),
+            self.reviewer.output_limits(&self.cfg, &self.spec),
             // Same policy fail-fast arming as the main run; at default settings the block-repair
             // timeout is shorter than the idle window, so timeout simply wins first.
             reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
@@ -3151,9 +3151,11 @@ impl Job {
         // configured, so a diff that could not be produced is never announced.
         // Rendered for the *active* entry, so a mixed-family fallback is told the truth about its
         // own shell/self-serve ability rather than the primary's.
-        let capabilities = self
-            .cfg
-            .reviewer_capabilities_of(self.spec.reviewer, change.is_some());
+        let capabilities = self.cfg.reviewer_capabilities_of(
+            self.spec.reviewer,
+            change.is_some(),
+            crate::reviewer::claude::claude_evidence_enabled(&self.cfg, &self.spec),
+        );
         let capabilities = if self.cfg.no_preamble {
             None
         } else {
@@ -3187,45 +3189,90 @@ impl Job {
         // Codex runs outside the repository and receives repository context through a mandatory
         // per-turn evidence capability. Build and handshake it before the findings write-ahead
         // marker: any failure here starts no reviewer process and advances no conversation.
-        let evidence_setup = if self.spec.reviewer == crate::config::ReviewerKind::Codex {
-            let executable = std::env::current_exe().map_err(|e| {
-                errors::evidence_unavailable(format!(
-                    "cannot resolve the running cross-review executable: {e}"
-                ))
-            })?;
-            let sterile = if self.cfg.isolate_reviewer {
-                Some(
-                    crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
-                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+        // Evidence is built for Codex (always) and for an in-scope Claude.
+        // THE eligibility decision (reviews f2/f3): a profile-pinned, shell-less, git-top-level,
+        // default-rules, isolated Claude. The same predicate gates evidence setup here and is keyed
+        // on by invocation, parse, output_limits, and the capability preamble, so none of them
+        // disagree. Requiring a profile (f2) keeps an ambient Claude -- whose ~/.claude user config
+        // the granular flags do not disable and the project-only sterile cwd does not cover -- on the
+        // existing --safe-mode + neutral-cwd path with no evidence. A named profile that reached here
+        // is authorized (an unauthorized one was refused above), so this matches authorized_start.
+        let claude_in_scope =
+            crate::reviewer::claude::claude_evidence_enabled(&self.cfg, &self.spec);
+        debug_assert_eq!(
+            claude_in_scope,
+            authorized_start.is_some()
+                && self.spec.reviewer == crate::config::ReviewerKind::Claude
+                && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some(),
+            "claude evidence eligibility must match the authorized-profile form"
+        );
+        // Section-7 (f4): whether the captured change is too thin to stand on its own -- empty
+        // (nothing to review, e.g. an uncommitted `main...HEAD`) or incomplete (truncated). Keyed on
+        // the CaptureSummary's reported counts, NOT the raw change text, which is non-empty even for a
+        // clean tree (it carries a `git status` line and headers) -- an early bug that left the gate
+        // inert on empty captures, caught by the Claude smoke. A `None` summary means nothing was
+        // captured, which is also thin. Computed before `summary` is consumed below. When thin AND the
+        // in-scope reviewer obtained no successful content evidence, the runtime gate (after
+        // collect_run) fails the review closed.
+        let capture_thin = claude_in_scope
+            && summary
+                .as_ref()
+                .map_or(true, |s| s.is_empty() || !s.is_complete());
+        let evidence_setup =
+            if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
+                let executable = std::env::current_exe().map_err(|e| {
+                    errors::evidence_unavailable(format!(
+                        "cannot resolve the running cross-review executable: {e}"
+                    ))
+                })?;
+                let sterile = if self.cfg.isolate_reviewer {
+                    Some(
+                        crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
+                            .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                let change_label = summary
+                    .map(crate::vcs::CaptureSummary::summary)
+                    .unwrap_or_else(|| "no selected change was captured".to_string());
+                let status_summary = if capture_warnings.is_empty() {
+                    change_label.clone()
+                } else {
+                    format!("{}\n{}", change_label, capture_warnings.join("\n"))
+                };
+                let bundle = crate::evidence::Bundle::create(
+                    &self.cfg.cwd,
+                    self.cfg.vcs,
+                    &self.id,
+                    change_label,
+                    status_summary,
+                    change.map(str::to_string),
                 )
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                // An in-scope Claude reaches the server through a generated --mcp-config file; Codex
+                // injects it through its own -c overrides and needs none.
+                let mcp_config_file = if claude_in_scope {
+                    Some(
+                        crate::evidence::write_claude_mcp_config(
+                            &self.cfg,
+                            &executable,
+                            &bundle_file.path,
+                            &self.id,
+                        )
+                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                Some((executable, sterile, bundle_file, mcp_config_file))
             } else {
                 None
             };
-            let change_label = summary
-                .map(crate::vcs::CaptureSummary::summary)
-                .unwrap_or_else(|| "no selected change was captured".to_string());
-            let status_summary = if capture_warnings.is_empty() {
-                change_label.clone()
-            } else {
-                format!("{}\n{}", change_label, capture_warnings.join("\n"))
-            };
-            let bundle = crate::evidence::Bundle::create(
-                &self.cfg.cwd,
-                self.cfg.vcs,
-                &self.id,
-                change_label,
-                status_summary,
-                change.map(str::to_string),
-            )
-            .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            Some((executable, sterile, bundle_file))
-        } else {
-            None
-        };
 
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
         // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
@@ -3272,7 +3319,12 @@ impl Job {
             };
         // The isolated Codex change is available through repository_change. Do not duplicate it
         // into the prompt (or let prompt size become the service's effective pagination limit).
-        let prompt_change = if evidence_setup.is_some() {
+        // Suppress it only for Codex, whose sole delivery is repository_change; an in-scope Claude
+        // keeps its captured change in the prompt (Non-goals / f3), which is what makes the evidence
+        // service additive rather than load-bearing for it.
+        let prompt_change = if evidence_setup.is_some()
+            && self.spec.reviewer == crate::config::ReviewerKind::Codex
+        {
             None
         } else {
             change
@@ -3299,16 +3351,18 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let evidence_invocation = evidence_setup
-            .as_ref()
-            .map(
-                |(executable, sterile, bundle)| crate::reviewer::EvidenceInvocation {
-                    executable,
-                    bundle_file: &bundle.path,
-                    nonce: &self.id,
-                    sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
-                },
-            );
+        let evidence_invocation =
+            evidence_setup
+                .as_ref()
+                .map(|(executable, sterile, bundle, mcp_config)| {
+                    crate::reviewer::EvidenceInvocation {
+                        executable,
+                        bundle_file: &bundle.path,
+                        nonce: &self.id,
+                        sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
+                        mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
+                    }
+                });
         let invocation = match self.reviewer.invocation(
             &self.cfg,
             &self.spec,
@@ -3345,7 +3399,7 @@ impl Job {
             // The armed Claude path raises the stdout cap and terminates a runaway stream at the
             // byte/line bound; every other path keeps the retain-and-drain default. See
             // docs/usage-remaining-gate.md.
-            self.reviewer.output_limits(&self.cfg),
+            self.reviewer.output_limits(&self.cfg, &self.spec),
             // Policy fail-fast (issue #68): Codex-only, disabled when --max-policy-denials is 0.
             reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
             |activity| {
@@ -3354,6 +3408,17 @@ impl Job {
             },
         );
         self.registry.set_phase(&self.id, Phase::Finalizing);
+
+        // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json` output
+        // before `run` is consumed by collect_run. Only meaningful on the in-scope Claude path (whose
+        // invocation forced stream-json); false everywhere else. `is_ok()` requires BOTH a successful
+        // content call AND no evidence-call error, so a success followed by a later transport failure
+        // does not pass. A failed run has no Ok outcome to read -- collect_run below returns its error
+        // first, so the gate is never reached for it.
+        let evidence_ok = capture_thin
+            && run.as_ref().ok().is_some_and(|o| {
+                crate::reviewer::claude::claude_evidence_health(&o.stdout).is_ok()
+            });
 
         // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
         // `collect_run`, which is also where the headroom observation and the parse happen, in that
@@ -3380,6 +3445,23 @@ impl Job {
                 return Err(f.failure);
             }
         };
+
+        // Section-7 (f4) evidence gate. When the captured change was empty or incomplete, an in-scope
+        // Claude review is trustworthy only if the reviewer actually obtained real change/tree
+        // evidence. The pre-review handshake already proved the server could start; this catches the
+        // server dying between that and the first content call, or the reviewer touching only
+        // `repository_scope`. The child ran, so its conversation advanced: leave the findings marker
+        // set (as the collect_run non-spawn error arm above does) so the next call rebaselines rather
+        // than resuming onto a rejected turn. Fail closed to a lost (re-runnable) review, never a
+        // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
+        // false), so the common review pays nothing.
+        if capture_thin && !evidence_ok {
+            return Err(errors::evidence_review_too_thin(
+                "the captured change was empty or incomplete and the reviewer did not obtain healthy \
+                 content evidence (no successful content call, or an evidence call errored), so the \
+                 review would rest on less than the intended change",
+            ));
+        }
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
         // build the completed envelope (pure — see `findings::assess_turn`). The nonce is this

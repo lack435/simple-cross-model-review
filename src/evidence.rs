@@ -414,6 +414,65 @@ pub fn write_bundle(
     Ok(BundleFile { path })
 }
 
+/// UTF-8 view of a path for JSON, failing closed rather than lossily mangling a non-UTF-8 path
+/// into a command line the reviewer would then mis-spawn.
+fn json_path(p: &Path) -> Result<&str, EvidenceError> {
+    p.to_str().ok_or_else(|| {
+        EvidenceError::new(
+            "mcp_config_write_failed",
+            format!(
+                "path is not valid UTF-8 and cannot be encoded as JSON: {}",
+                p.display()
+            ),
+        )
+    })
+}
+
+/// Write the Claude `--mcp-config` JSON registering the evidence server (and, under
+/// `--strict-mcp-config`, only it) for an in-scope Claude review. Returns a self-deleting handle,
+/// stored alongside the bundle and removed with it. The file carries no secret: the command, the
+/// bundle path, and the per-turn nonce (which is the review id, already in the bundle filename).
+/// `env` is deliberately omitted so the evidence child inherits the reviewer's environment and can
+/// still resolve `git` on `PATH`; it reads only the immutable bundle and the working tree.
+pub fn write_claude_mcp_config(
+    cfg: &crate::config::Config,
+    executable: &Path,
+    bundle_file: &Path,
+    nonce: &str,
+) -> Result<BundleFile, EvidenceError> {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        SERVER_NAME.to_string(),
+        json!({
+            "command": json_path(executable)?,
+            "args": [SERVER_FLAG, json_path(bundle_file)?, nonce],
+        }),
+    );
+    let config = json!({ "mcpServers": Value::Object(servers) });
+
+    let dir = capability_dir(cfg)?;
+    let path = dir.join(format!("{nonce}-claude-mcp.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| {
+            EvidenceError::new(
+                "mcp_config_write_failed",
+                format!("cannot create Claude MCP config: {e}"),
+            )
+        })?;
+    serde_json::to_writer(&mut file, &config).map_err(|e| {
+        EvidenceError::new(
+            "mcp_config_write_failed",
+            format!("cannot encode Claude MCP config: {e}"),
+        )
+    })?;
+    file.flush()
+        .map_err(|e| EvidenceError::new("mcp_config_write_failed", e.to_string()))?;
+    Ok(BundleFile { path })
+}
+
 fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError> {
     let candidates = [cfg.state_dir.clone(), std::env::temp_dir()];
     let mut last = None;

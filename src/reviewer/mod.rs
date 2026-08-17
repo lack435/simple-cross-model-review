@@ -243,13 +243,24 @@ pub struct Invocation {
     pub last_message_file: Option<PathBuf>,
 }
 
-/// Per-turn capability owned by the parent and injected only into a Codex invocation.
-/// Claude receives its captured change in the prompt and never starts this server.
+/// Per-turn capability owned by the parent and injected into an isolated reviewer.
+///
+/// Codex receives the evidence server through `-c mcp_servers.*` overrides and reaches the
+/// repository through it alone (its captured change is delivered via `repository_change`, not the
+/// prompt). An in-scope shell-less Claude (see `claude_neutral_target`) receives the same server
+/// through a generated `--mcp-config` file (`mcp_config_file`) *in addition to* its in-prompt
+/// capture, and runs from `sterile_dir` as its verified-empty working directory. A shell-enabled or
+/// otherwise non-qualifying Claude is not given evidence at all.
 pub struct EvidenceInvocation<'a> {
     pub executable: &'a Path,
     pub bundle_file: &'a Path,
     pub nonce: &'a str,
+    /// The verified-empty working directory the reviewer runs from. Set for isolated Codex and for
+    /// an in-scope Claude (where it becomes Claude's `current_dir`, replacing the neutral dir).
     pub sterile_dir: Option<&'a Path>,
+    /// The generated Claude `--mcp-config` JSON file. `Some` only for an in-scope Claude; Codex
+    /// injects the server through its own config overrides and leaves this `None`.
+    pub mcp_config_file: Option<&'a Path>,
 }
 
 /// Guard for a verified empty Codex working directory outside the reviewed repository.
@@ -1402,7 +1413,7 @@ pub trait Reviewer: Send + Sync {
     /// review text more than once and a runaway stream must not hold the worker until timeout).
     /// This is the single truncation contract on raw bytes/lines read — overrun before the
     /// terminal result is `OUTPUT_TRUNCATED`. See `docs/usage-remaining-gate.md`.
-    fn output_limits(&self, _cfg: &Config) -> StdoutLimits {
+    fn output_limits(&self, _cfg: &Config, _spec: &ReviewerSpec) -> StdoutLimits {
         StdoutLimits::default_retain()
     }
 }

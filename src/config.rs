@@ -1814,7 +1814,9 @@ impl Config {
     /// with the active entry.
     #[cfg(test)]
     pub fn reviewer_capabilities(&self, diff_supplied: bool) -> String {
-        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied)
+        let evidence_enabled =
+            crate::reviewer::claude::claude_evidence_enabled(self, self.primary());
+        self.reviewer_capabilities_of(self.primary().reviewer, diff_supplied, evidence_enabled)
     }
 
     /// `reviewer_capabilities`, rendered for a specific chain entry.
@@ -1822,7 +1824,12 @@ impl Config {
     /// This is rendered per *active* entry at turn time, from the captured change, so a
     /// mixed-family fallback is told the truth about *its* shell and self-serve ability — the
     /// captured block itself is capability-neutral. See `docs/reviewer-fallback-chain.md`.
-    pub fn reviewer_capabilities_of(&self, reviewer: ReviewerKind, diff_supplied: bool) -> String {
+    pub fn reviewer_capabilities_of(
+        &self,
+        reviewer: ReviewerKind,
+        diff_supplied: bool,
+        evidence_enabled: bool,
+    ) -> String {
         if reviewer == ReviewerKind::Codex {
             let history = match self.vcs {
                 Vcs::Git => "Use `repository_history` and `repository_revision` for commit history and revisions.",
@@ -1853,6 +1860,42 @@ impl Config {
                 out.push_str(
                     "\n\nNo selected change was captured. If the request depends on a diff, state \
                      that limitation under \"What I could not check\" rather than guessing.",
+                );
+            }
+            return out;
+        }
+        // In-scope shell-less Claude (plan section 0): the same read-only evidence service Codex
+        // has, but the selected change is ALSO in this prompt and remains authoritative, so the
+        // tools are for looking *past* it. Self-contained (early return): it states its own
+        // no-shell boundary and diff handling, so it does not fall through to the shared shell-based
+        // block below.
+        if reviewer == ReviewerKind::Claude && evidence_enabled {
+            let history = match self.vcs {
+                Vcs::Git => " `repository_history` and `repository_revision` walk commit history and read revisions.",
+                Vcs::Perforce => " `repository_history` and `repository_revision` report unsupported (this service makes no new Perforce network calls).",
+            };
+            let mut out = format!(
+                "You can read and search files with Read, Grep and Glob (scoped to this directory \
+                 tree, reachable by absolute path), and you have read-only repository evidence \
+                 tools: `repository_scope`, `repository_list`, `repository_search`, \
+                 `repository_read`, and `repository_change`.{history} Their paths are relative to \
+                 the reviewed repository root, and continuation cursors page a truncated result. \
+                 You have no shell."
+            );
+            if diff_supplied {
+                out.push_str(
+                    "\n\nThe change under review is captured for you and appears below under \
+                     \"Change under review\"; it stays the authoritative selected change. Use the \
+                     evidence tools to look *past* it -- read the live tree, search it, and walk \
+                     history for context and to verify what the captured diff shows.",
+                );
+            } else {
+                out.push_str(
+                    "\n\nNo selected change was captured (an empty or unavailable range). Obtain \
+                     the change yourself through the evidence tools -- read the working tree and \
+                     walk history. If you can neither see a captured change nor obtain one through \
+                     the evidence tools, the review is inconclusive: do NOT approve -- say so under \
+                     \"What I could not check\".",
                 );
             }
             return out;
@@ -3591,13 +3634,28 @@ mod tests {
         // A reviewer told it can run git when it cannot wastes its turn discovering that,
         // and the caller is never told the diff had to be supplied. This was observed:
         // a real review reported it could not run git diff, git log or git show.
-        let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        // Off the evidence path (isolation disabled), a shell-less Claude is told plainly that it
+        // has no shell and cannot run git, and to say so rather than guess at the change.
+        let claude = Config::from_args(&args(&["--reviewer", "claude", "--allow-reviewer-config"]))
+            .expect("config");
         assert!(!claude.reviewer_has_shell());
         let text = claude.reviewer_capabilities(false);
         assert!(text.contains("no shell"), "{text}");
         assert!(text.contains("cannot run `git`"), "{text}");
         // And it must be told to say so rather than guess at the change.
         assert!(text.contains("Do not guess"), "{text}");
+
+        // In scope (profile-pinned, git top-level, shell-less, default rules), it has the read-only
+        // evidence tools instead, is still told it has no shell, and is NOT told it cannot run git --
+        // because it can, through repository_history/revision.
+        let claude_evidence =
+            Config::from_args(&args(&["--reviewer", "claude", "--claude-profile", "test"]))
+                .expect("config");
+        assert!(!claude_evidence.reviewer_has_shell());
+        let text = claude_evidence.reviewer_capabilities(false);
+        assert!(text.contains("repository_scope"), "{text}");
+        assert!(text.contains("no shell"), "{text}");
+        assert!(!text.contains("cannot run `git`"), "{text}");
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert!(codex.reviewer_has_shell());

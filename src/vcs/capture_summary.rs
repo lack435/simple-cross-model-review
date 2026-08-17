@@ -75,6 +75,34 @@ pub enum CaptureSummary {
 }
 
 impl CaptureSummary {
+    /// Whether the capture was whole -- no truncation, short streams, dropped files, or unrun
+    /// commands. The section-7 evidence gate treats an incomplete (or empty) capture as "thin" and
+    /// then requires a successful content evidence call before trusting the review.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            CaptureSummary::Git { complete, .. } | CaptureSummary::Perforce { complete, .. } => {
+                *complete
+            }
+        }
+    }
+
+    /// Whether the capture conveyed no change at all -- the reviewer was handed nothing to review.
+    /// This keys on the reported counts, not on the raw captured text, which is non-empty even for a
+    /// clean tree (it carries a `git status` line and headers). The section-7 gate uses it together
+    /// with `is_complete`.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CaptureSummary::Git {
+                files,
+                insertions,
+                deletions,
+                untracked_files,
+                ..
+            } => *files == 0 && *insertions == 0 && *deletions == 0 && *untracked_files == 0,
+            CaptureSummary::Perforce { evidence_units, .. } => *evidence_units == 0,
+        }
+    }
+
     /// The informational `captured:` line body for the caller.
     pub fn summary(&self) -> String {
         match self {
@@ -276,6 +304,23 @@ mod tests {
             diff_incomplete,
             complete,
         }
+    }
+
+    #[test]
+    fn is_empty_and_is_complete_key_on_counts_for_the_section_7_gate() {
+        // A clean tree: zero files/lines/untracked, complete. This is the "thin" signal the gate
+        // needs. The raw captured text is NOT empty (status line + headers) -- keying on it left the
+        // gate inert, which the Claude smoke caught.
+        let empty = git("git diff HEAD", 0, 0, 0, 0, false, false, false, true);
+        assert!(empty.is_empty());
+        assert!(empty.is_complete());
+
+        // Any nonzero count is a real change, not thin.
+        assert!(!git("git diff HEAD", 1, 4, 0, 0, false, false, false, true).is_empty());
+        // Untracked-only still counts as a change.
+        assert!(!git("git diff HEAD", 0, 0, 0, 2, false, false, false, true).is_empty());
+        // A truncated/incomplete capture is thin via is_complete even with counts.
+        assert!(!git("git diff HEAD", 3, 10, 2, 0, false, true, true, false).is_complete());
     }
 
     #[test]

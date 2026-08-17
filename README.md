@@ -107,6 +107,15 @@ the single source of truth. There is no config file of our own to drift out of s
 --effort <level>            claude: low|medium|high|xhigh|max
                             codex:  low|medium|high|xhigh|max|ultra
 --bin <path>                Reviewer CLI path, if not on PATH.
+--claude-profile <name>     Pin the reviewer to a named account/config home (a controlled
+--codex-profile <name>      directory under %CROSS_REVIEW_HOME%/%LOCALAPPDATA%, provisioned once
+                            with cross_model_setup_profile) rather than the ambient login, so the
+                            review bills that account and loads none of the user's config. Binds to
+                            the --reviewer before it. A non-ambient home (this, or the explicit
+                            --claude-config-dir below) is required to put a Claude reviewer on the
+                            evidence path (see "the Claude reviewer's read-only evidence service"
+                            below). --claude-config-dir / --codex-home take an explicit home path
+                            instead of a managed label.
 --level NAME:MODEL:EFFORT    Declare a named review-depth preset the caller can pick per review
                             (e.g. fast:gpt-5.6-luna:high). Repeatable; binds to the --reviewer
                             before it. The caller selects one with the `level` tool argument at
@@ -153,7 +162,8 @@ the single source of truth. There is no config file of our own to drift out of s
                             Perforce. Filesystem-only — it never runs p4 to decide.
 --diff <spec>               git only. What to capture as "the change".
                             auto|none|staged|HEAD|<rev>. Default auto: supply a diff to a
-                            shell-less reviewer and to an isolated Codex evidence service.
+                            shell-less reviewer (in its prompt) and to an isolated evidence
+                            service (Codex, or a profile-pinned Claude — see below).
 --tools / --allow-tools     Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>      Replace the built-in reviewer preamble.
 --no-preamble               Send the caller's instructions with nothing added.
@@ -168,6 +178,32 @@ Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 > Pin models by full id, not an alias. `--model opus` resolves to whatever the provider
 > currently maps that alias to and can move as releases ship — verified once as
 > `claude-opus-4-8`. Pinning the exact id keeps the reviewer fixed to the one you chose.
+
+### The Claude reviewer's read-only evidence service
+
+A Claude reviewer normally sees only the change captured into its prompt. On the **evidence path** it
+additionally gets the same read-only repository evidence tools the Codex reviewer has —
+`repository_scope`/`list`/`search`/`read`/`change`, plus Git `history`/`revision` — so it can read the
+live tree and walk history to look *past* the captured diff rather than being blind to everything
+outside it. It stays shell-less and write-denied; the tools are read-only and path-scoped.
+
+There is no flag to turn this on: it applies automatically when the review qualifies, which needs
+**all** of:
+
+- **a pinned profile** — any non-ambient home, whether a named `--claude-profile <name>` or an
+  explicit `--claude-config-dir <path>`; an ambient Claude keeps its `~/.claude`, which has no
+  controlled config home, so it stays on `--safe-mode` with no evidence;
+- **no shell** (the default `--tools Read,Grep,Glob`; a shell needs `Bash` both in `--tools` and
+  permitted by `--allow-tools`, and adding it that way opts out);
+- **default read rules** (no custom `--allow-tools`), **a git top-level** working root, and
+  **configuration isolation on** (not `--allow-reviewer-config`).
+
+The dogfood `.codex/config.toml` entry already meets these. When the capture is empty or incomplete,
+a runtime gate requires the reviewer to actually read the change through the evidence tools before the
+review is trusted, else it fails closed with `EVIDENCE_UNAVAILABLE`. What moves at the isolation
+boundary versus `--safe-mode` is detailed under
+[what the reviewer can and cannot do](#what-the-reviewer-can-and-cannot-do); the full design is in
+[`docs/claude-reviewer-evidence-service.md`](docs/claude-reviewer-evidence-service.md).
 
 ### Reviewer fallback chain
 
@@ -867,6 +903,18 @@ fetching it — see [the change under review is fetched for you](#the-change-und
 The reviewer is told which of the two situations it is in, so it never claims to have seen
 a diff it was not shown, or reports one missing that is sitting in its prompt.
 
+On the evidence path — a shell-less, git-top-level, **profile-pinned** Claude (an ambient Claude
+with no profile keeps `--safe-mode`, since only a profile gives it a controlled config home) — a
+Claude additionally gets the **same read-only repository evidence service the Codex reviewer has** — `repository_scope`/`list`/`search`/`read`/`change`,
+plus Git `history`/`revision` — reached through a generated `--mcp-config` (allow-listed under
+`--permission-mode dontAsk`, which otherwise denies MCP tools). It is still shell-less and still
+write-denied; the tools are read-only and path-scoped exactly as for Codex. Unlike Codex, the
+captured change stays in the prompt as the authoritative diff, so the evidence tools are for
+looking *past* it — reading the live tree and walking history for context and verification — not
+for delivering it. When the captured change is empty or incomplete, a runtime gate requires that
+the reviewer actually obtained a successful content evidence call before the review is trusted;
+otherwise it fails closed to `EVIDENCE_UNAVAILABLE` rather than deliver a possibly-thin approval.
+
 ### The reviewer runs without the project's configuration
 
 The tool allow-list is not the only way a repository can get code to run. A committed
@@ -879,11 +927,26 @@ at code you are unsure about.
 
 So the reviewer runs configuration-isolated by default:
 
-- **Claude reviewer** — `--safe-mode`, which disables hooks, settings, plugins, skills,
-  commands and MCP servers while leaving auth, model selection and permissions working
-  normally. (`--bare` would also do it but redefines authentication as API-key-only,
-  breaking subscription sign-in.) Verified end to end: with a hostile project committing
-  the hook above, the review completed normally and the hook did **not** run.
+- **Claude reviewer** — isolation depends on whether the review is on the evidence path (a
+  **profile-pinned**, shell-less, git-top-level, default-rules Claude — the dogfood direction; an
+  ambient Claude has no controlled config home, so it stays off the evidence path):
+  - *Off the evidence path* (a shell-enabled, ambient, or otherwise non-qualifying Claude): `--safe-mode`,
+    which disables hooks, settings, plugins, skills, commands and MCP servers while leaving auth,
+    model selection and permissions working normally, and the reviewer runs from the project cwd.
+  - *On the evidence path*: `--safe-mode` would also disable the evidence MCP server, and `--bare`
+    (which allows one MCP server) redefines authentication as API-key-only, breaking subscription
+    sign-in. So the equivalent isolation is assembled from granular flags —
+    `--settings '{"disableAllHooks":true,"autoMemoryEnabled":false}'`, `--disable-slash-commands`,
+    `--strict-mcp-config` — **plus a verified-empty sterile working directory** (the same one the
+    Codex evidence path uses), which is what removes the reviewed repository's `.claude/settings.json`
+    and `CLAUDE.md` from discovery. The three flags close the execution vectors (hooks,
+    skills/commands, ambient MCP); the sterile cwd closes the `CLAUDE.md`/auto-memory
+    prompt-injection surface that no granular flag covers. What moves versus `--safe-mode` is that
+    two non-executable customization surfaces (plugins, auto-memory) are closed by the sterile cwd's
+    emptiness and `autoMemoryEnabled:false` rather than by one flag. Verified end to end (Phase 0):
+    a hostile project committing the hook above, a plugin, and a `CLAUDE.md` influenced the review
+    in no way. (`--bare`'s OAuth break and `autoMemoryEnabled:false`'s effect were both verified
+    against claude 2.1.233.)
 - **Codex reviewer** — `--ignore-user-config`, `--ignore-rules`, and
   `--skip-git-repo-check`, running from a verified empty cross-review-owned directory under
   `%TEMP%` rather than from the reviewed repository. The directory is canonical, outside any

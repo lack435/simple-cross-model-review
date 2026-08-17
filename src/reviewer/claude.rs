@@ -78,7 +78,7 @@ impl Reviewer for ClaudeReviewer {
         bin: &Path,
         resume: Option<&str>,
         _tmp_id: &str,
-        _evidence: Option<&super::EvidenceInvocation<'_>>,
+        evidence: Option<&super::EvidenceInvocation<'_>>,
         pinned_home: Option<&crate::config::AuthorizedHome>,
     ) -> std::io::Result<Invocation> {
         let mut cmd = Command::new(bin);
@@ -89,10 +89,29 @@ impl Reviewer for ClaudeReviewer {
         // outside the repo removes that context so a resume stays cache-read-cheap. When it
         // switches, the read scope moves from the relative `./**` (which would now point at the
         // neutral dir) to absolute rules pinned to `cfg.cwd`.
+        // An in-scope Claude (evidence present -- the parent sets it only when
+        // `claude_neutral_target` qualifies) runs from the verified-empty sterile directory the
+        // parent built, reading the repo through absolute rules pinned to `cfg.cwd`. Without
+        // evidence, the existing neutral-cwd optimisation or the project cwd applies. Fail closed
+        // rather than run a granular-flag Claude in the project cwd, which would re-open the f2
+        // configuration-contamination risk.
         let neutral = super::claude_neutral_target(cfg, spec.reviewer);
-        let (cwd, allowed_tools): (&Path, &[String]) = match &neutral {
-            Some((dir, rules)) => (dir.as_path(), rules),
-            None => (cfg.cwd.as_path(), &cfg.allowed_tools),
+        let (cwd, allowed_tools): (&Path, &[String]) = match (evidence, &neutral) {
+            (Some(ev), Some((_, rules))) => {
+                let dir = ev.sterile_dir.ok_or_else(|| {
+                    std::io::Error::other(
+                        "in-scope Claude evidence is missing its sterile working directory",
+                    )
+                })?;
+                (dir, rules.as_slice())
+            }
+            (Some(_), None) => {
+                return Err(std::io::Error::other(
+                    "in-scope Claude evidence present without a neutral target (inconsistent state)",
+                ));
+            }
+            (None, Some((dir, rules))) => (dir.as_path(), rules.as_slice()),
+            (None, None) => (cfg.cwd.as_path(), &cfg.allowed_tools),
         };
         cmd.current_dir(cwd);
         // Profile: for an authorized non-ambient profile, run in a controlled environment against
@@ -105,12 +124,11 @@ impl Reviewer for ClaudeReviewer {
             super::apply_controlled_env(&mut cmd, "CLAUDE_CONFIG_DIR", &home.home);
         }
         cmd.arg("-p");
-        if cfg.chain_gates_on_usage() {
-            // Armed: stream-json carries the `rate_limit_event` we read headroom from; its terminal
-            // `result` event otherwise carries the same fields the buffered document does.
-            // `--verbose` is required with `-p` + `stream-json`. Nothing else is added (in
-            // particular not `--include-partial-messages`, verified unnecessary). See
-            // `docs/usage-remaining-gate.md`.
+        // stream-json is used when the usage gate is armed (to read the rate_limit_event) OR for an
+        // in-scope evidence review (so the section-7 gate can observe evidence tool-call success from
+        // the CLI's own structured events). Its terminal `result` event carries the same review the
+        // buffered document does. `--verbose` is required with `-p` + `stream-json`.
+        if cfg.chain_gates_on_usage() || evidence.is_some() {
             cmd.args(["--output-format", "stream-json", "--verbose"]);
         } else {
             cmd.args(["--output-format", "json"]);
@@ -127,22 +145,44 @@ impl Reviewer for ClaudeReviewer {
         for rule in allowed_tools {
             cmd.arg(rule);
         }
+        // In scope, allow-list the evidence server in the SAME --allowed-tools list. Under
+        // --permission-mode dontAsk the MCP tools are otherwise denied even though they connect
+        // (verified in Phase 0); a server-level entry allows all seven repository_* tools.
+        if evidence.is_some() {
+            cmd.arg(format!("mcp__{}", crate::evidence::SERVER_NAME));
+        }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);
-        if cfg.isolate_reviewer {
-            // The tool allow-list is not the only way a repository can get code to run.
-            // A committed `.claude/settings.json` can define a hook, and Claude executes
-            // that shell command automatically -- no tool call, so no allow-list check.
-            // Verified: a `SessionStart` hook committed to a project ran on a plain
-            // `claude -p` invocation and created a file. Reviewing a repository would
-            // otherwise mean executing whatever that repository chose to define.
-            //
-            // --safe-mode disables hooks along with settings, plugins, skills, commands
-            // and MCP servers, while leaving auth, model selection and permissions
-            // working normally. --bare would also do it but redefines authentication
-            // (API key only, no OAuth), which would break subscription sign-in.
+        // Isolation posture. The whole thing keys on `evidence` (the plan's `evidence_enabled`
+        // predicate, set by the parent only for the in-scope shell-less path), NOT on a bare
+        // `cfg.isolate_reviewer` -- gating the flag swap on the broader condition would strip
+        // --safe-mode from a shell-enabled Claude still sitting in the project cwd (plan f7).
+        if let Some(ev) = evidence {
+            // In scope: replace --safe-mode with granular flags (--safe-mode would disable MCP;
+            // --bare would break OAuth) and attach the evidence server. The sterile cwd removes the
+            // reviewed repo's config surface, so disabling hooks, slash-commands/skills and auto-
+            // memory, plus strict MCP, is the equivalent isolation for the properties that matter.
+            cmd.args([
+                "--settings",
+                "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}",
+            ]);
+            cmd.arg("--disable-slash-commands");
+            cmd.arg("--strict-mcp-config");
+            let mcp = ev.mcp_config_file.ok_or_else(|| {
+                std::io::Error::other("in-scope Claude evidence is missing its --mcp-config file")
+            })?;
+            cmd.arg("--mcp-config");
+            cmd.arg(mcp);
+        } else if cfg.isolate_reviewer {
+            // Out of scope (shell-enabled / non-qualifying isolated Claude): keep today's behaviour.
+            // The tool allow-list is not the only way a repository can get code to run: a committed
+            // `.claude/settings.json` hook runs automatically with no tool call. --safe-mode disables
+            // hooks, settings, plugins, skills, commands and MCP servers while leaving auth, model
+            // selection and the shell working, so this reviewer self-serves via git from the project
+            // cwd as before. (--bare would also do it but redefines auth to API-key-only, breaking
+            // subscription sign-in, which is why the in-scope path uses granular flags instead.)
             cmd.arg("--safe-mode");
-            // Redundant under --safe-mode, kept so MCP isolation does not silently
-            // depend on one flag's exact scope.
+            // Redundant under --safe-mode, kept so MCP isolation does not silently depend on one
+            // flag's exact scope.
             cmd.arg("--strict-mcp-config");
         }
         if let Some(session_id) = resume {
@@ -161,10 +201,11 @@ impl Reviewer for ClaudeReviewer {
         out: &RunOutcome,
         _last_message_file: Option<&Path>,
     ) -> Result<Parsed, Failure> {
-        // Armed (usage-observing) runs use `--output-format stream-json`, a JSONL event stream
-        // rather than one buffered document, so they take the JSONL path below. A disarmed run is
-        // byte-for-byte the buffered `json` path this reviewer has always used.
-        if cfg.chain_gates_on_usage() {
+        // Armed (usage-observing) runs and in-scope evidence runs use `--output-format stream-json`,
+        // a JSONL event stream rather than one buffered document, so they take the JSONL path below.
+        // A disarmed, non-evidence run is byte-for-byte the buffered `json` path this reviewer has
+        // always used.
+        if cfg.chain_gates_on_usage() || claude_evidence_enabled(cfg, spec) {
             return parse_stream_json(spec, out);
         }
         // The review is stdout-only for this reviewer, so a stdout that hit the cap is
@@ -185,8 +226,12 @@ impl Reviewer for ClaudeReviewer {
     /// Armed runs raise the stdout byte cap (`stream-json` carries the review text more than
     /// once), add a line cap, and terminate the child at either bound. Disarmed keeps the
     /// historic retain-and-drain default.
-    fn output_limits(&self, cfg: &Config) -> super::StdoutLimits {
-        if cfg.chain_gates_on_usage() {
+    fn output_limits(&self, cfg: &Config, spec: &ReviewerSpec) -> super::StdoutLimits {
+        // The evidence path also streams (it must, for the section-7 gate), so it takes the raised
+        // caps too. Keyed on the same `claude_evidence_enabled(cfg, spec)` predicate as invocation
+        // and parse, so streaming caps and the stream parser never disagree (review f3).
+        let streams = cfg.chain_gates_on_usage() || claude_evidence_enabled(cfg, spec);
+        if streams {
             super::StdoutLimits {
                 max_bytes: super::MAX_ARMED_STREAM_BYTES,
                 max_lines: super::MAX_ARMED_STREAM_LINES,
@@ -510,6 +555,114 @@ fn from_result_document(
 /// `rejected` rate-limit event is mapped to `RATE_LIMITED` so the reactive chain still advances;
 /// classification never runs raw stdout through the generic classifier. See
 /// `docs/usage-remaining-gate.md`.
+/// Whether this Claude turn is the in-scope evidence path (plan section 0): a **profile-pinned**,
+/// shell-less, git-top-level, default-rules, isolated Claude. This is THE eligibility decision --
+/// the parent gates evidence setup on it, and `parse`, `output_limits`, the capability preamble, and
+/// the argv tests all key on it too, so every one of them agrees for a given `(cfg, spec)` (review
+/// f3, the profile-dimension analogue of f7's single-predicate rule). The profile requirement is
+/// review f2: an ambient Claude has no controlled config home, so it keeps `--safe-mode` and gets no
+/// evidence. A named profile that reached here is authorized (an unauthorized one is refused
+/// upstream), so `!Ambient` is equivalent to the parent's `authorized_start.is_some()`.
+pub(crate) fn claude_evidence_enabled(cfg: &Config, spec: &ReviewerSpec) -> bool {
+    spec.reviewer == crate::config::ReviewerKind::Claude
+        && !matches!(spec.profile, crate::profile::ProfileSelector::Ambient)
+        && super::claude_neutral_target(cfg, spec.reviewer).is_some()
+}
+
+/// Evidence-service health read from the reviewer's `stream-json`, for the section-7 (f4) gate.
+///
+/// `content_call_succeeded` is set once a non-`repository_scope` `repository_*` call returns a
+/// non-error `tool_result` -- proof the reviewer actually pulled change/tree evidence.
+/// `call_errored` is set if ANY evidence `tool_result` came back `is_error` -- a dead or timed-out
+/// server surfaces here (verified event shape: the Codex smoke showed a "tool call failed ... timed
+/// out awaiting tools/call" error result). The gate accepts a thin capture only when a content call
+/// succeeded AND nothing errored, so a success followed by a later transport failure does not slip
+/// through -- which is why this reads the WHOLE stream and never returns on the first success.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct EvidenceHealth {
+    pub content_call_succeeded: bool,
+    pub call_errored: bool,
+}
+
+impl EvidenceHealth {
+    /// Whether a thin-capture review may be trusted: real content evidence was obtained and no
+    /// evidence call failed.
+    pub(crate) fn is_ok(&self) -> bool {
+        self.content_call_succeeded && !self.call_errored
+    }
+}
+
+/// Read evidence-call health from the CLI's structured `tool_use`/`tool_result` events (never
+/// reviewer prose): `tool_use` carries the tool `name` and an `id`; the matching `tool_result`
+/// carries that `id` as `tool_use_id` and `is_error` (absent on success).
+pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
+    use std::collections::HashSet;
+    let server_prefix = format!("mcp__{}__", crate::evidence::SERVER_NAME);
+    let content_prefix = format!("mcp__{}__repository_", crate::evidence::SERVER_NAME);
+    let scope_tool = format!("mcp__{}__repository_scope", crate::evidence::SERVER_NAME);
+    // tool_use ids: all evidence calls, and the content (non-scope) subset.
+    let mut evidence_ids: HashSet<String> = HashSet::new();
+    let mut content_ids: HashSet<String> = HashSet::new();
+    let mut health = EvidenceHealth::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array);
+        let Some(content) = content else { continue };
+        match value.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                for item in content {
+                    if item.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    if !name.starts_with(&server_prefix) {
+                        continue;
+                    }
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        evidence_ids.insert(id.to_string());
+                        if name.starts_with(&content_prefix) && name != scope_tool {
+                            content_ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                for item in content {
+                    if item.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(id) = item.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !evidence_ids.contains(id) {
+                        continue;
+                    }
+                    let is_error = item
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if is_error {
+                        health.call_errored = true;
+                    } else if content_ids.contains(id) {
+                        health.content_call_succeeded = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    health
+}
+
 fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
     // The armed reader terminated the child the moment a raw byte/line bound was overrun and
     // recorded which; that is authoritative, so report OUTPUT_TRUNCATED naming the bound before
@@ -793,7 +946,17 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config {
-        Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config")
+        // A non-git working root keeps Claude off the evidence path (`claude_neutral_target` requires
+        // a git top-level), so these tests exercise the buffered `json` parse used off the evidence
+        // path. The in-scope stream path is covered by the `stream_json`/usage-gate tests.
+        let dir = crate::testutil::temp_dir("cross-review-claude-parse");
+        Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--cwd".into(),
+            dir.to_string_lossy().into_owned(),
+        ])
+        .expect("config")
     }
 
     fn outcome(stdout: &str, success: bool) -> RunOutcome {
@@ -1218,6 +1381,48 @@ mod tests {
             Some("3d759777-4801-4e26-b6c5-4fbdb70adbbf")
         );
         assert!(parsed.denials.is_empty());
+    }
+
+    #[test]
+    fn evidence_health_reads_the_whole_stream() {
+        fn call(name: &str, id: &str) -> String {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"mcp__cross_review_evidence__{name}"}}]}}}}"#
+            )
+        }
+        fn result(id: &str, err: bool) -> String {
+            let e = if err { r#","is_error":true"# } else { "" };
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}"{e}}}]}}}}"#
+            )
+        }
+
+        // A successful content call (repository_change), nothing errored -> ok.
+        let ok = [call("repository_change", "t1"), result("t1", false)].join("\n");
+        let h = claude_evidence_health(&ok);
+        assert!(h.content_call_succeeded && !h.call_errored && h.is_ok());
+
+        // A content success FOLLOWED BY a later evidence error (server died) is NOT ok -- the whole
+        // stream is read, so the success does not mask the later failure (review f1).
+        let then_err = [
+            call("repository_read", "t1"),
+            result("t1", false),
+            call("repository_list", "t2"),
+            result("t2", true),
+        ]
+        .join("\n");
+        let h = claude_evidence_health(&then_err);
+        assert!(h.content_call_succeeded && h.call_errored && !h.is_ok());
+
+        // Only repository_scope succeeded -> no content evidence, not ok.
+        let scope_only = [call("repository_scope", "s1"), result("s1", false)].join("\n");
+        assert!(!claude_evidence_health(&scope_only).is_ok());
+
+        // A content call whose result is never seen (server died after the call) -> not ok.
+        assert!(!claude_evidence_health(&call("repository_read", "n1")).is_ok());
+
+        // No evidence calls at all -> not ok.
+        assert!(!claude_evidence_health(r#"{"type":"result","result":"APPROVE"}"#).is_ok());
     }
 
     #[test]
