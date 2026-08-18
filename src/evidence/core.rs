@@ -2345,8 +2345,16 @@ fn resolve_branch_base(
 ) -> Result<(String, String), EvidenceError> {
     let head = super::git::resolve_commit(root, "HEAD", limits, cancel, received_at)?
         .ok_or_else(|| EvidenceError::new("branch_base_unresolved", "HEAD does not resolve"))?;
+    // Fully-qualified `refs/remotes/...` names, not `origin/main` (f10): git resolves
+    // `refs/heads/<name>` before `refs/remotes/<name>`, so a local branch literally named
+    // `origin/main` would otherwise shadow the intended remote-tracking ref and could point at HEAD,
+    // re-opening the omit-committed-changes hole.
     let mut base_ref = None;
-    for candidate in ["origin/HEAD", "origin/main", "origin/master"] {
+    for candidate in [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+    ] {
         if let Some(id) = super::git::resolve_commit(root, candidate, limits, cancel, received_at)?
         {
             base_ref = Some((id, candidate));
@@ -2356,8 +2364,8 @@ fn resolve_branch_base(
     let (default_branch, source) = base_ref.ok_or_else(|| {
         EvidenceError::new(
             "branch_base_unresolved",
-            "the default branch could not be resolved (no origin/HEAD, origin/main, or \
-             origin/master); pass an explicit base commit id, e.g. base: <full object id>",
+            "the default branch could not be resolved (no refs/remotes/origin/HEAD, .../main, or \
+             .../master); pass an explicit base commit id, e.g. base: <full object id>",
         )
     })?;
     let base = super::git::merge_base(root, &head, &default_branch, limits, cancel, received_at)?
@@ -2487,12 +2495,18 @@ fn compose_diff(
     if compose_untracked {
         let (paths, listing_complete) =
             super::git::untracked_paths(root, limits, cancel, received_at)?;
-        // Normalize the request path to git's slash form before comparing (f9): `.`, `./src`, and
-        // backslash-separated forms are all valid but would never prefix-match git's normalized
-        // untracked paths otherwise. `.` (or empty) means the whole tree — no narrowing.
-        let norm = path.replace('\\', "/");
-        let norm = norm.trim_start_matches("./").trim_end_matches('/');
-        let paths: Vec<String> = if norm.is_empty() || norm == "." {
+        // Normalize the request path to git's slash form before comparing (f9): backslashes, a
+        // leading `./`, embedded `.`/empty components (`src/./foo`, `src//foo`), and a trailing
+        // slash are all valid but would never prefix-match git's normalized untracked paths
+        // otherwise. Dropping every `.`/empty component leaves the canonical slash path; empty means
+        // the whole tree — no narrowing.
+        let norm: String = path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let paths: Vec<String> = if norm.is_empty() {
             paths
         } else {
             // Match at that path or under it, on a path-component boundary so `src/foo` does not also
@@ -2500,7 +2514,7 @@ fn compose_diff(
             let prefix = format!("{norm}/");
             paths
                 .into_iter()
-                .filter(|p| p == norm || p.starts_with(&prefix))
+                .filter(|p| *p == norm || p.starts_with(&prefix))
                 .collect()
         };
         complete = listing_complete;
