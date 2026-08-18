@@ -107,16 +107,17 @@ The essentials:
 ```
 --reviewer <claude|codex>   Which CLI reviews. Required. Pick the model that is NOT the
                             calling agent. Repeat it to configure a fallback chain.
---model <id>                Reviewer model. Pin the full id, never an alias.
---effort <level>            claude: low|medium|high|xhigh|max
-                            codex:  low|medium|high|xhigh|max|ultra
+--level NAME:MODEL:EFFORT   A caller-selectable (model, effort) preset. Required — at least one
+                            per --reviewer. Repeatable; the caller picks one per review via the
+                            `level` argument. effort: claude low|medium|high|xhigh|max
+                                                       codex  low|medium|high|xhigh|max|ultra
+--default-level NAME        Which --level an omitted `level` uses. Required with 2+ levels;
+                            defaults to the sole level otherwise.
 --bin <path>                Reviewer CLI path, if not on PATH.
 ```
 
-Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
-
-> Pin models by full id, not an alias. `--model opus` resolves to whatever the provider maps
-> that alias to and can move as releases ship. Pinning the exact id keeps the reviewer fixed.
+> Pin models by full id, never an alias. `opus` resolves to whatever the provider maps that
+> alias to and can move as releases ship. Pinning the exact id keeps the reviewer fixed.
 
 <details>
 <summary>All options</summary>
@@ -127,9 +128,6 @@ Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
                             your config. Provisioned once with cross_model_setup_profile.
 --claude-config-dir <path>  Explicit config-home path instead of a managed profile label.
 --codex-home <path>
---level NAME:MODEL:EFFORT    Declare a named review-depth preset the caller picks per review
-                            (e.g. fast:gpt-5.6-luna:high). Repeatable.
---default-level NAME         Which declared --level applies when a review omits `level`.
 --min-usage-remaining <n>    Proactive gate (codex): skip this entry when last-observed usage
                             remaining is below n% (1..=100).
 --min-usage-status <lvl>     Proactive gate (claude): 'ample' skips on warning-or-worse,

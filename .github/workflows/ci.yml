@@ -62,7 +62,7 @@ jobs:
           )
           $inFile = Join-Path $env:RUNNER_TEMP 'mcp-in.txt'
           [System.IO.File]::WriteAllLines($inFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-          $out = @(Get-Content $inFile | & '.\dist\cross-review.exe' --reviewer codex --bin 'C:\nope\codex.exe' 2>$null)
+          $out = @(Get-Content $inFile | & '.\dist\cross-review.exe' --reviewer codex --level standard:gpt-5.6-luna:max --bin 'C:\nope\codex.exe' 2>$null)
           if ($out.Count -lt 2) { throw "expected two responses, got $($out.Count)" }
           $call = $out[1] | ConvertFrom-Json
           if ($call.result.isError -ne $true) { throw 'expected isError=true' }

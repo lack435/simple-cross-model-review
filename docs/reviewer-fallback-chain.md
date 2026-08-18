@@ -10,6 +10,20 @@ are fixed, with no new regressions found"). The sections below fold every plan f
 [Review history](#review-history) records where; the implementation findings are summarised at
 the end of that section. It is the plan for [issue #48].
 
+> **Amendment — specifics that changed after this plan.** This is a design record, implemented as
+> written. Two later changes altered specifics it describes, and references to them throughout are
+> as-of-design-time:
+> - **`--model`/`--effort` were replaced by a required `--level`** (see the binding rules in [The
+>   argument grammar](#the-argument-grammar) and `README.md`). A reviewer's model/effort now come
+>   from a `--level` preset, not those flags.
+> - **PR #110 ("retire capture modes") removed `--diff`, `DiffMode`, and `src/vcs/git.rs`**, moving
+>   git reviews to live `repository_diff` delivery. **Every `--diff` / `--diff auto` / `vcs/git.rs`
+>   reference in this document describes the pre-#110 capture model** — including the syntax-error
+>   example in [Config validation](#2-config-validation-two-tiers-and-where-each-is-reported) and the
+>   capture cases in [Testing](#testing). The fallback reasoning (capture must reach whichever entry
+>   runs) still holds; only the mechanism changed. See
+>   [`docs/retire-capture-modes.md`](retire-capture-modes.md) for the current model.
+
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
 ## What the issue asks
@@ -159,34 +173,37 @@ resolve the wrong binary. So the design is explicit:
 
 ### The argument grammar
 
-A repeated `--reviewer` **starts a new entry**; the identity flags `--model`, `--effort`,
-`--bin` **bind to the most recent `--reviewer`**. Argument order is fallback order. This is
+A repeated `--reviewer` **starts a new entry**; the identity flag `--bin` and the `--level`
+menu **bind to the most recent `--reviewer`**. Argument order is fallback order. This is
 chosen over a delimited compound value (e.g. `--fallback codex:gpt-5.6-luna:max`) precisely
 because Windows binary paths contain `:` and `\`, so any single-string grammar drowns in
 escaping; the repeated-flag form has no delimiter to escape.
 
 ```
---reviewer claude --model claude-opus-4-8 --effort medium \
---reviewer codex  --model gpt-5.6-luna    --effort max
+--reviewer claude --level standard:claude-opus-4-8:medium \
+--reviewer codex  --level standard:gpt-5.6-luna:max
 ```
 
 is a two-entry chain: try Claude Opus first, fall back to Codex on a rate limit. A single
-`--reviewer claude --model …` is a one-entry chain — today's config, unchanged.
+`--reviewer claude --level …` is a one-entry chain.
 
-Binding rules, all validated at parse time so a slip is caught, not silently mis-bound:
+The `--model`/`--effort` flags were removed: a reviewer's model and effort come only from
+`--level NAME:MODEL:EFFORT`, so each entry declares at least one level, and its base pair —
+the `(model, effort)` used when a review omits `level` — is its **default level's** pair
+(`--default-level`, or the sole level). Identity, duplicate detection and resume matching are
+unchanged because they still key on `(model, effort)`; only the source moved.
 
-- An identity flag (`--model`/`--effort`/`--bin`) that appears **before any `--reviewer`**
-  is a parse error.
-- The **same identity flag twice within one entry** (two `--model` between two `--reviewer`,
+Binding rules, all validated so a slip is caught, not silently mis-bound:
+
+- The identity flag `--bin` (or a `--level`/`--default-level`) that appears **before any
+  `--reviewer`** is a parse error.
+- The **same identity flag twice within one entry** (two `--bin` between two `--reviewer`,
   say) is a parse error — it is almost always a forgotten `--reviewer`, and guessing which
   wins would hide the mistake.
-- Per-entry defaults are applied per entry: an entry with no `--model` takes that reviewer's
-  `default_model()`, no `--effort` takes its `default_effort()`, exactly as the single
-  reviewer does today.
-- The unknown-effort case stays a **non-fatal stderr warning** per entry ([config.rs:514]),
+- An entry with **no `--level`** is a parse error, as is one with **two or more levels and no
+  `--default-level`** (which of them an omitted `level` uses would be a guess).
+- The unknown-effort case stays a **non-fatal stderr warning** per declared level,
   deferred to surface as `MODEL_UNAVAILABLE` on first use, matching current behaviour.
-
-[config.rs:514]: ../src/config.rs
 
 ### 2. Config validation: two tiers, and where each is reported
 
@@ -403,6 +420,14 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
 [codex.rs:27]: ../src/reviewer/codex.rs
 
 ### Capture in a mixed-family chain — the change must reach whoever runs
+
+> **Historical (pre-#110).** This section describes the `--diff auto` static-capture model that
+> PR #110 ("retire capture modes") replaced: git reviews now derive the change live through the
+> evidence service's `repository_diff` tool, there is no `--diff` flag, and `src/vcs/git.rs` is
+> gone. The fallback-chain reasoning below still holds — capture (whatever its mechanism) must
+> reach whichever entry runs — but the `--diff`/`vcs/git.rs` specifics are how it worked when this
+> plan was written. See [`docs/retire-capture-modes.md`](retire-capture-modes.md) for the current
+> model.
 
 Round 1's most important finding: the plan wrongly claimed the capture pipeline was
 untouched. It is not, because **what gets captured depends on the reviewer**. Under `--diff
@@ -829,7 +854,8 @@ Unit tests (no network, no model call), extending the existing fakes:
 
 - **Parsing**: single `--reviewer` ⇒ one-entry chain (regression guard on today's
   behaviour); a two-entry chain preserves order; an identity flag before any `--reviewer`
-  errors; a doubled `--model` within one entry errors; per-entry defaults fill in per entry.
+  errors; a doubled `--bin` within one entry errors; a level-less entry errors; each entry's
+  base pair is its default level's.
 - **Chain validation**: an identity-equivalent entry (reviewer, model, effort equal; bin equal as a case- and separator-insensitive path) ⇒
   `INVALID_REVIEWER_CHAIN`, and a degraded `App` returns it from `start_review` and `status`
   **before any preflight** (assert no bin resolution / auth check happened); a same-family,

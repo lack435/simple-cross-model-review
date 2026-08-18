@@ -3236,6 +3236,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -3330,6 +3332,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -3389,6 +3393,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
             "--vcs".into(),
             "perforce".into(),
             "--cwd".into(),
@@ -3434,6 +3440,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
             "--vcs".into(),
             "perforce".into(),
             "--cwd".into(),
@@ -3497,6 +3505,8 @@ Change 5 by u@c on 2026/01/01\n\n\
         let mut cfg = Config::from_args(&[
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
             "--vcs".into(),
             "perforce".into(),
         ])

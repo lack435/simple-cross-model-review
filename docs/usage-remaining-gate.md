@@ -155,7 +155,7 @@ reviewer family whose signal fits it**, and a family mismatch is a **parse error
   acceptable** status: `ample` skips on `allowed_warning` **or** `rejected`; `warning` skips
   only on `rejected`. `exhausted` is not offered (a minimum that never gates is meaningless).
 
-Both bind to the most recent `--reviewer`, like `--model`/`--effort`/`--bin` ([config.rs:565]);
+Both bind to the most recent `--reviewer`, like `--level`/`--bin` ([config.rs:565]);
 before any `--reviewer`, twice within one entry, an out-of-range number, or an unknown status
 word are parse errors. Applying the Codex flag to a Claude entry (or vice-versa) is a parse
 error naming the mismatch. `ReviewerSpec` carries the policy as one field:

@@ -1236,7 +1236,13 @@ mod tests {
         // developer machine has genuinely authorized (issue #99).
         let _base = crate::profile::isolate_profile_base();
         // Ambient entry: reads the ambient home ($CODEX_HOME or ~/.codex).
-        let ambient = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let ambient = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         assert!(codex_home(&ambient, ambient.primary()).is_some());
         // `effective_read_home` (issue #81) is exactly `codex_home`, preserving the ambient fallback.
         assert_eq!(
@@ -1249,6 +1255,8 @@ mod tests {
         let profiled = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--codex-profile".into(),
             "work".into(),
         ])
@@ -1389,7 +1397,13 @@ mod tests {
     }
 
     fn cfg() -> Config {
-        Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config")
+        Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config")
     }
 
     fn outcome(stdout: &str, success: bool) -> RunOutcome {

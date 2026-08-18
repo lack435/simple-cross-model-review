@@ -279,8 +279,6 @@ impl ReviewerSpec {
 /// `--reviewer`, and guessing which value wins would hide the mistake.
 struct PendingEntry {
     reviewer: ReviewerKind,
-    model: Option<String>,
-    effort: Option<String>,
     bin: Option<PathBuf>,
     usage_minimum: Option<UsageMinimum>,
     /// The account profile under construction. `None` becomes `ProfileSelector::Ambient` at
@@ -298,8 +296,6 @@ impl PendingEntry {
     fn new(reviewer: ReviewerKind) -> Self {
         Self {
             reviewer,
-            model: None,
-            effort: None,
             bin: None,
             usage_minimum: None,
             profile: None,
@@ -430,30 +426,6 @@ impl PendingEntry {
         Ok(())
     }
 
-    fn set_model(&mut self, v: String) -> Result<(), String> {
-        if self.model.is_some() {
-            return Err(format!(
-                "--model given twice for the same --reviewer '{}' (did you forget a --reviewer \
-                 before the second one?)",
-                self.reviewer.as_str()
-            ));
-        }
-        self.model = Some(v);
-        Ok(())
-    }
-
-    fn set_effort(&mut self, v: String) -> Result<(), String> {
-        if self.effort.is_some() {
-            return Err(format!(
-                "--effort given twice for the same --reviewer '{}' (did you forget a --reviewer \
-                 before the second one?)",
-                self.reviewer.as_str()
-            ));
-        }
-        self.effort = Some(v);
-        Ok(())
-    }
-
     fn set_bin(&mut self, v: PathBuf) -> Result<(), String> {
         if self.bin.is_some() {
             return Err(format!(
@@ -470,7 +442,7 @@ impl PendingEntry {
     /// repeats — each call adds one named preset — but a *duplicate name* on one entry is an error
     /// (which of two mappings would win is a guess, and almost always a typo). Model ids and effort
     /// names carry no colons, so the value is exactly three colon-separated non-empty parts. The
-    /// effort is validated (warn-not-fail) at `finalize`, mirroring `--effort`.
+    /// effort is validated (warn-not-fail) at `finalize`.
     fn set_level(&mut self, v: &str) -> Result<(), String> {
         let parts: Vec<&str> = v.split(':').collect();
         if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
@@ -511,36 +483,74 @@ impl PendingEntry {
         Ok(())
     }
 
-    /// Fill per-entry defaults, mirroring the single-reviewer defaults exactly. Fallible only for
-    /// the one cross-field rule that cannot be checked at parse time: `--default-level` must name a
-    /// level that was declared, and the `--level` it names may appear after it on the command line.
+    /// Finalise this entry into a `ReviewerSpec`, deriving its base `(model, effort)` — the pair
+    /// used when a review omits `level` — from its **default level**.
+    ///
+    /// The `--model`/`--effort` flags were removed: a reviewer's model and effort now come only
+    /// from `--level`, so every entry must declare at least one level, and one of them is the
+    /// default. The default level is `--default-level` when given, or the sole level when exactly
+    /// one is declared; with two or more and no `--default-level`, which one an omitted `level`
+    /// resolves to would be a guess, so it is required. Fallible for exactly those three rules.
+    ///
+    /// The base pair is then the default level's pair, which keeps identity, resume matching and
+    /// reporting keyed on `(model, effort)` exactly as before — only the source changed. Because a
+    /// `--default-level` may name a `--level` that appears after it on the command line, the
+    /// cross-check has to wait until here rather than parse time.
     fn finalize(self) -> Result<ReviewerSpec, String> {
-        if let Some(dl) = &self.default_level {
-            if !self.levels.contains_key(dl) {
-                return Err(format!(
-                    "--default-level '{dl}' for --reviewer '{}' names no declared --level (declared: {})",
-                    self.reviewer.as_str(),
-                    if self.levels.is_empty() {
-                        "none".to_string()
-                    } else {
-                        self.levels.keys().cloned().collect::<Vec<_>>().join(", ")
-                    }
-                ));
-            }
+        if self.levels.is_empty() {
+            return Err(format!(
+                "--reviewer '{}' declares no --level. A reviewer's model and effort are set by \
+                 --level NAME:MODEL:EFFORT (the --model/--effort flags were removed); declare at \
+                 least one.",
+                self.reviewer.as_str()
+            ));
         }
+        let declared = self.levels.keys().cloned().collect::<Vec<_>>().join(", ");
+        let default_level = match self.default_level {
+            Some(dl) => {
+                if !self.levels.contains_key(&dl) {
+                    return Err(format!(
+                        "--default-level '{dl}' for --reviewer '{}' names no declared --level \
+                         (declared: {declared})",
+                        self.reviewer.as_str()
+                    ));
+                }
+                dl
+            }
+            None => {
+                if self.levels.len() == 1 {
+                    self.levels
+                        .keys()
+                        .next()
+                        .cloned()
+                        .expect("exactly one level")
+                } else {
+                    return Err(format!(
+                        "--reviewer '{}' declares {} levels but no --default-level; name which one \
+                         an omitted `level` uses (declared: {declared})",
+                        self.reviewer.as_str(),
+                        self.levels.len()
+                    ));
+                }
+            }
+        };
+        // The base pair is the default level's pair, cloned out before `self.levels` is moved.
+        let (model, effort) = {
+            let base = self
+                .levels
+                .get(&default_level)
+                .expect("default_level names a declared level");
+            (base.model.clone(), base.effort.clone())
+        };
         Ok(ReviewerSpec {
-            model: self
-                .model
-                .unwrap_or_else(|| self.reviewer.default_model().to_string()),
-            effort: self
-                .effort
-                .unwrap_or_else(|| self.reviewer.default_effort().to_string()),
+            model,
+            effort,
             bin: self.bin,
             reviewer: self.reviewer,
             usage_minimum: self.usage_minimum.unwrap_or(UsageMinimum::None),
             profile: self.profile.unwrap_or(ProfileSelector::Ambient),
             levels: self.levels,
-            default_level: self.default_level,
+            default_level: Some(default_level),
         })
     }
 }
@@ -978,7 +988,7 @@ impl Config {
         );
 
         // The chain is built as a list of entries. A repeated `--reviewer` starts a new entry;
-        // the identity flags `--model`/`--effort`/`--bin` bind to the most recent `--reviewer`.
+        // the identity flag `--bin` and the `--level` menu bind to the most recent `--reviewer`.
         // Argument order is fallback order. See `docs/reviewer-fallback-chain.md`.
         let mut entries: Vec<PendingEntry> = Vec::new();
         let mut cwd: Option<PathBuf> = None;
@@ -1000,9 +1010,8 @@ impl Config {
         let mut isolate_reviewer = true;
         let mut metrics = true;
         let mut resume_incremental_diff = true;
-        // `--diff` is parsed *after* the loop, because how its value is interpreted (and
-        // whether it is even legal) depends on `--vcs`, which may appear later on the command
-        // line. Kept raw until the backend is known.
+        // `--diff` (capture modes) was retired by #110: git reviews derive the change live through
+        // repository_diff, so the flag is now rejected in the loop below rather than parsed here.
         let mut vcs_arg: Option<Vcs> = None;
 
         let mut i = 0;
@@ -1031,19 +1040,15 @@ impl Config {
                     })?;
                     entries.push(PendingEntry::new(kind));
                 }
-                "--model" => {
-                    let v = take("--model")?;
-                    entries
-                        .last_mut()
-                        .ok_or("--model must follow a --reviewer (it binds to the reviewer entry before it)")?
-                        .set_model(v)?;
-                }
-                "--effort" => {
-                    let v = take("--effort")?;
-                    entries
-                        .last_mut()
-                        .ok_or("--effort must follow a --reviewer (it binds to the reviewer entry before it)")?
-                        .set_effort(v)?;
+                "--model" | "--effort" => {
+                    // Removed: a reviewer's model and effort now come only from --level. Reject
+                    // explicitly, rather than letting it fall through to "unknown argument", so an
+                    // existing config gets a migration hint pointing at the replacement.
+                    return Err(format!(
+                        "{key} was removed. A reviewer's model and effort are now set by \
+                         --level NAME:MODEL:EFFORT; declare at least one --level per --reviewer \
+                         and, with more than one, pick the default with --default-level NAME."
+                    ));
                 }
                 "--bin" => {
                     let v = take("--bin")?;
@@ -1268,10 +1273,9 @@ impl Config {
             .into_iter()
             .map(|e| e.finalize())
             .collect::<Result<_, _>>()?;
-        // The unknown-effort warning stays per entry and non-fatal (a bad value surfaces later as
-        // MODEL_UNAVAILABLE on first use), exactly as it did for the single reviewer — and now also
-        // covers each declared level's effort, since a level's effort reaches the reviewer the same
-        // way the base one does.
+        // The unknown-effort warning is per declared level and non-fatal (a bad value surfaces
+        // later as MODEL_UNAVAILABLE on first use), matching the pre-levels behaviour. Every effort
+        // a review can run at is a level's, so warning each level covers them all.
         let warn_effort = |effort: &str, reviewer: ReviewerKind, whence: &str| {
             if !reviewer.known_efforts().contains(&effort) {
                 eprintln!(
@@ -1283,7 +1287,8 @@ impl Config {
             }
         };
         for spec in &reviewers {
-            warn_effort(&spec.effort, spec.reviewer, "");
+            // The base pair is always the default level's, so warning each declared level's effort
+            // already covers it — no separate base warning is needed now that --effort is gone.
             for (name, lv) in &spec.levels {
                 warn_effort(&lv.effort, spec.reviewer, &format!(" for --level '{name}'"));
             }
@@ -2121,13 +2126,18 @@ or ~/.codex/config.toml (Codex); see examples/ in the repository.
 REQUIRED:
   --reviewer <claude|codex>   Which CLI performs the review. Pick the model that is
                               NOT the calling agent.
+  --level NAME:MODEL:EFFORT   A caller-selectable (model, effort) preset, repeatable. At
+                              least one is required per --reviewer -- it replaces the removed
+                              --model/--effort flags. The caller picks one per review via the
+                              `level` argument; an omitted `level` uses --default-level (or the
+                              sole level). Pin the full model id, not an alias.
+                              effort: claude low|medium|high|xhigh|max
+                                      codex  low|medium|high|xhigh|max|ultra
 
 OPTIONS:
-  --model <id>                Reviewer model. Pin the full id, not an alias.
-                              default: claude -> claude-opus-4-8, codex -> gpt-5.6-luna
-  --effort <level>            Reasoning effort.
-                              claude: low|medium|high|xhigh|max          (default medium)
-                              codex:  low|medium|high|xhigh|max|ultra    (default max)
+  --default-level NAME        Which --level an omitted `level` resolves to. Required when a
+                              --reviewer declares more than one level; defaults to the sole
+                              level otherwise.
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --codex-profile <name>      Run the codex reviewer under a dedicated account profile (a named
   --claude-profile <name>     config home under %CROSS_REVIEW_HOME% or %LOCALAPPDATA%\\cross-review),
@@ -2250,7 +2260,55 @@ OTHER:
 mod tests {
     use super::*;
 
-    fn args(items: &[&str]) -> Vec<String> {
+    /// Build a test arg vector, auto-supplying each `--reviewer` entry a default `--level` when it
+    /// declares none. `--model`/`--effort` were removed, so a level-less entry is now a parse error;
+    /// injecting the reviewer's pinned default (as its sole, default level) keeps the many tests that
+    /// predate levels — and only care about other flags — meaningful without restating a level in
+    /// each. An entry that already passes its own `--level` suppresses injection for that entry, so
+    /// level/default-level tests are unaffected. Tests that need to observe the level-less error
+    /// build their vector with [`raw_args`] instead.
+    pub(super) fn args(items: &[&str]) -> Vec<String> {
+        let is_reviewer = |t: &str| t == "--reviewer" || t.starts_with("--reviewer=");
+        let starts: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| is_reviewer(t))
+            .map(|(i, _)| i)
+            .collect();
+        if starts.is_empty() {
+            return items.iter().map(|s| s.to_string()).collect();
+        }
+        let mut out: Vec<String> = items[..starts[0]].iter().map(|s| s.to_string()).collect();
+        for (k, &start) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).copied().unwrap_or(items.len());
+            let entry = &items[start..end];
+            out.extend(entry.iter().map(|s| s.to_string()));
+            let has_level = entry
+                .iter()
+                .any(|t| *t == "--level" || t.starts_with("--level="));
+            if has_level {
+                continue;
+            }
+            // The reviewer token is either `--reviewer <kind>` or `--reviewer=<kind>`. An unknown
+            // kind never reaches finalize (from_args rejects it first), so any default is fine there.
+            let kind = if entry[0] == "--reviewer" {
+                entry.get(1).copied().unwrap_or("codex")
+            } else {
+                entry[0].trim_start_matches("--reviewer=")
+            };
+            let (model, effort) = match ReviewerKind::parse(kind) {
+                Some(r) => (r.default_model(), r.default_effort()),
+                None => ("gpt-5.6-luna", "max"),
+            };
+            out.push("--level".to_string());
+            out.push(format!("standard:{model}:{effort}"));
+        }
+        out
+    }
+
+    /// Raw arg vector with no `--level` injection, for tests that must observe the level-less parse
+    /// error (which [`args`] would mask by supplying a default level).
+    pub(super) fn raw_args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
     }
 
@@ -2521,10 +2579,61 @@ mod tests {
 
     #[test]
     fn identity_flag_before_any_reviewer_is_rejected() {
-        // `--model` binds to the most recent `--reviewer`; with none before it, that is almost
+        // `--bin` binds to the most recent `--reviewer`; with none before it, that is almost
         // always a forgotten `--reviewer`, so it is a parse error rather than a silent bind.
-        let err = Config::from_args(&args(&["--model", "x"])).unwrap_err();
-        assert!(err.contains("--model must follow a --reviewer"), "{err}");
+        let err = Config::from_args(&raw_args(&["--bin", "C:\\x\\codex.exe"])).unwrap_err();
+        assert!(err.contains("--bin must follow a --reviewer"), "{err}");
+    }
+
+    #[test]
+    fn removed_model_and_effort_flags_are_rejected_with_a_migration_hint() {
+        // --model/--effort were removed in favour of --level. Rejecting them explicitly (rather than
+        // as an "unknown argument") hands an existing config the replacement.
+        for flag in ["--model", "--effort"] {
+            let err =
+                Config::from_args(&raw_args(&["--reviewer", "codex", flag, "x"])).unwrap_err();
+            assert!(err.contains("was removed"), "{flag}: {err}");
+            assert!(err.contains("--level"), "{flag}: {err}");
+        }
+        // Unconditional, not entry-bound: rejected even before any --reviewer.
+        let err = Config::from_args(&raw_args(&["--model", "x"])).unwrap_err();
+        assert!(err.contains("was removed"), "{err}");
+    }
+
+    #[test]
+    fn a_reviewer_with_no_level_is_rejected() {
+        // A reviewer's model and effort come only from --level now, so a level-less entry has
+        // nothing to run and is refused (with a hint at the removed flags).
+        let err = Config::from_args(&raw_args(&["--reviewer", "codex"])).unwrap_err();
+        assert!(err.contains("declares no --level"), "{err}");
+        assert!(err.contains("--model/--effort"), "{err}");
+    }
+
+    #[test]
+    fn multiple_levels_require_a_default_level() {
+        // With two or more levels and no --default-level, which one an omitted `level` uses is a
+        // guess, so it is required.
+        let err = Config::from_args(&raw_args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "fast:gpt-5.6-luna:high",
+            "--level",
+            "thorough:gpt-5.6-luna:max",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("no --default-level"), "{err}");
+
+        // A single level needs no --default-level: it is the default, and the base pair.
+        let cfg = Config::from_args(&raw_args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "only:gpt-5.6-luna:high",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.primary().default_level.as_deref(), Some("only"));
+        assert_eq!(cfg.primary().effort, "high");
     }
 
     #[test]
@@ -2539,18 +2648,19 @@ mod tests {
     }
 
     #[test]
-    fn model_and_effort_can_be_overridden() {
+    fn a_sole_level_sets_the_base_pair() {
+        // With --model/--effort gone, an entry's base (no-`level`) pair comes from its default
+        // level — here the sole declared level.
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-sol",
-            "--effort",
-            "ultra",
+            "--level",
+            "only:gpt-5.6-sol:ultra",
         ]))
         .expect("config");
         assert_eq!(cfg.primary().model, "gpt-5.6-sol");
         assert_eq!(cfg.primary().effort, "ultra");
+        assert_eq!(cfg.primary().default_level.as_deref(), Some("only"));
     }
 
     #[test]
@@ -2720,16 +2830,12 @@ mod tests {
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "claude",
-            "--model",
-            "claude-opus-4-8",
-            "--effort",
-            "medium",
+            "--level",
+            "standard:claude-opus-4-8:medium",
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
-            "--effort",
-            "max",
+            "--level",
+            "standard:gpt-5.6-luna:max",
         ]))
         .expect("config");
         assert_eq!(cfg.reviewers.len(), 2);
@@ -2737,11 +2843,6 @@ mod tests {
         assert_eq!(cfg.reviewers[0].model, "claude-opus-4-8");
         assert_eq!(cfg.reviewers[1].reviewer, ReviewerKind::Codex);
         assert_eq!(cfg.reviewers[1].model, "gpt-5.6-luna");
-        // Each entry takes its own per-reviewer defaults when unspecified.
-        let defaulted = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
-            .expect("config");
-        assert_eq!(defaulted.reviewers[0].model, "claude-opus-4-8");
-        assert_eq!(defaulted.reviewers[1].model, "gpt-5.6-luna");
     }
 
     #[test]
@@ -2749,13 +2850,13 @@ mod tests {
         let err = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--model",
-            "a",
-            "--model",
-            "b",
+            "--bin",
+            "C:\\a\\codex.exe",
+            "--bin",
+            "C:\\b\\codex.exe",
         ]))
         .unwrap_err();
-        assert!(err.contains("--model given twice"), "{err}");
+        assert!(err.contains("--bin given twice"), "{err}");
     }
 
     #[test]
@@ -2782,16 +2883,17 @@ mod tests {
             .expect("config");
         assert!(Config::validate_chain(&dup.reviewers).is_err());
 
-        // Same reviewer, different model: a legitimate same-family fallback, honoured.
+        // Same reviewer, different model (via each entry's default level): a legitimate same-family
+        // fallback, honoured.
         let same_family = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
+            "--level",
+            "standard:gpt-5.6-luna:max",
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-sol",
+            "--level",
+            "standard:gpt-5.6-sol:max",
         ]))
         .expect("config");
         assert!(Config::validate_chain(&same_family.reviewers).is_ok());
@@ -2857,16 +2959,14 @@ mod tests {
 
     #[test]
     fn describe_reviewer_effective_shows_the_start_entrys_override_pair() {
-        // Base effort is max; the `standard` default level resolves to xhigh. The start response
-        // headline must name xhigh, matching the `level:` line, rather than the base max (issue
-        // #106: the two lines contradicted).
+        // The base (default-level) pair is max; a level override to xhigh must be what the start
+        // headline names, matching the `level:` line, rather than the base max (issue #106: the two
+        // lines contradicted).
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--effort",
-            "max",
             "--level",
-            "standard:gpt-5.6-luna:xhigh",
+            "standard:gpt-5.6-luna:max",
         ]))
         .expect("config");
 
@@ -2894,12 +2994,12 @@ mod tests {
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--effort",
-            "max",
+            "--level",
+            "standard:gpt-5.6-luna:max",
             "--reviewer",
             "claude",
-            "--effort",
-            "high",
+            "--level",
+            "standard:claude-opus-4-8:high",
         ]))
         .expect("config");
         let ov = LevelOverride {
@@ -2964,16 +3064,12 @@ mod tests {
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "claude",
-            "--model",
-            "claude-opus-4-8",
-            "--effort",
-            "medium",
+            "--level",
+            "standard:claude-opus-4-8:medium",
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
-            "--effort",
-            "max",
+            "--level",
+            "standard:gpt-5.6-luna:max",
         ]))
         .expect("config");
         let mut rec = SessionRecord {
@@ -3071,14 +3167,17 @@ mod tests {
     #[test]
     fn resume_entry_index_matches_a_level_pair_not_only_the_base() {
         use crate::session::{RawBin, SessionRecord};
-        // Base pair is (claude-opus-4-8, medium); the entry also declares thorough=(…, high).
+        // Base pair is (claude-opus-4-8, medium) via the `standard` default level; the entry also
+        // declares thorough=(…, high).
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "claude",
-            "--effort",
-            "medium",
+            "--level",
+            "standard:claude-opus-4-8:medium",
             "--level",
             "thorough:claude-opus-4-8:high",
+            "--default-level",
+            "standard",
         ]))
         .expect("config");
         let rec = |effort: &str| SessionRecord {
@@ -3188,10 +3287,8 @@ mod tests {
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
-            "--effort",
-            "max",
+            "--level",
+            "standard:gpt-5.6-luna:max",
             "--bin",
             "C:\\Tools\\codex.exe",
         ]))
@@ -3281,17 +3378,14 @@ mod tests {
             profile_identity: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.
+        // Each entry's default level (injected) gives the same base pair; only the bin differs.
         let ambiguous = Config::from_args(&args(&[
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
             "--bin",
             "C:\\a\\codex.exe",
             "--reviewer",
             "codex",
-            "--model",
-            "gpt-5.6-luna",
             "--bin",
             "C:\\b\\codex.exe",
         ]))
@@ -3310,9 +3404,13 @@ mod tests {
 
     #[test]
     fn equals_form_is_accepted() {
-        // MCP config files vary in how they split args, so both forms must work.
-        let cfg =
-            Config::from_args(&args(&["--reviewer=claude", "--effort=xhigh"])).expect("config");
+        // MCP config files vary in how they split args, so both forms must work (here also for
+        // --level, whose value carries colons).
+        let cfg = Config::from_args(&args(&[
+            "--reviewer=claude",
+            "--level=standard:claude-opus-4-8:xhigh",
+        ]))
+        .expect("config");
         assert_eq!(cfg.primary().reviewer, ReviewerKind::Claude);
         assert_eq!(cfg.primary().effort, "xhigh");
     }
@@ -3349,8 +3447,8 @@ mod tests {
 
     #[test]
     fn missing_value_is_rejected() {
-        let err = Config::from_args(&args(&["--reviewer", "codex", "--model"])).unwrap_err();
-        assert!(err.contains("--model requires a value"));
+        let err = Config::from_args(&raw_args(&["--reviewer", "codex", "--level"])).unwrap_err();
+        assert!(err.contains("--level requires a value"));
     }
 
     #[test]
@@ -4007,8 +4105,13 @@ mod tests {
     fn unusual_effort_is_passed_through_not_rejected() {
         // The CLI is the authority on valid effort levels; new ones must not need a
         // rebuild of this tool.
-        let cfg = Config::from_args(&args(&["--reviewer", "codex", "--effort", "hyper"]))
-            .expect("unusual effort should warn, not fail");
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--level",
+            "only:gpt-5.6-luna:hyper",
+        ]))
+        .expect("unusual effort should warn, not fail");
         assert_eq!(cfg.primary().effort, "hyper");
     }
 
@@ -4195,9 +4298,9 @@ mod tests {
 mod block_repair_flag_tests {
     use super::*;
 
-    /// Same helper the sibling `tests` module uses.
+    /// Same injecting helper the sibling `tests` module uses (these configs are all level-less).
     fn args(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+        super::tests::args(items)
     }
 
     #[test]

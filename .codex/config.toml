@@ -41,9 +41,10 @@
 [mcp_servers.cross_review]
 command = "dist\\cross-review.exe"
 args = [
-    "--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium",
-    # Review levels (a caller-selectable model+effort preset; see README "Review levels").
-    # standard == the base --effort, so an omitted `level` is unchanged from before.
+    "--reviewer", "claude",
+    # Review levels (a caller-selectable model+effort preset; see README "Review levels"). A
+    # reviewer's model and effort come only from --level now (--model/--effort were removed), so
+    # at least one level is required; --default-level picks the one an omitted `level` uses.
     "--level", "fast:claude-opus-4-8:low",
     "--level", "standard:claude-opus-4-8:medium",
     "--level", "thorough:claude-opus-4-8:high",

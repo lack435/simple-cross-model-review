@@ -81,7 +81,8 @@ Add **two** new tools. Reuse the rest.
   - `fresh` (optional) — restart a named session's conversation.
   - `include_change` (optional, **default false**) — bound at session creation; see "Change capture."
   - `level` (optional) — reuses the existing `--level` presets and **the review's exact resolution
-    order**: a passed level, else `--default-level`, else the entry's base `--model`/`--effort`.
+    order**: a passed level, else the entry's default level (`--default-level`, or its sole level) —
+    i.e. its base `(model, effort)` pair.
     There is no promised `"standard"` default (**f8**) — whatever the review path would resolve to is
     what a consult resolves to.
   - Perforce `change` / `include_shelved` — only meaningful when `include_change` is true; identical

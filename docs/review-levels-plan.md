@@ -1,5 +1,23 @@
 # Plan: user-defined review "levels" (model + effort presets)
 
+> **Amendment (post-merge): `--model`/`--effort` removed; levels are the sole source.**
+> This plan added `--level` alongside the pre-existing `--model`/`--effort`. Those two flags
+> have since been **removed**: a reviewer's model and effort now come only from `--level`, so
+> **at least one `--level` is required per `--reviewer`**, and passing `--model`/`--effort` is a
+> hard error with a migration hint. An entry's base `(model, effort)` — the pair used when a
+> review omits `level` — is its **default level's** pair (`--default-level`, or the sole level
+> when only one is declared; two or more with no `--default-level` is a parse error). Nothing
+> downstream changed: identity, duplicate detection (`same_reviewer_identity`), resume matching
+> (`resume_entry_index` / `produces_pair`), and reporting still key on `(model, effort)`; the
+> base pair is simply derived from the default level in `PendingEntry::finalize` instead of from
+> the removed flags.
+>
+> **Everything below this box is the plan as originally written.** It describes `--model`/`--effort`
+> and level-less configs as they existed at the time and is preserved as the historical design
+> record — it is **not** current CLI guidance. The resolution/lifecycle machinery it describes is
+> unchanged; only the *source* of the base pair moved (see this box). For current flags see
+> `README.md` and `docs/reviewer-fallback-chain.md`.
+
 ## Context
 
 Today the reviewer's `model` and `effort` are pinned once at server launch

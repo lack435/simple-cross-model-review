@@ -61,7 +61,7 @@ Write-Host "==> provisioning profile '$Profile' for: $($Reviewers -join ', ')" -
 
 # The server's own --reviewer does not matter here: cross_model_setup_profile takes the reviewer as an
 # argument. A minimal valid config launches the server; setup resolves the vendor CLI per its argument.
-$serverArgs = @('--reviewer', 'codex', '--effort', 'low', '--state-dir', $stateDir)
+$serverArgs = @('--reviewer', 'codex', '--level', 'smoke:gpt-5.6-luna:low', '--state-dir', $stateDir)
 
 # Windows PowerShell 5.1's ProcessStartInfo has no ArgumentList; quote by hand (paths here are simple).
 $psi = New-Object System.Diagnostics.ProcessStartInfo
