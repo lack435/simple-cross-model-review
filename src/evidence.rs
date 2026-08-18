@@ -30,13 +30,15 @@ pub const SERVER_NAME: &str = "cross_review_evidence";
 /// (once wired) the bundle stops carrying a pre-rendered `change`, so the reviewer-visible tool set
 /// and delivery contract both changed.
 pub const SCHEMA_VERSION: u32 = 3;
-/// Ceiling on the bytes served per text page (`repository_diff`/`repository_change`/
-/// `repository_revision`) for a reviewer whose MCP client caps tool-result size. Claude Code
-/// truncates or diverts an MCP tool result past ~25k tokens (`MAX_MCP_OUTPUT_TOKENS`) — a single
-/// `repository_diff` page above that is saved to a file the shell-less reviewer cannot read, so the
-/// change never reaches the model and the review fails `EVIDENCE_UNAVAILABLE` (issue #114). Codex
-/// imposes no such cap and is served at the full `max_change_bytes`. Set well under the observed
-/// boundary (~45 KiB of raw diff text) to leave margin for JSON escaping of dense diffs.
+/// Ceiling on the *JSON-escaped* bytes served per page for a reviewer whose MCP client caps
+/// tool-result size. Claude Code truncates or diverts an MCP tool result past ~25k tokens
+/// (`MAX_MCP_OUTPUT_TOKENS`) — a single `repository_diff` page above that is saved to a file the
+/// shell-less reviewer cannot read, so the change never reaches the model and the review fails
+/// `EVIDENCE_UNAVAILABLE` (issue #114). The bound is on the *encoded* content the client actually
+/// receives, not the raw text, so an escape-heavy diff cannot slip past it. It governs the text
+/// pages (`repository_diff`/`repository_change`/`repository_revision`) and the `repository_read`
+/// window. Codex imposes no such cap and is served at the full request. Set well under the observed
+/// boundary (~45 KiB encoded) to leave margin for the surrounding response envelope.
 pub const CLAUDE_PAGE_BYTES_CEILING: u32 = 24 * 1024;
 /// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
 /// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
@@ -304,10 +306,10 @@ pub struct Bundle {
     pub change: Option<String>,
     pub limits: Limits,
     pub initial_stamp: Drift,
-    /// Ceiling on the bytes served per text page, independent of `limits.max_change_bytes` (which
-    /// still bounds what the reviewer may *request*). `Some` for a reviewer whose MCP client caps
-    /// tool-result size (Claude Code): the change is paged in smaller slices so no single response
-    /// is truncated or diverted client-side (issue #114). `None` (Codex) serves the full request.
+    /// Ceiling on the JSON-escaped bytes served per page, independent of `limits.max_change_bytes`
+    /// (which still bounds what the reviewer may *request*). `Some` for a reviewer whose MCP client
+    /// caps tool-result size (Claude Code): pages are sliced so no single *serialized* response is
+    /// truncated or diverted client-side (issue #114). `None` (Codex) serves the full request.
     /// Defaulted so a bundle written without it still decodes; the writer and reader are one binary
     /// version within one process tree, so there is no cross-version bundle to migrate.
     #[serde(default)]
