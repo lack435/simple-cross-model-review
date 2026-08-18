@@ -25,7 +25,11 @@ pub const SERVER_NAME: &str = "cross_review_evidence";
 /// gained `drift_unavailable` and `scan_scope`. There is no migration to write — one binary writes
 /// and reads the bundle within one process tree, and the file is deleted when the review ends — so
 /// this is the reviewer-visible declaration that the contract changed, not a compatibility switch.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped to 3 by the retire-capture-modes work: a live `repository_diff` tool was added, and
+/// (once wired) the bundle stops carrying a pre-rendered `change`, so the reviewer-visible tool set
+/// and delivery contract both changed.
+pub const SCHEMA_VERSION: u32 = 3;
 /// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
 /// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
 /// it, and the evidence read watchdog (`src/evidence/core.rs`) derives its budget from it with a
@@ -36,7 +40,7 @@ const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BUNDLE_FILES: usize = 256;
 const STALE_BUNDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-pub const TOOLS: [&str; 7] = [
+pub const TOOLS: [&str; 8] = [
     "repository_scope",
     "repository_list",
     "repository_search",
@@ -44,6 +48,7 @@ pub const TOOLS: [&str; 7] = [
     "repository_change",
     "repository_history",
     "repository_revision",
+    "repository_diff",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1069,6 +1074,22 @@ pub fn tool_definitions() -> Vec<Value> {
             ],
             &[],
         ),
+        tool(
+            "repository_diff",
+            "Diff the live working tree against a base, on demand; unsupported for Perforce. 'base' \
+             is the left side (default 'branch-base', the branch's fork point) and 'head' the right \
+             (default 'worktree', the live working tree including untracked files). Each is a full \
+             Git object id or one of the sentinels 'worktree', 'index', 'head', 'branch-base'. To \
+             review the whole change, diff 'branch-base'..'worktree'; narrow with 'path' for focus.",
+            &[
+                ("base", "string"),
+                ("head", "string"),
+                ("path", "string"),
+                ("cursor", "string"),
+                ("limit_bytes", "integer"),
+            ],
+            &[],
+        ),
     ]
 }
 
@@ -1180,6 +1201,7 @@ fn output_schema(name: &str) -> Value {
             }),
         ),
         "repository_revision" => text_page("content"),
+        "repository_diff" => text_page("diff"),
         _ => json!({"type":"object","properties":{},"additionalProperties":false}),
     }
 }
