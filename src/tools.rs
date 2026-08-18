@@ -2943,6 +2943,13 @@ impl Job {
                     // sent no reviewable change.
                     o.disposition = disposition.take();
                     o.capture_summary = capture_summary.take();
+                    // A git review derived its change live, so there is no static capture summary;
+                    // build the caller-facing captured: line from what the evidence server served
+                    // (mechanism 5). Only a successful attempt reaches here, so the serve-record is
+                    // complete and the gate above already passed.
+                    if o.capture_summary.is_none() && self.cfg.vcs == crate::config::Vcs::Git {
+                        o.capture_summary = serve_record_capture_summary(&self.cfg, &self.id);
+                    }
                     outcome = Some(o);
                     break;
                 }
@@ -4860,7 +4867,7 @@ fn resume_block(
 /// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
 /// because an over-budget turn always reports it at rank 0.
 /// What a review's `repository_diff` serve-records add up to (retire-capture-modes mechanisms 3/4).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct DiffServeAggregate {
     /// The reviewer made at least one `repository_diff` call this turn.
     any_diff: bool,
@@ -4868,6 +4875,19 @@ struct DiffServeAggregate {
     /// served complete and paged to its terminal page. This is the floor a formal approval must
     /// clear (f1): it proves the reviewer was served the entire change, end to end.
     complete_canonical_terminal: bool,
+    /// Counts from the canonical operation, for the caller-facing `captured:` line (mechanism 5).
+    /// `None` when no canonical operation was served.
+    canonical: Option<CanonicalServe>,
+}
+
+/// The canonical diff's resolved base and counts, taken from the serve-record, for `captured:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalServe {
+    base: String,
+    files: usize,
+    insertions: usize,
+    deletions: usize,
+    untracked: usize,
 }
 
 /// Aggregate the nonce-bound serve-record JSONL the evidence server appended (mechanism 3). Each
@@ -4885,6 +4905,7 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
     let mut any_diff = false;
+    let mut canonical: Option<CanonicalServe> = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -4907,6 +4928,29 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
         entry.complete &= bool_field("complete").unwrap_or(false);
         entry.terminal |= bool_field("terminal").unwrap_or(false);
+        // The canonical operation's counts ride on its first page (the record carrying `files`);
+        // the last such wins, which for a given tree state describes the same change.
+        let u64_field = |k: &str| {
+            value
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize
+        };
+        if bool_field("canonical").unwrap_or(false) {
+            if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
+                canonical = Some(CanonicalServe {
+                    base: value
+                        .get("base_source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("branch-base")
+                        .to_string(),
+                    files: files as usize,
+                    insertions: u64_field("insertions"),
+                    deletions: u64_field("deletions"),
+                    untracked: u64_field("untracked"),
+                });
+            }
+        }
     }
     let complete_canonical_terminal = ops
         .values()
@@ -4914,6 +4958,7 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     DiffServeAggregate {
         any_diff,
         complete_canonical_terminal,
+        canonical,
     }
 }
 
@@ -4925,6 +4970,28 @@ fn read_serve_record_aggregate(cfg: &Config, nonce: &str) -> DiffServeAggregate 
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|c| aggregate_serve_records(&c))
         .unwrap_or_default()
+}
+
+/// Build the caller-facing `captured:` summary for a git review from the serve-record's canonical
+/// operation (mechanism 5) — reporting what the evidence server served the reviewer on demand, in
+/// place of the retired static capture. `None` when no canonical diff was served, so no `captured:`
+/// line is rendered (which is also the shape the gate already failed an approval on).
+fn serve_record_capture_summary(cfg: &Config, nonce: &str) -> Option<crate::vcs::CaptureSummary> {
+    let agg = read_serve_record_aggregate(cfg, nonce);
+    let c = agg.canonical?;
+    Some(crate::vcs::CaptureSummary::Git {
+        range: c.base,
+        files: c.files,
+        insertions: c.insertions,
+        deletions: c.deletions,
+        untracked_files: c.untracked,
+        untracked_files_floor: false,
+        diff_truncated: false,
+        // The serve-record's completeness collapses into these two: a canonical op that did not
+        // reach a complete terminal page is reported incomplete.
+        diff_incomplete: !agg.complete_canonical_terminal,
+        complete: agg.complete_canonical_terminal,
+    })
 }
 
 fn terminal_reason_for(envelope: &crate::findings::Envelope) -> Option<String> {
@@ -5196,6 +5263,22 @@ mod tests {
         let junk =
             "not json\n{bad\n{\"op\":\"z\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
         assert!(aggregate_serve_records(junk).complete_canonical_terminal);
+
+        // The canonical operation's counts are captured for the caller-facing captured: line.
+        let counted = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true,"base_source":"merge-base(HEAD, @{upstream})","files":3,"insertions":10,"deletions":2,"untracked":1}"#,
+        );
+        let c = counted.canonical.expect("canonical counts recorded");
+        assert_eq!(
+            (c.files, c.insertions, c.deletions, c.untracked),
+            (3, 10, 2, 1)
+        );
+        // A narrowed-only diff records no canonical counts.
+        assert!(
+            aggregate_serve_records(r#"{"op":"y","canonical":false,"files":2}"#)
+                .canonical
+                .is_none()
+        );
     }
 
     #[test]
