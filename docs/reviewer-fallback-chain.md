@@ -10,6 +10,20 @@ are fixed, with no new regressions found"). The sections below fold every plan f
 [Review history](#review-history) records where; the implementation findings are summarised at
 the end of that section. It is the plan for [issue #48].
 
+> **Amendment — specifics that changed after this plan.** This is a design record, implemented as
+> written. Two later changes altered specifics it describes, and references to them throughout are
+> as-of-design-time:
+> - **`--model`/`--effort` were replaced by a required `--level`** (see the binding rules in [The
+>   argument grammar](#the-argument-grammar) and `README.md`). A reviewer's model/effort now come
+>   from a `--level` preset, not those flags.
+> - **PR #110 ("retire capture modes") removed `--diff`, `DiffMode`, and `src/vcs/git.rs`**, moving
+>   git reviews to live `repository_diff` delivery. **Every `--diff` / `--diff auto` / `vcs/git.rs`
+>   reference in this document describes the pre-#110 capture model** — including the syntax-error
+>   example in [Config validation](#2-config-validation-two-tiers-and-where-each-is-reported) and the
+>   capture cases in [Testing](#testing). The fallback reasoning (capture must reach whichever entry
+>   runs) still holds; only the mechanism changed. See
+>   [`docs/retire-capture-modes.md`](retire-capture-modes.md) for the current model.
+
 [issue #48]: https://github.com/lack435/simple-cross-model-review/issues/48
 
 ## What the issue asks
