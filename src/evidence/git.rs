@@ -257,6 +257,44 @@ pub fn untracked_paths(
     Ok((paths, complete))
 }
 
+/// `git diff --numstat` counts for a resolved spec: (files, insertions, deletions). A binary file
+/// counts toward `files` but contributes no line counts (git renders it as `-\t-`). Feeds the
+/// serve-record so the caller-facing `captured:` line reports what was served (mechanism 5).
+pub fn numstat(
+    root: &Path,
+    spec: &[&str],
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<(usize, usize, usize), EvidenceError> {
+    let mut args = vec![
+        "diff".to_string(),
+        "--numstat".to_string(),
+        "--no-ext-diff".to_string(),
+        "--no-textconv".to_string(),
+    ];
+    args.extend(spec.iter().map(|s| s.to_string()));
+    if !path.is_empty() {
+        args.push("--".into());
+        args.push(path.to_string());
+    }
+    let out = run(root, &args, limits, cancel, received_at)?;
+    let (mut files, mut insertions, mut deletions) = (0usize, 0usize, 0usize);
+    for line in out.lines() {
+        let mut fields = line.split('\t');
+        let added = fields.next().unwrap_or("");
+        let deleted = fields.next().unwrap_or("");
+        if fields.next().is_none() {
+            continue; // not a numstat row (no path field)
+        }
+        files += 1;
+        insertions += added.parse::<usize>().unwrap_or(0);
+        deletions += deleted.parse::<usize>().unwrap_or(0);
+    }
+    Ok((files, insertions, deletions))
+}
+
 /// Resolve a revision to a full commit object id, or `None` if it does not name one.
 ///
 /// Used to pin the endpoints of the canonical diff — the branch's upstream and the merge-base — to

@@ -1155,6 +1155,10 @@ impl Core {
             "terminal": terminal,
             "base": composed.base_token,
             "base_source": composed.base_source,
+            "files": composed.files,
+            "insertions": composed.insertions,
+            "deletions": composed.deletions,
+            "untracked": composed.untracked_files,
         }));
         Ok(text_result("diff", content, end, cursor))
     }
@@ -2394,6 +2398,10 @@ struct ComposedDiff {
     base_token: String,
     base_source: String,
     complete: bool,
+    files: usize,
+    insertions: usize,
+    deletions: usize,
+    untracked_files: usize,
 }
 
 /// Resolve the endpoints, run the tracked diff, and — for a working-tree head — compose the
@@ -2444,8 +2452,11 @@ fn compose_diff(
     }
     let spec_refs: Vec<&str> = spec.iter().map(String::as_str).collect();
     let tracked = super::git::diff(root, &spec_refs, path, limits, cancel, received_at)?;
+    let (files, insertions, deletions) =
+        super::git::numstat(root, &spec_refs, path, limits, cancel, received_at)?;
 
     let mut complete = true;
+    let mut untracked_files = 0usize;
     let mut out = String::new();
     out.push_str(&format!(
         "# repository_diff base {base_source} = {base_token}\n\n"
@@ -2461,6 +2472,7 @@ fn compose_diff(
             paths.into_iter().filter(|p| p.starts_with(path)).collect()
         };
         complete = listing_complete;
+        untracked_files = paths.len();
         if !paths.is_empty() {
             out.push_str("\n\n# untracked (new) files\n");
         }
@@ -2490,6 +2502,10 @@ fn compose_diff(
         base_token,
         base_source,
         complete,
+        files,
+        insertions,
+        deletions,
+        untracked_files,
     })
 }
 
