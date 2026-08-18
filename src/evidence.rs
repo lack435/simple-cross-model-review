@@ -614,7 +614,12 @@ pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceErro
     let max_response = bundle.limits.max_response_bytes as usize;
     let cancel = Arc::new(AtomicBool::new(false));
     let cancellations = Arc::new(RequestCancellations::default());
-    let core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
+    let mut core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
+    // The serve-record side-channel sits beside the bundle, under the same per-turn nonce, so the
+    // parent (which created the bundle and knows both) can find and read it after the reviewer exits.
+    if let Some(dir) = path.parent() {
+        core.set_serve_record(dir.join(format!("{expected_nonce}-serverecord.jsonl")));
+    }
     // A *bounded* dispatch channel: admission control that caps buffered requests, so a client that
     // pipelines faster than the serial dispatcher drains cannot grow the queue until the evidence
     // process runs out of memory (issue #61, code-review finding f8). When it is full the reader

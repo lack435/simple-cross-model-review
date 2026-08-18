@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -489,6 +489,11 @@ pub struct Core {
     /// describe the scan that ran rather than the one the VCS implies.
     observed_method: Option<StampMethod>,
     cancel: Arc<AtomicBool>,
+    /// The nonce-bound side-channel file each `repository_diff` call appends a serve-record to, for
+    /// the parent's `captured:` line and fail-closed gate (retire-capture-modes mechanism 3). `None`
+    /// in tests and whenever the parent supplied no path; a missing sink is silent, never fatal — a
+    /// review that cannot record its serve-records fails closed at the gate, not here.
+    serve_record: Option<PathBuf>,
     /// The watchdog the walk-bearing routes (`repository_list`, `repository_search`) run under.
     ///
     /// A seam, not a setting: production always gets `WALK_WATCHDOG`, and it exists so a test can
@@ -532,8 +537,27 @@ impl Core {
             observed_stamp: None,
             observed_method: None,
             cancel,
+            serve_record: None,
             walk_watchdog: &WALK_WATCHDOG,
         })
+    }
+
+    /// Point `repository_diff` at the nonce-bound serve-record file the parent will read. Set once,
+    /// in `serve_stdio`, before the request loop starts.
+    pub fn set_serve_record(&mut self, path: PathBuf) {
+        self.serve_record = Some(path);
+    }
+
+    /// Append one serve-record line (JSON) to the side-channel file, best-effort. A write failure is
+    /// swallowed: the review continues and the gate fails closed on the missing record rather than
+    /// crashing the evidence server mid-turn.
+    fn append_serve_record(&self, record: &Value) {
+        let Some(path) = &self.serve_record else {
+            return;
+        };
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{record}");
+        }
     }
 
     /// Dispatch a call whose receipt clock starts now. Convenience for tests and any caller that
@@ -1064,7 +1088,7 @@ impl Core {
         )? as usize;
         if let Some(cursor) = optional_string(args, "cursor")? {
             cursor_only(args, &["cursor", "limit_bytes"])?;
-            return self.text_cursor("repository_diff", &cursor, limit, "diff");
+            return self.diff_cursor(&cursor, limit);
         }
         let base = optional_string(args, "base")?.unwrap_or_else(|| "branch-base".to_string());
         let head = optional_string(args, "head")?.unwrap_or_else(|| "worktree".to_string());
@@ -1074,6 +1098,11 @@ impl Core {
         if !path.is_empty() {
             self.validate_relative(&path)?;
         }
+        // The canonical diff — the one a formal approval must be served (mechanism 4) — is the whole
+        // working tree against the branch's fork point, unnarrowed. Anything else is exploratory.
+        let canonical = matches!(base_ep, DiffEndpoint::BranchBase)
+            && matches!(head_ep, DiffEndpoint::Worktree)
+            && path.is_empty();
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
@@ -1088,7 +1117,104 @@ impl Core {
                 received_at,
             )
         })?;
-        self.first_text_page("repository_diff", composed, limit, "diff")
+        self.first_diff_page(canonical, composed, limit)
+    }
+
+    /// First page of a `repository_diff`, recording the serve-record the parent's `captured:` line
+    /// and gate read (mechanism 3). A new operation id is minted here and carried in the cursor so
+    /// every follow-up page records under the same operation; `terminal` says whether this page was
+    /// the last, which is what lets the gate require the canonical diff was paged to its end (f1).
+    fn first_diff_page(
+        &mut self,
+        canonical: bool,
+        composed: ComposedDiff,
+        limit: usize,
+    ) -> Result<Value, EvidenceError> {
+        let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
+        let text = composed.text;
+        let end = utf8_end(&text, limit.min(text.len()));
+        let content = text[..end].to_string();
+        let terminal = end >= text.len();
+        let cursor = if terminal {
+            None
+        } else {
+            Some(self.store_cursor(
+                "repository_diff",
+                vec![json!({
+                    "text": text, "offset": end, "op": op,
+                    "canonical": canonical, "complete": composed.complete
+                })],
+                0,
+                true,
+            ))
+        };
+        self.append_serve_record(&json!({
+            "op": op,
+            "canonical": canonical,
+            "complete": composed.complete,
+            "terminal": terminal,
+            "base": composed.base_token,
+            "base_source": composed.base_source,
+        }));
+        Ok(text_result("diff", content, end, cursor))
+    }
+
+    /// A continuation page of a `repository_diff`, recording under the operation id carried in the
+    /// cursor. Its `terminal` flag closing an operation is what the gate reads as "the reviewer was
+    /// served the whole canonical diff."
+    fn diff_cursor(&mut self, token: &str, limit: usize) -> Result<Value, EvidenceError> {
+        let state = self.take_cursor(token, "repository_diff")?;
+        let item = state
+            .values
+            .first()
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?;
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
+            .to_string();
+        let offset = item
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
+            as usize;
+        let op = item
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let canonical = item
+            .get("canonical")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let complete = item
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
+        let content = text[offset..end].to_string();
+        let terminal = end >= text.len();
+        let cursor = if terminal {
+            None
+        } else {
+            Some(self.store_cursor(
+                "repository_diff",
+                vec![json!({
+                    "text": text, "offset": end, "op": op,
+                    "canonical": canonical, "complete": complete
+                })],
+                0,
+                true,
+            ))
+        };
+        self.append_serve_record(&json!({
+            "op": op,
+            "canonical": canonical,
+            "complete": complete,
+            "terminal": terminal,
+            "continuation": true,
+        }));
+        Ok(text_result("diff", content, end, cursor))
     }
 
     /// Resolve the search base and walk it, all on one watchdog-bounded worker.
@@ -2259,11 +2385,20 @@ fn read_untracked(
     Ok((text, truncated))
 }
 
+/// A composed working-tree diff plus the metadata the serve-record needs (mechanism 3). `complete`
+/// is the untracked half's wholeness — the tracked half is always whole here, because `git diff`
+/// output that hit the byte cap makes `git::diff` return an error rather than a truncated string, so
+/// an over-cap canonical diff surfaces as a failed call and fails the gate closed by its absence.
+struct ComposedDiff {
+    text: String,
+    base_token: String,
+    base_source: String,
+    complete: bool,
+}
+
 /// Resolve the endpoints, run the tracked diff, and — for a working-tree head — compose the
-/// untracked files `git diff` omits (f2). Runs on the watchdog-bounded worker. The output is the
-/// diff text with a one-line header naming the resolved base, so the reviewer sees what it is
-/// diffing against; the structured record for the caller-facing `captured:` and the gate is emitted
-/// separately (mechanism 3, wired in a later change).
+/// untracked files `git diff` omits (f2). Runs on the watchdog-bounded worker. The text carries a
+/// one-line header naming the resolved base, so the reviewer sees what it is diffing against.
 fn compose_diff(
     root: &Path,
     base: &DiffEndpoint,
@@ -2272,7 +2407,7 @@ fn compose_diff(
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
-) -> Result<String, EvidenceError> {
+) -> Result<ComposedDiff, EvidenceError> {
     let (base_token, base_source) = match base {
         DiffEndpoint::BranchBase => resolve_branch_base(root, limits, cancel, received_at)?,
         DiffEndpoint::Head => ("HEAD".to_string(), "HEAD".to_string()),
@@ -2310,6 +2445,7 @@ fn compose_diff(
     let spec_refs: Vec<&str> = spec.iter().map(String::as_str).collect();
     let tracked = super::git::diff(root, &spec_refs, path, limits, cancel, received_at)?;
 
+    let mut complete = true;
     let mut out = String::new();
     out.push_str(&format!(
         "# repository_diff base {base_source} = {base_token}\n\n"
@@ -2324,7 +2460,7 @@ fn compose_diff(
             // A path-narrowed diff only sees untracked files under that path.
             paths.into_iter().filter(|p| p.starts_with(path)).collect()
         };
-        let mut complete = listing_complete;
+        complete = listing_complete;
         if !paths.is_empty() {
             out.push_str("\n\n# untracked (new) files\n");
         }
@@ -2349,7 +2485,12 @@ fn compose_diff(
             out.push_str("\n# note: untracked listing or contents were incomplete\n");
         }
     }
-    Ok(out)
+    Ok(ComposedDiff {
+        text: out,
+        base_token,
+        base_source,
+        complete,
+    })
 }
 
 #[cfg(test)]
