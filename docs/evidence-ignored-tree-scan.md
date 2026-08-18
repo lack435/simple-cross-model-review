@@ -515,7 +515,7 @@ Then, per AGENTS.md:
 - `.\build.ps1` — fmt, clippy `-D warnings`, unit tests, release build.
 - `smoke.ps1 -Reviewer codex` — required, because this changes the evidence service, which is
   protocol; the Claude direction does not exercise it. Costs tokens.
-- Manual: `cross-review.exe --reviewer codex --model gpt-5.6-luna --effort max --doctor` in the
+- Manual: `cross-review.exe --reviewer codex --level standard:gpt-5.6-luna:max --doctor` in the
   reporter's repository, which must report `evidence: ready`, and a real review there that starts.
 
 ## 7. Files touched
