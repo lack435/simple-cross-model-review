@@ -13,7 +13,7 @@
 
 .EXAMPLE
   .\smoke.ps1 -Reviewer codex
-  .\smoke.ps1 -Reviewer claude -Effort low
+  .\smoke.ps1 -Reviewer claude
   .\smoke.ps1 -Reviewer codex -ProveBlockRepair
 #>
 [CmdletBinding()]
@@ -23,8 +23,9 @@ param(
 
     [string]$Model,
 
-    # Low effort keeps the smoke test cheap; the pinned defaults are for real reviews.
-    [string]$Effort = 'low',
+    # Reasoning effort. The default is per-reviewer (see below): low for Codex, medium for Claude.
+    # An explicit value here overrides that for either reviewer.
+    [string]$Effort,
 
     # Path to the reviewer CLI, when it is not on PATH.
     [string]$ReviewerBin,
@@ -65,6 +66,16 @@ if ($ProveBlockRepair) {
 
 if (-not (Test-Path $Exe)) {
     throw "cross-review.exe not found at $Exe. Run .\build.ps1 first."
+}
+
+# Effort default is per-reviewer. A git review is refused with EVIDENCE_UNAVAILABLE unless the
+# reviewer fetches the change through repository_diff (the retire-capture-modes fail-closed gate).
+# Codex does that reliably even at low effort; the Claude reviewer does so only intermittently at
+# low effort, so a low-effort Claude smoke trips the gate at random. Default Claude to medium -- the
+# effort real Claude reviews use (the `standard` level) -- so the round trip is reliable. An explicit
+# -Effort still wins for either reviewer.
+if (-not $PSBoundParameters.ContainsKey('Effort') -or [string]::IsNullOrEmpty($Effort)) {
+    $Effort = if ($Reviewer -eq 'claude') { 'medium' } else { 'low' }
 }
 
 # --model/--effort were removed: a reviewer's model and effort come only from --level now, so the
@@ -521,7 +532,7 @@ INCLUDE-CHANGE-OK
     $doomed = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of poll cancellation. Call repository_change, then wait quietly; the poll will be cancelled.'
+            instructions = 'Smoke test of poll cancellation. Call repository_diff (base "branch-base", head "worktree"), then wait quietly; the poll will be cancelled.'
             session      = 'smoke-cancel'
             fresh        = $true
         }
@@ -587,7 +598,7 @@ INCLUDE-CHANGE-OK
     $doomedB = Send-Rpc -Method 'tools/call' -Params @{
         name      = 'cross_model_review'
         arguments = @{
-            instructions = 'Smoke test of explicit cancellation. Call repository_change, then wait quietly; this will be cancelled.'
+            instructions = 'Smoke test of explicit cancellation. Call repository_diff (base "branch-base", head "worktree"), then wait quietly; this will be cancelled.'
             session      = 'smoke-cancel-b'
             fresh        = $true
         }
