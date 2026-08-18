@@ -269,7 +269,12 @@ impl ProgressReporter {
         request: &Arc<RequestCancel>,
         interval: Duration,
     ) -> Option<Self> {
-        if params.get("name").and_then(Value::as_str) != Some("cross_model_review_result") {
+        // Both result tools emit progress while their blocking wait is open: a consult can take a
+        // few minutes too, and the progress snapshot (phase, elapsed, liveness) is kind-agnostic.
+        if !matches!(
+            params.get("name").and_then(Value::as_str),
+            Some("cross_model_review_result") | Some("cross_model_consult_result")
+        ) {
             return None;
         }
         let token = params
@@ -567,9 +572,18 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
             Err(failure) => text_result(failure.render_for_agent(), true),
         };
     }
+    // The consult's collect, on its own for the same reason: it carries a structured value alongside
+    // the text, and both come from one blocking wait so they cannot describe different states.
+    if name == "cross_model_consult_result" {
+        return match app.consult_result_both(&args, request) {
+            Ok((text, structured)) => text_result_with_structured(text, structured),
+            Err(failure) => text_result(failure.render_for_agent(), true),
+        };
+    }
 
     let outcome = match name {
         "cross_model_review" => app.start_review(&args, request),
+        "cross_model_consult" => app.start_consult(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
         "cross_model_setup_profile" => app.setup_profile(&args, request),
@@ -577,8 +591,9 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
             return text_result(
                 format!(
                     "Unknown tool '{other}'. This server provides cross_model_review, \
-                     cross_model_review_result, cross_model_review_status, \
-                     cross_model_review_cancel, and cross_model_setup_profile."
+                     cross_model_consult, cross_model_review_result, cross_model_consult_result, \
+                     cross_model_review_status, cross_model_review_cancel, and \
+                     cross_model_setup_profile."
                 ),
                 true,
             )
@@ -860,6 +875,94 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     }
                 },
                 "required": ["instructions"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "cross_model_consult",
+            "description": format!(
+                "Ask {reviewer} an informal question about your work -- a lightweight second pair of \
+                 eyes, not a gated review. Use it for \"does this direction look right?\", \"where is \
+                 X handled in this code?\", or \"am I missing a simpler approach?\". The reviewer \
+                 reads the repository through a read-only evidence service and answers in prose: \
+                 there is no findings ledger, no verdict, and nothing to converge on.\n\n\
+                 Returns immediately with a review_id; collect the answer with \
+                 cross_model_consult_result. Reuse the same 'session' to ask a follow-up with the \
+                 earlier exchange still in context.\n\n\
+                 It requires the evidence service, so it runs only on a reviewer that provides one \
+                 (Codex, or a profile-pinned shell-less Claude); otherwise it fails with \
+                 EVIDENCE_UNAVAILABLE. If it fails, the consult did not happen -- tell the user what \
+                 the error says rather than answering yourself."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description":
+                            "What you want a second opinion on, or want found in the code. Passed to \
+                             the reviewer verbatim. Say why you are asking, not just what to look at."
+                    },
+                    "context_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description":
+                            "Optional paths to point the reviewer at first. Starting points, not \
+                             limits; it can read anything else it needs."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description":
+                            "Name for this consultation, chosen by you. Reusing a name continues the \
+                             same conversation for a follow-up. Defaults to 'default'."
+                    },
+                    "fresh": {
+                        "type": "boolean",
+                        "description":
+                            "Start a new conversation even if this session name already exists. \
+                             Defaults to false."
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "cross_model_consult_result",
+            "description": format!(
+                "Wait for and return the answer from a cross_model_consult. Blocks until the consult \
+                 is done: omit wait_seconds to wait to completion in one call. When the MCP client \
+                 supplies a progress token, it emits live phase and elapsed-time updates during the \
+                 wait. A consult usually takes a few minutes; a deeper question can take longer.\n\n\
+                 If the wait_seconds budget elapses before it finishes it returns status=running; \
+                 just call again with the same review_id. Abandoning this call does NOT cancel the \
+                 consult -- it keeps running and stays collectible by review_id. Use \
+                 cross_model_review_cancel to actually stop it.\n\n\
+                 The completed result is the reviewer's prose answer (an `answer` field in the \
+                 structured content), with the reviewer, cost, and any refused commands -- there is \
+                 no verdict or findings list. A review_id from cross_model_review must be collected \
+                 with cross_model_review_result, not here (and vice versa)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "review_id": {
+                        "type": "string",
+                        "description": "The review_id returned by cross_model_consult. Preferred."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description":
+                            "Session name, as an alternative to review_id. Returns that session's \
+                             most recent consult."
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description":
+                            "How long to wait before returning, in seconds. Omit to block until the \
+                             consult is done; pass 0 for an immediate snapshot."
+                    }
+                },
                 "additionalProperties": false
             }
         }),
@@ -1161,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_five_tools_with_valid_schemas() {
+    fn lists_exactly_the_seven_tools_with_valid_schemas() {
         let response = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
         let tools = response["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1169,6 +1272,8 @@ mod tests {
             names,
             vec![
                 "cross_model_review",
+                "cross_model_consult",
+                "cross_model_consult_result",
                 "cross_model_review_result",
                 "cross_model_review_status",
                 "cross_model_review_cancel",

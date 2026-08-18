@@ -55,9 +55,6 @@ pub enum IdState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobKind {
     Review,
-    // Constructed by `start_consult` in a later slice; until then only `Review` jobs exist, so the
-    // variant is unconstructed in the binary. Remove the allow when `start_consult` lands.
-    #[allow(dead_code)]
     Consult,
 }
 
@@ -725,9 +722,8 @@ impl Registry {
 pub struct Snapshot {
     pub id: String,
     pub session: String,
-    /// Which start path created this job; see [`Review::kind`]. Read by the result tools in a later
-    /// slice to refuse a cross-kind collect; the `allow` goes when `cross_model_consult_result` lands.
-    #[allow(dead_code)]
+    /// Which start path created this job; see [`Review::kind`]. Read by the result tools to refuse a
+    /// cross-kind collect.
     pub kind: JobKind,
     pub turn: u32,
     pub resumed: bool,

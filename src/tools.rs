@@ -763,8 +763,6 @@ impl App {
     /// lease/identity/preflight/chain machinery; `kind` gates the handful of findings/capture
     /// differences (the prompt field, the Perforce change requirement, the evidence-eligibility gate,
     /// the ledger, and the response wording). See `docs/cross-model-consult-plan.md`.
-    // Wired into the MCP dispatch in the next slice; unreached in the binary until then.
-    #[allow(dead_code)]
     pub fn start_consult(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
         self.start(crate::registry::JobKind::Consult, args, request)
     }
@@ -1346,6 +1344,7 @@ impl App {
         &self,
         args: &Value,
         request: &RequestCancel,
+        expected_kind: crate::registry::JobKind,
     ) -> Result<(Snapshot, u64), Failure> {
         let review_id = string_arg(args, "review_id");
         let session = string_arg(args, "session");
@@ -1401,6 +1400,17 @@ impl App {
                 ))
             }
         };
+
+        // Refuse a cross-kind collect *before* waiting: a consult id handed to
+        // cross_model_review_result (or a review id to cross_model_consult_result) is the wrong tool,
+        // and blocking on it for minutes only to reject at the end would be worse. `session`-name
+        // resolution passes through here too, because the registry indexes running jobs by name
+        // across kinds. Reads Snapshot.kind. See docs/cross-model-consult-plan.md (f9).
+        if let Some(snap) = self.registry.snapshot(&id) {
+            if snap.kind != expected_kind {
+                return Err(wrong_result_tool_error(&id, expected_kind));
+            }
+        }
 
         // Abandoning this call detaches the wait; it does NOT stop the review. `attach_wait`
         // binds this request as a waiter, not an owner, so a `notifications/cancelled` leaves the
@@ -1460,7 +1470,21 @@ impl App {
         args: &Value,
         request: &RequestCancel,
     ) -> Result<(String, Option<Value>), Failure> {
-        let (snapshot, wait) = self.collect_snapshot(args, request)?;
+        let (snapshot, wait) =
+            self.collect_snapshot(args, request, crate::registry::JobKind::Review)?;
+        self.render_snapshot_both(&snapshot, wait)
+    }
+
+    /// Collect a consult and render both channels. The twin of [`review_result_both`]: it shares the
+    /// blocking collect and the running/failed rendering, differing only in the cross-kind guard
+    /// (`Consult`) and the completed render (prose, no findings envelope).
+    pub fn consult_result_both(
+        &self,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<(String, Option<Value>), Failure> {
+        let (snapshot, wait) =
+            self.collect_snapshot(args, request, crate::registry::JobKind::Consult)?;
         self.render_snapshot_both(&snapshot, wait)
     }
 
@@ -1483,6 +1507,9 @@ impl App {
                     running_progress_of(snapshot),
                 )),
             )),
+            Status::Completed if snapshot.kind == crate::registry::JobKind::Consult => {
+                Ok(self.render_completed_consult(snapshot))
+            }
             Status::Completed => Ok(self.render_completed_both(snapshot)),
             Status::Failed => {
                 // Preserve the active-entry attribution the completed path renders: a failed
@@ -1766,6 +1793,111 @@ impl App {
             rendered.into_value()
         });
         (out, structured)
+    }
+
+    /// Render both channels of a completed *consult*: the reviewer's prose answer framed as a second
+    /// opinion, with the run facts (reviewer, cost, denials, warnings) but no findings envelope,
+    /// verdict, or `_OUT` block — a consult certifies nothing. The structured value mirrors the text,
+    /// so a structured-only client is never poorer than a text one (the issue #73 discipline). Every
+    /// string is marker-neutralised, and the assembled body is swept, so a text-only client sees zero
+    /// envelope blocks (the truthful count for a consult) rather than one smuggled in via the answer.
+    fn render_completed_consult(&self, snapshot: &Snapshot) -> (String, Option<Value>) {
+        let sweep = |s: &str| crate::findings::strip_marker_lines(s);
+        let reviewer = sweep(
+            &snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
+        );
+        let usage = (!snapshot.usage.is_empty()).then(|| sweep(&snapshot.usage.summary()));
+        let warnings: Vec<String> = snapshot.warnings.iter().map(|w| sweep(w)).collect();
+        let denials: Vec<String> = snapshot
+            .denials
+            .iter()
+            .take(DENIAL_EXAMPLES)
+            .map(|d| sweep(d))
+            .collect();
+        let denial_count = snapshot.denial_count.max(snapshot.denials.len());
+        let answer = sweep(snapshot.review.as_deref().unwrap_or("(no answer text)"));
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "status:    {}\n\
+             review_id: {}\n\
+             session:   {} ({})\n\
+             reviewer:  {reviewer}\n\
+             elapsed:   {}s\n\n",
+            snapshot.status.as_str(),
+            snapshot.id,
+            snapshot.session,
+            if snapshot.resumed {
+                format!("turn {}, continuing an earlier consult", snapshot.turn)
+            } else {
+                "turn 1, new consult".to_string()
+            },
+            snapshot.elapsed.as_secs(),
+        ));
+        if let Some(usage) = &usage {
+            out.push_str(&format!("usage:     {usage}\n\n"));
+        }
+        for warning in &warnings {
+            out.push_str(&format!("WARNING: {warning}\n\n"));
+        }
+        if denial_count > 0 || !denials.is_empty() {
+            let count_phrase = if snapshot.denial_count_is_floor {
+                format!("at least {denial_count}")
+            } else {
+                denial_count.to_string()
+            };
+            out.push_str(&format!(
+                "Note: the reviewer tried {count_phrase} command(s) it was not permitted to run, so \
+                 parts of its answer may rest on less evidence than usual:\n",
+            ));
+            for denial in &denials {
+                out.push_str(&format!("  - {denial}\n"));
+            }
+            out.push('\n');
+        }
+        out.push_str("--- BEGIN ANSWER ---\n");
+        out.push_str(&answer);
+        out.push_str("\n--- END ANSWER ---\n\n");
+        out.push_str(
+            "This is an informal second opinion from a different model, not a verdict. Weigh it and \
+             act on what you agree with.\n\n",
+        );
+        if snapshot.resumable {
+            out.push_str(&format!(
+                "To ask a follow-up with the same context, call cross_model_consult again with \
+                 session \"{}\".\n",
+                snapshot.session
+            ));
+        } else {
+            out.push_str(&format!(
+                "Note: this consult was not saved as a resumable session, so calling \
+                 cross_model_consult with session \"{}\" again starts a fresh consultation that does \
+                 not remember this exchange.\n",
+                snapshot.session
+            ));
+        }
+        let out = crate::findings::strip_marker_lines(&out);
+
+        let structured = serde_json::json!({
+            "status": "completed",
+            "kind": "consult",
+            "review_id": snapshot.id,
+            "session": snapshot.session,
+            "turn": snapshot.turn,
+            "resumed": snapshot.resumed,
+            "resumable": snapshot.resumable,
+            "reviewer": reviewer,
+            "answer": answer,
+            "denials": denials,
+            "denial_count": denial_count,
+            "denial_count_is_floor": snapshot.denial_count_is_floor,
+            "warnings": warnings,
+            "usage": usage,
+        });
+        (out, Some(structured))
     }
 
     /// One `status`/`--doctor` line describing an entry's proactive usage gate: its configured
@@ -4131,6 +4263,28 @@ fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) 
 /// Every branch refuses rather than silently starting a new session. A resume that quietly
 /// became a fresh review is the one outcome this tool must not produce: the caller asked
 /// for continuity and would act on the answer as though it had it.
+/// The error for collecting a job through the wrong result tool: a review id handed to
+/// `cross_model_consult_result`, or a consult id to `cross_model_review_result`. `expected` is the
+/// kind the result tool serves; the job is the other kind. See `docs/cross-model-consult-plan.md` (f9).
+fn wrong_result_tool_error(id: &str, expected: crate::registry::JobKind) -> Failure {
+    let (this_tool, other_start, other_result) = match expected {
+        crate::registry::JobKind::Review => (
+            "cross_model_review_result",
+            "cross_model_consult",
+            "cross_model_consult_result",
+        ),
+        crate::registry::JobKind::Consult => (
+            "cross_model_consult_result",
+            "cross_model_review",
+            "cross_model_review_result",
+        ),
+    };
+    errors::bad_request(format!(
+        "'{id}' was started by {other_start}, so it must be collected with {other_result}, not \
+         {this_tool}."
+    ))
+}
+
 /// Whether a single reviewer entry can provide the read-only evidence service a consult requires.
 /// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a
 /// profile-pinned, shell-less, git-top-level, isolated Claude ([`claude_evidence_enabled`]). An
@@ -5395,6 +5549,49 @@ mod tests {
         let claude_only =
             Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config");
         assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
+    }
+
+    #[test]
+    fn a_cross_kind_collect_is_refused_before_waiting() {
+        // A consult id handed to cross_model_review_result (or a review id to
+        // cross_model_consult_result) is the wrong tool. The refusal fires on the kind check in
+        // collect_snapshot, before the blocking wait, so it returns immediately even though the job
+        // is still "running" — proven here by never finishing the job.
+        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+
+        let (consult_id, _c) = app
+            .registry
+            .try_start("s", crate::registry::JobKind::Consult, 1, false)
+            .expect("start consult");
+        let err = app
+            .review_result_both(
+                &json!({"review_id": consult_id, "wait_seconds": 0}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("cross_model_consult_result"),
+            "{}",
+            err.summary
+        );
+
+        let (review_id, _c) = app
+            .registry
+            .try_start("t", crate::registry::JobKind::Review, 1, false)
+            .expect("start review");
+        let err = app
+            .consult_result_both(
+                &json!({"review_id": review_id, "wait_seconds": 0}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("cross_model_review_result"),
+            "{}",
+            err.summary
+        );
     }
 
     #[test]
