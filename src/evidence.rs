@@ -478,6 +478,17 @@ pub fn write_claude_mcp_config(
     Ok(BundleFile { path })
 }
 
+/// The nonce-bound serve-record file for one review (retire-capture-modes mechanism 3). Deterministic
+/// from the capability dir and nonce, so the child (`serve_stdio`, deriving it from the bundle's own
+/// directory) and the parent (which computes it here to read and to own its RAII cleanup) name the
+/// same file without threading a path between processes.
+pub fn serve_record_path(
+    cfg: &crate::config::Config,
+    nonce: &str,
+) -> Result<PathBuf, EvidenceError> {
+    Ok(capability_dir(cfg)?.join(format!("{nonce}-serverecord.jsonl")))
+}
+
 fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError> {
     let candidates = [cfg.state_dir.clone(), std::env::temp_dir()];
     let mut last = None;

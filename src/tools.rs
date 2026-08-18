@@ -3682,7 +3682,20 @@ impl Job {
                 } else {
                     None
                 };
-                Some((executable, sterile, bundle_file, mcp_config_file))
+                // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
+                // appends to it, the parent reads it after the run, and dropping this handle at turn
+                // end removes it. `None` if the path cannot be resolved — a missing sink fails the
+                // gate closed at read time rather than here.
+                let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
+                    .ok()
+                    .map(|path| crate::evidence::BundleFile { path });
+                Some((
+                    executable,
+                    sterile,
+                    bundle_file,
+                    mcp_config_file,
+                    serverecord_file,
+                ))
             } else {
                 None
             };
@@ -3788,18 +3801,17 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let evidence_invocation =
-            evidence_setup
-                .as_ref()
-                .map(|(executable, sterile, bundle, mcp_config)| {
-                    crate::reviewer::EvidenceInvocation {
-                        executable,
-                        bundle_file: &bundle.path,
-                        nonce: &self.id,
-                        sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
-                        mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
-                    }
-                });
+        let evidence_invocation = evidence_setup.as_ref().map(
+            |(executable, sterile, bundle, mcp_config, _serverecord)| {
+                crate::reviewer::EvidenceInvocation {
+                    executable,
+                    bundle_file: &bundle.path,
+                    nonce: &self.id,
+                    sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
+                    mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
+                }
+            },
+        );
         let invocation = match self.reviewer.invocation(
             &self.cfg,
             &self.spec,
@@ -4054,6 +4066,31 @@ impl Job {
             parsed.text = turn_eval.review_prose.clone();
             (Some(turn_eval), ledger, terminal)
         };
+
+        // Retire-capture-modes mechanism 4 (staged): a formal approval must rest on the complete
+        // canonical working-tree diff, served and paged to its terminal page (f1). Reviewer-agnostic
+        // — it reads the evidence server's serve-record file, not either CLI's stream. Staged
+        // deliberately: while the static change blob is still delivered through repository_change the
+        // reviewer makes no repository_diff call (`any_diff` false), so this cannot fire; it activates
+        // when the blob is removed and the preamble points the reviewer at repository_diff. The
+        // "never pulled any diff" floor lands with that same change, since it would misfire here while
+        // the blob path is live.
+        if !is_consult && evidence_setup.is_some() {
+            if let Some(te) = &turn_eval {
+                let approved = matches!(
+                    te.envelope.verdict,
+                    crate::findings::MachineVerdict::Approve
+                );
+                let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+                if approved && agg.any_diff && !agg.complete_canonical_terminal {
+                    return Err(errors::evidence_review_too_thin(
+                        "the reviewer approved without being served the complete canonical \
+                         working-tree diff paged to its end, so the approval would rest on less than \
+                         the whole change",
+                    ));
+                }
+            }
+        }
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
@@ -4807,6 +4844,74 @@ fn resume_block(
 /// `turn_not_durable` are recorded as ledger coverage, and promoting either here would turn one
 /// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
 /// because an over-budget turn always reports it at rank 0.
+/// What a review's `repository_diff` serve-records add up to (retire-capture-modes mechanisms 3/4).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DiffServeAggregate {
+    /// The reviewer made at least one `repository_diff` call this turn.
+    any_diff: bool,
+    /// A *canonical* operation — the whole working tree against the fork point, unnarrowed — was
+    /// served complete and paged to its terminal page. This is the floor a formal approval must
+    /// clear (f1): it proves the reviewer was served the entire change, end to end.
+    complete_canonical_terminal: bool,
+}
+
+/// Aggregate the nonce-bound serve-record JSONL the evidence server appended (mechanism 3). Each
+/// line is `{op, canonical, complete, terminal, ...}`; records are grouped by `op` and a canonical
+/// operation clears the floor only when some page marked it canonical, *every* page reported it
+/// complete, and some page was terminal. Malformed or missing lines are ignored — a review that
+/// cannot be shown to have been served the whole change fails closed at the caller, never rescued by
+/// a best guess. A missing file parses as the empty string: no diffs, floor not cleared.
+fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
+    #[derive(Clone, Copy)]
+    struct Op {
+        canonical: bool,
+        complete: bool,
+        terminal: bool,
+    }
+    let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
+    let mut any_diff = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        any_diff = true;
+        let bool_field = |k: &str| value.get(k).and_then(serde_json::Value::as_bool);
+        let entry = ops.entry(op.to_string()).or_insert(Op {
+            canonical: false,
+            complete: true,
+            terminal: false,
+        });
+        entry.canonical |= bool_field("canonical").unwrap_or(false);
+        // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
+        entry.complete &= bool_field("complete").unwrap_or(false);
+        entry.terminal |= bool_field("terminal").unwrap_or(false);
+    }
+    let complete_canonical_terminal = ops
+        .values()
+        .any(|o| o.canonical && o.complete && o.terminal);
+    DiffServeAggregate {
+        any_diff,
+        complete_canonical_terminal,
+    }
+}
+
+/// Read and aggregate the serve-record file for a review, best-effort. An unreadable or absent file
+/// yields the default (no diffs, floor not cleared), which fails the gate closed.
+fn read_serve_record_aggregate(cfg: &Config, nonce: &str) -> DiffServeAggregate {
+    crate::evidence::serve_record_path(cfg, nonce)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| aggregate_serve_records(&c))
+        .unwrap_or_default()
+}
+
 fn terminal_reason_for(envelope: &crate::findings::Envelope) -> Option<String> {
     envelope
         .non_convergence_reason
@@ -5034,6 +5139,49 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn serve_record_aggregate_clears_floor_only_on_a_complete_canonical_terminal_op() {
+        // Nothing recorded.
+        assert_eq!(aggregate_serve_records(""), DiffServeAggregate::default());
+
+        // A canonical op, complete and terminal in one page: floor cleared.
+        let a = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true}"#,
+        );
+        assert!(a.any_diff && a.complete_canonical_terminal);
+
+        // A canonical op paged across two calls, terminal on the second: cleared.
+        let paged = "{\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":false}\n\
+                     {\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":true,\"continuation\":true}";
+        assert!(aggregate_serve_records(paged).complete_canonical_terminal);
+
+        // The page-1-stop case: canonical op that never reached its terminal page — NOT cleared.
+        let stopped = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":false}"#,
+        );
+        assert!(stopped.any_diff && !stopped.complete_canonical_terminal);
+
+        // An incomplete canonical op (server-flagged) — not cleared.
+        assert!(
+            !aggregate_serve_records(
+                r#"{"op":"x","canonical":true,"complete":false,"terminal":true}"#
+            )
+            .complete_canonical_terminal
+        );
+
+        // Only a narrowed (non-canonical) exploratory diff: a diff happened, but the floor is not
+        // cleared — the path-restricted-approval case f1 named.
+        let narrow = aggregate_serve_records(
+            r#"{"op":"y","canonical":false,"complete":true,"terminal":true}"#,
+        );
+        assert!(narrow.any_diff && !narrow.complete_canonical_terminal);
+
+        // Malformed lines are ignored, not fatal.
+        let junk =
+            "not json\n{bad\n{\"op\":\"z\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
+        assert!(aggregate_serve_records(junk).complete_canonical_terminal);
+    }
 
     #[test]
     fn switch_guard_refuses_a_changed_or_unreadable_account() {
