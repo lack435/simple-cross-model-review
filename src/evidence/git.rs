@@ -338,12 +338,10 @@ pub fn merge_base(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<Option<String>, EvidenceError> {
-    let args = vec![
-        "merge-base".to_string(),
-        "--end-of-options".to_string(),
-        a.to_string(),
-        b.to_string(),
-    ];
+    // No `--end-of-options`: `git merge-base` does not accept it, and would fail the whole
+    // operation as "no merge base" (f2). It is unnecessary here anyway — both operands are full
+    // hex object ids the caller validated, so neither can be read as an option or a ref.
+    let args = vec!["merge-base".to_string(), a.to_string(), b.to_string()];
     match run(root, &args, limits, cancel, received_at) {
         Ok(out) => {
             let id = out.trim().to_string();

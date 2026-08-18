@@ -2325,13 +2325,18 @@ impl DiffEndpoint {
     }
 }
 
-/// Resolve `branch-base` to a fork-point commit id, preferring remote-tracking refs so a stale
-/// *local* branch can never be the base (f4). `@{upstream}` is tried first, then `origin/HEAD`;
-/// both are remote-tracking, so the "local ref behind its remote" widening (Case B) cannot arise by
-/// construction. When neither resolves, it fails closed rather than falling back to a guessed local
-/// base — the author sets the base (an upstream, or an explicit base commit), the tool does not
-/// guess it, and it never fetches. The one residual, an unfetched remote-tracking ref, is
-/// undetectable without a fetch and left to the author, exactly as the plan states.
+/// Resolve `branch-base` to the branch's fork point: `merge-base(HEAD, <default branch>)`.
+///
+/// The base ref is the repository's **default branch** — `origin/HEAD` (a symref to
+/// `origin/<default>`), then `origin/main`/`origin/master` as fallbacks — *not* `@{upstream}`. That
+/// distinction is f1, and it is a correctness one: `@{upstream}` is the branch's configured upstream,
+/// which under the common push-to-same-name workflow is the branch's *own* remote ref, so
+/// `merge-base(HEAD, @{upstream})` can equal HEAD and yield a canonical diff of only uncommitted
+/// changes while the gate still accepts an approval — the committed branch work silently omitted.
+/// The default branch is what a review is actually *against*. All candidates are remote-tracking, so
+/// a stale *local* branch can never be the base. When none resolves it fails closed rather than
+/// guessing a local base; the caller can pass an explicit base commit id instead. It never fetches —
+/// an unfetched remote-tracking ref is the residual the plan leaves to the author.
 fn resolve_branch_base(
     root: &Path,
     limits: &Limits,
@@ -2340,28 +2345,28 @@ fn resolve_branch_base(
 ) -> Result<(String, String), EvidenceError> {
     let head = super::git::resolve_commit(root, "HEAD", limits, cancel, received_at)?
         .ok_or_else(|| EvidenceError::new("branch_base_unresolved", "HEAD does not resolve"))?;
-    let (upstream, source) = if let Some(id) =
-        super::git::resolve_commit(root, "@{upstream}", limits, cancel, received_at)?
-    {
-        (id, "@{upstream}")
-    } else if let Some(id) =
-        super::git::resolve_commit(root, "origin/HEAD", limits, cancel, received_at)?
-    {
-        (id, "origin/HEAD")
-    } else {
-        return Err(EvidenceError::new(
+    let mut base_ref = None;
+    for candidate in ["origin/HEAD", "origin/main", "origin/master"] {
+        if let Some(id) = super::git::resolve_commit(root, candidate, limits, cancel, received_at)?
+        {
+            base_ref = Some((id, candidate));
+            break;
+        }
+    }
+    let (default_branch, source) = base_ref.ok_or_else(|| {
+        EvidenceError::new(
             "branch_base_unresolved",
-            "no upstream or origin/HEAD resolves the branch base; set an upstream or pass an \
-                 explicit base commit id",
-        ));
-    };
-    let base = super::git::merge_base(root, &head, &upstream, limits, cancel, received_at)?
+            "the default branch could not be resolved (no origin/HEAD, origin/main, or \
+             origin/master); pass an explicit base commit id, e.g. base: <full object id>",
+        )
+    })?;
+    let base = super::git::merge_base(root, &head, &default_branch, limits, cancel, received_at)?
         .ok_or_else(|| {
-            EvidenceError::new(
-                "branch_base_unresolved",
-                "HEAD shares no history with the resolved base",
-            )
-        })?;
+        EvidenceError::new(
+            "branch_base_unresolved",
+            "HEAD shares no history with the default branch",
+        )
+    })?;
     Ok((base, format!("merge-base(HEAD, {source})")))
 }
 
@@ -2376,16 +2381,29 @@ fn read_untracked(
 ) -> Result<(String, bool), EvidenceError> {
     let safe = resolve_existing_bounded(root, limits.max_path_bytes as usize, rel, false)
         .map_err(ReadFailure::into_evidence)?;
-    let data = std::fs::read(&safe).map_err(|e| {
+    let cap = limits.max_file_bytes as usize;
+    // Read at most cap+1 bytes rather than slurping the whole file and capping after (f5): a huge
+    // untracked file must not be pulled into memory in full. The +1 distinguishes "exactly cap"
+    // from "more remained".
+    let file = File::open(&safe).map_err(|e| {
         EvidenceError::new(
             "provider_failed",
             format!("cannot read untracked file: {e}"),
         )
     })?;
-    let cap = limits.max_file_bytes as usize;
+    let mut data = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| {
+            EvidenceError::new(
+                "provider_failed",
+                format!("cannot read untracked file: {e}"),
+            )
+        })?;
     let truncated = data.len() > cap;
+    data.truncate(cap);
     // Cutting mid-codepoint is fine: from_utf8_lossy substitutes the partial tail.
-    let text = String::from_utf8_lossy(&data[..cap.min(data.len())]).into_owned();
+    let text = String::from_utf8_lossy(&data).into_owned();
     Ok((text, truncated))
 }
 
@@ -2468,8 +2486,13 @@ fn compose_diff(
         let paths: Vec<String> = if path.is_empty() {
             paths
         } else {
-            // A path-narrowed diff only sees untracked files under that path.
-            paths.into_iter().filter(|p| p.starts_with(path)).collect()
+            // A path-narrowed diff only sees untracked files at that path or under it — matched on a
+            // path-component boundary so `src/foo` does not also pull in `src/foobar` (f6).
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            paths
+                .into_iter()
+                .filter(|p| p == path || p.starts_with(&prefix))
+                .collect()
         };
         complete = listing_complete;
         untracked_files = paths.len();

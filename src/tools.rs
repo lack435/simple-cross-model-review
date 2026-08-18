@@ -3697,11 +3697,17 @@ impl Job {
                 };
                 // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
                 // appends to it, the parent reads it after the run, and dropping this handle at turn
-                // end removes it. `None` if the path cannot be resolved — a missing sink fails the
-                // gate closed at read time rather than here.
+                // end removes it. It is created **fresh** (truncating), so a stale file left by a
+                // crashed earlier run that happened to reuse this process-local id cannot be read as
+                // this review's records (f4). `None` if the path cannot be resolved or created — a
+                // missing sink fails the gate closed at read time rather than here.
                 let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
                     .ok()
-                    .map(|path| crate::evidence::BundleFile { path });
+                    .and_then(|path| {
+                        std::fs::File::create(&path)
+                            .ok()
+                            .map(|_| crate::evidence::BundleFile { path })
+                    });
                 Some((
                     executable,
                     sterile,
@@ -4897,15 +4903,15 @@ struct CanonicalServe {
 /// cannot be shown to have been served the whole change fails closed at the caller, never rescued by
 /// a best guess. A missing file parses as the empty string: no diffs, floor not cleared.
 fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
-    #[derive(Clone, Copy)]
+    #[derive(Default)]
     struct Op {
         canonical: bool,
         complete: bool,
         terminal: bool,
+        counts: Option<CanonicalServe>,
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
     let mut any_diff = false;
-    let mut canonical: Option<CanonicalServe> = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -4919,26 +4925,25 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         };
         any_diff = true;
         let bool_field = |k: &str| value.get(k).and_then(serde_json::Value::as_bool);
-        let entry = ops.entry(op.to_string()).or_insert(Op {
-            canonical: false,
-            complete: true,
-            terminal: false,
-        });
-        entry.canonical |= bool_field("canonical").unwrap_or(false);
-        // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
-        entry.complete &= bool_field("complete").unwrap_or(false);
-        entry.terminal |= bool_field("terminal").unwrap_or(false);
-        // The canonical operation's counts ride on its first page (the record carrying `files`);
-        // the last such wins, which for a given tree state describes the same change.
         let u64_field = |k: &str| {
             value
                 .get(k)
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as usize
         };
+        let entry = ops.entry(op.to_string()).or_insert_with(|| Op {
+            complete: true,
+            ..Op::default()
+        });
+        entry.canonical |= bool_field("canonical").unwrap_or(false);
+        // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
+        entry.complete &= bool_field("complete").unwrap_or(false);
+        entry.terminal |= bool_field("terminal").unwrap_or(false);
+        // The counts ride on this operation's first page (the record carrying `files`), and stay
+        // bound to *this* op id — not overwritten by a later, possibly different, canonical op.
         if bool_field("canonical").unwrap_or(false) {
             if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
-                canonical = Some(CanonicalServe {
+                entry.counts = Some(CanonicalServe {
                     base: value
                         .get("base_source")
                         .and_then(serde_json::Value::as_str)
@@ -4952,9 +4957,15 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
             }
         }
     }
-    let complete_canonical_terminal = ops
-        .values()
-        .any(|o| o.canonical && o.complete && o.terminal);
+    // Require *exactly one* canonical operation (f3). Zero means none was served; more than one is
+    // ambiguous — an early complete op must not clear the floor for a later, possibly incomplete or
+    // differently-scoped one — so both fail closed. The single canonical op clears the floor only
+    // when it is itself complete and reached its terminal page, and its counts feed captured:.
+    let canonical_ops: Vec<&Op> = ops.values().filter(|o| o.canonical).collect();
+    let (complete_canonical_terminal, canonical) = match canonical_ops.as_slice() {
+        [only] => (only.complete && only.terminal, only.counts.clone()),
+        _ => (false, None),
+    };
     DiffServeAggregate {
         any_diff,
         complete_canonical_terminal,
@@ -5279,6 +5290,13 @@ mod tests {
                 .canonical
                 .is_none()
         );
+
+        // Two distinct canonical operations are ambiguous and do NOT clear the floor (f3) — an early
+        // complete op must not certify a later, possibly different one.
+        let two = "{\"op\":\"a\",\"canonical\":true,\"complete\":true,\"terminal\":true}\n\
+                   {\"op\":\"b\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
+        let t = aggregate_serve_records(two);
+        assert!(t.any_diff && !t.complete_canonical_terminal && t.canonical.is_none());
     }
 
     #[test]

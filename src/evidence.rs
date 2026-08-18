@@ -547,7 +547,9 @@ fn cleanup_capability_dir(dir: &Path) -> Result<(), EvidenceError> {
     {
         let entry = entry.map_err(|e| EvidenceError::new("bundle_write_failed", e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with("-evidence.json") {
+        // Reap both the bundle and the serve-record side-channel (f4): a serve-record file orphaned
+        // by a crash must not linger to be misread by a later run that reused its id.
+        if !name.ends_with("-evidence.json") && !name.ends_with("-serverecord.jsonl") {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())
