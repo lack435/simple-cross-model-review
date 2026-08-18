@@ -298,7 +298,7 @@ code you do not trust:
 Both reviewers run configuration-isolated, so a committed hook, plugin, or MCP server in the
 reviewed repository cannot execute during a review. The Codex reviewer — and a profile-pinned,
 shell-less Claude — read the repository through a read-only, path-scoped evidence service
-(`repository_scope`/`list`/`search`/`read`/`change`, plus Git `history`/`revision`) rather than by
+(`repository_scope`/`list`/`search`/`read`/`change`/`diff`, plus Git `history`/`revision`) rather than by
 loading project config; an ambient Claude reviewer instead uses its scoped native Read/Grep/Glob
 tools.
 
