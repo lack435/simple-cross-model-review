@@ -547,13 +547,16 @@ impl Registry {
         self.changed.notify_all();
     }
 
-    /// Most recent review for a session, running or not.
-    pub fn latest_for_session(&self, session: &str) -> Option<String> {
+    /// Most recent job of `kind` for a session, running or not. Kind-scoped so a session name reused
+    /// across kinds (a review then a consult, or the reverse, via `fresh`) resolves to the job the
+    /// caller's tool actually serves — otherwise a valid consult could resolve to a newer review and
+    /// be rejected by the cross-kind guard, and progress could report the wrong job (consult f2).
+    pub fn latest_for_session(&self, session: &str, kind: JobKind) -> Option<String> {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .reviews
             .values()
-            .filter(|r| r.session == session)
+            .filter(|r| r.session == session && r.kind == kind)
             .max_by_key(|r| r.started)
             .map(|r| r.id.clone())
     }
@@ -844,7 +847,9 @@ mod tests {
         // The newest survives, so the review a caller is most likely to collect -- the one
         // it just started -- is never the one thrown away.
         assert_eq!(
-            registry.latest_for_session("default").as_deref(),
+            registry
+                .latest_for_session("default", JobKind::Review)
+                .as_deref(),
             ids.last().map(String::as_str)
         );
     }

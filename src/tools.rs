@@ -944,15 +944,22 @@ impl App {
                 crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
             )
         {
-            return Err(resume_refusal(
-                &session,
+            // The write-ahead marker guards durability for both kinds (f1), but the remediation reads
+            // differently: a consult has no findings ledger to carry.
+            let reason = if is_consult {
+                format!(
+                    "the previous turn did not finish durably (its write-ahead marker is still set), \
+                     so the turn may have been lost. Start a fresh {noun} (fresh: true).",
+                    noun = job_noun(kind)
+                )
+            } else {
                 "the previous turn did not finish durably (its findings write-ahead marker is \
                  still set), so its findings ledger may be stale or the turn was lost. Start a \
                  fresh review (fresh: true) carrying any still-open findings into the new \
                  instructions."
-                    .to_string(),
-                prior.as_ref(),
-            ));
+                    .to_string()
+            };
+            return Err(resume_refusal(&session, reason, prior.as_ref()));
         }
 
         // A stored session that exists but must not be resumed is refused here, while the
@@ -1385,15 +1392,18 @@ impl App {
             // rather than stored; see `Registry::was_issued`. So this states both
             // possibilities rather than guessing at one, which is the honest shape of what
             // the server actually knows.
-            (None, Some(name)) => self.registry.latest_for_session(name).ok_or_else(|| {
-                errors::bad_request(format!(
-                    "No review is currently retained for session '{name}'. Either none was \
+            (None, Some(name)) => self
+                .registry
+                .latest_for_session(name, expected_kind)
+                .ok_or_else(|| {
+                    errors::bad_request(format!(
+                        "No review is currently retained for session '{name}'. Either none was \
                      started in this server process, or one finished and its result has since \
                      been discarded to bound memory. Either way it is not recoverable: start a \
                      new review. If you still hold the review_id, pass that instead — it can \
                      tell the two apart."
-                ))
-            })?,
+                    ))
+                })?,
             (None, None) => {
                 return Err(errors::bad_request(
                     "Provide either 'review_id' (preferred) or 'session'.",
@@ -1499,14 +1509,26 @@ impl App {
         wait: u64,
     ) -> Result<(String, Option<Value>), Failure> {
         match snapshot.status {
-            Status::Running => Ok((
-                self.render_running(snapshot, wait),
-                Some(crate::findings::running_structured_value(
-                    &snapshot.session,
-                    snapshot.turn,
-                    running_progress_of(snapshot),
-                )),
-            )),
+            Status::Running => {
+                // A consult's running envelope carries its own kind and no findings/convergence group
+                // (there is none), rather than the review-shaped running value.
+                let structured = if snapshot.kind == crate::registry::JobKind::Consult {
+                    serde_json::json!({
+                        "status": "running",
+                        "kind": "consult",
+                        "review_id": snapshot.id,
+                        "session": snapshot.session,
+                        "turn": snapshot.turn,
+                    })
+                } else {
+                    crate::findings::running_structured_value(
+                        &snapshot.session,
+                        snapshot.turn,
+                        running_progress_of(snapshot),
+                    )
+                };
+                Ok((self.render_running(snapshot, wait), Some(structured)))
+            }
             Status::Completed if snapshot.kind == crate::registry::JobKind::Consult => {
                 Ok(self.render_completed_consult(snapshot))
             }
@@ -1527,23 +1549,28 @@ impl App {
     }
 
     fn render_running(&self, snapshot: &Snapshot, waited: u64) -> String {
+        // A running consult must be polled with its own result tool: telling the caller to retry with
+        // cross_model_review_result would send it to the tool that rejects its id cross-kind.
+        let noun = job_noun(snapshot.kind);
+        let result_tool = result_tool_for(snapshot.kind);
         // Two different reasons to be looking at a running review, and inviting a retry is
         // only right for one of them. A wait ended by shutdown will get no second call:
         // the process is exiting and review ids do not survive it, so saying "call again"
         // would be advice the caller cannot act on.
         let next = if snapshot.shutting_down {
-            "This server's stdin is no longer readable, so it is shutting down and this \
-             wait will not be extended. The review will not be delivered, and its \
-             review_id does not survive the server process.\n\n\
-             Do not proceed as though the review had come back. Start a new review once the \
-             server is running again."
-                .to_string()
+            format!(
+                "This server's stdin is no longer readable, so it is shutting down and this wait \
+                 will not be extended. The {noun} will not be delivered, and its review_id does not \
+                 survive the server process.\n\n\
+                 Do not proceed as though the {noun} had come back. Start a new {noun} once the \
+                 server is running again."
+            )
         } else {
             format!(
-                "The reviewer is still working. This call waited {waited}s. Call \
-                 cross_model_review_result again with the same review_id to keep waiting.\n\n\
-                 Do not start a second review for this session, and do not proceed as though \
-                 the review had come back."
+                "The reviewer is still working. This call waited {waited}s. Call {result_tool} \
+                 again with the same review_id to keep waiting.\n\n\
+                 Do not start a second {noun} for this session, and do not proceed as though the \
+                 {noun} had come back."
             )
         };
         let body = format!(
@@ -1575,6 +1602,11 @@ impl App {
         // nonce-bearing block whether the review is running or done. The running variant carries no
         // convergence/findings group — there is nothing to decide yet — but does carry the same
         // progress/liveness the text line shows.
+        // A consult has no machine envelope, running or completed, so it appends no `_OUT` block —
+        // only the marker-swept body, so a text-only client sees zero envelope blocks either way.
+        if snapshot.kind == crate::registry::JobKind::Consult {
+            return crate::findings::strip_marker_lines(&body);
+        }
         let out_block = crate::findings::running_out_block(
             &snapshot.id,
             &snapshot.session,
@@ -1592,9 +1624,10 @@ impl App {
     /// Invalid or already-finished identifiers return no message: the result call itself
     /// owns the authoritative error or terminal response, and a speculative notification
     /// must not race it with a contradictory claim.
-    pub fn review_progress(&self, args: &Value) -> Option<String> {
+    pub fn review_progress(&self, args: &Value, kind: crate::registry::JobKind) -> Option<String> {
         let id = string_arg(args, "review_id").or_else(|| {
-            string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
+            string_arg(args, "session")
+                .and_then(|name| self.registry.latest_for_session(&name, kind))
         })?;
         let snapshot = self.registry.snapshot(&id)?;
         (snapshot.status == Status::Running).then(|| {
@@ -4263,6 +4296,23 @@ fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) 
 /// Every branch refuses rather than silently starting a new session. A resume that quietly
 /// became a fresh review is the one outcome this tool must not produce: the caller asked
 /// for continuity and would act on the answer as though it had it.
+/// The result tool that collects a job of this kind — so a running poll invites a retry on the tool
+/// that actually accepts the id, not the other one (which would reject it cross-kind).
+fn result_tool_for(kind: crate::registry::JobKind) -> &'static str {
+    match kind {
+        crate::registry::JobKind::Review => "cross_model_review_result",
+        crate::registry::JobKind::Consult => "cross_model_consult_result",
+    }
+}
+
+/// The human noun for a job of this kind, for caller-facing prose.
+fn job_noun(kind: crate::registry::JobKind) -> &'static str {
+    match kind {
+        crate::registry::JobKind::Review => "review",
+        crate::registry::JobKind::Consult => "consult",
+    }
+}
+
 /// The error for collecting a job through the wrong result tool: a review id handed to
 /// `cross_model_consult_result`, or a consult id to `cross_model_review_result`. `expected` is the
 /// kind the result tool serves; the job is the other kind. See `docs/cross-model-consult-plan.md` (f9).

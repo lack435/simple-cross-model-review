@@ -1,6 +1,17 @@
 # cross_model_consult — a lightweight second opinion
 
-Status: **plan, under review (revision 3).** Not yet implemented.
+Status: **implemented (v1, tree-only).** This document is the design of record; the sections below
+describe the full design, and the note immediately below records what v1 actually ships.
+
+> **v1 scope — tree-only (`include_change` deferred).** The shipped consult is **tree-only**: it
+> captures no diff and reads the repository through the read-only evidence service. The
+> `include_change: true` capture contract described under [Change capture](#change-capture) (finding
+> f2) is **not implemented in v1** — the tool advertises no `include_change` argument, and a caller
+> cannot request one (the schema is `additionalProperties: false`). It is a deliberate scope cut, not
+> an oversight: the common consult ("does this direction look right?", "where is X?") is tree-only,
+> and the capture contract + resume binding are enough machinery to be their own PR. The
+> [Change capture](#change-capture) section below is retained as the design for that follow-up. Every
+> other section describes v1 as shipped.
 
 Revision 2 folded in the cross-review of revision 1 (session `cross-model-consult-plan`, 8 findings,
 all accepted). The through-line of that review: *resumability*, not the ledger, is what pulls in the

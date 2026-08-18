@@ -270,13 +270,14 @@ impl ProgressReporter {
         interval: Duration,
     ) -> Option<Self> {
         // Both result tools emit progress while their blocking wait is open: a consult can take a
-        // few minutes too, and the progress snapshot (phase, elapsed, liveness) is kind-agnostic.
-        if !matches!(
-            params.get("name").and_then(Value::as_str),
-            Some("cross_model_review_result") | Some("cross_model_consult_result")
-        ) {
-            return None;
-        }
+        // few minutes too, and the progress snapshot (phase, elapsed, liveness) is kind-agnostic. The
+        // kind selects which job a `session`-addressed progress request resolves, so it cannot report
+        // the other kind's job under a reused name (consult f2).
+        let expected_kind = match params.get("name").and_then(Value::as_str) {
+            Some("cross_model_review_result") => crate::registry::JobKind::Review,
+            Some("cross_model_consult_result") => crate::registry::JobKind::Consult,
+            _ => return None,
+        };
         let token = params
             .get("_meta")
             .and_then(|meta| meta.get("progressToken"))
@@ -292,7 +293,7 @@ impl ProgressReporter {
         }
         // Nor a wait that the result call is about to reject, or a review that already
         // finished between calls.
-        let initial = app.review_progress(&args)?;
+        let initial = app.review_progress(&args, expected_kind)?;
 
         send_progress(writer, &token, 0, initial);
 
@@ -321,7 +322,7 @@ impl ProgressReporter {
                     if request.is_cancelled() {
                         break;
                     }
-                    let Some(message) = app.review_progress(&args) else {
+                    let Some(message) = app.review_progress(&args, expected_kind) else {
                         break;
                     };
                     progress = progress.saturating_add(1);
@@ -1175,19 +1176,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
             None => "Omit to use the reviewer's base model/effort.".to_string(),
         };
         let names = primary.level_names();
-        if let Some(props) = tools[0]["inputSchema"]["properties"].as_object_mut() {
-            props.insert(
-                "level".to_string(),
-                json!({
-                    "type": "string",
-                    "enum": names,
-                    "description": format!(
-                        "Optional review depth preset. Chosen at start and fixed for the session: a \
-                         resume/re-review keeps the session's original level (pass fresh:true to \
-                         change it). Levels: {menu}. {default_hint}"
-                    )
-                }),
+        let level_prop = json!({
+            "type": "string",
+            "enum": names,
+            "description": format!(
+                "Optional depth preset. Chosen at start and fixed for the session: a resume keeps \
+                 the session's original level (pass fresh:true to change it). Levels: {menu}. \
+                 {default_hint}"
+            )
+        });
+        // Both start tools resolve `level` through the shared start(), so both advertise it. Matched
+        // by name rather than index so the injection is robust to tool ordering (consult f4).
+        for tool in tools.iter_mut() {
+            let is_start = matches!(
+                tool["name"].as_str(),
+                Some("cross_model_review") | Some("cross_model_consult")
             );
+            if is_start {
+                if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+                    props.insert("level".to_string(), level_prop.clone());
+                }
+            }
         }
     }
 
