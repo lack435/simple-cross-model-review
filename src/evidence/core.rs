@@ -903,6 +903,14 @@ impl Core {
             None => end,
         };
         let mut lines = Vec::with_capacity(end.saturating_sub(begin));
+        // Set when a single line's own encoded size exceeds the ceiling. `encoded_line_window_end`
+        // always yields at least one line to guarantee progress, so a lone quote-heavy line (under
+        // the raw `max_line_bytes` cap but over the ceiling once escaped) would otherwise be served
+        // whole and diverted by a capped MCP client. Truncate that one line's text to fit and flag
+        // the window truncated, so the reviewer sees most of it and knows it was cut, rather than
+        // losing the whole read (issue #114). Every other line already fits — the window's total
+        // encoded size is bounded, so no line but a forced oversized first can be cut here.
+        let mut line_truncated = false;
         for (offset, line) in all[begin..end].iter().enumerate() {
             if line.len() > self.bundle.limits.max_line_bytes as usize {
                 return Err(EvidenceError::new(
@@ -910,8 +918,19 @@ impl Core {
                     format!("'{path}' contains a line over the configured cap"),
                 ));
             }
-            lines.push(json!({"line": begin + offset + 1, "text": line}));
+            let text: &str = match self.bundle.page_bytes_ceiling {
+                Some(ceiling) => {
+                    let cut = encoded_bounded_end(line, 0, line.len(), ceiling as usize);
+                    if cut < line.len() {
+                        line_truncated = true;
+                    }
+                    &line[..cut]
+                }
+                None => line,
+            };
+            lines.push(json!({"line": begin + offset + 1, "text": text}));
         }
+        let complete = end == all.len() && !line_truncated;
         let fingerprint = crate::digest::Fingerprint::of(&bytes)
             .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
         // Only after the content is known good do we compute the (cached) drift stamp. The walk is
@@ -925,8 +944,8 @@ impl Core {
             "sha256": fingerprint.sha256,
             "total_lines": all.len(),
             "lines": lines,
-            "complete": end == all.len(),
-            "truncated": end < all.len(),
+            "complete": complete,
+            "truncated": !complete,
             "cursor": Value::Null,
             "drifted": drifted,
             "drift_unavailable": drift_unavailable,
@@ -3172,6 +3191,46 @@ mod tests {
         assert!(
             encoded <= ceiling,
             "encoded read window {encoded} exceeds ceiling"
+        );
+    }
+
+    // Issue #114 (f2 turn 2): a lone line under the raw `max_line_bytes` cap but over the encoded
+    // ceiling (here 15,000 quotes: 15 KB raw, ~30 KB escaped) must not be served whole and diverted.
+    // The one forced line is truncated to fit and the read is marked not-complete, rather than lost.
+    #[test]
+    fn a_single_over_ceiling_line_is_truncated_not_served_oversized() {
+        let dir = temp_dir("evidence-read-line-ceiling");
+        let ceiling: usize = 24 * 1024;
+        fs::write(dir.as_path().join("one.txt"), "\"".repeat(15_000)).unwrap();
+        let bundle = Bundle::create(
+            dir.as_path(),
+            crate::config::Vcs::Perforce,
+            "nonce-line-ceil",
+            "working tree".into(),
+            "captured".into(),
+            None,
+            Some(ceiling as u32),
+        )
+        .unwrap();
+        let mut core = Core::new(bundle).unwrap();
+        let resp = core
+            .call("repository_read", &json!({"path":"one.txt"}))
+            .unwrap();
+        // The whole file is one line, yet the read is not complete: its single line was cut to fit.
+        assert_eq!(resp["complete"], json!(false));
+        assert_eq!(resp["truncated"], json!(true));
+        let lines = resp["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        let text = lines[0]["text"].as_str().unwrap();
+        assert!(
+            text.len() < 15_000,
+            "the oversized line must be truncated, got {} chars",
+            text.len()
+        );
+        assert!(
+            super::json_escaped_len(text) <= ceiling,
+            "the truncated line's encoded size {} must fit the ceiling",
+            super::json_escaped_len(text)
         );
     }
 
