@@ -8,7 +8,8 @@ so it applies to Claude Code and Codex alike.
 `cross-review` is a Windows-only MCP server that hands work to a *different* model for
 review and returns what it said. Rust, MSVC toolchain, `serde` as the only dependency —
 the small self-contained binary is a feature, so do not add crates casually. See
-[README.md](README.md) for the full design.
+[README.md](README.md) for what it is and how to set it up, and [`docs/`](docs/) for the
+full design and its verified evidence.
 
 ## Pull requests
 
@@ -269,7 +270,7 @@ shipping a stale binary.
   policy, `--safe-mode`, the Codex sterile-root/evidence service plus
   `--ignore-user-config` / `--ignore-rules`, the path-scoped
   `Read(./**)` grants, and the job-object process reaping all exist for reasons documented
-  in the README with verified evidence. Do not relax any of them without saying plainly
+  in [`docs/`](docs/) with verified evidence. Do not relax any of them without saying plainly
   what boundary moves.
-- **Claim only what was verified.** The README distinguishes "verified" from "assumed"
+- **Claim only what was verified.** The docs distinguish "verified" from "assumed"
   deliberately. Keep that discipline in code comments and in what you tell the user.
