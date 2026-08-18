@@ -16,7 +16,7 @@ publish = false
 #   "prerelease" -> published, but not marked Latest
 #   "stable"     -> published as Latest
 [package.metadata.release]
-channel = "prerelease"
+channel = "stable"
 
 [[bin]]
 name = "cross-review"
