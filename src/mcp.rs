@@ -269,9 +269,15 @@ impl ProgressReporter {
         request: &Arc<RequestCancel>,
         interval: Duration,
     ) -> Option<Self> {
-        if params.get("name").and_then(Value::as_str) != Some("cross_model_review_result") {
-            return None;
-        }
+        // Both result tools emit progress while their blocking wait is open: a consult can take a
+        // few minutes too, and the progress snapshot (phase, elapsed, liveness) is kind-agnostic. The
+        // kind selects which job a `session`-addressed progress request resolves, so it cannot report
+        // the other kind's job under a reused name (consult f2).
+        let expected_kind = match params.get("name").and_then(Value::as_str) {
+            Some("cross_model_review_result") => crate::registry::JobKind::Review,
+            Some("cross_model_consult_result") => crate::registry::JobKind::Consult,
+            _ => return None,
+        };
         let token = params
             .get("_meta")
             .and_then(|meta| meta.get("progressToken"))
@@ -287,7 +293,7 @@ impl ProgressReporter {
         }
         // Nor a wait that the result call is about to reject, or a review that already
         // finished between calls.
-        let initial = app.review_progress(&args)?;
+        let initial = app.review_progress(&args, expected_kind)?;
 
         send_progress(writer, &token, 0, initial);
 
@@ -316,7 +322,7 @@ impl ProgressReporter {
                     if request.is_cancelled() {
                         break;
                     }
-                    let Some(message) = app.review_progress(&args) else {
+                    let Some(message) = app.review_progress(&args, expected_kind) else {
                         break;
                     };
                     progress = progress.saturating_add(1);
@@ -567,9 +573,18 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
             Err(failure) => text_result(failure.render_for_agent(), true),
         };
     }
+    // The consult's collect, on its own for the same reason: it carries a structured value alongside
+    // the text, and both come from one blocking wait so they cannot describe different states.
+    if name == "cross_model_consult_result" {
+        return match app.consult_result_both(&args, request) {
+            Ok((text, structured)) => text_result_with_structured(text, structured),
+            Err(failure) => text_result(failure.render_for_agent(), true),
+        };
+    }
 
     let outcome = match name {
         "cross_model_review" => app.start_review(&args, request),
+        "cross_model_consult" => app.start_consult(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
         "cross_model_setup_profile" => app.setup_profile(&args, request),
@@ -577,8 +592,9 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
             return text_result(
                 format!(
                     "Unknown tool '{other}'. This server provides cross_model_review, \
-                     cross_model_review_result, cross_model_review_status, \
-                     cross_model_review_cancel, and cross_model_setup_profile."
+                     cross_model_consult, cross_model_review_result, cross_model_consult_result, \
+                     cross_model_review_status, cross_model_review_cancel, and \
+                     cross_model_setup_profile."
                 ),
                 true,
             )
@@ -864,6 +880,98 @@ fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "cross_model_consult",
+            "description": format!(
+                "Ask {reviewer} an informal question about your work -- a lightweight second pair of \
+                 eyes, not a gated review. Use it for \"does this direction look right?\", \"where is \
+                 X handled in this code?\", or \"am I missing a simpler approach?\". The reviewer \
+                 reads the repository through a read-only evidence service and answers in prose: \
+                 there is no findings ledger, no verdict, and nothing to converge on.\n\n\
+                 Returns immediately with a review_id; collect the answer with \
+                 cross_model_consult_result. Reuse the same 'session' to ask a follow-up with the \
+                 earlier exchange still in context.\n\n\
+                 It requires the evidence service, so it runs only on a reviewer that provides one \
+                 (Codex, or a profile-pinned shell-less Claude); otherwise it fails with \
+                 EVIDENCE_UNAVAILABLE. If it fails, the consult did not happen -- tell the user what \
+                 the error says rather than answering yourself."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description":
+                            "What you want a second opinion on, or want found in the code. Passed to \
+                             the reviewer verbatim. Say why you are asking, not just what to look at."
+                    },
+                    "context_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description":
+                            "Optional paths to point the reviewer at first. Starting points, not \
+                             limits; it can read anything else it needs."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description":
+                            "Name for this consultation, chosen by you. Reusing a name continues the \
+                             same conversation for a follow-up. Defaults to 'default'."
+                    },
+                    "fresh": {
+                        "type": "boolean",
+                        "description":
+                            "Start a new conversation even if this session name already exists. \
+                             Defaults to false."
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "cross_model_consult_result",
+            "description": format!(
+                "Wait for and return the answer from a cross_model_consult. Blocks until the consult \
+                 is done: omit wait_seconds to wait to completion in one call. When the MCP client \
+                 supplies a progress token, it emits live phase and elapsed-time updates during the \
+                 wait. A consult usually takes a few minutes; a deeper question can take longer.\n\n\
+                 If the wait_seconds budget elapses before it finishes it returns status=running; \
+                 just call again with the same review_id. Abandoning this call does NOT cancel the \
+                 consult -- it keeps running and stays collectible by review_id. Use \
+                 cross_model_review_cancel to actually stop it.\n\n\
+                 The completed result is the reviewer's prose answer (an `answer` field in the \
+                 structured content), with the reviewer, cost, and any refused commands -- there is \
+                 no verdict or findings list. A review_id from cross_model_review must be collected \
+                 with cross_model_review_result, not here (and vice versa)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "review_id": {
+                        "type": "string",
+                        "description": "The review_id returned by cross_model_consult. Preferred."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description":
+                            "Session name, as an alternative to review_id. Returns that session's \
+                             most recent consult."
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description":
+                            "How long to wait before returning, in seconds. Omit to block until the \
+                             consult is done; pass 0 for an immediate snapshot."
+                    }
+                },
+                "additionalProperties": false
+            },
+            // The consult envelope this tool returns as `structuredContent`: a running/completed shape
+            // with a prose `answer` and the run facts, but no verdict or findings. Advertised so a
+            // client can validate the structured channel, as the review result does (consult f6).
+            "outputSchema": crate::tools::consult_output_schema()
+        }),
+        json!({
             "name": "cross_model_review_result",
             "description": format!(
                 "Wait for and return the review from {reviewer}. Blocks until the review is done: \
@@ -1072,19 +1180,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
             None => "Omit to use the reviewer's base model/effort.".to_string(),
         };
         let names = primary.level_names();
-        if let Some(props) = tools[0]["inputSchema"]["properties"].as_object_mut() {
-            props.insert(
-                "level".to_string(),
-                json!({
-                    "type": "string",
-                    "enum": names,
-                    "description": format!(
-                        "Optional review depth preset. Chosen at start and fixed for the session: a \
-                         resume/re-review keeps the session's original level (pass fresh:true to \
-                         change it). Levels: {menu}. {default_hint}"
-                    )
-                }),
+        let level_prop = json!({
+            "type": "string",
+            "enum": names,
+            "description": format!(
+                "Optional depth preset. Chosen at start and fixed for the session: a resume keeps \
+                 the session's original level (pass fresh:true to change it). Levels: {menu}. \
+                 {default_hint}"
+            )
+        });
+        // Both start tools resolve `level` through the shared start(), so both advertise it. Matched
+        // by name rather than index so the injection is robust to tool ordering (consult f4).
+        for tool in tools.iter_mut() {
+            let is_start = matches!(
+                tool["name"].as_str(),
+                Some("cross_model_review") | Some("cross_model_consult")
             );
+            if is_start {
+                if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+                    props.insert("level".to_string(), level_prop.clone());
+                }
+            }
         }
     }
 
@@ -1161,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_five_tools_with_valid_schemas() {
+    fn lists_exactly_the_seven_tools_with_valid_schemas() {
         let response = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
         let tools = response["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1169,6 +1285,8 @@ mod tests {
             names,
             vec![
                 "cross_model_review",
+                "cross_model_consult",
+                "cross_model_consult_result",
                 "cross_model_review_result",
                 "cross_model_review_status",
                 "cross_model_review_cancel",
@@ -1441,7 +1559,7 @@ mod tests {
         let app = app();
         let (review_id, reviewer_cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         // `attach_owned` is the start call's binding: its review_id was never delivered, so a
@@ -1470,7 +1588,7 @@ mod tests {
         let app = app();
         let (review_id, reviewer_cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         let request = Arc::new(RequestCancel::new());
@@ -1531,7 +1649,7 @@ mod tests {
         let app = app();
         let (id, _cancel) = app
             .registry()
-            .try_start("default", 1, false)
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
             .expect("start");
 
         let handle = {
@@ -1649,7 +1767,7 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("progress", 1, false)
+            .try_start("progress", crate::registry::JobKind::Review, 1, false)
             .expect("start");
         app.registry().report_activity(&review_id, 4096);
 
@@ -1711,7 +1829,12 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("cancel-progress", 1, false)
+            .try_start(
+                "cancel-progress",
+                crate::registry::JobKind::Review,
+                1,
+                false,
+            )
             .expect("start");
         let recorder = Recorder::default();
         let writer = recorder.writer();
@@ -1749,7 +1872,7 @@ mod tests {
         let app = app();
         let (review_id, _cancel) = app
             .registry()
-            .try_start("progress", 1, false)
+            .try_start("progress", crate::registry::JobKind::Review, 1, false)
             .expect("start");
         let recorder = Recorder::default();
         let writer = recorder.writer();

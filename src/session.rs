@@ -119,6 +119,13 @@ impl ProfileIdentity {
     }
 }
 
+/// A session created by `cross_model_review`. The default kind, and the value a legacy record
+/// (written before the `kind` field existed) is read as.
+pub const KIND_REVIEW: &str = "review";
+/// A session created by `cross_model_consult`. Its record carries no findings ledger and is never
+/// resumed by a review, nor a review session by a consult. See `docs/cross-model-consult-plan.md`.
+pub const KIND_CONSULT: &str = "consult";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub reviewer: String,
@@ -128,6 +135,13 @@ pub struct SessionRecord {
     pub model: String,
     pub effort: String,
     pub cwd: String,
+    /// Which start path created this session: [`KIND_REVIEW`] or [`KIND_CONSULT`]. A resume must
+    /// match kind — a review cannot resume a consult conversation, nor a consult a review — because
+    /// the two are shaped for different protocols (a review has a findings ledger and convergence; a
+    /// consult has neither). `None` on a record written before this field existed, read as
+    /// [`KIND_REVIEW`], the only kind that then existed. See `docs/cross-model-consult-plan.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub turns: u32,
     pub created_unix: u64,
     pub updated_unix: u64,
@@ -251,6 +265,13 @@ pub enum LedgerLoad {
 }
 
 impl SessionRecord {
+    /// This session's kind, resolving a legacy `None` to [`KIND_REVIEW`]. The cross-kind resume
+    /// refusal compares against this, never the raw `Option`, so a pre-`kind` record reads as a
+    /// review rather than as "no kind".
+    pub fn kind(&self) -> &str {
+        self.kind.as_deref().unwrap_or(KIND_REVIEW)
+    }
+
     /// Load this session's findings ledger, tri-state. `Invalid` is a durable poison: a resume of
     /// such a session is refused before the model call (an unreadable ledger cannot be injected).
     pub fn ledger_load(&self) -> LedgerLoad {
@@ -296,6 +317,9 @@ pub struct TurnFacts<'a> {
     pub model: &'a str,
     pub effort: &'a str,
     pub cwd: &'a str,
+    /// Which start path produced this turn: [`KIND_REVIEW`] or [`KIND_CONSULT`]. Invariant across a
+    /// session (a cross-kind resume is refused before a turn runs), so it is stored directly.
+    pub kind: &'a str,
     /// The running total this turn reported, for reviewers that report cumulatively.
     pub cumulative_usage: Option<crate::metrics::Usage>,
     /// The canonical Perforce changelist set this session is bound to, or `None` for git.
@@ -401,6 +425,7 @@ impl SessionStore {
             model,
             effort,
             cwd,
+            kind,
             cumulative_usage,
             changes,
             head_sha,
@@ -465,6 +490,9 @@ impl SessionStore {
                 model: model.to_string(),
                 effort: effort.to_string(),
                 cwd: cwd.to_string(),
+                // Invariant across a session: a cross-kind resume is refused before a turn runs, so
+                // this turn's kind equals the existing record's. Stored from this turn either way.
+                kind: Some(kind.to_string()),
                 cumulative_usage,
                 changes: changes.or(existing.changes.clone()),
                 // The (head, base) baseline was already resolved above as a unit -- this turn's
@@ -498,6 +526,7 @@ impl SessionStore {
                 model: model.to_string(),
                 effort: effort.to_string(),
                 cwd: cwd.to_string(),
+                kind: Some(kind.to_string()),
                 turns: 1,
                 created_unix: now,
                 updated_unix: now,
@@ -968,6 +997,7 @@ mod tests {
                     model: "gpt-5.6-luna",
                     effort: "max",
                     cwd: "C:\\repo",
+                    kind: KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
@@ -1051,6 +1081,7 @@ mod tests {
             model: "gpt-5.6-luna",
             effort: "max",
             cwd: r"C:\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: None,
             changes: None,
             head_sha: None,
@@ -1262,6 +1293,7 @@ mod tests {
             model: "gpt-5.6-luna",
             effort: "max",
             cwd: "C:\\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: Some(usage),
             changes: None,
             head_sha: None,
@@ -1310,6 +1342,7 @@ mod tests {
             model: "claude-opus-4-8",
             effort: "medium",
             cwd: "C:\\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: None,
             changes: None,
             head_sha: head.map(str::to_string),
@@ -1366,6 +1399,7 @@ mod tests {
             model: "claude-opus-4-8",
             effort: "medium",
             cwd: "C:\\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: None,
             changes: None,
             head_sha: head.map(str::to_string),
@@ -1407,6 +1441,7 @@ mod tests {
             model: "gpt-5.6-luna",
             effort: "max",
             cwd: "C:\\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: None,
             changes,
             head_sha: None,
@@ -1447,6 +1482,7 @@ mod tests {
             model: "gpt-5.6-luna",
             effort: "max",
             cwd: "C:\\repo",
+            kind: KIND_REVIEW,
             cumulative_usage: None,
             changes: Some(vec![42]),
             head_sha: None,
@@ -1634,6 +1670,7 @@ mod tests {
                     model: "m",
                     effort: "max",
                     cwd: "C:\\repo",
+                    kind: KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,

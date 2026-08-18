@@ -111,6 +111,22 @@ impl Capture {
             disposition: None,
         }
     }
+
+    /// An empty capture that ran no VCS command: no change, no warning, no baseline. Used by a
+    /// tree-only consult (`include_change: false`), which sends the reviewer no diff and reads the
+    /// tree through the evidence service instead. Distinct from [`warn`](Self::warn): nothing went
+    /// wrong, there was simply nothing to capture.
+    pub(crate) fn empty() -> Self {
+        Self {
+            change: None,
+            warnings: Vec::new(),
+            head_sha: None,
+            base_sha: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            disposition: None,
+        }
+    }
 }
 
 /// Some text captured from a VCS, plus whether it was cut short.

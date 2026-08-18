@@ -756,14 +756,72 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn start_review(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        self.start(crate::registry::JobKind::Review, args, request)
+    }
+
+    /// Start a consult — the ledger-free "second pair of eyes". It shares all of `start`'s
+    /// lease/identity/preflight/chain machinery; `kind` gates the handful of findings/capture
+    /// differences (the prompt field, the Perforce change requirement, the evidence-eligibility gate,
+    /// the ledger, and the response wording). See `docs/cross-model-consult-plan.md`.
+    pub fn start_consult(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        self.start(crate::registry::JobKind::Consult, args, request)
+    }
+
+    fn start(
+        &self,
+        kind: crate::registry::JobKind,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<String, Failure> {
+        let is_consult = kind == crate::registry::JobKind::Consult;
+        // The session kind this call may resume: a consult resumes only a consult, a review only a
+        // review (cross-kind resumes are refused in `resume_block`).
+        let expected_kind = if is_consult {
+            session::KIND_CONSULT
+        } else {
+            session::KIND_REVIEW
+        };
         // An invalid reviewer chain refuses every review, before the session lease and before any
         // reviewer preflight, so nothing is resolved or billed against a chain known to be broken.
         if let Some(err) = &self.chain_error {
             return Err(err.clone());
         }
 
-        let instructions = string_arg(args, "instructions")
-            .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
+        // A consult reads its prompt from `question`; a review from `instructions`.
+        let instructions = if is_consult {
+            string_arg(args, "question").ok_or_else(|| {
+                errors::bad_request(
+                    "'question' is required and must be a non-empty string: what do you want a \
+                     second opinion on, or found in the code?",
+                )
+            })?
+        } else {
+            string_arg(args, "instructions").ok_or_else(|| {
+                errors::bad_request(
+                    "'instructions' is required and must be a non-empty string describing what to \
+                     review.",
+                )
+            })?
+        };
+
+        // A consult is tree-only in this version: it reads the repository through the evidence service
+        // and captures no diff, so it takes none of the change/capture arguments. Reject them
+        // server-side, not only via the schema's additionalProperties:false — the server does not
+        // validate arguments against the schema, so a non-compliant client could otherwise pass
+        // include_change and have it silently ignored while the consult ran tree-only. `include_change`
+        // is the deferred capture contract (plan f2); `change`/`include_shelved` are the Perforce
+        // capture inputs. (consult review f3)
+        if is_consult {
+            for key in ["include_change", "change", "include_shelved"] {
+                if args.get(key).is_some_and(|v| !v.is_null()) {
+                    return Err(errors::bad_request(format!(
+                        "'{key}' is not supported by cross_model_consult: a consult is tree-only in \
+                         this version and reads the repository through the read-only evidence \
+                         service rather than a captured diff. Omit it."
+                    )));
+                }
+            }
+        }
 
         let session = string_arg(args, "session").unwrap_or_else(|| DEFAULT_SESSION.to_string());
         // A session name is rendered into the human response and keys on-disk marker files, so it
@@ -824,7 +882,9 @@ impl App {
                 ))
             }
         };
-        if self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
+        // A consult is tree-only in this cut, so it names no changelist even on Perforce (it reads
+        // the workspace through the evidence service). A review must name the change under review.
+        if !is_consult && self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
             return Err(errors::bad_request(
                 "'change' is required for a Perforce review: name the changelist number(s) to \
                  review, for example \"43650\" or [\"43650\",\"43651\"].",
@@ -903,15 +963,22 @@ impl App {
                 crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
             )
         {
-            return Err(resume_refusal(
-                &session,
+            // The write-ahead marker guards durability for both kinds (f1), but the remediation reads
+            // differently: a consult has no findings ledger to carry.
+            let reason = if is_consult {
+                format!(
+                    "the previous turn did not finish durably (its write-ahead marker is still set), \
+                     so the turn may have been lost. Start a fresh {noun} (fresh: true).",
+                    noun = job_noun(kind)
+                )
+            } else {
                 "the previous turn did not finish durably (its findings write-ahead marker is \
                  still set), so its findings ledger may be stale or the turn was lost. Start a \
                  fresh review (fresh: true) carrying any still-open findings into the new \
                  instructions."
-                    .to_string(),
-                prior.as_ref(),
-            ));
+                    .to_string()
+            };
+            return Err(resume_refusal(&session, reason, prior.as_ref()));
         }
 
         // A stored session that exists but must not be resumed is refused here, while the
@@ -930,7 +997,13 @@ impl App {
         // the refusal covers exactly the stale-ledger case, and the Perforce full-recapture path
         // survives for the not-stale ones.
         if let Some(record) = &prior {
-            if let Some(reason) = resume_block(&self.cfg, record, &changes_canonical, now_unix()) {
+            if let Some(reason) = resume_block(
+                &self.cfg,
+                record,
+                &changes_canonical,
+                expected_kind,
+                now_unix(),
+            ) {
                 return Err(resume_refusal(&session, reason, Some(record)));
             }
         }
@@ -1015,6 +1088,29 @@ impl App {
                 }
             },
         };
+        // A consult requires the read-only evidence service — it is how the model reads the code to
+        // answer — so refuse an evidence-incapable reviewer up front, before any billing. A fresh
+        // consult can fall through the chain on a rate limit, so every reachable entry from the
+        // selected start onward must be capable; a resume runs only its bound entry, so only that one
+        // is checked. See `docs/cross-model-consult-plan.md` (f3).
+        if is_consult {
+            let incapable = if prior.is_some() {
+                (!entry_provides_evidence(&self.cfg, &self.cfg.reviewers[start_index]))
+                    .then_some(start_index)
+            } else {
+                first_evidence_incapable_entry(&self.cfg, start_index)
+            };
+            if let Some(idx) = incapable {
+                return Err(errors::evidence_unavailable(format!(
+                    "a consult requires the read-only evidence service, but reviewer entry #{} ({}) \
+                     cannot provide it (an ambient or shell-enabled Claude has no evidence service); \
+                     a consult reachable from this chain could run on it. Use a Codex reviewer, or a \
+                     profile-pinned, shell-less Claude.",
+                    idx,
+                    self.cfg.reviewers[idx].describe(),
+                )));
+            }
+        }
         // Resolve the review `level` against the *selected* start entry, now that the gate (or the
         // resume matcher) has chosen it. Pure and cheap: an unknown level fails fast here, before any
         // preflight, auth check, or billing. On resume the level is validated only — the effective
@@ -1091,7 +1187,7 @@ impl App {
         // on the other side of that could never be collected.
         let (id, cancel) = self
             .registry
-            .try_start(&session, turn, resumed)
+            .try_start(&session, kind, turn, resumed)
             .map_err(|refused| match refused {
                 StartRefused::Busy(existing) => errors::session_busy(&session, &existing),
                 StartRefused::TooManyRunning { limit } => errors::too_many_running(limit),
@@ -1154,23 +1250,30 @@ impl App {
             // already-broken `legacy_uncovered` prior so it stays non-convergent rather than posing
             // as a fresh turn 1. `Invalid` cannot occur — `resume_block` already refused it above —
             // but is mapped to the same legacy fallback defensively.
-            prior_findings: prior.as_ref().map(|record| match record.ledger_load() {
-                session::LedgerLoad::Valid(l) => crate::findings::PriorState {
-                    coverage: l.coverage,
-                    next_seq: l.next_seq,
-                    findings: l.findings,
-                },
-                session::LedgerLoad::Absent | session::LedgerLoad::Invalid => {
-                    crate::findings::PriorState {
-                        coverage: crate::findings::LedgerCoverage::LegacyUncovered,
-                        next_seq: 1,
-                        findings: Vec::new(),
+            // A consult has no findings ledger to carry: it never assesses, so `attempt` never reads
+            // this. `None` keeps the consult path off the whole ledger machinery.
+            prior_findings: if is_consult {
+                None
+            } else {
+                prior.as_ref().map(|record| match record.ledger_load() {
+                    session::LedgerLoad::Valid(l) => crate::findings::PriorState {
+                        coverage: l.coverage,
+                        next_seq: l.next_seq,
+                        findings: l.findings,
+                    },
+                    session::LedgerLoad::Absent | session::LedgerLoad::Invalid => {
+                        crate::findings::PriorState {
+                            coverage: crate::findings::LedgerCoverage::LegacyUncovered,
+                            next_seq: 1,
+                            findings: Vec::new(),
+                        }
                     }
-                }
-            }),
+                })
+            },
             // Non-fresh calls passed the findings gate, so their marker was absent on entry; fresh
             // calls skipped it. Used to decide whether a pre-launch failure may clear the marker.
             findings_marker_absent_on_entry: !fresh,
+            kind,
             cancel,
             _lease: Some(lease),
         };
@@ -1190,8 +1293,15 @@ impl App {
             );
         }
 
+        // A consult and a review announce themselves differently: the noun, and which result tool
+        // collects it. The cancel tool is shared (it stops any running job by id).
+        let (noun, result_tool) = if is_consult {
+            ("Consult", "cross_model_consult_result")
+        } else {
+            ("Review", "cross_model_review_result")
+        };
         let mut out = String::new();
-        out.push_str("Review started. It runs in the background.\n\n");
+        out.push_str(&format!("{noun} started. It runs in the background.\n\n"));
         out.push_str(&format!("review_id: {id}\n"));
         out.push_str(&format!(
             "session:   {session} ({})\n",
@@ -1227,17 +1337,23 @@ impl App {
             fmt_elapsed(Duration::from_secs(self.cfg.max_wait_secs()))
         ));
         out.push_str(&format!(
-            "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
-             until the review is done -- omit wait_seconds to wait to completion in one call -- and \
-             reports progress while it is open when the MCP client supports progress notifications. \
-             If the wait_seconds budget elapses first it returns status=running; if your client's \
-             own tool timeout is shorter and fires first you get a client-side timeout instead of a \
-             result. Either way the review keeps running -- abandoning a collect does not cancel it \
-             -- so just call cross_model_review_result again with the same review_id. Use \
-             cross_model_review_cancel to actually stop the reviewer.\n\n\
-             In this project's usage, reviews commonly take at least five minutes, and complex \
-             changes can take 20 minutes or longer. A running status during that window is normal \
-             and is not a reason to start over or cancel the review.\n"
+            "Collect it with {result_tool} using review_id \"{id}\". That call blocks until the {} \
+             is done -- omit wait_seconds to wait to completion in one call -- and reports progress \
+             while it is open when the MCP client supports progress notifications. If the \
+             wait_seconds budget elapses first it returns status=running; if your client's own tool \
+             timeout is shorter and fires first you get a client-side timeout instead of a result. \
+             Either way it keeps running -- abandoning a collect does not cancel it -- so just call \
+             {result_tool} again with the same review_id. Use cross_model_review_cancel to actually \
+             stop the reviewer.\n\n{}\n",
+            noun.to_lowercase(),
+            if is_consult {
+                "A consult usually takes a few minutes; a deeper question can take longer. A running \
+                 status during that window is normal."
+            } else {
+                "In this project's usage, reviews commonly take at least five minutes, and complex \
+                 changes can take 20 minutes or longer. A running status during that window is \
+                 normal and is not a reason to start over or cancel the review."
+            }
         ));
         Ok(out)
     }
@@ -1254,6 +1370,7 @@ impl App {
         &self,
         args: &Value,
         request: &RequestCancel,
+        expected_kind: crate::registry::JobKind,
     ) -> Result<(Snapshot, u64), Failure> {
         let review_id = string_arg(args, "review_id");
         let session = string_arg(args, "session");
@@ -1294,21 +1411,35 @@ impl App {
             // rather than stored; see `Registry::was_issued`. So this states both
             // possibilities rather than guessing at one, which is the honest shape of what
             // the server actually knows.
-            (None, Some(name)) => self.registry.latest_for_session(name).ok_or_else(|| {
-                errors::bad_request(format!(
-                    "No review is currently retained for session '{name}'. Either none was \
+            (None, Some(name)) => self
+                .registry
+                .latest_for_session(name, expected_kind)
+                .ok_or_else(|| {
+                    errors::bad_request(format!(
+                        "No review is currently retained for session '{name}'. Either none was \
                      started in this server process, or one finished and its result has since \
                      been discarded to bound memory. Either way it is not recoverable: start a \
                      new review. If you still hold the review_id, pass that instead — it can \
                      tell the two apart."
-                ))
-            })?,
+                    ))
+                })?,
             (None, None) => {
                 return Err(errors::bad_request(
                     "Provide either 'review_id' (preferred) or 'session'.",
                 ))
             }
         };
+
+        // Refuse a cross-kind collect *before* waiting: a consult id handed to
+        // cross_model_review_result (or a review id to cross_model_consult_result) is the wrong tool,
+        // and blocking on it for minutes only to reject at the end would be worse. `session`-name
+        // resolution passes through here too, because the registry indexes running jobs by name
+        // across kinds. Reads Snapshot.kind. See docs/cross-model-consult-plan.md (f9).
+        if let Some(snap) = self.registry.snapshot(&id) {
+            if snap.kind != expected_kind {
+                return Err(wrong_result_tool_error(&id, expected_kind));
+            }
+        }
 
         // Abandoning this call detaches the wait; it does NOT stop the review. `attach_wait`
         // binds this request as a waiter, not an owner, so a `notifications/cancelled` leaves the
@@ -1368,7 +1499,21 @@ impl App {
         args: &Value,
         request: &RequestCancel,
     ) -> Result<(String, Option<Value>), Failure> {
-        let (snapshot, wait) = self.collect_snapshot(args, request)?;
+        let (snapshot, wait) =
+            self.collect_snapshot(args, request, crate::registry::JobKind::Review)?;
+        self.render_snapshot_both(&snapshot, wait)
+    }
+
+    /// Collect a consult and render both channels. The twin of [`review_result_both`]: it shares the
+    /// blocking collect and the running/failed rendering, differing only in the cross-kind guard
+    /// (`Consult`) and the completed render (prose, no findings envelope).
+    pub fn consult_result_both(
+        &self,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<(String, Option<Value>), Failure> {
+        let (snapshot, wait) =
+            self.collect_snapshot(args, request, crate::registry::JobKind::Consult)?;
         self.render_snapshot_both(&snapshot, wait)
     }
 
@@ -1383,14 +1528,29 @@ impl App {
         wait: u64,
     ) -> Result<(String, Option<Value>), Failure> {
         match snapshot.status {
-            Status::Running => Ok((
-                self.render_running(snapshot, wait),
-                Some(crate::findings::running_structured_value(
-                    &snapshot.session,
-                    snapshot.turn,
-                    running_progress_of(snapshot),
-                )),
-            )),
+            Status::Running => {
+                // A consult's running envelope carries its own kind and no findings/convergence group
+                // (there is none), rather than the review-shaped running value.
+                let structured = if snapshot.kind == crate::registry::JobKind::Consult {
+                    serde_json::json!({
+                        "status": "running",
+                        "kind": "consult",
+                        "review_id": snapshot.id,
+                        "session": snapshot.session,
+                        "turn": snapshot.turn,
+                    })
+                } else {
+                    crate::findings::running_structured_value(
+                        &snapshot.session,
+                        snapshot.turn,
+                        running_progress_of(snapshot),
+                    )
+                };
+                Ok((self.render_running(snapshot, wait), Some(structured)))
+            }
+            Status::Completed if snapshot.kind == crate::registry::JobKind::Consult => {
+                Ok(self.render_completed_consult(snapshot))
+            }
             Status::Completed => Ok(self.render_completed_both(snapshot)),
             Status::Failed => {
                 // Preserve the active-entry attribution the completed path renders: a failed
@@ -1408,23 +1568,28 @@ impl App {
     }
 
     fn render_running(&self, snapshot: &Snapshot, waited: u64) -> String {
+        // A running consult must be polled with its own result tool: telling the caller to retry with
+        // cross_model_review_result would send it to the tool that rejects its id cross-kind.
+        let noun = job_noun(snapshot.kind);
+        let result_tool = result_tool_for(snapshot.kind);
         // Two different reasons to be looking at a running review, and inviting a retry is
         // only right for one of them. A wait ended by shutdown will get no second call:
         // the process is exiting and review ids do not survive it, so saying "call again"
         // would be advice the caller cannot act on.
         let next = if snapshot.shutting_down {
-            "This server's stdin is no longer readable, so it is shutting down and this \
-             wait will not be extended. The review will not be delivered, and its \
-             review_id does not survive the server process.\n\n\
-             Do not proceed as though the review had come back. Start a new review once the \
-             server is running again."
-                .to_string()
+            format!(
+                "This server's stdin is no longer readable, so it is shutting down and this wait \
+                 will not be extended. The {noun} will not be delivered, and its review_id does not \
+                 survive the server process.\n\n\
+                 Do not proceed as though the {noun} had come back. Start a new {noun} once the \
+                 server is running again."
+            )
         } else {
             format!(
-                "The reviewer is still working. This call waited {waited}s. Call \
-                 cross_model_review_result again with the same review_id to keep waiting.\n\n\
-                 Do not start a second review for this session, and do not proceed as though \
-                 the review had come back."
+                "The reviewer is still working. This call waited {waited}s. Call {result_tool} \
+                 again with the same review_id to keep waiting.\n\n\
+                 Do not start a second {noun} for this session, and do not proceed as though the \
+                 {noun} had come back."
             )
         };
         let body = format!(
@@ -1456,6 +1621,11 @@ impl App {
         // nonce-bearing block whether the review is running or done. The running variant carries no
         // convergence/findings group — there is nothing to decide yet — but does carry the same
         // progress/liveness the text line shows.
+        // A consult has no machine envelope, running or completed, so it appends no `_OUT` block —
+        // only the marker-swept body, so a text-only client sees zero envelope blocks either way.
+        if snapshot.kind == crate::registry::JobKind::Consult {
+            return crate::findings::strip_marker_lines(&body);
+        }
         let out_block = crate::findings::running_out_block(
             &snapshot.id,
             &snapshot.session,
@@ -1473,9 +1643,10 @@ impl App {
     /// Invalid or already-finished identifiers return no message: the result call itself
     /// owns the authoritative error or terminal response, and a speculative notification
     /// must not race it with a contradictory claim.
-    pub fn review_progress(&self, args: &Value) -> Option<String> {
+    pub fn review_progress(&self, args: &Value, kind: crate::registry::JobKind) -> Option<String> {
         let id = string_arg(args, "review_id").or_else(|| {
-            string_arg(args, "session").and_then(|name| self.registry.latest_for_session(&name))
+            string_arg(args, "session")
+                .and_then(|name| self.registry.latest_for_session(&name, kind))
         })?;
         let snapshot = self.registry.snapshot(&id)?;
         (snapshot.status == Status::Running).then(|| {
@@ -1674,6 +1845,111 @@ impl App {
             rendered.into_value()
         });
         (out, structured)
+    }
+
+    /// Render both channels of a completed *consult*: the reviewer's prose answer framed as a second
+    /// opinion, with the run facts (reviewer, cost, denials, warnings) but no findings envelope,
+    /// verdict, or `_OUT` block — a consult certifies nothing. The structured value mirrors the text,
+    /// so a structured-only client is never poorer than a text one (the issue #73 discipline). Every
+    /// string is marker-neutralised, and the assembled body is swept, so a text-only client sees zero
+    /// envelope blocks (the truthful count for a consult) rather than one smuggled in via the answer.
+    fn render_completed_consult(&self, snapshot: &Snapshot) -> (String, Option<Value>) {
+        let sweep = |s: &str| crate::findings::strip_marker_lines(s);
+        let reviewer = sweep(
+            &snapshot
+                .active
+                .clone()
+                .unwrap_or_else(|| self.cfg.describe_reviewer()),
+        );
+        let usage = (!snapshot.usage.is_empty()).then(|| sweep(&snapshot.usage.summary()));
+        let warnings: Vec<String> = snapshot.warnings.iter().map(|w| sweep(w)).collect();
+        let denials: Vec<String> = snapshot
+            .denials
+            .iter()
+            .take(DENIAL_EXAMPLES)
+            .map(|d| sweep(d))
+            .collect();
+        let denial_count = snapshot.denial_count.max(snapshot.denials.len());
+        let answer = sweep(snapshot.review.as_deref().unwrap_or("(no answer text)"));
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "status:    {}\n\
+             review_id: {}\n\
+             session:   {} ({})\n\
+             reviewer:  {reviewer}\n\
+             elapsed:   {}s\n\n",
+            snapshot.status.as_str(),
+            snapshot.id,
+            snapshot.session,
+            if snapshot.resumed {
+                format!("turn {}, continuing an earlier consult", snapshot.turn)
+            } else {
+                "turn 1, new consult".to_string()
+            },
+            snapshot.elapsed.as_secs(),
+        ));
+        if let Some(usage) = &usage {
+            out.push_str(&format!("usage:     {usage}\n\n"));
+        }
+        for warning in &warnings {
+            out.push_str(&format!("WARNING: {warning}\n\n"));
+        }
+        if denial_count > 0 || !denials.is_empty() {
+            let count_phrase = if snapshot.denial_count_is_floor {
+                format!("at least {denial_count}")
+            } else {
+                denial_count.to_string()
+            };
+            out.push_str(&format!(
+                "Note: the reviewer tried {count_phrase} command(s) it was not permitted to run, so \
+                 parts of its answer may rest on less evidence than usual:\n",
+            ));
+            for denial in &denials {
+                out.push_str(&format!("  - {denial}\n"));
+            }
+            out.push('\n');
+        }
+        out.push_str("--- BEGIN ANSWER ---\n");
+        out.push_str(&answer);
+        out.push_str("\n--- END ANSWER ---\n\n");
+        out.push_str(
+            "This is an informal second opinion from a different model, not a verdict. Weigh it and \
+             act on what you agree with.\n\n",
+        );
+        if snapshot.resumable {
+            out.push_str(&format!(
+                "To ask a follow-up with the same context, call cross_model_consult again with \
+                 session \"{}\".\n",
+                snapshot.session
+            ));
+        } else {
+            out.push_str(&format!(
+                "Note: this consult was not saved as a resumable session, so calling \
+                 cross_model_consult with session \"{}\" again starts a fresh consultation that does \
+                 not remember this exchange.\n",
+                snapshot.session
+            ));
+        }
+        let out = crate::findings::strip_marker_lines(&out);
+
+        let structured = serde_json::json!({
+            "status": "completed",
+            "kind": "consult",
+            "review_id": snapshot.id,
+            "session": snapshot.session,
+            "turn": snapshot.turn,
+            "resumed": snapshot.resumed,
+            "resumable": snapshot.resumable,
+            "reviewer": reviewer,
+            "answer": answer,
+            "denials": denials,
+            "denial_count": denial_count,
+            "denial_count_is_floor": snapshot.denial_count_is_floor,
+            "warnings": warnings,
+            "usage": usage,
+        });
+        (out, Some(structured))
     }
 
     /// One `status`/`--doctor` line describing an entry's proactive usage gate: its configured
@@ -2028,6 +2304,11 @@ struct Job {
     /// turn set, which it must not drop. Note this is *not* the same as `resume_id.is_some()`: a
     /// non-fresh turn 1 with no record still passed the gate and can clear.
     findings_marker_absent_on_entry: bool,
+    /// Which start path drives this job: [`JobKind::Review`] runs the full findings/convergence
+    /// pipeline; [`JobKind::Consult`] skips assessment, the block, the ledger and the envelope, and
+    /// carries the reviewer's prose straight through. Every consult divergence in `attempt`/`run` is
+    /// gated on this, so a review job takes byte-identical paths. See `docs/cross-model-consult-plan.md`.
+    kind: crate::registry::JobKind,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -2141,6 +2422,23 @@ fn assemble_disposition(
 }
 
 impl Job {
+    /// Whether this is a consult job, on which every findings/convergence divergence in the pipeline
+    /// is gated. A review job always reads `false` here, so its paths are unchanged.
+    fn is_consult(&self) -> bool {
+        self.kind == crate::registry::JobKind::Consult
+    }
+
+    /// The session-record kind string this job persists — [`session::KIND_CONSULT`] for a consult,
+    /// [`session::KIND_REVIEW`] otherwise — so `record_turn` stamps the record with the right kind and
+    /// a later cross-kind resume is refused.
+    fn session_kind(&self) -> &'static str {
+        if self.is_consult() {
+            session::KIND_CONSULT
+        } else {
+            session::KIND_REVIEW
+        }
+    }
+
     /// The effective entry to run at chain index `i`: the configured entry, with the start entry's
     /// resolved level override applied when `i` is the start index. A mid-run rate-limit fallback
     /// (`i != start_index`) is never overridden — it runs at its own base `(model, effort)`
@@ -2256,7 +2554,8 @@ impl Job {
             self.effective_entry(self.start_index)
                 .describe_with_bin(&self.bin),
         );
-        if self.cfg.chain_needs_capture() {
+        // A consult captures nothing (tree-only), so it shows no Capturing phase.
+        if self.cfg.chain_needs_capture() && !self.is_consult() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
@@ -2267,7 +2566,8 @@ impl Job {
         // marker (`PriorTurnPending`) from a marker whose state could not be read
         // (`MarkerStateUnreadable`); `prior_pending` folds both non-`Absent` states fail-closed,
         // exactly as the previous `is_pending` did.
-        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce)
+        // A consult produces no resume-delta baseline, so it needs no Perforce in-progress marker.
+        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce && !self.is_consult())
             .then(|| self.sessions.marker_state(&self.session));
         let prior_pending = matches!(
             marker_state,
@@ -2279,6 +2579,7 @@ impl Job {
         // resumable baseline at all (forced to `Disabled` below). This is the *Perforce* baseline
         // marker; the findings write-ahead is a separate marker written in `attempt`.
         let pending_marked = self.cfg.vcs == crate::config::Vcs::Perforce
+            && !self.is_consult()
             && self.sessions.mark_pending(&self.session).is_ok();
 
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
@@ -2308,13 +2609,19 @@ impl Job {
                 })
             }),
         };
-        let capture = vcs::capture(
-            &self.cfg,
-            &self.changes,
-            self.include_shelved,
-            resume,
-            &self.cancel,
-        );
+        // A consult is tree-only in this cut (`include_change: false`): it sends the reviewer no diff
+        // and reads whatever it needs through the evidence service, so it skips capture entirely.
+        let capture = if self.is_consult() {
+            vcs::Capture::empty()
+        } else {
+            vcs::capture(
+                &self.cfg,
+                &self.changes,
+                self.include_shelved,
+                resume,
+                &self.cancel,
+            )
+        };
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
         let change = capture.change.as_ref().map(|c| c.rendered.clone());
@@ -3067,8 +3374,19 @@ impl Job {
             perforce_baseline,
             summary,
         } = captured;
+        // A consult diverges from a review only where findings/convergence are concerned; everything
+        // to do with account identity, the home lock, evidence setup, spawning, and durable recording
+        // is shared. Each divergence below is gated on this, so a review job (`false`) is unchanged.
+        let is_consult = self.is_consult();
         let preamble = if self.cfg.no_preamble {
             None
+        } else if is_consult {
+            Some(
+                self.cfg
+                    .preamble
+                    .as_deref()
+                    .unwrap_or(prompt::DEFAULT_CONSULT_PREAMBLE),
+            )
         } else {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
@@ -3214,7 +3532,13 @@ impl Job {
         // captured, which is also thin. Computed before `summary` is consumed below. When thin AND the
         // in-scope reviewer obtained no successful content evidence, the runtime gate (after
         // collect_run) fails the review closed.
-        let capture_thin = claude_in_scope
+        // A consult has no captured change to have read (the plan drops this liveness gate for it):
+        // requiring it to have consumed a specific diff would defeat "just ask a question", so
+        // `is_consult` disarms the section-7 gate. The evidence *service* is still required to start
+        // (start_consult refuses an evidence-incapable chain), and reads stay path-scoped; only the
+        // "you must have read the change" check is dropped.
+        let capture_thin = !is_consult
+            && claude_in_scope
             && summary
                 .as_ref()
                 .map_or(true, |s| s.is_empty() || !s.is_complete());
@@ -3282,13 +3606,19 @@ impl Job {
         // resumable. A genuinely-new session has nothing to strand, but aborting there too is
         // harmless (just retry), so the rule is simply "mark, or abort".
         if self.sessions.mark_findings_pending(&self.session).is_err() {
-            return Err(errors::session_not_resumable(
-                &self.session,
+            // The write-ahead marker guards durability for both kinds; the wording differs because a
+            // consult has no ledger to go stale (consult review f5).
+            let reason = if self.is_consult() {
+                "the write-ahead marker could not be written, so a crash could not be detected; the \
+                 turn was not started. Retry, or start a fresh consult."
+                    .to_string()
+            } else {
                 "the findings write-ahead marker could not be written, so a crash could not be \
                  detected and the ledger could go stale; the turn was not started. Retry, or start \
                  a fresh review."
-                    .to_string(),
-            ));
+                    .to_string()
+            };
+            return Err(errors::session_not_resumable(&self.session, reason));
         }
 
         let prior_findings_digest: Option<String> = prior_state
@@ -3329,24 +3659,42 @@ impl Job {
         } else {
             change
         };
-        let text = prompt::build(&PromptParts {
-            instructions: &self.instructions,
-            context_paths: &context_paths,
-            cwd: &self.cfg.cwd,
-            turn,
-            resumed: resume_id.is_some(),
-            preamble,
-            capabilities,
-            change: prompt_change,
-            resumed_capture_note,
-            // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
-            // repository lookalike cannot know it. The prior-findings digest is built from the
-            // loaded ledger in the worker wiring (task: tools.rs worker); `None` renders the
-            // first-turn form.
-            nonce: Some(&self.id),
-            prior_findings_digest: prior_findings_digest.as_deref(),
-            neutral_root,
-        });
+        let text = if is_consult {
+            // A consult never asks for a machine block (no nonce) or a prior-findings digest: it has
+            // no ledger to reconcile. The follow-up framing and the "no findings list" preamble come
+            // from `build_consult`.
+            prompt::build_consult(&prompt::ConsultPromptParts {
+                question: &self.instructions,
+                context_paths: &context_paths,
+                cwd: &self.cfg.cwd,
+                turn,
+                resumed: resume_id.is_some(),
+                preamble,
+                capabilities,
+                change: prompt_change,
+                resumed_capture_note,
+                neutral_root,
+            })
+        } else {
+            prompt::build(&PromptParts {
+                instructions: &self.instructions,
+                context_paths: &context_paths,
+                cwd: &self.cfg.cwd,
+                turn,
+                resumed: resume_id.is_some(),
+                preamble,
+                capabilities,
+                change: prompt_change,
+                resumed_capture_note,
+                // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
+                // repository lookalike cannot know it. The prior-findings digest is built from the
+                // loaded ledger in the worker wiring (task: tools.rs worker); `None` renders the
+                // first-turn form.
+                nonce: Some(&self.id),
+                prior_findings_digest: prior_findings_digest.as_deref(),
+                neutral_root,
+            })
+        };
         // Reported back through the out-parameter so it survives the error paths below:
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
@@ -3468,94 +3816,108 @@ impl Job {
         // review's id, matching what the prompt told the reviewer to emit.
         // Keep a copy of the pre-turn state for the not-durable envelope, which must report the
         // pre-turn on-disk coverage and preserve the prior findings (assess_turn consumes it).
+        // A consult carries none of this: its prose is the whole answer, so it skips assessment, the
+        // block-repair loop, the ledger and the envelope, and `turn_eval` stays `None`.
+        // `warnings_from_repair` and `repair_refused_on_account` are declared out here because the
+        // shared finalization below reads them; both stay at their defaults on the consult path.
         let prior_snapshot = prior_state.clone();
-        let mut assessment =
-            crate::findings::assess_turn(&self.session, turn, &self.id, &parsed.text, prior_state);
-
-        // The reviewer answered without a usable machine block (or with one that would not
-        // reconcile). Ask it once more, in the same conversation, for the block alone — a short
-        // call against a re-review that would cost a whole max-effort turn plus a rebaseline
-        // handoff. Everything about whether and how to ask is decided by the pure `plan_repair`;
-        // this loop only runs the child and hands the text back. See
-        // docs/unstructured-turn-recovery.md.
-        //
-        // The repair target is the main run's *effective* conversation id, resolved before anything
-        // is attempted. A fresh run that reported no id has no conversation to resume, and starting
-        // a new one to ask for a block would produce a block describing a review that never
-        // happened — so there is no repair on that path. Likewise when the main run already failed
-        // the identity check: its conversation is one the server has decided not to trust.
-        let repair_target: Option<String> =
-            if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
-                None
-            } else {
-                parsed
-                    .session_id
-                    .clone()
-                    .or_else(|| resume_id.map(str::to_string))
-            };
         let mut warnings_from_repair: Vec<String> = Vec::new();
-        // Set only by a tripped switch guard on a repair run: this turn is not recorded and its
-        // write-ahead marker is left set, exactly as the main run's guard refusal would.
         let mut repair_refused_on_account = false;
-        let mut attempts_left = self.cfg.block_repair_attempts;
-        while let Some(request) = crate::findings::plan_repair(
-            &assessment,
-            attempts_left,
-            self.cancel.load(std::sync::atomic::Ordering::SeqCst),
-        ) {
-            let Some(target) = repair_target.as_deref() else {
-                break;
-            };
-            attempts_left = attempts_left.saturating_sub(1);
-            let repair_prompt = crate::prompt::block_repair(
-                &request.corrective,
+        let (turn_eval, findings_ledger_to_persist, terminal_reason_to_persist): (
+            Option<crate::findings::TurnEvaluation>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = if is_consult {
+            (None, None, None)
+        } else {
+            let mut assessment = crate::findings::assess_turn(
+                &self.session,
+                turn,
                 &self.id,
-                request.prior_digest.as_deref(),
+                &parsed.text,
+                prior_state,
             );
-            *prompt_bytes = prompt_bytes.saturating_add(repair_prompt.len());
-            match self.run_block_repair(
-                target,
-                &repair_prompt,
-                evidence_invocation.as_ref(),
-                authorized_start.as_ref(),
-                usage_key,
-                &mut parsed,
+
+            // The reviewer answered without a usable machine block (or with one that would not
+            // reconcile). Ask it once more, in the same conversation, for the block alone — a short
+            // call against a re-review that would cost a whole max-effort turn plus a rebaseline
+            // handoff. Everything about whether and how to ask is decided by the pure `plan_repair`;
+            // this loop only runs the child and hands the text back. See
+            // docs/unstructured-turn-recovery.md.
+            //
+            // The repair target is the main run's *effective* conversation id, resolved before anything
+            // is attempted. A fresh run that reported no id has no conversation to resume, and starting
+            // a new one to ask for a block would produce a block describing a review that never
+            // happened — so there is no repair on that path. Likewise when the main run already failed
+            // the identity check: its conversation is one the server has decided not to trust.
+            let repair_target: Option<String> =
+                if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
+                    None
+                } else {
+                    parsed
+                        .session_id
+                        .clone()
+                        .or_else(|| resume_id.map(str::to_string))
+                };
+            let mut attempts_left = self.cfg.block_repair_attempts;
+            while let Some(request) = crate::findings::plan_repair(
+                &assessment,
+                attempts_left,
+                self.cancel.load(std::sync::atomic::Ordering::SeqCst),
             ) {
-                Ok(repair_text) => {
-                    // Any prose the reviewer wrote alongside the block is kept rather than dropped:
-                    // a repair answer is transport, but "I have reconsidered f2" arriving on one is
-                    // still the reviewer talking, and discarding it silently is how that goes
-                    // missing.
-                    let note = crate::findings::strip_reviewer_block(&repair_text, &self.id);
-                    let note = note.trim();
-                    if !note.is_empty() {
-                        // Handed to the assessment rather than appended to the rendered text later:
-                        // the envelope's prose is composed from the assessment, so a note appended
-                        // after the fact reached the text body and not the structured channel.
-                        let note: String = note.chars().take(REPAIR_NOTE_CHARS).collect();
-                        assessment.push_repair_note(&note);
+                let Some(target) = repair_target.as_deref() else {
+                    break;
+                };
+                attempts_left = attempts_left.saturating_sub(1);
+                let repair_prompt = crate::prompt::block_repair(
+                    &request.corrective,
+                    &self.id,
+                    request.prior_digest.as_deref(),
+                );
+                *prompt_bytes = prompt_bytes.saturating_add(repair_prompt.len());
+                match self.run_block_repair(
+                    target,
+                    &repair_prompt,
+                    evidence_invocation.as_ref(),
+                    authorized_start.as_ref(),
+                    usage_key,
+                    &mut parsed,
+                ) {
+                    Ok(repair_text) => {
+                        // Any prose the reviewer wrote alongside the block is kept rather than dropped:
+                        // a repair answer is transport, but "I have reconsidered f2" arriving on one is
+                        // still the reviewer talking, and discarding it silently is how that goes
+                        // missing.
+                        let note = crate::findings::strip_reviewer_block(&repair_text, &self.id);
+                        let note = note.trim();
+                        if !note.is_empty() {
+                            // Handed to the assessment rather than appended to the rendered text later:
+                            // the envelope's prose is composed from the assessment, so a note appended
+                            // after the fact reached the text body and not the structured channel.
+                            let note: String = note.chars().take(REPAIR_NOTE_CHARS).collect();
+                            assessment.push_repair_note(&note);
+                        }
+                        assessment = crate::findings::apply_repair(assessment, &repair_text);
                     }
-                    assessment = crate::findings::apply_repair(assessment, &repair_text);
-                }
-                Err(RunFailure {
-                    failure,
-                    account_refusal,
-                    // A repair never withdraws the findings write-ahead marker (see
-                    // `run_block_repair`), so `child_never_started` has no bearing here.
-                    child_never_started: _,
-                }) => {
-                    // A failed repair never fails the review: the prose in hand is good. Record why
-                    // and fall through to the degraded envelope the turn would have had anyway.
-                    if account_refusal {
-                        // Except this one, which is a security refusal rather than a failed retry.
-                        // The account moved while the turn was running, so the repair's answer is
-                        // discarded unread *and* the turn must not be recorded -- leaving the
-                        // write-ahead marker set, so the next call is refused a resume and
-                        // rebaselines rather than continuing a conversation whose account moved.
-                        // The main run's prose was answered under the pinned account and verified
-                        // so, which is why it is still returned rather than erroring the call.
-                        repair_refused_on_account = true;
-                        warnings_from_repair.push(format!(
+                    Err(RunFailure {
+                        failure,
+                        account_refusal,
+                        // A repair never withdraws the findings write-ahead marker (see
+                        // `run_block_repair`), so `child_never_started` has no bearing here.
+                        child_never_started: _,
+                    }) => {
+                        // A failed repair never fails the review: the prose in hand is good. Record why
+                        // and fall through to the degraded envelope the turn would have had anyway.
+                        if account_refusal {
+                            // Except this one, which is a security refusal rather than a failed retry.
+                            // The account moved while the turn was running, so the repair's answer is
+                            // discarded unread *and* the turn must not be recorded -- leaving the
+                            // write-ahead marker set, so the next call is refused a resume and
+                            // rebaselines rather than continuing a conversation whose account moved.
+                            // The main run's prose was answered under the pinned account and verified
+                            // so, which is why it is still returned rather than erroring the call.
+                            repair_refused_on_account = true;
+                            warnings_from_repair.push(format!(
                             "the profile home's account changed while this turn was running: the \
                              block-repair response was discarded unread and this turn was not \
                              recorded, so session '{}' cannot be resumed. Start a fresh review \
@@ -3565,41 +3927,44 @@ impl Job {
                             failure.code,
                             failure.summary.trim()
                         ));
-                    } else {
-                        warnings_from_repair.push(format!(
+                        } else {
+                            warnings_from_repair.push(format!(
                             "the reviewer was asked to re-emit its machine block and the attempt \
                              failed ({}): {}",
                             failure.code,
                             failure.summary.trim()
                         ));
+                        }
+                        assessment = crate::findings::apply_repair(assessment, "");
+                        // A spawn, probe, timeout or guard failure is not something the reviewer can
+                        // answer differently on a second ask; only re-billing it. Stop.
+                        break;
                     }
-                    assessment = crate::findings::apply_repair(assessment, "");
-                    // A spawn, probe, timeout or guard failure is not something the reviewer can
-                    // answer differently on a second ask; only re-billing it. Stop.
+                }
+                if assessment.is_structured() {
                     break;
                 }
             }
-            if assessment.is_structured() {
-                break;
-            }
-        }
 
-        let turn_eval = crate::findings::finalize_turn(
-            assessment,
-            crate::findings::Budget::default(),
-            self.cfg.stagnant_session_turns,
-        );
-        let findings_ledger_to_persist: Option<serde_json::Value> =
-            Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
-        let terminal_reason_to_persist = terminal_reason_for(&turn_eval.envelope);
-        // The prose we store and render, with the reviewer's own machine block (exact nonce)
-        // already removed by the evaluation — one owner for "what prose does this turn have",
-        // rather than stripping again here. Any *other* stray marker line (a wrong-nonce block, or
-        // one injected via another field) is neutralised at render time by `strip_marker_lines`
-        // over the whole result body, right before the canonical `_OUT` block is appended.
-        // Anything the reviewer said on a repair turn beyond the block itself is already in here,
-        // framed and appended by the evaluation, so both channels carry the same notes.
-        parsed.text = turn_eval.review_prose.clone();
+            let turn_eval = crate::findings::finalize_turn(
+                assessment,
+                crate::findings::Budget::default(),
+                self.cfg.stagnant_session_turns,
+            );
+            let ledger: Option<serde_json::Value> =
+                Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
+            let terminal = terminal_reason_for(&turn_eval.envelope);
+            // The prose we store and render, with the reviewer's own machine block (exact nonce)
+            // already removed by the evaluation — one owner for "what prose does this turn have",
+            // rather than stripping again here. Any *other* stray marker line (a wrong-nonce block, or
+            // one injected via another field) is neutralised at render time by `strip_marker_lines`
+            // over the whole result body, right before the canonical `_OUT` block is appended.
+            // Anything the reviewer said on a repair turn beyond the block itself is already in here,
+            // framed and appended by the evaluation, so both channels carry the same notes. A consult
+            // skips all of this and leaves `parsed.text` as the reviewer's raw prose.
+            parsed.text = turn_eval.review_prose.clone();
+            (Some(turn_eval), ledger, terminal)
+        };
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
@@ -3730,6 +4095,8 @@ impl Job {
                             model: &self.spec.model,
                             effort: &self.spec.effort,
                             cwd: &self.cfg.cwd.to_string_lossy(),
+                            // Review or consult, stamped so a later cross-kind resume is refused.
+                            kind: self.session_kind(),
                             cumulative_usage: baseline_to_persist,
                             // Bind the session to the changelist set (Perforce only), canonicalised
                             // so a re-review naming the same changelists in another order resumes.
@@ -3825,15 +4192,25 @@ impl Job {
                             // resume against the stale baseline. The old destructive poisoning (drop
                             // the mapping) predated the write-ahead markers and would now erase the
                             // preserved findings for no added safety.
-                            warnings.push(format!(
-                            "This turn could not be saved to disk ({e}), so session '{}' cannot be \
-                             resumed: the next call is refused a resume because the write-ahead \
-                             marker is still set. Any prior findings are preserved on disk -- \
-                             recover by starting a fresh review (fresh: true) carrying the \
-                             still-open findings into the new instructions. The review below is \
-                             unaffected.",
-                            self.session
-                        ));
+                            warnings.push(if self.is_consult() {
+                                format!(
+                                    "This turn could not be saved to disk ({e}), so session '{}' \
+                                     cannot be resumed: the next call is refused a resume because \
+                                     the write-ahead marker is still set. Start a fresh consult \
+                                     (fresh: true). The answer below is unaffected.",
+                                    self.session
+                                )
+                            } else {
+                                format!(
+                                    "This turn could not be saved to disk ({e}), so session '{}' \
+                                     cannot be resumed: the next call is refused a resume because \
+                                     the write-ahead marker is still set. Any prior findings are \
+                                     preserved on disk -- recover by starting a fresh review \
+                                     (fresh: true) carrying the still-open findings into the new \
+                                     instructions. The review below is unaffected.",
+                                    self.session
+                                )
+                            });
                             eprintln!("cross-review: warning: could not save session state: {e}");
                             false
                         }
@@ -3846,14 +4223,25 @@ impl Job {
                     // findings write-ahead marker was set before the reviewer ran and is never cleared
                     // without a durable record, so the next non-fresh call is refused at the findings
                     // gate for every backend. No destructive poisoning of the mapping is needed.
-                    warnings.push(format!(
-                    "The reviewer did not report a session id, so this turn could not be recorded \
-                     and session '{}' cannot be resumed: the next call is refused a resume because \
-                     the write-ahead marker is still set. Any prior findings are preserved on disk \
-                     -- start a fresh review (fresh: true) carrying the still-open findings into \
-                     the new instructions. The review below is still valid.",
-                    self.session
-                ));
+                    warnings.push(if self.is_consult() {
+                        format!(
+                            "The reviewer did not report a session id, so this turn could not be \
+                             recorded and session '{}' cannot be resumed: the next call is refused \
+                             a resume because the write-ahead marker is still set. Start a fresh \
+                             consult (fresh: true). The answer below is still valid.",
+                            self.session
+                        )
+                    } else {
+                        format!(
+                            "The reviewer did not report a session id, so this turn could not be \
+                             recorded and session '{}' cannot be resumed: the next call is refused \
+                             a resume because the write-ahead marker is still set. Any prior \
+                             findings are preserved on disk -- start a fresh review (fresh: true) \
+                             carrying the still-open findings into the new instructions. The review \
+                             below is still valid.",
+                            self.session
+                        )
+                    });
                     eprintln!(
                     "cross-review: warning: the reviewer did not report a session id, so review \
                      session '{}' cannot be resumed",
@@ -3869,17 +4257,19 @@ impl Job {
         // (`record_turn` failed, or the reviewer reported no id to record under), the durable
         // outcome is `turn_not_durable` with the pre-turn on-disk coverage — the caller escalates
         // and rebaselines rather than resuming on a ledger that disagrees with the reviewer.
-        let envelope = if durable {
-            turn_eval.envelope
-        } else {
-            // A turn ran here, and its increment is not in `findings` by construction — it exists
-            // only in the prose, which is exactly where the design tells a human to reconstruct
-            // from. The already-composed `envelope_prose` is handed over rather than the rendered
-            // text: it is capped once, in the evaluation, so re-capping here would cut the
-            // block-repair notes off the tail. The evaluated turn's own warnings ride along too —
-            // this is the one path that asks a human to reconstruct the turn, so discarding what
-            // the evaluation observed about it was exactly backwards.
-            {
+        // A consult has no envelope (`turn_eval` is `None`); a review builds one from its evaluation.
+        let envelope: Option<crate::findings::Envelope> = match turn_eval {
+            None => None,
+            Some(turn_eval) => Some(if durable {
+                turn_eval.envelope
+            } else {
+                // A turn ran here, and its increment is not in `findings` by construction — it exists
+                // only in the prose, which is exactly where the design tells a human to reconstruct
+                // from. The already-composed `envelope_prose` is handed over rather than the rendered
+                // text: it is capped once, in the evaluation, so re-capping here would cut the
+                // block-repair notes off the tail. The evaluated turn's own warnings ride along too —
+                // this is the one path that asks a human to reconstruct the turn, so discarding what
+                // the evaluation observed about it was exactly backwards.
                 let env = crate::findings::not_durable_envelope(
                     &self.session,
                     turn,
@@ -3895,7 +4285,7 @@ impl Job {
                     Some(repair) => env.with_block_repair(repair),
                     None => env,
                 }
-            }
+            }),
         };
         let resumable = turn_is_resumable(
             durable,
@@ -3920,7 +4310,8 @@ impl Job {
             resumable,
             usage: parsed.usage,
             active: None,
-            envelope: Some(envelope),
+            // `None` for a consult (no findings envelope); `Some` for a review.
+            envelope,
         })
     }
 }
@@ -3951,12 +4342,128 @@ fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) 
 /// Every branch refuses rather than silently starting a new session. A resume that quietly
 /// became a fresh review is the one outcome this tool must not produce: the caller asked
 /// for continuity and would act on the answer as though it had it.
+/// The result tool that collects a job of this kind — so a running poll invites a retry on the tool
+/// that actually accepts the id, not the other one (which would reject it cross-kind).
+fn result_tool_for(kind: crate::registry::JobKind) -> &'static str {
+    match kind {
+        crate::registry::JobKind::Review => "cross_model_review_result",
+        crate::registry::JobKind::Consult => "cross_model_consult_result",
+    }
+}
+
+/// The human noun for a job of this kind, for caller-facing prose.
+fn job_noun(kind: crate::registry::JobKind) -> &'static str {
+    match kind {
+        crate::registry::JobKind::Review => "review",
+        crate::registry::JobKind::Consult => "consult",
+    }
+}
+
+/// The advertised `outputSchema` for `cross_model_consult_result`: the running/completed shapes that
+/// [`App::render_running`] (consult path) and [`App::render_completed_consult`] emit. Advertised so a
+/// client can discover and validate the structured channel, as the review result already does
+/// (consult review f6). It carries no verdict, findings or convergence — a consult certifies nothing.
+/// The five common fields are required; the completed-only fields are optional, so both shapes
+/// validate against this one object without over-constraining the running variant. It is **strict**
+/// (`additionalProperties: false`): a consult certifies nothing, so review-only fields like `findings`
+/// or `outcome` are not merely absent but *forbidden*, which is what makes the advertised schema a
+/// faithful contract rather than a permissive superset (consult review f7). Every field a consult
+/// actually emits is listed here, so the strictness never rejects a real structured value.
+pub(crate) fn consult_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["status", "kind", "review_id", "session", "turn"],
+        "additionalProperties": false,
+        "properties": {
+            "status": {"type": "string", "enum": ["running", "completed"]},
+            "kind": {"type": "string", "const": "consult"},
+            "review_id": {"type": "string"},
+            "session": {"type": "string"},
+            "turn": {"type": "integer"},
+            "resumed": {"type": "boolean"},
+            "resumable": {"type": "boolean"},
+            "reviewer": {"type": "string"},
+            "answer": {"type": "string"},
+            "denials": {"type": "array", "items": {"type": "string"}},
+            "denial_count": {"type": "integer"},
+            "denial_count_is_floor": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "usage": {"type": ["string", "null"]}
+        }
+    })
+}
+
+/// The error for collecting a job through the wrong result tool: a review id handed to
+/// `cross_model_consult_result`, or a consult id to `cross_model_review_result`. `expected` is the
+/// kind the result tool serves; the job is the other kind. See `docs/cross-model-consult-plan.md` (f9).
+fn wrong_result_tool_error(id: &str, expected: crate::registry::JobKind) -> Failure {
+    let (this_tool, other_start, other_result) = match expected {
+        crate::registry::JobKind::Review => (
+            "cross_model_review_result",
+            "cross_model_consult",
+            "cross_model_consult_result",
+        ),
+        crate::registry::JobKind::Consult => (
+            "cross_model_consult_result",
+            "cross_model_review",
+            "cross_model_review_result",
+        ),
+    };
+    errors::bad_request(format!(
+        "'{id}' was started by {other_start}, so it must be collected with {other_result}, not \
+         {this_tool}."
+    ))
+}
+
+/// Whether a single reviewer entry can provide the read-only evidence service a consult requires.
+/// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a
+/// profile-pinned, shell-less, git-top-level, isolated Claude ([`claude_evidence_enabled`]). An
+/// ambient or shell-enabled Claude has no evidence service, so a consult must not run on it.
+fn entry_provides_evidence(cfg: &Config, spec: &crate::config::ReviewerSpec) -> bool {
+    spec.reviewer == crate::config::ReviewerKind::Codex
+        || crate::reviewer::claude::claude_evidence_enabled(cfg, spec)
+}
+
+/// The consult evidence-eligibility gate over the *reachable* chain (f3). A fresh consult starting at
+/// `start_index` can fall through, on a rate limit, to any later entry, so **every** entry from the
+/// start onward must be evidence-capable — otherwise a fall-through could land on an evidence-less
+/// reviewer and run a consult with no way to read the code, silently breaking its core guarantee.
+///
+/// Evaluated ignoring the proactive usage gate on purpose: that gate only ever *removes* entries from
+/// play, so the static suffix `reviewers[start_index..]` is a sound superset of what can actually run,
+/// and needs no atomic re-check against a moving selection. Returns the index of the first ineligible
+/// reachable entry, so the caller can name it in an `EVIDENCE_UNAVAILABLE`. A resume binds to one
+/// entry, so the caller passes that entry's index as both start and (implicitly) the only element it
+/// cares about — a later entry it can never fall through to does not gate it.
+fn first_evidence_incapable_entry(cfg: &Config, start_index: usize) -> Option<usize> {
+    cfg.reviewers
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .find(|(_, spec)| !entry_provides_evidence(cfg, spec))
+        .map(|(i, _)| i)
+}
+
 fn resume_block(
     cfg: &Config,
     record: &session::SessionRecord,
     requested_changes: &[u64],
+    expected_kind: &str,
     now: u64,
 ) -> Option<String> {
+    // Kind first: a session belongs to the start path that created it. A `cross_model_review` resume
+    // must never continue a consult conversation (nor a consult a review), because the two are shaped
+    // for different protocols — a review reconciles a findings ledger the consult conversation never
+    // built. Refuse cross-kind before any other check, so the message names the real mismatch rather
+    // than a downstream symptom. Legacy records read as KIND_REVIEW (see SessionRecord::kind).
+    if record.kind() != expected_kind {
+        return Some(format!(
+            "it is a '{}' session, but this is a '{}' request; the two use different protocols and \
+             cannot share a conversation. Use the matching tool, or start fresh.",
+            record.kind(),
+            expected_kind
+        ));
+    }
     // A stored session id that normalizes to absent (empty or whitespace-only) is not a real
     // resume handle: `--resume ""` would try to continue a conversation no reviewer holds. Newly
     // reported ids are normalized away at the adapter boundary (`reviewer::normalize_session_id`),
@@ -5072,6 +5579,7 @@ mod tests {
             model: cfg.primary().model.clone(),
             effort: cfg.primary().effort.clone(),
             cwd: cfg.cwd.to_string_lossy().to_string(),
+            kind: Some(crate::session::KIND_REVIEW.to_string()),
             turns,
             created_unix: 0,
             updated_unix,
@@ -5098,7 +5606,188 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
-        assert!(resume_block(&cfg, &ok, &[], now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
+    }
+
+    #[test]
+    fn a_resume_that_crosses_session_kind_is_refused() {
+        // A cross_model_review resume must never continue a consult conversation (and vice versa):
+        // the two are shaped for different protocols. The kind check fires before every other
+        // identity check, so a consult session that is otherwise a perfect match is still refused.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let now = 1_000_000;
+
+        let mut consult = record_matching(&cfg, 1, now);
+        consult.kind = Some(session::KIND_CONSULT.to_string());
+        let reason = resume_block(&cfg, &consult, &[], session::KIND_REVIEW, now)
+            .expect("a review must not resume a consult session");
+        assert!(reason.contains("consult"), "{reason}");
+        assert!(reason.contains("different protocols"), "{reason}");
+
+        // The converse: a review session cannot be resumed as a consult.
+        let review = record_matching(&cfg, 1, now);
+        let reason = resume_block(&cfg, &review, &[], session::KIND_CONSULT, now)
+            .expect("a consult must not resume a review session");
+        assert!(reason.contains("review"), "{reason}");
+
+        // A legacy record (no `kind`) reads as a review, so a review resume of it is not blocked on
+        // kind — the pre-`kind` sessions on disk keep resuming.
+        let mut legacy = record_matching(&cfg, 1, now);
+        legacy.kind = None;
+        assert_eq!(legacy.kind(), session::KIND_REVIEW);
+        assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, now).is_none());
+    }
+
+    #[test]
+    fn the_consult_evidence_gate_covers_the_whole_reachable_chain() {
+        // Codex always provides the evidence service; an ambient Claude never does (no profile, so
+        // claude_evidence_enabled is false). A consult can fall through to any later chain entry, so
+        // the gate must reject a chain whose suffix contains an evidence-less entry.
+        let codex_only = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        assert_eq!(first_evidence_incapable_entry(&codex_only, 0), None);
+
+        // Two capable Codex entries (distinct models, so not identity-equivalent): still all capable.
+        let two_codex = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+            "--reviewer".into(),
+            "codex".into(),
+            "--model".into(),
+            "gpt-5.6-sol".into(),
+        ])
+        .expect("config");
+        assert_eq!(first_evidence_incapable_entry(&two_codex, 0), None);
+
+        // A fresh consult on codex that could fall through to an ambient Claude is refused, and the
+        // gate names the ineligible entry (index 1) so EVIDENCE_UNAVAILABLE can point at it.
+        let fallthrough = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--reviewer".into(),
+            "claude".into(),
+        ])
+        .expect("config");
+        assert_eq!(first_evidence_incapable_entry(&fallthrough, 0), Some(1));
+
+        // But a resume bound to the codex entry (start_index 0) never reaches entry 1, and a resume
+        // bound to entry 1 would be the ambient Claude itself — so from index 1 the gate reports it.
+        assert_eq!(first_evidence_incapable_entry(&fallthrough, 1), Some(1));
+
+        // A single ambient Claude is incapable from the start.
+        let claude_only =
+            Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config");
+        assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
+    }
+
+    #[test]
+    fn a_consult_rejects_capture_arguments_server_side() {
+        // The schema forbids these for a compliant client, but the server does not validate against
+        // the schema, so a raw call must be rejected here too rather than silently running tree-only
+        // (consult review f3). The rejection fires before the session lease, so no state dir is needed.
+        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+        for (key, val) in [
+            ("include_change", json!(true)),
+            ("change", json!("43650")),
+            ("include_shelved", json!(true)),
+        ] {
+            let err = app
+                .start_consult(
+                    &json!({"question": "does this look right?", key: val}),
+                    &RequestCancel::new(),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, "BAD_REQUEST", "{key}");
+            assert!(err.summary.contains(key), "{}: {}", key, err.summary);
+            assert!(
+                err.summary.contains("tree-only"),
+                "{}: {}",
+                key,
+                err.summary
+            );
+        }
+    }
+
+    #[test]
+    fn the_consult_output_schema_is_strict_and_forbids_review_fields() {
+        // A consult certifies nothing, so its advertised schema must not merely omit review-only
+        // fields but forbid them (consult review f7).
+        let schema = consult_output_schema();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let props = schema["properties"].as_object().expect("properties object");
+        for forbidden in ["findings", "outcome", "converged", "verdict", "envelope"] {
+            assert!(
+                !props.contains_key(forbidden),
+                "consult schema must not permit review-only field '{forbidden}'"
+            );
+        }
+        // Every field a consult actually emits must be listed, or the strictness would reject a real
+        // structured value. These mirror render_completed_consult and the running consult value.
+        for emitted in [
+            "status",
+            "kind",
+            "review_id",
+            "session",
+            "turn",
+            "resumed",
+            "resumable",
+            "reviewer",
+            "answer",
+            "denials",
+            "denial_count",
+            "denial_count_is_floor",
+            "warnings",
+            "usage",
+        ] {
+            assert!(
+                props.contains_key(emitted),
+                "consult schema is missing emitted field '{emitted}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cross_kind_collect_is_refused_before_waiting() {
+        // A consult id handed to cross_model_review_result (or a review id to
+        // cross_model_consult_result) is the wrong tool. The refusal fires on the kind check in
+        // collect_snapshot, before the blocking wait, so it returns immediately even though the job
+        // is still "running" — proven here by never finishing the job.
+        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+
+        let (consult_id, _c) = app
+            .registry
+            .try_start("s", crate::registry::JobKind::Consult, 1, false)
+            .expect("start consult");
+        let err = app
+            .review_result_both(
+                &json!({"review_id": consult_id, "wait_seconds": 0}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("cross_model_consult_result"),
+            "{}",
+            err.summary
+        );
+
+        let (review_id, _c) = app
+            .registry
+            .try_start("t", crate::registry::JobKind::Review, 1, false)
+            .expect("start review");
+        let err = app
+            .consult_result_both(
+                &json!({"review_id": review_id, "wait_seconds": 0}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("cross_model_review_result"),
+            "{}",
+            err.summary
+        );
     }
 
     #[test]
@@ -5118,14 +5807,15 @@ mod tests {
             .to_ascii_uppercase()
             .replace('\\', "/");
         assert!(
-            resume_block(&cfg, &variant, &[], now).is_none(),
+            resume_block(&cfg, &variant, &[], session::KIND_REVIEW, now).is_none(),
             "a case/separator-only cwd difference should resume"
         );
 
         // A genuinely different working root still invalidates.
         let mut moved = record_matching(&cfg, 1, now);
         moved.cwd = "C:\\somewhere\\else".to_string();
-        let reason = resume_block(&cfg, &moved, &[], now).expect("a different cwd is refused");
+        let reason = resume_block(&cfg, &moved, &[], session::KIND_REVIEW, now)
+            .expect("a different cwd is refused");
         assert!(reason.contains("working root"), "{reason}");
     }
 
@@ -5135,7 +5825,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("ledger_too_large".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("terminal state"));
         assert!(reason.contains("ledger_too_large"));
     }
@@ -5209,6 +5900,7 @@ mod tests {
                     model: "gpt-5.6-luna",
                     effort: "max",
                     cwd: &cfg.cwd.display().to_string(),
+                    kind: session::KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
@@ -5230,7 +5922,8 @@ mod tests {
             .expect("record the turn");
         assert_eq!(rec.terminal_reason.as_deref(), Some("session_stagnant"));
 
-        let refusal = resume_block(&cfg, &rec, &[], now).expect("the next resume is refused");
+        let refusal = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+            .expect("the next resume is refused");
         assert!(refusal.contains("session_stagnant"), "{refusal}");
         assert!(
             refusal.contains("without raising or resolving a finding"),
@@ -5260,7 +5953,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(
             reason.contains("without raising or resolving a finding"),
@@ -5291,7 +5985,8 @@ mod tests {
         // Past the turn limit *and* idle past the window, as well as terminal.
         let mut rec = record_matching(&cfg, 9, now - cfg.resume_max_idle.as_secs() - 60);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason = resume_block(&cfg, &rec, &[], now).expect("terminal is refused");
+        let reason =
+            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(!reason.contains("--session-max-turns"), "{reason}");
         assert!(!reason.contains("--session-max-idle-seconds"), "{reason}");
@@ -5306,14 +6001,14 @@ mod tests {
         for blank in ["", "   ", "\t"] {
             let mut rec = record_matching(&cfg, 1, now);
             rec.cli_session_id = blank.to_string();
-            let reason =
-                resume_block(&cfg, &rec, &[], now).expect("a blank session id is refused resume");
+            let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+                .expect("a blank session id is refused resume");
             assert!(reason.contains("blank"), "{reason}");
         }
         // A real id still resumes (no blank-id refusal).
         let ok = record_matching(&cfg, 1, now);
         assert!(!ok.cli_session_id.trim().is_empty());
-        assert!(resume_block(&cfg, &ok, &[], now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5323,7 +6018,8 @@ mod tests {
         let mut rec = record_matching(&cfg, 1, now);
         // A ledger value that is not a compatible ledger -> LedgerLoad::Invalid -> refused.
         rec.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
-        let reason = resume_block(&cfg, &rec, &[], now).expect("invalid ledger is refused");
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+            .expect("invalid ledger is refused");
         assert!(reason.contains("unreadable or at an incompatible version"));
         // The refusal is tagged machine-readably as `ledger_unavailable`, so a caller can tell an
         // unreadable-ledger refusal from a policy one (turns/idle/mismatch, which carry no detail).
@@ -5338,7 +6034,8 @@ mod tests {
         let mut invalid_and_stale = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         invalid_and_stale.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
         let compound_reason =
-            resume_block(&cfg, &invalid_and_stale, &[], now).expect("too many turns is refused");
+            resume_block(&cfg, &invalid_and_stale, &[], session::KIND_REVIEW, now)
+                .expect("too many turns is refused");
         assert!(compound_reason.contains("turn"));
         let compound = resume_refusal("default", compound_reason, Some(&invalid_and_stale));
         assert_eq!(compound.detail.as_deref(), Some("ledger_unavailable"));
@@ -5347,8 +6044,8 @@ mod tests {
         // refusal with no record at all (a leftover findings marker on a name with no record).
         let mut healthy = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         healthy.findings_ledger = None;
-        let policy_reason =
-            resume_block(&cfg, &healthy, &[], now).expect("too many turns is refused");
+        let policy_reason = resume_block(&cfg, &healthy, &[], session::KIND_REVIEW, now)
+            .expect("too many turns is refused");
         assert_eq!(
             resume_refusal("default", policy_reason, Some(&healthy)).detail,
             None
@@ -5373,7 +6070,7 @@ mod tests {
         );
         let mut rec = record_matching(&cfg, 1, now);
         rec.findings_ledger = Some(serde_json::to_value(&ev.ledger).expect("serialize"));
-        assert!(resume_block(&cfg, &rec, &[], now).is_none());
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5385,6 +6082,7 @@ mod tests {
             &cfg,
             &record_matching(&cfg, cfg.resume_max_turns - 1, now),
             &[],
+            session::KIND_REVIEW,
             now
         )
         .is_none());
@@ -5392,6 +6090,7 @@ mod tests {
             &cfg,
             &record_matching(&cfg, cfg.resume_max_turns, now),
             &[],
+            session::KIND_REVIEW,
             now,
         )
         .expect("at the cap it is refused");
@@ -5405,9 +6104,22 @@ mod tests {
         let now = 1_000_000;
         let idle = cfg.resume_max_idle.as_secs();
         // Exactly at the window still resumes; one second past it does not.
-        assert!(resume_block(&cfg, &record_matching(&cfg, 1, now - idle), &[], now).is_none());
-        let reason = resume_block(&cfg, &record_matching(&cfg, 1, now - idle - 1), &[], now)
-            .expect("past the window it is refused");
+        assert!(resume_block(
+            &cfg,
+            &record_matching(&cfg, 1, now - idle),
+            &[],
+            session::KIND_REVIEW,
+            now
+        )
+        .is_none());
+        let reason = resume_block(
+            &cfg,
+            &record_matching(&cfg, 1, now - idle - 1),
+            &[],
+            session::KIND_REVIEW,
+            now,
+        )
+        .expect("past the window it is refused");
         assert!(reason.contains("resume window"), "{reason}");
         assert!(reason.contains("--session-max-idle-seconds"), "{reason}");
     }
@@ -5421,26 +6133,32 @@ mod tests {
 
         let mut wrong_reviewer = record_matching(&cfg, 1, now);
         wrong_reviewer.reviewer = "claude".to_string();
-        assert!(resume_block(&cfg, &wrong_reviewer, &[], now)
-            .expect("refused")
-            .contains("reviewer"));
+        assert!(
+            resume_block(&cfg, &wrong_reviewer, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("reviewer")
+        );
 
         let mut wrong_model = record_matching(&cfg, 1, now);
         wrong_model.model = "gpt-5.6-sol".to_string();
-        assert!(resume_block(&cfg, &wrong_model, &[], now)
-            .expect("refused")
-            .contains("model"));
+        assert!(
+            resume_block(&cfg, &wrong_model, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("model")
+        );
 
         let mut wrong_cwd = record_matching(&cfg, 1, now);
         wrong_cwd.cwd = "C:\\somewhere\\else".to_string();
-        assert!(resume_block(&cfg, &wrong_cwd, &[], now)
-            .expect("refused")
-            .contains("working root"));
+        assert!(
+            resume_block(&cfg, &wrong_cwd, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("working root")
+        );
 
         // A case-only difference in the working root is the same root on Windows.
         let mut cased = record_matching(&cfg, 1, now);
         cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
-        assert!(resume_block(&cfg, &cased, &[], now).is_none());
+        assert!(resume_block(&cfg, &cased, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5459,15 +6177,19 @@ mod tests {
 
         let mut git_record = record_matching(&git, 1, now);
         git_record.backend = Some("git".into());
-        assert!(resume_block(&p4, &git_record, &[42], now)
-            .expect("refused")
-            .contains("backend"));
+        assert!(
+            resume_block(&p4, &git_record, &[42], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("backend")
+        );
 
         let mut p4_record = record_matching(&p4, 1, now);
         p4_record.backend = Some("perforce".into());
-        assert!(resume_block(&git, &p4_record, &[], now)
-            .expect("refused")
-            .contains("backend"));
+        assert!(
+            resume_block(&git, &p4_record, &[], session::KIND_REVIEW, now)
+                .expect("refused")
+                .contains("backend")
+        );
     }
 
     #[test]
@@ -5484,7 +6206,7 @@ mod tests {
         .expect("config");
         let now = 1_000_000;
         let ancient_and_long = record_matching(&cfg, 999, 0);
-        assert!(resume_block(&cfg, &ancient_and_long, &[], now).is_none());
+        assert!(resume_block(&cfg, &ancient_and_long, &[], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5629,16 +6351,17 @@ mod tests {
         record.changes = Some(vec![43650, 43651]);
 
         // Same set (any order, canonicalised by the caller) resumes.
-        assert!(resume_block(&cfg, &record, &[43650, 43651], now).is_none());
+        assert!(resume_block(&cfg, &record, &[43650, 43651], session::KIND_REVIEW, now).is_none());
         // A different set is refused, naming both sets and the escape hatch.
-        let reason = resume_block(&cfg, &record, &[43650], now).expect("refused");
+        let reason =
+            resume_block(&cfg, &record, &[43650], session::KIND_REVIEW, now).expect("refused");
         assert!(reason.contains("43650, 43651"), "{reason}");
         assert!(reason.contains("fresh: true"), "{reason}");
 
         // A record with no binding (legacy or git) is treated as unbound and resumes.
         let mut unbound = record.clone();
         unbound.changes = None;
-        assert!(resume_block(&cfg, &unbound, &[99999], now).is_none());
+        assert!(resume_block(&cfg, &unbound, &[99999], session::KIND_REVIEW, now).is_none());
     }
 
     #[test]
@@ -5746,7 +6469,10 @@ mod tests {
     fn render_completed_for(capture_summary: Option<crate::vcs::CaptureSummary>) -> String {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, _c) = app.registry().try_start("default", 2, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 2, true)
+            .expect("start");
         app.registry()
             .finish(&id, completed_outcome(capture_summary));
         app.review_result(
@@ -5811,7 +6537,10 @@ mod tests {
     fn render_both_for(outcome: Outcome) -> (String, Option<Value>) {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, _c) = app.registry().try_start("default", 2, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 2, true)
+            .expect("start");
         app.registry().finish(&id, outcome);
         app.review_result_both(
             &json!({"review_id": id, "wait_seconds": 0}),
@@ -6037,6 +6766,7 @@ mod tests {
                 findings,
             }),
             findings_marker_absent_on_entry: true,
+            kind: crate::registry::JobKind::Review,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
         }
@@ -6241,7 +6971,7 @@ mod tests {
         seed_resumable_record(&app, "p4-session");
         let (id, _c) = app
             .registry()
-            .try_start("p4-session", 4, true)
+            .try_start("p4-session", crate::registry::JobKind::Review, 4, true)
             .expect("start");
 
         over_budget_job(&app, "p4-session", &id).run(Some("cli-1".to_string()));
@@ -6282,7 +7012,10 @@ mod tests {
         .expect("config");
         let app = App::new(cfg);
         seed_resumable_record(&app, "default");
-        let (id, _c) = app.registry().try_start("default", 4, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 4, true)
+            .expect("start");
 
         // A real resume id, since this refusal only ever arises on a resume.
         over_budget_job(&app, "default", &id).run(Some("cli-1".to_string()));
@@ -6322,6 +7055,7 @@ mod tests {
                     model: &app.cfg.reviewers[0].model,
                     effort: &app.cfg.reviewers[0].effort,
                     cwd: &app.cfg.cwd.to_string_lossy(),
+                    kind: crate::session::KIND_REVIEW,
                     cumulative_usage: None,
                     changes: None,
                     head_sha: None,
@@ -6353,7 +7087,10 @@ mod tests {
         .expect("config");
         let app = App::new(cfg);
         seed_resumable_record(&app, "default");
-        let (id, _c) = app.registry().try_start("default", 4, true).expect("start");
+        let (id, _c) = app
+            .registry()
+            .try_start("default", crate::registry::JobKind::Review, 4, true)
+            .expect("start");
         // As `run` does before the capture, and as `Registry::finish` then preserves. The relocated
         // check returns before this in production; setting it here anyway means the assertions
         // below are about the *rendered* result rather than about one of the four places `active`
@@ -6462,7 +7199,7 @@ mod tests {
         for turn in 1..=MAX_TERMINAL_PER_SESSION as u32 + 1 {
             let (id, _c) = app
                 .registry()
-                .try_start(session, turn, turn > 1)
+                .try_start(session, crate::registry::JobKind::Review, turn, turn > 1)
                 .expect("start");
             app.registry()
                 .finish(&id, Outcome::failed(errors::cancelled()));
@@ -6512,7 +7249,10 @@ mod tests {
         // A session whose only review was evicted by the process-wide cap.
         for n in 0..=MAX_TERMINAL_TOTAL {
             let session = format!("session-{n}");
-            let (id, _c) = app.registry().try_start(&session, 1, false).expect("start");
+            let (id, _c) = app
+                .registry()
+                .try_start(&session, crate::registry::JobKind::Review, 1, false)
+                .expect("start");
             app.registry()
                 .finish(&id, Outcome::failed(errors::cancelled()));
         }
@@ -6553,7 +7293,10 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
         // Registered directly: starting one for real would need a reviewer CLI.
-        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         let request = RequestCancel::new();
         // Cancelled before the poll named its review: nothing is bound yet, so there is nothing
@@ -6580,7 +7323,10 @@ mod tests {
     fn a_live_result_call_detaches_rather_than_owns_its_review() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = App::new(cfg);
-        let (id, cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         let request = RequestCancel::new();
         let out = app
@@ -6603,7 +7349,10 @@ mod tests {
     fn shutdown_ends_a_long_poll_and_says_why() {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let app = Arc::new(App::new(cfg));
-        let (id, _cancel) = app.registry.try_start("default", 1, false).expect("start");
+        let (id, _cancel) = app
+            .registry
+            .try_start("default", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
 
         // A budget far longer than this test needs, so only the shutdown can end the poll
         // in time for the assertions below to hold.
