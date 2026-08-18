@@ -407,6 +407,14 @@ chain_budget = max_wait_secs_single                       # = today's capture + 
 
 ### Capture in a mixed-family chain — the change must reach whoever runs
 
+> **Historical (pre-#110).** This section describes the `--diff auto` static-capture model that
+> PR #110 ("retire capture modes") replaced: git reviews now derive the change live through the
+> evidence service's `repository_diff` tool, there is no `--diff` flag, and `src/vcs/git.rs` is
+> gone. The fallback-chain reasoning below still holds — capture (whatever its mechanism) must
+> reach whichever entry runs — but the `--diff`/`vcs/git.rs` specifics are how it worked when this
+> plan was written. See [`docs/retire-capture-modes.md`](retire-capture-modes.md) for the current
+> model.
+
 Round 1's most important finding: the plan wrongly claimed the capture pipeline was
 untouched. It is not, because **what gets captured depends on the reviewer**. Under `--diff
 auto`, the working-tree diff is supplied *only when the reviewer has no usable shell*

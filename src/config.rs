@@ -1010,9 +1010,8 @@ impl Config {
         let mut isolate_reviewer = true;
         let mut metrics = true;
         let mut resume_incremental_diff = true;
-        // `--diff` is parsed *after* the loop, because how its value is interpreted (and
-        // whether it is even legal) depends on `--vcs`, which may appear later on the command
-        // line. Kept raw until the backend is known.
+        // `--diff` (capture modes) was retired by #110: git reviews derive the change live through
+        // repository_diff, so the flag is now rejected in the loop below rather than parsed here.
         let mut vcs_arg: Option<Vcs> = None;
 
         let mut i = 0;

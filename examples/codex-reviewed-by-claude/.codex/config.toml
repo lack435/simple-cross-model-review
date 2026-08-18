@@ -17,15 +17,14 @@ command = "tools/cross-review.exe"
 # least one is required. Declare more and add --default-level to offer the caller a menu.
 args = ["--reviewer", "claude", "--level", "standard:claude-opus-4-8:medium"]
 
-# The Claude reviewer has no shell, so the server captures the change and hands it over.
-# The default captures the working tree, which suits reviewing work in progress but is
-# empty once the work is committed -- so for reviewing a branch, add the range you want:
-#
-#   args = [..., "--diff", "main...HEAD"]
-#
-# It is a startup flag, not a per-call argument, so one entry cannot do both. `main` there
-# is the local ref: fetch and fast-forward it first, or the range quietly widens to include
-# everything merged since. See "The change under review is fetched for you" in the README.
+# The Claude reviewer has no shell, so it reads the repository through the read-only evidence
+# service and derives the change live via its repository_diff tool: the working tree against the
+# branch's fork point (merge-base with the remote-tracking HEAD/main/master), covering committed
+# and uncommitted work and untracked files. There is no --diff flag -- capture modes were retired,
+# and passing --diff is now a hard error. A `git fetch` before reviewing is still worth it (the
+# fork point resolves from on-disk remote-tracking refs and never fetches); nothing else of the old
+# commit-first / fetch-and-fast-forward ritual applies. --claude-profile is required: an ambient
+# Claude has no evidence path and is refused.
 
 # A single cross_model_review_result call now blocks until the review is done, so this budget
 # must exceed the server's collect cap (CAPTURE_BUDGET + --timeout-seconds + finalization grace;
