@@ -756,14 +756,55 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn start_review(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        self.start(crate::registry::JobKind::Review, args, request)
+    }
+
+    /// Start a consult — the ledger-free "second pair of eyes". It shares all of `start`'s
+    /// lease/identity/preflight/chain machinery; `kind` gates the handful of findings/capture
+    /// differences (the prompt field, the Perforce change requirement, the evidence-eligibility gate,
+    /// the ledger, and the response wording). See `docs/cross-model-consult-plan.md`.
+    // Wired into the MCP dispatch in the next slice; unreached in the binary until then.
+    #[allow(dead_code)]
+    pub fn start_consult(&self, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
+        self.start(crate::registry::JobKind::Consult, args, request)
+    }
+
+    fn start(
+        &self,
+        kind: crate::registry::JobKind,
+        args: &Value,
+        request: &RequestCancel,
+    ) -> Result<String, Failure> {
+        let is_consult = kind == crate::registry::JobKind::Consult;
+        // The session kind this call may resume: a consult resumes only a consult, a review only a
+        // review (cross-kind resumes are refused in `resume_block`).
+        let expected_kind = if is_consult {
+            session::KIND_CONSULT
+        } else {
+            session::KIND_REVIEW
+        };
         // An invalid reviewer chain refuses every review, before the session lease and before any
         // reviewer preflight, so nothing is resolved or billed against a chain known to be broken.
         if let Some(err) = &self.chain_error {
             return Err(err.clone());
         }
 
-        let instructions = string_arg(args, "instructions")
-            .ok_or_else(|| errors::bad_request("'instructions' is required and must be a non-empty string describing what to review."))?;
+        // A consult reads its prompt from `question`; a review from `instructions`.
+        let instructions = if is_consult {
+            string_arg(args, "question").ok_or_else(|| {
+                errors::bad_request(
+                    "'question' is required and must be a non-empty string: what do you want a \
+                     second opinion on, or found in the code?",
+                )
+            })?
+        } else {
+            string_arg(args, "instructions").ok_or_else(|| {
+                errors::bad_request(
+                    "'instructions' is required and must be a non-empty string describing what to \
+                     review.",
+                )
+            })?
+        };
 
         let session = string_arg(args, "session").unwrap_or_else(|| DEFAULT_SESSION.to_string());
         // A session name is rendered into the human response and keys on-disk marker files, so it
@@ -824,7 +865,9 @@ impl App {
                 ))
             }
         };
-        if self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
+        // A consult is tree-only in this cut, so it names no changelist even on Perforce (it reads
+        // the workspace through the evidence service). A review must name the change under review.
+        if !is_consult && self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
             return Err(errors::bad_request(
                 "'change' is required for a Perforce review: name the changelist number(s) to \
                  review, for example \"43650\" or [\"43650\",\"43651\"].",
@@ -934,7 +977,7 @@ impl App {
                 &self.cfg,
                 record,
                 &changes_canonical,
-                session::KIND_REVIEW,
+                expected_kind,
                 now_unix(),
             ) {
                 return Err(resume_refusal(&session, reason, Some(record)));
@@ -1021,6 +1064,29 @@ impl App {
                 }
             },
         };
+        // A consult requires the read-only evidence service — it is how the model reads the code to
+        // answer — so refuse an evidence-incapable reviewer up front, before any billing. A fresh
+        // consult can fall through the chain on a rate limit, so every reachable entry from the
+        // selected start onward must be capable; a resume runs only its bound entry, so only that one
+        // is checked. See `docs/cross-model-consult-plan.md` (f3).
+        if is_consult {
+            let incapable = if prior.is_some() {
+                (!entry_provides_evidence(&self.cfg, &self.cfg.reviewers[start_index]))
+                    .then_some(start_index)
+            } else {
+                first_evidence_incapable_entry(&self.cfg, start_index)
+            };
+            if let Some(idx) = incapable {
+                return Err(errors::evidence_unavailable(format!(
+                    "a consult requires the read-only evidence service, but reviewer entry #{} ({}) \
+                     cannot provide it (an ambient or shell-enabled Claude has no evidence service); \
+                     a consult reachable from this chain could run on it. Use a Codex reviewer, or a \
+                     profile-pinned, shell-less Claude.",
+                    idx,
+                    self.cfg.reviewers[idx].describe(),
+                )));
+            }
+        }
         // Resolve the review `level` against the *selected* start entry, now that the gate (or the
         // resume matcher) has chosen it. Pure and cheap: an unknown level fails fast here, before any
         // preflight, auth check, or billing. On resume the level is validated only — the effective
@@ -1097,7 +1163,7 @@ impl App {
         // on the other side of that could never be collected.
         let (id, cancel) = self
             .registry
-            .try_start(&session, crate::registry::JobKind::Review, turn, resumed)
+            .try_start(&session, kind, turn, resumed)
             .map_err(|refused| match refused {
                 StartRefused::Busy(existing) => errors::session_busy(&session, &existing),
                 StartRefused::TooManyRunning { limit } => errors::too_many_running(limit),
@@ -1160,24 +1226,30 @@ impl App {
             // already-broken `legacy_uncovered` prior so it stays non-convergent rather than posing
             // as a fresh turn 1. `Invalid` cannot occur — `resume_block` already refused it above —
             // but is mapped to the same legacy fallback defensively.
-            prior_findings: prior.as_ref().map(|record| match record.ledger_load() {
-                session::LedgerLoad::Valid(l) => crate::findings::PriorState {
-                    coverage: l.coverage,
-                    next_seq: l.next_seq,
-                    findings: l.findings,
-                },
-                session::LedgerLoad::Absent | session::LedgerLoad::Invalid => {
-                    crate::findings::PriorState {
-                        coverage: crate::findings::LedgerCoverage::LegacyUncovered,
-                        next_seq: 1,
-                        findings: Vec::new(),
+            // A consult has no findings ledger to carry: it never assesses, so `attempt` never reads
+            // this. `None` keeps the consult path off the whole ledger machinery.
+            prior_findings: if is_consult {
+                None
+            } else {
+                prior.as_ref().map(|record| match record.ledger_load() {
+                    session::LedgerLoad::Valid(l) => crate::findings::PriorState {
+                        coverage: l.coverage,
+                        next_seq: l.next_seq,
+                        findings: l.findings,
+                    },
+                    session::LedgerLoad::Absent | session::LedgerLoad::Invalid => {
+                        crate::findings::PriorState {
+                            coverage: crate::findings::LedgerCoverage::LegacyUncovered,
+                            next_seq: 1,
+                            findings: Vec::new(),
+                        }
                     }
-                }
-            }),
+                })
+            },
             // Non-fresh calls passed the findings gate, so their marker was absent on entry; fresh
             // calls skipped it. Used to decide whether a pre-launch failure may clear the marker.
             findings_marker_absent_on_entry: !fresh,
-            kind: crate::registry::JobKind::Review,
+            kind,
             cancel,
             _lease: Some(lease),
         };
@@ -1197,8 +1269,15 @@ impl App {
             );
         }
 
+        // A consult and a review announce themselves differently: the noun, and which result tool
+        // collects it. The cancel tool is shared (it stops any running job by id).
+        let (noun, result_tool) = if is_consult {
+            ("Consult", "cross_model_consult_result")
+        } else {
+            ("Review", "cross_model_review_result")
+        };
         let mut out = String::new();
-        out.push_str("Review started. It runs in the background.\n\n");
+        out.push_str(&format!("{noun} started. It runs in the background.\n\n"));
         out.push_str(&format!("review_id: {id}\n"));
         out.push_str(&format!(
             "session:   {session} ({})\n",
@@ -1234,17 +1313,23 @@ impl App {
             fmt_elapsed(Duration::from_secs(self.cfg.max_wait_secs()))
         ));
         out.push_str(&format!(
-            "Collect it with cross_model_review_result using review_id \"{id}\". That call blocks \
-             until the review is done -- omit wait_seconds to wait to completion in one call -- and \
-             reports progress while it is open when the MCP client supports progress notifications. \
-             If the wait_seconds budget elapses first it returns status=running; if your client's \
-             own tool timeout is shorter and fires first you get a client-side timeout instead of a \
-             result. Either way the review keeps running -- abandoning a collect does not cancel it \
-             -- so just call cross_model_review_result again with the same review_id. Use \
-             cross_model_review_cancel to actually stop the reviewer.\n\n\
-             In this project's usage, reviews commonly take at least five minutes, and complex \
-             changes can take 20 minutes or longer. A running status during that window is normal \
-             and is not a reason to start over or cancel the review.\n"
+            "Collect it with {result_tool} using review_id \"{id}\". That call blocks until the {} \
+             is done -- omit wait_seconds to wait to completion in one call -- and reports progress \
+             while it is open when the MCP client supports progress notifications. If the \
+             wait_seconds budget elapses first it returns status=running; if your client's own tool \
+             timeout is shorter and fires first you get a client-side timeout instead of a result. \
+             Either way it keeps running -- abandoning a collect does not cancel it -- so just call \
+             {result_tool} again with the same review_id. Use cross_model_review_cancel to actually \
+             stop the reviewer.\n\n{}\n",
+            noun.to_lowercase(),
+            if is_consult {
+                "A consult usually takes a few minutes; a deeper question can take longer. A running \
+                 status during that window is normal."
+            } else {
+                "In this project's usage, reviews commonly take at least five minutes, and complex \
+                 changes can take 20 minutes or longer. A running status during that window is \
+                 normal and is not a reason to start over or cancel the review."
+            }
         ));
         Ok(out)
     }
@@ -4050,8 +4135,6 @@ fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) 
 /// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a
 /// profile-pinned, shell-less, git-top-level, isolated Claude ([`claude_evidence_enabled`]). An
 /// ambient or shell-enabled Claude has no evidence service, so a consult must not run on it.
-// Consumed by `start_consult` in a later slice; dead in the binary until then.
-#[allow(dead_code)]
 fn entry_provides_evidence(cfg: &Config, spec: &crate::config::ReviewerSpec) -> bool {
     spec.reviewer == crate::config::ReviewerKind::Codex
         || crate::reviewer::claude::claude_evidence_enabled(cfg, spec)
@@ -4068,8 +4151,6 @@ fn entry_provides_evidence(cfg: &Config, spec: &crate::config::ReviewerSpec) -> 
 /// reachable entry, so the caller can name it in an `EVIDENCE_UNAVAILABLE`. A resume binds to one
 /// entry, so the caller passes that entry's index as both start and (implicitly) the only element it
 /// cares about — a later entry it can never fall through to does not gate it.
-// Consumed by `start_consult` in a later slice; dead in the binary until then.
-#[allow(dead_code)]
 fn first_evidence_incapable_entry(cfg: &Config, start_index: usize) -> Option<usize> {
     cfg.reviewers
         .iter()
