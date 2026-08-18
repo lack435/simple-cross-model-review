@@ -199,6 +199,160 @@ pub fn revision(
     run(root, &args, limits, cancel, received_at)
 }
 
+/// Diff the working tree (or a commit range) against a resolved base, live.
+///
+/// `spec` is the already-resolved endpoint list the handler built — `["<base_id>"]` for the
+/// working tree against a commit, `["--cached", "<base_id>"]` for the index, `["<a>", "<b>"]` for a
+/// commit-to-commit range. Every token is either a fixed flag this module wrote or a full object id
+/// the handler validated with `valid_object_id`; no symbolic ref or raw model input reaches here, so
+/// the closed `--diff`-style hardening is preserved. Untracked files are *not* part of this output —
+/// `git diff` never lists them — and are composed in by the caller from `reviewable_paths`; this
+/// function is the tracked half only.
+pub fn diff(
+    root: &Path,
+    spec: &[&str],
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<String, EvidenceError> {
+    let mut args = vec![
+        "diff".to_string(),
+        "--no-ext-diff".to_string(),
+        "--no-textconv".to_string(),
+    ];
+    args.extend(spec.iter().map(|s| s.to_string()));
+    if !path.is_empty() {
+        args.push("--".into());
+        args.push(path.to_string());
+    }
+    run(root, &args, limits, cancel, received_at)
+}
+
+/// The untracked, non-ignored files in the working tree (`git ls-files --others
+/// --exclude-standard`), NUL-separated so a newline in a path cannot split an entry. `complete` is
+/// false when the list hit `max_files`. These are what `git diff` never shows and the handler
+/// composes into the working-tree diff (f2).
+pub fn untracked_paths(
+    root: &Path,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<(Vec<String>, bool), EvidenceError> {
+    let args = vec![
+        "ls-files".to_string(),
+        "-z".to_string(),
+        "--others".to_string(),
+        "--exclude-standard".to_string(),
+    ];
+    let out = run(root, &args, limits, cancel, received_at)?;
+    let mut paths: Vec<String> = out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let max = limits.max_files as usize;
+    let complete = paths.len() <= max;
+    paths.truncate(max);
+    Ok((paths, complete))
+}
+
+/// `git diff --numstat` counts for a resolved spec: (files, insertions, deletions). A binary file
+/// counts toward `files` but contributes no line counts (git renders it as `-\t-`). Feeds the
+/// serve-record so the caller-facing `captured:` line reports what was served (mechanism 5).
+pub fn numstat(
+    root: &Path,
+    spec: &[&str],
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<(usize, usize, usize), EvidenceError> {
+    let mut args = vec![
+        "diff".to_string(),
+        "--numstat".to_string(),
+        "--no-ext-diff".to_string(),
+        "--no-textconv".to_string(),
+    ];
+    args.extend(spec.iter().map(|s| s.to_string()));
+    if !path.is_empty() {
+        args.push("--".into());
+        args.push(path.to_string());
+    }
+    let out = run(root, &args, limits, cancel, received_at)?;
+    let (mut files, mut insertions, mut deletions) = (0usize, 0usize, 0usize);
+    for line in out.lines() {
+        let mut fields = line.split('\t');
+        let added = fields.next().unwrap_or("");
+        let deleted = fields.next().unwrap_or("");
+        if fields.next().is_none() {
+            continue; // not a numstat row (no path field)
+        }
+        files += 1;
+        insertions += added.parse::<usize>().unwrap_or(0);
+        deletions += deleted.parse::<usize>().unwrap_or(0);
+    }
+    Ok((files, insertions, deletions))
+}
+
+/// Resolve a revision to a full commit object id, or `None` if it does not name one.
+///
+/// Used to pin the endpoints of the canonical diff — the branch's upstream and the merge-base — to
+/// fixed ids that cannot move mid-review, and to peel a ref to a commit. `rev` is trusted server
+/// input (a configured/detected branch name or `@{upstream}`), never a model-supplied token, and it
+/// is passed after `--end-of-options` so it can never be read as a flag.
+pub fn resolve_commit(
+    root: &Path,
+    rev: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Option<String>, EvidenceError> {
+    let args = vec![
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        "--end-of-options".to_string(),
+        format!("{rev}^{{commit}}"),
+    ];
+    // `--verify --quiet` exits non-zero with empty stdout when the rev does not resolve; `run`
+    // surfaces that as a `provider_failed`, so a resolvable-but-absent ref and a genuine git error
+    // are told apart by the empty-vs-populated result rather than by the exit code alone.
+    match run(root, &args, limits, cancel, received_at) {
+        Ok(out) => {
+            let id = out.trim().to_string();
+            Ok(if id.is_empty() { None } else { Some(id) })
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// The merge-base of two commits — the branch's fork point when called as `merge_base(HEAD,
+/// upstream)`. `None` when the two share no history. Both arguments are full object ids the handler
+/// already resolved and validated.
+pub fn merge_base(
+    root: &Path,
+    a: &str,
+    b: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Option<String>, EvidenceError> {
+    // No `--end-of-options`: `git merge-base` does not accept it, and would fail the whole
+    // operation as "no merge base" (f2). It is unnecessary here anyway — both operands are full
+    // hex object ids the caller validated, so neither can be read as an option or a ref.
+    let args = vec!["merge-base".to_string(), a.to_string(), b.to_string()];
+    match run(root, &args, limits, cancel, received_at) {
+        Ok(out) => {
+            let id = out.trim().to_string();
+            Ok(if id.is_empty() { None } else { Some(id) })
+        }
+        // `merge-base` exits 1 with no output when there is no common ancestor; that is a `None`,
+        // not an error, but any other failure (a bad object, a broken repo) still propagates.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Run one bounded Git command, against the **request's** deadline rather than a fresh per-command
 /// one.
 ///

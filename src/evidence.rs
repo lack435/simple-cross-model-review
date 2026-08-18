@@ -25,7 +25,11 @@ pub const SERVER_NAME: &str = "cross_review_evidence";
 /// gained `drift_unavailable` and `scan_scope`. There is no migration to write — one binary writes
 /// and reads the bundle within one process tree, and the file is deleted when the review ends — so
 /// this is the reviewer-visible declaration that the contract changed, not a compatibility switch.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped to 3 by the retire-capture-modes work: a live `repository_diff` tool was added, and
+/// (once wired) the bundle stops carrying a pre-rendered `change`, so the reviewer-visible tool set
+/// and delivery contract both changed.
+pub const SCHEMA_VERSION: u32 = 3;
 /// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
 /// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
 /// it, and the evidence read watchdog (`src/evidence/core.rs`) derives its budget from it with a
@@ -36,7 +40,7 @@ const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BUNDLE_FILES: usize = 256;
 const STALE_BUNDLE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-pub const TOOLS: [&str; 7] = [
+pub const TOOLS: [&str; 8] = [
     "repository_scope",
     "repository_list",
     "repository_search",
@@ -44,6 +48,7 @@ pub const TOOLS: [&str; 7] = [
     "repository_change",
     "repository_history",
     "repository_revision",
+    "repository_diff",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -473,6 +478,17 @@ pub fn write_claude_mcp_config(
     Ok(BundleFile { path })
 }
 
+/// The nonce-bound serve-record file for one review (retire-capture-modes mechanism 3). Deterministic
+/// from the capability dir and nonce, so the child (`serve_stdio`, deriving it from the bundle's own
+/// directory) and the parent (which computes it here to read and to own its RAII cleanup) name the
+/// same file without threading a path between processes.
+pub fn serve_record_path(
+    cfg: &crate::config::Config,
+    nonce: &str,
+) -> Result<PathBuf, EvidenceError> {
+    Ok(capability_dir(cfg)?.join(format!("{nonce}-serverecord.jsonl")))
+}
+
 fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError> {
     let candidates = [cfg.state_dir.clone(), std::env::temp_dir()];
     let mut last = None;
@@ -531,7 +547,9 @@ fn cleanup_capability_dir(dir: &Path) -> Result<(), EvidenceError> {
     {
         let entry = entry.map_err(|e| EvidenceError::new("bundle_write_failed", e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with("-evidence.json") {
+        // Reap both the bundle and the serve-record side-channel (f4): a serve-record file orphaned
+        // by a crash must not linger to be misread by a later run that reused its id.
+        if !name.ends_with("-evidence.json") && !name.ends_with("-serverecord.jsonl") {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())
@@ -609,7 +627,12 @@ pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceErro
     let max_response = bundle.limits.max_response_bytes as usize;
     let cancel = Arc::new(AtomicBool::new(false));
     let cancellations = Arc::new(RequestCancellations::default());
-    let core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
+    let mut core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
+    // The serve-record side-channel sits beside the bundle, under the same per-turn nonce, so the
+    // parent (which created the bundle and knows both) can find and read it after the reviewer exits.
+    if let Some(dir) = path.parent() {
+        core.set_serve_record(dir.join(format!("{expected_nonce}-serverecord.jsonl")));
+    }
     // A *bounded* dispatch channel: admission control that caps buffered requests, so a client that
     // pipelines faster than the serial dispatcher drains cannot grow the queue until the evidence
     // process runs out of memory (issue #61, code-review finding f8). When it is full the reader
@@ -1069,6 +1092,22 @@ pub fn tool_definitions() -> Vec<Value> {
             ],
             &[],
         ),
+        tool(
+            "repository_diff",
+            "Diff the live working tree against a base, on demand; unsupported for Perforce. 'base' \
+             is the left side (default 'branch-base', the branch's fork point) and 'head' the right \
+             (default 'worktree', the live working tree including untracked files). Each is a full \
+             Git object id or one of the sentinels 'worktree', 'index', 'head', 'branch-base'. To \
+             review the whole change, diff 'branch-base'..'worktree'; narrow with 'path' for focus.",
+            &[
+                ("base", "string"),
+                ("head", "string"),
+                ("path", "string"),
+                ("cursor", "string"),
+                ("limit_bytes", "integer"),
+            ],
+            &[],
+        ),
     ]
 }
 
@@ -1180,6 +1219,7 @@ fn output_schema(name: &str) -> Value {
             }),
         ),
         "repository_revision" => text_page("content"),
+        "repository_diff" => text_page("diff"),
         _ => json!({"type":"object","properties":{},"additionalProperties":false}),
     }
 }

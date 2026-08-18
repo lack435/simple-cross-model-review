@@ -12,8 +12,6 @@
 //! rule that governs this module: it reports what the server *sent*, never what the reviewer
 //! received or still holds, which the server cannot know.
 
-use std::fmt::Write as _;
-
 /// The resume disposition of one turn. Only ever constructed for a turn that both resumed and
 /// sent a change; a fresh turn or a no-change turn carries `None` and renders nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,16 +27,10 @@ pub enum Disposition {
     FellBackToFull(FellBack),
 }
 
-/// What an incremental turn actually sent, per backend.
+/// What an incremental turn actually sent. Perforce-only: git no longer captures, so it has no
+/// incremental-resume delta (retire-capture-modes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Incremental {
-    /// git: the pinned delta range `<prior>..<head>`, and the count of new commits when it was
-    /// worth the extra `rev-list --count` (else `None`).
-    GitRange {
-        prior: String,
-        head: String,
-        commits: Option<u64>,
-    },
     /// Perforce: how many evidence units were re-sent versus collapsed as byte-identical to the
     /// previous server-generated capture.
     PerforceEvidence { resent: usize, collapsed: usize },
@@ -47,39 +39,14 @@ pub enum Incremental {
 /// Why a delta was never intended this turn. Never warns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FullByDesign {
-    /// `--no-incremental-resume`. Applies to both backends; the G1 gate.
+    /// `--no-incremental-resume`. The G1 gate. (Git no longer captures, so this is Perforce-only.)
     Disabled,
-    /// The git mode is not a HEAD-anchored committed range (working-tree, staged, or a fixed
-    /// window). git-only -- a Perforce review always intends to capture its named changelists.
-    ModeNotDeltable,
 }
 
 /// Why an eligible delta fell back to a full re-capture. Warns on a resumed turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FellBack {
-    // --- git ---
-    /// No complete `(head, base)` pair is retained to delta from (first-turn truncation with no
-    /// earlier baseline). Assigned in `tools.rs`, which alone can tell a fresh turn (no
-    /// disposition) from a resumed turn whose session held no baseline.
-    NoCompleteBaselineRetained,
-    /// This turn's HEAD will not resolve (unborn HEAD, or `git rev-parse HEAD` failed). Not a
-    /// detached HEAD, which resolves.
-    CurrentHeadUnavailable,
-    /// The configured range's base is unknown this turn (left ref will not resolve, or a
-    /// three-dot merge-base could not be computed). `BaseMoved` cannot be evaluated without it.
-    CurrentBaseUnresolvable,
-    /// A stored baseline field (prior head or prior base) is not a usable object id: a corrupt
-    /// or truncated session record. Decided before `BaseMoved` so garbage is never miscompared.
-    PriorBaselineInvalid,
-    /// The stored base and the current effective base are both valid and differ (`main`
-    /// advanced, or `--diff` repointed).
-    BaseMoved,
-    /// The ancestry check could not be *run* (git error/timeout): distinct from a definite "no".
-    AncestryUndecidable,
-    /// The prior HEAD is a valid commit that is definitively not an ancestor of HEAD (rebase,
-    /// amend, force-push).
-    BranchRewritten,
-
+    // Git no longer captures, so it has no fall-back-to-full reasons (retire-capture-modes).
     // --- Perforce ---
     /// A resumed Perforce session whose `perforce_baseline` is `None` (the prior turn persisted
     /// no baseline field). Strictly absent -- a persisted `Disabled` is `PriorBaselineUnusable`.
@@ -120,14 +87,10 @@ impl Disposition {
     /// which turns deltaed and which re-billed the full range without parsing prose.
     pub fn tag(&self) -> String {
         match self {
-            Disposition::Incremental(Incremental::GitRange { .. }) => "incremental:git".into(),
             Disposition::Incremental(Incremental::PerforceEvidence { .. }) => {
                 "incremental:perforce".into()
             }
             Disposition::FullByDesign(FullByDesign::Disabled) => "full-by-design:disabled".into(),
-            Disposition::FullByDesign(FullByDesign::ModeNotDeltable) => {
-                "full-by-design:mode-not-deltable".into()
-            }
             Disposition::FellBackToFull(reason) => format!("fell-back:{}", reason.tag()),
         }
     }
@@ -135,21 +98,6 @@ impl Disposition {
     /// The informational `disposition:` line for the caller, describing what the server sent.
     pub fn summary(&self) -> String {
         match self {
-            Disposition::Incremental(Incremental::GitRange {
-                prior,
-                head,
-                commits,
-            }) => {
-                let mut s = format!(
-                    "incremental -- only the delta since your last turn ({}..{}) was sent",
-                    short(prior),
-                    short(head)
-                );
-                if let Some(n) = commits {
-                    let _ = write!(s, ", {n} new commit{}", plural(*n));
-                }
-                s
-            }
             Disposition::Incremental(Incremental::PerforceEvidence { resent, collapsed }) => {
                 format!(
                     "incremental -- {resent} evidence unit(s) re-sent, {collapsed} collapsed as \
@@ -173,9 +121,6 @@ impl FullByDesign {
     fn reason_str(&self) -> &'static str {
         match self {
             FullByDesign::Disabled => "incremental resume disabled (--no-incremental-resume)",
-            FullByDesign::ModeNotDeltable => {
-                "the configured diff is not a HEAD-anchored committed range"
-            }
         }
     }
 }
@@ -184,13 +129,6 @@ impl FellBack {
     /// A compact kebab-case tag for the usage log; see [`Disposition::tag`].
     fn tag(&self) -> &'static str {
         match self {
-            FellBack::NoCompleteBaselineRetained => "no-complete-baseline-retained",
-            FellBack::CurrentHeadUnavailable => "current-head-unavailable",
-            FellBack::CurrentBaseUnresolvable => "current-base-unresolvable",
-            FellBack::PriorBaselineInvalid => "prior-baseline-invalid",
-            FellBack::BaseMoved => "base-moved",
-            FellBack::AncestryUndecidable => "ancestry-undecidable",
-            FellBack::BranchRewritten => "branch-rewritten",
             FellBack::PriorBaselineMissing => "prior-baseline-missing",
             FellBack::PriorTurnPending => "prior-turn-pending",
             FellBack::MarkerUnwritable => "marker-unwritable",
@@ -205,17 +143,6 @@ impl FellBack {
 
     fn reason_str(&self) -> &'static str {
         match self {
-            FellBack::NoCompleteBaselineRetained => {
-                "no complete baseline was retained to delta from"
-            }
-            FellBack::CurrentHeadUnavailable => "the current HEAD could not be resolved",
-            FellBack::CurrentBaseUnresolvable => "the configured base could not be resolved",
-            FellBack::PriorBaselineInvalid => "the stored baseline was not a usable commit id",
-            FellBack::BaseMoved => "the base moved since the last turn",
-            FellBack::AncestryUndecidable => {
-                "the ancestry of the prior commit could not be checked"
-            }
-            FellBack::BranchRewritten => "the branch was rewritten since the last turn",
             FellBack::PriorBaselineMissing => "no prior Perforce baseline was recorded",
             FellBack::PriorTurnPending => {
                 "the previous turn did not finish persisting its baseline"
@@ -233,23 +160,6 @@ impl FellBack {
     }
 }
 
-/// Abbreviate a hex object id for the caller line, leaving anything already short alone.
-fn short(id: &str) -> &str {
-    if id.len() > 12 {
-        &id[..12]
-    } else {
-        id
-    }
-}
-
-fn plural(n: u64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,44 +167,30 @@ mod tests {
     #[test]
     fn only_fell_back_warns() {
         assert!(!Disposition::FullByDesign(FullByDesign::Disabled).warns());
-        assert!(!Disposition::FullByDesign(FullByDesign::ModeNotDeltable).warns());
-        assert!(!Disposition::Incremental(Incremental::GitRange {
-            prior: "a".into(),
-            head: "b".into(),
-            commits: None,
+        assert!(!Disposition::Incremental(Incremental::PerforceEvidence {
+            resent: 1,
+            collapsed: 2,
         })
         .warns());
-        assert!(Disposition::FellBackToFull(FellBack::BaseMoved).warns());
+        assert!(Disposition::FellBackToFull(FellBack::PriorTurnPending).warns());
         assert!(Disposition::FellBackToFull(FellBack::MarkerUnwritable).warns());
     }
 
     #[test]
-    fn git_range_summary_names_the_range_and_count() {
-        let d = Disposition::Incremental(Incremental::GitRange {
-            prior: "0123456789abcdef".into(),
-            head: "fedcba9876543210".into(),
-            commits: Some(2),
+    fn perforce_evidence_summary_names_the_counts() {
+        let d = Disposition::Incremental(Incremental::PerforceEvidence {
+            resent: 3,
+            collapsed: 5,
         });
         let s = d.summary();
-        assert!(s.contains("0123456789ab..fedcba987654"), "{s}");
-        assert!(s.contains("2 new commits"), "{s}");
-    }
-
-    #[test]
-    fn one_commit_is_singular() {
-        let d = Disposition::Incremental(Incremental::GitRange {
-            prior: "aaaa".into(),
-            head: "bbbb".into(),
-            commits: Some(1),
-        });
-        assert!(d.summary().contains("1 new commit,") || d.summary().ends_with("1 new commit"));
-        assert!(!d.summary().contains("1 new commits"));
+        assert!(s.contains("3 evidence unit(s) re-sent"), "{s}");
+        assert!(s.contains("5 collapsed"), "{s}");
     }
 
     #[test]
     fn fell_back_summary_names_the_reason() {
-        let s = Disposition::FellBackToFull(FellBack::BranchRewritten).summary();
+        let s = Disposition::FellBackToFull(FellBack::PriorBaselineMissing).summary();
         assert!(s.contains("fell back"), "{s}");
-        assert!(s.contains("rewritten"), "{s}");
+        assert!(s.contains("no prior Perforce baseline"), "{s}");
     }
 }

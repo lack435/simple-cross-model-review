@@ -880,8 +880,8 @@ impl App {
             if present("change") || present("include_shelved") {
                 return Err(errors::bad_request(
                     "'change' and 'include_shelved' name Perforce inputs, but this working root \
-                     is git. Omit them -- the git diff to review is configured on the server \
-                     (see --diff).",
+                     is git. Omit them -- a git review derives the change live through the \
+                     read-only evidence service's repository_diff, not from named inputs.",
                 ));
             }
         }
@@ -1263,8 +1263,6 @@ impl App {
             prior_cumulative: prior.as_ref().and_then(|record| record.cumulative_usage),
             // Only carried on a genuine resume: `prior` is `None` for a fresh review
             // (fresh=true or a new session name), so the first turn always captures in full.
-            prior_head: prior.as_ref().and_then(|record| record.head_sha.clone()),
-            prior_base: prior.as_ref().and_then(|record| record.base_sha.clone()),
             prior_perforce_baseline: prior
                 .as_ref()
                 .and_then(|record| record.perforce_baseline.clone()),
@@ -2320,12 +2318,6 @@ struct Job {
     /// report cumulatively. Subtracting it is the only way to recover a per-turn figure
     /// from Codex, whose event stream carries the thread total and nothing else.
     prior_cumulative: Option<crate::metrics::Usage>,
-    /// The git HEAD the previous turn of this session captured, and the `--diff` spec it was
-    /// captured under, for the incremental-resume delta. Both `None` on a fresh review, a
-    /// Perforce session, or a prior turn that could not resolve HEAD; the delta needs both, so
-    /// a resume only reviews the delta when each is present and the spec still matches.
-    prior_head: Option<String>,
-    prior_base: Option<String>,
     /// The previous Perforce turn's resume-delta baseline, capture identity and shelved-capture
     /// mode, for collapsing unchanged files. All `None` on a fresh review or a git session; the
     /// delta needs the baseline and the identity, and only collapses when the mode still matches.
@@ -2447,7 +2439,9 @@ fn assemble_disposition(
         return Some(vcs::Disposition::FullByDesign(FullByDesign::Disabled));
     }
     let reason = match vcs {
-        crate::config::Vcs::Git => FellBack::NoCompleteBaselineRetained,
+        // Git no longer captures, so it produces no disposition (it never reaches here anyway: G0
+        // returns None because a git turn is never `change_present`). Retire-capture-modes.
+        crate::config::Vcs::Git => return None,
         crate::config::Vcs::Perforce => {
             if !pending_marked {
                 FellBack::MarkerUnwritable
@@ -2479,6 +2473,12 @@ impl Job {
     /// at all — the single predicate every capture branch is gated on, so none is left
     /// `is_consult()`-shaped. See `docs/cross-model-consult-include-change-impl.md`.
     fn should_capture_change(&self) -> bool {
+        // Git no longer pre-captures: a review derives the change live through repository_diff, and
+        // an include_change consult does the same (retire-capture-modes mechanisms 2/3). Perforce
+        // keeps its per-call changelist capture — it has no repository_diff and no --diff.
+        if self.cfg.vcs == crate::config::Vcs::Git {
+            return false;
+        }
         !self.is_consult() || self.include_change
     }
 
@@ -2645,14 +2645,9 @@ impl Job {
         // identity, mode and per-file fingerprint). A git session never carries a Perforce
         // baseline and vice versa, so at most one arm is `Some`.
         let resume = match self.cfg.vcs {
-            crate::config::Vcs::Git => {
-                match (self.prior_head.as_deref(), self.prior_base.as_deref()) {
-                    (Some(head), Some(base)) => {
-                        Some(vcs::Resume::Git(vcs::GitResumeBaseline { head, base }))
-                    }
-                    _ => None,
-                }
-            }
+            // Git no longer pre-captures (retire-capture-modes), so it carries no incremental-resume
+            // baseline; the delta path is Perforce-only now.
+            crate::config::Vcs::Git => None,
             // Force a full capture (no elision this turn) when either the prior turn did not
             // cleanly persist (`prior_pending`) or this turn's in-progress marker could not be
             // written (`!pending_marked`) -- in the latter case a later crash would be undetectable,
@@ -2937,6 +2932,13 @@ impl Job {
                     // sent no reviewable change.
                     o.disposition = disposition.take();
                     o.capture_summary = capture_summary.take();
+                    // A git review derived its change live, so there is no static capture summary;
+                    // build the caller-facing captured: line from what the evidence server served
+                    // (mechanism 5). Only a successful attempt reaches here, so the serve-record is
+                    // complete and the gate above already passed.
+                    if o.capture_summary.is_none() && self.cfg.vcs == crate::config::Vcs::Git {
+                        o.capture_summary = serve_record_capture_summary(&self.cfg, &self.id);
+                    }
                     outcome = Some(o);
                     break;
                 }
@@ -3682,10 +3684,42 @@ impl Job {
                 } else {
                     None
                 };
-                Some((executable, sterile, bundle_file, mcp_config_file))
+                // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
+                // appends to it, the parent reads it after the run, and dropping this handle at turn
+                // end removes it. It is created **fresh** (truncating), so a stale file left by a
+                // crashed earlier run that happened to reuse this process-local id cannot be read as
+                // this review's records (f4). `None` if the path cannot be resolved or created — a
+                // missing sink fails the gate closed at read time rather than here.
+                let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
+                    .ok()
+                    .and_then(|path| {
+                        std::fs::File::create(&path)
+                            .ok()
+                            .map(|_| crate::evidence::BundleFile { path })
+                    });
+                Some((
+                    executable,
+                    sterile,
+                    bundle_file,
+                    mcp_config_file,
+                    serverecord_file,
+                ))
             } else {
                 None
             };
+
+        // A git review requires the evidence path to deliver the change live and to arm the
+        // fail-closed gate (mechanism 4 / f7). Codex always has it; an ambient (unprofiled, or
+        // shell-enabled) Claude does not, and since git no longer pre-captures, such a review would
+        // be handed no change AND skip the gate — free to approve blind. Refuse it before spawning,
+        // as the plan requires (resolved decision 1). Consults are informal and exempt.
+        if !is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_none() {
+            return Err(errors::evidence_unavailable(
+                "a git review needs the read-only evidence service to deliver the change live, but \
+                 it is unavailable for this reviewer -- an ambient Claude has no evidence path. Pin \
+                 a profile for the Claude reviewer (--claude-profile), or use the Codex reviewer.",
+            ));
+        }
 
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
         // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
@@ -3788,18 +3822,17 @@ impl Job {
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
 
-        let evidence_invocation =
-            evidence_setup
-                .as_ref()
-                .map(|(executable, sterile, bundle, mcp_config)| {
-                    crate::reviewer::EvidenceInvocation {
-                        executable,
-                        bundle_file: &bundle.path,
-                        nonce: &self.id,
-                        sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
-                        mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
-                    }
-                });
+        let evidence_invocation = evidence_setup.as_ref().map(
+            |(executable, sterile, bundle, mcp_config, _serverecord)| {
+                crate::reviewer::EvidenceInvocation {
+                    executable,
+                    bundle_file: &bundle.path,
+                    nonce: &self.id,
+                    sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
+                    mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
+                }
+            },
+        );
         let invocation = match self.reviewer.invocation(
             &self.cfg,
             &self.spec,
@@ -4055,6 +4088,40 @@ impl Job {
             (Some(turn_eval), ledger, terminal)
         };
 
+        // Retire-capture-modes mechanism 4: the fail-closed evidence gate for the live model,
+        // reviewer-agnostic — it reads the evidence server's serve-record file, not either CLI's
+        // stream, so it covers Codex (which has no capture_thin gate) as well as Claude. Git only:
+        // Perforce has no repository_diff and still delivers its changelist through repository_change.
+        // Disarmed for consults, which are informal and certify nothing.
+        if !is_consult && evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
+            let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+            // The reviewer never pulled the change at all: whatever the verdict, the review rests on
+            // nothing it was shown. Fail closed to a re-runnable EVIDENCE_UNAVAILABLE.
+            if !agg.any_diff {
+                return Err(errors::evidence_review_too_thin(
+                    "the reviewer obtained no repository_diff of the change, so the review would \
+                     rest on nothing it was shown",
+                ));
+            }
+            // A formal APPROVE must have been served the complete canonical diff, paged to its end
+            // (f1): a reviewer that approved on only a narrowed slice, or that stopped mid-pagination,
+            // is caught here. A non-approving verdict on a narrowed diff is a legitimate partial
+            // review and is left alone.
+            if let Some(te) = &turn_eval {
+                let approved = matches!(
+                    te.envelope.verdict,
+                    crate::findings::MachineVerdict::Approve
+                );
+                if approved && !agg.complete_canonical_terminal {
+                    return Err(errors::evidence_review_too_thin(
+                        "the reviewer approved without being served the complete canonical \
+                         working-tree diff paged to its end, so the approval would rest on less than \
+                         the whole change",
+                    ));
+                }
+            }
+        }
+
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
         // every later one is inflated by everything before it -- which is exactly what
@@ -4222,10 +4289,10 @@ impl Job {
                             // contract (git + include_change) -- a Perforce consult is bound by its
                             // changelist set, and a tree-only consult has no capture to bind.
                             include_change: self.is_consult().then_some(self.include_change),
-                            diff_mode: (self.is_consult()
-                                && self.include_change
-                                && self.cfg.vcs == crate::config::Vcs::Git)
-                                .then(|| self.cfg.diff.to_string()),
+                            // Git no longer has a capture mode (retire-capture-modes), so this is
+                            // always None now. It stays on the record so an *old* record written
+                            // with Some(diff_mode) is detected and refused on resume (f5).
+                            diff_mode: None,
                             // The active entry's identity, so a resume can match this exact entry and
                             // detect PATH drift.
                             raw_bin: self.spec.raw_bin(),
@@ -4674,21 +4741,20 @@ fn resume_block(
                 },
             ));
         }
-        // When the change is bound and the backend is git, the *configured* --diff mode is part of
-        // the contract: resuming under a different mode would continue the conversation against a
-        // different capture. (Perforce binds by its changelist set, checked below.) The per-turn
-        // resolved HEAD/base still drift as they do for a review — only the configured mode is bound.
-        if requested_include_change && cfg.vcs == crate::config::Vcs::Git {
-            let current = cfg.diff.to_string();
-            if record.diff_mode.as_deref() != Some(current.as_str()) {
-                return Some(format!(
-                    "it was created with --diff '{}', but this server is now configured for \
-                     --diff '{}'; a consult that includes the change is bound to its configured \
-                     diff mode, so start a fresh consult (fresh: true).",
-                    record.diff_mode.as_deref().unwrap_or("(unset)"),
-                    current,
-                ));
-            }
+        // Git no longer has a capture mode (retire-capture-modes): a record that carries a
+        // `diff_mode` was written under the old static-capture contract, before the change was
+        // derived live, so its stored change semantics do not match this server's. Refuse the resume
+        // and rebaseline (f5). New git records carry no diff_mode and pass.
+        if requested_include_change
+            && cfg.vcs == crate::config::Vcs::Git
+            && record.diff_mode.is_some()
+        {
+            return Some(
+                "it was created under the retired git capture-mode contract (it carries a --diff \
+                 mode), but this server now derives the change live through repository_diff; the \
+                 stored change semantics differ, so start a fresh consult (fresh: true)."
+                    .to_string(),
+            );
         }
         // A tree-only consult must carry no capture state. A pre-`include_change` Perforce consult
         // record does, and has include_change: None, so the effective-mode check above passes it
@@ -4807,6 +4873,139 @@ fn resume_block(
 /// `turn_not_durable` are recorded as ledger coverage, and promoting either here would turn one
 /// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
 /// because an over-budget turn always reports it at rank 0.
+/// What a review's `repository_diff` serve-records add up to (retire-capture-modes mechanisms 3/4).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DiffServeAggregate {
+    /// The reviewer made at least one `repository_diff` call this turn.
+    any_diff: bool,
+    /// A *canonical* operation — the whole working tree against the fork point, unnarrowed — was
+    /// served complete and paged to its terminal page. This is the floor a formal approval must
+    /// clear (f1): it proves the reviewer was served the entire change, end to end.
+    complete_canonical_terminal: bool,
+    /// Counts from the canonical operation, for the caller-facing `captured:` line (mechanism 5).
+    /// `None` when no canonical operation was served.
+    canonical: Option<CanonicalServe>,
+}
+
+/// The canonical diff's resolved base and counts, taken from the serve-record, for `captured:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalServe {
+    base: String,
+    files: usize,
+    insertions: usize,
+    deletions: usize,
+    untracked: usize,
+}
+
+/// Aggregate the nonce-bound serve-record JSONL the evidence server appended (mechanism 3). Each
+/// line is `{op, canonical, complete, terminal, ...}`; records are grouped by `op` and a canonical
+/// operation clears the floor only when some page marked it canonical, *every* page reported it
+/// complete, and some page was terminal. Malformed or missing lines are ignored — a review that
+/// cannot be shown to have been served the whole change fails closed at the caller, never rescued by
+/// a best guess. A missing file parses as the empty string: no diffs, floor not cleared.
+fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
+    #[derive(Default)]
+    struct Op {
+        canonical: bool,
+        complete: bool,
+        terminal: bool,
+        counts: Option<CanonicalServe>,
+    }
+    let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
+    let mut any_diff = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        any_diff = true;
+        let bool_field = |k: &str| value.get(k).and_then(serde_json::Value::as_bool);
+        let u64_field = |k: &str| {
+            value
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize
+        };
+        let entry = ops.entry(op.to_string()).or_insert_with(|| Op {
+            complete: true,
+            ..Op::default()
+        });
+        entry.canonical |= bool_field("canonical").unwrap_or(false);
+        // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
+        entry.complete &= bool_field("complete").unwrap_or(false);
+        entry.terminal |= bool_field("terminal").unwrap_or(false);
+        // The counts ride on this operation's first page (the record carrying `files`), and stay
+        // bound to *this* op id — not overwritten by a later, possibly different, canonical op.
+        if bool_field("canonical").unwrap_or(false) {
+            if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
+                entry.counts = Some(CanonicalServe {
+                    base: value
+                        .get("base_source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("branch-base")
+                        .to_string(),
+                    files: files as usize,
+                    insertions: u64_field("insertions"),
+                    deletions: u64_field("deletions"),
+                    untracked: u64_field("untracked"),
+                });
+            }
+        }
+    }
+    // Require *exactly one* canonical operation (f3). Zero means none was served; more than one is
+    // ambiguous — an early complete op must not clear the floor for a later, possibly incomplete or
+    // differently-scoped one — so both fail closed. The single canonical op clears the floor only
+    // when it is itself complete and reached its terminal page, and its counts feed captured:.
+    let canonical_ops: Vec<&Op> = ops.values().filter(|o| o.canonical).collect();
+    let (complete_canonical_terminal, canonical) = match canonical_ops.as_slice() {
+        [only] => (only.complete && only.terminal, only.counts.clone()),
+        _ => (false, None),
+    };
+    DiffServeAggregate {
+        any_diff,
+        complete_canonical_terminal,
+        canonical,
+    }
+}
+
+/// Read and aggregate the serve-record file for a review, best-effort. An unreadable or absent file
+/// yields the default (no diffs, floor not cleared), which fails the gate closed.
+fn read_serve_record_aggregate(cfg: &Config, nonce: &str) -> DiffServeAggregate {
+    crate::evidence::serve_record_path(cfg, nonce)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| aggregate_serve_records(&c))
+        .unwrap_or_default()
+}
+
+/// Build the caller-facing `captured:` summary for a git review from the serve-record's canonical
+/// operation (mechanism 5) — reporting what the evidence server served the reviewer on demand, in
+/// place of the retired static capture. `None` when no canonical diff was served, so no `captured:`
+/// line is rendered (which is also the shape the gate already failed an approval on).
+fn serve_record_capture_summary(cfg: &Config, nonce: &str) -> Option<crate::vcs::CaptureSummary> {
+    let agg = read_serve_record_aggregate(cfg, nonce);
+    let c = agg.canonical?;
+    Some(crate::vcs::CaptureSummary::Git {
+        range: c.base,
+        files: c.files,
+        insertions: c.insertions,
+        deletions: c.deletions,
+        untracked_files: c.untracked,
+        untracked_files_floor: false,
+        diff_truncated: false,
+        // The serve-record's completeness collapses into these two: a canonical op that did not
+        // reach a complete terminal page is reported incomplete.
+        diff_incomplete: !agg.complete_canonical_terminal,
+        complete: agg.complete_canonical_terminal,
+    })
+}
+
 fn terminal_reason_for(envelope: &crate::findings::Envelope) -> Option<String> {
     envelope
         .non_convergence_reason
@@ -5034,6 +5233,72 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn serve_record_aggregate_clears_floor_only_on_a_complete_canonical_terminal_op() {
+        // Nothing recorded.
+        assert_eq!(aggregate_serve_records(""), DiffServeAggregate::default());
+
+        // A canonical op, complete and terminal in one page: floor cleared.
+        let a = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true}"#,
+        );
+        assert!(a.any_diff && a.complete_canonical_terminal);
+
+        // A canonical op paged across two calls, terminal on the second: cleared.
+        let paged = "{\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":false}\n\
+                     {\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":true,\"continuation\":true}";
+        assert!(aggregate_serve_records(paged).complete_canonical_terminal);
+
+        // The page-1-stop case: canonical op that never reached its terminal page — NOT cleared.
+        let stopped = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":false}"#,
+        );
+        assert!(stopped.any_diff && !stopped.complete_canonical_terminal);
+
+        // An incomplete canonical op (server-flagged) — not cleared.
+        assert!(
+            !aggregate_serve_records(
+                r#"{"op":"x","canonical":true,"complete":false,"terminal":true}"#
+            )
+            .complete_canonical_terminal
+        );
+
+        // Only a narrowed (non-canonical) exploratory diff: a diff happened, but the floor is not
+        // cleared — the path-restricted-approval case f1 named.
+        let narrow = aggregate_serve_records(
+            r#"{"op":"y","canonical":false,"complete":true,"terminal":true}"#,
+        );
+        assert!(narrow.any_diff && !narrow.complete_canonical_terminal);
+
+        // Malformed lines are ignored, not fatal.
+        let junk =
+            "not json\n{bad\n{\"op\":\"z\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
+        assert!(aggregate_serve_records(junk).complete_canonical_terminal);
+
+        // The canonical operation's counts are captured for the caller-facing captured: line.
+        let counted = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true,"base_source":"merge-base(HEAD, @{upstream})","files":3,"insertions":10,"deletions":2,"untracked":1}"#,
+        );
+        let c = counted.canonical.expect("canonical counts recorded");
+        assert_eq!(
+            (c.files, c.insertions, c.deletions, c.untracked),
+            (3, 10, 2, 1)
+        );
+        // A narrowed-only diff records no canonical counts.
+        assert!(
+            aggregate_serve_records(r#"{"op":"y","canonical":false,"files":2}"#)
+                .canonical
+                .is_none()
+        );
+
+        // Two distinct canonical operations are ambiguous and do NOT clear the floor (f3) — an early
+        // complete op must not certify a later, possibly different one.
+        let two = "{\"op\":\"a\",\"canonical\":true,\"complete\":true,\"terminal\":true}\n\
+                   {\"op\":\"b\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
+        let t = aggregate_serve_records(two);
+        assert!(t.any_diff && !t.complete_canonical_terminal && t.canonical.is_none());
+    }
 
     #[test]
     fn switch_guard_refuses_a_changed_or_unreadable_account() {
@@ -5654,7 +5919,7 @@ mod tests {
                 true,
                 false,
                 true,
-                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             )
@@ -5665,7 +5930,7 @@ mod tests {
                 true,
                 true,
                 false,
-                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             )
@@ -5679,24 +5944,21 @@ mod tests {
                 true,
                 true,
                 true,
-                Some(Disposition::FellBackToFull(FellBack::BranchRewritten)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             );
             assert_eq!(
                 d,
-                Some(Disposition::FellBackToFull(FellBack::BranchRewritten))
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending))
             );
         }
 
         #[test]
-        fn a_resumed_git_turn_with_no_baseline_is_no_complete_baseline_retained() {
-            assert_eq!(
-                git_no_backing(),
-                Some(Disposition::FellBackToFull(
-                    FellBack::NoCompleteBaselineRetained
-                ))
-            );
+        fn a_resumed_git_turn_produces_no_disposition() {
+            // Git no longer captures (retire-capture-modes), so it produces no resume disposition
+            // even when resumed with a change present.
+            assert_eq!(git_no_backing(), None);
         }
 
         #[test]
@@ -6623,7 +6885,6 @@ mod tests {
         // Stored change-capturing, requested tree-only: refused.
         let mut rec = consult_record(&cfg, now);
         rec.include_change = Some(true);
-        rec.diff_mode = Some(cfg.diff.to_string());
         let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now)
             .expect("mismatch is refused");
         assert!(reason.contains("include_change"), "{reason}");
@@ -6641,38 +6902,28 @@ mod tests {
         rec.include_change = None;
         assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now).is_none());
         rec.include_change = Some(true);
-        rec.diff_mode = Some(cfg.diff.to_string());
         assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
     }
 
     #[test]
-    fn a_change_capturing_git_consult_is_bound_to_its_configured_diff_mode() {
-        let cfg = Config::from_args(&[
-            "--reviewer".into(),
-            "codex".into(),
-            "--diff".into(),
-            "main...HEAD".into(),
-        ])
-        .expect("cfg");
+    fn a_git_consult_record_under_the_retired_diff_mode_contract_is_refused() {
+        // f5: git no longer has a capture mode, so an include_change consult record written under the
+        // old static-capture contract (it carries a diff_mode) has stored change semantics this
+        // server cannot match. It is refused on resume and the caller rebaselines; a record with no
+        // diff_mode (the live shape) resumes.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
         let now = 1_000_000;
 
-        // Same configured mode resumes.
         let mut rec = consult_record(&cfg, now);
         rec.include_change = Some(true);
         rec.diff_mode = Some("main...HEAD".to_string());
-        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
-
-        // A different configured mode refuses.
-        rec.diff_mode = Some("HEAD".to_string());
         let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now)
-            .expect("a changed diff mode is refused");
-        assert!(reason.contains("--diff"), "{reason}");
+            .expect("a record under the retired diff-mode contract is refused");
+        assert!(reason.contains("retired"), "{reason}");
 
-        // A tree-only consult ignores diff_mode entirely (it binds nothing).
-        let mut tree = consult_record(&cfg, now);
-        tree.include_change = Some(false);
-        tree.diff_mode = Some("HEAD".to_string());
-        assert!(resume_block(&cfg, &tree, &[], session::KIND_CONSULT, false, now).is_none());
+        // A live record carries no diff_mode and resumes.
+        rec.diff_mode = None;
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
     }
 
     #[test]
@@ -6833,10 +7084,9 @@ mod tests {
             denial_count_is_floor: false,
             warnings: Vec::new(),
             disposition: Some(crate::vcs::Disposition::Incremental(
-                crate::vcs::disposition::Incremental::GitRange {
-                    prior: "aaaaaaaaaaaa".into(),
-                    head: "bbbbbbbbbbbb".into(),
-                    commits: Some(1),
+                crate::vcs::disposition::Incremental::PerforceEvidence {
+                    resent: 1,
+                    collapsed: 0,
                 },
             )),
             capture_summary,
@@ -7137,8 +7387,6 @@ mod tests {
             turn: 4,
             gap_secs: None,
             prior_cumulative: None,
-            prior_head: None,
-            prior_base: None,
             prior_perforce_baseline: None,
             prior_capture_identity: None,
             prior_include_shelved: None,

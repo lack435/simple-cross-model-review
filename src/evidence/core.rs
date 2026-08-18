@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -489,6 +489,11 @@ pub struct Core {
     /// describe the scan that ran rather than the one the VCS implies.
     observed_method: Option<StampMethod>,
     cancel: Arc<AtomicBool>,
+    /// The nonce-bound side-channel file each `repository_diff` call appends a serve-record to, for
+    /// the parent's `captured:` line and fail-closed gate (retire-capture-modes mechanism 3). `None`
+    /// in tests and whenever the parent supplied no path; a missing sink is silent, never fatal — a
+    /// review that cannot record its serve-records fails closed at the gate, not here.
+    serve_record: Option<PathBuf>,
     /// The watchdog the walk-bearing routes (`repository_list`, `repository_search`) run under.
     ///
     /// A seam, not a setting: production always gets `WALK_WATCHDOG`, and it exists so a test can
@@ -532,8 +537,27 @@ impl Core {
             observed_stamp: None,
             observed_method: None,
             cancel,
+            serve_record: None,
             walk_watchdog: &WALK_WATCHDOG,
         })
+    }
+
+    /// Point `repository_diff` at the nonce-bound serve-record file the parent will read. Set once,
+    /// in `serve_stdio`, before the request loop starts.
+    pub fn set_serve_record(&mut self, path: PathBuf) {
+        self.serve_record = Some(path);
+    }
+
+    /// Append one serve-record line (JSON) to the side-channel file, best-effort. A write failure is
+    /// swallowed: the review continues and the gate fails closed on the missing record rather than
+    /// crashing the evidence server mid-turn.
+    fn append_serve_record(&self, record: &Value) {
+        let Some(path) = &self.serve_record else {
+            return;
+        };
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{record}");
+        }
     }
 
     /// Dispatch a call whose receipt clock starts now. Convenience for tests and any caller that
@@ -614,6 +638,10 @@ impl Core {
             "repository_revision" => {
                 require_only(args, &["id", "path", "cursor", "limit_bytes"])?;
                 self.revision(args, received_at)
+            }
+            "repository_diff" => {
+                require_only(args, &["base", "head", "path", "cursor", "limit_bytes"])?;
+                self.diff(args, received_at)
             }
             _ => Err(EvidenceError::new(
                 "unknown_tool",
@@ -1036,6 +1064,161 @@ impl Core {
             super::git::revision(&root, &id, &path, &limits, &cancel, received_at)
         })?;
         self.first_text_page("repository_revision", text, limit, "content")
+    }
+
+    /// Diff the live working tree (or a commit range) against a base, on demand (retire-capture-modes
+    /// mechanism 1). Replaces the pre-rendered `repository_change` blob: the change under review is
+    /// derived live here rather than captured before the turn.
+    fn diff(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
+        if self.bundle.vcs != VcsKind::Git {
+            return Err(EvidenceError::new(
+                "unsupported",
+                "repository_diff is unsupported for Perforce",
+            ));
+        }
+        let limit = limit_arg(
+            args,
+            "limit_bytes",
+            self.bundle.limits.default_change_bytes,
+            self.bundle.limits.max_change_bytes,
+        )? as usize;
+        if let Some(cursor) = optional_string(args, "cursor")? {
+            cursor_only(args, &["cursor", "limit_bytes"])?;
+            return self.diff_cursor(&cursor, limit);
+        }
+        let base = optional_string(args, "base")?.unwrap_or_else(|| "branch-base".to_string());
+        let head = optional_string(args, "head")?.unwrap_or_else(|| "worktree".to_string());
+        let base_ep = DiffEndpoint::parse_base(&base)?;
+        let head_ep = DiffEndpoint::parse_head(&head)?;
+        let path = optional_string(args, "path")?.unwrap_or_default();
+        if !path.is_empty() {
+            self.validate_relative(&path)?;
+        }
+        // The canonical diff — the one a formal approval must be served (mechanism 4) — is the whole
+        // working tree against the branch's fork point, unnarrowed. Anything else is exploratory.
+        let canonical = matches!(base_ep, DiffEndpoint::BranchBase)
+            && matches!(head_ep, DiffEndpoint::Worktree)
+            && path.is_empty();
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let composed = run_bounded_walk(&CHILD_WATCHDOG, "git diff", received_at, move || {
+            compose_diff(
+                &root,
+                &base_ep,
+                &head_ep,
+                &path,
+                &limits,
+                &cancel,
+                received_at,
+            )
+        })?;
+        self.first_diff_page(canonical, composed, limit)
+    }
+
+    /// First page of a `repository_diff`, recording the serve-record the parent's `captured:` line
+    /// and gate read (mechanism 3). A new operation id is minted here and carried in the cursor so
+    /// every follow-up page records under the same operation; `terminal` says whether this page was
+    /// the last, which is what lets the gate require the canonical diff was paged to its end (f1).
+    fn first_diff_page(
+        &mut self,
+        canonical: bool,
+        composed: ComposedDiff,
+        limit: usize,
+    ) -> Result<Value, EvidenceError> {
+        let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
+        let text = composed.text;
+        let end = utf8_end(&text, limit.min(text.len()));
+        let content = text[..end].to_string();
+        let terminal = end >= text.len();
+        let cursor = if terminal {
+            None
+        } else {
+            Some(self.store_cursor(
+                "repository_diff",
+                vec![json!({
+                    "text": text, "offset": end, "op": op,
+                    "canonical": canonical, "complete": composed.complete
+                })],
+                0,
+                true,
+            ))
+        };
+        self.append_serve_record(&json!({
+            "op": op,
+            "canonical": canonical,
+            "complete": composed.complete,
+            "terminal": terminal,
+            "base": composed.base_token,
+            "base_source": composed.base_source,
+            "files": composed.files,
+            "insertions": composed.insertions,
+            "deletions": composed.deletions,
+            "untracked": composed.untracked_files,
+        }));
+        Ok(text_result("diff", content, end, cursor))
+    }
+
+    /// A continuation page of a `repository_diff`, recording under the operation id carried in the
+    /// cursor. Its `terminal` flag closing an operation is what the gate reads as "the reviewer was
+    /// served the whole canonical diff."
+    fn diff_cursor(&mut self, token: &str, limit: usize) -> Result<Value, EvidenceError> {
+        let state = self.take_cursor(token, "repository_diff")?;
+        let item = state
+            .values
+            .first()
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?;
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
+            .to_string();
+        let offset = item
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
+            as usize;
+        let op = item
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let canonical = item
+            .get("canonical")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let complete = item
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
+        let content = text[offset..end].to_string();
+        let terminal = end >= text.len();
+        let cursor = if terminal {
+            None
+        } else {
+            Some(self.store_cursor(
+                "repository_diff",
+                vec![json!({
+                    "text": text, "offset": end, "op": op,
+                    "canonical": canonical, "complete": complete
+                })],
+                0,
+                true,
+            ))
+        };
+        self.append_serve_record(&json!({
+            "op": op,
+            "canonical": canonical,
+            "complete": complete,
+            "terminal": terminal,
+            "continuation": true,
+        }));
+        Ok(text_result("diff", content, end, cursor))
     }
 
     /// Resolve the search base and walk it, all on one watchdog-bounded worker.
@@ -2098,10 +2281,340 @@ fn valid_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A resolved endpoint of a `repository_diff` (retire-capture-modes mechanism 1). The closed
+/// sentinel set plus full-hex ids is what keeps model input off git's ref/option surface: nothing
+/// symbolic reaches git — a base sentinel maps to a fixed, server-written token, and an id is
+/// validated by `valid_object_id`.
+#[derive(Clone, Debug)]
+enum DiffEndpoint {
+    Worktree,
+    Index,
+    Head,
+    BranchBase,
+    Commit(String),
+}
+
+impl DiffEndpoint {
+    /// A base is a commit to diff *from*: `branch-base` (the fork point), `head`, or an id. The
+    /// working tree and index are not commits, so they are not valid bases.
+    fn parse_base(raw: &str) -> Result<Self, EvidenceError> {
+        match raw {
+            "branch-base" => Ok(Self::BranchBase),
+            "head" => Ok(Self::Head),
+            other if valid_object_id(other) => Ok(Self::Commit(other.to_string())),
+            _ => Err(EvidenceError::new(
+                "invalid_arguments",
+                "base must be 'branch-base', 'head', or a full Git object id",
+            )),
+        }
+    }
+
+    /// A head is what to diff *to*: `worktree` (default, live tree incl. untracked), `index`
+    /// (staged), `head`, or an id. `branch-base` is a base concept, not a head.
+    fn parse_head(raw: &str) -> Result<Self, EvidenceError> {
+        match raw {
+            "worktree" => Ok(Self::Worktree),
+            "index" => Ok(Self::Index),
+            "head" => Ok(Self::Head),
+            other if valid_object_id(other) => Ok(Self::Commit(other.to_string())),
+            _ => Err(EvidenceError::new(
+                "invalid_arguments",
+                "head must be 'worktree', 'index', 'head', or a full Git object id",
+            )),
+        }
+    }
+}
+
+/// Resolve `branch-base` to the branch's fork point: `merge-base(HEAD, <default branch>)`.
+///
+/// The base ref is the repository's **default branch** — `origin/HEAD` (a symref to
+/// `origin/<default>`), then `origin/main`/`origin/master` as fallbacks — *not* `@{upstream}`. That
+/// distinction is f1, and it is a correctness one: `@{upstream}` is the branch's configured upstream,
+/// which under the common push-to-same-name workflow is the branch's *own* remote ref, so
+/// `merge-base(HEAD, @{upstream})` can equal HEAD and yield a canonical diff of only uncommitted
+/// changes while the gate still accepts an approval — the committed branch work silently omitted.
+/// The default branch is what a review is actually *against*. All candidates are remote-tracking, so
+/// a stale *local* branch can never be the base. When none resolves it fails closed rather than
+/// guessing a local base; the caller can pass an explicit base commit id instead. It never fetches —
+/// an unfetched remote-tracking ref is the residual the plan leaves to the author.
+fn resolve_branch_base(
+    root: &Path,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<(String, String), EvidenceError> {
+    let head = super::git::resolve_commit(root, "HEAD", limits, cancel, received_at)?
+        .ok_or_else(|| EvidenceError::new("branch_base_unresolved", "HEAD does not resolve"))?;
+    // Fully-qualified `refs/remotes/...` names, not `origin/main` (f10): git resolves
+    // `refs/heads/<name>` before `refs/remotes/<name>`, so a local branch literally named
+    // `origin/main` would otherwise shadow the intended remote-tracking ref and could point at HEAD,
+    // re-opening the omit-committed-changes hole.
+    let mut base_ref = None;
+    for candidate in [
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+    ] {
+        if let Some(id) = super::git::resolve_commit(root, candidate, limits, cancel, received_at)?
+        {
+            base_ref = Some((id, candidate));
+            break;
+        }
+    }
+    let (default_branch, source) = base_ref.ok_or_else(|| {
+        EvidenceError::new(
+            "branch_base_unresolved",
+            "the default branch could not be resolved (no refs/remotes/origin/HEAD, .../main, or \
+             .../master); pass an explicit base commit id, e.g. base: <full object id>",
+        )
+    })?;
+    let base = super::git::merge_base(root, &head, &default_branch, limits, cancel, received_at)?
+        .ok_or_else(|| {
+        EvidenceError::new(
+            "branch_base_unresolved",
+            "HEAD shares no history with the default branch",
+        )
+    })?;
+    Ok((base, format!("merge-base(HEAD, {source})")))
+}
+
+/// Read one untracked file's bounded content, symlink-safe. The path came from `git ls-files
+/// --others`, but it is still routed through `resolve_existing_bounded` so a symlink pointing out
+/// of the root cannot exfiltrate an outside file. Returns the (lossy-UTF-8) content and whether it
+/// was truncated at `max_file_bytes`.
+fn read_untracked(
+    root: &Path,
+    rel: &str,
+    limits: &Limits,
+) -> Result<(String, bool), EvidenceError> {
+    let safe = resolve_existing_bounded(root, limits.max_path_bytes as usize, rel, false)
+        .map_err(ReadFailure::into_evidence)?;
+    let cap = limits.max_file_bytes as usize;
+    // Read at most cap+1 bytes rather than slurping the whole file and capping after (f5): a huge
+    // untracked file must not be pulled into memory in full. The +1 distinguishes "exactly cap"
+    // from "more remained".
+    let file = File::open(&safe).map_err(|e| {
+        EvidenceError::new(
+            "provider_failed",
+            format!("cannot read untracked file: {e}"),
+        )
+    })?;
+    // Verify the *opened handle* still points inside the root (f8): resolve_existing_bounded checked
+    // the path, but a concurrent path/reparse-point swap between resolution and open could redirect
+    // it outside — the same guard read_file_bounded applies.
+    verify_open_file(&file, &safe, root).map_err(ReadFailure::into_evidence)?;
+    let mut data = Vec::new();
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| {
+            EvidenceError::new(
+                "provider_failed",
+                format!("cannot read untracked file: {e}"),
+            )
+        })?;
+    let truncated = data.len() > cap;
+    data.truncate(cap);
+    // Cutting mid-codepoint is fine: from_utf8_lossy substitutes the partial tail.
+    let text = String::from_utf8_lossy(&data).into_owned();
+    Ok((text, truncated))
+}
+
+/// A composed working-tree diff plus the metadata the serve-record needs (mechanism 3). `complete`
+/// is the untracked half's wholeness — the tracked half is always whole here, because `git diff`
+/// output that hit the byte cap makes `git::diff` return an error rather than a truncated string, so
+/// an over-cap canonical diff surfaces as a failed call and fails the gate closed by its absence.
+struct ComposedDiff {
+    text: String,
+    base_token: String,
+    base_source: String,
+    complete: bool,
+    files: usize,
+    insertions: usize,
+    deletions: usize,
+    untracked_files: usize,
+}
+
+/// Resolve the endpoints, run the tracked diff, and — for a working-tree head — compose the
+/// untracked files `git diff` omits (f2). Runs on the watchdog-bounded worker. The text carries a
+/// one-line header naming the resolved base, so the reviewer sees what it is diffing against.
+fn compose_diff(
+    root: &Path,
+    base: &DiffEndpoint,
+    head: &DiffEndpoint,
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<ComposedDiff, EvidenceError> {
+    let (base_token, base_source) = match base {
+        DiffEndpoint::BranchBase => resolve_branch_base(root, limits, cancel, received_at)?,
+        DiffEndpoint::Head => ("HEAD".to_string(), "HEAD".to_string()),
+        DiffEndpoint::Commit(id) => (id.clone(), id.clone()),
+        DiffEndpoint::Worktree | DiffEndpoint::Index => {
+            return Err(EvidenceError::new(
+                "invalid_arguments",
+                "base cannot be the working tree or index",
+            ))
+        }
+    };
+    let mut spec: Vec<String> = Vec::new();
+    let compose_untracked = matches!(head, DiffEndpoint::Worktree);
+    match head {
+        DiffEndpoint::Worktree => spec.push(base_token.clone()),
+        DiffEndpoint::Index => {
+            spec.push("--cached".to_string());
+            spec.push(base_token.clone());
+        }
+        DiffEndpoint::Head => {
+            spec.push(base_token.clone());
+            spec.push("HEAD".to_string());
+        }
+        DiffEndpoint::Commit(id) => {
+            spec.push(base_token.clone());
+            spec.push(id.clone());
+        }
+        DiffEndpoint::BranchBase => {
+            return Err(EvidenceError::new(
+                "invalid_arguments",
+                "head cannot be 'branch-base'",
+            ))
+        }
+    }
+    let spec_refs: Vec<&str> = spec.iter().map(String::as_str).collect();
+    let tracked = super::git::diff(root, &spec_refs, path, limits, cancel, received_at)?;
+    let (files, insertions, deletions) =
+        super::git::numstat(root, &spec_refs, path, limits, cancel, received_at)?;
+
+    let mut complete = true;
+    let mut untracked_files = 0usize;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# repository_diff base {base_source} = {base_token}\n\n"
+    ));
+    out.push_str(&tracked);
+    if compose_untracked {
+        let (paths, listing_complete) =
+            super::git::untracked_paths(root, limits, cancel, received_at)?;
+        // Normalize the request path to git's slash form before comparing (f9): backslashes, a
+        // leading `./`, embedded `.`/empty components (`src/./foo`, `src//foo`), and a trailing
+        // slash are all valid but would never prefix-match git's normalized untracked paths
+        // otherwise. Dropping every `.`/empty component leaves the canonical slash path; empty means
+        // the whole tree — no narrowing.
+        let norm: String = path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let paths: Vec<String> = if norm.is_empty() {
+            paths
+        } else {
+            // Match at that path or under it, on a path-component boundary so `src/foo` does not also
+            // pull in `src/foobar` (f6).
+            let prefix = format!("{norm}/");
+            paths
+                .into_iter()
+                .filter(|p| *p == norm || p.starts_with(&prefix))
+                .collect()
+        };
+        complete = listing_complete;
+        untracked_files = paths.len();
+        if !paths.is_empty() {
+            out.push_str("\n\n# untracked (new) files\n");
+        }
+        for p in &paths {
+            match read_untracked(root, p, limits) {
+                Ok((content, truncated)) => {
+                    out.push_str(&format!("\n=== new file: {p} ===\n"));
+                    out.push_str(&content);
+                    out.push('\n');
+                    if truncated {
+                        complete = false;
+                        out.push_str("… (content truncated)\n");
+                    }
+                }
+                Err(_) => {
+                    complete = false;
+                    out.push_str(&format!("\n=== new file: {p} (unreadable, omitted) ===\n"));
+                }
+            }
+        }
+        if !complete {
+            out.push_str("\n# note: untracked listing or contents were incomplete\n");
+        }
+    }
+    Ok(ComposedDiff {
+        text: out,
+        base_token,
+        base_source,
+        complete,
+        files,
+        insertions,
+        deletions,
+        untracked_files,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+
+    #[test]
+    fn diff_endpoints_accept_only_sentinels_and_full_ids() {
+        // Base sentinels and a full id resolve; the working tree/index are not bases.
+        assert!(matches!(
+            DiffEndpoint::parse_base("branch-base"),
+            Ok(DiffEndpoint::BranchBase)
+        ));
+        assert!(matches!(
+            DiffEndpoint::parse_base("head"),
+            Ok(DiffEndpoint::Head)
+        ));
+        assert!(matches!(
+            DiffEndpoint::parse_base(&"a".repeat(40)),
+            Ok(DiffEndpoint::Commit(_))
+        ));
+        assert!(matches!(
+            DiffEndpoint::parse_base(&"b".repeat(64)),
+            Ok(DiffEndpoint::Commit(_))
+        ));
+        // Head sentinels.
+        assert!(matches!(
+            DiffEndpoint::parse_head("worktree"),
+            Ok(DiffEndpoint::Worktree)
+        ));
+        assert!(matches!(
+            DiffEndpoint::parse_head("index"),
+            Ok(DiffEndpoint::Index)
+        ));
+
+        // Symbolic refs, options, partial ids, and cross-role sentinels are all rejected — nothing
+        // symbolic or option-shaped can reach git.
+        for bad in [
+            "main",
+            "HEAD~3",
+            "origin/main",
+            "@{upstream}",
+            "--output=/tmp/x",
+            "-x",
+            "abc123",
+            &"g".repeat(40),
+        ] {
+            assert!(
+                DiffEndpoint::parse_base(bad).is_err(),
+                "base accepted {bad:?}"
+            );
+            assert!(
+                DiffEndpoint::parse_head(bad).is_err(),
+                "head accepted {bad:?}"
+            );
+        }
+        // Cross-role: the working tree is not a base; branch-base is not a head.
+        assert!(DiffEndpoint::parse_base("worktree").is_err());
+        assert!(DiffEndpoint::parse_base("index").is_err());
+        assert!(DiffEndpoint::parse_head("branch-base").is_err());
+    }
 
     /// A bundle over a plain temp directory. `VcsKind::Perforce` because these fixtures are not
     /// Git repositories: the filesystem walk is the scan they are testing, and a Git bundle here

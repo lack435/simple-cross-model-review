@@ -27,62 +27,30 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   checkout — Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 4.8 via
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
-- **Do not paste a diff into `instructions` in either direction.** The isolated Codex reviewer
-  receives the selected change through `repository_change` and reads/searches the tree through
-  the other bounded evidence tools; its shell runs from a sterile non-repository directory and
-  is not the normal repository interface. The Claude reviewer receives the server capture in
-  its prompt. Describe the intent and what you want scrutinised, and let the configured capture
-  plus reviewer evidence do the rest.
-- **For the Claude direction, the gate reviews what is committed.** What gets captured is
-  fixed by `--diff` on the server entry, not chosen per call, and
-  [`.codex/config.toml`](.codex/config.toml) pins `main...HEAD` so the reviewer is shown the
-  branch against its base rather than the default working-tree capture, which is empty once
-  the work is committed. Four things follow, and the first two are pre-flight:
-  - **Commit, and check `git status --porcelain` is empty, before every call in that
-    direction — the first review and each re-review.** A dirty tree is worse than it looks:
-    the capture is the committed range, but the reviewer can read the live files and is
-    handed `git status`, so it would be reviewing one revision through a diff and another
-    through the tree. The reviewer is now told when that has happened; do not make it rely
-    on that.
-  - **`main` there is the *local* ref, so fetch and check it is current first.** A stale
-    local `main` does not fail — it silently widens the capture to include everything merged
-    since, and the reviewer spends its turn on code the PR did not touch. This has happened:
-    a review of this PR was handed 1707 insertions instead of 208. Nothing in the response
-    distinguishes that from a large PR, so the check is yours to make:
-
-    ```powershell
-    git fetch origin
-    if ($LASTEXITCODE -ne 0) { throw "fetch failed - origin/main may be stale, stop" }
-    git merge-base --is-ancestor main origin/main
-    if ($LASTEXITCODE -eq 1) { throw "local main has diverged - sort that out first" }
-    if ($LASTEXITCODE -ne 0) { throw "could not compare main to origin/main - stop" }
-    git branch -f main origin/main
-    if ((git rev-parse main) -ne (git rev-parse origin/main)) { throw "main was not updated - stop" }
-    ```
-
-    Every check earns its line. A failed `fetch` leaves `origin/main` at whatever it was
-    last time, so the ancestor test passes against a stale ref and reports everything
-    current — the exact failure this preflight exists to catch, wearing the costume of a
-    passing check. `--is-ancestor` exits 1 for "no" and 128 for an error, so a missing
-    `origin` would otherwise be reported as divergence. `git branch -f` on a diverged `main`
-    discards the local tip rather than refusing, and it fails outright when `main` is the
-    branch you have checked out — so the last line confirms the ref actually moved rather
-    than trusting that it did. Use `$LASTEXITCODE`, not `$?`: for native commands in
-    Windows PowerShell, `$?` can be set from the error stream.
-  - **If your PR is not based on `main`, this entry cannot gate it.** The base is pinned in
-    the server arguments, so a review of `main...HEAD` on a stacked branch takes in the PR
-    underneath as well and would pass the gate without the PR's own diff ever being reviewed
-    alone. Do not describe the mismatch and proceed. Register a second server under a
-    different `[mcp_servers.…]` name, with `--diff` pointing at the real base, in your
-    **global** `%USERPROFILE%\.codex\config.toml` — not in this repository's
-    [`.codex/config.toml`](.codex/config.toml), which is tracked, so editing it would either
-    dirty the tree the bullet above requires to be clean or land a config change inside the
-    PR being gated.
-  - For mid-development review of work that is not committed yet, open a Claude Code session
-    against this checkout and call from there — that direction gets the Codex reviewer, whose
-    default `--diff auto` capture is exposed through `repository_change` alongside bounded live
-    tree evidence. A Codex session cannot reach it by changing arguments; it is a different
-    server entry.
+- **Do not paste a diff into `instructions` in either direction.** For git the reviewer derives
+  the change live through `repository_diff` and reads/searches the tree through the other bounded,
+  read-only evidence tools; its shell (Codex) runs from a sterile non-repository directory and is
+  not the normal repository interface (the Claude reviewer has no shell). For Perforce the reviewer
+  is handed the captured changelist through `repository_change`. Describe the intent and what you
+  want scrutinised, and let the reviewer's evidence tools do the rest.
+- **Git reviews are live, so there is no capture-mode ritual in either direction.** A git review
+  is the working tree, derived live through `repository_diff`: the reviewer diffs it against the
+  branch's fork point (`merge-base(HEAD, refs/remotes/origin/{HEAD,main,master})`), which includes
+  committed *and* uncommitted work and untracked files. The old commit-first / clean-`git status` /
+  fetch-and-fast-forward-`main` preflight is gone -- committed and uncommitted work are both in the
+  canonical diff, and the base is a remote-tracking ref no local branch can shadow. Three things
+  follow:
+  - **A `git fetch` before the review is still worth it -- but only that.** `branch-base` resolves
+    `refs/remotes/origin/*` from what is on disk and never fetches, so a stale (unfetched)
+    remote-tracking ref would put the fork point behind where the branch diverged. Fetch to keep the
+    base current; nothing else in the old ritual applies.
+  - **Git reviews require the evidence path.** The Codex reviewer always has it; the Claude reviewer
+    needs a pinned `--claude-profile` (both dogfood directions already do). A formal git review with
+    no evidence path -- an ambient or shell-enabled Claude -- is refused before it runs, with a clear
+    error, rather than reviewing blind.
+  - **A stacked branch reviews against the default branch,** so `branch-base` takes in the PR
+    underneath as well. To review just your PR's own diff, name an explicit base commit in the review
+    `instructions` for the reviewer to diff against, or review after the parent merges.
 - Say what changed and why, and point the reviewer at this file and `README.md`. It runs
   configuration-isolated, so `CLAUDE.md` is not auto-loaded; it will read convention files
   when told to.

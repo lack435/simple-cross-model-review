@@ -739,14 +739,21 @@ fn tool_definitions(app: &App) -> Vec<Value> {
             .to_string()
     } else if primary_isolated_codex {
         let (captures, caveat) = cfg.capture_caller_summary();
+        // Git derives the change live through repository_diff; Perforce pages an immutable
+        // pre-captured changelist snapshot through repository_change (retire-capture-modes).
+        let delivery = match cfg.vcs {
+            crate::config::Vcs::Git => "on demand",
+            crate::config::Vcs::Perforce => {
+                "as an immutable snapshot the reviewer pages through repository_change"
+            }
+        };
         format!(
             "The reviewer receives a required, read-only repository evidence service with \
-             bounded scope/list/search/read/change/history/revision tools. Its process shell \
+             bounded scope/list/search/read/diff/history/revision tools. Its process shell \
              runs from a sterile non-repository directory and is not the normal repository \
-             interface. When the working root is a {vcs} repository, this server captures \
-             {captures}; the reviewer pages that immutable snapshot through repository_change. \
-             Do not paste a diff or whole files into 'instructions' -- describe the intent and \
-             what you want scrutinised instead. {caveat}",
+             interface. When the working root is a {vcs} repository, it obtains {captures} \
+             {delivery}. Do not paste a diff or whole files into 'instructions' -- describe the \
+             intent and what you want scrutinised instead. {caveat}",
             vcs = cfg.vcs.name(),
         )
     } else if cfg.reviewer_has_shell() && !cfg.supplies_change() {
@@ -783,6 +790,16 @@ fn tool_definitions(app: &App) -> Vec<Value> {
              you want scrutinised instead. {caveat}",
             vcs = cfg.vcs.name(),
         )
+    } else if cfg.vcs == crate::config::Vcs::Git {
+        // Git derives the change live through repository_diff (retire-capture-modes); there is no
+        // static capture to describe and nothing to paste. A git review needs the evidence path,
+        // so an ambient (unprofiled) Claude reviewer is refused before it runs.
+        "The reviewer can read and search files in this repository, and derives the change under \
+         review live through the read-only evidence service's repository_diff tool -- it diffs the \
+         working tree against the branch's fork point on demand, including untracked files. You do \
+         not need to paste a diff or describe the change. (A git review requires the evidence path; \
+         an ambient Claude reviewer without a pinned --claude-profile is refused.)"
+            .to_string()
     } else {
         format!(
             "The reviewer can read and search files in this repository, so you do not need to \
@@ -890,11 +907,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  Returns immediately with a review_id; collect the answer with \
                  cross_model_consult_result. Reuse the same 'session' to ask a follow-up with the \
                  earlier exchange still in context.\n\n\
-                 By default the reviewer reads the tree and captures no diff. Pass \
-                 include_change: true to also show it the configured change (the git --diff, or a \
-                 named Perforce changelist), the same capture a review gets. A consult still \
-                 certifies nothing either way; an empty capture is reported as a warning, never a \
-                 refusal.\n\n\
+                 For **git** the change under review is always available live through the \
+                 repository_diff evidence tool (base 'branch-base', head 'worktree'), so \
+                 include_change has no effect -- ask about the change directly. For **Perforce**, \
+                 the reviewer reads the tree by default; pass include_change: true to also capture \
+                 and show the changelist(s) you name in 'change'. A consult certifies nothing \
+                 either way.\n\n\
                  It requires the evidence service, so it runs only on a reviewer that provides one \
                  (Codex, or a profile-pinned shell-less Claude); otherwise it fails with \
                  EVIDENCE_UNAVAILABLE. If it fails, the consult did not happen -- tell the user what \
@@ -931,11 +949,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     "include_change": {
                         "type": "boolean",
                         "description":
-                            "Also show the reviewer the configured change, not just the tree. \
-                             Defaults to false (tree-only). When true, the server captures the git \
-                             --diff (or the named Perforce changelist) and hands it to the reviewer, \
-                             exactly as a review does. Fixed for the session: a resume must pass the \
-                             same value (use fresh:true to change it)."
+                            "Perforce only: capture and show the reviewer the changelist(s) named \
+                             in 'change', not just the tree (defaults to false, tree-only). For git \
+                             it has no effect -- the change is always available live through the \
+                             repository_diff evidence tool. Fixed for the session: a resume must \
+                             pass the same value (use fresh:true to change it)."
                     }
                 },
                 "required": ["question"],
@@ -1437,11 +1455,10 @@ mod tests {
             .contains("thorough"));
     }
 
-    /// The caller is told what `--diff` actually captures. A description hardcoded to the
-    /// working-tree modes told a `--diff main...HEAD` caller that untracked files and
-    /// uncommitted work were included, which is exactly backwards for a range.
+    /// The caller is told the git change is derived live through repository_diff, not pre-captured
+    /// under a --diff mode (retire-capture-modes).
     #[test]
-    fn review_tool_description_matches_the_configured_diff_mode() {
+    fn review_tool_description_describes_live_git_delivery() {
         let describe = |args: &[&str]| {
             let mut all: Vec<String> = vec!["--reviewer".into(), "claude".into()];
             all.extend(args.iter().map(|a| (*a).to_string()));
@@ -1453,114 +1470,12 @@ mod tests {
                 .to_string()
         };
 
-        // The contract for the modes that supply something other than the working tree:
-        // the named revision is the diff, `git status` still comes with it, and the
-        // contents of anything dirty or untracked do not. Asserted as those facts rather
-        // than as one banned phrase, so a rewording that breaks the contract cannot pass
-        // by avoiding the old words.
-        // `HEAD~3` is deliberately absent: a bare revision diffs against the working tree,
-        // so it belongs with the working-tree modes below, not with the two-endpoint ranges.
-        for (spec, diff_label) in [
-            ("main...HEAD", "`git diff main...HEAD`"),
-            ("main..HEAD", "`git diff main..HEAD`"),
-            ("staged", "`git diff --cached`"),
-        ] {
-            let text = describe(&["--diff", spec]);
-            assert!(text.contains(diff_label), "{spec}: {text}");
-            assert!(text.contains("`git status`"), "{spec}: {text}");
-            assert!(
-                text.contains("their contents are not sent"),
-                "{spec}: {text}"
-            );
-            assert!(
-                !text.contains("the contents of untracked files"),
-                "{spec}: {text}"
-            );
-            assert!(!text.contains("covers uncommitted work"), "{spec}: {text}");
-        }
-
-        // A bare revision compares against the working tree, so the caller must not be told
-        // to commit first -- it would be describing a range it did not configure.
-        let bare = describe(&["--diff", "HEAD~3"]);
-        assert!(bare.contains("working tree**"), "{bare}");
-        assert!(bare.contains("the contents of untracked files"), "{bare}");
-        assert!(
-            !bare.contains("commit what you want reviewed first"),
-            "{bare}"
-        );
-
-        // The working-tree modes do supply untracked contents, and say so. `auto` reaches
-        // this because the Claude reviewer has no shell to fetch a diff itself.
-        for spec in [vec![], vec!["--diff", "HEAD"]] {
-            let text = describe(&spec);
-            assert!(
-                text.contains("the contents of untracked files"),
-                "{spec:?}: {text}"
-            );
-            assert!(text.contains("covers uncommitted work"), "{spec:?}: {text}");
-        }
-
-        // A reviewer with a shell and no capture configured fetches its own, and is told so.
-        let shelled = describe(&[
-            "--tools",
-            "Read,Grep,Glob,Bash",
-            "--allow-tools",
-            "Read Grep Glob Bash(git diff:*)",
-        ]);
-        assert!(
-            shelled.contains("inspect the change history itself"),
-            "{shelled}"
-        );
-        // And an opted-in Claude shell is never sold as read-only: the README shows a
-        // prefix allow-list cannot express that, so only Codex's sandbox earns the word.
-        assert!(!shelled.contains("read-only shell"), "{shelled}");
-        assert!(shelled.contains("soft boundary"), "{shelled}");
-
-        let codex_shell = {
-            let all: Vec<String> = ["--reviewer", "codex"]
-                .iter()
-                .map(|a| a.to_string())
-                .collect();
-            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
-            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
-            response["result"]["tools"][0]["description"]
-                .as_str()
-                .expect("description")
-                .to_string()
-        };
-        assert!(
-            codex_shell.contains("repository evidence service"),
-            "{codex_shell}"
-        );
-        assert!(
-            codex_shell.contains("sterile non-repository directory"),
-            "{codex_shell}"
-        );
-
-        // Shell *and* capture is a real configuration (`README.md` advertises `--diff HEAD`
-        // regardless of shell), and it used to fall into the shell branch, so the caller was
-        // never told about a capture that was happening.
-        for args in [
-            vec!["--reviewer", "codex", "--diff", "HEAD"],
-            vec![
-                "--reviewer",
-                "claude",
-                "--tools",
-                "Read,Grep,Glob,Bash",
-                "--allow-tools",
-                "Read Grep Glob Bash(git diff:*)",
-                "--diff",
-                "main...HEAD",
-            ],
-        ] {
-            let all: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-            let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
-            let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
-            let text = response["result"]["tools"][0]["description"]
-                .as_str()
-                .expect("description");
-            assert!(text.contains("this server captures"), "{args:?}: {text}");
-            assert!(!text.contains("NO shell"), "{args:?}: {text}");
+        // A git review (any reviewer) describes the live repository_diff delivery, and never a
+        // static --diff capture.
+        for args in [vec![], vec!["--reviewer", "codex"]] {
+            let text = describe(&args);
+            assert!(text.contains("repository_diff"), "{args:?}: {text}");
+            assert!(!text.contains("--diff"), "{args:?}: {text}");
         }
     }
 

@@ -255,7 +255,7 @@ try {
         'the reviewer CLI is missing or not signed in; the rest of the smoke test cannot run'
     if ($Reviewer -eq 'codex') {
         Assert-That 'Codex evidence handshake is ready' `
-            ($statusText -match 'evidence:\s+ready \(schema 2, 7 read-only tools; no-model handshake passed;') `
+            ($statusText -match 'evidence:\s+ready \(schema 3, 8 read-only tools; no-model handshake passed;') `
             $statusText
         # A tree too large to scan no longer refuses the review (issue #86), so "ready" alone no
         # longer says drift is being tracked. This checkout is small, so it must be.
@@ -275,8 +275,9 @@ try {
     $firstInstructions = @'
 This is an automated smoke test of a review tool. Do not review any code. Do not use the shell.
 Call repository_scope, repository_list for the repository root, repository_search for the literal
-"cross-review", and repository_change. These calls test the repository evidence service.
-After they complete, reply with exactly two lines and nothing else:
+"cross-review", and repository_diff with base "branch-base" and head "worktree" (page it to the end
+if it returns a cursor). These calls test the repository evidence service and the live change under
+review. After they complete, reply with exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=1
 '@
@@ -342,8 +343,10 @@ COUNTER=1
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
     $resumeInstructions = @'
-Still the smoke test. Call repository_scope and repository_read for README.md lines 1-5; do not
-use the shell. Then increment the counter you reported before and reply with exactly two lines:
+Still the smoke test. Call repository_scope, repository_read for README.md lines 1-5, and
+repository_diff with base "branch-base" and head "worktree" (page it to the end if it returns a
+cursor); do not use the shell. Then increment the counter you reported before and reply with
+exactly two lines:
 SMOKE-OK
 COUNTER=2
 '@
@@ -451,13 +454,10 @@ LOOKS-FINE
     Write-Host $cResult
 
     Write-Host "`n=== 5c. a change-capturing consult (include_change: true) ===" -ForegroundColor Cyan
-    # include_change: true runs the capture pipeline for a consult -- the same spawn + evidence
-    # service + capture path a review uses -- which AGENTS.md classifies as protocol needing the real
-    # round trip. The server runs with the default --diff auto, so what the reviewer is *shown*
-    # depends on the reviewer (a shelled Codex has auto withhold the diff; a shell-less Claude is
-    # handed it) and the working tree, so this asserts the path runs end-to-end and the envelope is
-    # well-formed rather than an exact diff. An empty/auto-suppressed capture is a warning here, never
-    # a refusal -- a consult certifies nothing.
+    # include_change: true runs a consult through the same spawn + evidence service a review uses --
+    # which AGENTS.md classifies as protocol needing the real round trip. For git the change is
+    # derived live through repository_diff (no static capture); a consult is informal and un-gated, so
+    # this asserts the path runs end-to-end and the envelope is well-formed rather than an exact diff.
     $icQuestion = @'
 This is an automated smoke test of a consult that includes the change. Do not use the shell.
 Answer with exactly one line and nothing else:

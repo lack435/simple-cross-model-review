@@ -48,31 +48,21 @@ args = [
     "--level", "standard:claude-opus-4-8:medium",
     "--level", "thorough:claude-opus-4-8:high",
     "--default-level", "standard",
-    "--diff", "main...HEAD",
     "--claude-profile", "work",
 ]
 
-# The Claude reviewer has no shell, so the server captures the change for it. The default
-# --diff auto captures the working tree, which is empty exactly when a PR is ready to review
-# -- the work is committed by then. AGENTS.md makes cross-review the merge gate, so this
-# entry is pinned to the branch against its base instead, which is what a PR review needs.
+# There is no --diff here: git reviews are no longer pre-captured. The Claude reviewer derives
+# the change live through the read-only evidence service's repository_diff tool -- it diffs the
+# working tree against the branch's fork point (merge-base with refs/remotes/origin/{HEAD,main,
+# master}), including committed and uncommitted work and untracked files. So the old commit-first /
+# clean-`git status` / fetch-and-fast-forward-`main` ritual is gone: committed and uncommitted work
+# are both in the canonical diff, and the base is a remote-tracking ref no local branch can shadow.
 #
-# The cost is the other half: --diff is a startup flag rather than a per-call argument, so
-# this entry cannot also capture uncommitted work. Mid-development review of a dirty tree
-# goes the other direction, where the Codex reviewer has a shell and can look for itself.
-#
-# So commit before every review through this entry, re-reviews included, and check that
-# `git status --porcelain` is empty first. The reviewer reads the live working tree and is
-# handed `git status` alongside the range, so an uncommitted edit does not go unseen -- it
-# gets seen out of step with the diff, which is worse.
-#
-# `main` here is the *local* ref. Fetch and check it is current before reviewing: a stale
-# local main does not fail, it quietly widens the range to include everything merged since,
-# and the reviewer spends its turn on code the branch never touched. Nothing in the response
-# distinguishes that from a large PR. Guard the fast-forward with
-# `git merge-base --is-ancestor main origin/main` -- `git branch -f` on a diverged main
-# discards the local tip. A branch based on something other than main needs a different pin;
-# there is no per-call override, so it cannot be gated from this entry.
+# A `git fetch` before the review is still worth it, and only that: branch-base resolves
+# refs/remotes/origin/* from what is on disk and never fetches, so a stale (unfetched) tracking ref
+# would put the fork point behind where the branch diverged. Nothing else in the old ritual applies.
+# (--claude-profile is required for a git review: an ambient Claude has no evidence path and is
+# refused before it runs.)
 
 # A single cross_model_review_result call now blocks until the review is done, so this budget
 # must exceed the server's collect cap (CAPTURE_BUDGET + --timeout-seconds + finalization grace;
