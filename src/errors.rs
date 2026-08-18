@@ -238,9 +238,9 @@ pub fn model_unavailable(
              \x20 model:  {model}\n\
              \x20 effort: {effort}\n\n\
              The model may have been renamed, may not be available on this account or plan, or \
-             the effort level may not be valid for it. Fix it by editing the --model / --effort \
-             values in the cross-review entry of this project's MCP configuration, then restart \
-             the agent session.\n\n\
+             the effort level may not be valid for it. Fix it by editing the --level \
+             (NAME:MODEL:EFFORT) entries -- or the --default-level -- in the cross-review entry \
+             of this project's MCP configuration, then restart the agent session.\n\n\
              The review has NOT been performed."
         ),
     )
@@ -286,7 +286,7 @@ pub fn invalid_reviewer_chain(detail: impl Into<String>) -> Failure {
         "The reviewer fallback chain is misconfigured, so every review is refused.",
         "This server was started with a reviewer fallback chain that cannot function, so it \
          refuses every review until the configuration is fixed.\n\n\
-         Fix the --reviewer/--model/--effort/--bin arguments in this project's MCP \
+         Fix the --reviewer/--level/--default-level/--bin arguments in this project's MCP \
          configuration so the chain is valid, then restart the agent session. See \
          docs/reviewer-fallback-chain.md for the rules.\n\n\
          The review has NOT been performed.",

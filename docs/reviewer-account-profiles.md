@@ -93,7 +93,7 @@ machine. This is what makes a team repo safe to configure.
 
 ```json
 { "mcpServers": { "cross-review": { "command": "...cross-review.exe",
-  "args": ["--reviewer","codex","--model","gpt-5.6-luna","--effort","max",
+  "args": ["--reviewer","codex","--level","standard:gpt-5.6-luna:max",
            "--codex-profile","personal"], "timeout": 2400000 } } }
 ```
 
@@ -102,7 +102,7 @@ machine. This is what makes a team repo safe to configure.
 
 ```json
 { "mcpServers": { "cross-review": { "command": "cross-review.exe",
-  "args": ["--reviewer","codex","--model","gpt-5.6-luna","--effort","max",
+  "args": ["--reviewer","codex","--level","standard:gpt-5.6-luna:max",
            "--codex-profile","work"], "timeout": 2400000 } } }
 ```
 

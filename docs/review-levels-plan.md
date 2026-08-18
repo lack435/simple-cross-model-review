@@ -10,8 +10,13 @@
 > downstream changed: identity, duplicate detection (`same_reviewer_identity`), resume matching
 > (`resume_entry_index` / `produces_pair`), and reporting still key on `(model, effort)`; the
 > base pair is simply derived from the default level in `PendingEntry::finalize` instead of from
-> the removed flags. The sections below still describe the resolution/lifecycle machinery, which
-> is unchanged; only the *source* of the base pair moved.
+> the removed flags.
+>
+> **Everything below this box is the plan as originally written.** It describes `--model`/`--effort`
+> and level-less configs as they existed at the time and is preserved as the historical design
+> record — it is **not** current CLI guidance. The resolution/lifecycle machinery it describes is
+> unchanged; only the *source* of the base pair moved (see this box). For current flags see
+> `README.md` and `docs/reviewer-fallback-chain.md`.
 
 ## Context
 
