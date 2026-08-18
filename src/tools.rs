@@ -1238,7 +1238,7 @@ impl App {
             reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
             spec: self.cfg.reviewers[start_index].clone(),
             start_index,
-            start_spec_override,
+            start_spec_override: start_spec_override.clone(),
             preflight: Arc::clone(&self.preflight),
             registry: Arc::clone(&self.registry),
             sessions: Arc::clone(&self.sessions),
@@ -1339,7 +1339,16 @@ impl App {
                 "new".to_string()
             }
         ));
-        out.push_str(&format!("reviewer:  {}\n", self.cfg.describe_reviewer()));
+        // Render the start entry at its effective pair so this headline never contradicts the
+        // `level:` line below: before the worker publishes the active entry, the base pair would
+        // otherwise show `effort=max` here while the level line shows the override's `effort=xhigh`
+        // (issue #106). The running/completed responses already read `snapshot.active`, which the
+        // worker sets from `effective_entry`, so they need no equivalent adjustment.
+        out.push_str(&format!(
+            "reviewer:  {}\n",
+            self.cfg
+                .describe_reviewer_effective(start_index, start_spec_override.as_ref())
+        ));
         // Report the effective starting level/pair when one is in play, so the response never
         // understates the effort a review actually runs at (docs/review-levels-plan.md §4b / f6).
         if let Some(line) = &level_report_line {
