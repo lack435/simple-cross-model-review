@@ -960,13 +960,25 @@ impl Core {
         Ok(current_stamp)
     }
 
+    /// Clamp a resolved text-page byte limit to the bundle's served-page ceiling, if one is set.
+    /// The request itself is never rejected (the reviewer may still ask for a large `limit_bytes`);
+    /// it is only served in smaller slices, each followed by a continuation cursor, so no single
+    /// response exceeds a capped MCP client's tool-result limit (issue #114). Bundles without a
+    /// ceiling (Codex) are served at the full limit.
+    fn clamp_page(&self, limit: usize) -> usize {
+        match self.bundle.page_bytes_ceiling {
+            Some(ceiling) => limit.min(ceiling as usize),
+            None => limit,
+        }
+    }
+
     fn change(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
-        let limit = limit_arg(
+        let limit = self.clamp_page(limit_arg(
             args,
             "limit_bytes",
             self.bundle.limits.default_change_bytes,
             self.bundle.limits.max_change_bytes,
-        )? as usize;
+        )? as usize);
         let offset = if let Some(cursor) = optional_string(args, "cursor")? {
             return self.change_cursor(&cursor, limit);
         } else {
@@ -1036,12 +1048,12 @@ impl Core {
                 "repository_revision is unsupported for Perforce",
             ));
         }
-        let limit = limit_arg(
+        let limit = self.clamp_page(limit_arg(
             args,
             "limit_bytes",
             self.bundle.limits.default_change_bytes,
             self.bundle.limits.max_change_bytes,
-        )? as usize;
+        )? as usize);
         if let Some(cursor) = optional_string(args, "cursor")? {
             cursor_only(args, &["cursor", "limit_bytes"])?;
             return self.text_cursor("repository_revision", &cursor, limit, "content");
@@ -1080,12 +1092,12 @@ impl Core {
                 "repository_diff is unsupported for Perforce",
             ));
         }
-        let limit = limit_arg(
+        let limit = self.clamp_page(limit_arg(
             args,
             "limit_bytes",
             self.bundle.limits.default_change_bytes,
             self.bundle.limits.max_change_bytes,
-        )? as usize;
+        )? as usize);
         if let Some(cursor) = optional_string(args, "cursor")? {
             cursor_only(args, &["cursor", "limit_bytes"])?;
             return self.diff_cursor(&cursor, limit);
@@ -2643,6 +2655,7 @@ mod tests {
             change: Some("abcdef".into()),
             limits: limits.clone(),
             initial_stamp: initial_stamp(root, &limits, vcs),
+            page_bytes_ceiling: None,
         }
     }
 
@@ -2955,6 +2968,74 @@ mod tests {
         assert!(scope["scan_scope"]
             .as_str()
             .is_some_and(|s| s.contains("Git")));
+    }
+
+    // Issue #114: a served-page ceiling caps the bytes of every text page below what the reviewer
+    // requested, without rejecting the request, so a reviewer whose MCP client truncates a large
+    // tool result is instead paged in slices it can consume. Exercised through `repository_change`
+    // (no git needed); `repository_diff`/`repository_revision` share the one `clamp_page` seam.
+    #[test]
+    fn a_page_ceiling_clamps_served_text_pages_without_rejecting_the_request() {
+        let dir = temp_dir("evidence-page-ceiling");
+        let ceiling: usize = 24 * 1024;
+        // A change several ceilings wide, so a single page cannot hold it.
+        let big = "x".repeat(100 * 1024);
+        let bundle = Bundle::create(
+            dir.as_path(),
+            crate::config::Vcs::Perforce,
+            "nonce-ceil",
+            "working tree".into(),
+            "captured".into(),
+            Some(big.clone()),
+            Some(ceiling as u32),
+        )
+        .unwrap();
+        let mut core = Core::new(bundle).unwrap();
+
+        // Ask for the whole change in one page (limit_bytes at the request maximum). The request is
+        // honoured — no error — but the served page is clamped to the ceiling and offers a cursor.
+        let first = core
+            .call(
+                "repository_change",
+                &json!({"limit_bytes": super::Limits::default().max_change_bytes}),
+            )
+            .unwrap();
+        let content = first["content"].as_str().unwrap();
+        assert!(
+            content.len() <= ceiling,
+            "served page {} must not exceed the ceiling {ceiling}",
+            content.len()
+        );
+        assert_eq!(first["complete"], json!(false));
+        assert!(
+            first["cursor"].as_str().is_some(),
+            "a clamped page must offer a continuation cursor"
+        );
+
+        // Paging to completion reassembles the whole change, and no page exceeds the ceiling.
+        let mut total = content.len();
+        let mut cursor = first["cursor"].as_str().unwrap().to_string();
+        loop {
+            let next = core
+                .call("repository_change", &json!({ "cursor": cursor }))
+                .unwrap();
+            let c = next["content"].as_str().unwrap();
+            assert!(
+                c.len() <= ceiling,
+                "continuation page {} exceeds ceiling",
+                c.len()
+            );
+            total += c.len();
+            if next["complete"] == json!(true) {
+                break;
+            }
+            cursor = next["cursor"].as_str().unwrap().to_string();
+        }
+        assert_eq!(
+            total,
+            big.len(),
+            "the whole change is served across the pages"
+        );
     }
 
     // Git present, root not a work tree: the scan refuses rather than quietly walking a tree the

@@ -3663,6 +3663,11 @@ impl Job {
                     change_label,
                     status_summary,
                     change.map(str::to_string),
+                    // An in-scope Claude reviewer reads evidence through Claude Code's MCP client,
+                    // which truncates or diverts a tool result past its output cap; page text tools
+                    // in Claude-safe slices so a large repository_diff still reaches the model
+                    // (issue #114). Codex has no such cap and is served at the full limit.
+                    claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
                 )
                 .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
                 let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
