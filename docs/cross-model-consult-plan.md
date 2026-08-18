@@ -249,7 +249,12 @@ chain composition, and `resume_incremental_diff` swaps full-vs-delta capture per
 line the same place reviews already draw it:
 
 - **Bound** (a change refuses the resume): `include_change`; the *configured* git `--diff` mode; the
-  Perforce changelist set + `include_shelved`. These are caller/config intent.
+  Perforce changelist set. These are caller/config intent. (`include_shelved` was listed here in an
+  earlier revision as bound, but the implementation review of issue #105 corrected that: the code
+  never refuses a resume on a changed `include_shelved` — it forces a full re-capture, which shows the
+  reviewer the newly in/out-of-scope shelved content freshly. So `include_shelved` is **allowed scope
+  drift, made safe by full re-capture**, not a hard binding. See
+  `docs/cross-model-consult-include-change-impl.md` D2.)
 - **Allowed to drift per turn, reused verbatim from the review path** (*not* bound): the resolved
   `HEAD`/`base` and the incremental-vs-full delta. Reviews already advance `head_sha` every turn and
   delta against it; a consult inherits that behaviour unchanged rather than freezing it, because it is

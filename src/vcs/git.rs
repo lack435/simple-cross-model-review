@@ -135,6 +135,24 @@ pub enum DiffMode {
     Rev(String),
 }
 
+impl std::fmt::Display for DiffMode {
+    /// The canonical string form, and the exact inverse of [`DiffMode::parse`] for every value
+    /// `parse` can produce: `parse(m.to_string()) == m`. Used to persist the *configured* mode into
+    /// the consult capture contract (`SessionRecord::diff_mode`) as a string, so the enum need not
+    /// carry serde. A `Rev` prints its revision verbatim; the keyword variants print the canonical
+    /// keyword `parse` matches (a `Rev` can never equal one, since `parse` maps those spellings to
+    /// their keyword variant, so the round trip is unambiguous).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::None => f.write_str("none"),
+            Self::Staged => f.write_str("staged"),
+            Self::Head => f.write_str("head"),
+            Self::Rev(rev) => f.write_str(rev),
+        }
+    }
+}
+
 impl DiffMode {
     pub fn parse(s: &str) -> Result<Self, String> {
         let trimmed = s.trim();
@@ -1662,6 +1680,30 @@ mod tests {
             DiffMode::parse("  HEAD~3  ").unwrap(),
             DiffMode::Rev("HEAD~3".into())
         );
+    }
+
+    #[test]
+    fn display_is_the_canonical_inverse_of_parse() {
+        // The consult capture contract persists the configured mode via `to_string()` and reads it
+        // back with `parse`, so the round trip must hold for every value `parse` can produce --
+        // otherwise a stored contract would fail to reload (or reload as a different mode).
+        for mode in [
+            DiffMode::Auto,
+            DiffMode::None,
+            DiffMode::Staged,
+            DiffMode::Head,
+            DiffMode::Rev("main...HEAD".into()),
+            DiffMode::Rev("HEAD~3".into()),
+            // Case is preserved through a `Rev`, which the keyword match never claims.
+            DiffMode::Rev("Feature/X..HEAD".into()),
+        ] {
+            let printed = mode.to_string();
+            assert_eq!(
+                DiffMode::parse(&printed).expect(&printed),
+                mode,
+                "round trip failed for {mode:?} (printed as {printed:?})"
+            );
+        }
     }
 
     #[test]
