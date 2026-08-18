@@ -2285,7 +2285,8 @@ impl Job {
             self.effective_entry(self.start_index)
                 .describe_with_bin(&self.bin),
         );
-        if self.cfg.chain_needs_capture() {
+        // A consult captures nothing (tree-only), so it shows no Capturing phase.
+        if self.cfg.chain_needs_capture() && !self.is_consult() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
@@ -2296,7 +2297,8 @@ impl Job {
         // marker (`PriorTurnPending`) from a marker whose state could not be read
         // (`MarkerStateUnreadable`); `prior_pending` folds both non-`Absent` states fail-closed,
         // exactly as the previous `is_pending` did.
-        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce)
+        // A consult produces no resume-delta baseline, so it needs no Perforce in-progress marker.
+        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce && !self.is_consult())
             .then(|| self.sessions.marker_state(&self.session));
         let prior_pending = matches!(
             marker_state,
@@ -2308,6 +2310,7 @@ impl Job {
         // resumable baseline at all (forced to `Disabled` below). This is the *Perforce* baseline
         // marker; the findings write-ahead is a separate marker written in `attempt`.
         let pending_marked = self.cfg.vcs == crate::config::Vcs::Perforce
+            && !self.is_consult()
             && self.sessions.mark_pending(&self.session).is_ok();
 
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
@@ -2337,13 +2340,19 @@ impl Job {
                 })
             }),
         };
-        let capture = vcs::capture(
-            &self.cfg,
-            &self.changes,
-            self.include_shelved,
-            resume,
-            &self.cancel,
-        );
+        // A consult is tree-only in this cut (`include_change: false`): it sends the reviewer no diff
+        // and reads whatever it needs through the evidence service, so it skips capture entirely.
+        let capture = if self.is_consult() {
+            vcs::Capture::empty()
+        } else {
+            vcs::capture(
+                &self.cfg,
+                &self.changes,
+                self.include_shelved,
+                resume,
+                &self.cancel,
+            )
+        };
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
         let change = capture.change.as_ref().map(|c| c.rendered.clone());
