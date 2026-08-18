@@ -1177,6 +1177,7 @@ impl App {
             // Non-fresh calls passed the findings gate, so their marker was absent on entry; fresh
             // calls skipped it. Used to decide whether a pre-launch failure may clear the marker.
             findings_marker_absent_on_entry: !fresh,
+            kind: crate::registry::JobKind::Review,
             cancel,
             _lease: Some(lease),
         };
@@ -2034,6 +2035,11 @@ struct Job {
     /// turn set, which it must not drop. Note this is *not* the same as `resume_id.is_some()`: a
     /// non-fresh turn 1 with no record still passed the gate and can clear.
     findings_marker_absent_on_entry: bool,
+    /// Which start path drives this job: [`JobKind::Review`] runs the full findings/convergence
+    /// pipeline; [`JobKind::Consult`] skips assessment, the block, the ledger and the envelope, and
+    /// carries the reviewer's prose straight through. Every consult divergence in `attempt`/`run` is
+    /// gated on this, so a review job takes byte-identical paths. See `docs/cross-model-consult-plan.md`.
+    kind: crate::registry::JobKind,
     cancel: Arc<AtomicBool>,
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
@@ -2147,6 +2153,23 @@ fn assemble_disposition(
 }
 
 impl Job {
+    /// Whether this is a consult job, on which every findings/convergence divergence in the pipeline
+    /// is gated. A review job always reads `false` here, so its paths are unchanged.
+    fn is_consult(&self) -> bool {
+        self.kind == crate::registry::JobKind::Consult
+    }
+
+    /// The session-record kind string this job persists — [`session::KIND_CONSULT`] for a consult,
+    /// [`session::KIND_REVIEW`] otherwise — so `record_turn` stamps the record with the right kind and
+    /// a later cross-kind resume is refused.
+    fn session_kind(&self) -> &'static str {
+        if self.is_consult() {
+            session::KIND_CONSULT
+        } else {
+            session::KIND_REVIEW
+        }
+    }
+
     /// The effective entry to run at chain index `i`: the configured entry, with the start entry's
     /// resolved level override applied when `i` is the start index. A mid-run rate-limit fallback
     /// (`i != start_index`) is never overridden — it runs at its own base `(model, effort)`
@@ -3073,8 +3096,19 @@ impl Job {
             perforce_baseline,
             summary,
         } = captured;
+        // A consult diverges from a review only where findings/convergence are concerned; everything
+        // to do with account identity, the home lock, evidence setup, spawning, and durable recording
+        // is shared. Each divergence below is gated on this, so a review job (`false`) is unchanged.
+        let is_consult = self.is_consult();
         let preamble = if self.cfg.no_preamble {
             None
+        } else if is_consult {
+            Some(
+                self.cfg
+                    .preamble
+                    .as_deref()
+                    .unwrap_or(prompt::DEFAULT_CONSULT_PREAMBLE),
+            )
         } else {
             Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
         };
@@ -3220,7 +3254,13 @@ impl Job {
         // captured, which is also thin. Computed before `summary` is consumed below. When thin AND the
         // in-scope reviewer obtained no successful content evidence, the runtime gate (after
         // collect_run) fails the review closed.
-        let capture_thin = claude_in_scope
+        // A consult has no captured change to have read (the plan drops this liveness gate for it):
+        // requiring it to have consumed a specific diff would defeat "just ask a question", so
+        // `is_consult` disarms the section-7 gate. The evidence *service* is still required to start
+        // (start_consult refuses an evidence-incapable chain), and reads stay path-scoped; only the
+        // "you must have read the change" check is dropped.
+        let capture_thin = !is_consult
+            && claude_in_scope
             && summary
                 .as_ref()
                 .map_or(true, |s| s.is_empty() || !s.is_complete());
@@ -3335,24 +3375,42 @@ impl Job {
         } else {
             change
         };
-        let text = prompt::build(&PromptParts {
-            instructions: &self.instructions,
-            context_paths: &context_paths,
-            cwd: &self.cfg.cwd,
-            turn,
-            resumed: resume_id.is_some(),
-            preamble,
-            capabilities,
-            change: prompt_change,
-            resumed_capture_note,
-            // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
-            // repository lookalike cannot know it. The prior-findings digest is built from the
-            // loaded ledger in the worker wiring (task: tools.rs worker); `None` renders the
-            // first-turn form.
-            nonce: Some(&self.id),
-            prior_findings_digest: prior_findings_digest.as_deref(),
-            neutral_root,
-        });
+        let text = if is_consult {
+            // A consult never asks for a machine block (no nonce) or a prior-findings digest: it has
+            // no ledger to reconcile. The follow-up framing and the "no findings list" preamble come
+            // from `build_consult`.
+            prompt::build_consult(&prompt::ConsultPromptParts {
+                question: &self.instructions,
+                context_paths: &context_paths,
+                cwd: &self.cfg.cwd,
+                turn,
+                resumed: resume_id.is_some(),
+                preamble,
+                capabilities,
+                change: prompt_change,
+                resumed_capture_note,
+                neutral_root,
+            })
+        } else {
+            prompt::build(&PromptParts {
+                instructions: &self.instructions,
+                context_paths: &context_paths,
+                cwd: &self.cfg.cwd,
+                turn,
+                resumed: resume_id.is_some(),
+                preamble,
+                capabilities,
+                change: prompt_change,
+                resumed_capture_note,
+                // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
+                // repository lookalike cannot know it. The prior-findings digest is built from the
+                // loaded ledger in the worker wiring (task: tools.rs worker); `None` renders the
+                // first-turn form.
+                nonce: Some(&self.id),
+                prior_findings_digest: prior_findings_digest.as_deref(),
+                neutral_root,
+            })
+        };
         // Reported back through the out-parameter so it survives the error paths below:
         // a failed turn still sent a prompt, and its size is part of explaining the cost.
         *prompt_bytes = text.len();
@@ -3474,94 +3532,108 @@ impl Job {
         // review's id, matching what the prompt told the reviewer to emit.
         // Keep a copy of the pre-turn state for the not-durable envelope, which must report the
         // pre-turn on-disk coverage and preserve the prior findings (assess_turn consumes it).
+        // A consult carries none of this: its prose is the whole answer, so it skips assessment, the
+        // block-repair loop, the ledger and the envelope, and `turn_eval` stays `None`.
+        // `warnings_from_repair` and `repair_refused_on_account` are declared out here because the
+        // shared finalization below reads them; both stay at their defaults on the consult path.
         let prior_snapshot = prior_state.clone();
-        let mut assessment =
-            crate::findings::assess_turn(&self.session, turn, &self.id, &parsed.text, prior_state);
-
-        // The reviewer answered without a usable machine block (or with one that would not
-        // reconcile). Ask it once more, in the same conversation, for the block alone — a short
-        // call against a re-review that would cost a whole max-effort turn plus a rebaseline
-        // handoff. Everything about whether and how to ask is decided by the pure `plan_repair`;
-        // this loop only runs the child and hands the text back. See
-        // docs/unstructured-turn-recovery.md.
-        //
-        // The repair target is the main run's *effective* conversation id, resolved before anything
-        // is attempted. A fresh run that reported no id has no conversation to resume, and starting
-        // a new one to ask for a block would produce a block describing a review that never
-        // happened — so there is no repair on that path. Likewise when the main run already failed
-        // the identity check: its conversation is one the server has decided not to trust.
-        let repair_target: Option<String> =
-            if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
-                None
-            } else {
-                parsed
-                    .session_id
-                    .clone()
-                    .or_else(|| resume_id.map(str::to_string))
-            };
         let mut warnings_from_repair: Vec<String> = Vec::new();
-        // Set only by a tripped switch guard on a repair run: this turn is not recorded and its
-        // write-ahead marker is left set, exactly as the main run's guard refusal would.
         let mut repair_refused_on_account = false;
-        let mut attempts_left = self.cfg.block_repair_attempts;
-        while let Some(request) = crate::findings::plan_repair(
-            &assessment,
-            attempts_left,
-            self.cancel.load(std::sync::atomic::Ordering::SeqCst),
-        ) {
-            let Some(target) = repair_target.as_deref() else {
-                break;
-            };
-            attempts_left = attempts_left.saturating_sub(1);
-            let repair_prompt = crate::prompt::block_repair(
-                &request.corrective,
+        let (turn_eval, findings_ledger_to_persist, terminal_reason_to_persist): (
+            Option<crate::findings::TurnEvaluation>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ) = if is_consult {
+            (None, None, None)
+        } else {
+            let mut assessment = crate::findings::assess_turn(
+                &self.session,
+                turn,
                 &self.id,
-                request.prior_digest.as_deref(),
+                &parsed.text,
+                prior_state,
             );
-            *prompt_bytes = prompt_bytes.saturating_add(repair_prompt.len());
-            match self.run_block_repair(
-                target,
-                &repair_prompt,
-                evidence_invocation.as_ref(),
-                authorized_start.as_ref(),
-                usage_key,
-                &mut parsed,
+
+            // The reviewer answered without a usable machine block (or with one that would not
+            // reconcile). Ask it once more, in the same conversation, for the block alone — a short
+            // call against a re-review that would cost a whole max-effort turn plus a rebaseline
+            // handoff. Everything about whether and how to ask is decided by the pure `plan_repair`;
+            // this loop only runs the child and hands the text back. See
+            // docs/unstructured-turn-recovery.md.
+            //
+            // The repair target is the main run's *effective* conversation id, resolved before anything
+            // is attempted. A fresh run that reported no id has no conversation to resume, and starting
+            // a new one to ask for a block would produce a block describing a review that never
+            // happened — so there is no repair on that path. Likewise when the main run already failed
+            // the identity check: its conversation is one the server has decided not to trust.
+            let repair_target: Option<String> =
+                if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
+                    None
+                } else {
+                    parsed
+                        .session_id
+                        .clone()
+                        .or_else(|| resume_id.map(str::to_string))
+                };
+            let mut attempts_left = self.cfg.block_repair_attempts;
+            while let Some(request) = crate::findings::plan_repair(
+                &assessment,
+                attempts_left,
+                self.cancel.load(std::sync::atomic::Ordering::SeqCst),
             ) {
-                Ok(repair_text) => {
-                    // Any prose the reviewer wrote alongside the block is kept rather than dropped:
-                    // a repair answer is transport, but "I have reconsidered f2" arriving on one is
-                    // still the reviewer talking, and discarding it silently is how that goes
-                    // missing.
-                    let note = crate::findings::strip_reviewer_block(&repair_text, &self.id);
-                    let note = note.trim();
-                    if !note.is_empty() {
-                        // Handed to the assessment rather than appended to the rendered text later:
-                        // the envelope's prose is composed from the assessment, so a note appended
-                        // after the fact reached the text body and not the structured channel.
-                        let note: String = note.chars().take(REPAIR_NOTE_CHARS).collect();
-                        assessment.push_repair_note(&note);
+                let Some(target) = repair_target.as_deref() else {
+                    break;
+                };
+                attempts_left = attempts_left.saturating_sub(1);
+                let repair_prompt = crate::prompt::block_repair(
+                    &request.corrective,
+                    &self.id,
+                    request.prior_digest.as_deref(),
+                );
+                *prompt_bytes = prompt_bytes.saturating_add(repair_prompt.len());
+                match self.run_block_repair(
+                    target,
+                    &repair_prompt,
+                    evidence_invocation.as_ref(),
+                    authorized_start.as_ref(),
+                    usage_key,
+                    &mut parsed,
+                ) {
+                    Ok(repair_text) => {
+                        // Any prose the reviewer wrote alongside the block is kept rather than dropped:
+                        // a repair answer is transport, but "I have reconsidered f2" arriving on one is
+                        // still the reviewer talking, and discarding it silently is how that goes
+                        // missing.
+                        let note = crate::findings::strip_reviewer_block(&repair_text, &self.id);
+                        let note = note.trim();
+                        if !note.is_empty() {
+                            // Handed to the assessment rather than appended to the rendered text later:
+                            // the envelope's prose is composed from the assessment, so a note appended
+                            // after the fact reached the text body and not the structured channel.
+                            let note: String = note.chars().take(REPAIR_NOTE_CHARS).collect();
+                            assessment.push_repair_note(&note);
+                        }
+                        assessment = crate::findings::apply_repair(assessment, &repair_text);
                     }
-                    assessment = crate::findings::apply_repair(assessment, &repair_text);
-                }
-                Err(RunFailure {
-                    failure,
-                    account_refusal,
-                    // A repair never withdraws the findings write-ahead marker (see
-                    // `run_block_repair`), so `child_never_started` has no bearing here.
-                    child_never_started: _,
-                }) => {
-                    // A failed repair never fails the review: the prose in hand is good. Record why
-                    // and fall through to the degraded envelope the turn would have had anyway.
-                    if account_refusal {
-                        // Except this one, which is a security refusal rather than a failed retry.
-                        // The account moved while the turn was running, so the repair's answer is
-                        // discarded unread *and* the turn must not be recorded -- leaving the
-                        // write-ahead marker set, so the next call is refused a resume and
-                        // rebaselines rather than continuing a conversation whose account moved.
-                        // The main run's prose was answered under the pinned account and verified
-                        // so, which is why it is still returned rather than erroring the call.
-                        repair_refused_on_account = true;
-                        warnings_from_repair.push(format!(
+                    Err(RunFailure {
+                        failure,
+                        account_refusal,
+                        // A repair never withdraws the findings write-ahead marker (see
+                        // `run_block_repair`), so `child_never_started` has no bearing here.
+                        child_never_started: _,
+                    }) => {
+                        // A failed repair never fails the review: the prose in hand is good. Record why
+                        // and fall through to the degraded envelope the turn would have had anyway.
+                        if account_refusal {
+                            // Except this one, which is a security refusal rather than a failed retry.
+                            // The account moved while the turn was running, so the repair's answer is
+                            // discarded unread *and* the turn must not be recorded -- leaving the
+                            // write-ahead marker set, so the next call is refused a resume and
+                            // rebaselines rather than continuing a conversation whose account moved.
+                            // The main run's prose was answered under the pinned account and verified
+                            // so, which is why it is still returned rather than erroring the call.
+                            repair_refused_on_account = true;
+                            warnings_from_repair.push(format!(
                             "the profile home's account changed while this turn was running: the \
                              block-repair response was discarded unread and this turn was not \
                              recorded, so session '{}' cannot be resumed. Start a fresh review \
@@ -3571,41 +3643,44 @@ impl Job {
                             failure.code,
                             failure.summary.trim()
                         ));
-                    } else {
-                        warnings_from_repair.push(format!(
+                        } else {
+                            warnings_from_repair.push(format!(
                             "the reviewer was asked to re-emit its machine block and the attempt \
                              failed ({}): {}",
                             failure.code,
                             failure.summary.trim()
                         ));
+                        }
+                        assessment = crate::findings::apply_repair(assessment, "");
+                        // A spawn, probe, timeout or guard failure is not something the reviewer can
+                        // answer differently on a second ask; only re-billing it. Stop.
+                        break;
                     }
-                    assessment = crate::findings::apply_repair(assessment, "");
-                    // A spawn, probe, timeout or guard failure is not something the reviewer can
-                    // answer differently on a second ask; only re-billing it. Stop.
+                }
+                if assessment.is_structured() {
                     break;
                 }
             }
-            if assessment.is_structured() {
-                break;
-            }
-        }
 
-        let turn_eval = crate::findings::finalize_turn(
-            assessment,
-            crate::findings::Budget::default(),
-            self.cfg.stagnant_session_turns,
-        );
-        let findings_ledger_to_persist: Option<serde_json::Value> =
-            Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
-        let terminal_reason_to_persist = terminal_reason_for(&turn_eval.envelope);
-        // The prose we store and render, with the reviewer's own machine block (exact nonce)
-        // already removed by the evaluation — one owner for "what prose does this turn have",
-        // rather than stripping again here. Any *other* stray marker line (a wrong-nonce block, or
-        // one injected via another field) is neutralised at render time by `strip_marker_lines`
-        // over the whole result body, right before the canonical `_OUT` block is appended.
-        // Anything the reviewer said on a repair turn beyond the block itself is already in here,
-        // framed and appended by the evaluation, so both channels carry the same notes.
-        parsed.text = turn_eval.review_prose.clone();
+            let turn_eval = crate::findings::finalize_turn(
+                assessment,
+                crate::findings::Budget::default(),
+                self.cfg.stagnant_session_turns,
+            );
+            let ledger: Option<serde_json::Value> =
+                Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
+            let terminal = terminal_reason_for(&turn_eval.envelope);
+            // The prose we store and render, with the reviewer's own machine block (exact nonce)
+            // already removed by the evaluation — one owner for "what prose does this turn have",
+            // rather than stripping again here. Any *other* stray marker line (a wrong-nonce block, or
+            // one injected via another field) is neutralised at render time by `strip_marker_lines`
+            // over the whole result body, right before the canonical `_OUT` block is appended.
+            // Anything the reviewer said on a repair turn beyond the block itself is already in here,
+            // framed and appended by the evaluation, so both channels carry the same notes. A consult
+            // skips all of this and leaves `parsed.text` as the reviewer's raw prose.
+            parsed.text = turn_eval.review_prose.clone();
+            (Some(turn_eval), ledger, terminal)
+        };
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
@@ -3736,8 +3811,8 @@ impl Job {
                             model: &self.spec.model,
                             effort: &self.spec.effort,
                             cwd: &self.cfg.cwd.to_string_lossy(),
-                            // This is the review Job; the consult path records under KIND_CONSULT.
-                            kind: session::KIND_REVIEW,
+                            // Review or consult, stamped so a later cross-kind resume is refused.
+                            kind: self.session_kind(),
                             cumulative_usage: baseline_to_persist,
                             // Bind the session to the changelist set (Perforce only), canonicalised
                             // so a re-review naming the same changelists in another order resumes.
@@ -3877,17 +3952,19 @@ impl Job {
         // (`record_turn` failed, or the reviewer reported no id to record under), the durable
         // outcome is `turn_not_durable` with the pre-turn on-disk coverage — the caller escalates
         // and rebaselines rather than resuming on a ledger that disagrees with the reviewer.
-        let envelope = if durable {
-            turn_eval.envelope
-        } else {
-            // A turn ran here, and its increment is not in `findings` by construction — it exists
-            // only in the prose, which is exactly where the design tells a human to reconstruct
-            // from. The already-composed `envelope_prose` is handed over rather than the rendered
-            // text: it is capped once, in the evaluation, so re-capping here would cut the
-            // block-repair notes off the tail. The evaluated turn's own warnings ride along too —
-            // this is the one path that asks a human to reconstruct the turn, so discarding what
-            // the evaluation observed about it was exactly backwards.
-            {
+        // A consult has no envelope (`turn_eval` is `None`); a review builds one from its evaluation.
+        let envelope: Option<crate::findings::Envelope> = match turn_eval {
+            None => None,
+            Some(turn_eval) => Some(if durable {
+                turn_eval.envelope
+            } else {
+                // A turn ran here, and its increment is not in `findings` by construction — it exists
+                // only in the prose, which is exactly where the design tells a human to reconstruct
+                // from. The already-composed `envelope_prose` is handed over rather than the rendered
+                // text: it is capped once, in the evaluation, so re-capping here would cut the
+                // block-repair notes off the tail. The evaluated turn's own warnings ride along too —
+                // this is the one path that asks a human to reconstruct the turn, so discarding what
+                // the evaluation observed about it was exactly backwards.
                 let env = crate::findings::not_durable_envelope(
                     &self.session,
                     turn,
@@ -3903,7 +3980,7 @@ impl Job {
                     Some(repair) => env.with_block_repair(repair),
                     None => env,
                 }
-            }
+            }),
         };
         let resumable = turn_is_resumable(
             durable,
@@ -3928,7 +4005,8 @@ impl Job {
             resumable,
             usage: parsed.usage,
             active: None,
-            envelope: Some(envelope),
+            // `None` for a consult (no findings envelope); `Some` for a review.
+            envelope,
         })
     }
 }
@@ -6205,6 +6283,7 @@ mod tests {
                 findings,
             }),
             findings_marker_absent_on_entry: true,
+            kind: crate::registry::JobKind::Review,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
         }

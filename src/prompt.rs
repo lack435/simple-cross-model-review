@@ -181,15 +181,11 @@ fn reading_files_section(root: &Path) -> String {
     )
 }
 
-// The consult prompt API is wired by `start_consult` in a later slice of the implementation
-// (docs/cross-model-consult-plan.md). Until that consumer lands, these items are unused in the
-// binary target; the `allow(dead_code)` is removed when `start_consult` calls `build_consult`.
 /// The consult preamble: a *second pair of eyes*, not a gated reviewer. It frames the model as a
 /// different-model consultant answering a question, asks for a direct prose answer, and — the load-
 /// bearing difference from [`DEFAULT_PREAMBLE`] — never requests a machine-readable findings block,
 /// verdict, or severity list, because the consult path neither extracts nor repairs one. See
 /// `docs/cross-model-consult-plan.md` (f5).
-#[allow(dead_code)]
 pub const DEFAULT_CONSULT_PREAMBLE: &str = r#"You are a second pair of eyes. A different model — the agent that is doing this work — has asked you an informal question about it, because you reason differently and will notice things it cannot see in its own output. This is a consultation, not a gated review: there is no verdict to reach and no findings list to produce. Just answer the question well.
 
 Ground rules:
@@ -203,12 +199,10 @@ Ground rules:
 /// The consult follow-up guidance, rendered on a resumed consult turn. Unlike
 /// [`FOLLOW_UP_GUIDANCE`], it references the prior *conversation*, not a findings ledger — a consult
 /// has none to reconcile.
-#[allow(dead_code)]
 pub const CONSULT_FOLLOW_UP_GUIDANCE: &str = "This is a follow-up in the same consultation. You have the earlier exchange in context; answer the new question or request below, building on what you already told me. There is no findings list to account for — respond directly.";
 
 /// Inputs for [`build_consult`]. A deliberately smaller shape than [`PromptParts`]: no `nonce` or
 /// `prior_findings_digest`, because a consult never emits a machine block.
-#[allow(dead_code)]
 pub struct ConsultPromptParts<'a> {
     pub question: &'a str,
     pub context_paths: &'a [String],
@@ -228,7 +222,6 @@ pub struct ConsultPromptParts<'a> {
 /// Assemble a consult prompt. Mirrors [`build`]'s structure — preamble and capabilities on the first
 /// turn, the change on every turn, the neutral-root reading rule shared verbatim — but frames the
 /// request as a question, and **never** renders the machine-readable findings block.
-#[allow(dead_code)]
 pub fn build_consult(parts: &ConsultPromptParts) -> String {
     let mut out = String::new();
 

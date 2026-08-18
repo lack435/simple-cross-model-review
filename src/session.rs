@@ -124,9 +124,6 @@ impl ProfileIdentity {
 pub const KIND_REVIEW: &str = "review";
 /// A session created by `cross_model_consult`. Its record carries no findings ledger and is never
 /// resumed by a review, nor a review session by a consult. See `docs/cross-model-consult-plan.md`.
-// Consumed in the binary target by `start_consult` in a later slice; until then only tests and the
-// cross-kind resume guard (which compares against it) reference it. Remove when `start_consult` lands.
-#[allow(dead_code)]
 pub const KIND_CONSULT: &str = "consult";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
