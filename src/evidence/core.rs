@@ -2391,6 +2391,10 @@ fn read_untracked(
             format!("cannot read untracked file: {e}"),
         )
     })?;
+    // Verify the *opened handle* still points inside the root (f8): resolve_existing_bounded checked
+    // the path, but a concurrent path/reparse-point swap between resolution and open could redirect
+    // it outside — the same guard read_file_bounded applies.
+    verify_open_file(&file, &safe, root).map_err(ReadFailure::into_evidence)?;
     let mut data = Vec::new();
     file.take(cap as u64 + 1)
         .read_to_end(&mut data)
@@ -2483,15 +2487,20 @@ fn compose_diff(
     if compose_untracked {
         let (paths, listing_complete) =
             super::git::untracked_paths(root, limits, cancel, received_at)?;
-        let paths: Vec<String> = if path.is_empty() {
+        // Normalize the request path to git's slash form before comparing (f9): `.`, `./src`, and
+        // backslash-separated forms are all valid but would never prefix-match git's normalized
+        // untracked paths otherwise. `.` (or empty) means the whole tree — no narrowing.
+        let norm = path.replace('\\', "/");
+        let norm = norm.trim_start_matches("./").trim_end_matches('/');
+        let paths: Vec<String> = if norm.is_empty() || norm == "." {
             paths
         } else {
-            // A path-narrowed diff only sees untracked files at that path or under it — matched on a
-            // path-component boundary so `src/foo` does not also pull in `src/foobar` (f6).
-            let prefix = format!("{}/", path.trim_end_matches('/'));
+            // Match at that path or under it, on a path-component boundary so `src/foo` does not also
+            // pull in `src/foobar` (f6).
+            let prefix = format!("{norm}/");
             paths
                 .into_iter()
-                .filter(|p| p == path || p.starts_with(&prefix))
+                .filter(|p| p == norm || p.starts_with(&prefix))
                 .collect()
         };
         complete = listing_complete;

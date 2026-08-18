@@ -3719,6 +3719,19 @@ impl Job {
                 None
             };
 
+        // A git review requires the evidence path to deliver the change live and to arm the
+        // fail-closed gate (mechanism 4 / f7). Codex always has it; an ambient (unprofiled, or
+        // shell-enabled) Claude does not, and since git no longer pre-captures, such a review would
+        // be handed no change AND skip the gate — free to approve blind. Refuse it before spawning,
+        // as the plan requires (resolved decision 1). Consults are informal and exempt.
+        if !is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_none() {
+            return Err(errors::evidence_unavailable(
+                "a git review needs the read-only evidence service to deliver the change live, but \
+                 it is unavailable for this reviewer -- an ambient Claude has no evidence path. Pin \
+                 a profile for the Claude reviewer (--claude-profile), or use the Codex reviewer.",
+            ));
+        }
+
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
         // recorded (the `record_turn` Ok arm). If the mark cannot be written, a crash could not be
         // detected and the ledger could go stale relative to the reviewer's advanced conversation,
