@@ -728,10 +728,10 @@ pub fn absolute_scoped_rules(root: &std::path::Path) -> Option<Vec<String>> {
 ///
 /// Three shapes have to work. Our defaults arrive as separate scoped entries; a
 /// user-supplied list arrives as one string for the CLI to split, and the CLI accepts both
-/// whitespace and commas as separators. Getting this wrong is not symmetrical -- a missed
-/// grant only costs a redundant capture, while a false one withholds the diff from a
-/// reviewer that cannot fetch it -- but a false negative still tells the caller the reviewer
-/// has no shell when it has one, so both are worth getting right.
+/// whitespace and commas as separators. Getting this wrong is not symmetrical -- a false
+/// positive tells the caller the reviewer has a shell when it does not, so the prompt points
+/// it at a shell it can never run; a false negative tells the caller it has no shell when it
+/// has one -- so both are worth getting right.
 ///
 /// Separators are recognised at paren depth zero only, since a grant's own argument may
 /// contain either: `Bash(git diff:*)` has a space in it, and a pattern may have a comma.

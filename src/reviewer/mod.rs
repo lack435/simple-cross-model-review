@@ -975,10 +975,10 @@ pub fn claude_neutral_target(
         return None;
     }
     // Shell-less only: this helper predates the separate Codex evidence path. A shell-enabled
-    // Claude reviewer still expects to run git itself and `--diff auto` withholds the capture on
-    // that basis, so it needs the project as cwd. Use the
-    // active entry's predicate, not the primary's, so a Codex->shell-less-Claude fallback is
-    // judged on Claude.
+    // Claude reviewer runs git itself against the working tree, so it needs the project as cwd; a
+    // shell-less one reaches the change only through the cwd-agnostic evidence service, so it can
+    // run from a neutral cwd. Use the active entry's predicate, not the primary's, so a
+    // Codex->shell-less-Claude fallback is judged on Claude.
     if cfg.reviewer_has_shell_of(reviewer) {
         return None;
     }
