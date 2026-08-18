@@ -184,7 +184,22 @@ impl ReviewerSpec {
     /// PATH entries with the same reviewer/model would be a fully-identical duplicate, which
     /// `validate_chain` rejects, so this cannot be ambiguous.
     pub fn describe(&self) -> String {
-        self.describe_bin(self.bin.as_deref())
+        self.describe_bin(&self.model, &self.effort, self.bin.as_deref())
+    }
+
+    /// Like [`describe`](Self::describe) but renders `over`'s `(model, effort)` in place of this
+    /// entry's base pair, so a headline shown *before* the run starts still names the pair the
+    /// review will actually run at when a level override or resume pin is in play (issue #106).
+    /// `None` renders the base pair, identical to [`describe`](Self::describe). On the run path the
+    /// override has already been folded into the entry's own `model`/`effort` (`effective_entry`),
+    /// so `describe`/`describe_with_bin` there already name the effective pair; this exists for the
+    /// start response, which is rendered before any entry is published as active.
+    pub fn describe_effective(&self, over: Option<&LevelOverride>) -> String {
+        let (model, effort) = match over {
+            Some(o) => (o.model.as_str(), o.effort.as_str()),
+            None => (self.model.as_str(), self.effort.as_str()),
+        };
+        self.describe_bin(model, effort, self.bin.as_deref())
     }
 
     /// Like [`describe`](Self::describe) but pins the *resolved* binary rather than only the
@@ -193,16 +208,16 @@ impl ReviewerSpec {
     /// `describe` is kept for the cases where no resolved path is available yet (the chain
     /// listing, or a fallback whose preflight failed before a binary was verified).
     pub fn describe_with_bin(&self, resolved: &Path) -> String {
-        self.describe_bin(Some(resolved))
+        self.describe_bin(&self.model, &self.effort, Some(resolved))
     }
 
-    fn describe_bin(&self, bin: Option<&Path>) -> String {
+    fn describe_bin(&self, model: &str, effort: &str, bin: Option<&Path>) -> String {
         let mut out = format!(
             "{} ({}, model={}, effort={}",
             self.reviewer.vendor(),
             self.reviewer.as_str(),
-            self.model,
-            self.effort,
+            model,
+            effort,
         );
         if let Some(bin) = bin {
             out.push_str(&format!(", bin={}", bin.display()));
@@ -1997,16 +2012,44 @@ impl Config {
     /// the primary and then each fallback in order, so `tools/list`, `status`, and the config
     /// display advertise the chain honestly rather than implying the primary is the only one.
     pub fn describe_reviewer(&self) -> String {
+        self.describe_reviewer_effective(0, None)
+    }
+
+    /// Like [`describe_reviewer`](Self::describe_reviewer) but renders the entry at `start_index`
+    /// with `over`'s `(model, effort)` applied, so the start response's headline names the pair the
+    /// review actually runs at when a level override or resume pin is in play — rather than the
+    /// entry's base pair, which would contradict the `level:` line the same response prints (issue
+    /// #106). Only `start_index` is adjusted: a mid-run fallback runs at its own base pair
+    /// (`effective_entry`), so the other entries keep theirs. With `over == None` this is identical
+    /// to [`describe_reviewer`](Self::describe_reviewer), which delegates here.
+    pub fn describe_reviewer_effective(
+        &self,
+        start_index: usize,
+        over: Option<&LevelOverride>,
+    ) -> String {
         // Defensive: `from_args` never produces an empty chain, but a degraded `App` built from an
         // invalid config must not panic here if something renders it before the chain-error guard.
-        let Some(first) = self.reviewers.first() else {
+        if self.reviewers.is_empty() {
             return "(no reviewer configured)".to_string();
+        }
+        // The override belongs to whichever entry actually starts; every other entry is described at
+        // its base pair.
+        let describe_at = |i: usize, spec: &ReviewerSpec| -> String {
+            if i == start_index {
+                spec.describe_effective(over)
+            } else {
+                spec.describe()
+            }
         };
-        let primary = first.describe();
+        let primary = describe_at(0, &self.reviewers[0]);
         if self.reviewers.len() == 1 {
             return primary;
         }
-        let fallbacks: Vec<String> = self.reviewers[1..].iter().map(|s| s.describe()).collect();
+        let fallbacks: Vec<String> = self.reviewers[1..]
+            .iter()
+            .enumerate()
+            .map(|(k, s)| describe_at(k + 1, s))
+            .collect();
         format!(
             "{primary}, falling back on a rate/usage limit to: {}",
             fallbacks.join(", ")
@@ -2847,6 +2890,75 @@ mod tests {
         let desc = two.describe_reviewer();
         assert!(desc.contains("falling back"), "{desc}");
         assert!(desc.contains("claude"), "{desc}");
+    }
+
+    #[test]
+    fn describe_reviewer_effective_shows_the_start_entrys_override_pair() {
+        // Base effort is max; the `standard` default level resolves to xhigh. The start response
+        // headline must name xhigh, matching the `level:` line, rather than the base max (issue
+        // #106: the two lines contradicted).
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--effort",
+            "max",
+            "--level",
+            "standard:gpt-5.6-luna:xhigh",
+        ]))
+        .expect("config");
+
+        // No override -> base pair, identical to describe_reviewer.
+        assert!(cfg.describe_reviewer().contains("effort=max"));
+        assert!(cfg
+            .describe_reviewer_effective(0, None)
+            .contains("effort=max"));
+
+        // With the level override -> the effective pair, not the base.
+        let ov = LevelOverride {
+            model: "gpt-5.6-luna".into(),
+            effort: "xhigh".into(),
+        };
+        let desc = cfg.describe_reviewer_effective(0, Some(&ov));
+        assert!(desc.contains("effort=xhigh"), "{desc}");
+        assert!(!desc.contains("effort=max"), "{desc}");
+    }
+
+    #[test]
+    fn describe_reviewer_effective_only_touches_the_start_entry() {
+        // A two-entry chain: the override belongs to whichever entry actually starts. When the gate
+        // selects the fallback (start_index 1), the primary keeps its base pair and only the
+        // fallback shows the override -- a mid-run fallback runs at its own base (`effective_entry`).
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--effort",
+            "max",
+            "--reviewer",
+            "claude",
+            "--effort",
+            "high",
+        ]))
+        .expect("config");
+        let ov = LevelOverride {
+            model: cfg.reviewers[1].model.clone(),
+            effort: "low".into(),
+        };
+
+        // Override on the primary (start_index 0): the primary shows it, the fallback keeps `high`.
+        let on_primary = cfg.describe_reviewer_effective(0, Some(&ov));
+        let (primary, fallback) = on_primary
+            .split_once("falling back")
+            .expect("two-entry chain names a fallback");
+        assert!(primary.contains("effort=low"), "{on_primary}");
+        assert!(fallback.contains("effort=high"), "{on_primary}");
+
+        // Override on the fallback (start_index 1): the primary keeps `max`, the fallback shows it.
+        let on_fallback = cfg.describe_reviewer_effective(1, Some(&ov));
+        let (primary, fallback) = on_fallback
+            .split_once("falling back")
+            .expect("two-entry chain names a fallback");
+        assert!(primary.contains("effort=max"), "{on_fallback}");
+        assert!(fallback.contains("effort=low"), "{on_fallback}");
     }
 
     #[test]
