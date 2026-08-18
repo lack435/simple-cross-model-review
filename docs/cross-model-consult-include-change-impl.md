@@ -1,6 +1,11 @@
 # cross_model_consult — `include_change: true` implementation plan (issue #105)
 
-Status: **plan, pre-implementation.** This is the implementation punch-list for the
+Status: **implemented** (PR for issue #105; branch `feat/consult-include-change`). Reviewed to
+convergence by the Codex direction of the cross-review gate (session `consult-include-change-impl`),
+with `cargo fmt`/`clippy -D warnings`/unit tests and `smoke.ps1` passing in both the `-Reviewer codex`
+and `-Reviewer claude` directions. The sections below are the punch-list it was built against.
+
+This was the implementation punch-list for the
 `include_change` capture contract that `docs/cross-model-consult-plan.md` deferred out of the v1
 (tree-only) consult. The design is settled there (finding **f2**, plus the bound-vs-drift line in
 its turn-3 table); this document does not re-open it. It enumerates the existing call-sites to
