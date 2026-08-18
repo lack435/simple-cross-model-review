@@ -135,30 +135,6 @@ pub struct Section {
     pub truncated: bool,
 }
 
-impl Section {
-    pub(crate) fn empty() -> Self {
-        Self {
-            text: String::new(),
-            truncated: false,
-        }
-    }
-}
-
-/// A new file whose content a diff cannot cover -- git-untracked, or opened-for-add in
-/// Perforce -- read from disk and carried alongside the diff.
-pub struct NewFile {
-    pub path: String,
-    pub body: Section,
-    /// Which cap cut `body` short, when it was cut at all.
-    ///
-    /// The per-file cap and whatever is left of the total are the same code path -- the read
-    /// is capped at the smaller of the two -- so a file cut by an exhausted total budget is
-    /// indistinguishable from a large one unless this is carried. Naming the wrong cap tells
-    /// the reviewer this file is bigger than the per-file cap when it may be a few hundred
-    /// bytes.
-    pub cut_by_total_cap: bool,
-}
-
 /// The universal preamble that labels the capture as evidence rather than instructions.
 ///
 /// A diff or a changelist description from a repository you do not trust is a prompt
@@ -367,14 +343,6 @@ pub(crate) fn safe_label(path: &str) -> String {
         out.push('…');
     }
     out
-}
-
-pub(crate) fn first_line(text: &str) -> String {
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("(no output)")
-        .trim()
-        .to_string()
 }
 
 #[cfg(test)]

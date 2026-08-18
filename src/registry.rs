@@ -1453,10 +1453,9 @@ mod tests {
         registry.finish(
             &id,
             Outcome {
-                disposition: Some(Disposition::Incremental(Incremental::GitRange {
-                    prior: "aaaa".into(),
-                    head: "bbbb".into(),
-                    commits: Some(2),
+                disposition: Some(Disposition::Incremental(Incremental::PerforceEvidence {
+                    resent: 2,
+                    collapsed: 3,
                 })),
                 ..Outcome::completed("ok")
             },
@@ -1467,8 +1466,8 @@ mod tests {
         assert!(
             matches!(
                 snapshot.disposition,
-                Some(Disposition::Incremental(Incremental::GitRange {
-                    commits: Some(2),
+                Some(Disposition::Incremental(Incremental::PerforceEvidence {
+                    resent: 2,
                     ..
                 }))
             ),
@@ -1483,7 +1482,7 @@ mod tests {
         registry.finish(
             &id2,
             Outcome {
-                disposition: Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable)),
+                disposition: Some(Disposition::FullByDesign(FullByDesign::Disabled)),
                 ..Outcome::completed("ok")
             },
         );
@@ -1492,7 +1491,7 @@ mod tests {
             .expect("snapshot");
         assert_eq!(
             snap2.disposition,
-            Some(Disposition::FullByDesign(FullByDesign::ModeNotDeltable))
+            Some(Disposition::FullByDesign(FullByDesign::Disabled))
         );
         assert!(!snap2.disposition.unwrap().warns());
 
@@ -1506,7 +1505,7 @@ mod tests {
             .expect("snapshot");
         assert!(snap3.disposition.is_none());
         // Sanity: FellBack is the warning-bearing variant, distinct from the above.
-        assert!(Disposition::FellBackToFull(FellBack::BaseMoved).warns());
+        assert!(Disposition::FellBackToFull(FellBack::PriorTurnPending).warns());
     }
 
     #[test]

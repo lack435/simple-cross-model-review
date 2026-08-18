@@ -1263,8 +1263,6 @@ impl App {
             prior_cumulative: prior.as_ref().and_then(|record| record.cumulative_usage),
             // Only carried on a genuine resume: `prior` is `None` for a fresh review
             // (fresh=true or a new session name), so the first turn always captures in full.
-            prior_head: prior.as_ref().and_then(|record| record.head_sha.clone()),
-            prior_base: prior.as_ref().and_then(|record| record.base_sha.clone()),
             prior_perforce_baseline: prior
                 .as_ref()
                 .and_then(|record| record.perforce_baseline.clone()),
@@ -2320,12 +2318,6 @@ struct Job {
     /// report cumulatively. Subtracting it is the only way to recover a per-turn figure
     /// from Codex, whose event stream carries the thread total and nothing else.
     prior_cumulative: Option<crate::metrics::Usage>,
-    /// The git HEAD the previous turn of this session captured, and the `--diff` spec it was
-    /// captured under, for the incremental-resume delta. Both `None` on a fresh review, a
-    /// Perforce session, or a prior turn that could not resolve HEAD; the delta needs both, so
-    /// a resume only reviews the delta when each is present and the spec still matches.
-    prior_head: Option<String>,
-    prior_base: Option<String>,
     /// The previous Perforce turn's resume-delta baseline, capture identity and shelved-capture
     /// mode, for collapsing unchanged files. All `None` on a fresh review or a git session; the
     /// delta needs the baseline and the identity, and only collapses when the mode still matches.
@@ -2447,7 +2439,9 @@ fn assemble_disposition(
         return Some(vcs::Disposition::FullByDesign(FullByDesign::Disabled));
     }
     let reason = match vcs {
-        crate::config::Vcs::Git => FellBack::NoCompleteBaselineRetained,
+        // Git no longer captures, so it produces no disposition (it never reaches here anyway: G0
+        // returns None because a git turn is never `change_present`). Retire-capture-modes.
+        crate::config::Vcs::Git => return None,
         crate::config::Vcs::Perforce => {
             if !pending_marked {
                 FellBack::MarkerUnwritable
@@ -2651,14 +2645,9 @@ impl Job {
         // identity, mode and per-file fingerprint). A git session never carries a Perforce
         // baseline and vice versa, so at most one arm is `Some`.
         let resume = match self.cfg.vcs {
-            crate::config::Vcs::Git => {
-                match (self.prior_head.as_deref(), self.prior_base.as_deref()) {
-                    (Some(head), Some(base)) => {
-                        Some(vcs::Resume::Git(vcs::GitResumeBaseline { head, base }))
-                    }
-                    _ => None,
-                }
-            }
+            // Git no longer pre-captures (retire-capture-modes), so it carries no incremental-resume
+            // baseline; the delta path is Perforce-only now.
+            crate::config::Vcs::Git => None,
             // Force a full capture (no elision this turn) when either the prior turn did not
             // cleanly persist (`prior_pending`) or this turn's in-progress marker could not be
             // written (`!pending_marked`) -- in the latter case a later crash would be undetectable,
@@ -4300,10 +4289,10 @@ impl Job {
                             // contract (git + include_change) -- a Perforce consult is bound by its
                             // changelist set, and a tree-only consult has no capture to bind.
                             include_change: self.is_consult().then_some(self.include_change),
-                            diff_mode: (self.is_consult()
-                                && self.include_change
-                                && self.cfg.vcs == crate::config::Vcs::Git)
-                                .then(|| self.cfg.diff.to_string()),
+                            // Git no longer has a capture mode (retire-capture-modes), so this is
+                            // always None now. It stays on the record so an *old* record written
+                            // with Some(diff_mode) is detected and refused on resume (f5).
+                            diff_mode: None,
                             // The active entry's identity, so a resume can match this exact entry and
                             // detect PATH drift.
                             raw_bin: self.spec.raw_bin(),
@@ -4752,21 +4741,20 @@ fn resume_block(
                 },
             ));
         }
-        // When the change is bound and the backend is git, the *configured* --diff mode is part of
-        // the contract: resuming under a different mode would continue the conversation against a
-        // different capture. (Perforce binds by its changelist set, checked below.) The per-turn
-        // resolved HEAD/base still drift as they do for a review — only the configured mode is bound.
-        if requested_include_change && cfg.vcs == crate::config::Vcs::Git {
-            let current = cfg.diff.to_string();
-            if record.diff_mode.as_deref() != Some(current.as_str()) {
-                return Some(format!(
-                    "it was created with --diff '{}', but this server is now configured for \
-                     --diff '{}'; a consult that includes the change is bound to its configured \
-                     diff mode, so start a fresh consult (fresh: true).",
-                    record.diff_mode.as_deref().unwrap_or("(unset)"),
-                    current,
-                ));
-            }
+        // Git no longer has a capture mode (retire-capture-modes): a record that carries a
+        // `diff_mode` was written under the old static-capture contract, before the change was
+        // derived live, so its stored change semantics do not match this server's. Refuse the resume
+        // and rebaseline (f5). New git records carry no diff_mode and pass.
+        if requested_include_change
+            && cfg.vcs == crate::config::Vcs::Git
+            && record.diff_mode.is_some()
+        {
+            return Some(
+                "it was created under the retired git capture-mode contract (it carries a --diff \
+                 mode), but this server now derives the change live through repository_diff; the \
+                 stored change semantics differ, so start a fresh consult (fresh: true)."
+                    .to_string(),
+            );
         }
         // A tree-only consult must carry no capture state. A pre-`include_change` Perforce consult
         // record does, and has include_change: None, so the effective-mode check above passes it
@@ -5931,7 +5919,7 @@ mod tests {
                 true,
                 false,
                 true,
-                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             )
@@ -5942,7 +5930,7 @@ mod tests {
                 true,
                 true,
                 false,
-                Some(Disposition::FellBackToFull(FellBack::BaseMoved)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             )
@@ -5956,24 +5944,21 @@ mod tests {
                 true,
                 true,
                 true,
-                Some(Disposition::FellBackToFull(FellBack::BranchRewritten)),
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending)),
                 None,
                 true,
             );
             assert_eq!(
                 d,
-                Some(Disposition::FellBackToFull(FellBack::BranchRewritten))
+                Some(Disposition::FellBackToFull(FellBack::PriorTurnPending))
             );
         }
 
         #[test]
-        fn a_resumed_git_turn_with_no_baseline_is_no_complete_baseline_retained() {
-            assert_eq!(
-                git_no_backing(),
-                Some(Disposition::FellBackToFull(
-                    FellBack::NoCompleteBaselineRetained
-                ))
-            );
+        fn a_resumed_git_turn_produces_no_disposition() {
+            // Git no longer captures (retire-capture-modes), so it produces no resume disposition
+            // even when resumed with a change present.
+            assert_eq!(git_no_backing(), None);
         }
 
         #[test]
@@ -6900,7 +6885,6 @@ mod tests {
         // Stored change-capturing, requested tree-only: refused.
         let mut rec = consult_record(&cfg, now);
         rec.include_change = Some(true);
-        rec.diff_mode = Some(cfg.diff.to_string());
         let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now)
             .expect("mismatch is refused");
         assert!(reason.contains("include_change"), "{reason}");
@@ -6918,38 +6902,28 @@ mod tests {
         rec.include_change = None;
         assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now).is_none());
         rec.include_change = Some(true);
-        rec.diff_mode = Some(cfg.diff.to_string());
         assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
     }
 
     #[test]
-    fn a_change_capturing_git_consult_is_bound_to_its_configured_diff_mode() {
-        let cfg = Config::from_args(&[
-            "--reviewer".into(),
-            "codex".into(),
-            "--diff".into(),
-            "main...HEAD".into(),
-        ])
-        .expect("cfg");
+    fn a_git_consult_record_under_the_retired_diff_mode_contract_is_refused() {
+        // f5: git no longer has a capture mode, so an include_change consult record written under the
+        // old static-capture contract (it carries a diff_mode) has stored change semantics this
+        // server cannot match. It is refused on resume and the caller rebaselines; a record with no
+        // diff_mode (the live shape) resumes.
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
         let now = 1_000_000;
 
-        // Same configured mode resumes.
         let mut rec = consult_record(&cfg, now);
         rec.include_change = Some(true);
         rec.diff_mode = Some("main...HEAD".to_string());
-        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
-
-        // A different configured mode refuses.
-        rec.diff_mode = Some("HEAD".to_string());
         let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now)
-            .expect("a changed diff mode is refused");
-        assert!(reason.contains("--diff"), "{reason}");
+            .expect("a record under the retired diff-mode contract is refused");
+        assert!(reason.contains("retired"), "{reason}");
 
-        // A tree-only consult ignores diff_mode entirely (it binds nothing).
-        let mut tree = consult_record(&cfg, now);
-        tree.include_change = Some(false);
-        tree.diff_mode = Some("HEAD".to_string());
-        assert!(resume_block(&cfg, &tree, &[], session::KIND_CONSULT, false, now).is_none());
+        // A live record carries no diff_mode and resumes.
+        rec.diff_mode = None;
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
     }
 
     #[test]
@@ -7110,10 +7084,9 @@ mod tests {
             denial_count_is_floor: false,
             warnings: Vec::new(),
             disposition: Some(crate::vcs::Disposition::Incremental(
-                crate::vcs::disposition::Incremental::GitRange {
-                    prior: "aaaaaaaaaaaa".into(),
-                    head: "bbbbbbbbbbbb".into(),
-                    commits: Some(1),
+                crate::vcs::disposition::Incremental::PerforceEvidence {
+                    resent: 1,
+                    collapsed: 0,
                 },
             )),
             capture_summary,
@@ -7414,8 +7387,6 @@ mod tests {
             turn: 4,
             gap_secs: None,
             prior_cumulative: None,
-            prior_head: None,
-            prior_base: None,
             prior_perforce_baseline: None,
             prior_capture_identity: None,
             prior_include_shelved: None,

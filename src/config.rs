@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use crate::profile::ProfileSelector;
 use crate::reviewer::HeadroomLevel;
-use crate::vcs::DiffMode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReviewerKind {
@@ -914,18 +913,6 @@ pub struct Config {
     /// cost of a review is invisible to the tool that caused it. `--no-metrics` turns it
     /// off for anyone who would rather the server wrote one less file.
     pub metrics: bool,
-    /// What the server captures and hands the reviewer as "the change".
-    ///
-    /// Defaults to `auto`, which supplies a working-tree diff only when the reviewer has
-    /// no shell to fetch one itself. That closes a real asymmetry: most reviews are
-    /// reviews *of a change*, and without this the caller of a shell-less reviewer had to
-    /// paste the diff into `instructions` -- spending its own context on it, missing
-    /// untracked files, and getting a confident review of the current tree when it forgot.
-    ///
-    /// Meaningful only when `vcs == Git`. The Perforce backend is driven by the per-call
-    /// `change` request argument, not by anything on the server entry -- there is no
-    /// launch-time changelist default.
-    pub diff: DiffMode,
     /// Which VCS the capture backend drives, resolved from `--vcs` (default `auto`).
     pub vcs: Vcs,
     /// On a resumed turn, send the reviewer only what changed since its previous turn rather
@@ -1016,7 +1003,6 @@ impl Config {
         // `--diff` is parsed *after* the loop, because how its value is interpreted (and
         // whether it is even legal) depends on `--vcs`, which may appear later on the command
         // line. Kept raw until the backend is known.
-        let mut diff_raw: Option<String> = None;
         let mut vcs_arg: Option<Vcs> = None;
 
         let mut i = 0;
@@ -1235,7 +1221,15 @@ impl Config {
                 "--sandbox" => sandbox = take("--sandbox")?,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
                 "--tools" => tools = Some(take("--tools")?),
-                "--diff" => diff_raw = Some(take("--diff")?),
+                "--diff" => {
+                    return Err(
+                        "--diff (capture modes) has been retired: git reviews now derive \
+                                the change live through repository_diff, and Perforce is driven by \
+                                the per-call `change` argument. Remove --diff from your \
+                                configuration."
+                            .into(),
+                    )
+                }
                 "--vcs" => vcs_arg = Vcs::parse_arg(&take("--vcs")?)?,
                 "--preamble-file" => preamble_file = Some(PathBuf::from(take("--preamble-file")?)),
                 "--no-preamble" => no_preamble = true,
@@ -1267,28 +1261,6 @@ impl Config {
         // `--vcs auto` (or unset) resolves from the filesystem now that `cwd` is known. This
         // is the only place a backend is chosen, and it spawns nothing.
         let vcs = vcs_arg.unwrap_or_else(|| detect_vcs(&cwd));
-
-        // `--diff` is git-specific; passing it under Perforce is a configuration mistake
-        // worth failing on rather than silently ignoring. The Perforce backend has no
-        // launch-time flag of its own -- the changelists are named per call in the `change`
-        // request argument -- so there is nothing symmetrical to reject here for git.
-        let diff = match vcs {
-            Vcs::Git => match diff_raw {
-                Some(s) => DiffMode::parse(&s)?,
-                None => DiffMode::Auto,
-            },
-            Vcs::Perforce => {
-                if diff_raw.is_some() {
-                    return Err(
-                        "--diff applies to git; the working root resolved to Perforce. \
-                         Name the changelists to review in the `change` argument of \
-                         cross_model_review, or pass --vcs git."
-                            .into(),
-                    );
-                }
-                DiffMode::Auto
-            }
-        };
 
         // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. `finalize` is
         // fallible only for the `--default-level` cross-check (a level name must be declared).
@@ -1369,7 +1341,6 @@ impl Config {
             no_preamble,
             isolate_reviewer,
             metrics,
-            diff,
             vcs,
             resume_incremental_diff,
             max_concurrent_reviews,
@@ -1717,21 +1688,13 @@ impl Config {
     /// Under `--diff auto` the answer is per-reviewer (a shell-less entry needs the diff, a
     /// shelled one does not), which is why `chain_needs_capture` folds it across every entry.
     pub fn supplies_change_of(&self, reviewer: ReviewerKind) -> bool {
-        // Each backend matches exhaustively: a new mode or backend states its answer here
-        // rather than opting itself in by falling through a wildcard.
+        // Each backend states its answer here rather than opting itself in by falling through a
+        // wildcard.
+        let _ = reviewer;
         match self.vcs {
-            Vcs::Git => match self.diff {
-                DiffMode::None => false,
-                // An isolated Codex reviewer now runs from a sterile non-repository cwd. Its
-                // evidence service, not the mere presence of a shell, supplies the selected
-                // change, so auto must capture it. The explicit config opt-out retains the old
-                // project-cwd self-serve behaviour.
-                DiffMode::Auto => {
-                    !self.reviewer_has_shell_of(reviewer)
-                        || (reviewer == ReviewerKind::Codex && self.isolate_reviewer)
-                }
-                DiffMode::Staged | DiffMode::Head | DiffMode::Rev(_) => true,
-            },
+            // Git no longer pre-captures (retire-capture-modes): the change is derived live through
+            // the evidence service's repository_diff, so nothing is gathered up front.
+            Vcs::Git => false,
             // The `change` argument is required for a Perforce review (enforced in `tools.rs`
             // before a job is created), so a Perforce backend always intends to hand over a
             // change.
@@ -1797,10 +1760,16 @@ impl Config {
     /// capture it does not perform.
     pub fn capture_caller_summary(&self) -> (String, String) {
         match self.vcs {
-            Vcs::Git => {
-                let (captures, caveat) = self.diff.caller_summary();
-                (captures, caveat.to_string())
-            }
+            // Git no longer pre-captures: the reviewer derives the change live through
+            // repository_diff (retire-capture-modes), so there is no static capture to describe.
+            Vcs::Git => (
+                "the live working tree: the reviewer diffs it against the branch's fork point \
+                 (including untracked files) on demand through the repository_diff evidence tool"
+                    .to_string(),
+                "The reviewer obtains the change itself through the read-only evidence service; \
+                 there is no static pre-capture, so nothing needs to go in `instructions`."
+                    .to_string(),
+            ),
             Vcs::Perforce => (
                 "the changelist(s) you name in `change`: for each, its diff, a listing of the \
                  opened or affected files, the contents of files opened for add, and the \
@@ -2891,13 +2860,13 @@ mod tests {
 
     #[test]
     fn chain_needs_capture_folds_across_entries() {
-        // Isolated Codex and shell-less Claude both receive auto through their non-shell evidence
-        // path, so a mixed chain captures once for either entry.
+        // Git no longer pre-captures (retire-capture-modes): no entry needs a static capture,
+        // whatever the chain, because the change is derived live through repository_diff.
         let cfg = Config::from_args(&args(&["--reviewer", "codex", "--reviewer", "claude"]))
             .expect("config");
-        assert!(cfg.supplies_change_of(ReviewerKind::Codex));
-        assert!(cfg.supplies_change_of(ReviewerKind::Claude));
-        assert!(cfg.chain_needs_capture());
+        assert!(!cfg.supplies_change_of(ReviewerKind::Codex));
+        assert!(!cfg.supplies_change_of(ReviewerKind::Claude));
+        assert!(!cfg.chain_needs_capture());
     }
 
     #[test]
@@ -3717,8 +3686,8 @@ mod tests {
         .expect("config");
         assert!(!listed_only.reviewer_has_shell());
         assert!(
-            listed_only.supplies_change(),
-            "and the diff must be supplied, since it has no usable shell"
+            !listed_only.supplies_change(),
+            "git no longer pre-captures a static change; it is derived live via repository_diff"
         );
 
         // Permitted but absent from the session is the same answer for the other reason.
@@ -3867,21 +3836,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_supplies_a_diff_only_to_a_reviewer_that_cannot_fetch_one() {
-        // Isolated Codex receives auto through repository_change; Claude receives it in-prompt.
+    fn git_never_supplies_a_static_change() {
+        // Git no longer pre-captures (retire-capture-modes): supplies_change is false for every git
+        // reviewer configuration, because the change is derived live through repository_diff.
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert!(claude.supplies_change());
+        assert!(!claude.supplies_change());
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert!(codex.supplies_change());
+        assert!(!codex.supplies_change());
 
-        let codex_opt_out =
-            Config::from_args(&args(&["--reviewer", "codex", "--allow-reviewer-config"]))
-                .expect("config");
-        assert!(!codex_opt_out.supplies_change());
-
-        // And a Claude reviewer given Bash back -- in the session *and* permitted, since
-        // either alone leaves it unable to run anything -- can fetch its own.
         let with_bash = Config::from_args(&args(&[
             "--reviewer",
             "claude",
@@ -3895,29 +3858,17 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_diff_mode_overrides_the_auto_decision_in_both_directions() {
-        // A caller who curates its own diff must be able to turn ours off, and one that
-        // wants a specific range must get it even when the reviewer has a shell.
-        let off =
-            Config::from_args(&args(&["--reviewer", "claude", "--diff", "none"])).expect("config");
-        assert!(!off.supplies_change());
-
-        let ranged = Config::from_args(&args(&["--reviewer", "codex", "--diff", "main...HEAD"]))
-            .expect("config");
-        assert!(ranged.supplies_change());
-        assert_eq!(ranged.diff, DiffMode::Rev("main...HEAD".into()));
-    }
-
-    #[test]
-    fn diff_defaults_to_auto_and_rejects_an_option_shaped_value() {
-        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert_eq!(cfg.diff, DiffMode::Auto);
-
-        // `git diff --output=<file>` writes, so the value cannot be allowed to become a
-        // git option -- the same prefix-matching hole that kept Bash out of the defaults.
-        let err = Config::from_args(&args(&["--reviewer", "claude", "--diff", "--output=x"]))
+    fn diff_flag_is_retired_and_rejected() {
+        // Capture modes are gone (retire-capture-modes): git reviews derive the change live through
+        // repository_diff, so --diff is no longer accepted. A stale config carrying it fails with a
+        // clear message rather than silently pinning a mode.
+        let err = Config::from_args(&args(&["--reviewer", "claude", "--diff", "main...HEAD"]))
             .unwrap_err();
-        assert!(err.contains("git option"), "{err}");
+        assert!(err.contains("retired"), "{err}");
+
+        // Git reviews no longer pre-capture at all, so the primary never "supplies" a change.
+        let cfg = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
+        assert!(!cfg.supplies_change());
     }
 
     #[test]
