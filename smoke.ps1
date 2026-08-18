@@ -67,8 +67,10 @@ if (-not (Test-Path $Exe)) {
     throw "cross-review.exe not found at $Exe. Run .\build.ps1 first."
 }
 
-$serverArgs = @('--reviewer', $Reviewer, '--effort', $Effort, '--timeout-seconds', '600')
-if ($Model) { $serverArgs += @('--model', $Model) }
+# --model/--effort were removed: a reviewer's model and effort come only from --level now, so the
+# smoke builds a single default level from -Effort and -Model (or the reviewer's pinned default).
+$levelModel = if ($Model) { $Model } elseif ($Reviewer -eq 'claude') { 'claude-opus-4-8' } else { 'gpt-5.6-luna' }
+$serverArgs = @('--reviewer', $Reviewer, '--level', "smoke:${levelModel}:${Effort}", '--timeout-seconds', '600')
 if ($ReviewerBin) { $serverArgs += @('--bin', $ReviewerBin) }
 # The Claude evidence path requires a pinned profile home (an ambient Claude keeps --safe-mode and
 # gets no evidence, review f2), so the Claude smoke pins the dogfood "work" profile to exercise it.

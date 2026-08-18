@@ -2690,8 +2690,13 @@ mod drain_tests {
     fn truncation_is_reported_under_its_own_code_not_as_an_empty_review() {
         // An empty review means the CLI wrote nothing and retrying is reasonable. A
         // truncated one means it wrote far too much, and retrying does the same again.
-        let cfg =
-            Config::from_args(&["--reviewer".to_string(), "claude".to_string()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".to_string(),
+            "claude".to_string(),
+            "--level".to_string(),
+            "standard:claude-opus-4-8:medium".to_string(),
+        ])
+        .expect("config");
         let out = RunOutcome {
             stdout: "{\"result\": \"half a doc".into(),
             stderr: String::new(),
@@ -2720,8 +2725,13 @@ mod drain_tests {
 
     #[test]
     fn a_codex_timeout_with_policy_denials_explains_the_likely_stall() {
-        let cfg =
-            Config::from_args(&["--reviewer".to_string(), "codex".to_string()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".to_string(),
+            "codex".to_string(),
+            "--level".to_string(),
+            "standard:gpt-5.6-luna:max".to_string(),
+        ])
+        .expect("config");
         let out = RunOutcome {
             stdout: String::new(),
             stderr: concat!(
@@ -2810,7 +2820,13 @@ mod drain_tests {
 
     #[test]
     fn a_policy_stalled_outcome_routes_to_policy_blocked_not_timeout() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("cfg");
         // The exact count is carried on the outcome (policy_denials), not recomputed from stderr.
         // Here the retained stderr shows only one refusal and is even flagged truncated, but the
         // stream-wide count was 5 -- the diagnostic must report 5, exactly, not "at least 1" or
@@ -2863,19 +2879,33 @@ mod drain_tests {
     #[test]
     fn policy_stall_is_armed_only_for_codex_and_only_when_enabled() {
         // Codex with the default threshold: armed.
-        let codex = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        let codex = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("cfg");
         assert!(PolicyStall::for_run(&codex, codex.primary()).is_some());
         // Codex with the fail-fast disabled: off.
         let disabled = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--max-policy-denials".into(),
             "0".into(),
         ])
         .expect("cfg");
         assert!(PolicyStall::for_run(&disabled, disabled.primary()).is_none());
         // Claude has no command router, so it is never armed even at the default threshold.
-        let claude = Config::from_args(&["--reviewer".into(), "claude".into()]).expect("cfg");
+        let claude = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+        ])
+        .expect("cfg");
         assert!(PolicyStall::for_run(&claude, claude.primary()).is_none());
     }
 

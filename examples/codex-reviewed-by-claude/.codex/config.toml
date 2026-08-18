@@ -13,7 +13,9 @@
 
 [mcp_servers.cross_review]
 command = "tools/cross-review.exe"
-args = ["--reviewer", "claude", "--model", "claude-opus-4-8", "--effort", "medium"]
+# A reviewer's model and effort come only from --level (--model/--effort were removed); at
+# least one is required. Declare more and add --default-level to offer the caller a menu.
+args = ["--reviewer", "claude", "--level", "standard:claude-opus-4-8:medium"]
 
 # The Claude reviewer has no shell, so the server captures the change and hands it over.
 # The default captures the working tree, which suits reviewing work in progress but is

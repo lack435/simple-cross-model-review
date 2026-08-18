@@ -1756,7 +1756,13 @@ mod tests {
     // --- provisioning flow (Codex, with a stubbed login) ------------------------------------------
 
     fn codex_config() -> Config {
-        Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config")
+        Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config")
     }
 
     /// A stub login that writes a valid Codex `auth.json` (subscription) into the staging home, as a

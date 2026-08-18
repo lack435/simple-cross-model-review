@@ -159,34 +159,37 @@ resolve the wrong binary. So the design is explicit:
 
 ### The argument grammar
 
-A repeated `--reviewer` **starts a new entry**; the identity flags `--model`, `--effort`,
-`--bin` **bind to the most recent `--reviewer`**. Argument order is fallback order. This is
+A repeated `--reviewer` **starts a new entry**; the identity flag `--bin` and the `--level`
+menu **bind to the most recent `--reviewer`**. Argument order is fallback order. This is
 chosen over a delimited compound value (e.g. `--fallback codex:gpt-5.6-luna:max`) precisely
 because Windows binary paths contain `:` and `\`, so any single-string grammar drowns in
 escaping; the repeated-flag form has no delimiter to escape.
 
 ```
---reviewer claude --model claude-opus-4-8 --effort medium \
---reviewer codex  --model gpt-5.6-luna    --effort max
+--reviewer claude --level standard:claude-opus-4-8:medium \
+--reviewer codex  --level standard:gpt-5.6-luna:max
 ```
 
 is a two-entry chain: try Claude Opus first, fall back to Codex on a rate limit. A single
-`--reviewer claude --model …` is a one-entry chain — today's config, unchanged.
+`--reviewer claude --level …` is a one-entry chain.
 
-Binding rules, all validated at parse time so a slip is caught, not silently mis-bound:
+The `--model`/`--effort` flags were removed: a reviewer's model and effort come only from
+`--level NAME:MODEL:EFFORT`, so each entry declares at least one level, and its base pair —
+the `(model, effort)` used when a review omits `level` — is its **default level's** pair
+(`--default-level`, or the sole level). Identity, duplicate detection and resume matching are
+unchanged because they still key on `(model, effort)`; only the source moved.
 
-- An identity flag (`--model`/`--effort`/`--bin`) that appears **before any `--reviewer`**
-  is a parse error.
-- The **same identity flag twice within one entry** (two `--model` between two `--reviewer`,
+Binding rules, all validated so a slip is caught, not silently mis-bound:
+
+- The identity flag `--bin` (or a `--level`/`--default-level`) that appears **before any
+  `--reviewer`** is a parse error.
+- The **same identity flag twice within one entry** (two `--bin` between two `--reviewer`,
   say) is a parse error — it is almost always a forgotten `--reviewer`, and guessing which
   wins would hide the mistake.
-- Per-entry defaults are applied per entry: an entry with no `--model` takes that reviewer's
-  `default_model()`, no `--effort` takes its `default_effort()`, exactly as the single
-  reviewer does today.
-- The unknown-effort case stays a **non-fatal stderr warning** per entry ([config.rs:514]),
+- An entry with **no `--level`** is a parse error, as is one with **two or more levels and no
+  `--default-level`** (which of them an omitted `level` uses would be a guess).
+- The unknown-effort case stays a **non-fatal stderr warning** per declared level,
   deferred to surface as `MODEL_UNAVAILABLE` on first use, matching current behaviour.
-
-[config.rs:514]: ../src/config.rs
 
 ### 2. Config validation: two tiers, and where each is reported
 
@@ -829,7 +832,8 @@ Unit tests (no network, no model call), extending the existing fakes:
 
 - **Parsing**: single `--reviewer` ⇒ one-entry chain (regression guard on today's
   behaviour); a two-entry chain preserves order; an identity flag before any `--reviewer`
-  errors; a doubled `--model` within one entry errors; per-entry defaults fill in per entry.
+  errors; a doubled `--bin` within one entry errors; a level-less entry errors; each entry's
+  base pair is its default level's.
 - **Chain validation**: an identity-equivalent entry (reviewer, model, effort equal; bin equal as a case- and separator-insensitive path) ⇒
   `INVALID_REVIEWER_CHAIN`, and a degraded `App` returns it from `start_review` and `status`
   **before any preflight** (assert no bin resolution / auth check happened); a same-family,

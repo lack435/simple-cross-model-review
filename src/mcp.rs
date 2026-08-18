@@ -1284,7 +1284,13 @@ mod tests {
     use crate::config::Config;
 
     fn app() -> Arc<App> {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         Arc::new(App::new(cfg))
     }
 
@@ -1295,6 +1301,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--timeout-seconds".into(),
             "3600".into(),
         ])
@@ -1382,6 +1390,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -1415,19 +1425,25 @@ mod tests {
     }
 
     #[test]
-    fn level_property_is_advertised_only_when_levels_are_configured() {
-        // No levels: the property is absent, so additionalProperties:false rejects a stray `level`
-        // and the schema reads exactly as before.
+    fn level_property_advertises_the_declared_levels() {
+        // Every config declares at least one level now (--model/--effort were removed), so `level`
+        // is always advertised — optional, and additionalProperties:false still rejects anything
+        // outside the schema.
         let plain = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
+        let plain_schema = &plain["result"]["tools"][0]["inputSchema"];
+        assert!(plain_schema["properties"].get("level").is_some(), "{plain}");
+        assert_eq!(plain_schema["additionalProperties"], false);
         assert!(
-            plain["result"]["tools"][0]["inputSchema"]["properties"]
-                .get("level")
-                .is_none(),
-            "{plain}"
+            !plain_schema["required"]
+                .as_array()
+                .expect("required array")
+                .iter()
+                .any(|v| v == "level"),
+            "{plain_schema}"
         );
 
-        // With levels declared on the primary, `level` is advertised as an enum of the declared
-        // names, and is optional (never in `required`).
+        // With several levels declared on the primary, `level` is advertised as an enum of the
+        // declared names, and is optional (never in `required`).
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
@@ -1460,7 +1476,12 @@ mod tests {
     #[test]
     fn review_tool_description_describes_live_git_delivery() {
         let describe = |args: &[&str]| {
-            let mut all: Vec<String> = vec!["--reviewer".into(), "claude".into()];
+            let mut all: Vec<String> = vec![
+                "--reviewer".into(),
+                "claude".into(),
+                "--level".into(),
+                "standard:claude-opus-4-8:medium".into(),
+            ];
             all.extend(args.iter().map(|a| (*a).to_string()));
             let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
             let response = handle_sync(&app, "tools/list", &Value::Null, &json!(1));
@@ -1472,7 +1493,15 @@ mod tests {
 
         // A git review (any reviewer) describes the live repository_diff delivery, and never a
         // static --diff capture.
-        for args in [vec![], vec!["--reviewer", "codex"]] {
+        for args in [
+            vec![],
+            vec![
+                "--reviewer",
+                "codex",
+                "--level",
+                "standard:gpt-5.6-luna:max",
+            ],
+        ] {
             let text = describe(&args);
             assert!(text.contains("repository_diff"), "{args:?}: {text}");
             assert!(!text.contains("--diff"), "{args:?}: {text}");
@@ -1954,6 +1983,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--bin".into(),
             "C:\\definitely\\not\\here\\codex.exe".into(),
         ])

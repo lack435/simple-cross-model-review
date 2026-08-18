@@ -60,14 +60,17 @@ Add `--bin` with its full path:
 ```json
 "args": [
   "--reviewer", "codex",
-  "--model", "gpt-5.6-luna",
-  "--effort", "max",
+  "--level", "standard:gpt-5.6-luna:max",
   "--bin", "C:\\Users\\you\\AppData\\Roaming\\npm\\codex.cmd"
 ]
 ```
 
-## Effort levels
+## Levels
 
-Codex accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. `max` is the
-default here. Lowering it is cheaper and faster; `ultra`, the only level above it, is
-worth the extra cost only for genuinely hard review questions.
+A reviewer's model and effort come from `--level NAME:MODEL:EFFORT`, and at least one is
+required. Codex accepts the efforts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`;
+this example pins one `standard` level at `max`. Declare more than one — say a cheaper
+`fast` and a deeper `thorough` — and add `--default-level` to pick which an omitted `level`
+uses; the caller then selects one per review with the `level` argument. Lowering effort is
+cheaper and faster; `ultra`, the only level above `max`, is worth the cost only for
+genuinely hard review questions.

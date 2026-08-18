@@ -5696,6 +5696,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--bin".into(),
             bin.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
@@ -5747,6 +5749,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--bin".into(),
             bin.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
@@ -5798,12 +5802,16 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--bin".into(),
             bin_a.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
             "50".into(),
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--bin".into(),
             bin_b.to_string_lossy().into_owned(),
             "--state-dir".into(),
@@ -5874,10 +5882,15 @@ mod tests {
 
     #[test]
     fn a_gated_skip_attempt_is_non_billed() {
-        let spec = Config::from_args(&["--reviewer".into(), "codex".into()])
-            .unwrap()
-            .primary()
-            .clone();
+        let spec = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .unwrap()
+        .primary()
+        .clone();
         let a = gated_skip_attempt(&spec, Some(PathBuf::from("C:/x/codex.exe")));
         assert_eq!(a.failure_code, "USAGE_BELOW_MINIMUM");
         assert!(!a.billed);
@@ -6052,7 +6065,13 @@ mod tests {
 
     #[test]
     fn a_fresh_short_matching_session_resumes() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
         assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, false, now).is_none());
@@ -6063,7 +6082,13 @@ mod tests {
         // A cross_model_review resume must never continue a consult conversation (and vice versa):
         // the two are shaped for different protocols. The kind check fires before every other
         // identity check, so a consult session that is otherwise a perfect match is still refused.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
 
         let mut consult = record_matching(&cfg, 1, now);
@@ -6092,19 +6117,25 @@ mod tests {
         // Codex always provides the evidence service; an ambient Claude never does (no profile, so
         // claude_evidence_enabled is false). A consult can fall through to any later chain entry, so
         // the gate must reject a chain whose suffix contains an evidence-less entry.
-        let codex_only = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let codex_only = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         assert_eq!(first_evidence_incapable_entry(&codex_only, 0), None);
 
         // Two capable Codex entries (distinct models, so not identity-equivalent): still all capable.
         let two_codex = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
-            "--model".into(),
-            "gpt-5.6-luna".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--reviewer".into(),
             "codex".into(),
-            "--model".into(),
-            "gpt-5.6-sol".into(),
+            "--level".into(),
+            "standard:gpt-5.6-sol:max".into(),
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&two_codex, 0), None);
@@ -6114,8 +6145,12 @@ mod tests {
         let fallthrough = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&fallthrough, 0), Some(1));
@@ -6125,8 +6160,13 @@ mod tests {
         assert_eq!(first_evidence_incapable_entry(&fallthrough, 1), Some(1));
 
         // A single ambient Claude is incapable from the start.
-        let claude_only =
-            Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config");
+        let claude_only = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+        ])
+        .expect("config");
         assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
     }
 
@@ -6137,7 +6177,15 @@ mod tests {
         // schema's additionalProperties (the server does not validate against it). `include_change`
         // itself is a valid git consult input, so it is not in this set. The rejection fires before
         // the session lease, so no state dir is needed.
-        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+        let app = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
+            ])
+            .expect("cfg"),
+        );
         for (key, val) in [("change", json!("43650")), ("include_shelved", json!(true))] {
             let err = app
                 .start_consult(
@@ -6199,7 +6247,15 @@ mod tests {
         // cross_model_consult_result) is the wrong tool. The refusal fires on the kind check in
         // collect_snapshot, before the blocking wait, so it returns immediately even though the job
         // is still "running" — proven here by never finishing the job.
-        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+        let app = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
+            ])
+            .expect("cfg"),
+        );
 
         let (consult_id, _c) = app
             .registry
@@ -6238,7 +6294,13 @@ mod tests {
 
     #[test]
     fn a_case_or_separator_only_cwd_difference_still_resumes() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
 
         // Same directory spelled with different case and separators: the same root, so it still
@@ -6267,7 +6329,13 @@ mod tests {
 
     #[test]
     fn a_terminal_ledger_too_large_session_is_refused_resume() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("ledger_too_large".to_string());
@@ -6288,7 +6356,13 @@ mod tests {
 
         let dir = crate::testutil::temp_dir("stagnant-chain");
         let store = session::SessionStore::new(dir.as_ref());
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
 
         // Two findings open since turn 1; this is turn 4 and the reviewer reports nothing new and
@@ -6397,7 +6471,13 @@ mod tests {
 
     #[test]
     fn a_terminal_stagnant_session_is_refused_with_its_own_reason() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("session_stagnant".to_string());
@@ -6425,6 +6505,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--session-max-turns".into(),
             "2".into(),
         ])
@@ -6444,7 +6526,13 @@ mod tests {
     fn a_blank_stored_session_id_is_refused_resume() {
         // A record persisted with a blank/whitespace cli_session_id is not a resumable handle:
         // resume_block refuses it before the model call rather than attempting `--resume ""`.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         for blank in ["", "   ", "\t"] {
             let mut rec = record_matching(&cfg, 1, now);
@@ -6461,7 +6549,13 @@ mod tests {
 
     #[test]
     fn an_invalid_findings_ledger_is_refused_resume() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         // A ledger value that is not a compatible ledger -> LedgerLoad::Invalid -> refused.
@@ -6512,7 +6606,13 @@ mod tests {
 
     #[test]
     fn a_valid_findings_ledger_still_resumes() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let ev = crate::findings::evaluate_turn(
             "s",
@@ -6529,7 +6629,13 @@ mod tests {
 
     #[test]
     fn reaching_the_turn_limit_refuses_resume() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         // One below the cap still resumes; the cap itself does not.
         assert!(resume_block(
@@ -6556,7 +6662,13 @@ mod tests {
 
     #[test]
     fn passing_the_idle_window_refuses_resume() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
         let idle = cfg.resume_max_idle.as_secs();
         // Exactly at the window still resumes; one second past it does not.
@@ -6586,7 +6698,13 @@ mod tests {
     fn identity_mismatch_refuses_rather_than_silently_starting_fresh() {
         // reviewer, model and working root each pin the session. A configuration that now
         // points elsewhere is told so explicitly rather than being handed a fresh review.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let now = 1_000_000;
 
         let mut wrong_reviewer = record_matching(&cfg, 1, now);
@@ -6623,10 +6741,18 @@ mod tests {
     fn a_session_cannot_be_resumed_under_a_different_backend() {
         // A git record must never satisfy the Perforce binding logic (it carries no `changes`,
         // which would otherwise read as "unbound"), and vice versa.
-        let git = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("git cfg");
+        let git = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("git cfg");
         let p4 = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -6656,6 +6782,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--session-max-turns".into(),
             "0".into(),
             "--session-max-idle-seconds".into(),
@@ -6722,6 +6850,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -6742,6 +6872,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -6767,6 +6899,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -6787,6 +6921,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -6808,6 +6944,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -6827,6 +6965,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -6879,7 +7019,13 @@ mod tests {
 
     #[test]
     fn a_consult_resume_refuses_on_an_include_change_mismatch() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("cfg");
         let now = 1_000_000;
 
         // Stored change-capturing, requested tree-only: refused.
@@ -6911,7 +7057,13 @@ mod tests {
         // old static-capture contract (it carries a diff_mode) has stored change semantics this
         // server cannot match. It is refused on resume and the caller rebaselines; a record with no
         // diff_mode (the live shape) resumes.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("cfg");
         let now = 1_000_000;
 
         let mut rec = consult_record(&cfg, now);
@@ -6935,6 +7087,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -6966,6 +7120,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -7028,7 +7184,13 @@ mod tests {
 
     #[test]
     fn missing_instructions_is_a_request_error_not_a_stop_everything_failure() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let err = app
             .start_review(&json!({"session": "x"}), &RequestCancel::new())
@@ -7041,7 +7203,13 @@ mod tests {
 
     #[test]
     fn result_without_an_identifier_is_rejected() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let err = app
             .review_result(&json!({}), &RequestCancel::new())
@@ -7051,7 +7219,13 @@ mod tests {
 
     #[test]
     fn unknown_review_id_is_rejected_clearly() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let err = app
             .review_result(&json!({"review_id": "rv-nope-1"}), &RequestCancel::new())
@@ -7098,7 +7272,13 @@ mod tests {
     }
 
     fn render_completed_for(capture_summary: Option<crate::vcs::CaptureSummary>) -> String {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let (id, _c) = app
             .registry()
@@ -7166,7 +7346,13 @@ mod tests {
     }
 
     fn render_both_for(outcome: Outcome) -> (String, Option<Value>) {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let (id, _c) = app
             .registry()
@@ -7444,17 +7630,19 @@ mod tests {
 
     #[test]
     fn resolve_start_level_resume_pins_the_pair_and_guards_a_differing_level() {
-        // Base effort is xhigh; thorough is a *different* pair (max), so an omitted level on resume
-        // must run at the session's pinned pair, not the base.
+        // Base effort is xhigh (the standard default level); thorough is a *different* pair (max),
+        // so an omitted level on resume must run at the session's pinned pair, not the base.
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
-            "--effort".into(),
-            "xhigh".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:xhigh".into(),
             "--level".into(),
             "fast:gpt-5.6-luna:high".into(),
             "--level".into(),
             "thorough:gpt-5.6-luna:max".into(),
+            "--default-level".into(),
+            "standard".into(),
         ])
         .expect("cfg");
         let app = App::new(cfg);
@@ -7499,12 +7687,12 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
-            "--effort".into(),
-            "xhigh".into(),
             "--level".into(),
             "thorough:gpt-5.6-luna:max".into(),
             "--reviewer".into(),
             "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
         ])
         .expect("cfg");
         let app = App::new(cfg);
@@ -7555,6 +7743,8 @@ mod tests {
             Config::from_args(&[
                 "--reviewer".into(),
                 "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -7591,6 +7781,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
             "--state-dir".into(),
@@ -7636,6 +7828,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--state-dir".into(),
             dir.to_string_lossy().into_owned(),
         ])
@@ -7713,6 +7907,8 @@ mod tests {
         let cfg = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--state-dir".into(),
             dir.to_string_lossy().into_owned(),
         ])
@@ -7825,7 +8021,13 @@ mod tests {
 
     /// Finish enough reviews on one session to push its oldest past the retention cap.
     fn app_with_an_evicted_review(session: &str) -> (App, String) {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let mut ids = Vec::new();
         for turn in 1..=MAX_TERMINAL_PER_SESSION as u32 + 1 {
@@ -7870,7 +8072,13 @@ mod tests {
         // where the caller is told less than before, so what it *is* told has to hold: the
         // two cases must be indistinguishable, and both must point at the identifier that
         // can still tell them apart.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
 
         // A session this process never saw.
@@ -7922,7 +8130,13 @@ mod tests {
 
     #[test]
     fn a_cancelled_result_poll_detaches_without_stopping_the_review() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         // Registered directly: starting one for real would need a reviewer CLI.
         let (id, cancel) = app
@@ -7953,7 +8167,13 @@ mod tests {
 
     #[test]
     fn a_live_result_call_detaches_rather_than_owns_its_review() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = App::new(cfg);
         let (id, cancel) = app
             .registry
@@ -7979,7 +8199,13 @@ mod tests {
 
     #[test]
     fn shutdown_ends_a_long_poll_and_says_why() {
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let app = Arc::new(App::new(cfg));
         let (id, _cancel) = app
             .registry
@@ -8021,7 +8247,13 @@ mod tests {
         // The cap now tracks the review budget rather than a fixed 300, so a single blocking call
         // can cover a whole review. An over-large request is still clamped so an agent cannot pin
         // the server open with wait_seconds=99999.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let max = cfg.max_wait_secs();
         assert!(max > 300, "the cap should now exceed the old fixed 300");
 
@@ -8037,6 +8269,8 @@ mod tests {
         let cfg2 = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
             "--timeout-seconds".into(),
             "3600".into(),
         ])
@@ -8050,7 +8284,13 @@ mod tests {
     #[test]
     fn an_omitted_wait_seconds_blocks_to_completion() {
         // The default is the full cap, so the no-argument collect is one blocking call.
-        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
         let max = cfg.max_wait_secs();
         let args = json!({});
         let wait = args

@@ -55,7 +55,33 @@ fn evidence_for(cfg: &Config) -> Option<EvidenceInvocation<'_>> {
 fn config(extra: &[&str]) -> Config {
     let mut args: Vec<String> = vec!["--reviewer".into()];
     args.extend(extra.iter().map(|s| s.to_string()));
+    inject_level(&mut args);
     Config::from_args(&args).expect("config")
+}
+
+/// Supply a default `--level` when the args declare none. `--model`/`--effort` were removed, so a
+/// level-less entry no longer parses; these argv tests are always single-reviewer and mostly care
+/// about other flags, so injecting the reviewer's pinned default (as its sole, default level) keeps
+/// them one call. An explicit `--level` in `extra` suppresses injection.
+fn inject_level(args: &mut Vec<String>) {
+    if args
+        .iter()
+        .any(|a| a == "--level" || a.starts_with("--level="))
+    {
+        return;
+    }
+    let kind = args
+        .iter()
+        .position(|a| a == "--reviewer")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or("codex");
+    let (model, effort) = match crate::config::ReviewerKind::parse(kind) {
+        Some(r) => (r.default_model(), r.default_effort()),
+        None => ("gpt-5.6-luna", "max"),
+    };
+    args.push("--level".into());
+    args.push(format!("standard:{model}:{effort}"));
 }
 
 /// A config with an explicit working root (and optionally a state dir), so a test controls
@@ -70,6 +96,7 @@ fn config_at(cwd: &Path, state: Option<&Path>, extra: &[&str]) -> Config {
         args.push("--state-dir".into());
         args.push(state.to_string_lossy().into_owned());
     }
+    inject_level(&mut args);
     Config::from_args(&args).expect("config")
 }
 
@@ -175,10 +202,8 @@ fn claude_argv_carries_the_pinned_model_and_effort() {
         "claude",
         "--claude-profile",
         "test",
-        "--model",
-        "claude-opus-4-8",
-        "--effort",
-        "xhigh",
+        "--level",
+        "only:claude-opus-4-8:xhigh",
     ]);
     let args = argv(&ClaudeReviewer, &cfg, None);
     assert_eq!(
@@ -746,7 +771,7 @@ fn codex_argv_states_the_sandbox_on_every_turn_including_resumes() {
 
 #[test]
 fn codex_argv_carries_model_and_effort_on_both_paths() {
-    let cfg = config(&["codex", "--model", "gpt-5.6-luna", "--effort", "xhigh"]);
+    let cfg = config(&["codex", "--level", "only:gpt-5.6-luna:xhigh"]);
     for resume in [None, Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")] {
         let args = argv(&CodexReviewer, &cfg, resume);
         assert_eq!(value_after(&args, "-m").as_deref(), Some("gpt-5.6-luna"));
@@ -927,6 +952,13 @@ fn an_invocation_applies_the_pinned_home_rather_than_resolving_its_own() {
                 "codex"
             } else {
                 "claude"
+            }
+            .to_string(),
+            "--level".to_string(),
+            if var == "CODEX_HOME" {
+                "standard:gpt-5.6-luna:max"
+            } else {
+                "standard:claude-opus-4-8:medium"
             }
             .to_string(),
         ])
