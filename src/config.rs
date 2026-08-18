@@ -2200,43 +2200,16 @@ OPTIONS:
                               auto    git if a .git entry exists at or above the working
                                       root, else Perforce. Filesystem-only: never runs p4
                                       to decide. (default)
-                              git     git backend, configured by --diff.
+                              git     git backend. The change is derived live through the
+                                      repository_diff evidence tool; there is no capture mode
+                                      and no --diff flag.
                               perforce  Perforce backend. The changelists to review are
                                       named per call in the cross_model_review `change`
                                       argument (there is no launch-time changelist flag).
-  --diff <spec>               git only: what to capture and hand the reviewer as "the
-                              change". Rejected under --vcs perforce (name changelists in
-                              the `change` request argument there).
-                              auto    supply a working-tree diff only when the reviewer
-                                      has no usable shell to fetch one itself -- i.e.
-                                      Claude without Bash both enabled and allow-listed.
-                                      The Codex reviewer always has one, so auto supplies
-                                      nothing there. (default)
-                              none    supply nothing; paste your own into 'instructions'
-                              staged  git diff --cached
-                              HEAD    git diff HEAD, plus untracked file contents
-                              a..b    two commits, e.g. main...HEAD: no working tree,
-                                      no untracked files
-                              <rev>   that commit against the WORKING TREE, e.g. HEAD~3,
-                                      plus untracked file contents -- git's own semantics,
-                                      not ours. Two spellings are rejected because nothing
-                                      distinguishes them from the other shape: revision-set
-                                      shorthand (^!, ^@, ^-), which is a range with no ..
-                                      to see, and :/<pattern> containing .., which is a
-                                      range whose left end is a message search.
-                              A capture that was configured and could not be produced is
-                              reported to the caller with the review, not skipped in
-                              silence. Not affected by --no-preamble; use --diff none.
-  --no-incremental-resume     on a resumed turn, send the WHOLE captured change again
-                              instead of only what changed since the reviewer's previous
-                              turn. The incremental default resumes the reviewer's own
-                              conversation, so the earlier change is still in its context,
-                              and re-sending it every turn pays to re-cache a near-duplicate
-                              -- billed at a premium for the Claude reviewer. Both backends
-                              honour it: git sends only the commits added since the prior
-                              turn (a rewritten branch falls back to the full range on its
-                              own); Perforce collapses files byte-identical to what the
-                              reviewer was already shown. This flag forces full capture.
+  --no-incremental-resume     Perforce only: on a resumed turn, re-send the whole captured
+                              changelist instead of collapsing files byte-identical to what
+                              the reviewer was already shown. Git derives its change live and
+                              carries no resume baseline, so this flag has no effect there.
   --preamble-file <path>      Replace the built-in reviewer preamble.
   --no-preamble               Send the caller's instructions with no preamble at all.
   --allow-reviewer-config     Let the reviewer load project and user configuration

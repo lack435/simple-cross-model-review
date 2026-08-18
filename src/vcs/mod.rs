@@ -1,15 +1,13 @@
 //! Capturing the change under review.
 //!
-//! The server hands the reviewer "the change" as evidence -- a diff, a listing of what
-//! changed, and the contents of files a diff cannot cover -- so a shell-less reviewer does
-//! not have to be handed one by the caller. Which version-control system produced that
-//! change is a backend detail: [`git`] runs git over a work tree, [`perforce`] runs `p4`
-//! over a client.
+//! Only **Perforce** captures a change here now: [`perforce`] runs `p4` over a client and hands the
+//! reviewer the named changelists. Git no longer pre-captures (retire-capture-modes) — a git review
+//! derives the change live through the read-only evidence service's `repository_diff` tool (see
+//! [`crate::evidence`]), so the git arm of [`capture`] returns an empty [`Capture`].
 //!
-//! This module is the seam. [`capture`] is what the rest of the server calls; each backend
-//! renders its own [`CapturedChange`]. The VCS-neutral primitives every backend shares --
-//! truncation, capped reads, fenced rendering, path sanitisation, omission bookkeeping --
-//! live in [`shared`], single-sourced so a second backend cannot fork the security logic.
+//! This module is the seam. [`capture`] is what the rest of the server calls; the Perforce backend
+//! renders its own [`CapturedChange`]. The VCS-neutral primitives it shares -- truncation, capped
+//! reads, fenced rendering, path sanitisation, omission bookkeeping -- live in [`shared`].
 
 pub mod baseline;
 pub mod capture_summary;

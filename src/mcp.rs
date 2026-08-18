@@ -907,11 +907,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  Returns immediately with a review_id; collect the answer with \
                  cross_model_consult_result. Reuse the same 'session' to ask a follow-up with the \
                  earlier exchange still in context.\n\n\
-                 By default the reviewer reads the tree and captures no diff. Pass \
-                 include_change: true to also show it the configured change (the git --diff, or a \
-                 named Perforce changelist), the same capture a review gets. A consult still \
-                 certifies nothing either way; an empty capture is reported as a warning, never a \
-                 refusal.\n\n\
+                 For **git** the change under review is always available live through the \
+                 repository_diff evidence tool (base 'branch-base', head 'worktree'), so \
+                 include_change has no effect -- ask about the change directly. For **Perforce**, \
+                 the reviewer reads the tree by default; pass include_change: true to also capture \
+                 and show the changelist(s) you name in 'change'. A consult certifies nothing \
+                 either way.\n\n\
                  It requires the evidence service, so it runs only on a reviewer that provides one \
                  (Codex, or a profile-pinned shell-less Claude); otherwise it fails with \
                  EVIDENCE_UNAVAILABLE. If it fails, the consult did not happen -- tell the user what \
