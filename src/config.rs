@@ -1871,6 +1871,15 @@ impl Config {
                      `repository_change`; page it to completion when the review depends on the \
                      diff. Do not reconstruct it with a repo-relative shell command.",
                 );
+            } else if self.vcs == Vcs::Git {
+                out.push_str(
+                    "\n\nThe change under review is the live working tree. Diff it on demand with \
+                     `repository_diff`: `base: \"branch-base\"`, `head: \"worktree\"` gives the whole \
+                     change -- the working tree against the branch's fork point, including untracked \
+                     files. Page that canonical diff to completion; a formal APPROVE is accepted only \
+                     if you were served it end to end. Narrow with `path`, or diff a commit id, for \
+                     focused exploration on top. Do not reconstruct the diff with a shell command.",
+                );
             } else {
                 out.push_str(
                     "\n\nNo selected change was captured. If the request depends on a diff, state \
@@ -1893,9 +1902,9 @@ impl Config {
                 "You can read and search files with Read, Grep and Glob (scoped to this directory \
                  tree, reachable by absolute path), and you have read-only repository evidence \
                  tools: `repository_scope`, `repository_list`, `repository_search`, \
-                 `repository_read`, and `repository_change`.{history} Their paths are relative to \
-                 the reviewed repository root, and continuation cursors page a truncated result. \
-                 You have no shell."
+                 `repository_read`, `repository_change`, and `repository_diff`.{history} Their \
+                 paths are relative to the reviewed repository root, and continuation cursors page a \
+                 truncated result. You have no shell."
             );
             if diff_supplied {
                 out.push_str(
@@ -1903,6 +1912,17 @@ impl Config {
                      \"Change under review\"; it stays the authoritative selected change. Use the \
                      evidence tools to look *past* it -- read the live tree, search it, and walk \
                      history for context and to verify what the captured diff shows.",
+                );
+            } else if self.vcs == Vcs::Git {
+                out.push_str(
+                    "\n\nThe change under review is the live working tree. Diff it on demand with \
+                     `repository_diff`: `base: \"branch-base\"`, `head: \"worktree\"` gives the whole \
+                     change -- the working tree against the branch's fork point, including untracked \
+                     files. Page that canonical diff to completion; a formal APPROVE is accepted only \
+                     if you were served it end to end. Narrow with `path`, or diff a commit id, for \
+                     focused exploration on top. If the evidence service cannot produce the change, \
+                     the review is inconclusive: do NOT approve -- say so under \"What I could not \
+                     check\".",
                 );
             } else {
                 out.push_str(

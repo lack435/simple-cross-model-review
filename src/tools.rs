@@ -2479,6 +2479,12 @@ impl Job {
     /// at all — the single predicate every capture branch is gated on, so none is left
     /// `is_consult()`-shaped. See `docs/cross-model-consult-include-change-impl.md`.
     fn should_capture_change(&self) -> bool {
+        // Git no longer pre-captures: a review derives the change live through repository_diff, and
+        // an include_change consult does the same (retire-capture-modes mechanisms 2/3). Perforce
+        // keeps its per-call changelist capture — it has no repository_diff and no --diff.
+        if self.cfg.vcs == crate::config::Vcs::Git {
+            return false;
+        }
         !self.is_consult() || self.include_change
     }
 
@@ -4067,22 +4073,31 @@ impl Job {
             (Some(turn_eval), ledger, terminal)
         };
 
-        // Retire-capture-modes mechanism 4 (staged): a formal approval must rest on the complete
-        // canonical working-tree diff, served and paged to its terminal page (f1). Reviewer-agnostic
-        // — it reads the evidence server's serve-record file, not either CLI's stream. Staged
-        // deliberately: while the static change blob is still delivered through repository_change the
-        // reviewer makes no repository_diff call (`any_diff` false), so this cannot fire; it activates
-        // when the blob is removed and the preamble points the reviewer at repository_diff. The
-        // "never pulled any diff" floor lands with that same change, since it would misfire here while
-        // the blob path is live.
-        if !is_consult && evidence_setup.is_some() {
+        // Retire-capture-modes mechanism 4: the fail-closed evidence gate for the live model,
+        // reviewer-agnostic — it reads the evidence server's serve-record file, not either CLI's
+        // stream, so it covers Codex (which has no capture_thin gate) as well as Claude. Git only:
+        // Perforce has no repository_diff and still delivers its changelist through repository_change.
+        // Disarmed for consults, which are informal and certify nothing.
+        if !is_consult && evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
+            let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+            // The reviewer never pulled the change at all: whatever the verdict, the review rests on
+            // nothing it was shown. Fail closed to a re-runnable EVIDENCE_UNAVAILABLE.
+            if !agg.any_diff {
+                return Err(errors::evidence_review_too_thin(
+                    "the reviewer obtained no repository_diff of the change, so the review would \
+                     rest on nothing it was shown",
+                ));
+            }
+            // A formal APPROVE must have been served the complete canonical diff, paged to its end
+            // (f1): a reviewer that approved on only a narrowed slice, or that stopped mid-pagination,
+            // is caught here. A non-approving verdict on a narrowed diff is a legitimate partial
+            // review and is left alone.
             if let Some(te) = &turn_eval {
                 let approved = matches!(
                     te.envelope.verdict,
                     crate::findings::MachineVerdict::Approve
                 );
-                let agg = read_serve_record_aggregate(&self.cfg, &self.id);
-                if approved && agg.any_diff && !agg.complete_canonical_terminal {
+                if approved && !agg.complete_canonical_terminal {
                     return Err(errors::evidence_review_too_thin(
                         "the reviewer approved without being served the complete canonical \
                          working-tree diff paged to its end, so the approval would rest on less than \
