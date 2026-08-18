@@ -151,8 +151,7 @@ Defaults are `claude-opus-4-8` at `medium` and `gpt-5.6-luna` at `max`.
 --cwd <path>                 Review root. Defaults to the server's working directory.
 --state-dir <path>           Where named sessions live.
 --sandbox <mode>             Codex sandbox policy. Default read-only.
---vcs <auto|git|perforce>    Which version control the capture backend drives. Default auto.
---diff <spec>                git only. auto|none|staged|HEAD|<rev>. Default auto.
+--vcs <auto|git|perforce>    Which version control the change backend uses. Default auto.
 --tools / --allow-tools      Override the Claude reviewer's read-only tool policy.
 --preamble-file <path>       Replace the built-in reviewer preamble.
 --no-preamble                Send the caller's instructions with nothing added.
@@ -170,33 +169,25 @@ Deeper behaviors have their own design docs: the
 
 </details>
 
-## The change under review is fetched for you
+## The change under review is derived live
 
 Most reviews are reviews *of a change*, not of a tree. Rather than making the caller paste a
 diff into `instructions` — spending the caller's context, missing untracked files, and, when
-forgotten, getting back a review of the current tree instead of the change — the server fetches
-the change itself. It is already a process on your machine with a known working root, so running
-`git` (or `p4`) here costs the calling agent nothing.
+forgotten, getting back a review of the current tree instead of the change — the reviewer derives
+the change itself, live, through the read-only evidence service.
 
-For **git**, `--diff` selects what is captured:
-
-| `--diff` | What the reviewer is shown |
-| --- | --- |
-| `auto` *(default)* | `git diff HEAD` + status + untracked file contents |
-| `none` | nothing; supply your own in `instructions` |
-| `staged` | `git diff --cached` + status |
-| `HEAD` | as `auto` |
-| *a range* (`main...HEAD`) | two commits — no working tree, no untracked files |
-| *a bare revision* (`HEAD~3`) | that commit **against the working tree** + untracked |
-
-The capture is scoped to the working root, labelled as evidence rather than instructions, and
-truncation is always stated in the reviewer's prompt. It is hardened against a hostile
-repository's git config (`diff.external`, textconv, `core.fsmonitor` are disabled) and `git` is
-resolved from PATH, never from beside the vendored executable. (A reviewer with its own shell — a
-Codex under `--allow-reviewer-config`, or a Claude given `Bash` — fetches the change itself from
-its working directory instead of receiving this capture; the isolated Codex reviewer and a
-shell-less Claude always get it.) Full behavior and the verified threat model:
-[`docs/capture-summary.md`](docs/capture-summary.md).
+For **git**, there are no capture modes: the reviewer diffs the live working tree on demand through
+the `repository_diff` evidence tool. Its default scope — `base: "branch-base"`, `head: "worktree"` —
+is the whole change: the working tree against the branch's fork point
+(`merge-base(HEAD, refs/remotes/origin/{HEAD,main,master})`), including committed work, uncommitted
+edits, and untracked files. There is nothing to commit first and nothing to paste. A fail-closed
+gate ensures a formal *approve* was actually served that complete diff, end to end, so an approval
+cannot rest on less than the whole change. Git reviews require the evidence path — the Codex reviewer
+always has it; the Claude reviewer needs a pinned `--claude-profile` — and a git review without it is
+refused before it runs. `git` is resolved from PATH and run with a hostile repository's config
+disabled (`diff.external`, textconv, `core.fsmonitor`); `repository_diff` accepts only full object
+ids or a closed sentinel set, never a raw ref or option. Full behavior:
+[`docs/retire-capture-modes.md`](docs/retire-capture-modes.md).
 
 For **Perforce** (`--vcs perforce`, or `auto` in a workspace with no `.git`), the change is an
 explicit list of changelists named per call in the `change` argument (`"43650"`,
