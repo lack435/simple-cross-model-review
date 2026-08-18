@@ -949,11 +949,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     "include_change": {
                         "type": "boolean",
                         "description":
-                            "Also show the reviewer the configured change, not just the tree. \
-                             Defaults to false (tree-only). When true, the server captures the git \
-                             --diff (or the named Perforce changelist) and hands it to the reviewer, \
-                             exactly as a review does. Fixed for the session: a resume must pass the \
-                             same value (use fresh:true to change it)."
+                            "Perforce only: capture and show the reviewer the changelist(s) named \
+                             in 'change', not just the tree (defaults to false, tree-only). For git \
+                             it has no effect -- the change is always available live through the \
+                             repository_diff evidence tool. Fixed for the session: a resume must \
+                             pass the same value (use fresh:true to change it)."
                     }
                 },
                 "required": ["question"],
