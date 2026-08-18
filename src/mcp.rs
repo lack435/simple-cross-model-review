@@ -890,6 +890,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  Returns immediately with a review_id; collect the answer with \
                  cross_model_consult_result. Reuse the same 'session' to ask a follow-up with the \
                  earlier exchange still in context.\n\n\
+                 By default the reviewer reads the tree and captures no diff. Pass \
+                 include_change: true to also show it the configured change (the git --diff, or a \
+                 named Perforce changelist), the same capture a review gets. A consult still \
+                 certifies nothing either way; an empty capture is reported as a warning, never a \
+                 refusal.\n\n\
                  It requires the evidence service, so it runs only on a reviewer that provides one \
                  (Codex, or a profile-pinned shell-less Claude); otherwise it fails with \
                  EVIDENCE_UNAVAILABLE. If it fails, the consult did not happen -- tell the user what \
@@ -922,6 +927,15 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                         "description":
                             "Start a new conversation even if this session name already exists. \
                              Defaults to false."
+                    },
+                    "include_change": {
+                        "type": "boolean",
+                        "description":
+                            "Also show the reviewer the configured change, not just the tree. \
+                             Defaults to false (tree-only). When true, the server captures the git \
+                             --diff (or the named Perforce changelist) and hands it to the reviewer, \
+                             exactly as a review does. Fixed for the session: a resume must pass the \
+                             same value (use fresh:true to change it)."
                     }
                 },
                 "required": ["question"],
@@ -1159,6 +1173,45 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         // so the schema says so too rather than describing it as required in prose alone.
         if let Some(required) = tools[0]["inputSchema"]["required"].as_array_mut() {
             required.push(json!("change"));
+        }
+
+        // The consult also takes the Perforce inputs, but only when include_change: true, so its
+        // `change` is *conditionally* required: rejected when include_change is false, required when
+        // true. That cannot be expressed as a flat `required` entry, so it is NOT pushed there (the
+        // runtime is the real validator) and the description states the condition. Matched by name,
+        // not index, so it survives a reordering of the tool list (consult include_change f6). The
+        // review string above starts "Required." and describes a review, so it is not reused here.
+        if let Some(consult) = tools
+            .iter_mut()
+            .find(|t| t["name"] == json!("cross_model_consult"))
+        {
+            if let Some(props) = consult["inputSchema"]["properties"].as_object_mut() {
+                props.insert(
+                    "change".to_string(),
+                    json!({
+                        "type": ["string", "array"],
+                        "items": {"type": ["string", "integer"]},
+                        "description":
+                            "The Perforce changelist number(s) to include: a single number \
+                             (\"43650\"), a comma-separated string (\"43650,43651\"), or an array \
+                             ([\"43650\",\"43651\"]). Required only when include_change: true, and \
+                             rejected when it is false (a tree-only consult names no changelist). \
+                             Bound to the session -- reuse the same set to follow up, or pass \
+                             fresh:true to switch."
+                    }),
+                );
+                props.insert(
+                    "include_shelved".to_string(),
+                    json!({
+                        "type": "boolean",
+                        "description":
+                            "Optional, default false. Only meaningful with include_change: true. \
+                             When a pending changelist has nothing open in this workspace (it is \
+                             shelved, or belongs to another client), pull its shelved snapshot with \
+                             `p4 describe -S` instead of reporting no diff."
+                    }),
+                );
+            }
         }
     }
 

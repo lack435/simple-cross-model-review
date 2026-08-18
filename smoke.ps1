@@ -450,6 +450,50 @@ LOOKS-FINE
         ($script:progressMessages.Count -gt $consultProgressBefore)
     Write-Host $cResult
 
+    Write-Host "`n=== 5c. a change-capturing consult (include_change: true) ===" -ForegroundColor Cyan
+    # include_change: true runs the capture pipeline for a consult -- the same spawn + evidence
+    # service + capture path a review uses -- which AGENTS.md classifies as protocol needing the real
+    # round trip. The server runs with the default --diff auto, so what the reviewer is *shown*
+    # depends on the reviewer (a shelled Codex has auto withhold the diff; a shell-less Claude is
+    # handed it) and the working tree, so this asserts the path runs end-to-end and the envelope is
+    # well-formed rather than an exact diff. An empty/auto-suppressed capture is a warning here, never
+    # a refusal -- a consult certifies nothing.
+    $icQuestion = @'
+This is an automated smoke test of a consult that includes the change. Do not use the shell.
+Answer with exactly one line and nothing else:
+INCLUDE-CHANGE-OK
+'@
+    $icStart = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_consult'
+        arguments = @{ question = $icQuestion; session = 'smoke-consult-change'; include_change = $true }
+    } -TimeoutSeconds 60
+    $icStartText = Get-ToolText $icStart
+    Assert-That 'include_change consult start is not an error' ($icStart.result.isError -eq $false) $icStartText
+    $icId = ([regex]::Match($icStartText, 'review_id:\s*(\S+)')).Groups[1].Value
+    Assert-That 'an include_change consult review_id was returned' (-not [string]::IsNullOrWhiteSpace($icId)) $icStartText
+    Write-Host "  include_change consult review_id: $icId"
+
+    Write-Host '  waiting for the include_change consult...' -ForegroundColor DarkGray
+    $icCollected = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        $icCollected = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_consult_result'
+            arguments = @{ review_id = $icId; wait_seconds = 120 }
+        } -TimeoutSeconds 300
+        $text = Get-ToolText $icCollected
+        if ($text -notmatch 'status:\s+running') { break }
+        Write-Host "  still running (poll $attempt)" -ForegroundColor DarkGray
+    }
+    $icResult = Get-ToolText $icCollected
+    Assert-That 'include_change consult completed without error' ($icCollected.result.isError -eq $false) $icResult
+    Assert-That 'include_change consult reports completed status' ($icResult -match 'status:\s+completed') $icResult
+    Assert-That 'the include_change consult actually answered' ($icResult -match 'INCLUDE-CHANGE-OK') $icResult
+    $icsc = $icCollected.result.structuredContent
+    Assert-That 'the include_change consult is marked kind=consult' ($icsc.kind -eq 'consult') "kind=$($icsc.kind)"
+    # The session must be stamped include_change: true, so a resume that flips the capture mode is
+    # refused. This is what the capture-contract binding exists to protect (issue #105).
+    Write-Host $icResult
+
     Write-Host "`n=== 6. error handling ===" -ForegroundColor Cyan
     $bad = Send-Rpc -Method 'tools/call' -Params @{
         name = 'cross_model_review'; arguments = @{ session = 'nope' }
@@ -596,6 +640,12 @@ LOOKS-FINE
         $consultSession = $saved.sessions.'smoke-consult'
         Assert-That 'the consult session was recorded with kind=consult' `
             ($null -ne $consultSession -and $consultSession.kind -eq 'consult') (Get-Content $sessionsFile -Raw)
+        # The change-capturing consult stamps its capture contract (include_change: true) on the
+        # record, so a later resume that flipped the capture mode would be refused (issue #105).
+        $icSession = $saved.sessions.'smoke-consult-change'
+        Assert-That 'the include_change consult recorded its capture contract' `
+            ($null -ne $icSession -and $icSession.kind -eq 'consult' -and $icSession.include_change -eq $true) `
+            (Get-Content $sessionsFile -Raw)
     }
 }
 finally {

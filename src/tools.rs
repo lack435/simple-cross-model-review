@@ -804,20 +804,36 @@ impl App {
             })?
         };
 
-        // A consult is tree-only in this version: it reads the repository through the evidence service
-        // and captures no diff, so it takes none of the change/capture arguments. Reject them
-        // server-side, not only via the schema's additionalProperties:false — the server does not
-        // validate arguments against the schema, so a non-compliant client could otherwise pass
-        // include_change and have it silently ignored while the consult ran tree-only. `include_change`
-        // is the deferred capture contract (plan f2); `change`/`include_shelved` are the Perforce
-        // capture inputs. (consult review f3)
-        if is_consult {
-            for key in ["include_change", "change", "include_shelved"] {
+        // A consult's capture-contract flag. Parsed strictly: absent or a JSON null is the tree-only
+        // default (`false`), a present non-boolean is rejected rather than silently coerced. Only a
+        // consult honours it — a review always captures — so for a review it stays `false` and unused.
+        let include_change = match args.get("include_change") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(errors::bad_request(
+                    "'include_change' must be true or false.",
+                ))
+            }
+        };
+
+        // Conditional acceptance of the capture inputs on a consult (consult include_change f1). A
+        // *tree-only* consult (`include_change: false`, the default) takes none of the change/capture
+        // arguments and must carry no capture state, so reject them server-side — not only via the
+        // schema's additionalProperties:false, which the server does not enforce, so a non-compliant
+        // client could otherwise make a tree-only consult report and persist changelist state. On
+        // git those inputs are rejected for everyone by the backend guard below (with the pointed
+        // "wrong backend" message), so this consult-specific rejection only needs the Perforce case;
+        // when `include_change: true` a consult captures exactly as a review does and accepts them
+        // (with `change` then required below, same as a review).
+        if is_consult && !include_change && self.cfg.vcs == crate::config::Vcs::Perforce {
+            for key in ["change", "include_shelved"] {
                 if args.get(key).is_some_and(|v| !v.is_null()) {
                     return Err(errors::bad_request(format!(
-                        "'{key}' is not supported by cross_model_consult: a consult is tree-only in \
-                         this version and reads the repository through the read-only evidence \
-                         service rather than a captured diff. Omit it."
+                        "'{key}' applies only to a consult that includes the change. Pass \
+                         include_change: true to capture a changelist, or omit '{key}' for a \
+                         tree-only consult that reads the workspace through the read-only evidence \
+                         service."
                     )));
                 }
             }
@@ -882,13 +898,23 @@ impl App {
                 ))
             }
         };
-        // A consult is tree-only in this cut, so it names no changelist even on Perforce (it reads
-        // the workspace through the evidence service). A review must name the change under review.
-        if !is_consult && self.cfg.vcs == crate::config::Vcs::Perforce && changes.is_empty() {
-            return Err(errors::bad_request(
+        // Perforce needs a changelist named whenever it is going to capture one: a review always
+        // does, and a consult does exactly when `include_change: true`. A tree-only consult names
+        // none — it reads the workspace through the evidence service. `should_capture_change` is a
+        // job-time predicate, so it is spelled out here from the same two inputs.
+        if (!is_consult || include_change)
+            && self.cfg.vcs == crate::config::Vcs::Perforce
+            && changes.is_empty()
+        {
+            let what = if is_consult {
+                "'change' is required for a Perforce consult with include_change: true: name the \
+                 changelist number(s) to include, for example \"43650\" or [\"43650\",\"43651\"] \
+                 (or omit include_change for a tree-only consult)."
+            } else {
                 "'change' is required for a Perforce review: name the changelist number(s) to \
-                 review, for example \"43650\" or [\"43650\",\"43651\"].",
-            ));
+                 review, for example \"43650\" or [\"43650\",\"43651\"]."
+            };
+            return Err(errors::bad_request(what));
         }
         let changes_canonical = crate::changeset::canonical(&changes);
 
@@ -1002,6 +1028,7 @@ impl App {
                 record,
                 &changes_canonical,
                 expected_kind,
+                include_change,
                 now_unix(),
             ) {
                 return Err(resume_refusal(&session, reason, Some(record)));
@@ -1227,6 +1254,7 @@ impl App {
             context_paths,
             changes: changes.clone(),
             include_shelved,
+            include_change,
             turn,
             // Read here, while the lease is held and before this turn overwrites it, so
             // the recorded gap is the interval the reviewer's prompt cache actually saw.
@@ -2270,6 +2298,12 @@ struct Job {
     changes: Vec<u64>,
     /// Whether to pull shelved content for a pending changelist with nothing open.
     include_shelved: bool,
+    /// A consult's capture-contract flag: whether it includes the change (`include_change: true`) or
+    /// is tree-only (`false`, the default). Always `false` for a review — a review always captures —
+    /// so `should_capture_change()` folds it with the job kind. When `false` on a consult, every
+    /// capture branch and persisted capture field is skipped, so a tree-only consult carries no
+    /// capture state. See `docs/cross-model-consult-include-change-impl.md`.
+    include_change: bool,
     turn: u32,
     /// How long this session sat idle before this turn, when it had a previous one.
     gap_secs: Option<u64>,
@@ -2428,6 +2462,17 @@ impl Job {
         self.kind == crate::registry::JobKind::Consult
     }
 
+    /// Whether this turn captures the change and therefore participates in all the capture
+    /// bookkeeping (the capture call, the Capturing phase, the Perforce in-progress marker and
+    /// baseline, the empty-capture warning, and the persisted capture fields). A review always
+    /// does; a consult does exactly when it was started `include_change: true`. A *tree-only*
+    /// consult (`is_consult() && !include_change`) reads `false` here and carries no capture state
+    /// at all — the single predicate every capture branch is gated on, so none is left
+    /// `is_consult()`-shaped. See `docs/cross-model-consult-include-change-impl.md`.
+    fn should_capture_change(&self) -> bool {
+        !self.is_consult() || self.include_change
+    }
+
     /// The session-record kind string this job persists — [`session::KIND_CONSULT`] for a consult,
     /// [`session::KIND_REVIEW`] otherwise — so `record_turn` stamps the record with the right kind and
     /// a later cross-kind resume is refused.
@@ -2554,8 +2599,9 @@ impl Job {
             self.effective_entry(self.start_index)
                 .describe_with_bin(&self.bin),
         );
-        // A consult captures nothing (tree-only), so it shows no Capturing phase.
-        if self.cfg.chain_needs_capture() && !self.is_consult() {
+        // A tree-only consult captures nothing, so it shows no Capturing phase. A change-capturing
+        // consult (`include_change: true`) captures like a review, so it does.
+        if self.cfg.chain_needs_capture() && self.should_capture_change() {
             self.registry.set_phase(&self.id, Phase::Capturing);
         }
         // Durable poison check: if the *previous* Perforce turn left an uncleared "in progress"
@@ -2566,9 +2612,11 @@ impl Job {
         // marker (`PriorTurnPending`) from a marker whose state could not be read
         // (`MarkerStateUnreadable`); `prior_pending` folds both non-`Absent` states fail-closed,
         // exactly as the previous `is_pending` did.
-        // A consult produces no resume-delta baseline, so it needs no Perforce in-progress marker.
-        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce && !self.is_consult())
-            .then(|| self.sessions.marker_state(&self.session));
+        // A turn that captures no change produces no resume-delta baseline, so it needs no Perforce
+        // in-progress marker (a tree-only consult; a review and a change-capturing consult do).
+        let marker_state = (self.cfg.vcs == crate::config::Vcs::Perforce
+            && self.should_capture_change())
+        .then(|| self.sessions.marker_state(&self.session));
         let prior_pending = matches!(
             marker_state,
             Some(crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable)
@@ -2579,7 +2627,7 @@ impl Job {
         // resumable baseline at all (forced to `Disabled` below). This is the *Perforce* baseline
         // marker; the findings write-ahead is a separate marker written in `attempt`.
         let pending_marked = self.cfg.vcs == crate::config::Vcs::Perforce
-            && !self.is_consult()
+            && self.should_capture_change()
             && self.sessions.mark_pending(&self.session).is_ok();
 
         // The prior turn's baseline for the incremental-resume delta, tagged by backend. Git
@@ -2609,11 +2657,11 @@ impl Job {
                 })
             }),
         };
-        // A consult is tree-only in this cut (`include_change: false`): it sends the reviewer no diff
-        // and reads whatever it needs through the evidence service, so it skips capture entirely.
-        let capture = if self.is_consult() {
-            vcs::Capture::empty()
-        } else {
+        // A tree-only consult (`include_change: false`) sends the reviewer no diff and reads whatever
+        // it needs through the evidence service, so it skips capture entirely. A review and a
+        // change-capturing consult run the same capture pipeline (truncation caps and
+        // evidence-not-instructions fencing included).
+        let capture = if self.should_capture_change() {
             vcs::capture(
                 &self.cfg,
                 &self.changes,
@@ -2621,6 +2669,8 @@ impl Job {
                 resume,
                 &self.cancel,
             )
+        } else {
+            vcs::Capture::empty()
         };
         // The backend has already rendered the change into the prompt string; clone it out
         // so `capture.change` stays available for the usage metrics below.
@@ -2635,13 +2685,40 @@ impl Job {
         let capture_identity = capture.capture_identity.clone();
         // If the in-progress marker could not be written, this turn cannot be made safely
         // resumable (a later crash would be undetectable), so refuse to persist a `Full` baseline
-        // regardless of what the capture produced.
-        let perforce_baseline = if self.cfg.vcs == crate::config::Vcs::Perforce && !pending_marked {
+        // regardless of what the capture produced. A tree-only consult captures nothing and marks
+        // nothing, so it persists no baseline at all (`None`) rather than `Disabled` — it never had a
+        // capture to protect.
+        let perforce_baseline = if self.should_capture_change()
+            && self.cfg.vcs == crate::config::Vcs::Perforce
+            && !pending_marked
+        {
             Some(crate::vcs::baseline::PerforceBaseline::Disabled)
         } else {
             capture.perforce_baseline.clone()
         };
         let mut capture_warnings = capture.warnings;
+
+        // An `include_change: true` consult that produced no diff must not answer as if a change was
+        // shown. The review path's section-7 gate — which would otherwise flag a thin capture — is
+        // disarmed for a consult (a consult certifies nothing), and a clean tree or an
+        // `auto`-suppressed capture carries no warning of its own, so add one here. Fires when the
+        // capture is absent (empty/suppressed) or present but zero-count. Warning-only: an absent
+        // change is never a refusal on a consult. See `docs/cross-model-consult-include-change-impl.md`.
+        if self.is_consult() && self.include_change {
+            let captured_nothing = match &capture.change {
+                None => true,
+                Some(c) => c.summary.is_empty(),
+            };
+            if captured_nothing {
+                capture_warnings.push(
+                    "You asked to include the change (include_change: true), but no change was \
+                     captured: the configured diff produced nothing, the reviewer's configuration \
+                     supplies no diff, or the change is empty in this workspace. The reviewer \
+                     answered from the repository tree alone, read through the evidence service."
+                        .to_string(),
+                );
+            }
+        }
 
         // The caller-facing resume disposition. The backend fills the decisions it can see; here
         // we supply the framing it cannot: a disposition exists only on a resumed turn that sent a
@@ -2667,7 +2744,10 @@ impl Job {
         // enabled that is worth an ordinary persistence warning on its own footing, independent of
         // the disposition (which G0 suppresses on a no-change resume): the durability guarantee is
         // gone. When the feature is off there is no future elision to protect, so it is immaterial.
-        if self.cfg.vcs == crate::config::Vcs::Perforce
+        // A tree-only consult never marked pending because it captures nothing, so this is not a
+        // failure for it and must not warn — `should_capture_change()` gates it out.
+        if self.should_capture_change()
+            && self.cfg.vcs == crate::config::Vcs::Perforce
             && !pending_marked
             && self.cfg.resume_incremental_diff
         {
@@ -4100,7 +4180,12 @@ impl Job {
                             cumulative_usage: baseline_to_persist,
                             // Bind the session to the changelist set (Perforce only), canonicalised
                             // so a re-review naming the same changelists in another order resumes.
-                            changes: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                            // Gated on `should_capture_change()` too: a tree-only Perforce consult
+                            // captures no changelist, so it must persist `None` here — persisting
+                            // `Some([])` would make its own next tree-only resume trip the f5
+                            // capture-state refusal in `resume_block`.
+                            changes: (self.should_capture_change()
+                                && self.cfg.vcs == crate::config::Vcs::Perforce)
                                 .then(|| crate::changeset::canonical(&self.changes)),
                             // The (HEAD, base) baseline this turn captured, so the next resume
                             // reviews only what changed since it -- and only when its own range
@@ -4113,10 +4198,25 @@ impl Job {
                             // shelved flag are known from config; the capture identity and per-file
                             // baseline come from the capture (both `None` for git).
                             backend: Some(self.cfg.vcs.backend_id()),
-                            include_shelved: (self.cfg.vcs == crate::config::Vcs::Perforce)
+                            // Same gating as `changes`: a tree-only Perforce consult persists no
+                            // shelved flag, so its next tree-only resume is not refused as carrying
+                            // capture state.
+                            include_shelved: (self.should_capture_change()
+                                && self.cfg.vcs == crate::config::Vcs::Perforce)
                                 .then_some(self.include_shelved),
                             capture_identity: capture_identity.cloned(),
                             perforce_baseline: perforce_baseline.cloned(),
+                            // The consult capture contract (consult-only; `None` for a review). A
+                            // consult stamps its `include_change` so a later resume that would flip
+                            // tree-only vs change-capturing is refused. `diff_mode` binds the
+                            // *configured* git mode, and only when the change is actually part of the
+                            // contract (git + include_change) -- a Perforce consult is bound by its
+                            // changelist set, and a tree-only consult has no capture to bind.
+                            include_change: self.is_consult().then_some(self.include_change),
+                            diff_mode: (self.is_consult()
+                                && self.include_change
+                                && self.cfg.vcs == crate::config::Vcs::Git)
+                                .then(|| self.cfg.diff.to_string()),
                             // The active entry's identity, so a resume can match this exact entry and
                             // detect PATH drift.
                             raw_bin: self.spec.raw_bin(),
@@ -4151,8 +4251,12 @@ impl Job {
                             // trusts this turn's baseline. Only reached after `record_turn` returned
                             // `Ok`. If the delete fails the marker may survive and wrongly disable the
                             // *next* incremental review, so say so rather than letting it silently
-                            // persist.
-                            if self.cfg.vcs == crate::config::Vcs::Perforce {
+                            // persist. A tree-only consult never wrote a marker (it captures nothing),
+                            // so it must not touch one it neither read nor created —
+                            // `should_capture_change()` gates cleanup on capture participation.
+                            if self.should_capture_change()
+                                && self.cfg.vcs == crate::config::Vcs::Perforce
+                            {
                                 if let Err(e) = self.sessions.clear_pending(&self.session) {
                                     warnings.push(format!(
                                     "This turn was saved, but the session's in-progress marker \
@@ -4444,11 +4548,27 @@ fn first_evidence_incapable_entry(cfg: &Config, start_index: usize) -> Option<us
         .map(|(i, _)| i)
 }
 
+/// Whether a session record carries any capture state — a bound changelist set, shelved flag,
+/// capture identity, Perforce delta baseline, or git baseline pair. Used to refuse a *tree-only*
+/// consult resume of a record that should have none: a pre-`include_change` Perforce consult
+/// persisted an (empty) changelist set, a shelved flag and a `Disabled` baseline before the capture
+/// gating existed, and continuing it tree-only would inherit that stale state through
+/// `record_turn`'s `.or(existing)` merge. See `docs/cross-model-consult-include-change-impl.md` (f5).
+fn record_carries_capture_state(record: &session::SessionRecord) -> bool {
+    record.changes.is_some()
+        || record.include_shelved.is_some()
+        || record.capture_identity.is_some()
+        || record.perforce_baseline.is_some()
+        || record.head_sha.is_some()
+        || record.base_sha.is_some()
+}
+
 fn resume_block(
     cfg: &Config,
     record: &session::SessionRecord,
     requested_changes: &[u64],
     expected_kind: &str,
+    requested_include_change: bool,
     now: u64,
 ) -> Option<String> {
     // Kind first: a session belongs to the start path that created it. A `cross_model_review` resume
@@ -4518,6 +4638,62 @@ fn resume_block(
                 backend,
                 cfg.vcs.backend_id()
             ));
+        }
+    }
+
+    // The consult capture contract (docs/cross-model-consult-include-change-impl.md). Only a consult
+    // binds it — a review always captures and never sets these fields, so the whole block is gated on
+    // the consult kind. The cross-kind check above already guarantees a consult record here.
+    if expected_kind == session::KIND_CONSULT {
+        // Compare *effective* include_change: a `None` (legacy or a review record) and an absent
+        // request both mean tree-only (`false`), normalised on both sides, so a legacy tree-only
+        // consult is not falsely refused against a requested tree-only.
+        let record_include_change = record.include_change.unwrap_or(false);
+        if record_include_change != requested_include_change {
+            return Some(format!(
+                "it was created {}, but this call requests {}; a consult's include_change is fixed \
+                 for the session, so start a fresh consult (fresh: true) to change it.",
+                if record_include_change {
+                    "with include_change: true"
+                } else {
+                    "tree-only (include_change: false)"
+                },
+                if requested_include_change {
+                    "include_change: true"
+                } else {
+                    "tree-only (include_change: false)"
+                },
+            ));
+        }
+        // When the change is bound and the backend is git, the *configured* --diff mode is part of
+        // the contract: resuming under a different mode would continue the conversation against a
+        // different capture. (Perforce binds by its changelist set, checked below.) The per-turn
+        // resolved HEAD/base still drift as they do for a review — only the configured mode is bound.
+        if requested_include_change && cfg.vcs == crate::config::Vcs::Git {
+            let current = cfg.diff.to_string();
+            if record.diff_mode.as_deref() != Some(current.as_str()) {
+                return Some(format!(
+                    "it was created with --diff '{}', but this server is now configured for \
+                     --diff '{}'; a consult that includes the change is bound to its configured \
+                     diff mode, so start a fresh consult (fresh: true).",
+                    record.diff_mode.as_deref().unwrap_or("(unset)"),
+                    current,
+                ));
+            }
+        }
+        // A tree-only consult must carry no capture state. A pre-`include_change` Perforce consult
+        // record does, and has include_change: None, so the effective-mode check above passes it
+        // through. Refuse it here so that stale state is never inherited via record_turn's
+        // `.or(existing)` merge; the caller rebaselines (fresh: true) — a one-time cost on the first
+        // resume of such a legacy session. Post-feature a genuine tree-only consult carries no
+        // capture state, so this never fires for one.
+        if !requested_include_change && record_carries_capture_state(record) {
+            return Some(
+                "it is a tree-only consult whose stored record carries capture state from before \
+                 include_change existed, which cannot be safely continued in a tree-only \
+                 conversation. Start a fresh consult (fresh: true)."
+                    .to_string(),
+            );
         }
     }
 
@@ -5591,6 +5767,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             // Match what `cfg`'s primary entry would record, so the resume identity check binds.
             raw_bin: Some(cfg.primary().raw_bin()),
             resolved_bin: None,
@@ -5606,7 +5784,7 @@ mod tests {
         let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("config");
         let now = 1_000_000;
         let ok = record_matching(&cfg, cfg.resume_max_turns - 1, now - 10);
-        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -5619,14 +5797,14 @@ mod tests {
 
         let mut consult = record_matching(&cfg, 1, now);
         consult.kind = Some(session::KIND_CONSULT.to_string());
-        let reason = resume_block(&cfg, &consult, &[], session::KIND_REVIEW, now)
+        let reason = resume_block(&cfg, &consult, &[], session::KIND_REVIEW, false, now)
             .expect("a review must not resume a consult session");
         assert!(reason.contains("consult"), "{reason}");
         assert!(reason.contains("different protocols"), "{reason}");
 
         // The converse: a review session cannot be resumed as a consult.
         let review = record_matching(&cfg, 1, now);
-        let reason = resume_block(&cfg, &review, &[], session::KIND_CONSULT, now)
+        let reason = resume_block(&cfg, &review, &[], session::KIND_CONSULT, false, now)
             .expect("a consult must not resume a review session");
         assert!(reason.contains("review"), "{reason}");
 
@@ -5635,7 +5813,7 @@ mod tests {
         let mut legacy = record_matching(&cfg, 1, now);
         legacy.kind = None;
         assert_eq!(legacy.kind(), session::KIND_REVIEW);
-        assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -5682,16 +5860,14 @@ mod tests {
     }
 
     #[test]
-    fn a_consult_rejects_capture_arguments_server_side() {
-        // The schema forbids these for a compliant client, but the server does not validate against
-        // the schema, so a raw call must be rejected here too rather than silently running tree-only
-        // (consult review f3). The rejection fires before the session lease, so no state dir is needed.
+    fn a_git_consult_rejects_the_perforce_inputs_server_side() {
+        // `change`/`include_shelved` name Perforce inputs; on a git server they are rejected with the
+        // pointed "wrong backend" message for a consult exactly as for a review — not only via the
+        // schema's additionalProperties (the server does not validate against it). `include_change`
+        // itself is a valid git consult input, so it is not in this set. The rejection fires before
+        // the session lease, so no state dir is needed.
         let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
-        for (key, val) in [
-            ("include_change", json!(true)),
-            ("change", json!("43650")),
-            ("include_shelved", json!(true)),
-        ] {
+        for (key, val) in [("change", json!("43650")), ("include_shelved", json!(true))] {
             let err = app
                 .start_consult(
                     &json!({"question": "does this look right?", key: val}),
@@ -5699,9 +5875,8 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(err.code, "BAD_REQUEST", "{key}");
-            assert!(err.summary.contains(key), "{}: {}", key, err.summary);
             assert!(
-                err.summary.contains("tree-only"),
+                err.summary.contains("Perforce inputs"),
                 "{}: {}",
                 key,
                 err.summary
@@ -5807,14 +5982,14 @@ mod tests {
             .to_ascii_uppercase()
             .replace('\\', "/");
         assert!(
-            resume_block(&cfg, &variant, &[], session::KIND_REVIEW, now).is_none(),
+            resume_block(&cfg, &variant, &[], session::KIND_REVIEW, false, now).is_none(),
             "a case/separator-only cwd difference should resume"
         );
 
         // A genuinely different working root still invalidates.
         let mut moved = record_matching(&cfg, 1, now);
         moved.cwd = "C:\\somewhere\\else".to_string();
-        let reason = resume_block(&cfg, &moved, &[], session::KIND_REVIEW, now)
+        let reason = resume_block(&cfg, &moved, &[], session::KIND_REVIEW, false, now)
             .expect("a different cwd is refused");
         assert!(reason.contains("working root"), "{reason}");
     }
@@ -5825,8 +6000,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("ledger_too_large".to_string());
-        let reason =
-            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
+            .expect("terminal is refused");
         assert!(reason.contains("terminal state"));
         assert!(reason.contains("ledger_too_large"));
     }
@@ -5909,6 +6084,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    include_change: None,
+                    diff_mode: None,
                     raw_bin: session::RawBin::PathSearch,
                     resolved_bin: String::new(),
                     findings_ledger: Some(
@@ -5922,7 +6099,7 @@ mod tests {
             .expect("record the turn");
         assert_eq!(rec.terminal_reason.as_deref(), Some("session_stagnant"));
 
-        let refusal = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+        let refusal = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
             .expect("the next resume is refused");
         assert!(refusal.contains("session_stagnant"), "{refusal}");
         assert!(
@@ -5953,8 +6130,8 @@ mod tests {
         let now = 1_000_000;
         let mut rec = record_matching(&cfg, 1, now);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason =
-            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
+            .expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(
             reason.contains("without raising or resolving a finding"),
@@ -5985,8 +6162,8 @@ mod tests {
         // Past the turn limit *and* idle past the window, as well as terminal.
         let mut rec = record_matching(&cfg, 9, now - cfg.resume_max_idle.as_secs() - 60);
         rec.terminal_reason = Some("session_stagnant".to_string());
-        let reason =
-            resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).expect("terminal is refused");
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
+            .expect("terminal is refused");
         assert!(reason.contains("session_stagnant"), "{reason}");
         assert!(!reason.contains("--session-max-turns"), "{reason}");
         assert!(!reason.contains("--session-max-idle-seconds"), "{reason}");
@@ -6001,14 +6178,14 @@ mod tests {
         for blank in ["", "   ", "\t"] {
             let mut rec = record_matching(&cfg, 1, now);
             rec.cli_session_id = blank.to_string();
-            let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+            let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
                 .expect("a blank session id is refused resume");
             assert!(reason.contains("blank"), "{reason}");
         }
         // A real id still resumes (no blank-id refusal).
         let ok = record_matching(&cfg, 1, now);
         assert!(!ok.cli_session_id.trim().is_empty());
-        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &ok, &[], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -6018,7 +6195,7 @@ mod tests {
         let mut rec = record_matching(&cfg, 1, now);
         // A ledger value that is not a compatible ledger -> LedgerLoad::Invalid -> refused.
         rec.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
-        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now)
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
             .expect("invalid ledger is refused");
         assert!(reason.contains("unreadable or at an incompatible version"));
         // The refusal is tagged machine-readably as `ledger_unavailable`, so a caller can tell an
@@ -6033,9 +6210,15 @@ mod tests {
         // the ledger_unavailable tag still rides (the recovery, a fresh rebaseline, is identical).
         let mut invalid_and_stale = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         invalid_and_stale.findings_ledger = Some(serde_json::json!({"schema_version": 999}));
-        let compound_reason =
-            resume_block(&cfg, &invalid_and_stale, &[], session::KIND_REVIEW, now)
-                .expect("too many turns is refused");
+        let compound_reason = resume_block(
+            &cfg,
+            &invalid_and_stale,
+            &[],
+            session::KIND_REVIEW,
+            false,
+            now,
+        )
+        .expect("too many turns is refused");
         assert!(compound_reason.contains("turn"));
         let compound = resume_refusal("default", compound_reason, Some(&invalid_and_stale));
         assert_eq!(compound.detail.as_deref(), Some("ledger_unavailable"));
@@ -6044,7 +6227,7 @@ mod tests {
         // refusal with no record at all (a leftover findings marker on a name with no record).
         let mut healthy = record_matching(&cfg, cfg.resume_max_turns + 1, now);
         healthy.findings_ledger = None;
-        let policy_reason = resume_block(&cfg, &healthy, &[], session::KIND_REVIEW, now)
+        let policy_reason = resume_block(&cfg, &healthy, &[], session::KIND_REVIEW, false, now)
             .expect("too many turns is refused");
         assert_eq!(
             resume_refusal("default", policy_reason, Some(&healthy)).detail,
@@ -6070,7 +6253,7 @@ mod tests {
         );
         let mut rec = record_matching(&cfg, 1, now);
         rec.findings_ledger = Some(serde_json::to_value(&ev.ledger).expect("serialize"));
-        assert!(resume_block(&cfg, &rec, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -6083,6 +6266,7 @@ mod tests {
             &record_matching(&cfg, cfg.resume_max_turns - 1, now),
             &[],
             session::KIND_REVIEW,
+            false,
             now
         )
         .is_none());
@@ -6091,6 +6275,7 @@ mod tests {
             &record_matching(&cfg, cfg.resume_max_turns, now),
             &[],
             session::KIND_REVIEW,
+            false,
             now,
         )
         .expect("at the cap it is refused");
@@ -6109,6 +6294,7 @@ mod tests {
             &record_matching(&cfg, 1, now - idle),
             &[],
             session::KIND_REVIEW,
+            false,
             now
         )
         .is_none());
@@ -6117,6 +6303,7 @@ mod tests {
             &record_matching(&cfg, 1, now - idle - 1),
             &[],
             session::KIND_REVIEW,
+            false,
             now,
         )
         .expect("past the window it is refused");
@@ -6134,7 +6321,7 @@ mod tests {
         let mut wrong_reviewer = record_matching(&cfg, 1, now);
         wrong_reviewer.reviewer = "claude".to_string();
         assert!(
-            resume_block(&cfg, &wrong_reviewer, &[], session::KIND_REVIEW, now)
+            resume_block(&cfg, &wrong_reviewer, &[], session::KIND_REVIEW, false, now)
                 .expect("refused")
                 .contains("reviewer")
         );
@@ -6142,7 +6329,7 @@ mod tests {
         let mut wrong_model = record_matching(&cfg, 1, now);
         wrong_model.model = "gpt-5.6-sol".to_string();
         assert!(
-            resume_block(&cfg, &wrong_model, &[], session::KIND_REVIEW, now)
+            resume_block(&cfg, &wrong_model, &[], session::KIND_REVIEW, false, now)
                 .expect("refused")
                 .contains("model")
         );
@@ -6150,7 +6337,7 @@ mod tests {
         let mut wrong_cwd = record_matching(&cfg, 1, now);
         wrong_cwd.cwd = "C:\\somewhere\\else".to_string();
         assert!(
-            resume_block(&cfg, &wrong_cwd, &[], session::KIND_REVIEW, now)
+            resume_block(&cfg, &wrong_cwd, &[], session::KIND_REVIEW, false, now)
                 .expect("refused")
                 .contains("working root")
         );
@@ -6158,7 +6345,7 @@ mod tests {
         // A case-only difference in the working root is the same root on Windows.
         let mut cased = record_matching(&cfg, 1, now);
         cased.cwd = cfg.cwd.to_string_lossy().to_uppercase();
-        assert!(resume_block(&cfg, &cased, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &cased, &[], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -6178,7 +6365,7 @@ mod tests {
         let mut git_record = record_matching(&git, 1, now);
         git_record.backend = Some("git".into());
         assert!(
-            resume_block(&p4, &git_record, &[42], session::KIND_REVIEW, now)
+            resume_block(&p4, &git_record, &[42], session::KIND_REVIEW, false, now)
                 .expect("refused")
                 .contains("backend")
         );
@@ -6186,7 +6373,7 @@ mod tests {
         let mut p4_record = record_matching(&p4, 1, now);
         p4_record.backend = Some("perforce".into());
         assert!(
-            resume_block(&git, &p4_record, &[], session::KIND_REVIEW, now)
+            resume_block(&git, &p4_record, &[], session::KIND_REVIEW, false, now)
                 .expect("refused")
                 .contains("backend")
         );
@@ -6206,7 +6393,15 @@ mod tests {
         .expect("config");
         let now = 1_000_000;
         let ancient_and_long = record_matching(&cfg, 999, 0);
-        assert!(resume_block(&cfg, &ancient_and_long, &[], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(
+            &cfg,
+            &ancient_and_long,
+            &[],
+            session::KIND_REVIEW,
+            false,
+            now
+        )
+        .is_none());
     }
 
     #[test]
@@ -6337,6 +6532,175 @@ mod tests {
     }
 
     #[test]
+    fn consult_include_change_is_parsed_strictly_and_gates_the_capture_inputs() {
+        let git = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "git".into(),
+            ])
+            .expect("cfg"),
+        );
+        // A non-boolean include_change is a request error, not a silent false.
+        let err = git
+            .start_consult(
+                &json!({"question": "x", "include_change": "yes"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains("include_change"), "{}", err.summary);
+
+        let p4 = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--vcs".into(),
+                "perforce".into(),
+            ])
+            .expect("cfg"),
+        );
+        // A tree-only consult (include_change omitted/false) rejects the capture inputs, so it can
+        // never persist changelist state a later tree-only follow-up would be refused against.
+        let err = p4
+            .start_consult(
+                &json!({"question": "x", "change": "43650"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("include_change: true"),
+            "{}",
+            err.summary
+        );
+
+        // With include_change: true on Perforce, `change` becomes required — and the message names
+        // include_change as the reason, distinct from the review's unconditional requirement.
+        let err = p4
+            .start_consult(
+                &json!({"question": "x", "include_change": true}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("include_change: true"),
+            "{}",
+            err.summary
+        );
+        assert!(
+            err.summary.contains("'change' is required"),
+            "{}",
+            err.summary
+        );
+    }
+
+    /// A consult-kind record matching `cfg`, so it clears the identity checks and reaches the
+    /// capture-contract gate. Starts with no capture fields and `include_change` unset (a tree-only
+    /// git consult); tests set what they need.
+    fn consult_record(cfg: &Config, now: u64) -> crate::session::SessionRecord {
+        let mut rec = record_matching(cfg, 1, now);
+        rec.kind = Some(session::KIND_CONSULT.to_string());
+        rec
+    }
+
+    #[test]
+    fn a_consult_resume_refuses_on_an_include_change_mismatch() {
+        let cfg = Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg");
+        let now = 1_000_000;
+
+        // Stored change-capturing, requested tree-only: refused.
+        let mut rec = consult_record(&cfg, now);
+        rec.include_change = Some(true);
+        rec.diff_mode = Some(cfg.diff.to_string());
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now)
+            .expect("mismatch is refused");
+        assert!(reason.contains("include_change"), "{reason}");
+
+        // Stored tree-only, requested change-capturing: refused.
+        let mut rec = consult_record(&cfg, now);
+        rec.include_change = Some(false);
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now)
+            .expect("mismatch is refused");
+        assert!(reason.contains("include_change"), "{reason}");
+
+        // Same effective mode resumes. A legacy `None` reads as tree-only (false), so a tree-only
+        // request matches it — provided it carries no capture state (checked separately below).
+        let mut rec = consult_record(&cfg, now);
+        rec.include_change = None;
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now).is_none());
+        rec.include_change = Some(true);
+        rec.diff_mode = Some(cfg.diff.to_string());
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
+    }
+
+    #[test]
+    fn a_change_capturing_git_consult_is_bound_to_its_configured_diff_mode() {
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--diff".into(),
+            "main...HEAD".into(),
+        ])
+        .expect("cfg");
+        let now = 1_000_000;
+
+        // Same configured mode resumes.
+        let mut rec = consult_record(&cfg, now);
+        rec.include_change = Some(true);
+        rec.diff_mode = Some("main...HEAD".to_string());
+        assert!(resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now).is_none());
+
+        // A different configured mode refuses.
+        rec.diff_mode = Some("HEAD".to_string());
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, true, now)
+            .expect("a changed diff mode is refused");
+        assert!(reason.contains("--diff"), "{reason}");
+
+        // A tree-only consult ignores diff_mode entirely (it binds nothing).
+        let mut tree = consult_record(&cfg, now);
+        tree.include_change = Some(false);
+        tree.diff_mode = Some("HEAD".to_string());
+        assert!(resume_block(&cfg, &tree, &[], session::KIND_CONSULT, false, now).is_none());
+    }
+
+    #[test]
+    fn a_legacy_perforce_consult_carrying_capture_state_is_refused_tree_only() {
+        // The f5 case: a v1 Perforce consult persisted an (empty) changelist set, a shelved flag and
+        // a Disabled baseline before include_change existed, and has include_change: None. Resumed
+        // tree-only it would inherit that stale state through record_turn's `.or(existing)` merge, so
+        // it is refused and the caller rebaselines.
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--vcs".into(),
+            "perforce".into(),
+        ])
+        .expect("cfg");
+        let now = 1_000_000;
+
+        let mut rec = consult_record(&cfg, now);
+        rec.include_change = None;
+        rec.changes = Some(vec![]);
+        rec.include_shelved = Some(false);
+        rec.perforce_baseline = Some(crate::vcs::baseline::PerforceBaseline::Disabled);
+        let reason = resume_block(&cfg, &rec, &[], session::KIND_CONSULT, false, now)
+            .expect("a legacy consult with capture state is refused tree-only");
+        assert!(reason.contains("capture state"), "{reason}");
+
+        // A genuine (post-#105) fresh tree-only Perforce consult carries no capture state — the
+        // worker gates `changes`/`include_shelved`/`perforce_baseline` on should_capture_change(), so
+        // they are all `None` even on Perforce — and it resumes cleanly rather than tripping the f5
+        // refusal above. include_change is Some(false), the shape the fixed worker persists.
+        let mut clean = consult_record(&cfg, now);
+        clean.include_change = Some(false);
+        assert!(clean.changes.is_none() && clean.include_shelved.is_none());
+        assert!(resume_block(&cfg, &clean, &[], session::KIND_CONSULT, false, now).is_none());
+    }
+
+    #[test]
     fn a_perforce_session_is_bound_to_its_changelist_set() {
         // A record created under Perforce, bound to a changelist set.
         let cfg = Config::from_args(&[
@@ -6351,17 +6715,25 @@ mod tests {
         record.changes = Some(vec![43650, 43651]);
 
         // Same set (any order, canonicalised by the caller) resumes.
-        assert!(resume_block(&cfg, &record, &[43650, 43651], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(
+            &cfg,
+            &record,
+            &[43650, 43651],
+            session::KIND_REVIEW,
+            false,
+            now
+        )
+        .is_none());
         // A different set is refused, naming both sets and the escape hatch.
-        let reason =
-            resume_block(&cfg, &record, &[43650], session::KIND_REVIEW, now).expect("refused");
+        let reason = resume_block(&cfg, &record, &[43650], session::KIND_REVIEW, false, now)
+            .expect("refused");
         assert!(reason.contains("43650, 43651"), "{reason}");
         assert!(reason.contains("fresh: true"), "{reason}");
 
         // A record with no binding (legacy or git) is treated as unbound and resumes.
         let mut unbound = record.clone();
         unbound.changes = None;
-        assert!(resume_block(&cfg, &unbound, &[99999], session::KIND_REVIEW, now).is_none());
+        assert!(resume_block(&cfg, &unbound, &[99999], session::KIND_REVIEW, false, now).is_none());
     }
 
     #[test]
@@ -6752,6 +7124,7 @@ mod tests {
             context_paths: Vec::new(),
             changes: Vec::new(),
             include_shelved: false,
+            include_change: false,
             turn: 4,
             gap_secs: None,
             prior_cumulative: None,
@@ -7064,6 +7437,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    include_change: None,
+                    diff_mode: None,
                     raw_bin: crate::session::RawBin::PathSearch,
                     resolved_bin: "codex.exe".into(),
                     findings_ledger: None,

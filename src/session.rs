@@ -204,6 +204,23 @@ pub struct SessionRecord {
     /// inventory can never be eluded against. `None` for git or a record predating this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perforce_baseline: Option<PerforceBaseline>,
+    /// The consult *capture contract*: whether this consult session was created with
+    /// `include_change: true`. Bound for the session's life — a resume whose effective
+    /// `include_change` differs is refused (`resume_block`), so a conversation built tree-only is
+    /// never continued against a captured diff, nor the reverse. `None` on a review record (the
+    /// contract is consult-only) or a record predating this field; both read as tree-only
+    /// (effective `false`). See `docs/cross-model-consult-include-change-impl.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_change: Option<bool>,
+    /// The *configured* git `--diff` mode (`DiffMode`) at consult-session creation, as its canonical
+    /// string (`DiffMode::Display`). The other half of the consult capture contract: when
+    /// `include_change` is true and the backend is git, a resume whose current `cfg.diff` differs is
+    /// refused, so the reviewer is never handed a different configured capture mid-conversation. This
+    /// is the *configured* mode only — the per-turn resolved `head..base` and the incremental delta
+    /// still drift exactly as they do for a review. `None` for a review record, a Perforce consult
+    /// (bound by its changelist set instead), or a record predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_mode: Option<String>,
     /// The reviewer entry's binary *as configured* (raw), used to match the chain entry that
     /// created this session on resume without resolving any other entry. `None` on a record
     /// written before the reviewer chain existed — matched leniently (exactly-one) then.
@@ -338,6 +355,13 @@ pub struct TurnFacts<'a> {
     pub include_shelved: Option<bool>,
     pub capture_identity: Option<CaptureIdentity>,
     pub perforce_baseline: Option<PerforceBaseline>,
+    /// The consult capture contract this turn ran under: whether the consult includes the change
+    /// (`include_change`), and the *configured* git `DiffMode` as its canonical string. Both `None`
+    /// for a review turn (the contract is consult-only) and a Perforce consult carries `diff_mode`
+    /// `None` (bound by its changelist set instead). Invariants for the session's life, so they
+    /// persist-then-inherit like `changes`. See `docs/cross-model-consult-include-change-impl.md`.
+    pub include_change: Option<bool>,
+    pub diff_mode: Option<String>,
     /// The active reviewer entry's binary as configured, and the path it resolved to, so a resume
     /// can match this entry and detect PATH drift.
     pub raw_bin: RawBin,
@@ -434,6 +458,8 @@ impl SessionStore {
             include_shelved,
             capture_identity,
             perforce_baseline,
+            include_change,
+            diff_mode,
             raw_bin,
             resolved_bin,
             findings_ledger,
@@ -509,6 +535,11 @@ impl SessionStore {
                 // exactly what the reviewer was last shown, so it is stored directly and never
                 // inherited -- a stale inventory must never be eluded against.
                 perforce_baseline,
+                // The consult capture contract is a session-life invariant like the changelist
+                // binding, so carry this turn's value while tolerating a `None` (a review turn, or a
+                // Perforce consult's `diff_mode`) rather than erasing what is bound.
+                include_change: include_change.or(existing.include_change),
+                diff_mode: diff_mode.or(existing.diff_mode.clone()),
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
                 // The findings ledger and terminal state are this turn's alone: the new ledger
@@ -538,6 +569,8 @@ impl SessionStore {
                 include_shelved,
                 capture_identity,
                 perforce_baseline,
+                include_change,
+                diff_mode,
                 raw_bin: Some(raw_bin),
                 resolved_bin: Some(resolved_bin),
                 findings_ledger,
@@ -1006,6 +1039,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    include_change: None,
+                    diff_mode: None,
                     raw_bin: RawBin::PathSearch,
                     resolved_bin: String::new(),
                     findings_ledger: None,
@@ -1090,6 +1125,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1302,6 +1339,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1351,6 +1390,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1408,6 +1449,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1450,6 +1493,8 @@ mod tests {
             include_shelved: None,
             capture_identity: None,
             perforce_baseline: None,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1464,6 +1509,119 @@ mod tests {
         // A later turn that carried no binding must not erase the one already stored.
         store.record_turn("p4", facts(None)).expect("turn 2");
         assert_eq!(store.get("p4").unwrap().changes, Some(vec![43650, 43651]));
+    }
+
+    #[test]
+    fn the_consult_capture_contract_persists_and_survives_a_none_turn() {
+        // include_change and the configured diff mode are session-life invariants like the
+        // changelist binding: written every turn, but a turn that supplies `None` must inherit
+        // rather than erase, so the contract the resume gate compares against stays intact.
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |include_change: Option<bool>, diff_mode: Option<&str>| TurnFacts {
+            reviewer: "codex",
+            cli_session_id: "thread-1",
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: "C:\\repo",
+            kind: KIND_CONSULT,
+            cumulative_usage: None,
+            changes: None,
+            head_sha: None,
+            base_sha: None,
+            backend: Some("git"),
+            include_shelved: None,
+            capture_identity: None,
+            perforce_baseline: None,
+            include_change,
+            diff_mode: diff_mode.map(str::to_string),
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: "project",
+            profile_identity: None,
+        };
+        store
+            .record_turn("c", facts(Some(true), Some("main...HEAD")))
+            .expect("turn 1");
+        let rec = store.get("c").unwrap();
+        assert_eq!(rec.include_change, Some(true));
+        assert_eq!(rec.diff_mode.as_deref(), Some("main...HEAD"));
+        // A follow-up that supplies neither must not erase the bound contract.
+        store.record_turn("c", facts(None, None)).expect("turn 2");
+        let rec = store.get("c").unwrap();
+        assert_eq!(rec.include_change, Some(true));
+        assert_eq!(rec.diff_mode.as_deref(), Some("main...HEAD"));
+    }
+
+    #[test]
+    fn a_tree_only_perforce_consult_persists_no_capture_state() {
+        // The worker gates the Perforce capture fields on should_capture_change(), so a tree-only
+        // consult hands `record_turn` `None` for `changes`/`include_shelved`/`perforce_baseline`
+        // even though the backend is Perforce. The stored record must then carry no capture state, or
+        // its own next tree-only resume would trip the f5 capture-state refusal in `resume_block`
+        // (issue #105). A change-capturing consult, by contrast, persists them like a review.
+        use crate::vcs::baseline::PerforceBaseline;
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let facts = |changes, include_shelved, baseline: Option<PerforceBaseline>| TurnFacts {
+            reviewer: "codex",
+            cli_session_id: "thread-1",
+            model: "gpt-5.6-luna",
+            effort: "max",
+            cwd: "C:\\repo",
+            kind: KIND_CONSULT,
+            cumulative_usage: None,
+            changes,
+            head_sha: None,
+            base_sha: None,
+            backend: Some("perforce"),
+            include_shelved,
+            capture_identity: None,
+            perforce_baseline: baseline,
+            include_change: Some(include_shelved.is_some()),
+            diff_mode: None,
+            raw_bin: RawBin::PathSearch,
+            resolved_bin: String::new(),
+            findings_ledger: None,
+            terminal_reason: None,
+            reviewer_cwd_mode: "project",
+            profile_identity: None,
+        };
+        // Tree-only: the worker supplies no capture fields, so none are stored.
+        store
+            .record_turn("tree", facts(None, None, None))
+            .expect("tree-only turn");
+        let rec = store.get("tree").unwrap();
+        assert_eq!(rec.include_change, Some(false));
+        assert!(
+            rec.changes.is_none(),
+            "tree-only must persist no changelist set"
+        );
+        assert!(
+            rec.include_shelved.is_none(),
+            "tree-only must persist no shelved flag"
+        );
+        assert!(
+            rec.perforce_baseline.is_none(),
+            "tree-only must persist no baseline"
+        );
+        // Change-capturing: the binding is stored, like a review.
+        store
+            .record_turn(
+                "cap",
+                facts(
+                    Some(vec![43650]),
+                    Some(false),
+                    Some(PerforceBaseline::Disabled),
+                ),
+            )
+            .expect("change-capturing turn");
+        let rec = store.get("cap").unwrap();
+        assert_eq!(rec.include_change, Some(true));
+        assert_eq!(rec.changes, Some(vec![43650]));
+        assert_eq!(rec.include_shelved, Some(false));
     }
 
     #[test]
@@ -1491,6 +1649,8 @@ mod tests {
             include_shelved: Some(false),
             capture_identity: None,
             perforce_baseline: baseline,
+            include_change: None,
+            diff_mode: None,
             raw_bin: RawBin::PathSearch,
             resolved_bin: String::new(),
             findings_ledger: None,
@@ -1679,6 +1839,8 @@ mod tests {
                     include_shelved: None,
                     capture_identity: None,
                     perforce_baseline: None,
+                    include_change: None,
+                    diff_mode: None,
                     raw_bin: RawBin::PathSearch,
                     resolved_bin: String::new(),
                     findings_ledger: None,
