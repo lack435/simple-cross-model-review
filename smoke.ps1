@@ -230,6 +230,8 @@ try {
     # the sorted set says which tool appeared or vanished, and still catches an accidental extra one.
     $expectedTools = @(
         'cross_model_review',
+        'cross_model_consult',
+        'cross_model_consult_result',
         'cross_model_review_cancel',
         'cross_model_review_result',
         'cross_model_review_status',
@@ -240,6 +242,8 @@ try {
         "expected: $(($expectedTools | Sort-Object) -join ', ')`n        got:      $sorted"
     Assert-That 'cross_model_review is present' ($names -contains 'cross_model_review')
     Assert-That 'cross_model_review_result is present' ($names -contains 'cross_model_review_result')
+    Assert-That 'cross_model_consult is present' ($names -contains 'cross_model_consult')
+    Assert-That 'cross_model_consult_result is present' ($names -contains 'cross_model_consult_result')
 
     Write-Host "`n=== 3. status (reviewer CLI and auth) ===" -ForegroundColor Cyan
     $status = Send-Rpc -Method 'tools/call' -Params @{
@@ -377,6 +381,74 @@ COUNTER=2
     Assert-That 'the resumed wait emitted MCP progress notifications' `
         ($script:progressMessages.Count -gt $resumeProgressBefore)
     Write-Host $resumeResult
+
+    Write-Host "`n=== 5b. a consult (second pair of eyes) ===" -ForegroundColor Cyan
+    # The consult is a distinct protocol path -- its own prompt (no findings block), its own result
+    # tool, and a prose answer rather than a findings envelope -- so a change touching it needs the
+    # real round trip, not just the review above. Both reviewers exercise the evidence service here.
+    $consultQuestion = @'
+This is an automated smoke test of a consult tool. Do not review any code. Do not use the shell.
+Call repository_scope and repository_search for the literal "cross-review" to exercise the evidence
+service, then answer with exactly two lines and nothing else:
+CONSULT-OK
+LOOKS-FINE
+'@
+    $cstart = Send-Rpc -Method 'tools/call' -Params @{
+        name      = 'cross_model_consult'
+        arguments = @{ question = $consultQuestion; session = 'smoke-consult' }
+    } -TimeoutSeconds 60
+    $cstartText = Get-ToolText $cstart
+    Assert-That 'consult start is not an error' ($cstart.result.isError -eq $false) $cstartText
+    Assert-That 'consult announces itself as a consult' ($cstartText -match 'Consult started') $cstartText
+    $consultId = ([regex]::Match($cstartText, 'review_id:\s*(\S+)')).Groups[1].Value
+    Assert-That 'a consult review_id was returned' (-not [string]::IsNullOrWhiteSpace($consultId)) $cstartText
+    Write-Host "  consult review_id: $consultId"
+
+    # Cross-kind guard: a consult id must be refused by the review result tool, before any wait, and
+    # the refusal must name the right tool. This costs no model call (it rejects on the kind check).
+    $wrongTool = Send-Rpc -Method 'tools/call' -Params @{
+        name = 'cross_model_review_result'; arguments = @{ review_id = $consultId; wait_seconds = 0 }
+    } -TimeoutSeconds 30
+    $wrongToolText = Get-ToolText $wrongTool
+    Assert-That 'a consult id is refused by the review result tool, naming the right one' `
+        (($wrongTool.result.isError -eq $true) -and ($wrongToolText -match 'cross_model_consult_result')) $wrongToolText
+
+    Write-Host '  waiting for the consult...' -ForegroundColor DarkGray
+    $cCollected = $null
+    $consultProgressBefore = $script:progressMessages.Count
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        $cCollected = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_consult_result'
+            arguments = @{ review_id = $consultId; wait_seconds = 120 }
+            _meta     = @{ progressToken = "smoke-consult-$attempt" }
+        } -TimeoutSeconds 300
+        $text = Get-ToolText $cCollected
+        if ($text -notmatch 'status:\s+running') { break }
+        Write-Host "  still running (poll $attempt)" -ForegroundColor DarkGray
+    }
+    $cResult = Get-ToolText $cCollected
+    Assert-That 'consult completed without error' ($cCollected.result.isError -eq $false) $cResult
+    Assert-That 'consult reports completed status' ($cResult -match 'status:\s+completed') $cResult
+    Assert-That 'the consult actually answered' ($cResult -match 'CONSULT-OK') $cResult
+    Assert-That 'the consult body is delimited as an answer, not a review' ($cResult -match 'BEGIN ANSWER') $cResult
+    # A consult certifies nothing: it renders no findings envelope or verdict block.
+    Assert-That 'a consult carries no review-verdict block' ($cResult -notmatch 'BEGIN REVIEW') $cResult
+
+    # Issue #73 parity for the consult envelope: a structured-only client gets the answer and facts.
+    $csc = $cCollected.result.structuredContent
+    Assert-That 'the consult carries structuredContent' ($null -ne $csc) $cResult
+    Assert-That 'the structured consult is marked kind=consult' ($csc.kind -eq 'consult') "kind=$($csc.kind)"
+    Assert-That 'the consult answer is on the structured channel' ($csc.answer -match 'CONSULT-OK') $csc.answer
+    Assert-That 'the consult carries the denial-count floor field' `
+        ($csc.PSObject.Properties.Name -contains 'denial_count_is_floor') ($csc.PSObject.Properties.Name -join ',')
+    # No findings/convergence machinery on a consult.
+    Assert-That 'the consult reports no verdict/outcome/findings' `
+        (-not (($csc.PSObject.Properties.Name -contains 'outcome') -or
+               ($csc.PSObject.Properties.Name -contains 'findings') -or
+               ($csc.PSObject.Properties.Name -contains 'converged'))) ($csc.PSObject.Properties.Name -join ',')
+    Assert-That 'the consult wait emitted MCP progress notifications' `
+        ($script:progressMessages.Count -gt $consultProgressBefore)
+    Write-Host $cResult
 
     Write-Host "`n=== 6. error handling ===" -ForegroundColor Cyan
     $bad = Send-Rpc -Method 'tools/call' -Params @{
@@ -519,6 +591,11 @@ COUNTER=2
         $saved = Get-Content $sessionsFile -Raw | ConvertFrom-Json
         Assert-That 'smoke session recorded two turns' ($saved.sessions.smoke.turns -eq 2) `
             (Get-Content $sessionsFile -Raw)
+        # The review session is stamped 'review' (or a legacy null read as review); the consult
+        # session is stamped 'consult', which is what keeps a cross-kind resume from crossing them.
+        $consultSession = $saved.sessions.'smoke-consult'
+        Assert-That 'the consult session was recorded with kind=consult' `
+            ($null -ne $consultSession -and $consultSession.kind -eq 'consult') (Get-Content $sessionsFile -Raw)
     }
 }
 finally {
