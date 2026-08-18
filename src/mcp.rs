@@ -965,7 +965,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                     }
                 },
                 "additionalProperties": false
-            }
+            },
+            // The consult envelope this tool returns as `structuredContent`: a running/completed shape
+            // with a prose `answer` and the run facts, but no verdict or findings. Advertised so a
+            // client can validate the structured channel, as the review result does (consult f6).
+            "outputSchema": crate::tools::consult_output_schema()
         }),
         json!({
             "name": "cross_model_review_result",

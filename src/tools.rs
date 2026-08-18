@@ -804,6 +804,25 @@ impl App {
             })?
         };
 
+        // A consult is tree-only in this version: it reads the repository through the evidence service
+        // and captures no diff, so it takes none of the change/capture arguments. Reject them
+        // server-side, not only via the schema's additionalProperties:false — the server does not
+        // validate arguments against the schema, so a non-compliant client could otherwise pass
+        // include_change and have it silently ignored while the consult ran tree-only. `include_change`
+        // is the deferred capture contract (plan f2); `change`/`include_shelved` are the Perforce
+        // capture inputs. (consult review f3)
+        if is_consult {
+            for key in ["include_change", "change", "include_shelved"] {
+                if args.get(key).is_some_and(|v| !v.is_null()) {
+                    return Err(errors::bad_request(format!(
+                        "'{key}' is not supported by cross_model_consult: a consult is tree-only in \
+                         this version and reads the repository through the read-only evidence \
+                         service rather than a captured diff. Omit it."
+                    )));
+                }
+            }
+        }
+
         let session = string_arg(args, "session").unwrap_or_else(|| DEFAULT_SESSION.to_string());
         // A session name is rendered into the human response and keys on-disk marker files, so it
         // must be a single line of printable text. Rejecting control characters (newlines above all)
@@ -3587,13 +3606,19 @@ impl Job {
         // resumable. A genuinely-new session has nothing to strand, but aborting there too is
         // harmless (just retry), so the rule is simply "mark, or abort".
         if self.sessions.mark_findings_pending(&self.session).is_err() {
-            return Err(errors::session_not_resumable(
-                &self.session,
+            // The write-ahead marker guards durability for both kinds; the wording differs because a
+            // consult has no ledger to go stale (consult review f5).
+            let reason = if self.is_consult() {
+                "the write-ahead marker could not be written, so a crash could not be detected; the \
+                 turn was not started. Retry, or start a fresh consult."
+                    .to_string()
+            } else {
                 "the findings write-ahead marker could not be written, so a crash could not be \
                  detected and the ledger could go stale; the turn was not started. Retry, or start \
                  a fresh review."
-                    .to_string(),
-            ));
+                    .to_string()
+            };
+            return Err(errors::session_not_resumable(&self.session, reason));
         }
 
         let prior_findings_digest: Option<String> = prior_state
@@ -4167,15 +4192,25 @@ impl Job {
                             // resume against the stale baseline. The old destructive poisoning (drop
                             // the mapping) predated the write-ahead markers and would now erase the
                             // preserved findings for no added safety.
-                            warnings.push(format!(
-                            "This turn could not be saved to disk ({e}), so session '{}' cannot be \
-                             resumed: the next call is refused a resume because the write-ahead \
-                             marker is still set. Any prior findings are preserved on disk -- \
-                             recover by starting a fresh review (fresh: true) carrying the \
-                             still-open findings into the new instructions. The review below is \
-                             unaffected.",
-                            self.session
-                        ));
+                            warnings.push(if self.is_consult() {
+                                format!(
+                                    "This turn could not be saved to disk ({e}), so session '{}' \
+                                     cannot be resumed: the next call is refused a resume because \
+                                     the write-ahead marker is still set. Start a fresh consult \
+                                     (fresh: true). The answer below is unaffected.",
+                                    self.session
+                                )
+                            } else {
+                                format!(
+                                    "This turn could not be saved to disk ({e}), so session '{}' \
+                                     cannot be resumed: the next call is refused a resume because \
+                                     the write-ahead marker is still set. Any prior findings are \
+                                     preserved on disk -- recover by starting a fresh review \
+                                     (fresh: true) carrying the still-open findings into the new \
+                                     instructions. The review below is unaffected.",
+                                    self.session
+                                )
+                            });
                             eprintln!("cross-review: warning: could not save session state: {e}");
                             false
                         }
@@ -4188,14 +4223,25 @@ impl Job {
                     // findings write-ahead marker was set before the reviewer ran and is never cleared
                     // without a durable record, so the next non-fresh call is refused at the findings
                     // gate for every backend. No destructive poisoning of the mapping is needed.
-                    warnings.push(format!(
-                    "The reviewer did not report a session id, so this turn could not be recorded \
-                     and session '{}' cannot be resumed: the next call is refused a resume because \
-                     the write-ahead marker is still set. Any prior findings are preserved on disk \
-                     -- start a fresh review (fresh: true) carrying the still-open findings into \
-                     the new instructions. The review below is still valid.",
-                    self.session
-                ));
+                    warnings.push(if self.is_consult() {
+                        format!(
+                            "The reviewer did not report a session id, so this turn could not be \
+                             recorded and session '{}' cannot be resumed: the next call is refused \
+                             a resume because the write-ahead marker is still set. Start a fresh \
+                             consult (fresh: true). The answer below is still valid.",
+                            self.session
+                        )
+                    } else {
+                        format!(
+                            "The reviewer did not report a session id, so this turn could not be \
+                             recorded and session '{}' cannot be resumed: the next call is refused \
+                             a resume because the write-ahead marker is still set. Any prior \
+                             findings are preserved on disk -- start a fresh review (fresh: true) \
+                             carrying the still-open findings into the new instructions. The review \
+                             below is still valid.",
+                            self.session
+                        )
+                    });
                     eprintln!(
                     "cross-review: warning: the reviewer did not report a session id, so review \
                      session '{}' cannot be resumed",
@@ -4311,6 +4357,35 @@ fn job_noun(kind: crate::registry::JobKind) -> &'static str {
         crate::registry::JobKind::Review => "review",
         crate::registry::JobKind::Consult => "consult",
     }
+}
+
+/// The advertised `outputSchema` for `cross_model_consult_result`: the running/completed shapes that
+/// [`App::render_running`] (consult path) and [`App::render_completed_consult`] emit. Advertised so a
+/// client can discover and validate the structured channel, as the review result already does
+/// (consult review f6). It carries no verdict, findings or convergence — a consult certifies nothing.
+/// The five common fields are required; the completed-only fields are optional, so both shapes
+/// validate against this one object without over-constraining the running variant.
+pub(crate) fn consult_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["status", "kind", "review_id", "session", "turn"],
+        "properties": {
+            "status": {"type": "string", "enum": ["running", "completed"]},
+            "kind": {"type": "string", "const": "consult"},
+            "review_id": {"type": "string"},
+            "session": {"type": "string"},
+            "turn": {"type": "integer"},
+            "resumed": {"type": "boolean"},
+            "resumable": {"type": "boolean"},
+            "reviewer": {"type": "string"},
+            "answer": {"type": "string"},
+            "denials": {"type": "array", "items": {"type": "string"}},
+            "denial_count": {"type": "integer"},
+            "denial_count_is_floor": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "usage": {"type": ["string", "null"]}
+        }
+    })
 }
 
 /// The error for collecting a job through the wrong result tool: a review id handed to
@@ -5599,6 +5674,34 @@ mod tests {
         let claude_only =
             Config::from_args(&["--reviewer".into(), "claude".into()]).expect("config");
         assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
+    }
+
+    #[test]
+    fn a_consult_rejects_capture_arguments_server_side() {
+        // The schema forbids these for a compliant client, but the server does not validate against
+        // the schema, so a raw call must be rejected here too rather than silently running tree-only
+        // (consult review f3). The rejection fires before the session lease, so no state dir is needed.
+        let app = App::new(Config::from_args(&["--reviewer".into(), "codex".into()]).expect("cfg"));
+        for (key, val) in [
+            ("include_change", json!(true)),
+            ("change", json!("43650")),
+            ("include_shelved", json!(true)),
+        ] {
+            let err = app
+                .start_consult(
+                    &json!({"question": "does this look right?", key: val}),
+                    &RequestCancel::new(),
+                )
+                .unwrap_err();
+            assert_eq!(err.code, "BAD_REQUEST", "{key}");
+            assert!(err.summary.contains(key), "{}: {}", key, err.summary);
+            assert!(
+                err.summary.contains("tree-only"),
+                "{}: {}",
+                key,
+                err.summary
+            );
+        }
     }
 
     #[test]
