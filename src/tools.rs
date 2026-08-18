@@ -4364,11 +4364,16 @@ fn job_noun(kind: crate::registry::JobKind) -> &'static str {
 /// client can discover and validate the structured channel, as the review result already does
 /// (consult review f6). It carries no verdict, findings or convergence — a consult certifies nothing.
 /// The five common fields are required; the completed-only fields are optional, so both shapes
-/// validate against this one object without over-constraining the running variant.
+/// validate against this one object without over-constraining the running variant. It is **strict**
+/// (`additionalProperties: false`): a consult certifies nothing, so review-only fields like `findings`
+/// or `outcome` are not merely absent but *forbidden*, which is what makes the advertised schema a
+/// faithful contract rather than a permissive superset (consult review f7). Every field a consult
+/// actually emits is listed here, so the strictness never rejects a real structured value.
 pub(crate) fn consult_output_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "required": ["status", "kind", "review_id", "session", "turn"],
+        "additionalProperties": false,
         "properties": {
             "status": {"type": "string", "enum": ["running", "completed"]},
             "kind": {"type": "string", "const": "consult"},
@@ -5700,6 +5705,44 @@ mod tests {
                 "{}: {}",
                 key,
                 err.summary
+            );
+        }
+    }
+
+    #[test]
+    fn the_consult_output_schema_is_strict_and_forbids_review_fields() {
+        // A consult certifies nothing, so its advertised schema must not merely omit review-only
+        // fields but forbid them (consult review f7).
+        let schema = consult_output_schema();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let props = schema["properties"].as_object().expect("properties object");
+        for forbidden in ["findings", "outcome", "converged", "verdict", "envelope"] {
+            assert!(
+                !props.contains_key(forbidden),
+                "consult schema must not permit review-only field '{forbidden}'"
+            );
+        }
+        // Every field a consult actually emits must be listed, or the strictness would reject a real
+        // structured value. These mirror render_completed_consult and the running consult value.
+        for emitted in [
+            "status",
+            "kind",
+            "review_id",
+            "session",
+            "turn",
+            "resumed",
+            "resumable",
+            "reviewer",
+            "answer",
+            "denials",
+            "denial_count",
+            "denial_count_is_floor",
+            "warnings",
+            "usage",
+        ] {
+            assert!(
+                props.contains_key(emitted),
+                "consult schema is missing emitted field '{emitted}'"
             );
         }
     }
