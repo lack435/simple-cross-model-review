@@ -208,6 +208,16 @@ shell), isolated git config, `current_dir(root)` (`src/evidence/git.rs:178-252`)
     override the author's ref state — deliberately *not* done, because per the principle above the
     base is the author's to set. The resolved base object id and its source are always recorded in the
     serve-record, so the scope is visible even where it cannot be auto-verified.
+  - **Implementation note (superseding the `@{upstream}` design above).** The implementation's own
+    cross-review (session `impl-retire-capture-modes`, f1/f10) showed `@{upstream}` is *wrong* as the
+    base — under the common push-to-same-name workflow it is the branch's own remote ref, so
+    `merge-base(HEAD, @{upstream})` can equal `HEAD` and omit all committed work while the gate still
+    accepts an approval. So `branch-base` resolves the **default branch** instead —
+    `refs/remotes/origin/HEAD`, then `refs/remotes/origin/main`, then `refs/remotes/origin/master`,
+    *fully qualified* so a local branch named `origin/main` cannot shadow it — and fails closed if
+    none resolves. Because all candidates are remote-tracking, a stale *local* branch can never be the
+    base **by construction**, which makes the separate no-fetch staleness check above unnecessary; it
+    was not implemented. The never-fetched residual stands as described.
 - **The op emits a structured serve-record (f3), because the server computes the diff to serve it.**
   Each `repository_diff` call records what it actually served: the resolved scope (which sentinel /
   which endpoints), the resolved base object id and its source, file/insertion/deletion counts, the
