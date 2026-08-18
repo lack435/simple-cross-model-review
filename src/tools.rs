@@ -880,8 +880,8 @@ impl App {
             if present("change") || present("include_shelved") {
                 return Err(errors::bad_request(
                     "'change' and 'include_shelved' name Perforce inputs, but this working root \
-                     is git. Omit them -- the git diff to review is configured on the server \
-                     (see --diff).",
+                     is git. Omit them -- a git review derives the change live through the \
+                     read-only evidence service's repository_diff, not from named inputs.",
                 ));
             }
         }

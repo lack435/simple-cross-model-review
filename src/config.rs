@@ -1650,10 +1650,10 @@ impl Config {
             // `--permission-mode dontAsk`, so a rule that does not mention Bash denies it
             // outright rather than prompting. `--tools ...,Bash` on its own therefore gives
             // the reviewer a tool it can never use -- and answering "yes, it has a shell"
-            // there makes `--diff auto` withhold the capture too, leaving it with neither.
+            // there would point the prompt at a shell that can run nothing.
             //
             // So the answer is conservative in the direction that costs nothing: unless a
-            // shell is established, the diff gets supplied.
+            // shell is established, the reviewer is treated as shell-less.
             //
             // Entries are compared whole, not as substrings: `BashOutput` is a separate
             // tool that reads a background shell's output and can run nothing.
@@ -1673,9 +1673,9 @@ impl Config {
     /// Whether this configuration intends to hand the reviewer a change.
     ///
     /// Intent only: whether one actually arrives depends on the working root really being a
-    /// repository of that kind, which is a runtime question. For git, `auto` supplies a diff
-    /// exactly when the reviewer cannot fetch one itself, so a shelled reviewer is left to do
-    /// its own looking rather than handed a stale snapshot alongside live access. For
+    /// repository of that kind, which is a runtime question. Git never pre-captures now
+    /// (retire-capture-modes): the change is derived live through the evidence service's
+    /// `repository_diff`, so a git configuration never intends to hand over a captured change. For
     /// Perforce the changelists are named per call and always captured, so the intent is
     /// always to supply -- whether a change actually arrives depends on the capture, which is
     /// the runtime question this caller-facing intent does not promise.
@@ -1685,8 +1685,9 @@ impl Config {
 
     /// `supplies_change`, evaluated for a specific chain entry rather than the primary.
     ///
-    /// Under `--diff auto` the answer is per-reviewer (a shell-less entry needs the diff, a
-    /// shelled one does not), which is why `chain_needs_capture` folds it across every entry.
+    /// The answer no longer varies by reviewer — git supplies no captured change to any entry and
+    /// Perforce supplies one to every entry — but the per-entry form is kept because
+    /// `chain_needs_capture` folds it across every entry.
     pub fn supplies_change_of(&self, reviewer: ReviewerKind) -> bool {
         // Each backend states its answer here rather than opting itself in by falling through a
         // wildcard.
@@ -1705,10 +1706,9 @@ impl Config {
     /// Whether the capture must be gathered at all, folded across the whole chain.
     ///
     /// The change is captured whenever *any* entry the walk might reach would need it — not
-    /// merely the primary — because a `Codex → Claude` chain must have the diff ready for the
-    /// shell-less Claude fallback even though the Codex primary would fetch its own. A shelled
-    /// entry handed the captured change is the harmless `--diff HEAD` case. See
-    /// `docs/reviewer-fallback-chain.md`.
+    /// merely the primary. Since retire-capture-modes only Perforce captures, so for a git root
+    /// this is always false regardless of the chain; the fold is retained for Perforce and for any
+    /// future backend that captures per-reviewer. See `docs/reviewer-fallback-chain.md`.
     pub fn chain_needs_capture(&self) -> bool {
         self.reviewers
             .iter()
@@ -1755,9 +1755,10 @@ impl Config {
     /// What the *caller* is told the capture will contain, per backend.
     ///
     /// The tool description needs the shape of the capture so the calling agent knows what to
-    /// put in `instructions`. Git derives it from the `--diff` mode; Perforce from the
-    /// changelist list. Kept here, next to `supplies_change`, so a backend cannot advertise a
-    /// capture it does not perform.
+    /// put in `instructions`. Git no longer captures — the reviewer derives the change live
+    /// through `repository_diff` — so its summary describes that live path; Perforce derives it
+    /// from the changelist list. Kept here, next to `supplies_change`, so a backend cannot
+    /// advertise a capture it does not perform.
     pub fn capture_caller_summary(&self) -> (String, String) {
         match self.vcs {
             // Git no longer pre-captures: the reviewer derives the change live through
@@ -3643,9 +3644,8 @@ mod tests {
     }
 
     /// A Claude shell needs the tool *and* a permission rule, and getting this wrong is
-    /// expensive in one specific direction: `--diff auto` withholds the capture from a
-    /// reviewer believed to have a shell, so a Bash that `dontAsk` denies would leave it
-    /// with no shell and no diff at all.
+    /// expensive in one specific direction: the prompt would point a reviewer believed to have
+    /// a shell at a Bash that `dontAsk` denies, leaving it told to use a shell it cannot run.
     #[test]
     fn a_claude_shell_needs_both_the_tool_and_a_rule_permitting_it() {
         // In the session, but nothing permits it: the default rules are Read/Grep/Glob, and

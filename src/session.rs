@@ -356,11 +356,14 @@ pub struct TurnFacts<'a> {
     pub capture_identity: Option<CaptureIdentity>,
     pub perforce_baseline: Option<PerforceBaseline>,
     /// The consult capture contract this turn ran under: whether the consult includes the change
-    /// (`include_change`), and the *configured* git `DiffMode` as its canonical string. Both `None`
-    /// for a review turn (the contract is consult-only) and a Perforce consult carries `diff_mode`
-    /// `None` (bound by its changelist set instead). Invariants for the session's life, so they
-    /// persist-then-inherit like `changes`. See `docs/cross-model-consult-include-change-impl.md`.
+    /// (`include_change`). `None` for a review turn (the contract is consult-only). An invariant for
+    /// the session's life, so it persists-then-inherits like `changes`. See
+    /// `docs/cross-model-consult-include-change-impl.md`.
     pub include_change: Option<bool>,
+    /// **Legacy migration marker only** (retire-capture-modes / f5), mirroring
+    /// [`SessionRecord::diff_mode`]. Git no longer has a capture mode, so a *current* turn always
+    /// writes `None`; it is retained solely so an *old* record carrying `Some(diff_mode)` is refused
+    /// on resume. `None` for every current turn (review or consult) and for Perforce.
     pub diff_mode: Option<String>,
     /// The active reviewer entry's binary as configured, and the path it resolved to, so a resume
     /// can match this entry and detect PATH drift.
