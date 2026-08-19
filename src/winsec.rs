@@ -747,7 +747,8 @@ fn finish_open(raw: Handle) -> io::Result<OwnedHandle> {
     if raw as isize == INVALID_HANDLE_VALUE || raw.is_null() {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: a valid, owned handle from CreateFileW; OwnedHandle closes it exactly once on drop.
+    // SAFETY: a valid, owned handle from either `CreateFileW` (open_no_follow) or `NtCreateFile`
+    // (nt_open); OwnedHandle closes it exactly once on drop.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut _) };
     if handle_attributes(&handle)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::other(
