@@ -44,8 +44,10 @@ descriptor FFI in `winjob`'s style (no new crate; declares `advapi32`/`ntdll` di
 restrictive, inheritance-protected DACL (current user + SYSTEM + Administrators, deduped by SID for the
 LocalSystem case) and **applies + verifies it through a handle** (`SetSecurityInfo`/`GetSecurityInfo`);
 `create_secured_dir`, `write_secured_file`, `read_secured_file`, plus a **handle-relative
-`open_child_relative` (`NtCreateFile`, `RootDirectory` + `OBJ_DONT_REPARSE`)** so a store/credential
-file is proven a direct child of its verified parent — no by-path reopen TOCTOU (`[f15]`/`[f20]`/`[f22]`).
+`open_child_relative` (`NtCreateFile`, `RootDirectory`, leaf opened as a reparse point and refused if
+it is one)** so a store/credential file is proven a direct child of its verified parent — no by-path
+reopen TOCTOU (`[f15]`/`[f20]`/`[f22]`). (The leaf uses the `FILE_OPEN_REPARSE_POINT` create option
+rather than the `OBJ_DONT_REPARSE` object attribute, which failed under filesystem overlays — issue #117.)
 Since #12, `src/winsec.rs` also provides `create_secured_child_dir` (handle-relative secured subdir),
 `reject_reparse_on_ancestors`, a `FILE_ATTRIBUTE_DIRECTORY` check on `open_dir_no_follow` (so a DACL is
 never applied to a file), and a component-length guard in `nt_open`; `profile::secure_profile_dir`

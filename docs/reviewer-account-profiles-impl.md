@@ -375,8 +375,9 @@ by handle-relative open, not by file identity** — [f3] `BY_HANDLE_FILE_INFORMA
 identify the credential file but do *not* encode its parent, so they cannot show it sits inside the
 held directory (ancestor/intermediate reparse or replacement stays unproven). Instead open the
 credential file **relative to the held directory handle** (`NtCreateFile` with `RootDirectory` set to
-that handle, a leaf name with no separators, `OBJ_DONT_REPARSE` / no-follow) so containment is
-*structural* — the open can only resolve a direct child of the object we hold — then re-read its DACL;
+that handle, a leaf name with no separators, the leaf opened as a reparse point and refused if it is
+one) so containment is *structural* — the open can only resolve a direct child of the object we hold —
+then re-read its DACL;
 (c) **fail closed** (discard the login, do not commit the allowlist) on any failure or DACL mismatch.
 The held handle prevents replacement of the verified directory; the handle-relative open proves the
 credential file is genuinely inside it.
