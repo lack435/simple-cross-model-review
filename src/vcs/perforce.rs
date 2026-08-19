@@ -30,7 +30,7 @@
 //! nothing here constructs a filespec from a literal name, and there is nothing to escape:
 //! the only external input is the changelist *numbers*, validated numeric at parse time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -1210,22 +1210,34 @@ impl<'a> P4<'a> {
                                 .to_string(),
                         );
                     }
-                    for section in parse_describe_diff(&out.stdout) {
-                        if section.body.trim().is_empty() {
+                    // `p4 diff -du` prints no `==== //depot#rev - local ====` banner (unlike
+                    // `p4 describe -du`), so the describe parser found zero sections and the
+                    // whole workspace delta was silently dropped (issue #119). Split on the
+                    // unified `--- <depot>` / `+++ <local>` header pairs instead, anchored on the
+                    // depot paths we asked to diff, and take each file's comparator (the
+                    // have-revision the diff was taken against) from `p4 opened`.
+                    let known: BTreeSet<String> = edit_targets.iter().cloned().collect();
+                    let rev_by_depot: BTreeMap<&str, Option<String>> = opened
+                        .iter()
+                        .map(|f| (f.depot.as_str(), f.have_rev.clone()))
+                        .collect();
+                    for (depot, body) in parse_opened_diff(&out.stdout, &known) {
+                        if body.trim().is_empty() {
                             continue;
                         }
-                        let (hunk, cut) = budget.take_diff(section.body.clone());
+                        let (hunk, cut) = budget.take_diff(body);
                         if cut {
                             diff_truncated = true;
                             complete = false;
                         }
+                        let rev = rev_by_depot.get(depot.as_str()).cloned().flatten();
                         let local = local_by_depot
-                            .get(&section.depot)
+                            .get(&depot)
                             .cloned()
-                            .unwrap_or_else(|| section.depot.clone());
+                            .unwrap_or_else(|| depot.clone());
                         units.push(Unit::text_diff(
-                            section.depot,
-                            section.rev,
+                            depot,
+                            rev,
                             local,
                             hunk,
                             !cut && !output_cut,
@@ -2080,6 +2092,12 @@ struct OpenedFile {
     depot: String,
     action: String,
     ptype: String,
+    /// The have-revision reported by `p4 opened`. For a pending edit this is the revision the
+    /// workspace `p4 diff` is taken against, i.e. the unit's comparator -- `p4 diff -du` output
+    /// does not carry it, so it comes from here. `None` when the field was absent or malformed,
+    /// which makes the resulting diff unit non-elidable rather than eliding against an unknown
+    /// basis.
+    have_rev: Option<String>,
 }
 
 struct DescribeMeta {
@@ -2201,10 +2219,18 @@ fn parse_opened_ztag(raw: &str) -> (Vec<OpenedFile>, bool) {
             let depot = rec.get("depotFile")?.clone();
             let action = rec.get("action").cloned().unwrap_or_default();
             let ptype = rec.get("type").cloned().unwrap_or_default();
+            // Only an all-digits haveRev is a usable comparator; anything else (empty, `none`,
+            // a client with the file not yet synced) is dropped to `None` so the unit is shown
+            // but never elided against a basis we cannot trust.
+            let have_rev = rec
+                .get("haveRev")
+                .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                .cloned();
             Some(OpenedFile {
                 depot,
                 action,
                 ptype,
+                have_rev,
             })
         })
         .collect();
@@ -2339,6 +2365,56 @@ fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
         });
     }
     sections
+}
+
+/// Split `p4 diff -du` output into per-file `(depot, body)` sections.
+///
+/// The client-side `p4 diff -du` emits no `==== //depot#rev - local ====` banner (issue #119) --
+/// each file is introduced only by the unified `--- <depot>\t<time>` / `+++ <local>\t<time>`
+/// header pair. A file boundary is a `--- ` line whose path is one of the depot paths we asked to
+/// diff (`known`), immediately followed by its `+++ ` line: anchoring on the known depot set keeps
+/// a removed content line that happens to start with `--- ` from being read as a header. The
+/// `--- `/`+++ ` pair itself is dropped from the body so it holds only the `@@` hunks -- the same
+/// shape as the `describe -du` bodies the submitted and shelved paths produce, and never carrying
+/// the absolute local path from the `+++ ` line. The comparator (the have-revision the diff was
+/// taken against) is not in this output; the caller supplies it from `p4 opened`.
+fn parse_opened_diff(raw: &str, known: &BTreeSet<String>) -> Vec<(String, String)> {
+    let text = normalize(raw);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(depot) = opened_diff_header(lines[i], lines.get(i + 1).copied(), known) {
+            if let Some(sec) = current.take() {
+                sections.push(sec);
+            }
+            current = Some((depot, String::new()));
+            i += 2; // skip the `--- ` line and its paired `+++ ` line
+            continue;
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push_str(lines[i]);
+            body.push('\n');
+        }
+        i += 1;
+    }
+    if let Some(sec) = current.take() {
+        sections.push(sec);
+    }
+    sections
+}
+
+/// The depot path a `--- ` line introduces when it is a genuine unified-diff file header: its path
+/// (up to the tab before the timestamp) is a known opened depot, and the next line is the paired
+/// `+++ ` header. Depot paths never contain a tab, so the tab split is exact.
+fn opened_diff_header(line: &str, next: Option<&str>, known: &BTreeSet<String>) -> Option<String> {
+    let rest = line.strip_prefix("--- ")?;
+    if !next?.starts_with("+++ ") {
+        return None;
+    }
+    let depot = rest.split('\t').next().unwrap_or(rest);
+    known.contains(depot).then(|| depot.to_string())
 }
 
 /// The depot path and its `#rev`/`@rev` in a `==== ... ====` describe header, tail-stripped.
@@ -2656,14 +2732,18 @@ mod tests {
     #[test]
     fn opened_records_are_parsed_with_action_and_type() {
         let raw = "\
-... depotFile //depot/a.txt\n... clientFile //cl/a.txt\n... action edit\n... type text\n\n\
-... depotFile //depot/bin.uasset\n... clientFile //cl/bin.uasset\n... action add\n... type binary+l\n";
+... depotFile //depot/a.txt\n... clientFile //cl/a.txt\n... action edit\n... type text\n... haveRev 7\n\n\
+... depotFile //depot/bin.uasset\n... clientFile //cl/bin.uasset\n... action add\n... type binary+l\n... haveRev none\n";
         let (opened, dropped) = parse_opened_ztag(raw);
         assert!(!dropped, "well-formed records are not dropped");
         assert_eq!(opened.len(), 2);
         assert_eq!(opened[0].depot, "//depot/a.txt");
         assert_eq!(opened[0].action, "edit");
+        // A numeric haveRev is captured as the comparator; a non-numeric one (`none`, or an
+        // absent field on an add) is dropped to None so the unit is never elided blind.
+        assert_eq!(opened[0].have_rev.as_deref(), Some("7"));
         assert_eq!(opened[1].ptype, "binary+l");
+        assert_eq!(opened[1].have_rev, None);
 
         // A record missing its depotFile is dropped, and the drop is reported so the caller can
         // treat the (now short) file list as untrustworthy.
@@ -2749,6 +2829,53 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn opened_diff_splits_on_unified_headers_anchored_on_known_depots() {
+        // `p4 -x - diff -du` concatenates per-file unified output with no `==== ====` banner
+        // (issue #119): each file starts at `--- <depot>\t<time>` / `+++ <local>\t<time>`.
+        let raw = "\
+--- //depot/a.py\t2026-08-18 23:37:18.000000000 0000\n\
++++ C:\\ws\\a.py\t2026-08-18 23:37:18.000000000 0000\n\
+@@ -1 +1 @@\n-- old\n++ new\n\
+--- //depot/b.md\t2026-08-18 23:37:18.000000000 0000\n\
++++ C:\\ws\\b.md\t2026-08-18 23:37:18.000000000 0000\n\
+@@ -1 +1 @@\n-x\n+y\n";
+        let known: BTreeSet<String> =
+            ["//depot/a.py".to_string(), "//depot/b.md".to_string()].into();
+        let sections = parse_opened_diff(raw, &known);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "//depot/a.py");
+        assert_eq!(sections[1].0, "//depot/b.md");
+        // The `--- `/`+++ ` header pair is stripped: the body is the `@@` hunks only, so the
+        // absolute local path from the `+++ ` line never reaches the reviewer. The `-- old`/
+        // `++ new` content lines -- whose prefixes could be mistaken for headers -- are kept
+        // because they are inside a hunk and their paths are not in `known`.
+        assert!(sections[0].1.starts_with("@@ -1 +1 @@"));
+        assert!(sections[0].1.contains("-- old"));
+        assert!(sections[0].1.contains("++ new"));
+        assert!(!sections[0].1.contains("C:\\ws"));
+        assert!(sections[1].1.contains("+y"));
+    }
+
+    #[test]
+    fn opened_diff_header_ignores_unknown_paths_and_unpaired_lines() {
+        let known: BTreeSet<String> = ["//depot/a".to_string()].into();
+        // A `--- ` line whose path is not a known opened depot is a content line, not a header.
+        assert_eq!(
+            opened_diff_header("--- //depot/other\ttime", Some("+++ x"), &known),
+            None
+        );
+        // A `--- ` line not immediately followed by a `+++ ` line is not a header.
+        assert_eq!(
+            opened_diff_header("--- //depot/a\ttime", Some("@@ -1 +1 @@"), &known),
+            None
+        );
+        assert_eq!(
+            opened_diff_header("--- //depot/a\ttime", Some("+++ //ws/a\ttime"), &known).as_deref(),
+            Some("//depot/a")
+        );
+    }
+
+    #[test]
     fn diff_header_and_strip_rev_handle_revisions_and_encoded_names() {
         assert_eq!(
             parse_diff_header("==== //depot/a.rs#5 (text) ====").unwrap(),
@@ -2811,6 +2938,7 @@ Change 5 by u@c on 2026/01/01\n\n\
                 depot: "//d/a".into(),
                 action: "edit".into(),
                 ptype: ptype.into(),
+                have_rev: None,
             }]
         };
         assert!(is_diffable_text("//d/a", &opened("text")));
