@@ -2446,10 +2446,15 @@ fn strip_unified_file_header(raw: &str) -> HeaderStrip {
         return HeaderStrip::Malformed;
     }
     let body: String = lines.map(|line| format!("{line}\n")).collect();
-    if body.trim().is_empty() {
-        return HeaderStrip::Empty;
+    match body.lines().find(|l| !l.trim().is_empty()) {
+        // No hunks after the header pair: an opened file identical to its have-revision.
+        None => HeaderStrip::Empty,
+        // The body must begin with a unified hunk marker. Anything else after a `--- `/`+++ ` pair
+        // -- a diagnostic line, or otherwise non-hunk text -- is not a diff and must fail closed
+        // (issue #119 review, finding f3): shown to no one, and never an elision baseline.
+        Some(l) if l.starts_with("@@ ") => HeaderStrip::Body(body),
+        Some(_) => HeaderStrip::Malformed,
     }
-    HeaderStrip::Body(body)
 }
 
 /// The depot path and its `#rev`/`@rev` in a `==== ... ====` describe header, tail-stripped.
@@ -2901,6 +2906,15 @@ Change 5 by u@c on 2026/01/01\n\n\
         // Output that is not a unified diff is malformed, not silently treated as a body.
         assert!(matches!(
             strip_unified_file_header("//depot/a - file(s) not opened on this client.\n"),
+            HeaderStrip::Malformed
+        ));
+        // A valid `--- `/`+++ ` header pair followed by non-hunk text (no `@@` marker) is
+        // malformed too, not a complete body (finding f3): it must never become an elision
+        // baseline.
+        assert!(matches!(
+            strip_unified_file_header(
+                "--- //depot/a\ttime\n+++ //ws/a\ttime\nnot a unified hunk\n"
+            ),
             HeaderStrip::Malformed
         ));
     }
