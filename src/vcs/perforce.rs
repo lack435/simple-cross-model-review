@@ -58,6 +58,13 @@ const MAX_DESC_BYTES: usize = 8_000;
 const MAX_INVENTORY_ENTRIES: usize = 5_000;
 const MAX_INVENTORY_BYTES: usize = 4_000_000;
 
+/// Cap on how many opened edits a pending changelist will diff one-at-a-time. Each edit costs a
+/// `p4 diff` invocation (the per-file diff is what makes attribution exact -- see `pending_segment`),
+/// so an unbounded count is a spawn-storm risk on a pathologically large changelist. Past the cap
+/// the segment is marked incomplete and says so, rather than diffing forever. Generous enough that
+/// ordinary changelists are unaffected.
+const MAX_EDIT_DIFFS: usize = 1_000;
+
 /// The prior turn's persisted state, handed to a resumed Perforce capture so it can collapse
 /// files byte-identical to what the reviewer already saw. Assembled by `tools.rs` from the
 /// session record; `None` on a fresh review.
@@ -1177,75 +1184,127 @@ impl<'a> P4<'a> {
         // would broaden `p4 diff` to every open file in the client. The unified output is split
         // per file so each becomes its own elidable unit; the header carries the revision the
         // workspace was diffed against, which is the unit's comparator.
-        if !edit_targets.is_empty() {
-            let stdin = edit_targets.join("\n") + "\n";
-            match self.run(&["-x", "-", "diff", "-du"], &stdin) {
-                Some(out) if out.success => {
-                    // A cut here truncates the final section, so every unit built from this
-                    // output is marked incomplete (non-elidable) rather than trusting a prefix.
-                    let output_cut =
-                        out.stdout_truncated || out.stdout_lossy || out.stdout_incomplete;
-                    if out.stdout_truncated {
-                        omissions.push(
-                            "`p4 diff` output hit the size cap; some edits may be missing from \
-                             the diff."
-                                .to_string(),
-                        );
-                    }
-                    if out.stdout_lossy {
-                        omissions.push(
-                            "`p4 diff` output did not decode cleanly, so some edits may be \
-                             misrepresented."
-                                .to_string(),
-                        );
-                    }
-                    if out.stdout_incomplete {
-                        // A partial prefix (pipe error or drain-deadline) may contain no non-empty
-                        // sections at all, in which case no unit would be built and the segment
-                        // would look vacuously complete. Push an omission so it is marked
-                        // incomplete regardless of what the prefix parsed to (gate finding).
-                        omissions.push(
-                            "`p4 diff` output ended before it was fully read, so some edits may be \
-                             missing from the diff."
-                                .to_string(),
-                        );
-                    }
-                    for section in parse_describe_diff(&out.stdout) {
-                        if section.body.trim().is_empty() {
-                            continue;
-                        }
-                        let (hunk, cut) = budget.take_diff(section.body.clone());
-                        if cut {
-                            diff_truncated = true;
-                            complete = false;
-                        }
-                        let local = local_by_depot
-                            .get(&section.depot)
-                            .cloned()
-                            .unwrap_or_else(|| section.depot.clone());
-                        units.push(Unit::text_diff(
-                            section.depot,
-                            section.rev,
-                            local,
-                            hunk,
-                            !cut && !output_cut,
-                        ));
-                    }
-                }
+        // Diff each editable open on its own. `p4 diff -du` prints no `==== //depot#rev - local
+        // ====` banner (unlike `p4 describe -du`), so the concatenated `-x -` output cannot be
+        // attributed back to a depot without parsing depot paths out of untrusted diff text -- and
+        // a removed content line beginning `-- ` renders as `--- `, which a header heuristic
+        // mistakes for a file boundary (issue #119 review, findings f1/f2). Running one file at a
+        // time makes attribution exact: the output is that file's diff, so no depot is parsed from
+        // the body, and empty output is an opened file identical to its have-revision -- a
+        // legitimate no-op open, told apart from a diff we failed to capture. The have-revision the
+        // workspace was diffed against is the comparator; `p4 diff -du` does not print it, so it
+        // comes from `p4 opened`.
+        let rev_by_depot: BTreeMap<&str, Option<String>> = opened
+            .iter()
+            .map(|f| (f.depot.as_str(), f.have_rev.clone()))
+            .collect();
+        let mut unchanged: Vec<String> = Vec::new();
+        for (diffed, depot) in edit_targets.iter().enumerate() {
+            if diffed >= MAX_EDIT_DIFFS {
+                complete = false;
+                omissions.push(format!(
+                    "more than {MAX_EDIT_DIFFS} files were open for edit; the remaining {} were \
+                     not diffed (edit-diff cap reached), so the diff is incomplete.",
+                    edit_targets.len() - diffed
+                ));
+                break;
+            }
+            let out = match self.run(&["diff", "-du", depot.as_str()], "") {
+                Some(out) if out.success => out,
                 Some(out) if out.cancelled => return CaptureOne::Cancelled,
                 Some(out) => {
                     complete = false;
                     omissions.push(format!(
-                        "`p4 diff` failed, so the diff may be incomplete: {}",
+                        "`p4 diff {}` failed, so its diff is missing: {}",
+                        safe_label(depot),
                         first_line(&out.diagnostics())
                     ));
+                    continue;
                 }
                 None => {
                     complete = false;
-                    omissions
-                        .push("`p4 diff` could not be run, so the diff is missing.".to_string());
+                    omissions.push(format!(
+                        "`p4 diff {}` could not be run, so its diff is missing.",
+                        safe_label(depot)
+                    ));
+                    continue;
                 }
+            };
+            // Any shortfall in this file's output makes its unit incomplete (non-elidable) and the
+            // segment incomplete, rather than trusting a cut or mis-decoded prefix.
+            let output_cut = out.stdout_truncated || out.stdout_lossy || out.stdout_incomplete;
+            if out.stdout_truncated {
+                complete = false;
+                omissions.push(format!(
+                    "`p4 diff {}` output hit the size cap; its diff may be incomplete.",
+                    safe_label(depot)
+                ));
             }
+            if out.stdout_lossy {
+                complete = false;
+                omissions.push(format!(
+                    "`p4 diff {}` output did not decode cleanly, so its diff may be \
+                     misrepresented.",
+                    safe_label(depot)
+                ));
+            }
+            if out.stdout_incomplete {
+                complete = false;
+                omissions.push(format!(
+                    "`p4 diff {}` output ended before it was fully read, so its diff may be \
+                     incomplete.",
+                    safe_label(depot)
+                ));
+            }
+            let body = match strip_unified_file_header(&out.stdout) {
+                HeaderStrip::Body(body) => body,
+                // No output (or a header with no hunks): the open is identical to the depot. A
+                // real no-op, recorded explicitly rather than as an omission -- so it never forces
+                // the segment incomplete and is never confused with a diff we could not capture.
+                HeaderStrip::Empty => {
+                    unchanged.push(depot.clone());
+                    continue;
+                }
+                // Output that is not a unified diff at all: shown to no one, and the segment is
+                // marked incomplete so the gap is visible.
+                HeaderStrip::Malformed => {
+                    complete = false;
+                    omissions.push(format!(
+                        "`p4 diff {}` produced output with no unified header, so it was not shown.",
+                        safe_label(depot)
+                    ));
+                    continue;
+                }
+            };
+            let (hunk, cut) = budget.take_diff(body);
+            if cut {
+                diff_truncated = true;
+                complete = false;
+            }
+            let rev = rev_by_depot.get(depot.as_str()).cloned().flatten();
+            let local = local_by_depot
+                .get(depot)
+                .cloned()
+                .unwrap_or_else(|| depot.clone());
+            units.push(Unit::text_diff(
+                depot.clone(),
+                rev,
+                local,
+                hunk,
+                !cut && !output_cut,
+            ));
+        }
+        if !unchanged.is_empty() {
+            // Surfaced in the listing (which does not gate completeness), so the reviewer can see
+            // these opens carry no delta rather than wondering whether their diffs were lost.
+            listing.push_str(&format!(
+                "(no textual changes vs the depot: {})\n",
+                unchanged
+                    .iter()
+                    .map(|d| safe_label(d))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
 
         // Read opened-for-add contents from disk, confined to the working root, drawing from
@@ -2080,6 +2139,12 @@ struct OpenedFile {
     depot: String,
     action: String,
     ptype: String,
+    /// The have-revision reported by `p4 opened`. For a pending edit this is the revision the
+    /// workspace `p4 diff` is taken against, i.e. the unit's comparator -- `p4 diff -du` output
+    /// does not carry it, so it comes from here. `None` when the field was absent or malformed,
+    /// which makes the resulting diff unit non-elidable rather than eliding against an unknown
+    /// basis.
+    have_rev: Option<String>,
 }
 
 struct DescribeMeta {
@@ -2201,10 +2266,18 @@ fn parse_opened_ztag(raw: &str) -> (Vec<OpenedFile>, bool) {
             let depot = rec.get("depotFile")?.clone();
             let action = rec.get("action").cloned().unwrap_or_default();
             let ptype = rec.get("type").cloned().unwrap_or_default();
+            // Only an all-digits haveRev is a usable comparator; anything else (empty, `none`,
+            // a client with the file not yet synced) is dropped to `None` so the unit is shown
+            // but never elided against a basis we cannot trust.
+            let have_rev = rec
+                .get("haveRev")
+                .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                .cloned();
             Some(OpenedFile {
                 depot,
                 action,
                 ptype,
+                have_rev,
             })
         })
         .collect();
@@ -2339,6 +2412,49 @@ fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
         });
     }
     sections
+}
+
+/// The result of stripping the leading unified-diff file header from one file's `p4 diff -du`
+/// output.
+enum HeaderStrip {
+    /// The `@@` hunk body, with the leading `--- `/`+++ ` header pair removed.
+    Body(String),
+    /// No output, or a header with no hunks: the opened file is identical to its have-revision.
+    Empty,
+    /// Output that is not a unified diff (no `--- `/`+++ ` header pair): must not be shown as one.
+    Malformed,
+}
+
+/// Strip the leading `--- <from>` / `+++ <to>` header pair from one file's `p4 diff -du` output,
+/// returning the `@@` hunk body.
+///
+/// Because each `p4 diff` here runs on a single file, the depot is already known and nothing is
+/// parsed out of the body (issue #119 review): a hunk line such as a removed `-- //depot/x`, which
+/// renders as `--- //depot/x`, stays inside the body untouched. Only the first two lines are ever
+/// treated as the header, and only when they are the `--- `/`+++ ` pair. Dropping that pair leaves
+/// the body the same `@@`-only shape as the `describe -du` bodies the submitted and shelved paths
+/// produce, and keeps the absolute local path from the `+++ ` line out of what the reviewer sees.
+fn strip_unified_file_header(raw: &str) -> HeaderStrip {
+    let text = normalize(raw);
+    if text.trim().is_empty() {
+        return HeaderStrip::Empty;
+    }
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let second = lines.next().unwrap_or_default();
+    if !(first.starts_with("--- ") && second.starts_with("+++ ")) {
+        return HeaderStrip::Malformed;
+    }
+    let body: String = lines.map(|line| format!("{line}\n")).collect();
+    match body.lines().find(|l| !l.trim().is_empty()) {
+        // No hunks after the header pair: an opened file identical to its have-revision.
+        None => HeaderStrip::Empty,
+        // The body must begin with a unified hunk marker. Anything else after a `--- `/`+++ ` pair
+        // -- a diagnostic line, or otherwise non-hunk text -- is not a diff and must fail closed
+        // (issue #119 review, finding f3): shown to no one, and never an elision baseline.
+        Some(l) if l.starts_with("@@ ") => HeaderStrip::Body(body),
+        Some(_) => HeaderStrip::Malformed,
+    }
 }
 
 /// The depot path and its `#rev`/`@rev` in a `==== ... ====` describe header, tail-stripped.
@@ -2656,14 +2772,18 @@ mod tests {
     #[test]
     fn opened_records_are_parsed_with_action_and_type() {
         let raw = "\
-... depotFile //depot/a.txt\n... clientFile //cl/a.txt\n... action edit\n... type text\n\n\
-... depotFile //depot/bin.uasset\n... clientFile //cl/bin.uasset\n... action add\n... type binary+l\n";
+... depotFile //depot/a.txt\n... clientFile //cl/a.txt\n... action edit\n... type text\n... haveRev 7\n\n\
+... depotFile //depot/bin.uasset\n... clientFile //cl/bin.uasset\n... action add\n... type binary+l\n... haveRev none\n";
         let (opened, dropped) = parse_opened_ztag(raw);
         assert!(!dropped, "well-formed records are not dropped");
         assert_eq!(opened.len(), 2);
         assert_eq!(opened[0].depot, "//depot/a.txt");
         assert_eq!(opened[0].action, "edit");
+        // A numeric haveRev is captured as the comparator; a non-numeric one (`none`, or an
+        // absent field on an add) is dropped to None so the unit is never elided blind.
+        assert_eq!(opened[0].have_rev.as_deref(), Some("7"));
         assert_eq!(opened[1].ptype, "binary+l");
+        assert_eq!(opened[1].have_rev, None);
 
         // A record missing its depotFile is dropped, and the drop is reported so the caller can
         // treat the (now short) file list as untrustworthy.
@@ -2749,6 +2869,57 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn strip_unified_file_header_drops_only_the_leading_header_pair() {
+        // A single file's `p4 diff -du` output: `--- <depot>` / `+++ <local>` header, then hunks.
+        // The hunk body contains a removed `-- x` line, which renders as `--- x`, and a removed
+        // depot-path-shaped line -- both stay in the body because only the first two lines are
+        // ever treated as the header (issue #119 review, finding f1: no content is misread as a
+        // boundary now that each diff is per-file).
+        let raw = "\
+--- //depot/a.md\t2026-08-18 23:37:18.000000000 0000\n\
++++ C:\\ws\\a.md\t2026-08-18 23:37:18.000000000 0000\n\
+@@ -1,2 +1,2 @@\n--- //depot/a.md\n+++ replacement\n x\n";
+        let HeaderStrip::Body(body) = strip_unified_file_header(raw) else {
+            panic!("expected a body");
+        };
+        assert!(body.starts_with("@@ -1,2 +1,2 @@"));
+        // The content lines that look like headers survive; the absolute local path from the real
+        // `+++ ` header does not.
+        assert!(body.contains("--- //depot/a.md"));
+        assert!(body.contains("+++ replacement"));
+        assert!(!body.contains("C:\\ws"));
+    }
+
+    #[test]
+    fn strip_unified_file_header_classifies_empty_and_malformed() {
+        // Empty output is an unchanged open, distinct from a diff we failed to capture (finding f2).
+        assert!(matches!(strip_unified_file_header(""), HeaderStrip::Empty));
+        assert!(matches!(
+            strip_unified_file_header("   \n"),
+            HeaderStrip::Empty
+        ));
+        // A `--- `/`+++ ` header with no hunks is also an unchanged open.
+        assert!(matches!(
+            strip_unified_file_header("--- //depot/a\ttime\n+++ //ws/a\ttime\n"),
+            HeaderStrip::Empty
+        ));
+        // Output that is not a unified diff is malformed, not silently treated as a body.
+        assert!(matches!(
+            strip_unified_file_header("//depot/a - file(s) not opened on this client.\n"),
+            HeaderStrip::Malformed
+        ));
+        // A valid `--- `/`+++ ` header pair followed by non-hunk text (no `@@` marker) is
+        // malformed too, not a complete body (finding f3): it must never become an elision
+        // baseline.
+        assert!(matches!(
+            strip_unified_file_header(
+                "--- //depot/a\ttime\n+++ //ws/a\ttime\nnot a unified hunk\n"
+            ),
+            HeaderStrip::Malformed
+        ));
+    }
+
+    #[test]
     fn diff_header_and_strip_rev_handle_revisions_and_encoded_names() {
         assert_eq!(
             parse_diff_header("==== //depot/a.rs#5 (text) ====").unwrap(),
@@ -2811,6 +2982,7 @@ Change 5 by u@c on 2026/01/01\n\n\
                 depot: "//d/a".into(),
                 action: "edit".into(),
                 ptype: ptype.into(),
+                have_rev: None,
             }]
         };
         assert!(is_diffable_text("//d/a", &opened("text")));
