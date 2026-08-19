@@ -230,12 +230,23 @@ extern "system" {
 // `FILE_FLAG_OPEN_REPARSE_POINT` guards only the *final* component: a junction swapped in for the
 // parent directory would still be followed. To prove a store/credential file is genuinely a direct
 // child of the directory whose DACL we verified, we open it **relative to that directory's handle**
-// with `NtCreateFile` (`RootDirectory` = the held handle, `OBJ_DONT_REPARSE`), so the resolution can
-// only reach a direct child of the verified object and refuses if it is a reparse point ([f15]/[f20]).
+// with `NtCreateFile` (`RootDirectory` = the held handle), a single leaf component with no
+// separators, so the resolution can only reach a direct child of the verified object ([f15]/[f20]).
+//
+// Containment against a swapped-in junction/symlink is enforced by opening the leaf as a reparse
+// point (`FILE_OPEN_REPARSE_POINT`) rather than following it, then rejecting any handle that carries
+// `FILE_ATTRIBUTE_REPARSE_POINT` (`finish_open`). We deliberately do **not** use the `OBJ_DONT_REPARSE`
+// object attribute: it fails the whole open with `STATUS_REPARSE_POINT_ENCOUNTERED` (0xC000050B)
+// whenever *any* reparse is met during resolution, including the benign, transparent reparses a
+// filesystem overlay / HSM minifilter (e.g. Windows `UnionFS`, cloud-files) posts on an ordinary
+// create or open. That broke first-time profile setup on machines whose `%LOCALAPPDATA%` sits under
+// such an overlay (issue #117). `FILE_OPEN_REPARSE_POINT` only affects the final component — which is
+// the only component here — so a real name-surrogate junction at the leaf still surfaces as a
+// reparse-point handle and is refused, while an overlay's transparent redirection is followed as the
+// filter intends. A `FILE_CREATE` onto a pre-planted junction still fails closed with a name collision.
 
 // OBJECT_ATTRIBUTES.Attributes
 const OBJ_CASE_INSENSITIVE: Dword = 0x0000_0040;
-const OBJ_DONT_REPARSE: Dword = 0x0000_1000;
 // NtCreateFile CreateDisposition
 const FILE_OPEN: Dword = 1;
 const FILE_CREATE: Dword = 2;
@@ -244,6 +255,11 @@ const FILE_OPEN_IF: Dword = 3;
 const FILE_DIRECTORY_FILE: Dword = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: Dword = 0x0000_0040;
 const FILE_SYNCHRONOUS_IO_NONALERT: Dword = 0x0000_0020;
+// Open the final component as a reparse point instead of following it, so a name-surrogate junction
+// at the leaf is returned as a reparse-point handle (rejected by `finish_open`) rather than followed.
+// Unlike the `OBJ_DONT_REPARSE` object attribute, it does not fail on an overlay filter's transparent
+// reparse (issue #117). This is the CreateOptions counterpart of Win32 `FILE_FLAG_OPEN_REPARSE_POINT`.
+const FILE_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
 // ACCESS_MASK: required alongside FILE_SYNCHRONOUS_IO_NONALERT.
 const SYNCHRONIZE: Dword = 0x0010_0000;
 const STATUS_SUCCESS: i32 = 0;
@@ -474,9 +490,10 @@ fn open_child_relative(
 /// Open (creating if absent) a direct **subdirectory** of `parent` by handle-relative resolution and
 /// lock it to the current user with the restrictive DACL, returning the held no-follow handle.
 ///
-/// Because the open is handle-relative with `OBJ_DONT_REPARSE`, the subdirectory is provably a direct
-/// child of `parent` — a junction swapped in at this level fails the open rather than redirecting —
-/// and no ancestor path component is re-resolved. The handle carries `WRITE_DAC` (to set the DACL),
+/// Because the open is handle-relative (leaf opened as a reparse point, not followed), the
+/// subdirectory is provably a direct child of `parent` — a junction swapped in at this level is
+/// refused rather than redirecting — and no ancestor path component is re-resolved. The handle
+/// carries `WRITE_DAC` (to set the DACL),
 /// `READ_CONTROL` (to verify it), and list/traverse (so it can in turn be a RootDirectory for the next
 /// level down). Idempotent: an existing correctly-secured child re-verifies.
 pub fn create_secured_child_dir(parent: &OwnedHandle, leaf: &OsStr) -> io::Result<OwnedHandle> {
@@ -520,8 +537,9 @@ pub fn create_new_secured_child_dir(parent: &OwnedHandle, leaf: &OsStr) -> io::R
 /// The vendor login writes its credential file **by path** into the directory we handed it as
 /// `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, so after it exits we re-establish two guarantees on that file
 /// ([f20]): (1) **structural containment** — the open is handle-relative (`RootDirectory = parent`,
-/// `OBJ_DONT_REPARSE`), so it can only resolve a direct child of the object we hold, not a reparse or
-/// replacement; and (2) **lockdown** — because the directory's restrictive ACEs are non-inheritable, a
+/// leaf opened as a reparse point and refused if it is one), so it can only resolve a direct child of
+/// the object we hold, not a reparse or replacement; and (2) **lockdown** — because the directory's
+/// restrictive ACEs are non-inheritable, a
 /// freshly written child does *not* inherit them, so a verify-only re-read would fail closed on a
 /// legitimate login. We therefore **apply** the restrictive DACL to the file and then **verify** it,
 /// mirroring what [`create_secured_dir`] does for a directory. Fails closed on any error.
@@ -540,7 +558,7 @@ pub fn secure_and_verify_child_file(parent: &OwnedHandle, leaf: &OsStr) -> io::R
 }
 
 /// Read a credential/account file that is a **direct child of the held `parent` directory**,
-/// resolved handle-relative (`RootDirectory = parent`, `OBJ_DONT_REPARSE`).
+/// resolved handle-relative (`RootDirectory = parent`, leaf opened as a reparse point, not followed).
 ///
 /// The setup confirmation reads the account fingerprint through this, not by path, so a late reparse
 /// or replacement between the [f20] verify and the read cannot make the authorized account describe a
@@ -589,10 +607,13 @@ pub fn reject_reparse_on_ancestors(path: &Path) -> io::Result<()> {
 }
 
 /// The shared `NtCreateFile` handle-relative open, rejecting a reparse point and any name that is not
-/// a single path component. `RootDirectory = parent` + `OBJ_DONT_REPARSE` can only reach a direct
-/// child of the held directory object, so containment is structural — no ancestor path component is
-/// re-resolved ([f15]/[f20]). `create_options` selects file vs directory; `disposition` selects
-/// open/create/open-if.
+/// a single path component. `RootDirectory = parent` with a separator-free leaf can only reach a
+/// direct child of the held directory object, so containment is structural — no ancestor path
+/// component is re-resolved ([f15]/[f20]). The leaf is opened as a reparse point
+/// (`FILE_OPEN_REPARSE_POINT`) rather than followed, and `finish_open` refuses any handle bearing
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, so a name-surrogate junction/symlink at the leaf is rejected while
+/// an overlay filter's transparent reparse is tolerated (issue #117; see the module note above).
+/// `create_options` selects file vs directory; `disposition` selects open/create/open-if.
 fn nt_open(
     parent: &OwnedHandle,
     leaf: &OsStr,
@@ -630,7 +651,7 @@ fn nt_open(
         length: std::mem::size_of::<ObjectAttributes>() as Dword,
         root_directory: parent.as_raw_handle() as Handle,
         object_name: &unicode,
-        attributes: OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE,
+        attributes: OBJ_CASE_INSENSITIVE,
         security_descriptor: std::ptr::null_mut(),
         security_quality_of_service: std::ptr::null_mut(),
     };
@@ -655,7 +676,7 @@ fn nt_open(
             FILE_ATTRIBUTE_NORMAL,
             share,
             disposition,
-            kind_option | FILE_SYNCHRONOUS_IO_NONALERT,
+            kind_option | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null_mut(),
             0,
         )
@@ -1337,6 +1358,33 @@ mod tests {
         let err = create_new_secured_child_dir(&parent, OsStr::new("stage"))
             .expect_err("a second exclusive create must be refused");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_junction_at_the_leaf_is_refused_by_handle_relative_open() {
+        // Containment ([f15]/[f20]): the descent opens each leaf as a reparse point rather than
+        // following it, so a name-surrogate junction swapped in at a child name is refused instead of
+        // redirecting the open to its target. This is the security property the #117 fix preserves
+        // after dropping OBJ_DONT_REPARSE (which would fail the whole open) in favour of
+        // FILE_OPEN_REPARSE_POINT + the finish_open reparse-attribute rejection.
+        let dir = temp_dir();
+        let parent = create_secured_dir(dir.as_path()).expect("secure parent");
+        let escape = dir.join("escape");
+        std::fs::create_dir_all(&escape).expect("mkdir escape target");
+        let link = dir.join("link");
+        assert!(
+            crate::testutil::make_junction(&link, &escape),
+            "could not create a junction to exercise the check"
+        );
+        // The descent opens each level as a directory (FILE_OPEN_IF): meeting the junction here opens
+        // the reparse point itself (FILE_OPEN_REPARSE_POINT) rather than following it, and finish_open
+        // refuses the reparse-point handle instead of adopting the junction's target.
+        let err = create_secured_child_dir(&parent, OsStr::new("link"))
+            .expect_err("a junction at the leaf must be refused, not followed");
+        assert!(
+            err.to_string().contains("reparse point"),
+            "expected a reparse-point rejection, got: {err}"
+        );
     }
 
     #[test]

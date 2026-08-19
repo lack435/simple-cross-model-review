@@ -337,9 +337,10 @@ impl SecuredProfileDir {
 ///
 /// - **`Named`**: descends **handle-relative** from the trusted base (`profiles` → `{reviewer}` →
 ///   `{name}`), creating and locking each level to the current user. Because every step is a
-///   handle-relative open with `OBJ_DONT_REPARSE`, a junction swapped in at any level fails the open
-///   rather than redirecting, and containment under the profile root is *structural* — no path
-///   component is re-resolved ([f5]/[f15]/[f20]). The name is validated first.
+///   handle-relative open whose leaf is opened as a reparse point and refused if it is one, a junction
+///   swapped in at any level fails the open rather than redirecting, and containment under the profile
+///   root is *structural* — no path component is re-resolved ([f5]/[f15]/[f20]). The name is validated
+///   first.
 /// - **`ExplicitHome`**: the deliberately-outside-the-root escape hatch. Rejects a reparse point on
 ///   each original ancestor component, then creates and locks the leaf directory by handle. Local /
 ///   trusted-only.
