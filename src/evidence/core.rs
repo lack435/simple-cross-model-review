@@ -894,7 +894,23 @@ impl Core {
         let all: Vec<&str> = text.lines().collect();
         let begin = start_line.saturating_sub(1).min(all.len());
         let end = begin.saturating_add(line_count).min(all.len());
+        // Cap the returned window by the served-page ceiling's encoded size when one is set, so a
+        // large file read is not truncated/diverted by a capped MCP client (issue #114, f2). The
+        // `complete`/`truncated` fields below already report a short window, which the reviewer
+        // continues from with `start_line`; no cursor is added (repository_read has none).
+        let end = match self.bundle.page_bytes_ceiling {
+            Some(ceiling) => encoded_line_window_end(&all, begin, end, ceiling as usize),
+            None => end,
+        };
         let mut lines = Vec::with_capacity(end.saturating_sub(begin));
+        // Set when a single line's own encoded size exceeds the ceiling. `encoded_line_window_end`
+        // always yields at least one line to guarantee progress, so a lone quote-heavy line (under
+        // the raw `max_line_bytes` cap but over the ceiling once escaped) would otherwise be served
+        // whole and diverted by a capped MCP client. Truncate that one line's text to fit and flag
+        // the window truncated, so the reviewer sees most of it and knows it was cut, rather than
+        // losing the whole read (issue #114). Every other line already fits — the window's total
+        // encoded size is bounded, so no line but a forced oversized first can be cut here.
+        let mut line_truncated = false;
         for (offset, line) in all[begin..end].iter().enumerate() {
             if line.len() > self.bundle.limits.max_line_bytes as usize {
                 return Err(EvidenceError::new(
@@ -902,8 +918,19 @@ impl Core {
                     format!("'{path}' contains a line over the configured cap"),
                 ));
             }
-            lines.push(json!({"line": begin + offset + 1, "text": line}));
+            let text: &str = match self.bundle.page_bytes_ceiling {
+                Some(ceiling) => {
+                    let cut = encoded_bounded_end(line, 0, line.len(), ceiling as usize);
+                    if cut < line.len() {
+                        line_truncated = true;
+                    }
+                    &line[..cut]
+                }
+                None => line,
+            };
+            lines.push(json!({"line": begin + offset + 1, "text": text}));
         }
+        let complete = end == all.len() && !line_truncated;
         let fingerprint = crate::digest::Fingerprint::of(&bytes)
             .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
         // Only after the content is known good do we compute the (cached) drift stamp. The walk is
@@ -917,8 +944,8 @@ impl Core {
             "sha256": fingerprint.sha256,
             "total_lines": all.len(),
             "lines": lines,
-            "complete": end == all.len(),
-            "truncated": end < all.len(),
+            "complete": complete,
+            "truncated": !complete,
             "cursor": Value::Null,
             "drifted": drifted,
             "drift_unavailable": drift_unavailable,
@@ -958,6 +985,21 @@ impl Core {
         self.observed_stamp = Some(current_stamp.clone());
         self.observed_method = Some(method);
         Ok(current_stamp)
+    }
+
+    /// End offset for a text page: the requested raw byte `limit` from `start`, on a UTF-8 boundary,
+    /// tightened further so the JSON-escaped content fits the bundle's served-page ceiling when one
+    /// is set. The reviewer's MCP client caps the *serialized* tool result, not the raw text (issue
+    /// #114), so an escape-heavy diff (quotes, backslashes, control bytes) must be paged against its
+    /// encoded size, not its byte length. The request is never rejected — a large `limit_bytes` is
+    /// just served in more, smaller slices, each with a continuation cursor. Bundles without a
+    /// ceiling (Codex) are bounded only by the requested limit.
+    fn page_end(&self, text: &str, start: usize, limit: usize) -> usize {
+        let hard = utf8_end(text, start.saturating_add(limit).min(text.len()));
+        match self.bundle.page_bytes_ceiling {
+            Some(ceiling) => encoded_bounded_end(text, start, hard, ceiling as usize),
+            None => hard,
+        }
     }
 
     fn change(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
@@ -1132,7 +1174,7 @@ impl Core {
     ) -> Result<Value, EvidenceError> {
         let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
         let text = composed.text;
-        let end = utf8_end(&text, limit.min(text.len()));
+        let end = self.page_end(&text, 0, limit);
         let content = text[..end].to_string();
         let terminal = end >= text.len();
         let cursor = if terminal {
@@ -1195,7 +1237,7 @@ impl Core {
             .get("complete")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
+        let end = self.page_end(&text, offset, limit);
         let content = text[offset..end].to_string();
         let terminal = end >= text.len();
         let cursor = if terminal {
@@ -1494,7 +1536,7 @@ impl Core {
 
     fn change_page(&mut self, offset: usize, limit: usize) -> Result<Value, EvidenceError> {
         let text = self.bundle.change.clone().unwrap_or_default();
-        let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
+        let end = self.page_end(&text, offset, limit);
         let content = text.get(offset..end).ok_or_else(|| {
             EvidenceError::new("invalid_cursor", "change cursor is not on a UTF-8 boundary")
         })?;
@@ -1533,7 +1575,7 @@ impl Core {
         limit: usize,
         field: &str,
     ) -> Result<Value, EvidenceError> {
-        let end = utf8_end(&text, limit.min(text.len()));
+        let end = self.page_end(&text, 0, limit);
         let content = text[..end].to_string();
         let cursor = if end < text.len() {
             Some(self.store_cursor(
@@ -1570,7 +1612,7 @@ impl Core {
             .and_then(Value::as_u64)
             .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed text cursor"))?
             as usize;
-        let end = utf8_end(&text, offset.saturating_add(limit).min(text.len()));
+        let end = self.page_end(&text, offset, limit);
         let content = text[offset..end].to_string();
         let cursor = if end < text.len() {
             Some(self.store_cursor(
@@ -2277,6 +2319,69 @@ fn utf8_end(value: &str, mut end: usize) -> usize {
     }
     end
 }
+
+/// The bytes `c` occupies inside a JSON string literal as serde_json emits it (surrounding quotes
+/// excluded): `"` and `\` and the five short control escapes (`\b \t \n \f \r`) cost two, any other
+/// control char (< 0x20) six (`\u00XX`), and every other character — ASCII or multibyte UTF-8 — its
+/// own UTF-8 length (serde_json does not `\u`-escape non-ASCII). This is the quantity a capped MCP
+/// client counts, not the raw byte length (issue #114, f1).
+fn json_escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\t' | '\r' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Encoded byte length of `s` as a JSON string body (no surrounding quotes).
+fn json_escaped_len(s: &str) -> usize {
+    s.chars().map(json_escaped_char_len).sum()
+}
+
+/// Largest end offset in `start..hard_end` (a char boundary) whose JSON-escaped content fits
+/// `max_encoded` bytes. Always advances at least one character when any remain, so a page can never
+/// stall on a single expensive character — the smallest ceiling in use dwarfs one character's
+/// six-byte worst case.
+fn encoded_bounded_end(text: &str, start: usize, hard_end: usize, max_encoded: usize) -> usize {
+    let mut used = 0usize;
+    let mut end = start;
+    for (i, c) in text[start..hard_end].char_indices() {
+        let cost = json_escaped_char_len(c);
+        if used + cost > max_encoded && end > start {
+            break;
+        }
+        used = used.saturating_add(cost);
+        end = start + i + c.len_utf8();
+    }
+    end
+}
+
+/// Largest line index in `begin..hard_end` whose lines, once JSON-encoded as `repository_read`
+/// emits them, fit `max_encoded` bytes. Each line becomes a `{"line":N,"text":"…"}` object; the
+/// per-line structural overhead is over-estimated so the window stays under the ceiling. Always
+/// returns at least one line past `begin` when any remain, so a read cannot stall (issue #114, f2).
+fn encoded_line_window_end(
+    all: &[&str],
+    begin: usize,
+    hard_end: usize,
+    max_encoded: usize,
+) -> usize {
+    // `{"line":<digits>,"text":"<escaped>"},` — the fixed punctuation is 20 bytes; 12 covers the
+    // line-number digits and array comma with room to spare. Deliberately generous: better a page
+    // slightly under the ceiling than one that serializes past it.
+    const PER_LINE_OVERHEAD: usize = 32;
+    let mut used = 0usize;
+    let mut end = begin;
+    for (offset, line) in all[begin..hard_end].iter().enumerate() {
+        let cost = json_escaped_len(line).saturating_add(PER_LINE_OVERHEAD);
+        if used + cost > max_encoded && end > begin {
+            break;
+        }
+        used = used.saturating_add(cost);
+        end = begin + offset + 1;
+    }
+    end
+}
 fn valid_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -2643,6 +2748,7 @@ mod tests {
             change: Some("abcdef".into()),
             limits: limits.clone(),
             initial_stamp: initial_stamp(root, &limits, vcs),
+            page_bytes_ceiling: None,
         }
     }
 
@@ -2955,6 +3061,177 @@ mod tests {
         assert!(scope["scan_scope"]
             .as_str()
             .is_some_and(|s| s.contains("Git")));
+    }
+
+    // Issue #114 (f1): the served-page ceiling bounds the JSON-ENCODED bytes of every page below
+    // what the reviewer requested, without rejecting the request, so a reviewer whose MCP client
+    // caps the *serialized* tool result is instead paged in slices it can consume. Exercised
+    // through `repository_change` (no git needed); diff/revision share the one `page_end` seam.
+    #[test]
+    fn a_page_ceiling_bounds_the_encoded_size_of_every_served_page() {
+        let ceiling: usize = 24 * 1024;
+
+        // Page the whole `change` at once (limit_bytes at the request maximum) and collect every
+        // served content page. The request is honoured, just paged.
+        fn page_all(change: String, ceiling: usize) -> Vec<String> {
+            let dir = temp_dir("evidence-page-ceiling");
+            let bundle = Bundle::create(
+                dir.as_path(),
+                crate::config::Vcs::Perforce,
+                "nonce-ceil",
+                "working tree".into(),
+                "captured".into(),
+                Some(change),
+                Some(ceiling as u32),
+            )
+            .unwrap();
+            let mut core = Core::new(bundle).unwrap();
+            let mut resp = core
+                .call(
+                    "repository_change",
+                    &json!({"limit_bytes": super::Limits::default().max_change_bytes}),
+                )
+                .unwrap();
+            let mut pages = vec![resp["content"].as_str().unwrap().to_string()];
+            while resp["complete"] == json!(false) {
+                let cursor = resp["cursor"].as_str().unwrap().to_string();
+                resp = core
+                    .call("repository_change", &json!({ "cursor": cursor }))
+                    .unwrap();
+                pages.push(resp["content"].as_str().unwrap().to_string());
+            }
+            pages
+        }
+
+        // Plain text (encoded == raw): pages span the change and reassemble it whole.
+        let plain = "x".repeat(100 * 1024);
+        let pages = page_all(plain.clone(), ceiling);
+        assert!(
+            pages.len() > 1,
+            "a change several ceilings wide must span pages"
+        );
+        for p in &pages {
+            assert!(
+                super::json_escaped_len(p) <= ceiling,
+                "encoded page {} exceeds ceiling",
+                super::json_escaped_len(p)
+            );
+        }
+        assert_eq!(pages.concat(), plain, "the whole change is reassembled");
+
+        // Escape-heavy text: every byte is a quote, which serialises to two bytes. A raw-byte clamp
+        // would serve ~24 KiB raw that becomes ~48 KiB encoded and gets diverted; the encoded bound
+        // instead serves ~12 KiB raw so the ENCODED page still fits, and it still reassembles whole.
+        let quotes = "\"".repeat(100 * 1024);
+        let qpages = page_all(quotes.clone(), ceiling);
+        for p in &qpages {
+            assert!(
+                super::json_escaped_len(p) <= ceiling,
+                "encoded quote page {} exceeds ceiling",
+                super::json_escaped_len(p)
+            );
+            assert!(
+                p.len() <= ceiling / 2,
+                "raw quote page {} should be about half the ceiling (each char encodes to two bytes)",
+                p.len()
+            );
+        }
+        assert_eq!(
+            qpages.concat(),
+            quotes,
+            "the whole escape-heavy change is reassembled"
+        );
+    }
+
+    // Issue #114 (f2): repository_read's window is bounded by the same encoded ceiling, so a large
+    // file read is not diverted by a capped MCP client. It has no cursor, so a short window is
+    // signalled through `truncated`/`complete`, which the reviewer continues from with `start_line`.
+    #[test]
+    fn a_page_ceiling_bounds_the_repository_read_window() {
+        let dir = temp_dir("evidence-read-ceiling");
+        let ceiling: usize = 24 * 1024;
+        // 5,000 lines of 100 chars ~= 500 KiB, far past the ceiling.
+        let body = (0..5000)
+            .map(|i| format!("line {i:04} {}", "abcdefghij".repeat(9)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.as_path().join("big.txt"), &body).unwrap();
+        let bundle = Bundle::create(
+            dir.as_path(),
+            crate::config::Vcs::Perforce,
+            "nonce-read-ceil",
+            "working tree".into(),
+            "captured".into(),
+            None,
+            Some(ceiling as u32),
+        )
+        .unwrap();
+        let mut core = Core::new(bundle).unwrap();
+        // Ask for the whole file (line_count at the max). The read is honoured but the window is
+        // capped, so it comes back short and marked truncated rather than diverted.
+        let resp = core
+            .call(
+                "repository_read",
+                &json!({"path":"big.txt","line_count": super::Limits::default().max_lines}),
+            )
+            .unwrap();
+        assert_eq!(resp["truncated"], json!(true));
+        assert_eq!(resp["complete"], json!(false));
+        let lines = resp["lines"].as_array().unwrap();
+        assert!(!lines.is_empty(), "at least one line is always returned");
+        assert!(
+            lines.len() < 5000,
+            "the window must be cut short of the whole file"
+        );
+        // The encoded size of the returned lines fits the ceiling.
+        let encoded: usize = lines
+            .iter()
+            .map(|l| super::json_escaped_len(l["text"].as_str().unwrap()) + 32)
+            .sum();
+        assert!(
+            encoded <= ceiling,
+            "encoded read window {encoded} exceeds ceiling"
+        );
+    }
+
+    // Issue #114 (f2 turn 2): a lone line under the raw `max_line_bytes` cap but over the encoded
+    // ceiling (here 15,000 quotes: 15 KB raw, ~30 KB escaped) must not be served whole and diverted.
+    // The one forced line is truncated to fit and the read is marked not-complete, rather than lost.
+    #[test]
+    fn a_single_over_ceiling_line_is_truncated_not_served_oversized() {
+        let dir = temp_dir("evidence-read-line-ceiling");
+        let ceiling: usize = 24 * 1024;
+        fs::write(dir.as_path().join("one.txt"), "\"".repeat(15_000)).unwrap();
+        let bundle = Bundle::create(
+            dir.as_path(),
+            crate::config::Vcs::Perforce,
+            "nonce-line-ceil",
+            "working tree".into(),
+            "captured".into(),
+            None,
+            Some(ceiling as u32),
+        )
+        .unwrap();
+        let mut core = Core::new(bundle).unwrap();
+        let resp = core
+            .call("repository_read", &json!({"path":"one.txt"}))
+            .unwrap();
+        // The whole file is one line, yet the read is not complete: its single line was cut to fit.
+        assert_eq!(resp["complete"], json!(false));
+        assert_eq!(resp["truncated"], json!(true));
+        let lines = resp["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        let text = lines[0]["text"].as_str().unwrap();
+        assert!(
+            text.len() < 15_000,
+            "the oversized line must be truncated, got {} chars",
+            text.len()
+        );
+        assert!(
+            super::json_escaped_len(text) <= ceiling,
+            "the truncated line's encoded size {} must fit the ceiling",
+            super::json_escaped_len(text)
+        );
     }
 
     // Git present, root not a work tree: the scan refuses rather than quietly walking a tree the

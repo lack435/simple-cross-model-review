@@ -30,6 +30,16 @@ pub const SERVER_NAME: &str = "cross_review_evidence";
 /// (once wired) the bundle stops carrying a pre-rendered `change`, so the reviewer-visible tool set
 /// and delivery contract both changed.
 pub const SCHEMA_VERSION: u32 = 3;
+/// Ceiling on the *JSON-escaped* bytes served per page for a reviewer whose MCP client caps
+/// tool-result size. Claude Code truncates or diverts an MCP tool result past ~25k tokens
+/// (`MAX_MCP_OUTPUT_TOKENS`) — a single `repository_diff` page above that is saved to a file the
+/// shell-less reviewer cannot read, so the change never reaches the model and the review fails
+/// `EVIDENCE_UNAVAILABLE` (issue #114). The bound is on the *encoded* content the client actually
+/// receives, not the raw text, so an escape-heavy diff cannot slip past it. It governs the text
+/// pages (`repository_diff`/`repository_change`/`repository_revision`) and the `repository_read`
+/// window. Codex imposes no such cap and is served at the full request. Set well under the observed
+/// boundary (~45 KiB encoded) to leave margin for the surrounding response envelope.
+pub const CLAUDE_PAGE_BYTES_CEILING: u32 = 24 * 1024;
 /// The MCP client-side per-`tools/call` ceiling we hand Codex (`tool_timeout_sec`). This is the
 /// single source of truth for that ceiling: the reviewer config (`src/reviewer/codex.rs`) emits
 /// it, and the evidence read watchdog (`src/evidence/core.rs`) derives its budget from it with a
@@ -296,6 +306,14 @@ pub struct Bundle {
     pub change: Option<String>,
     pub limits: Limits,
     pub initial_stamp: Drift,
+    /// Ceiling on the JSON-escaped bytes served per page, independent of `limits.max_change_bytes`
+    /// (which still bounds what the reviewer may *request*). `Some` for a reviewer whose MCP client
+    /// caps tool-result size (Claude Code): pages are sliced so no single *serialized* response is
+    /// truncated or diverted client-side (issue #114). `None` (Codex) serves the full request.
+    /// Defaulted so a bundle written without it still decodes; the writer and reader are one binary
+    /// version within one process tree, so there is no cross-version bundle to migrate.
+    #[serde(default)]
+    pub page_bytes_ceiling: Option<u32>,
 }
 
 impl Bundle {
@@ -306,6 +324,7 @@ impl Bundle {
         change_label: String,
         status_summary: String,
         change: Option<String>,
+        page_bytes_ceiling: Option<u32>,
     ) -> Result<Self, EvidenceError> {
         validate_nonce(nonce)?;
         let canonical = fs::canonicalize(root).map_err(|e| {
@@ -326,6 +345,7 @@ impl Bundle {
             change,
             limits,
             initial_stamp,
+            page_bytes_ceiling,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -352,6 +372,15 @@ impl Bundle {
             return Err(EvidenceError::new(
                 "invalid_bundle",
                 "captured change exceeds bundle cap",
+            ));
+        }
+        // A zero ceiling would clamp every text page to nothing, stranding the reviewer with an
+        // unpageable change; a ceiling above `max_change_bytes` is inert but harmless. Reject only
+        // the broken case.
+        if self.page_bytes_ceiling == Some(0) {
+            return Err(EvidenceError::new(
+                "invalid_bundle",
+                "page byte ceiling must be positive",
             ));
         }
         self.initial_stamp.validate()?;
@@ -1007,6 +1036,9 @@ pub fn readiness(cfg: &crate::config::Config) -> Result<String, EvidenceError> {
         "status preflight (no selected change)".to_string(),
         "no-model evidence readiness check".to_string(),
         None,
+        // The readiness handshake only lists tools; it never pages a text tool, so the served-page
+        // ceiling is immaterial here.
+        None,
     )?;
     let file = write_bundle(cfg, &bundle)?;
     let exe = std::env::current_exe()
@@ -1298,6 +1330,7 @@ mod tests {
             "working tree".into(),
             "captured".into(),
             Some("diff".into()),
+            None,
         )
         .unwrap()
     }
