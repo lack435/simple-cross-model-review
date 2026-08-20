@@ -1174,6 +1174,13 @@ impl Core {
     ) -> Result<Value, EvidenceError> {
         let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
         let text = composed.text;
+        // A content digest of the *whole* composed diff (which begins with the resolved-base header,
+        // so the base is inside it) identifies this canonical change exactly. The approval gate uses
+        // it to tell a benign repeat pull of one unchanged change from a mid-review re-pull of a
+        // *drifted* one: same digest is the same change, and numstat counts alone cannot prove that
+        // (two different edits can share a files/±line tally). Digested here, before paging, so every
+        // page of this operation is anchored to the same identity (issue #121 review f1/f2).
+        let digest = crate::digest::Fingerprint::of(text.as_bytes()).map(|f| f.sha256);
         let end = self.page_end(&text, 0, limit);
         let content = text[..end].to_string();
         let terminal = end >= text.len();
@@ -1195,6 +1202,7 @@ impl Core {
             "canonical": canonical,
             "complete": composed.complete,
             "terminal": terminal,
+            "digest": digest,
             "base": composed.base_token,
             "base_source": composed.base_source,
             "files": composed.files,

@@ -4883,16 +4883,21 @@ fn resume_block(
 struct DiffServeAggregate {
     /// The reviewer made at least one `repository_diff` call this turn.
     any_diff: bool,
-    /// A *canonical* operation — the whole working tree against the fork point, unnarrowed — was
-    /// served complete and paged to its terminal page. This is the floor a formal approval must
-    /// clear (f1): it proves the reviewer was served the entire change, end to end.
+    /// At least one *canonical* operation — the whole working tree against the fork point,
+    /// unnarrowed — was served complete and paged to its terminal page. This is the floor a formal
+    /// approval must clear (f1): it proves the reviewer was served the entire change, end to end.
+    /// More than one such op is fine (issue #121): a reviewer that re-pulls the whole diff was still
+    /// served it whole; only a canonical op that never reached its terminal page fails the floor.
     complete_canonical_terminal: bool,
     /// Counts from the canonical operation, for the caller-facing `captured:` line (mechanism 5).
     /// `None` when no canonical operation was served.
     canonical: Option<CanonicalServe>,
 }
 
-/// The canonical diff's resolved base and counts, taken from the serve-record, for `captured:`.
+/// The canonical diff's resolved base and counts, taken from the serve-record, for the `captured:`
+/// line. `base` is the human-facing source label (`merge-base(...)`). Same-change reconciliation does
+/// not key on these fields — it keys on the operation's content digest (see `aggregate_serve_records`)
+/// — so this carries only what `captured:` renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonicalServe {
     base: String,
@@ -4903,17 +4908,26 @@ struct CanonicalServe {
 }
 
 /// Aggregate the nonce-bound serve-record JSONL the evidence server appended (mechanism 3). Each
-/// line is `{op, canonical, complete, terminal, ...}`; records are grouped by `op` and a canonical
-/// operation clears the floor only when some page marked it canonical, *every* page reported it
-/// complete, and some page was terminal. Malformed or missing lines are ignored — a review that
-/// cannot be shown to have been served the whole change fails closed at the caller, never rescued by
-/// a best guess. A missing file parses as the empty string: no diffs, floor not cleared.
+/// line is `{op, canonical, complete, terminal, digest, ...}`; records are grouped by `op`, and a
+/// canonical operation is itself whole only when some page marked it canonical, *every* page reported
+/// it complete, and some page was terminal. The approval floor then clears only when every canonical
+/// operation describes the *same* change — identical content `digest` — and at least one of them was
+/// whole. So a benign repeat pull of one unchanged change clears it (issue #121) while a mid-review
+/// re-pull of a *drifted* change, left half-paged, does not (review f1): the digest is a hash of the
+/// whole composed diff (base header included), so it distinguishes two different edits even when their
+/// numstat tallies happen to match (review f1 residual), and a canonical op with no digest at all is a
+/// disagreement that fails closed (review f2). Malformed or missing lines are ignored — a review that
+/// cannot be shown to have been served the whole change fails closed at the caller, never rescued by a
+/// best guess. A missing file parses as the empty string: no diffs, floor not cleared.
 fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     #[derive(Default)]
     struct Op {
         canonical: bool,
         complete: bool,
         terminal: bool,
+        /// Content hash of the whole composed diff, from this operation's first page — the identity
+        /// two canonical operations must share to be the same change. `None` if no page carried one.
+        digest: Option<String>,
         counts: Option<CanonicalServe>,
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
@@ -4945,9 +4959,13 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
         entry.complete &= bool_field("complete").unwrap_or(false);
         entry.terminal |= bool_field("terminal").unwrap_or(false);
-        // The counts ride on this operation's first page (the record carrying `files`), and stay
-        // bound to *this* op id — not overwritten by a later, possibly different, canonical op.
+        // The digest and counts ride on this operation's first page (the record carrying them), and
+        // stay bound to *this* op id — not overwritten by a later, possibly different, canonical op.
+        // The digest is the reconciliation identity; the counts are only for the `captured:` line.
         if bool_field("canonical").unwrap_or(false) {
+            if let Some(digest) = value.get("digest").and_then(serde_json::Value::as_str) {
+                entry.digest = Some(digest.to_string());
+            }
             if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
                 entry.counts = Some(CanonicalServe {
                     base: value
@@ -4963,14 +4981,40 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
             }
         }
     }
-    // Require *exactly one* canonical operation (f3). Zero means none was served; more than one is
-    // ambiguous — an early complete op must not clear the floor for a later, possibly incomplete or
-    // differently-scoped one — so both fail closed. The single canonical op clears the floor only
-    // when it is itself complete and reached its terminal page, and its counts feed captured:.
+    // A formal approval must have been served the whole canonical diff, end to end. A thorough
+    // reviewer legitimately re-pulls that whole diff more than once in a turn (issue #121), and each
+    // pull opens its own operation, so requiring *exactly one* canonical op — the earlier rule — failed
+    // those benign re-reads closed with a spurious EVIDENCE_UNAVAILABLE on approval. But "at least one
+    // complete+terminal op" is too loose (review f1): the `canonical` flag is only request *shape*
+    // (branch-base → worktree, no path); each op independently re-resolves the fork point and re-reads
+    // the *live* worktree, so if the change drifts mid-review an early complete op and a later
+    // *incomplete* one describe different changes, and clearing on the early one would approve a latest
+    // change that was never paged to its end. So the floor clears only when **every** canonical op
+    // describes the *same* change — identical content digest — and at least one of them was itself
+    // complete and reached its terminal page. Repeat pulls of one unchanged change clear it (the #121
+    // case); a drifted re-pull that was left mid-pagination does not, because its digest differs. A
+    // canonical op that never reached its terminal page, a canonical op with no digest at all (review
+    // f2), and a narrowed/exploratory diff (never canonical) all still fail closed.
     let canonical_ops: Vec<&Op> = ops.values().filter(|o| o.canonical).collect();
-    let (complete_canonical_terminal, canonical) = match canonical_ops.as_slice() {
-        [only] => (only.complete && only.terminal, only.counts.clone()),
-        _ => (false, None),
+    // Same change across every canonical op: all must carry a digest, and all digests must be equal. A
+    // canonical op missing its digest is a disagreement — fail closed rather than guess.
+    let agree = |ops: &[&Op]| match ops.first().and_then(|o| o.digest.as_deref()) {
+        Some(first) => ops.iter().all(|o| o.digest.as_deref() == Some(first)),
+        None => false,
+    };
+    let (complete_canonical_terminal, canonical) = if !canonical_ops.is_empty()
+        && agree(&canonical_ops)
+        && canonical_ops.iter().any(|o| o.complete && o.terminal)
+    {
+        // All canonical ops share one change, so any complete+terminal op's counts are the ones to
+        // report — deterministic regardless of HashMap iteration order.
+        let counts = canonical_ops
+            .iter()
+            .find(|o| o.complete && o.terminal)
+            .and_then(|o| o.counts.clone());
+        (true, counts)
+    } else {
+        (false, None)
     };
     DiffServeAggregate {
         any_diff,
@@ -5244,30 +5288,60 @@ mod tests {
         // Nothing recorded.
         assert_eq!(aggregate_serve_records(""), DiffServeAggregate::default());
 
+        // A real canonical op's first page always carries the resolved base and numstat; these
+        // fixtures mirror that so the same-change reconciliation is exercised, not bypassed. A helper
+        // keeps the base token constant (the unchanged-tree case) unless a case varies it on purpose.
+        // A real canonical op's first page carries a content `digest` (the identity) plus base and
+        // numstat (for `captured:`); a continuation page carries only the op id. `digest` is the change
+        // identity two canonical ops must share; `files` rides along for the captured: line.
+        let op = |id: &str,
+                  complete: bool,
+                  terminal: bool,
+                  digest: &str,
+                  files: u64,
+                  continuation: bool| {
+            if continuation {
+                format!(
+                    r#"{{"op":"{id}","canonical":true,"complete":{complete},"terminal":{terminal},"continuation":true}}"#
+                )
+            } else {
+                format!(
+                    r#"{{"op":"{id}","canonical":true,"complete":{complete},"terminal":{terminal},"digest":"{digest}","base":"abc123","base_source":"branch-base","files":{files},"insertions":10,"deletions":2,"untracked":0}}"#
+                )
+            }
+        };
+        let d1 = "1111111111111111111111111111111111111111111111111111111111111111";
+        let d2 = "2222222222222222222222222222222222222222222222222222222222222222";
+
         // A canonical op, complete and terminal in one page: floor cleared.
-        let a = aggregate_serve_records(
-            r#"{"op":"x","canonical":true,"complete":true,"terminal":true}"#,
-        );
+        let a = aggregate_serve_records(&op("x", true, true, d1, 8, false));
         assert!(a.any_diff && a.complete_canonical_terminal);
 
-        // A canonical op paged across two calls, terminal on the second: cleared.
-        let paged = "{\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":false}\n\
-                     {\"op\":\"x\",\"canonical\":true,\"complete\":true,\"terminal\":true,\"continuation\":true}";
-        assert!(aggregate_serve_records(paged).complete_canonical_terminal);
+        // A canonical op paged across two calls, terminal on the second: cleared. Only the first page
+        // carries the digest and counts; the continuation carries the op id.
+        let paged = format!(
+            "{}\n{}",
+            op("x", true, false, d1, 8, false),
+            op("x", true, true, "", 0, true)
+        );
+        assert!(aggregate_serve_records(&paged).complete_canonical_terminal);
 
         // The page-1-stop case: canonical op that never reached its terminal page — NOT cleared.
-        let stopped = aggregate_serve_records(
-            r#"{"op":"x","canonical":true,"complete":true,"terminal":false}"#,
-        );
+        let stopped = aggregate_serve_records(&op("x", true, false, d1, 8, false));
         assert!(stopped.any_diff && !stopped.complete_canonical_terminal);
 
         // An incomplete canonical op (server-flagged) — not cleared.
         assert!(
-            !aggregate_serve_records(
-                r#"{"op":"x","canonical":true,"complete":false,"terminal":true}"#
-            )
-            .complete_canonical_terminal
+            !aggregate_serve_records(&op("x", false, true, d1, 8, false))
+                .complete_canonical_terminal
         );
+
+        // Review f2: a canonical op whose first page carried no digest cannot be reconciled — fail
+        // closed rather than treat an identity-less record as the whole change.
+        let no_digest = aggregate_serve_records(
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true,"files":8}"#,
+        );
+        assert!(no_digest.any_diff && !no_digest.complete_canonical_terminal);
 
         // Only a narrowed (non-canonical) exploratory diff: a diff happened, but the floor is not
         // cleared — the path-restricted-approval case f1 named.
@@ -5277,14 +5351,13 @@ mod tests {
         assert!(narrow.any_diff && !narrow.complete_canonical_terminal);
 
         // Malformed lines are ignored, not fatal.
-        let junk =
-            "not json\n{bad\n{\"op\":\"z\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
-        assert!(aggregate_serve_records(junk).complete_canonical_terminal);
+        let junk = format!("not json\n{{bad\n{}", op("z", true, true, d1, 8, false));
+        assert!(aggregate_serve_records(&junk).complete_canonical_terminal);
 
         // The canonical operation's counts are captured for the caller-facing captured: line.
-        let counted = aggregate_serve_records(
-            r#"{"op":"x","canonical":true,"complete":true,"terminal":true,"base_source":"merge-base(HEAD, @{upstream})","files":3,"insertions":10,"deletions":2,"untracked":1}"#,
-        );
+        let counted = aggregate_serve_records(&format!(
+            r#"{{"op":"x","canonical":true,"complete":true,"terminal":true,"digest":"{d1}","base":"abc123","base_source":"merge-base(HEAD, @{{upstream}})","files":3,"insertions":10,"deletions":2,"untracked":1}}"#
+        ));
         let c = counted.canonical.expect("canonical counts recorded");
         assert_eq!(
             (c.files, c.insertions, c.deletions, c.untracked),
@@ -5297,12 +5370,62 @@ mod tests {
                 .is_none()
         );
 
-        // Two distinct canonical operations are ambiguous and do NOT clear the floor (f3) — an early
-        // complete op must not certify a later, possibly different one.
-        let two = "{\"op\":\"a\",\"canonical\":true,\"complete\":true,\"terminal\":true}\n\
-                   {\"op\":\"b\",\"canonical\":true,\"complete\":true,\"terminal\":true}";
-        let t = aggregate_serve_records(two);
-        assert!(t.any_diff && !t.complete_canonical_terminal && t.canonical.is_none());
+        // Two distinct canonical operations describing the *same* change (same digest), each served
+        // whole: the reviewer re-pulled the entire canonical diff, which is more evidence, not less.
+        // The floor clears (issue #121) — the old "exactly one" rule failed this benign re-read closed
+        // with a spurious EVIDENCE_UNAVAILABLE. Counts are deterministic because both agree.
+        let two = format!(
+            "{}\n{}",
+            op("a", true, true, d1, 8, false),
+            op("b", true, true, d1, 8, false)
+        );
+        let t = aggregate_serve_records(&two);
+        assert!(t.any_diff && t.complete_canonical_terminal);
+        assert_eq!(
+            t.canonical.expect("counts from a whole canonical op").files,
+            8
+        );
+
+        // A whole canonical op plus a second, same-change one (same digest) abandoned after page 1:
+        // the first still proves the reviewer was served the change end to end.
+        let whole_then_partial = format!(
+            "{}\n{}",
+            op("a", true, true, d1, 8, false),
+            op("b", true, false, d1, 8, false)
+        );
+        assert!(aggregate_serve_records(&whole_then_partial).complete_canonical_terminal);
+
+        // Review f1 residual: an early whole op and a later *drifted* re-pull left mid-pagination must
+        // NOT clear the floor — the latest canonical change was not served to its end. This holds even
+        // when the drift keeps the numstat identical (same files/±lines): the content digests differ,
+        // which is exactly why reconciliation keys on the digest and not on the counts.
+        let drift_partial = format!(
+            "{}\n{}",
+            op("a", true, true, d1, 8, false),
+            op("b", true, false, d2, 8, false)
+        );
+        let dp = aggregate_serve_records(&drift_partial);
+        assert!(dp.any_diff && !dp.complete_canonical_terminal && dp.canonical.is_none());
+
+        // Review f1: two whole ops with different content digests are different changes, so the floor
+        // fails closed even though each was itself whole.
+        let moved = format!(
+            "{}\n{}",
+            op("a", true, true, d1, 8, false),
+            op("b", true, true, d2, 8, false)
+        );
+        let m = aggregate_serve_records(&moved);
+        assert!(m.any_diff && !m.complete_canonical_terminal && m.canonical.is_none());
+
+        // Two canonical ops that were *both* left mid-pagination clear nothing, even agreeing: the
+        // whole change was never served end to end.
+        let both_partial = format!(
+            "{}\n{}",
+            op("a", true, false, d1, 8, false),
+            op("b", true, false, d1, 8, false)
+        );
+        let bp = aggregate_serve_records(&both_partial);
+        assert!(bp.any_diff && !bp.complete_canonical_terminal && bp.canonical.is_none());
     }
 
     #[test]
