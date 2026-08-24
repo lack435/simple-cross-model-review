@@ -3939,7 +3939,12 @@ impl Job {
         // than resuming onto a rejected turn. Fail closed to a lost (re-runnable) review, never a
         // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
         // false), so the common review pays nothing.
-        if capture_thin && !evidence_ok {
+        // Perforce keeps the hard fail-closed gate: it has no `repository_diff`, so the serve-record
+        // evidence floor below (git only) cannot cover it, and there is no canonical-diff auto-repair
+        // to fall back on. For git this early return is retired in favour of the resumable evidence
+        // floor + in-turn auto-repair applied around `finalize_turn` below: a git turn that read no
+        // content is downgraded to a resumable `changes_requested`, not lost.
+        if capture_thin && !evidence_ok && self.cfg.vcs != crate::config::Vcs::Git {
             return Err(errors::evidence_review_too_thin(
                 "the captured change was empty or incomplete and the reviewer did not obtain healthy \
                  content evidence (no successful content call, or the evidence transport failed), \
@@ -4085,11 +4090,150 @@ impl Job {
                 }
             }
 
+            // Evidence auto-repair (retire-capture-modes; git only, reviewer-agnostic via the
+            // serve-record). If the reviewer's answer would not clear the per-turn evidence floor —
+            // an approval not served the whole current canonical diff, or a turn that read no
+            // repository content at all — ask it once, in the same conversation, to pull the complete
+            // current change and decide again on the strength of it. Its `repository_diff` calls
+            // append to this turn's serve-record, so the floor re-check below sees them.
+            //
+            // Unlike block-repair (which patches a malformed block on a turn whose evidence was fine
+            // and keeps the prose verbatim), this is a genuine **re-review**: the reviewer has now
+            // seen the whole change, so a structured answer *replaces* this turn's assessment —
+            // verdict, findings, and prose. A repair that comes back without a usable block leaves the
+            // main assessment in place but is treated as *unconfirmed*: it cannot re-affirm an
+            // approval, so `complete_canonical` is forced false for the floor and the approve
+            // downgrades to a resumable re-review rather than converging on an unusable answer. At
+            // most one attempt; skipped on cancel and when there is no conversation to resume.
+            let mut evidence_repair_unconfirmed = false;
+            if evidence_setup.is_some()
+                && self.cfg.vcs == crate::config::Vcs::Git
+                && !self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+                let looked_at_something = agg.any_diff
+                    || evidence_health
+                        .as_ref()
+                        .is_some_and(|h| h.content_call_succeeded);
+                let floor_unmet = !looked_at_something
+                    || (assessment.provisional_approve() && !agg.complete_canonical_terminal);
+                if floor_unmet {
+                    if let Some(target) = repair_target.as_deref() {
+                        // Attempted-but-unconfirmed until a structured re-review clears it.
+                        evidence_repair_unconfirmed = true;
+                        let evidence_prompt = crate::prompt::evidence_repair(
+                            &self.id,
+                            assessment.prior_digest().as_deref(),
+                        );
+                        *prompt_bytes = prompt_bytes.saturating_add(evidence_prompt.len());
+                        match self.run_block_repair(
+                            target,
+                            &evidence_prompt,
+                            evidence_invocation.as_ref(),
+                            authorized_start.as_ref(),
+                            usage_key,
+                            &mut parsed,
+                        ) {
+                            Ok(repair_text) => {
+                                // The re-review's own answer is this turn's answer when it is
+                                // structured: reconcile it against the same prior state the main run
+                                // used, so its verdict may legitimately change now that it saw the
+                                // whole change. A blockless re-review is left unconfirmed (below).
+                                let reassessed = crate::findings::assess_turn(
+                                    &self.session,
+                                    turn,
+                                    &self.id,
+                                    &repair_text,
+                                    prior_snapshot.clone(),
+                                );
+                                if reassessed.is_structured() {
+                                    assessment = reassessed;
+                                    evidence_repair_unconfirmed = false;
+                                    warnings_from_repair.push(
+                                        "the reviewer had not been served the whole current change, \
+                                         so it was asked once to pull the complete diff and \
+                                         re-reviewed on the strength of it; the verdict below is that \
+                                         re-review."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    warnings_from_repair.push(
+                                        "the reviewer was asked to pull the complete current change \
+                                         but did not return a usable re-review, so its verdict was \
+                                         not trusted to rest on the whole change."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            Err(RunFailure {
+                                failure,
+                                account_refusal,
+                                child_never_started: _,
+                            }) => {
+                                if account_refusal {
+                                    // Same security refusal the block-repair loop handles: the account
+                                    // moved mid-turn, so the repair's answer is discarded unread and the
+                                    // turn is not recorded, leaving the session non-resumable.
+                                    repair_refused_on_account = true;
+                                    warnings_from_repair.push(format!(
+                                        "the profile home's account changed while this turn was \
+                                         running: the evidence auto-repair response was discarded \
+                                         unread and this turn was not recorded, so session '{}' \
+                                         cannot be resumed. Start a fresh review (fresh: true) \
+                                         carrying the still-open findings. The review below was \
+                                         produced under the authorized account and is still valid. \
+                                         ({}: {})",
+                                        self.session,
+                                        failure.code,
+                                        failure.summary.trim()
+                                    ));
+                                } else {
+                                    // A failed evidence-repair never fails the review: the floor
+                                    // re-check below still runs and downgrades to a resumable
+                                    // changes_requested if the change was not shown whole.
+                                    warnings_from_repair.push(format!(
+                                        "the reviewer was asked to pull the complete current change \
+                                         and the attempt failed ({}): {}",
+                                        failure.code,
+                                        failure.summary.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let turn_eval = crate::findings::finalize_turn(
                 assessment,
                 crate::findings::Budget::default(),
                 self.cfg.stagnant_session_turns,
             );
+            // Apply the per-turn evidence floor to the finalized turn (git only, reviewer-agnostic).
+            // Keep-requirement: an approval must have been served the whole current canonical diff
+            // this turn, and every turn must have read some content. When unmet — after the auto-repair
+            // above had its one chance — the turn is downgraded to a resumable `changes_requested`
+            // (EvidenceIncomplete), never accepted as an approval and never hard-failed. Perforce is
+            // excluded (no `repository_diff`); its evidence is gated by the health early-return above.
+            let turn_eval = if evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
+                let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+                let looked_at_something = agg.any_diff
+                    || evidence_health
+                        .as_ref()
+                        .is_some_and(|h| h.content_call_succeeded);
+                crate::findings::apply_evidence_floor(
+                    turn_eval,
+                    crate::findings::EvidenceCoverage {
+                        looked_at_something,
+                        // An unconfirmed repair (attempted, no usable re-review) cannot re-affirm an
+                        // approval even if it pulled the diff, so the whole-change proof is withheld.
+                        complete_canonical: agg.complete_canonical_terminal
+                            && !evidence_repair_unconfirmed,
+                    },
+                )
+            } else {
+                turn_eval
+            };
             let ledger: Option<serde_json::Value> =
                 Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
             let terminal = terminal_reason_for(&turn_eval.envelope);
@@ -4105,39 +4249,14 @@ impl Job {
             (Some(turn_eval), ledger, terminal)
         };
 
-        // Retire-capture-modes mechanism 4: the fail-closed evidence gate for the live model,
-        // reviewer-agnostic — it reads the evidence server's serve-record file, not either CLI's
-        // stream, so it covers Codex (which has no capture_thin gate) as well as Claude. Git only:
-        // Perforce has no repository_diff and still delivers its changelist through repository_change.
-        // Disarmed for consults, which are informal and certify nothing.
-        if !is_consult && evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
-            let agg = read_serve_record_aggregate(&self.cfg, &self.id);
-            // The reviewer never pulled the change at all: whatever the verdict, the review rests on
-            // nothing it was shown. Fail closed to a re-runnable EVIDENCE_UNAVAILABLE.
-            if !agg.any_diff {
-                return Err(errors::evidence_review_too_thin(
-                    "the reviewer obtained no repository_diff of the change, so the review would \
-                     rest on nothing it was shown",
-                ));
-            }
-            // A formal APPROVE must have been served the complete canonical diff, paged to its end
-            // (f1): a reviewer that approved on only a narrowed slice, or that stopped mid-pagination,
-            // is caught here. A non-approving verdict on a narrowed diff is a legitimate partial
-            // review and is left alone.
-            if let Some(te) = &turn_eval {
-                let approved = matches!(
-                    te.envelope.verdict,
-                    crate::findings::MachineVerdict::Approve
-                );
-                if approved && !agg.complete_canonical_terminal {
-                    return Err(errors::evidence_review_too_thin(
-                        "the reviewer approved without being served the complete canonical \
-                         working-tree diff paged to its end, so the approval would rest on less than \
-                         the whole change",
-                    ));
-                }
-            }
-        }
+        // Retire-capture-modes mechanism 4 (the fail-closed serve-record evidence floor) now lives
+        // inside the turn_eval computation above: `apply_evidence_floor` is applied to the finalized
+        // turn, preceded by a one-shot in-turn auto-repair that gives the reviewer a chance to pull
+        // the whole current change first. Where this used to `return Err(EVIDENCE_UNAVAILABLE)` and
+        // strand the session (the reviewer never pulled the diff, or approved on a narrowed slice), an
+        // unmet floor is now a resumable `changes_requested` (EvidenceIncomplete) — the approval is
+        // still never accepted, but a converging review is re-reviewed rather than lost. Perforce is
+        // unaffected: it has no `repository_diff`, so it keeps the health early-return above.
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and

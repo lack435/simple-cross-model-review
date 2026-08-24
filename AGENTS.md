@@ -119,6 +119,20 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   around this by getting the reviewer to mark a genuinely-deferred finding `resolved` — that corrupts
   the record. If that temptation recurs, that is the signal to revisit #82 (a reviewer-set deferral
   disposition, which removes the ambiguity rather than annotating it) instead of documenting around it.
+- **`changes_requested` with `non_convergence_reason: evidence_incomplete` means the reviewer's
+  judgement was not shown the whole current change — re-review, do not treat it as a lost review.**
+  For a git review, an approval is only accepted if the reviewer was served the *complete* canonical
+  `branch-base..worktree` diff, paged to its end, on the turn it approves (a converging review that
+  approved after re-checking only the changed file has not cleared this). The server first asks the
+  reviewer *once*, in the same turn, to pull the whole current diff and decide again — so most such
+  turns resolve to a genuine `converged` or a real `changes_requested` without you seeing anything.
+  When that auto-repair could not confirm it, the turn comes back as `changes_requested` /
+  `evidence_incomplete` **instead of the old hard `EVIDENCE_UNAVAILABLE`**: the approval is never
+  accepted, but the session stays **resumable** — just re-review it on the same session (the reviewer
+  is reminded to pull the complete diff) rather than rebaselining. This replaced a gate that stranded
+  legitimate converging reviews; `EVIDENCE_UNAVAILABLE` now means only that the evidence *service*
+  could not be proved available (or a Perforce review with no content), not that a git reviewer merely
+  needed one more look at the diff.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
   and what is still disputed. Keep findings the reviewer has confirmed resolved separate
   from ones you argued against — they are not the same claim.

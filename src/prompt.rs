@@ -31,10 +31,16 @@ Anything you lacked the access or context to verify. Omit this section if it is 
 
 pub const FOLLOW_UP_GUIDANCE: &str = "This is a follow-up turn in the same review session. Re-review with your earlier findings in mind, and state explicitly which of your previous findings are now resolved, which are still open, and whether the new work introduced anything new. Use the same response structure as before.";
 
-/// The live-git approval floor is enforced independently of the model's prose. Restate it on every
+/// The live-git evidence floor is enforced independently of the model's prose. Restate it on every
 /// resumed turn: the full capability block is intentionally turn-1-only, and a long conversation can
 /// leave this operational requirement too far back for the reviewer to follow reliably.
-pub const RESUMED_CANONICAL_DIFF_REMINDER: &str = "Before returning APPROVE on this turn, call `repository_diff` with `base: \"branch-base\"` and `head: \"worktree\"`, without `path`, and follow every continuation cursor until `complete: true`. Prior-turn diff coverage and narrower path diffs do not satisfy this turn's approval gate.";
+///
+/// Phrased for *any* verdict, not only APPROVE: the working tree may have moved since the last turn,
+/// so the reminder is about seeing the current change before judging it — an earlier "before you
+/// APPROVE" framing left a reviewer about to request changes with no instruction, and it would then
+/// answer from a stale view. The hard requirement it states is still the approval floor, because that
+/// is the judgement that must rest on the whole change.
+pub const RESUMED_CANONICAL_DIFF_REMINDER: &str = "The change under review may have moved since your last turn, so re-establish what it is now before you judge it this turn — do not let your verdict rest on a view of the change that is now stale. To return APPROVE you must have called `repository_diff` with `base: \"branch-base\"` and `head: \"worktree\"`, without `path`, following every continuation cursor until `complete: true`: an earlier turn's diff and narrower path diffs do not satisfy that floor. If you only need to re-check the files that changed since your last turn, read them — but an approval still requires having been served the whole current change.";
 
 pub struct PromptParts<'a> {
     pub instructions: &'a str,
@@ -321,6 +327,34 @@ pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -
          again, do not revise, add, or withdraw findings, and do not change your verdict. Your \
          prose review has been kept exactly as you wrote it -- what is missing is only its \
          machine-readable record, so re-state what you already said, in the required form.\n\n",
+    );
+    s.push_str(&machine_block_section(nonce, prior_digest));
+    s.push('\n');
+    s
+}
+
+/// One evidence-repair follow-up: the reviewer's answer would not clear the per-turn evidence floor
+/// (an approval not served the whole current change, or a turn that read no repository content), so
+/// ask it once — in the same conversation — to pull the complete current canonical diff and decide
+/// again on the strength of it. Unlike [`block_repair`], this **is** a re-review: the point is that
+/// the reviewer looks at the whole current change, so its verdict may legitimately change, and the
+/// re-emitted block is authoritative. Its `repository_diff` calls append to this turn's serve-record,
+/// which is what the evidence floor re-checks afterward.
+pub fn evidence_repair(nonce: &str, prior_digest: Option<&str>) -> String {
+    let mut s = String::new();
+    s.push_str("## Judge the whole current change before your verdict stands\n\n");
+    s.push_str(
+        "Your review has not been shown the current, complete change this turn, so its verdict \
+         cannot be trusted to rest on the whole of it. This can happen when an earlier turn showed \
+         you the change and this turn only re-checked part of it — but the working tree may have \
+         moved since, and a fix for one finding can introduce or reveal a defect anywhere in the \
+         change.\n\n\
+         Call `repository_diff` with `base: \"branch-base\"` and `head: \"worktree\"`, without \
+         `path`, and follow every continuation cursor until the response reports `complete: true`. \
+         Read the whole current change end to end, then decide again: if it is correct, approve; if \
+         this turn's edits introduced or revealed a defect anywhere in it, request changes and name \
+         the finding. Do not approve on the strength of an earlier turn's view. Re-emit your prose \
+         review and your machine block reflecting this decision.\n\n",
     );
     s.push_str(&machine_block_section(nonce, prior_digest));
     s.push('\n');
@@ -682,7 +716,13 @@ mod tests {
             "{resumed}"
         );
         assert!(resumed.contains("without `path`"), "{resumed}");
-        assert!(resumed.contains("Prior-turn diff coverage"), "{resumed}");
+        // Verdict-agnostic: it speaks to seeing the current change on any verdict, not only APPROVE,
+        // while still stating the approval floor as the hard requirement.
+        assert!(
+            resumed.contains("may have moved since your last turn"),
+            "{resumed}"
+        );
+        assert!(resumed.contains("To return APPROVE"), "{resumed}");
     }
 
     #[test]
