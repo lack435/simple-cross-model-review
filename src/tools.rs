@@ -4109,6 +4109,11 @@ impl Job {
             if evidence_setup.is_some()
                 && self.cfg.vcs == crate::config::Vcs::Git
                 && !self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+                // Never launch another resumed reviewer after the block-repair loop already hit an
+                // account refusal (cross-review f1): the account moved mid-turn, the turn is already
+                // going to be non-durable and non-resumable, and spawning again under a moved account
+                // is exactly what the refusal exists to stop.
+                && !repair_refused_on_account
             {
                 let agg = read_serve_record_aggregate(&self.cfg, &self.id);
                 let looked_at_something = agg.any_diff
@@ -4147,7 +4152,12 @@ impl Job {
                                     prior_snapshot.clone(),
                                 );
                                 if reassessed.is_structured() {
-                                    assessment = reassessed;
+                                    // Preserve any block-repair marker from the main run: the
+                                    // re-review supersedes the verdict, but a block repair that ran
+                                    // (and was billed) this turn must still show on the envelope
+                                    // (cross-review f3).
+                                    assessment = reassessed
+                                        .carry_block_repair(assessment.block_repair_marker());
                                     evidence_repair_unconfirmed = false;
                                     warnings_from_repair.push(
                                         "the reviewer had not been served the whole current change, \

@@ -1599,6 +1599,24 @@ impl TurnAssessment {
         (!self.prior_findings.is_empty()).then(|| render_digest(&self.prior_findings))
     }
 
+    /// The block-repair marker this assessment carries, if a block repair ran on it. Read before an
+    /// evidence re-review replaces the assessment, so a block repair that already happened this turn
+    /// is not dropped from the envelope/metrics.
+    pub fn block_repair_marker(&self) -> Option<BlockRepair> {
+        self.repair
+    }
+
+    /// Carry a prior block-repair marker onto this assessment when it has none of its own. Used when
+    /// an evidence re-review (a fresh `assess_turn`, which never itself block-repairs) supersedes the
+    /// main-run assessment: the re-review is the turn's answer, but a block repair that ran on the
+    /// main run still happened and was billed, so its marker must survive on the final envelope.
+    pub fn carry_block_repair(mut self, prior: Option<BlockRepair>) -> Self {
+        if self.repair.is_none() {
+            self.repair = prior;
+        }
+        self
+    }
+
     /// Record something the reviewer said on a repair turn beyond the block itself.
     ///
     /// Owns the framing so both channels get identically-framed notes: the caller used to append
