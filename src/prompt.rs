@@ -31,6 +31,11 @@ Anything you lacked the access or context to verify. Omit this section if it is 
 
 pub const FOLLOW_UP_GUIDANCE: &str = "This is a follow-up turn in the same review session. Re-review with your earlier findings in mind, and state explicitly which of your previous findings are now resolved, which are still open, and whether the new work introduced anything new. Use the same response structure as before.";
 
+/// The live-git approval floor is enforced independently of the model's prose. Restate it on every
+/// resumed turn: the full capability block is intentionally turn-1-only, and a long conversation can
+/// leave this operational requirement too far back for the reviewer to follow reliably.
+pub const RESUMED_CANONICAL_DIFF_REMINDER: &str = "Before returning APPROVE on this turn, call `repository_diff` with `base: \"branch-base\"` and `head: \"worktree\"`, without `path`, and follow every continuation cursor until `complete: true`. Prior-turn diff coverage and narrower path diffs do not satisfy this turn's approval gate.";
+
 pub struct PromptParts<'a> {
     pub instructions: &'a str,
     pub context_paths: &'a [String],
@@ -54,6 +59,10 @@ pub struct PromptParts<'a> {
     /// may have moved since the previous turn, so it does not read a legitimate change as a
     /// contradiction of its earlier findings.
     pub resumed_capture_note: Option<&'a str>,
+    /// A short operational requirement rendered near the end of a resumed formal-review prompt.
+    /// Git review callers use this to restate the per-turn canonical-diff approval floor without
+    /// repeating the whole capability block. `None` for first turns and non-git reviews.
+    pub resumed_approval_requirement: Option<&'a str>,
     /// This review's nonce (derived from the review id). When `Some`, the machine-readable
     /// findings-block contract is rendered on **every** turn, carrying this nonce, so the reviewer
     /// emits exactly the block the server extracts. The nonce changes each turn, and the
@@ -150,6 +159,9 @@ pub fn build(parts: &PromptParts) -> String {
 
     if parts.resumed {
         out.push_str(&format!("\n{FOLLOW_UP_GUIDANCE}\n"));
+        if let Some(requirement) = parts.resumed_approval_requirement {
+            out.push_str(&format!("\n{}\n", requirement.trim()));
+        }
         // The block contract renders before this guidance, so on a resumed turn the last thing the
         // reviewer reads would otherwise be the follow-up instruction. One line restores it to the
         // end. An unmeasured mitigation, not a fix -- whether it reduces missing blocks is what the
@@ -423,6 +435,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -449,6 +462,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -501,6 +515,7 @@ mod tests {
             capabilities: Some("You have no shell."),
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -519,6 +534,7 @@ mod tests {
             capabilities: Some("You have no shell."),
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -539,6 +555,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -564,6 +581,7 @@ mod tests {
                 capabilities: None,
                 change: Some("## Change under review\n\n+ added a line\n"),
                 resumed_capture_note: None,
+                resumed_approval_requirement: None,
                 nonce: None,
                 prior_findings_digest: None,
                 neutral_root: None,
@@ -588,6 +606,7 @@ mod tests {
             capabilities: None,
             change: Some("## Change under review\n\n+ y\n"),
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -611,6 +630,7 @@ mod tests {
             capabilities: None,
             change: Some("## Change under review\n\n+ y\n"),
             resumed_capture_note: Some(note),
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -627,6 +647,45 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_git_review_restates_the_canonical_diff_approval_floor_near_the_end() {
+        let (cwd, paths) = fixtures();
+        let parts = |resumed| PromptParts {
+            instructions: "Review the focused animation fix.",
+            context_paths: &paths,
+            cwd: &cwd,
+            turn: if resumed { 4 } else { 1 },
+            resumed,
+            preamble: None,
+            capabilities: None,
+            change: None,
+            resumed_capture_note: None,
+            resumed_approval_requirement: Some(RESUMED_CANONICAL_DIFF_REMINDER),
+            nonce: Some("rv-42-4"),
+            prior_findings_digest: None,
+            neutral_root: None,
+        };
+
+        // Turn 1 already receives the full capability block from the caller. The compact reminder
+        // is for resumed turns, where that block is intentionally omitted.
+        assert!(!build(&parts(false)).contains(RESUMED_CANONICAL_DIFF_REMINDER));
+
+        let resumed = build(&parts(true));
+        let guidance_at = resumed
+            .find(FOLLOW_UP_GUIDANCE)
+            .expect("follow-up guidance");
+        let reminder_at = resumed
+            .find(RESUMED_CANONICAL_DIFF_REMINDER)
+            .expect("canonical diff reminder");
+        let block_reminder_at = resumed.find(BLOCK_REMINDER).expect("block reminder");
+        assert!(
+            guidance_at < reminder_at && reminder_at < block_reminder_at,
+            "{resumed}"
+        );
+        assert!(resumed.contains("without `path`"), "{resumed}");
+        assert!(resumed.contains("Prior-turn diff coverage"), "{resumed}");
+    }
+
+    #[test]
     fn the_machine_block_contract_renders_on_every_turn_with_the_nonce() {
         let (cwd, paths) = fixtures();
         for (resumed, turn) in [(false, 1u32), (true, 2u32)] {
@@ -640,6 +699,7 @@ mod tests {
                 capabilities: None,
                 change: None,
                 resumed_capture_note: None,
+                resumed_approval_requirement: None,
                 nonce: Some("rv-42-7"),
                 prior_findings_digest: None,
                 neutral_root: None,
@@ -679,6 +739,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: Some("rv-42-3"),
             prior_findings_digest: Some(digest),
             neutral_root: None,
@@ -713,6 +774,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: Some("rv-42-1"),
             prior_findings_digest: None,
             neutral_root: None,
@@ -734,6 +796,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -754,6 +817,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root,
@@ -780,6 +844,7 @@ mod tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
@@ -839,6 +904,7 @@ mod repair_prompt_tests {
             capabilities: None,
             change: None,
             resumed_capture_note: None,
+            resumed_approval_requirement: None,
             nonce,
             prior_findings_digest: None,
             neutral_root: None,

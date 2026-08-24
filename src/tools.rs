@@ -3814,6 +3814,9 @@ impl Job {
                 capabilities,
                 change: prompt_change,
                 resumed_capture_note,
+                resumed_approval_requirement: (resume_id.is_some()
+                    && self.cfg.vcs == crate::config::Vcs::Git)
+                    .then_some(prompt::RESUMED_CANONICAL_DIFF_REMINDER),
                 // The nonce is this review's id (`rv-<pid>-<counter>`), unique per turn — a static
                 // repository lookalike cannot know it. The prior-findings digest is built from the
                 // loaded ledger in the worker wiring (task: tools.rs worker); `None` renders the
