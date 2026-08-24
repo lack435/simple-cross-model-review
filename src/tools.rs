@@ -4152,12 +4152,15 @@ impl Job {
                                     prior_snapshot.clone(),
                                 );
                                 if reassessed.is_structured() {
-                                    // Preserve any block-repair marker from the main run: the
-                                    // re-review supersedes the verdict, but a block repair that ran
-                                    // (and was billed) this turn must still show on the envelope
-                                    // (cross-review f3).
-                                    assessment = reassessed
-                                        .carry_block_repair(assessment.block_repair_marker());
+                                    // Preserve the main run's block-repair marker and prose notes:
+                                    // the re-review supersedes the verdict, but a block repair that
+                                    // ran (and was billed) this turn must still show on the envelope
+                                    // (cross-review f3), and any commentary it carried must not be
+                                    // silently dropped (cross-review f4).
+                                    let prior_marker = assessment.block_repair_marker();
+                                    let prior_notes = assessment.block_repair_notes();
+                                    assessment =
+                                        reassessed.carry_prior_repair(prior_marker, prior_notes);
                                     evidence_repair_unconfirmed = false;
                                     warnings_from_repair.push(
                                         "the reviewer had not been served the whole current change, \

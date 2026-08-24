@@ -1606,13 +1606,30 @@ impl TurnAssessment {
         self.repair
     }
 
-    /// Carry a prior block-repair marker onto this assessment when it has none of its own. Used when
-    /// an evidence re-review (a fresh `assess_turn`, which never itself block-repairs) supersedes the
-    /// main-run assessment: the re-review is the turn's answer, but a block repair that ran on the
-    /// main run still happened and was billed, so its marker must survive on the final envelope.
-    pub fn carry_block_repair(mut self, prior: Option<BlockRepair>) -> Self {
+    /// The block-repair prose notes this assessment accumulated (the reviewer's commentary beyond the
+    /// block on a block-repair turn). Read alongside [`block_repair_marker`](Self::block_repair_marker)
+    /// before an evidence re-review replaces the assessment, so that commentary is not silently lost.
+    pub fn block_repair_notes(&self) -> Vec<String> {
+        self.repair_notes.clone()
+    }
+
+    /// Carry a prior turn's block-repair marker and prose notes onto this assessment. Used when an
+    /// evidence re-review (a fresh `assess_turn`, which never itself block-repairs, so it has neither
+    /// of its own) supersedes the main-run assessment: the re-review is the turn's answer, but a block
+    /// repair that ran on the main run still happened, was billed, and may have carried reviewer
+    /// commentary — both must survive on the final envelope. The prior notes go first so any note the
+    /// re-review itself later carries trails them in order.
+    pub fn carry_prior_repair(
+        mut self,
+        marker: Option<BlockRepair>,
+        mut notes: Vec<String>,
+    ) -> Self {
         if self.repair.is_none() {
-            self.repair = prior;
+            self.repair = marker;
+        }
+        if !notes.is_empty() {
+            notes.append(&mut self.repair_notes);
+            self.repair_notes = notes;
         }
         self
     }
