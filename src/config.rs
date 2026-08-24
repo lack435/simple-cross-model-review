@@ -1608,7 +1608,15 @@ impl Config {
             .block_repair_timeout
             .as_secs()
             .saturating_add(PREFLIGHT_CAP_SECS);
-        let repair = per_repair.saturating_mul(self.block_repair_attempts as u64);
+        // The configured block-repair attempts, plus one always-available evidence auto-repair
+        // (git + evidence path): it runs one more resumed reviewer round-trip through the same
+        // `run_block_repair` budget, and unlike block-repair it can fire even at
+        // `--block-repair-attempts 0`, so a blocking collect advertised as covering a whole review
+        // must budget for it too (cross-review f2). Added unconditionally as a conservative upper
+        // bound — a non-git review simply never spends it.
+        let repair = per_repair
+            .saturating_mul(self.block_repair_attempts as u64)
+            .saturating_add(per_repair);
         let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
             .saturating_add(self.timeout.as_secs())
@@ -2801,15 +2809,18 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert_eq!(cfg.reviewers.len(), 1);
         assert_eq!(cfg.primary().reviewer, ReviewerKind::Codex);
-        // Capture + timeout + the default block-repair budget + grace.
+        // Capture + timeout + the default block-repair budget + one always-available evidence
+        // auto-repair + grace.
+        let per_repair = cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS;
         let single = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
-            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
-                * cfg.block_repair_attempts as u64
+            + per_repair * cfg.block_repair_attempts as u64
+            + per_repair
             + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), single);
 
-        // With repairs disabled the budget is byte-for-byte what it was before they existed.
+        // With block repairs disabled the budget still carries the one evidence auto-repair term,
+        // which fires independently of --block-repair-attempts.
         let no_repair = Config::from_args(&args(&[
             "--reviewer",
             "codex",
@@ -2817,10 +2828,12 @@ mod tests {
             "0",
         ]))
         .expect("config");
+        let per_repair_nr = no_repair.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS;
         assert_eq!(
             no_repair.max_wait_secs(),
             crate::vcs::CAPTURE_BUDGET.as_secs()
                 + no_repair.timeout.as_secs()
+                + per_repair_nr
                 + FINALIZATION_GRACE_SECS
         );
     }
@@ -2864,8 +2877,10 @@ mod tests {
         let cfg = Config::from_args(&args(&["--reviewer", "claude", "--reviewer", "codex"]))
             .expect("config");
         // A fallback entry's turn can degrade and repair too, so the repair term appears in both.
-        let repair = (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
-            * cfg.block_repair_attempts as u64;
+        // It includes the one always-available evidence auto-repair on top of the block-repair
+        // attempts.
+        let per_repair = cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS;
+        let repair = per_repair * cfg.block_repair_attempts as u64 + per_repair;
         let single = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
             + repair
@@ -3512,10 +3527,11 @@ mod tests {
         // Capture budget + reviewer turn + the block-repair budget + finalization grace, so a
         // single blocking collect can cover a whole review -- including a degraded turn that spends
         // its whole turn budget and then re-asks for the block -- rather than a fixed 300s window.
+        let per_repair = cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS;
         let expected = crate::vcs::CAPTURE_BUDGET.as_secs()
             + cfg.timeout.as_secs()
-            + (cfg.block_repair_timeout.as_secs() + PREFLIGHT_CAP_SECS)
-                * cfg.block_repair_attempts as u64
+            + per_repair * cfg.block_repair_attempts as u64
+            + per_repair
             + FINALIZATION_GRACE_SECS;
         assert_eq!(cfg.max_wait_secs(), expected);
         assert!(cfg.max_wait_secs() > 300);

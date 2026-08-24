@@ -209,6 +209,15 @@ pub enum NonConvergenceReason {
     /// is why issue #78's per-finding half was closed won't-fix. It says only that the record stopped
     /// moving. See `docs/finding-liveness.md`.
     SessionStagnant,
+    /// The reviewer was not served the *current, complete* change this turn: an approving turn that
+    /// was not shown the whole canonical `branch-base..worktree` diff paged to its end, or any turn
+    /// that read no repository content at all. Re-review the same session (not terminal): the
+    /// per-turn evidence floor is unmet, so the reviewer's judgement — an approval especially —
+    /// cannot be trusted to rest on the whole current change. Unlike the old hard `EVIDENCE_UNAVAILABLE`
+    /// this keeps the session resumable, so a converging review that needs one more look at the whole
+    /// diff is a re-review, not a lost session. An in-turn auto-repair tries to satisfy the floor
+    /// before this reason is ever reported; it appears only when that repair could not.
+    EvidenceIncomplete,
 }
 
 /// What the caller should **do next**, as a total function of [`NonConvergenceReason`].
@@ -241,7 +250,9 @@ impl Outcome {
         use NonConvergenceReason::*;
         match reason {
             None => Outcome::Converged,
-            Some(OpenFindings) | Some(VerdictContradiction) => Outcome::ChangesRequested,
+            Some(OpenFindings) | Some(VerdictContradiction) | Some(EvidenceIncomplete) => {
+                Outcome::ChangesRequested
+            }
             Some(ReviewerBlocked) | Some(ReviewerWithheldApprove) => Outcome::Escalate,
             Some(LedgerUnavailable)
             | Some(TurnNotDurable)
@@ -281,9 +292,14 @@ impl NonConvergenceReason {
             TurnNotDurable => 2,
             SessionStagnant => 3,
             ReviewerBlocked => 4,
-            VerdictContradiction => 5,
-            ReviewerWithheldApprove => 6,
-            OpenFindings => 7,
+            // Outranks the verdict/open-count reasons: "you were not shown the whole current change"
+            // is a more fundamental thing to report than a verdict that contradicts the open count,
+            // and an unproven approval is the case this exists to catch. It yields to the sticky
+            // terminal/durability reasons and to a reviewer that blocked, which speak to graver states.
+            EvidenceIncomplete => 5,
+            VerdictContradiction => 6,
+            ReviewerWithheldApprove => 7,
+            OpenFindings => 8,
         }
     }
 
@@ -1556,6 +1572,68 @@ impl TurnAssessment {
         self.result.is_ok()
     }
 
+    /// Whether this turn's block, as it stands, would resolve to a machine `approve` — a structured
+    /// `approve`/`approve_with_comments` verdict with no open findings. Mirrors the Approve arms of
+    /// `resolve_structured`'s truth table, and is used *before* `finalize_turn` to decide whether the
+    /// per-turn evidence floor's approval requirement applies, so the in-turn evidence auto-repair can
+    /// run against the reviewer's provisional verdict. A degraded (unstructured) turn is never an
+    /// approve.
+    pub fn provisional_approve(&self) -> bool {
+        match &self.result {
+            Ok((detail, findings, _)) => {
+                let open = findings.iter().filter(|f| f.status.is_open()).count();
+                open == 0
+                    && matches!(
+                        detail,
+                        VerdictDetail::Approve | VerdictDetail::ApproveWithComments
+                    )
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The prior-findings digest to restate on a resumed repair prompt, or `None` on a first turn.
+    /// Same rule `plan_repair` uses for the block-repair prompt, exposed so the evidence auto-repair
+    /// can carry the identical restatement contract without reaching into private fields.
+    pub fn prior_digest(&self) -> Option<String> {
+        (!self.prior_findings.is_empty()).then(|| render_digest(&self.prior_findings))
+    }
+
+    /// The block-repair marker this assessment carries, if a block repair ran on it. Read before an
+    /// evidence re-review replaces the assessment, so a block repair that already happened this turn
+    /// is not dropped from the envelope/metrics.
+    pub fn block_repair_marker(&self) -> Option<BlockRepair> {
+        self.repair
+    }
+
+    /// The block-repair prose notes this assessment accumulated (the reviewer's commentary beyond the
+    /// block on a block-repair turn). Read alongside [`block_repair_marker`](Self::block_repair_marker)
+    /// before an evidence re-review replaces the assessment, so that commentary is not silently lost.
+    pub fn block_repair_notes(&self) -> Vec<String> {
+        self.repair_notes.clone()
+    }
+
+    /// Carry a prior turn's block-repair marker and prose notes onto this assessment. Used when an
+    /// evidence re-review (a fresh `assess_turn`, which never itself block-repairs, so it has neither
+    /// of its own) supersedes the main-run assessment: the re-review is the turn's answer, but a block
+    /// repair that ran on the main run still happened, was billed, and may have carried reviewer
+    /// commentary — both must survive on the final envelope. The prior notes go first so any note the
+    /// re-review itself later carries trails them in order.
+    pub fn carry_prior_repair(
+        mut self,
+        marker: Option<BlockRepair>,
+        mut notes: Vec<String>,
+    ) -> Self {
+        if self.repair.is_none() {
+            self.repair = marker;
+        }
+        if !notes.is_empty() {
+            notes.append(&mut self.repair_notes);
+            self.repair_notes = notes;
+        }
+        self
+    }
+
     /// Record something the reviewer said on a repair turn beyond the block itself.
     ///
     /// Owns the framing so both channels get identically-framed notes: the caller used to append
@@ -1874,6 +1952,77 @@ pub fn finalize_turn(
     evaluation.review_prose = review_prose;
     evaluation.envelope_prose = envelope_prose;
     evaluation
+}
+
+/// What the reviewer's own evidence calls established this turn, distilled from the evidence
+/// server's serve-record and (for the shell-less Claude reviewer) its stream. The per-turn evidence
+/// floor is expressed over exactly these two facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvidenceCoverage {
+    /// The reviewer read *some* real repository content this turn — a `repository_diff`, or any
+    /// non-scope `repository_*` read. A turn that read nothing answered from stale conversation
+    /// context alone.
+    pub looked_at_something: bool,
+    /// The reviewer was served the whole current canonical `branch-base..worktree` diff, paged to
+    /// its terminal page (the `complete_canonical_terminal` floor). This is what an approval must
+    /// rest on.
+    pub complete_canonical: bool,
+}
+
+impl EvidenceCoverage {
+    /// Whether this turn's evidence clears the floor for the given resolved verdict. Keep-requirement:
+    /// an `approve` must have been served the current complete canonical diff; every turn must have
+    /// looked at real content (an approval that looked at nothing is caught by the first clause too).
+    fn clears_floor(&self, verdict: MachineVerdict) -> bool {
+        if !self.looked_at_something {
+            return false;
+        }
+        if matches!(verdict, MachineVerdict::Approve) && !self.complete_canonical {
+            return false;
+        }
+        true
+    }
+}
+
+/// Apply the per-turn evidence floor to a finalized structured turn (git only; the caller gates on
+/// backend). When the floor is unmet, downgrade the turn to a resumable `changes_requested` carrying
+/// [`NonConvergenceReason::EvidenceIncomplete`]: an unproven approval is never reported as
+/// `approve`/`converged`, but the session stays resumable so the caller re-reviews rather than losing
+/// it. A degraded (unstructured) turn is left untouched — it has no trusted verdict to gate, is
+/// already non-converged, and its recovery path is block-repair, not this. The in-turn auto-repair is
+/// expected to satisfy the floor before this ever fires; this is the fail-closed backstop for when it
+/// could not.
+pub fn apply_evidence_floor(
+    mut eval: TurnEvaluation,
+    coverage: EvidenceCoverage,
+) -> TurnEvaluation {
+    if !eval.envelope.structured {
+        return eval;
+    }
+    if coverage.clears_floor(eval.envelope.verdict) {
+        return eval;
+    }
+    // Never let an unproven approval stand as an approval, on either channel.
+    eval.envelope.verdict = MachineVerdict::Changes;
+    let reason = [
+        eval.envelope.non_convergence_reason,
+        Some(NonConvergenceReason::EvidenceIncomplete),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|r| r.rank());
+    eval.envelope.non_convergence_reason = reason;
+    eval.envelope.converged = false;
+    eval.envelope.outcome = Outcome::from_reason(reason);
+    eval.envelope.warnings.push(
+        "the reviewer was not served the current, complete change this turn (an approval requires \
+         the whole canonical branch-base..worktree diff, paged to its end; every turn must read some \
+         repository content), so its verdict was recorded as changes_requested rather than trusted. \
+         The session is still resumable: re-review it, pulling the complete current diff, so the \
+         judgement rests on the whole change."
+            .to_string(),
+    );
+    eval
 }
 
 /// The corrective instruction a repair prompt carries for an extraction failure — phrased at the
@@ -3024,6 +3173,188 @@ mod tests {
         assert_eq!(ev.envelope.total_count, Some(2));
         assert!(ev.envelope.findings_trusted);
         assert_eq!(ev.ledger.findings.len(), 2, "the record survives intact");
+    }
+
+    // --- Per-turn evidence floor (retire-capture-modes) ---------------------------------------
+
+    fn clean_approve(nonce: &str) -> TurnEvaluation {
+        turn_with_prior(
+            1,
+            nonce,
+            r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
+            prior_of(Vec::new(), 1),
+            0,
+        )
+    }
+
+    #[test]
+    fn evidence_floor_downgrades_an_approve_not_served_the_whole_change_to_resumable_changes() {
+        let ev = clean_approve("rv-ev-1");
+        assert!(
+            ev.envelope.converged,
+            "a clean approve converges before the floor"
+        );
+        let ev = apply_evidence_floor(
+            ev,
+            EvidenceCoverage {
+                looked_at_something: true,
+                complete_canonical: false,
+            },
+        );
+        assert!(!ev.envelope.converged);
+        assert_eq!(ev.envelope.verdict, MachineVerdict::Changes);
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::EvidenceIncomplete)
+        );
+        assert_eq!(ev.envelope.outcome, Outcome::ChangesRequested);
+        // Resumable: EvidenceIncomplete is never a sticky terminal state.
+        assert!(NonConvergenceReason::EvidenceIncomplete
+            .sticky_terminal()
+            .is_none());
+        // The reviewer's own verdict_detail is preserved; only the folded machine verdict changes.
+        assert_eq!(ev.envelope.verdict_detail, Some(VerdictDetail::Approve));
+    }
+
+    #[test]
+    fn evidence_floor_downgrades_a_turn_that_read_nothing_whatever_its_verdict() {
+        let ev = turn_with_prior(
+            1,
+            "rv-ev-2",
+            r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#,
+            prior_of(Vec::new(), 1),
+            0,
+        );
+        let ev = apply_evidence_floor(
+            ev,
+            EvidenceCoverage {
+                looked_at_something: false,
+                complete_canonical: false,
+            },
+        );
+        // EvidenceIncomplete outranks the turn's own OpenFindings reason and is what gets reported.
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::EvidenceIncomplete)
+        );
+        assert_eq!(ev.envelope.outcome, Outcome::ChangesRequested);
+    }
+
+    #[test]
+    fn evidence_floor_leaves_a_fully_served_approval_converged() {
+        let ev = apply_evidence_floor(
+            clean_approve("rv-ev-3"),
+            EvidenceCoverage {
+                looked_at_something: true,
+                complete_canonical: true,
+            },
+        );
+        assert!(ev.envelope.converged);
+        assert_eq!(ev.envelope.verdict, MachineVerdict::Approve);
+        assert_eq!(ev.envelope.non_convergence_reason, None);
+        assert_eq!(ev.envelope.outcome, Outcome::Converged);
+    }
+
+    #[test]
+    fn evidence_floor_leaves_a_non_approving_turn_that_read_content_untouched() {
+        // request_changes with an open finding: it read the relevant file and flagged an issue; it
+        // does not need the whole canonical diff, so its own OpenFindings reason stands unchanged.
+        let ev = turn_with_prior(
+            1,
+            "rv-ev-4",
+            r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#,
+            prior_of(Vec::new(), 1),
+            0,
+        );
+        let before = ev.envelope.non_convergence_reason;
+        assert_eq!(before, Some(NonConvergenceReason::OpenFindings));
+        let ev = apply_evidence_floor(
+            ev,
+            EvidenceCoverage {
+                looked_at_something: true,
+                complete_canonical: false,
+            },
+        );
+        assert_eq!(ev.envelope.non_convergence_reason, before);
+    }
+
+    #[test]
+    fn evidence_floor_does_not_touch_a_degraded_turn() {
+        // No usable block → unstructured → already non-converged; block-repair, not the evidence
+        // floor, is its recovery path, so the floor is a no-op even on the worst coverage.
+        let ev = finalize_turn(
+            assess_turn(
+                "s",
+                1,
+                "rv-ev-5",
+                "no block at all",
+                Some(prior_of(Vec::new(), 1)),
+            ),
+            Budget::default(),
+            0,
+        );
+        assert!(!ev.envelope.structured);
+        let before = ev.envelope.non_convergence_reason;
+        let ev = apply_evidence_floor(
+            ev,
+            EvidenceCoverage {
+                looked_at_something: false,
+                complete_canonical: false,
+            },
+        );
+        assert_eq!(ev.envelope.non_convergence_reason, before);
+    }
+
+    #[test]
+    fn evidence_incomplete_is_resumable_changes_requested() {
+        assert_eq!(
+            Outcome::from_reason(Some(NonConvergenceReason::EvidenceIncomplete)),
+            Outcome::ChangesRequested
+        );
+        assert!(NonConvergenceReason::EvidenceIncomplete
+            .sticky_terminal()
+            .is_none());
+    }
+
+    #[test]
+    fn provisional_approve_reads_the_would_be_verdict() {
+        let approve = assess_turn(
+            "s",
+            1,
+            "rv-ev-6",
+            &block(
+                "rv-ev-6",
+                r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
+            ),
+            Some(prior_of(Vec::new(), 1)),
+        );
+        assert!(approve.provisional_approve());
+        // approve with a new open finding folds to changes, so it is not a provisional approve.
+        let approve_open = assess_turn(
+            "s",
+            1,
+            "rv-ev-7",
+            &block(
+                "rv-ev-7",
+                r#"{"verdict":"approve","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#,
+            ),
+            Some(prior_of(Vec::new(), 1)),
+        );
+        assert!(!approve_open.provisional_approve());
+        let changes = assess_turn(
+            "s",
+            1,
+            "rv-ev-8",
+            &block(
+                "rv-ev-8",
+                r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#,
+            ),
+            Some(prior_of(Vec::new(), 1)),
+        );
+        assert!(!changes.provisional_approve());
+        // A degraded (blockless) turn is never a provisional approve.
+        let degraded = assess_turn("s", 1, "rv-ev-9", "no block", Some(prior_of(Vec::new(), 1)));
+        assert!(!degraded.provisional_approve());
     }
 
     #[test]

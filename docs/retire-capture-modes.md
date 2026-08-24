@@ -315,12 +315,39 @@ against a non-threat and cannot work anyway (see "Threat model").
   *attention* — it just cannot **approve** without having been served the whole working tree, end to
   end. A genuinely partial review is a `consult`, not an approving review.
 - **The rest is a sanity floor**, re-keyed from the static summary (`capture_thin`,
-  `src/tools.rs:3629`; enforced `:3895`) to the serve-record and unified across both reviewers. It
-  fails closed when an approval would rest on nothing or on something the server itself marked partial:
-  - *the reviewer never pulled a diff* → `EVIDENCE_UNAVAILABLE`;
+  `src/tools.rs:3629`) to the serve-record and unified across both reviewers. It fails closed when an
+  approval would rest on nothing or on something the server itself marked partial:
+  - *the reviewer never pulled a diff*, or read no repository content at all;
   - *the canonical diff was server-flagged incomplete* (truncated at the byte budget, unresolved/stale
     base per f4) or *left mid-pagination* (a cursor remained unfollowed) and the reviewer approved
     anyway → fail closed, because it approved on evidence known to be partial.
+
+- **Revision note (r5 → r6): the floor's *response* is resumable, not a hard stop, and it retries
+  once first.** The *requirement* above is unchanged — an approval still demands the complete
+  canonical diff, paged to its terminal page, this turn — but the way an unmet floor is handled was
+  reworked after it kept false-failing legitimate *converging* reviews and, worse, stranding them.
+  A late converging turn approves after re-checking only the file that changed, without re-pulling the
+  whole tree; the old gate hard-returned `EVIDENCE_UNAVAILABLE`, which is a code that says the review
+  *never ran*, and it left the session non-resumable, forcing a rebaseline that hand-carries the
+  findings. Two changes fix this without moving the requirement:
+  - **A one-shot in-turn auto-repair.** Before the floor is judged, a turn whose answer would not
+    clear it is asked *once*, in the same conversation, to pull the complete current canonical diff
+    and decide again on the strength of it (`src/prompt.rs::evidence_repair`, run through
+    `run_block_repair`). Its `repository_diff` calls append to the same serve-record, and because it
+    is a genuine *re-review* — the reviewer now sees the whole change — its structured answer replaces
+    the turn's, so a fix that revealed a defect across a dozen files is caught here rather than
+    approved. This is what makes your dozen-file case safe: the approval only stands after the whole
+    current change was served and re-judged.
+  - **A resumable downgrade, not a hard error.** If the floor is still unmet after that one repair,
+    the turn is recorded (durably, so the session stays resumable) as
+    `outcome: changes_requested` / `non_convergence_reason: evidence_incomplete`
+    (`src/findings.rs::apply_evidence_floor`) — the approval is **never** accepted, but the caller
+    re-reviews the same session rather than losing it. A repair that comes back without a usable block
+    is treated as *unconfirmed*: it cannot re-affirm an approval even if it pulled the diff, so the
+    approve still downgrades. `EVIDENCE_UNAVAILABLE` remains only for **Perforce** (no `repository_diff`,
+    so no canonical-diff auto-repair) and for the pre-model service-startup failures. The floor is thus
+    still fail-closed against a thin *approval*; only its blast radius shrank from "lost session" to
+    "one more re-review".
 - **What it still does not do — the anti-gaming line stays cut.** The floor checks that the server
   *served* the complete canonical diff and the reviewer *requested* it end to end. It does **not** try
   to prove the reviewer *read or comprehended* any page — that is the distinction that keeps this
