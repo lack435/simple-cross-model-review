@@ -1,5 +1,6 @@
 //! Claude Code adapter (`claude -p`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -573,22 +574,83 @@ pub(crate) fn claude_evidence_enabled(cfg: &Config, spec: &ReviewerSpec) -> bool
 ///
 /// `content_call_succeeded` is set once a non-`repository_scope` `repository_*` call returns a
 /// non-error `tool_result` -- proof the reviewer actually pulled change/tree evidence.
-/// `call_errored` is set if ANY evidence `tool_result` came back `is_error` -- a dead or timed-out
-/// server surfaces here (verified event shape: the Codex smoke showed a "tool call failed ... timed
-/// out awaiting tools/call" error result). The gate accepts a thin capture only when a content call
-/// succeeded AND nothing errored, so a success followed by a later transport failure does not slip
-/// through -- which is why this reads the WHOLE stream and never returns on the first success.
+/// `transport_error` is set only for an error result that was not an in-band application response
+/// from the evidence server. The server tags its own errors because Claude Code flattens away their
+/// structured error code; without that provenance, ordinary model mistakes such as `not_found` or
+/// `invalid_arguments` are indistinguishable from a disconnect and used to poison an otherwise
+/// complete review. Unknown/unmarked error shapes still fail closed. The whole stream is read so a
+/// success followed by a later transport failure cannot slip through.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct EvidenceHealth {
     pub content_call_succeeded: bool,
-    pub call_errored: bool,
+    pub transport_error: bool,
+    application_error_codes: Vec<String>,
 }
 
 impl EvidenceHealth {
-    /// Whether a thin-capture review may be trusted: real content evidence was obtained and no
-    /// evidence call failed.
+    /// Whether a thin-capture review may be trusted: real content evidence was obtained and the
+    /// evidence transport stayed usable. In-band application errors are visible to the reviewer and
+    /// do not make the service unavailable.
     pub(crate) fn is_ok(&self) -> bool {
-        self.content_call_succeeded && !self.call_errored
+        self.content_call_succeeded && !self.transport_error
+    }
+
+    /// Tell the caller about evidence calls that answered in-band without returning the requested
+    /// content. Codes are server-controlled and bounded by the evidence call limit; aggregate them
+    /// so the warning stays compact even when the reviewer retries.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        if self.application_error_codes.is_empty() {
+            return Vec::new();
+        }
+        let mut counts = BTreeMap::<&str, usize>::new();
+        for code in &self.application_error_codes {
+            *counts.entry(code).or_default() += 1;
+        }
+        let summary = counts
+            .into_iter()
+            .map(|(code, count)| {
+                if count == 1 {
+                    code.to_string()
+                } else {
+                    format!("{code} x{count}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        vec![format!(
+            "The repository evidence service answered {} tool call(s) with in-band tool errors \
+             ({summary}). These were application responses, not transport failures; the reviewer \
+             received each error, but the requested content from those calls was not returned.",
+            self.application_error_codes.len()
+        )]
+    }
+}
+
+/// Recover the server-controlled error code from the text Claude Code preserves in `stream-json`.
+/// Anything without the exact origin marker is not guessed at: it remains a transport/infrastructure
+/// error and fails closed. Accept both today's flattened string and a future client that preserves
+/// the MCP content-block array.
+fn evidence_application_error_code(item: &Value) -> Option<String> {
+    fn from_text(text: &str) -> Option<String> {
+        let tagged = text.strip_prefix(crate::evidence::TOOL_ERROR_MARKER)?;
+        let tagged = tagged.strip_prefix(':')?;
+        let (code, _) = tagged.split_once(": ")?;
+        (!code.is_empty()
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+        .then(|| code.to_string())
+    }
+
+    match item.get("content")? {
+        Value::String(text) => from_text(text),
+        Value::Array(blocks) => blocks.iter().find_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+                .and_then(from_text)
+        }),
+        _ => None,
     }
 }
 
@@ -651,7 +713,11 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     if is_error {
-                        health.call_errored = true;
+                        if let Some(code) = evidence_application_error_code(item) {
+                            health.application_error_codes.push(code);
+                        } else {
+                            health.transport_error = true;
+                        }
                     } else if content_ids.contains(id) {
                         health.content_call_succeeded = true;
                     }
@@ -1396,32 +1462,87 @@ mod tests {
                 r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"mcp__cross_review_evidence__{name}"}}]}}}}"#
             )
         }
-        fn result(id: &str, err: bool) -> String {
-            let e = if err { r#","is_error":true"# } else { "" };
+        fn result(id: &str) -> String {
             format!(
-                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}"{e}}}]}}}}"#
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}"}}]}}}}"#
+            )
+        }
+        fn error(id: &str, content: &str) -> String {
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":true,"content":{}}}]}}}}"#,
+                serde_json::to_string(content).unwrap()
+            )
+        }
+        fn application_error(id: &str, code: &str) -> String {
+            error(
+                id,
+                &format!(
+                    "{}:{code}: representative tool error",
+                    crate::evidence::TOOL_ERROR_MARKER
+                ),
+            )
+        }
+        fn application_error_blocks(id: &str, code: &str) -> String {
+            let text = format!(
+                "{}:{code}: preserved content block",
+                crate::evidence::TOOL_ERROR_MARKER
+            );
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":true,"content":[{{"type":"text","text":{}}}]}}]}}}}"#,
+                serde_json::to_string(&text).unwrap()
             )
         }
 
         // A successful content call (repository_change), nothing errored -> ok.
-        let ok = [call("repository_change", "t1"), result("t1", false)].join("\n");
+        let ok = [call("repository_change", "t1"), result("t1")].join("\n");
         let h = claude_evidence_health(&ok);
-        assert!(h.content_call_succeeded && !h.call_errored && h.is_ok());
+        assert!(h.content_call_succeeded && !h.transport_error && h.is_ok());
+        assert!(h.warnings().is_empty());
 
-        // A content success FOLLOWED BY a later evidence error (server died) is NOT ok -- the whole
-        // stream is read, so the success does not mask the later failure (review f1).
-        let then_err = [
+        // The exact regression from the live Claude turns: successful content plus ordinary in-band
+        // tool errors remains healthy. The caller gets a compact warning instead of losing the
+        // completed review, and repeated codes are aggregated.
+        let application_errors = [
             call("repository_read", "t1"),
-            result("t1", false),
+            result("t1"),
             call("repository_list", "t2"),
-            result("t2", true),
+            application_error("t2", "invalid_arguments"),
+            call("repository_search", "t3"),
+            application_error("t3", "deadline_exceeded"),
+            call("repository_search", "t4"),
+            application_error_blocks("t4", "deadline_exceeded"),
         ]
         .join("\n");
-        let h = claude_evidence_health(&then_err);
-        assert!(h.content_call_succeeded && h.call_errored && !h.is_ok());
+        let h = claude_evidence_health(&application_errors);
+        assert!(h.content_call_succeeded && !h.transport_error && h.is_ok());
+        let warnings = h.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid_arguments"), "{warnings:?}");
+        assert!(warnings[0].contains("deadline_exceeded x2"), "{warnings:?}");
+
+        // A content success FOLLOWED BY an unmarked error is NOT ok. Unknown shapes stay fatal: the
+        // whole stream is read, so success cannot mask a later disconnect (review f1).
+        let then_transport_err = [
+            call("repository_read", "t1"),
+            result("t1"),
+            call("repository_list", "t2"),
+            error("t2", "MCP error: connection closed"),
+        ]
+        .join("\n");
+        let h = claude_evidence_health(&then_transport_err);
+        assert!(h.content_call_succeeded && h.transport_error && !h.is_ok());
+
+        // An application error proves that the service answered, but it did not return content. It
+        // cannot satisfy the liveness/content half of the gate on its own.
+        let app_error_only = [
+            call("repository_read", "a1"),
+            application_error("a1", "not_found"),
+        ]
+        .join("\n");
+        assert!(!claude_evidence_health(&app_error_only).is_ok());
 
         // Only repository_scope succeeded -> no content evidence, not ok.
-        let scope_only = [call("repository_scope", "s1"), result("s1", false)].join("\n");
+        let scope_only = [call("repository_scope", "s1"), result("s1")].join("\n");
         assert!(!claude_evidence_health(&scope_only).is_ok());
 
         // A content call whose result is never seen (server died after the call) -> not ok.

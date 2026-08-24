@@ -513,8 +513,9 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
 }
 
 /// The section-7 runtime evidence gate for an in-scope Claude review: the reviewer **ran**, but the
-/// captured change was empty or incomplete AND it obtained no successful content evidence call, so
-/// the review would rest on less than the intended change. Keeps the `EVIDENCE_UNAVAILABLE` code
+/// captured change was empty or incomplete AND it obtained no successful content evidence call or
+/// its evidence transport failed, so the review would rest on less than the intended change. Keeps
+/// the `EVIDENCE_UNAVAILABLE` code
 /// (the caller's action -- stop, do not self-review, re-run -- is the same) but with a message
 /// accurate to the runtime case: the startup `evidence_unavailable` wording ("Codex", "was not
 /// started") would misreport this, which is the class of bug AGENTS.md names.
@@ -523,13 +524,14 @@ pub fn evidence_review_too_thin(detail: impl Into<String>) -> Failure {
         "EVIDENCE_UNAVAILABLE",
         "The review ran, but the captured change was empty or incomplete and the reviewer did not \
          obtain healthy content evidence -- either it made no successful content evidence call, or \
-         an evidence call failed -- so the review would rest on less than the intended change and \
-         was not accepted.",
+         the evidence transport failed -- so the review would rest on less than the intended change \
+         and was not accepted.",
         "The captured change was empty or incomplete (for example an uncommitted or empty range), \
          and the reviewer did not read the whole change through a healthy evidence service (no \
-         successful content call, or an evidence call errored), so the review cannot be trusted. \
-         Re-run once the change is committed or the range is non-empty and the evidence service is \
-         healthy. The review has NOT been accepted; do not substitute your own read of the change.",
+         successful content call, or the evidence transport failed), so the review cannot be \
+         trusted. Re-run once the change is committed or the range is non-empty and the evidence \
+         service is healthy. The review has NOT been accepted; do not substitute your own read of \
+         the change.",
     )
     .with_detail(detail)
 }
