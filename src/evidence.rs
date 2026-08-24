@@ -21,6 +21,11 @@ use serde_json::{json, Value};
 
 pub const SERVER_FLAG: &str = "--evidence-server";
 pub const SERVER_NAME: &str = "cross_review_evidence";
+/// Prefix on an in-band tool error produced by this evidence server. Claude Code's `stream-json`
+/// flattens an MCP tool result to text plus `is_error`, dropping the structured error code. The
+/// parent needs to distinguish a service answer such as `not_found` from an MCP transport failure,
+/// so the text carries this unambiguous origin marker as well as the existing structured content.
+pub const TOOL_ERROR_MARKER: &str = "cross-review-evidence-error";
 /// Bumped to 2 by issue #86: `drifted` and the two stamps became nullable, and `repository_scope`
 /// gained `drift_unavailable` and `scan_scope`. There is no migration to write — one binary writes
 /// and reads the bundle within one process tree, and the file is deleted when the review ends — so
@@ -909,7 +914,7 @@ fn handle(request: &Value, core: &mut core::Core, received_at: Instant) -> Optio
 
 fn tool_error_result(code: &str, message: &str) -> Value {
     json!({
-        "content":[{"type":"text","text":format!("{code}: {message}")}],
+        "content":[{"type":"text","text":format!("{TOOL_ERROR_MARKER}:{code}: {message}")}],
         "structuredContent":{"error":{"code":code,"message":message}},
         "isError":true
     })
@@ -1367,6 +1372,14 @@ mod tests {
         assert_eq!(scope["result"]["isError"], false);
         let unknown = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{}}}), &mut core, Instant::now()).unwrap();
         assert_eq!(unknown["result"]["isError"], true);
+        assert_eq!(
+            unknown["result"]["structuredContent"]["error"]["code"],
+            "unknown_tool"
+        );
+        assert!(unknown["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{TOOL_ERROR_MARKER}:unknown_tool: ")));
     }
 
     fn stamp(method: StampMethod, byte: char) -> Drift {

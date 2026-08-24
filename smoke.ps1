@@ -289,8 +289,11 @@ try {
 This is an automated smoke test of a review tool. Do not review any code. Do not use the shell.
 Call repository_scope, repository_list for the repository root, repository_search for the literal
 "cross-review", and repository_diff with base "branch-base" and head "worktree" (page it to the end
-if it returns a cursor). These calls test the repository evidence service and the live change under
-review. After they complete, reply with exactly two lines and nothing else:
+if it returns a cursor). Also call repository_read once for the deliberately absent path
+"__cross_review_smoke_intentionally_missing_6f95f4b8__". Its expected not_found response tests that
+an in-band tool error is not misclassified as an evidence transport failure. These calls test the
+repository evidence service and the live change under review. After they complete, reply with
+exactly two lines and nothing else:
 SMOKE-OK
 COUNTER=1
 '@
@@ -326,7 +329,11 @@ COUNTER=1
     Assert-That 'the reviewer actually answered' ($resultText -match 'SMOKE-OK') $resultText
     if ($Reviewer -eq 'codex') {
         Assert-That 'fresh Codex turn used all requested evidence operations' `
-            ($resultText -match 'evidence service completed (?:[4-9]|[1-9][0-9]+) tool call') $resultText
+            ($resultText -match 'evidence service completed (?:[5-9]|[1-9][0-9]+) tool call') $resultText
+    } else {
+        Assert-That 'Claude preserves an in-band evidence error as a warning' `
+            (($resultText -match 'in-band tool errors') -and ($resultText -match 'not_found')) `
+            $resultText
     }
     Assert-That 'review body is delimited' ($resultText -match 'BEGIN REVIEW') $resultText
     Assert-That 'the wait emitted MCP progress notifications' `

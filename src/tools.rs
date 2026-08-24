@@ -3886,14 +3886,20 @@ impl Job {
 
         // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json` output
         // before `run` is consumed by collect_run. Only meaningful on the in-scope Claude path (whose
-        // invocation forced stream-json); false everywhere else. `is_ok()` requires BOTH a successful
-        // content call AND no evidence-call error, so a success followed by a later transport failure
-        // does not pass. A failed run has no Ok outcome to read -- collect_run below returns its error
-        // first, so the gate is never reached for it.
-        let evidence_ok = capture_thin
-            && run.as_ref().ok().is_some_and(|o| {
-                crate::reviewer::claude::claude_evidence_health(&o.stdout).is_ok()
-            });
+        // invocation forced stream-json); absent everywhere else. `is_ok()` requires BOTH a
+        // successful content call AND no transport/infrastructure error. In-band tool errors do not
+        // condemn the service: the reviewer received them and they are surfaced as warnings below.
+        // A failed run has no Ok outcome to read -- collect_run below returns its error first, so the
+        // gate is never reached for it.
+        let evidence_health = capture_thin.then(|| {
+            run.as_ref()
+                .ok()
+                .map(|o| crate::reviewer::claude::claude_evidence_health(&o.stdout))
+                .unwrap_or_default()
+        });
+        let evidence_ok = evidence_health
+            .as_ref()
+            .is_some_and(crate::reviewer::claude::EvidenceHealth::is_ok);
 
         // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
         // `collect_run`, which is also where the headroom observation and the parse happen, in that
@@ -3933,9 +3939,12 @@ impl Job {
         if capture_thin && !evidence_ok {
             return Err(errors::evidence_review_too_thin(
                 "the captured change was empty or incomplete and the reviewer did not obtain healthy \
-                 content evidence (no successful content call, or an evidence call errored), so the \
-                 review would rest on less than the intended change",
+                 content evidence (no successful content call, or the evidence transport failed), \
+                 so the review would rest on less than the intended change",
             ));
+        }
+        if let Some(health) = &evidence_health {
+            parsed.warnings.extend(health.warnings());
         }
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
