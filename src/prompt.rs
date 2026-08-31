@@ -21,7 +21,7 @@ Ground rules:
 Structure your response like this:
 
 ## Verdict
-One of APPROVE, APPROVE WITH COMMENTS, REQUEST CHANGES, or BLOCKED, plus one sentence saying why.
+One of APPROVE, REQUEST CHANGES, or BLOCKED, plus one sentence saying why. There is no "approve with comments": if you want something addressed, REQUEST CHANGES and raise it as a finding; if you do not, APPROVE and put the non-blocking aside in your prose.
 
 ## Findings
 For each finding: severity (critical / major / minor), the location, what is wrong, why it matters, and a concrete suggested fix. If there are no findings, say so plainly.
@@ -386,8 +386,11 @@ fn machine_block_section(nonce: &str, digest: Option<&str>) -> String {
     s.push_str(&format!("{begin}\n{{ ...JSON... }}\n{end}\n\n"));
     s.push_str("The JSON object has these fields:\n");
     s.push_str(
-        "- `\"verdict\"`: one of `\"approve\"`, `\"approve_with_comments\"`, `\"request_changes\"`, \
-         `\"blocked\"` — your own top-level verdict, and it MUST match your prose `## Verdict`.\n",
+        "- `\"verdict\"`: one of `\"approve\"`, `\"request_changes\"`, `\"blocked\"` — your own \
+         top-level verdict, and it MUST match your prose `## Verdict`. There is no \
+         \"approve with comments\": if you want something addressed, raise it as a finding and \
+         `request_changes`; if you do not, `approve` and put the non-blocking aside in your \
+         prose.\n",
     );
     s.push_str(
         "- `\"new_findings\"`: an array of findings you are raising for the FIRST time this turn. \
@@ -524,6 +527,18 @@ mod tests {
         assert!(DEFAULT_PREAMBLE.contains("the refusal is final"));
         assert!(DEFAULT_PREAMBLE.contains("Fall back to a simpler command"));
         assert!(DEFAULT_PREAMBLE.contains("do not abandon the review"));
+    }
+
+    #[test]
+    fn the_preamble_does_not_offer_the_retired_approve_with_comments_verdict() {
+        // The verdict vocabulary is binary (plus blocked): approve or request_changes. The prose
+        // `## Verdict` instruction must agree with the machine-block instruction, which no longer
+        // offers approve-with-comments -- a preamble that still listed it would give the reviewer
+        // contradictory instructions and keep eliciting the retired verdict. The retired verdict
+        // may appear only in the sentence that *negates* it, never in the offer list.
+        assert!(!DEFAULT_PREAMBLE.contains("APPROVE, APPROVE WITH COMMENTS"));
+        assert!(DEFAULT_PREAMBLE.contains("One of APPROVE, REQUEST CHANGES, or BLOCKED"));
+        assert!(DEFAULT_PREAMBLE.contains("There is no \"approve with comments\""));
     }
 
     #[test]

@@ -263,16 +263,16 @@ The rule, stated so it can be checked rather than case-enumerated:
 | **3** | **`session_stagnant`** | **yes** |
 | 4 | `reviewer_blocked` | no |
 | 5 | `verdict_contradiction` | no |
-| 6 | `reviewer_withheld_approve` | no |
-| 7 | `open_findings` | no |
+| 6 | `open_findings` | no |
 
 `session_stagnant` must outrank `open_findings`, which always co-occurs with it, or it would be
 unreachable. It yields to the three ledger/durability reasons because those say the record itself is
 unusable, which is graver than a usable record that stopped growing.
 
-`reviewer_withheld_approve` is listed for completeness only: round 2 is right that it cannot
-co-occur, since it requires `open_count == 0` (`src/findings.rs:840-842`) and this gate requires
-`open_count > 0`.
+(A retired `reviewer_withheld_approve` reason once sat at rank 6 above `open_findings`; it was removed
+with the `approve_with_comments` verdict — see the retirement note in
+[`structured-findings-envelope.md`](structured-findings-envelope.md) — and `open_findings` moved up to
+6.)
 
 ## Two integration defects round 2 found in the existing code
 
@@ -359,8 +359,7 @@ that loads today still loads.
   rather than as a substituted turn number.
 - Precedence, one test per *reachable* co-occurrence: `session_stagnant` beats `open_findings`,
   `reviewer_blocked` and `verdict_contradiction`, and loses to `ledger_too_large`,
-  `ledger_unavailable` and `turn_not_durable`. `reviewer_withheld_approve` is not tested because it
-  cannot co-occur.
+  `ledger_unavailable` and `turn_not_durable`.
 - The prompt is unchanged — pinned by the existing prompt tests continuing to pass unmodified.
 
 ## Verification

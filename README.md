@@ -225,7 +225,7 @@ Switch on `outcome`:
 | --- | --- | --- |
 | `converged` | The machine contract passed. | Stop. (It certifies the structured contract, not that a human read the prose.) |
 | `changes_requested` | Findings are open, or the verdict and count disagree. | Act on `findings`, re-review the same session. |
-| `escalate` | The reviewer blocked, or withheld a clean approve. | A person decides; re-reviewing keeps producing this. |
+| `escalate` | The reviewer blocked. | A person decides; re-reviewing keeps producing this. |
 | `rebaseline` | This session cannot continue — coverage broke, the turn was not durable, the ledger is over budget, or the session stalled. | A person decides, then starts a fresh review carrying the still-open findings. |
 
 Every review carries a machine-readable envelope (verdict, findings with stable ids, a

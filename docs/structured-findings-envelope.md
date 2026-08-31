@@ -108,9 +108,10 @@ convergence is `open_count == 0`" that was a round-2 self-contradiction and is n
   open, which blocks the next clause on its own. Omission needs no fail-closed condition to be safe,
   because the carried status already does the work, and
 - every finding in the ledger has `status == resolved`, so `open_count == 0`, and
-- the reviewer's own `verdict_detail` is exactly `approve` — not `approve_with_comments`, not
-  `request_changes`, not `blocked`. The reviewer's own top-level judgement must itself be a
-  clean approve; numeric zero is necessary but not sufficient, and
+- the reviewer's own `verdict_detail` is exactly `approve` — not `request_changes`, not `blocked`
+  (and there is no longer an `approve_with_comments`: it was retired precisely so a hedge could not
+  reach this clause; see the verdict note below). The reviewer's own top-level judgement must itself
+  be a clean approve; numeric zero is necessary but not sufficient, and
 - **the session is in no sticky terminal state** — not `ledger_too_large` (over the bounded
   budget) and not any future terminal escalation. Round 6's point: a session can have zero open
   findings *and* be over budget (many resolved findings still counted), so the budget condition is
@@ -120,7 +121,7 @@ convergence is `open_count == 0`" that was a round-2 self-contradiction and is n
 
 If any one is false, `converged` is `false`, and the envelope carries a machine-readable
 `non_convergence_reason` (below) naming which one, so an autonomous loop can tell "keep working,
-findings still open" from "the reviewer withheld a clean approve, a human should look" and
+findings still open" from "the reviewer blocked, a human should look" and
 **cannot livelock silently**. `open_count` is a number **only** when the block is structured,
 the ledger is valid, and reconciliation was clean; otherwise it is `null`, never `0`. A caller's
 safe loop is **`while (!converged)`, re-reviewing on `open_findings`/`verdict_contradiction` and
@@ -138,7 +139,6 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `non_convergence_reason` | Meaning | What a loop should do |
 | --- | --- | --- |
 | `open_findings` | Structured, valid, but `open_count > 0`. | Act on the findings, re-review. |
-| `reviewer_withheld_approve` | `open_count == 0` but `verdict_detail` is `approve_with_comments`. | The reviewer left only comments and declined a clean approve. Do **not** auto-stop; surface to a human. |
 | `reviewer_blocked` | `verdict_detail` is `blocked` (the reviewer reports it cannot complete a clean review), at any `open_count`. | **Escalate to a human**; a blocked reviewer is not a re-review-and-hope state. |
 | `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
 | `ledger_unavailable` | On-disk coverage is a *readable* persisted break — `legacy_uncovered` or `needs_rebaseline` — whether from **this turn's coverage-break write persisting** *or* the **session already being broken on entry**. (A degraded turn whose *own* break-write failed reports `turn_not_durable` **only** when it entered `whole_conversation`/`unestablished`; on an already-broken session `ledger_unavailable` holds regardless — precedence. An *unreadable* ledger — `invalid` — never reaches a completed envelope; it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
@@ -167,8 +167,8 @@ run (round 17, the `invalid` note).
 
 **None of the non-convergent reasons is an autonomous "just `fresh` and continue" signal** (round
 11 closed that hole): `open_findings` and `verdict_contradiction` say re-review; **every other
-reason is a human-escalation outcome** — `reviewer_withheld_approve` (the reviewer will keep
-withholding), `reviewer_blocked` (the reviewer declared it cannot finish), `state_corrupt`,
+reason is a human-escalation outcome** — `reviewer_blocked` (the reviewer declared it cannot
+finish), `state_corrupt`,
 `ledger_too_large`, `session_stagnant`, `turn_not_durable`, and **`ledger_unavailable`**. The last is
 the subtle one:
 telling an autonomous loop to blindly `fresh` on a coverage break re-introduces the silent drop the
@@ -198,15 +198,14 @@ exists), so they never enter this ordering:
 `ledger_too_large` → `ledger_unavailable` (the completed-envelope readable-break states
 `legacy_uncovered` / `needs_rebaseline` — *not* a degraded turn whose own write failed, which is
 `turn_not_durable`) → `turn_not_durable` → `session_stagnant` → `reviewer_blocked` →
-`verdict_contradiction` → `reviewer_withheld_approve` → `open_findings`.
+`verdict_contradiction` → `open_findings`.
 
 `session_stagnant` sits where it does under a rule worth stating, because it is the one that will
 place the next reason added here: **a sticky terminal reason outranks an advisory one**, since
 reporting an advisory reason on a turn that also killed the session would understate what happened.
 It yields to the three ledger/durability reasons because those say the record itself is unusable,
 which is graver than a usable record that stopped growing. It must outrank `open_findings`, which
-always co-occurs with it, or it would be unreachable; `reviewer_withheld_approve` cannot co-occur at
-all, since that requires `open_count == 0`.
+always co-occurs with it, or it would be unreachable.
 
 Only two reasons are **sticky** — persisted to `SessionRecord::terminal_reason` so every later resume
 of that session is refused: `ledger_too_large` and `session_stagnant`
@@ -218,9 +217,18 @@ A permanently-uncovered session therefore always reports `ledger_unavailable` (*
 rebaseline**), never `open_findings` ("re-review"), no matter how many findings it also has — so the
 loop cannot be lured into re-reviewing a session it can never converge.
 
-The `reviewer_withheld_approve` row is the livelock guard round 2 asked for: the loop is not
-told "done," but it *is* told exactly why it is not done, so it stops spinning and escalates
-rather than re-reviewing forever against a reviewer that will keep leaving the same comment.
+> **Retired (post-#73):** an earlier design had an `approve_with_comments` verdict and a matching
+> `reviewer_withheld_approve` reason (an `escalate` livelock guard: `open_count == 0` but the reviewer
+> declined a clean approve). It was removed because "approve with comments" is near-universally read as
+> a green light, so mapping it to `escalate` surprised callers and let a reviewer sit in a state that
+> was neither done nor changes. The verdict vocabulary is now binary — `approve` (clean stop; any
+> non-blocking aside lives in the prose) or `request_changes` (every remark it wants acted on is a
+> finding). The wire string `approve_with_comments` is still *accepted* for robustness and folds to
+> `request_changes` ("you have comments, so resolve them"); with nothing open that is the ordinary
+> `request_changes`/zero-open `verdict_contradiction`, which re-reviews rather than escalating. This
+> preserves the one-way ratchet — convergence still requires the reviewer to actively choose `approve`
+> — without a third, hedging state. The round-by-round history below still refers to the retired
+> verdict as the record of how the design got here.
 
 ## The three hard parts
 
@@ -454,8 +462,9 @@ no prose on that path. With that boundary:
   **Since issue #73 that capped copy is on every turn that ran, not only degraded ones.** Issue #63
   attached it iff the machine channel did not represent the turn, which left a clean structured
   turn's `review_prose` `null` — so everything the reviewer said outside its findings list was
-  unreachable to a `structuredContent`-only client, most sharply on `approve_with_comments`, whose
-  entire content is the comments. `review_prose` is now `null` **iff no reviewer ran**, and the
+  unreachable to a `structuredContent`-only client, most sharply on the then-existing
+  `approve_with_comments`, whose entire content was the comments. `review_prose` is now `null` **iff
+  no reviewer ran** (whatever the verdict), and the
   envelope also carries the result-context group described in
   [`structured-channel-parity.md`](structured-channel-parity.md). That document is authoritative for
   both.
@@ -480,10 +489,10 @@ while the truth table required the reviewer's verdict too; the shorthand is gone
 reviewer's block claims `verdict: approve` while the ledger still has open findings, that is a
 contradiction; the server resolves it in favour of the ledger (machine verdict `changes`,
 `converged: false`, `non_convergence_reason: verdict_contradiction`) and warns. If the reviewer
-reports `approve_with_comments` with nothing open, that is not a contradiction but it is not a
-clean approve either: `converged: false`, `non_convergence_reason: reviewer_withheld_approve`.
-A loop cannot be talked into stopping by a reviewer that wrote `approve` at the top and left a
-`major` open below, nor left spinning silently by one that only ever comments.
+emits the retired `approve_with_comments` string with nothing open, it folds to `request_changes`,
+which with zero open is the same contradiction: `converged: false`, `non_convergence_reason:
+verdict_contradiction`. A loop cannot be talked into stopping by a reviewer that wrote `approve` at
+the top and left a `major` open below.
 
 ### Decision 4 — extraction is fail-closed on ambiguity, and the ledger is injected as quoted evidence
 
@@ -583,7 +592,7 @@ must not break the prose channel anything already depends on:
   "non_convergence_reason": "open_findings",  // null iff converged; see the reason table
   "verdict": "changes",          // machine verdict; allowed: "approve" | "changes" | "unknown"
   "verdict_source": "structured",   // "structured" or "none"; the server never infers a verdict from prose
-  "verdict_detail": "request_changes",  // the reviewer's own call: approve | approve_with_comments | request_changes | blocked | null
+  "verdict_detail": "request_changes",  // the reviewer's own call: approve | request_changes | blocked | null (the retired "approve_with_comments" is still accepted on the wire and folds to request_changes)
   "ledger_coverage": "whole_conversation",  // completed-envelope states: whole_conversation | legacy_uncovered | needs_rebaseline | unestablished (invalid is a resume-refusal, never here — see below)
   "findings_trusted": true,      // false when ledger_coverage is unestablished; when false, `findings` is [] and this turn's prose must be used
   "open_count": 2,               // count(status != resolved); NUMBER only when structured+valid+clean, else null
@@ -650,10 +659,13 @@ Notes on the shape:
 - **`converged` is the loop signal.** `verdict` is retained as the human-facing two-value
   summary the issue named, but the *machine* stop condition is `converged`, which folds in
   structured-ness and ledger validity so a caller cannot accidentally stop on a bare zero.
-- **`verdict_detail`** preserves the reviewer's richer four-level judgement (`APPROVE / APPROVE
-  WITH COMMENTS / REQUEST CHANGES / BLOCKED`) so nuance is not lost — a reviewer can
-  approve-with-comments and the loop still sees the `minor`s in the findings list. See the
-  [verdict truth table](#verdict-truth-table) for the complete mapping.
+- **`verdict_detail`** preserves the reviewer's own top-level judgement — `approve`,
+  `request_changes`, or `blocked` — so nuance is not lost. The vocabulary is deliberately binary
+  (plus `blocked`): a reviewer that wants something addressed raises it as a finding and
+  `request_changes`, and the loop still sees the `minor`s in the findings list; a non-blocking aside
+  lives in the prose under a clean `approve`. There is no `approve_with_comments` — that wire string
+  is still *accepted* for robustness and folds to `request_changes` (see the retirement note above).
+  See the [verdict truth table](#verdict-truth-table) for the complete mapping.
 - **`open_count` is exactly `count(status != resolved)`.** Stated as a formula rather than as a
   count of one enum variant so it cannot drift from the definition. (It was written when `regressed`
   also counted as open; with that status deleted the formula is unchanged and now has one non-open
@@ -772,30 +784,27 @@ its own.
 | --- | --- | --- | --- |
 | `approve` | 0 | `approve` | **true** |
 | `approve` | ≥1 (contradiction) | `changes` + warning | false, `verdict_contradiction` |
-| `approve_with_comments` | 0 | `approve` | false¹, `reviewer_withheld_approve` |
-| `approve_with_comments` | ≥1 | `changes` | false, `open_findings` |
 | `request_changes` | ≥1 | `changes` | false, `open_findings` |
-| `request_changes` | 0 (contradiction) | `changes` + warning | false², `verdict_contradiction` |
-| `blocked` | any | `changes` | false, `reviewer_blocked`³ |
-| *unstructured (no valid block, and the repair did not recover one)* | unknown (`null`) | `unknown` | false, `ledger_unavailable`⁴ |
+| `request_changes` | 0 (contradiction) | `changes` + warning | false¹, `verdict_contradiction` |
+| `blocked` | any | `changes` | false, `reviewer_blocked`² |
+| *unstructured (no valid block, and the repair did not recover one)* | unknown (`null`) | `unknown` | false, `ledger_unavailable`³ |
 
-¹ `approve_with_comments` with zero *open* findings means the reviewer left only informational
-comments. Those are not open findings and do not block convergence *numerically*, but the
-reviewer explicitly declined a clean `approve`, so the server honours that: `converged` stays
-false until the reviewer itself returns a clean `approve`. Convergence follows the reviewer's
-own top-level judgement, never overrides it toward "done."
+The retired `approve_with_comments` string is not its own row: it is accepted on the wire and folds
+to `request_changes` before this table applies, so it takes the `request_changes` row for its open
+count (zero open → `verdict_contradiction`, ≥1 → `open_findings`). See the retirement note under the
+reason precedence section for why the distinct verdict was removed.
 
-² `request_changes` with zero open findings is a contradiction in the other direction (the
+¹ `request_changes` with zero open findings is a contradiction in the other direction (the
 reviewer wants changes but named none as open). Fail safe: treat as `changes`, warn, do not
 converge. Uncertainty never resolves to done.
 
-³ `blocked` is a distinct outcome, not a flavour of contradiction or open findings (round 5): the
+² `blocked` is a distinct outcome, not a flavour of contradiction or open findings (round 5): the
 reviewer is reporting it *could not complete a clean review* at all. Its `non_convergence_reason`
 is `reviewer_blocked` regardless of `open_count`, and it is a human-escalation outcome — a loop
 must not re-review-and-hope against a reviewer that has declared itself blocked. It sits above
 `verdict_contradiction` in the precedence order.
 
-⁴ Since issue #63 a turn only reaches this row after the block repair has been tried and failed
+³ Since issue #63 a turn only reaches this row after the block repair has been tried and failed
 (or was disabled, unavailable, or not applicable): the server asks the reviewer once more, in the
 same conversation, before accepting that the turn has no machine record. A *recovered* turn is an
 ordinary structured turn and takes one of the rows above.
@@ -1367,8 +1376,7 @@ degradation**:
   `verdict_contradiction` are autonomous re-review reasons; every other reason escalates to a
   human** — **`ledger_unavailable`** (coverage break → [rebaseline
   handoff](#recovery-from-a-broken-ledger-is-a-human-rebaseline-not-an-autonomous-fresh), *not* a
-  blind `fresh`, round-11 major #4), **`turn_not_durable`**, **`reviewer_withheld_approve`** (the
-  reviewer keeps declining a clean approve), **`reviewer_blocked`**, **`state_corrupt`**,
+  blind `fresh`, round-11 major #4), **`turn_not_durable`**, **`reviewer_blocked`**, **`state_corrupt`**,
   **`ledger_too_large`**, and **`SESSION_NOT_RESUMABLE`**. (Repeated degraded turns across
   rebaseline attempts are themselves a stop signal: a reviewer that cannot produce a valid block N
   times running is not going to.) The loop contract is therefore "while (!converged): if the reason
@@ -1481,7 +1489,8 @@ state is a human-directed rebaseline, not an autonomous `fresh`.
   duplicate-id → degrade; `new_findings` with a status → degrade; monotonic non-reuse of ids
   across many turns); convergence + verdict (every row of the truth table; approve-with-open
   contradiction → `verdict_contradiction`; request-changes-with-none → `verdict_contradiction`;
-  approve-with-comments + zero open → `reviewer_withheld_approve`, not converged; **`blocked` →
+  the retired `approve_with_comments` wire alias folds to `request_changes`, so zero open →
+  `verdict_contradiction`, not converged; **`blocked` →
   `reviewer_blocked` at any open count** (round-5 major #4); unstructured →
   `converged:false`, `open_count:null`, and — being a degraded turn — `non_convergence_reason:
   ledger_unavailable` **when the on-disk break is persisted (this turn's, or an already-broken
