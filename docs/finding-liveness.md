@@ -262,17 +262,20 @@ The rule, stated so it can be checked rather than case-enumerated:
 | 2 | `turn_not_durable` | persisted break |
 | **3** | **`session_stagnant`** | **yes** |
 | 4 | `reviewer_blocked` | no |
-| 5 | `verdict_contradiction` | no |
-| 6 | `reviewer_withheld_approve` | no |
+| 5 | `evidence_incomplete` | no |
+| 6 | `verdict_contradiction` | no |
 | 7 | `open_findings` | no |
 
 `session_stagnant` must outrank `open_findings`, which always co-occurs with it, or it would be
 unreachable. It yields to the three ledger/durability reasons because those say the record itself is
-unusable, which is graver than a usable record that stopped growing.
+unusable, which is graver than a usable record that stopped growing. `evidence_incomplete` (rank 5) is
+a re-review signal, not an escalation: the reviewer was not shown the whole current change, and the
+session stays resumable — see [`structured-findings-envelope.md`](structured-findings-envelope.md).
 
-`reviewer_withheld_approve` is listed for completeness only: round 2 is right that it cannot
-co-occur, since it requires `open_count == 0` (`src/findings.rs:840-842`) and this gate requires
-`open_count > 0`.
+(A retired `reviewer_withheld_approve` reason once sat at rank 7 above `open_findings`; it was removed
+with the `approve_with_comments` verdict — see the retirement note in
+[`structured-findings-envelope.md`](structured-findings-envelope.md) — and `open_findings` moved up to
+7.)
 
 ## Two integration defects round 2 found in the existing code
 
@@ -357,10 +360,12 @@ that loads today still loads.
 - `--stagnant-session-turns 0` never trips.
 - A finding carrying no `last_verified_turn` — a pre-#77 ledger — appears in the warning as `unknown`
   rather than as a substituted turn number.
-- Precedence, one test per *reachable* co-occurrence: `session_stagnant` beats `open_findings`,
-  `reviewer_blocked` and `verdict_contradiction`, and loses to `ledger_too_large`,
-  `ledger_unavailable` and `turn_not_durable`. `reviewer_withheld_approve` is not tested because it
-  cannot co-occur.
+- Precedence, one test per *reachable* co-occurrence **among the `resolve_structured` reasons**:
+  `session_stagnant` beats `open_findings`, `reviewer_blocked` and `verdict_contradiction`, and loses
+  to `ledger_too_large`, `ledger_unavailable` and `turn_not_durable`. `evidence_incomplete` is **not**
+  a `resolve_structured` reason — it is merged afterward by `apply_evidence_floor` (rank 5, by the same
+  `min_by_key(rank)` precedence), so on a turn that is both stagnant and evidence-short the
+  higher-priority `session_stagnant` is what is reported.
 - The prompt is unchanged — pinned by the existing prompt tests continuing to pass unmodified.
 
 ## Verification

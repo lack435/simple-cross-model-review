@@ -962,7 +962,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "cross_model_consult_result",
-            "description": format!(
+            "description":
                 "Wait for and return the answer from a cross_model_consult. Blocks until the consult \
                  is done: omit wait_seconds to wait to completion in one call. When the MCP client \
                  supplies a progress token, it emits live phase and elapsed-time updates during the \
@@ -974,8 +974,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  The completed result is the reviewer's prose answer (an `answer` field in the \
                  structured content), with the reviewer, cost, and any refused commands -- there is \
                  no verdict or findings list. A review_id from cross_model_review must be collected \
-                 with cross_model_review_result, not here (and vice versa)."
-            ),
+                 with cross_model_review_result, not here (and vice versa).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

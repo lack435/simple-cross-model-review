@@ -104,11 +104,18 @@ impl Status {
 }
 
 /// The reviewer's own top-level verdict, preserved at full fidelity so nuance is not lost.
+///
+/// There is deliberately no `approve_with_comments`: a reviewer either approves (a clean stop, with
+/// any non-blocking aside living in its prose) or requests changes (every remark it wants acted on
+/// is a finding). The middle verdict was a way to decline to commit to either, and its removal is
+/// what keeps a hedge from ever laundering into convergence. The wire string is still *accepted* for
+/// robustness — a reviewer that emits it despite the prompt is folded to `request_changes` via the
+/// serde alias below, i.e. "you have comments, so resolve them" — but it is no longer offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictDetail {
     Approve,
-    ApproveWithComments,
+    #[serde(alias = "approve_with_comments")]
     RequestChanges,
     Blocked,
 }
@@ -189,8 +196,6 @@ impl LedgerCoverage {
 pub enum NonConvergenceReason {
     /// Structured, valid, but `open_count > 0`. Re-review.
     OpenFindings,
-    /// `open_count == 0` but the reviewer left `approve_with_comments`. Escalate.
-    ReviewerWithheldApprove,
     /// The reviewer reported `blocked`. Escalate.
     ReviewerBlocked,
     /// The reviewer's verdict and the open count disagree. Treat as changes; re-review.
@@ -253,7 +258,7 @@ impl Outcome {
             Some(OpenFindings) | Some(VerdictContradiction) | Some(EvidenceIncomplete) => {
                 Outcome::ChangesRequested
             }
-            Some(ReviewerBlocked) | Some(ReviewerWithheldApprove) => Outcome::Escalate,
+            Some(ReviewerBlocked) => Outcome::Escalate,
             Some(LedgerUnavailable)
             | Some(TurnNotDurable)
             | Some(LedgerTooLarge)
@@ -298,8 +303,7 @@ impl NonConvergenceReason {
             // terminal/durability reasons and to a reviewer that blocked, which speak to graver states.
             EvidenceIncomplete => 5,
             VerdictContradiction => 6,
-            ReviewerWithheldApprove => 7,
-            OpenFindings => 8,
+            OpenFindings => 7,
         }
     }
 
@@ -917,7 +921,6 @@ fn resolve_structured(
             ));
             MachineVerdict::Changes
         }
-        (VerdictDetail::ApproveWithComments, 0) => MachineVerdict::Approve,
         (VerdictDetail::RequestChanges, 0) => {
             warnings.push("reviewer requested changes but named no open findings".to_string());
             MachineVerdict::Changes
@@ -942,17 +945,9 @@ fn resolve_structured(
         VerdictDetail::RequestChanges if open_count == 0 => {
             reasons.push(NonConvergenceReason::VerdictContradiction)
         }
-        VerdictDetail::ApproveWithComments if open_count == 0 => {
-            reasons.push(NonConvergenceReason::ReviewerWithheldApprove)
-        }
         _ => {}
     }
-    if open_count > 0
-        && matches!(
-            verdict_detail,
-            VerdictDetail::ApproveWithComments | VerdictDetail::RequestChanges
-        )
-    {
+    if open_count > 0 && matches!(verdict_detail, VerdictDetail::RequestChanges) {
         reasons.push(NonConvergenceReason::OpenFindings);
     }
     // Issue #78. Conditioned on `open_count > 0`, so it can only ever make an outcome graver: a
@@ -1573,7 +1568,7 @@ impl TurnAssessment {
     }
 
     /// Whether this turn's block, as it stands, would resolve to a machine `approve` — a structured
-    /// `approve`/`approve_with_comments` verdict with no open findings. Mirrors the Approve arms of
+    /// `approve` verdict with no open findings. Mirrors the Approve arm of
     /// `resolve_structured`'s truth table, and is used *before* `finalize_turn` to decide whether the
     /// per-turn evidence floor's approval requirement applies, so the in-turn evidence auto-repair can
     /// run against the reviewer's provisional verdict. A degraded (unstructured) turn is never an
@@ -1582,11 +1577,7 @@ impl TurnAssessment {
         match &self.result {
             Ok((detail, findings, _)) => {
                 let open = findings.iter().filter(|f| f.status.is_open()).count();
-                open == 0
-                    && matches!(
-                        detail,
-                        VerdictDetail::Approve | VerdictDetail::ApproveWithComments
-                    )
+                open == 0 && matches!(detail, VerdictDetail::Approve)
             }
             Err(_) => false,
         }
@@ -2970,20 +2961,25 @@ mod tests {
     }
 
     #[test]
-    fn approve_with_comments_and_zero_open_withholds() {
-        let r = resolve_structured(
-            VerdictDetail::ApproveWithComments,
-            LedgerCoverage::WholeConversation,
-            0,
-            false,
-            Liveness::default(),
+    fn approve_with_comments_wire_string_folds_to_request_changes() {
+        // The verdict is retired but its wire string is still accepted for robustness: a reviewer
+        // that emits it despite the prompt deserializes to `request_changes` — "you have comments,
+        // so resolve them" — never to a distinct withheld-approve state. With nothing open that is
+        // the ordinary `request_changes`/zero-open contradiction, which re-reviews rather than
+        // escalating to a human.
+        let v: VerdictDetail =
+            serde_json::from_str("\"approve_with_comments\"").expect("alias deserializes");
+        assert_eq!(v, VerdictDetail::RequestChanges);
+
+        let ev = evaluate_turn(
+            "s",
+            1,
+            "rv-1-1",
+            &block("rv-1-1", r#"{"verdict":"approve_with_comments"}"#),
+            None,
+            Budget::default(),
         );
-        assert_eq!(r.verdict, MachineVerdict::Approve);
-        assert_eq!(
-            r.reason,
-            Some(NonConvergenceReason::ReviewerWithheldApprove)
-        );
-        assert!(!r.converged);
+        assert_eq!(ev.envelope.outcome, Outcome::ChangesRequested);
     }
 
     #[test]
@@ -3486,8 +3482,7 @@ mod tests {
             let r = resolve_structured(verdict, coverage, 1, over, stalled(3, 3, &open));
             assert_eq!(r.reason, Some(expected), "{verdict:?} / {coverage:?}");
         }
-        // `turn_not_durable` is applied by the caller after this returns and outranks it there;
-        // `reviewer_withheld_approve` cannot co-occur at all, since it requires `open_count == 0`.
+        // `turn_not_durable` is applied by the caller after this returns and outranks it there.
         assert!(
             NonConvergenceReason::TurnNotDurable.rank()
                 < NonConvergenceReason::SessionStagnant.rank()
@@ -3506,7 +3501,6 @@ mod tests {
             TurnNotDurable,
             ReviewerBlocked,
             VerdictContradiction,
-            ReviewerWithheldApprove,
             OpenFindings,
         ] {
             assert_eq!(r.sticky_terminal(), None, "{r:?}");
@@ -4092,7 +4086,6 @@ mod repair_tests {
             (Some(OpenFindings), Outcome::ChangesRequested),
             (Some(VerdictContradiction), Outcome::ChangesRequested),
             (Some(ReviewerBlocked), Outcome::Escalate),
-            (Some(ReviewerWithheldApprove), Outcome::Escalate),
             // The four that mean "this session cannot continue". `turn_not_durable` belongs here
             // and not with the unstructured turns: the caller must be told to rebaseline carrying
             // the preserved findings, which an "it was unstructured" signal would hide.
@@ -4139,12 +4132,12 @@ mod repair_tests {
         let request_changes = block("rv-1-1", r#"{"verdict":"request_changes"}"#);
         let cases: Vec<(&str, String, Outcome)> = vec![
             ("converged", approve, Outcome::Converged),
-            // `approve_with_comments` with nothing open: the issue's own case, and the one whose
-            // entire content is the comments the envelope was withholding.
+            // The retired `approve_with_comments` wire string folds to `request_changes`; with
+            // nothing open that is a verdict contradiction, and its prose must still be carried.
             (
-                "escalate/withheld_approve",
+                "changes_requested/folded_approve_with_comments",
                 approve_with_comments,
-                Outcome::Escalate,
+                Outcome::ChangesRequested,
             ),
             ("escalate/blocked", blocked, Outcome::Escalate),
             // `request_changes` naming no open findings is a verdict contradiction.

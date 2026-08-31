@@ -7599,7 +7599,7 @@ mod tests {
             "default",
             2,
             "rv-parity-1",
-            "## Verdict\nAPPROVE WITH COMMENTS\nthe reasoning that used to be unreadable",
+            "## Verdict\nREQUEST CHANGES\nthe reasoning that used to be unreadable",
         );
         Outcome {
             // The rendered review is the evaluation's prose, exactly as `attempt` sets it -- one
