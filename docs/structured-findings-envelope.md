@@ -124,7 +124,7 @@ If any one is false, `converged` is `false`, and the envelope carries a machine-
 findings still open" from "the reviewer blocked, a human should look" and
 **cannot livelock silently**. `open_count` is a number **only** when the block is structured,
 the ledger is valid, and reconciliation was clean; otherwise it is `null`, never `0`. A caller's
-safe loop is **`while (!converged)`, re-reviewing on `open_findings`/`verdict_contradiction` and
+safe loop is **`while (!converged)`, re-reviewing on `open_findings`/`verdict_contradiction`/`evidence_incomplete` and
 *stopping to escalate to a human* on every other reason** — it never treats non-convergence as an
 autonomous "just `fresh` and keep going" (that is the round-11 hole; see
 [the reason table](#non_convergence_reason) and the rebaseline handoff). It still never has to
@@ -141,6 +141,7 @@ to act differently on the two. The envelope carries one machine-readable reason 
 | `open_findings` | Structured, valid, but `open_count > 0`. | Act on the findings, re-review. |
 | `reviewer_blocked` | `verdict_detail` is `blocked` (the reviewer reports it cannot complete a clean review), at any `open_count`. | **Escalate to a human**; a blocked reviewer is not a re-review-and-hope state. |
 | `verdict_contradiction` | Reviewer verdict and `open_count` disagree (e.g. `approve` with open findings, or `request_changes` with none). | Treat as changes; re-review. |
+| `evidence_incomplete` | The reviewer was not served the *current, complete* change this turn — an approving turn not shown the whole canonical `branch-base..worktree` diff paged to its end, or a turn that read no repository content at all. Not terminal; the session stays resumable, and an in-turn auto-repair tries to satisfy the evidence floor before this is ever reported. | **Re-review the same session** (the reviewer is reminded to pull the complete diff); do **not** escalate or rebaseline. |
 | `ledger_unavailable` | On-disk coverage is a *readable* persisted break — `legacy_uncovered` or `needs_rebaseline` — whether from **this turn's coverage-break write persisting** *or* the **session already being broken on entry**. (A degraded turn whose *own* break-write failed reports `turn_not_durable` **only** when it entered `whole_conversation`/`unestablished`; on an already-broken session `ledger_unavailable` holds regardless — precedence. An *unreadable* ledger — `invalid` — never reaches a completed envelope; it is a `SESSION_NOT_RESUMABLE` refusal carrying `ledger_unavailable` as its detail. See the persistence-first rule and the `invalid` note below.) | **Escalate to a human** for a rebaseline decision — do **not** autonomously `fresh`; a blind `fresh` can converge while abandoning the untracked findings that broke coverage (below). |
 | `turn_not_durable` | This turn's ledger/coverage could not be persisted (`.findings-pending` sidecar left set); reported when on-disk coverage was not already broken — `whole_conversation` on entry, or a fresh turn 1 with no persisted coverage yet. The *prior* ledger, **if one exists**, is intact on disk. | **Escalate**, then a human/caller may `fresh` **carrying the preserved prior open findings** (only this turn's incremental output is at risk; a fresh turn 1 has none). |
 | `state_corrupt` | The session store itself did not parse. Like `invalid`, this is caught at load, so it is a **pre-model `SESSION_NOT_RESUMABLE`-class refusal** carrying `state_corrupt` as its detail — **never a completed-envelope `non_convergence_reason`** (round 21); no review runs. | **Escalate to a human**; operator moves the corrupt store aside / uses `--state-dir`; do not silently start fresh (below). |
@@ -166,7 +167,9 @@ the *unreadable* `invalid` state carries `ledger_unavailable` as the **detail of
 run (round 17, the `invalid` note).
 
 **None of the non-convergent reasons is an autonomous "just `fresh` and continue" signal** (round
-11 closed that hole): `open_findings` and `verdict_contradiction` say re-review; **every other
+11 closed that hole): `open_findings`, `verdict_contradiction`, and `evidence_incomplete` say
+re-review (the last on the *same* session — the reviewer was not shown the whole current change, so it
+is reminded to pull the complete diff, not escalated); **every other
 reason is a human-escalation outcome** — `reviewer_blocked` (the reviewer declared it cannot
 finish), `state_corrupt`,
 `ledger_too_large`, `session_stagnant`, `turn_not_durable`, and **`ledger_unavailable`**. The last is
@@ -198,7 +201,7 @@ exists), so they never enter this ordering:
 `ledger_too_large` → `ledger_unavailable` (the completed-envelope readable-break states
 `legacy_uncovered` / `needs_rebaseline` — *not* a degraded turn whose own write failed, which is
 `turn_not_durable`) → `turn_not_durable` → `session_stagnant` → `reviewer_blocked` →
-`verdict_contradiction` → `open_findings`.
+`evidence_incomplete` → `verdict_contradiction` → `open_findings`.
 
 `session_stagnant` sits where it does under a rule worth stating, because it is the one that will
 place the next reason added here: **a sticky terminal reason outranks an advisory one**, since
@@ -1372,15 +1375,15 @@ degradation**:
   instructions. **No id is ever silently retired** to make room — that would be exactly the silent
   drop the whole design refuses.
 - The same escalation discipline covers every "trying again won't help" state, so an autonomous
-  loop has a defined stopping point rather than spinning. **Only `open_findings` and
-  `verdict_contradiction` are autonomous re-review reasons; every other reason escalates to a
+  loop has a defined stopping point rather than spinning. **Only `open_findings`,
+  `verdict_contradiction`, and `evidence_incomplete` are autonomous re-review reasons; every other reason escalates to a
   human** — **`ledger_unavailable`** (coverage break → [rebaseline
   handoff](#recovery-from-a-broken-ledger-is-a-human-rebaseline-not-an-autonomous-fresh), *not* a
   blind `fresh`, round-11 major #4), **`turn_not_durable`**, **`reviewer_blocked`**, **`state_corrupt`**,
   **`ledger_too_large`**, and **`SESSION_NOT_RESUMABLE`**. (Repeated degraded turns across
   rebaseline attempts are themselves a stop signal: a reviewer that cannot produce a valid block N
   times running is not going to.) The loop contract is therefore "while (!converged): if the reason
-  is `open_findings`/`verdict_contradiction`, re-review; otherwise stop and escalate," and the
+  is `open_findings`/`verdict_contradiction`/`evidence_incomplete`, re-review; otherwise stop and escalate," and the
   reason field is what makes that expressible without string-matching.
 
 This is the honest counterpart to a growing ledger: it is the safe choice for correctness, and its
