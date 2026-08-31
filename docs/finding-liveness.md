@@ -360,9 +360,12 @@ that loads today still loads.
 - `--stagnant-session-turns 0` never trips.
 - A finding carrying no `last_verified_turn` — a pre-#77 ledger — appears in the warning as `unknown`
   rather than as a substituted turn number.
-- Precedence, one test per *reachable* co-occurrence: `session_stagnant` beats `open_findings`,
-  `reviewer_blocked` and `verdict_contradiction`, and loses to `ledger_too_large`,
-  `ledger_unavailable` and `turn_not_durable`.
+- Precedence, one test per *reachable* co-occurrence **among the `resolve_structured` reasons**:
+  `session_stagnant` beats `open_findings`, `reviewer_blocked` and `verdict_contradiction`, and loses
+  to `ledger_too_large`, `ledger_unavailable` and `turn_not_durable`. `evidence_incomplete` is **not**
+  a `resolve_structured` reason — it is merged afterward by `apply_evidence_floor` (rank 5, by the same
+  `min_by_key(rank)` precedence), so on a turn that is both stagnant and evidence-short the
+  higher-priority `session_stagnant` is what is reported.
 - The prompt is unchanged — pinned by the existing prompt tests continuing to pass unmodified.
 
 ## Verification
