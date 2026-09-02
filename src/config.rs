@@ -112,11 +112,11 @@ pub struct LevelOverride {
 ///
 /// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
 /// them (`Config::reviewers`). Only a reviewer's *identity* lives here — the process-global
-/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, the preamble
-/// overrides) stay
-/// on `Config`, because they are already family-scoped in effect: `--sandbox` is read only by
-/// the Codex invocation and `--tools`/`--allow-tools` only by the Claude one, so a global value
-/// applies to whichever entries are of that family and is inert for the others.
+/// behaviour flags (`sandbox`, `codex_fast_mode`, `tools`, `allowed_tools`, `isolate_reviewer`,
+/// the preamble overrides) stay on `Config`, because they are already family-scoped in effect:
+/// `--sandbox` and `--codex-fast-mode` are read only by the Codex invocation and
+/// `--tools`/`--allow-tools` only by the Claude one, so a global value applies to whichever
+/// entries are of that family and is inert for the others.
 ///
 /// See `docs/reviewer-fallback-chain.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
