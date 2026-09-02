@@ -149,6 +149,7 @@ The essentials:
 --cwd <path>                 Review root. Defaults to the server's working directory.
 --state-dir <path>           Where named sessions live.
 --sandbox <mode>             Codex sandbox policy. Default read-only.
+--codex-fast-mode            Turn on Codex fast mode. Off by default.
 --vcs <auto|git|perforce>    Which version control the change backend uses. Default auto.
 --tools / --allow-tools      Override the Claude reviewer's read-only tool policy.
 --review-preamble-file <path>  Replace the built-in review preamble (cross_model_review).

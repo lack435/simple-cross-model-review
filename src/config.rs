@@ -112,11 +112,11 @@ pub struct LevelOverride {
 ///
 /// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
 /// them (`Config::reviewers`). Only a reviewer's *identity* lives here — the process-global
-/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, the preamble
-/// overrides) stay
-/// on `Config`, because they are already family-scoped in effect: `--sandbox` is read only by
-/// the Codex invocation and `--tools`/`--allow-tools` only by the Claude one, so a global value
-/// applies to whichever entries are of that family and is inert for the others.
+/// behaviour flags (`sandbox`, `codex_fast_mode`, `tools`, `allowed_tools`, `isolate_reviewer`,
+/// the preamble overrides) stay on `Config`, because they are already family-scoped in effect:
+/// `--sandbox` and `--codex-fast-mode` are read only by the Codex invocation and
+/// `--tools`/`--allow-tools` only by the Claude one, so a global value applies to whichever
+/// entries are of that family and is inert for the others.
 ///
 /// See `docs/reviewer-fallback-chain.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -895,6 +895,12 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Codex sandbox policy.
     pub sandbox: String,
+    /// Turn on Codex's fast mode (`--codex-fast-mode`). Off by default. When set, the Codex
+    /// invocation adds `-c service_tier="fast"` and `-c features.fast_mode=true` — the two
+    /// config keys the "fast mode" docs pair for a persistent on state, since `codex exec`
+    /// cannot use the interactive `/fast on` toggle. Codex-only, like `sandbox`: the Claude
+    /// invocation never reads it, so a global value is inert for Claude entries in a chain.
+    pub codex_fast_mode: bool,
     /// Claude permission rules, one per entry. Kept as separate strings so each reaches
     /// the CLI as its own argument and a path with spaces cannot be mis-split.
     pub allowed_tools: Vec<String>,
@@ -1011,6 +1017,7 @@ impl Config {
         let mut max_policy_idle_secs = DEFAULT_MAX_POLICY_IDLE_SECS;
         let mut state_dir: Option<PathBuf> = None;
         let mut sandbox = "read-only".to_string();
+        let mut codex_fast_mode = false;
         let mut allowed_tools: Option<String> = None;
         let mut tools: Option<String> = None;
         let mut review_preamble_file: Option<PathBuf> = None;
@@ -1233,6 +1240,7 @@ impl Config {
                     state_dir = Some(dir);
                 }
                 "--sandbox" => sandbox = take("--sandbox")?,
+                "--codex-fast-mode" => codex_fast_mode = true,
                 "--allow-tools" | "--allowed-tools" => allowed_tools = Some(take("--allow-tools")?),
                 "--tools" => tools = Some(take("--tools")?),
                 "--diff" => {
@@ -1359,6 +1367,7 @@ impl Config {
                 block_repair_timeout_secs.min(timeout_secs.max(1)),
             ),
             sandbox,
+            codex_fast_mode,
             allowed_tools,
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
             review_preamble,
@@ -2227,6 +2236,9 @@ OPTIONS:
   --state-dir <path>          Where named sessions are recorded.
                               Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
+  --codex-fast-mode           Turn on Codex fast mode (off by default). Adds
+                              -c service_tier="fast" and -c features.fast_mode=true
+                              to the codex invocation. Codex-only; inert for Claude.
   --tools <list>              Claude built-in tools. Default: Read,Grep,Glob
                               (no Bash: see the README on why a prefix allow-list
                               cannot express read-only). Bash here is not enough on
@@ -2502,6 +2514,20 @@ mod tests {
         assert_eq!(
             cfg.primary().profile,
             ProfileSelector::Named("work".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_fast_mode_is_off_by_default_and_set_by_the_flag() {
+        assert!(
+            !Config::from_args(&args(&["--reviewer", "codex"]))
+                .expect("config")
+                .codex_fast_mode
+        );
+        assert!(
+            Config::from_args(&args(&["--reviewer", "codex", "--codex-fast-mode"]))
+                .expect("config")
+                .codex_fast_mode
         );
     }
 

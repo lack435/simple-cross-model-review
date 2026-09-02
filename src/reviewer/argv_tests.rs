@@ -783,6 +783,41 @@ fn codex_argv_carries_model_and_effort_on_both_paths() {
 }
 
 #[test]
+fn codex_fast_mode_is_off_by_default() {
+    // No override keys unless --codex-fast-mode is passed, on either path.
+    let cfg = config(&["codex"]);
+    for resume in [None, Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")] {
+        let args = argv(&CodexReviewer, &cfg, resume);
+        assert!(
+            !args.iter().any(|a| a == "service_tier=\"fast\""),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "features.fast_mode=true"),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn codex_fast_mode_adds_both_config_keys_on_every_turn() {
+    // `codex exec` cannot use the interactive /fast toggle, so --codex-fast-mode replicates the
+    // documented persistent-on state with its two config keys, asserted on fresh and resumed turns
+    // alike (like the sandbox and effort overrides). Each is passed as its own `-c <value>` pair.
+    let cfg = config(&["codex", "--codex-fast-mode"]);
+    for resume in [None, Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")] {
+        let args = argv(&CodexReviewer, &cfg, resume);
+        for key in ["service_tier=\"fast\"", "features.fast_mode=true"] {
+            let i = args
+                .iter()
+                .position(|a| a == key)
+                .unwrap_or_else(|| panic!("expected {key} in {args:?}"));
+            assert_eq!(args[i - 1], "-c", "{key} must follow a -c flag: {args:?}");
+        }
+    }
+}
+
+#[test]
 fn codex_resume_passes_the_session_id_positionally() {
     let cfg = config(&["codex"]);
     let args = argv(

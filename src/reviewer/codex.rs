@@ -127,6 +127,16 @@ impl Reviewer for CodexReviewer {
         // No shell is involved, so the quotes are part of the value and make this a
         // TOML string rather than relying on the raw-literal fallback.
         cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", spec.effort)]);
+        // Fast mode, off unless `--codex-fast-mode` is set. `codex exec` cannot use the
+        // interactive `/fast on` toggle, so we replicate the documented persistent-on state
+        // with its two config keys. Asserted on every turn (fresh and resume) alongside the
+        // sandbox and effort overrides above, for the same reason: it is set, not inherited by
+        // accident. Both keys are recognised under `--strict-config` (verified against codex
+        // v0.146.0); an unknown one would abort the run rather than be ignored.
+        if cfg.codex_fast_mode {
+            cmd.args(["-c", "service_tier=\"fast\""]);
+            cmd.args(["-c", "features.fast_mode=true"]);
+        }
         if cfg.isolate_reviewer {
             // `codex exec` does start configured MCP servers (verified: a marker server
             // ran and left a file), so a reviewer that also has cross-review registered
