@@ -129,13 +129,15 @@ pub struct Config {
     /// primary and matches the single-reviewer behaviour that predates this field.
     pub reviewers: Vec<ReviewerSpec>,
     // ... all the process-global fields unchanged (cwd, timeout, state_dir, sandbox,
-    //     allowed_tools, tools, preamble, isolate_reviewer, metrics, diff, vcs, ...).
+    //     allowed_tools, tools, review_preamble, consult_preamble, isolate_reviewer,
+    //     metrics, diff, vcs, ...).
 }
 ```
 
 **What stays global, and why.** Only the reviewer's *identity* is per-entry. The
 behaviour flags — `--sandbox` (Codex-only), `--tools`/`--allow-tools` (Claude-only),
-`--allow-reviewer-config`, `--preamble-file` — stay process-global. This is correct rather
+`--allow-reviewer-config`, `--review-preamble-file`/`--consult-preamble-file` — stay
+process-global. This is correct rather
 than merely convenient: `sandbox` is read only by the Codex invocation and `tools` only by
 the Claude invocation, so a global value already applies to whichever entries are of that
 family and is inert for the others. A mixed chain therefore needs no per-entry behaviour

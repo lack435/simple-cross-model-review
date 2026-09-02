@@ -3474,12 +3474,17 @@ impl Job {
         } else if is_consult {
             Some(
                 self.cfg
-                    .preamble
+                    .consult_preamble
                     .as_deref()
                     .unwrap_or(prompt::DEFAULT_CONSULT_PREAMBLE),
             )
         } else {
-            Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
+            Some(
+                self.cfg
+                    .review_preamble
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PREAMBLE),
+            )
         };
 
         // Switch guard [f4], part 1 of 2: capture the account this profile is authorized for, at spawn
