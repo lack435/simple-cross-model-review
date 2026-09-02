@@ -2458,6 +2458,25 @@ fn assemble_disposition(
     Some(vcs::Disposition::FellBackToFull(reason))
 }
 
+/// Choose the preamble to prepend: `None` under `--no-preamble` (send the caller's instructions
+/// raw), otherwise the consult override for a consult and the review override for a review, each
+/// falling back to its own built-in default. Free-standing and pure so the review/consult/no-preamble
+/// selection — the swap-prone part — is testable without constructing a `Job`.
+fn select_preamble<'a>(
+    no_preamble: bool,
+    is_consult: bool,
+    review_preamble: Option<&'a str>,
+    consult_preamble: Option<&'a str>,
+) -> Option<&'a str> {
+    if no_preamble {
+        None
+    } else if is_consult {
+        Some(consult_preamble.unwrap_or(prompt::DEFAULT_CONSULT_PREAMBLE))
+    } else {
+        Some(review_preamble.unwrap_or(DEFAULT_PREAMBLE))
+    }
+}
+
 impl Job {
     /// Whether this is a consult job, on which every findings/convergence divergence in the pipeline
     /// is gated. A review job always reads `false` here, so its paths are unchanged.
@@ -3469,18 +3488,12 @@ impl Job {
         // to do with account identity, the home lock, evidence setup, spawning, and durable recording
         // is shared. Each divergence below is gated on this, so a review job (`false`) is unchanged.
         let is_consult = self.is_consult();
-        let preamble = if self.cfg.no_preamble {
-            None
-        } else if is_consult {
-            Some(
-                self.cfg
-                    .preamble
-                    .as_deref()
-                    .unwrap_or(prompt::DEFAULT_CONSULT_PREAMBLE),
-            )
-        } else {
-            Some(self.cfg.preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE))
-        };
+        let preamble = select_preamble(
+            self.cfg.no_preamble,
+            is_consult,
+            self.cfg.review_preamble.as_deref(),
+            self.cfg.consult_preamble.as_deref(),
+        );
 
         // Switch guard [f4], part 1 of 2: capture the account this profile is authorized for, at spawn
         // time. This re-checks the allowlist tuple now, just before the child starts (so a profile
@@ -5426,6 +5439,53 @@ fn fmt_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn select_preamble_routes_each_path_to_its_own_override_and_default() {
+        // The swap-prone part: a review must read the review override and a consult the consult
+        // override, and confusing the two (or the two built-in defaults) must be visible here rather
+        // than only at runtime. `is_consult` false = review, true = consult.
+
+        // No override: each path falls back to its own built-in default, never the other's.
+        assert_eq!(
+            select_preamble(false, false, None, None),
+            Some(DEFAULT_PREAMBLE)
+        );
+        assert_eq!(
+            select_preamble(false, true, None, None),
+            Some(prompt::DEFAULT_CONSULT_PREAMBLE)
+        );
+
+        // An override is honoured only on its own path and never leaks to the other.
+        assert_eq!(
+            select_preamble(false, false, Some("REVIEW"), Some("CONSULT")),
+            Some("REVIEW")
+        );
+        assert_eq!(
+            select_preamble(false, true, Some("REVIEW"), Some("CONSULT")),
+            Some("CONSULT")
+        );
+
+        // Overriding one path leaves the other on its built-in default.
+        assert_eq!(
+            select_preamble(false, true, Some("REVIEW"), None),
+            Some(prompt::DEFAULT_CONSULT_PREAMBLE)
+        );
+        assert_eq!(
+            select_preamble(false, false, None, Some("CONSULT")),
+            Some(DEFAULT_PREAMBLE)
+        );
+
+        // --no-preamble suppresses both paths regardless of any override present.
+        assert_eq!(
+            select_preamble(true, false, Some("REVIEW"), Some("CONSULT")),
+            None
+        );
+        assert_eq!(
+            select_preamble(true, true, Some("REVIEW"), Some("CONSULT")),
+            None
+        );
+    }
 
     #[test]
     fn serve_record_aggregate_clears_floor_only_on_a_complete_canonical_terminal_op() {

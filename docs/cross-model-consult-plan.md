@@ -335,7 +335,9 @@ So the consult path supplies:
 - the same **evidence-tool direction** the review preamble gives (how to discover, read, search, and
   page the change), because that vocabulary is exactly what a consult needs.
 
-The existing `--preamble-file` / `--no-preamble` overrides apply to the consult preamble too.
+The consult preamble has its own override, `--consult-preamble-file`, independent of the review
+preamble's `--review-preamble-file` (so overriding one framing never clobbers the other). The
+`--no-preamble` switch still suppresses both.
 
 ## Concurrency
 

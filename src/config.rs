@@ -112,7 +112,8 @@ pub struct LevelOverride {
 ///
 /// This is the per-entry slice lifted out of `Config` so a chain can hold an ordered list of
 /// them (`Config::reviewers`). Only a reviewer's *identity* lives here — the process-global
-/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, `preamble`) stay
+/// behaviour flags (`sandbox`, `tools`, `allowed_tools`, `isolate_reviewer`, the preamble
+/// overrides) stay
 /// on `Config`, because they are already family-scoped in effect: `--sandbox` is read only by
 /// the Codex invocation and `--tools`/`--allow-tools` only by the Claude one, so a global value
 /// applies to whichever entries are of that family and is inert for the others.
@@ -898,7 +899,14 @@ pub struct Config {
     /// the CLI as its own argument and a path with spaces cannot be mis-split.
     pub allowed_tools: Vec<String>,
     pub tools: String,
-    pub preamble: Option<String>,
+    /// Replaces the built-in review preamble (`--review-preamble-file`); `None` uses
+    /// `prompt::DEFAULT_PREAMBLE`. Kept separate from `consult_preamble` so overriding the
+    /// framing of one path does not silently clobber the other's — the two preambles say
+    /// very different things (a gated reviewer vs. a second pair of eyes).
+    pub review_preamble: Option<String>,
+    /// Replaces the built-in consult preamble (`--consult-preamble-file`); `None` uses
+    /// `prompt::DEFAULT_CONSULT_PREAMBLE`.
+    pub consult_preamble: Option<String>,
     pub no_preamble: bool,
     /// Run the reviewer without the configuration it would normally pick up from the
     /// project and the user.
@@ -1005,7 +1013,8 @@ impl Config {
         let mut sandbox = "read-only".to_string();
         let mut allowed_tools: Option<String> = None;
         let mut tools: Option<String> = None;
-        let mut preamble_file: Option<PathBuf> = None;
+        let mut review_preamble_file: Option<PathBuf> = None;
+        let mut consult_preamble_file: Option<PathBuf> = None;
         let mut no_preamble = false;
         let mut isolate_reviewer = true;
         let mut metrics = true;
@@ -1236,7 +1245,12 @@ impl Config {
                     )
                 }
                 "--vcs" => vcs_arg = Vcs::parse_arg(&take("--vcs")?)?,
-                "--preamble-file" => preamble_file = Some(PathBuf::from(take("--preamble-file")?)),
+                "--review-preamble-file" => {
+                    review_preamble_file = Some(PathBuf::from(take("--review-preamble-file")?))
+                }
+                "--consult-preamble-file" => {
+                    consult_preamble_file = Some(PathBuf::from(take("--consult-preamble-file")?))
+                }
                 "--no-preamble" => no_preamble = true,
                 // The original name only spoke of MCP; kept working because it is in
                 // published example configs.
@@ -1294,13 +1308,18 @@ impl Config {
             }
         }
 
-        let preamble = match preamble_file {
-            Some(p) => Some(
-                std::fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read --preamble-file {}: {e}", p.display()))?,
-            ),
-            None => None,
+        let read_preamble = |flag: &str, path: Option<PathBuf>| -> Result<Option<String>, String> {
+            match path {
+                Some(p) => {
+                    Ok(Some(std::fs::read_to_string(&p).map_err(|e| {
+                        format!("cannot read {flag} {}: {e}", p.display())
+                    })?))
+                }
+                None => Ok(None),
+            }
         };
+        let review_preamble = read_preamble("--review-preamble-file", review_preamble_file)?;
+        let consult_preamble = read_preamble("--consult-preamble-file", consult_preamble_file)?;
 
         // Computed before the struct literal because the default rules are derived from
         // `cwd`, which the literal moves.
@@ -1342,7 +1361,8 @@ impl Config {
             sandbox,
             allowed_tools,
             tools: tools.unwrap_or_else(|| DEFAULT_CLAUDE_TOOLS.to_string()),
-            preamble,
+            review_preamble,
+            consult_preamble,
             no_preamble,
             isolate_reviewer,
             metrics,
@@ -2229,8 +2249,12 @@ OPTIONS:
                               changelist instead of collapsing files byte-identical to what
                               the reviewer was already shown. Git derives its change live and
                               carries no resume baseline, so this flag has no effect there.
-  --preamble-file <path>      Replace the built-in reviewer preamble.
-  --no-preamble               Send the caller's instructions with no preamble at all.
+  --review-preamble-file <path>
+                              Replace the built-in review preamble (cross_model_review).
+  --consult-preamble-file <path>
+                              Replace the built-in consult preamble (cross_model_consult).
+  --no-preamble               Send the caller's instructions with no preamble at all
+                              (applies to both review and consult).
   --allow-reviewer-config     Let the reviewer load project and user configuration
                               (hooks, settings, plugins, skills, MCP servers, CLAUDE.md).
                               Off by default, and it is a security boundary: a reviewed
@@ -2341,6 +2365,68 @@ mod tests {
         // An absolute one is accepted.
         Config::from_args(&args(&["--reviewer", "codex", "--state-dir", "C:\\state"]))
             .expect("absolute state dir");
+    }
+
+    #[test]
+    fn review_and_consult_preamble_files_are_independent() {
+        let dir = crate::testutil::temp_dir("cross-review-preamble");
+        let review = dir.join("review.md");
+        let consult = dir.join("consult.md");
+        std::fs::write(&review, "REVIEW PREAMBLE").expect("write review preamble");
+        std::fs::write(&consult, "CONSULT PREAMBLE").expect("write consult preamble");
+
+        // Each flag fills only its own field; the other falls back to the built-in default
+        // (represented as `None`), so overriding one never clobbers the other.
+        let review_only = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--review-preamble-file",
+            review.to_str().unwrap(),
+        ]))
+        .expect("config");
+        assert_eq!(
+            review_only.review_preamble.as_deref(),
+            Some("REVIEW PREAMBLE")
+        );
+        assert_eq!(review_only.consult_preamble, None);
+
+        let consult_only = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--consult-preamble-file",
+            consult.to_str().unwrap(),
+        ]))
+        .expect("config");
+        assert_eq!(consult_only.review_preamble, None);
+        assert_eq!(
+            consult_only.consult_preamble.as_deref(),
+            Some("CONSULT PREAMBLE")
+        );
+
+        // Both together, each landing in its own field.
+        let both = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--review-preamble-file",
+            review.to_str().unwrap(),
+            "--consult-preamble-file",
+            consult.to_str().unwrap(),
+        ]))
+        .expect("config");
+        assert_eq!(both.review_preamble.as_deref(), Some("REVIEW PREAMBLE"));
+        assert_eq!(both.consult_preamble.as_deref(), Some("CONSULT PREAMBLE"));
+    }
+
+    #[test]
+    fn a_missing_preamble_file_names_the_flag_it_came_from() {
+        let err = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--consult-preamble-file",
+            "C:\\does\\not\\exist.md",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("cannot read --consult-preamble-file"), "{err}");
     }
 
     #[test]

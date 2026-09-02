@@ -151,8 +151,9 @@ The essentials:
 --sandbox <mode>             Codex sandbox policy. Default read-only.
 --vcs <auto|git|perforce>    Which version control the change backend uses. Default auto.
 --tools / --allow-tools      Override the Claude reviewer's read-only tool policy.
---preamble-file <path>       Replace the built-in reviewer preamble.
---no-preamble                Send the caller's instructions with nothing added.
+--review-preamble-file <path>  Replace the built-in review preamble (cross_model_review).
+--consult-preamble-file <path> Replace the built-in consult preamble (cross_model_consult).
+--no-preamble                Send the caller's instructions with nothing added (both paths).
 --allow-reviewer-config      Let the reviewer load project and user configuration.
 --no-metrics                 Stop recording per-turn token usage. On by default.
 --doctor                     Check CLI and auth from a terminal, then exit.
