@@ -696,6 +696,13 @@ fn server_instructions(app: &App) -> String {
 fn tool_definitions(app: &App) -> Vec<Value> {
     let cfg = app.cfg();
     let reviewer = cfg.describe_reviewer();
+    let setup_targets = cfg
+        .reviewers
+        .iter()
+        .filter(|spec| !spec.profile.is_ambient())
+        .map(|spec| format!("{} {}", spec.reviewer.as_str(), spec.profile.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Stated accurately per reviewer, because it changes what the caller must supply. A
     // reviewer with no shell cannot obtain a diff, and a description that implied
@@ -1106,7 +1113,7 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "cross_model_setup_profile",
-            "description":
+            "description": format!(
                 "Authorize THIS repository to run reviews under a reviewer account profile — a \
                  dedicated config home that fixes which account a review bills, regardless of what \
                  the desktop app is signed into. This is a one-time, human-approved step: it opens a \
@@ -1117,7 +1124,12 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  local page asks you to paste a code shown in the browser), then authorizes the \
                  result — this both first-provisions a new home and re-signs-in (switches the account \
                  of) an existing one. Nothing is authorized unless you approve, and authorization is \
-                 scoped to the directory this server was launched from.",
+                 scoped to the directory this server was launched from. The requested reviewer and \
+                 profile/home must match a non-ambient entry in this server's configured reviewer \
+                 chain; unconfigured targets are rejected before setup starts. Configured setup \
+                 targets: {}.",
+                if setup_targets.is_empty() { "none" } else { &setup_targets }
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1375,6 +1387,28 @@ mod tests {
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert!(!tool["description"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn setup_tool_names_the_configured_profiles() {
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+            "--claude-profile".into(),
+            "ruckus".into(),
+        ])
+        .expect("config");
+        let app = App::new(cfg);
+        let tools = tool_definitions(&app);
+        let setup = tools
+            .iter()
+            .find(|tool| tool["name"] == "cross_model_setup_profile")
+            .unwrap();
+        let description = setup["description"].as_str().unwrap();
+        assert!(description.contains("claude profile:ruckus"));
+        assert!(description.contains("unconfigured targets are rejected"));
     }
 
     #[test]

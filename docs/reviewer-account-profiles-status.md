@@ -1,10 +1,19 @@
 # Reviewer account profiles — build status & handoff
 
+> **Historical build log — not a current status.** This was the resume point while the feature was
+> being built, and each entry is frozen at the moment it was written: statements below that something
+> is "missing" or "not yet implemented" were true of *that* entry's tree, not of this one. The feature
+> shipped; the branch (`docs/multi-account-plan`) is long merged and the test count quoted below (581)
+> is far behind. For what the tool does **now**, read [../README.md](../README.md) and the code; for
+> the design and its rationale, read the two notes linked in the next paragraph. Kept as written
+> because the per-phase commits and gate approvals recorded here are the evidence trail for how each
+> boundary was verified, and rewriting it would destroy that.
+
 Resume point for the account-profiles feature. Read this, then
 [`reviewer-account-profiles-impl.md`](reviewer-account-profiles-impl.md) (the detailed plan) and
-[`reviewer-account-profiles.md`](reviewer-account-profiles.md) (design). Everything below is on branch
+[`reviewer-account-profiles.md`](reviewer-account-profiles.md) (design). Everything below was on branch
 `docs/multi-account-plan`; all code is committed and green (`cargo fmt --check`, `clippy -D warnings`,
-581 tests).
+581 tests **at the time of writing**).
 
 ## Done (committed, gate-approved)
 

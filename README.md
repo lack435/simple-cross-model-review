@@ -66,7 +66,16 @@ this repository; releases are built and published by CI.
 | `cross_model_review_status` | Is the reviewer CLI installed and signed in? Costs nothing, calls no model. |
 | `cross_model_consult` | Ask the reviewer an informal question — a lightweight second opinion, no findings ledger and nothing to converge on. Returns a `review_id`. |
 | `cross_model_consult_result` | Wait for and return a consult's prose answer. |
-| `cross_model_setup_profile` | One-time, human-approved step to authorize this repository to review under a dedicated reviewer account (see [account profiles](docs/reviewer-account-profiles.md)). |
+| `cross_model_setup_profile` | Human-approved login/authorization for a profile configured in this server's reviewer chain (see [account profiles](docs/reviewer-account-profiles.md)). |
+
+Profile setup accepts only a reviewer/profile configured in the running server's chain, including
+fallback entries. Its tool description lists those targets; a mismatched request returns `BAD_REQUEST`
+before creating setup state or opening a browser. Configure a new profile and restart the server before
+setting it up. Setup uses the first matching entry's configured CLI binary.
+
+Use `login: true` to repair a signed-out profile. The approval page shows the stored account, if
+available, as unauthenticated information. Setup verifies the new subscription login before replacing
+the old home and authorizing it. With `login: false`, the existing login must still pass verification.
 
 ### Reviews are asynchronous
 

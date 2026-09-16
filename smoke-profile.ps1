@@ -34,6 +34,7 @@ param(
     [string[]]$Reviewers = @('codex', 'claude'),
 
     # The profile name to provision (a safe name: letters, digits, '.', '_', '-').
+    [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$Profile = 'smoke',
 
     # Path to the built server. Point at target\release so it need not be the (possibly locked) dist copy.
@@ -50,6 +51,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# ValidateSet matches case-insensitively, so -Reviewers CODEX binds. The name is interpolated
+# into the `--<reviewer>-profile` flag, which the server matches by exact string, so normalize
+# once here rather than at each use.
+$Reviewers = @($Reviewers | ForEach-Object { $_.ToLowerInvariant() })
 if (-not (Test-Path $Exe)) { throw "cross-review.exe not found at $Exe. Run .\build.ps1 (or cargo build --release) first." }
 
 if ($HomeDir) { $crHome = $HomeDir; $Keep = $true } else { $crHome = Join-Path ([System.IO.Path]::GetTempPath()) "cr-smoke-home-$PID" }
@@ -59,9 +64,12 @@ New-Item -ItemType Directory -Force $crHome | Out-Null
 Write-Host "==> CROSS_REVIEW_HOME = $crHome" -ForegroundColor Cyan
 Write-Host "==> provisioning profile '$Profile' for: $($Reviewers -join ', ')" -ForegroundColor Cyan
 
-# The server's own --reviewer does not matter here: cross_model_setup_profile takes the reviewer as an
-# argument. A minimal valid config launches the server; setup resolves the vendor CLI per its argument.
-$serverArgs = @('--reviewer', 'codex', '--level', 'smoke:gpt-5.6-luna:low', '--state-dir', $stateDir)
+$serverArgs = @()
+foreach ($rv in ($Reviewers | Select-Object -Unique)) {
+    $level = if ($rv -eq 'codex') { 'smoke:gpt-5.6-luna:low' } else { 'smoke:claude-opus-4-8:low' }
+    $serverArgs += @('--reviewer', $rv, '--level', $level, "--$rv-profile", $Profile)
+}
+$serverArgs += @('--state-dir', $stateDir)
 
 # Windows PowerShell 5.1's ProcessStartInfo has no ArgumentList; quote by hand (paths here are simple).
 $psi = New-Object System.Diagnostics.ProcessStartInfo
