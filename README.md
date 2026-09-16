@@ -195,6 +195,11 @@ explicit list of changelists named per call in the `change` argument (`"43650"`,
 the client-derivation rules and read-confinement by basis, are in
 [`docs/perforce-resume-delta.md`](docs/perforce-resume-delta.md).
 
+Pending Perforce workspace diffs use `p4 diff -du -dl`: line-ending differences (such as
+CRLF versus LF) are ignored so they cannot exhaust the diff budget. Spaces, tabs and
+content changes are still shown. Opens with no remaining textual changes are named in
+the capture listing. Submitted and shelved diffs and added-file contents are unchanged.
+
 ## Re-reviewing after you act on feedback
 
 Sessions are named, and you choose the names. Calling `cross_model_review` again with the same
