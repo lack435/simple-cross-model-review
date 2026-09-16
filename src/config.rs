@@ -56,6 +56,9 @@ impl ReviewerKind {
         }
     }
 
+    /// Test-only: the run path takes model and effort from an explicit `--level`, so these
+    /// defaults only stand in for one the config tests did not spell out.
+    #[cfg(test)]
     pub fn default_model(self) -> &'static str {
         match self {
             // Pinned by full id on purpose. Bare aliases like `opus` can change resolution
@@ -67,6 +70,7 @@ impl ReviewerKind {
         }
     }
 
+    #[cfg(test)]
     pub fn default_effort(self) -> &'static str {
         match self {
             Self::Claude => "medium",

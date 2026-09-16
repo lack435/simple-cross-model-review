@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use crate::approval::{ApprovalDetails, ApprovalOutcome, ApprovalRow, ApprovalServer};
 use crate::cancel::RequestCancel;
-use crate::config::{Config, ReviewerKind, ReviewerSpec, UsageMinimum};
+use crate::config::{Config, ReviewerKind, ReviewerSpec};
 use crate::errors::{self, Failure};
 use crate::profile::ProfileSelector;
 use crate::reviewer::AuthMethod;
@@ -599,6 +599,9 @@ type LoginFn<'a> =
 ///   authorize — the crash-safe staged-provisioning flow ([`provision`]).
 /// - home absent without `login` is refused with guidance.
 ///
+/// Before any of that, [`configured_setup_spec`] refuses a reviewer/profile this server was not
+/// configured with, so an unconfigured target never reaches the lock or creates state.
+///
 /// All of it runs under the per-home [`SetupSession`] lock, whose `begin` also replays any crashed
 /// prior run's journal first.
 pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<String, Failure> {
@@ -612,6 +615,8 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
              there is a fixed, protected location to record the authorization.",
         )
     })?;
+    let spec = configured_setup_spec(cfg, reviewer, &selector, &base)?;
+    let selector = spec.profile.clone();
     let home = crate::profile::resolve_home(&selector, reviewer, Some(&base))
         .map_err(errors::bad_request)?
         .expect("a non-ambient selector resolves to a home");
@@ -629,19 +634,7 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
         }
     })?;
 
-    let spec = ReviewerSpec {
-        reviewer,
-        model: reviewer.default_model().to_string(),
-        effort: reviewer.default_effort().to_string(),
-        bin: None,
-        usage_minimum: UsageMinimum::None,
-        profile: selector.clone(),
-        // Setup provisions/authorizes an account; levels are a per-review selection knob with no
-        // bearing on that, so this synthetic spec declares none.
-        levels: std::collections::BTreeMap::new(),
-        default_level: None,
-    };
-    let bin = crate::reviewer::resolve_bin(&spec)?;
+    let bin = crate::reviewer::resolve_bin(spec)?;
     let adapter = crate::reviewer::for_kind(reviewer);
 
     let exists = home.is_dir();
@@ -953,9 +946,34 @@ fn provision(
     request: &RequestCancel,
     login_fn: &LoginFn,
 ) -> Result<String, Failure> {
-    // For re-login, read the existing account so the human sees what will be replaced (read-only).
+    let details = provision_approval_details(cfg, home, reviewer, selector, adapter, op);
+    await_approval(&details, request)?;
+
+    provision_after_approval(
+        cfg, base, home, reviewer, selector, adapter, bin, op, session, request, login_fn,
+    )
+}
+
+/// The approval page's rows for a provisioning run.
+///
+/// For a re-login this shows the account currently stored in the home, read straight from the local
+/// account file via [`crate::reviewer::Reviewer::fingerprint_at`] — no CLI call, no auth. It is
+/// labelled as unauthenticated on purpose: a signed-out or expired home is precisely the one a
+/// re-login exists to repair, so requiring the *old* credentials to work before the human may
+/// approve replacing them made the broken case unrepairable. `Unavailable` when the file is missing
+/// or unreadable. Nothing downstream consumes this value; the replacement account is the one
+/// verified after login, in [`provision_after_approval`].
+fn provision_approval_details(
+    cfg: &Config,
+    home: &Path,
+    reviewer: ReviewerKind,
+    selector: &ProfileSelector,
+    adapter: &dyn crate::reviewer::Reviewer,
+    op: Operation,
+) -> ApprovalDetails {
+    // The old account is display-only; expired credentials must not prevent re-login.
     let existing = if op == Operation::Relogin {
-        Some(adapter.resolve_home_identity(bin, cfg, home, request.cancel_flag())?)
+        adapter.fingerprint_at(home)
     } else {
         None
     };
@@ -981,19 +999,17 @@ fn provision(
         row("Profile home", &home.to_string_lossy()),
         row("Launch root", &cfg.launch_root.to_string_lossy()),
     ];
-    if let Some(id) = &existing {
-        rows.push(row("Current account (to be replaced)", &id.account));
+    if op == Operation::Relogin {
+        rows.push(row(
+            "Stored account (not authenticated; to be replaced)",
+            existing.as_deref().unwrap_or("Unavailable"),
+        ));
     }
-    let details = ApprovalDetails {
+    ApprovalDetails {
         title: "Set up a reviewer profile for this repository".to_string(),
         rows,
         caution: Some(caution.to_string()),
-    };
-    await_approval(&details, request)?;
-
-    provision_after_approval(
-        cfg, base, home, reviewer, selector, adapter, bin, op, session, request, login_fn,
-    )
+    }
 }
 
 /// The staged-provisioning core, factored from the human approval so unit tests drive it with a stub
@@ -1228,6 +1244,61 @@ fn provision_after_approval(
     ))
 }
 
+/// Resolve the request against the **running server's reviewer chain**, before any state exists.
+///
+/// Setup writes credential state and authorizes an account, so it may only target a profile this
+/// server was actually configured with: the matching chain entry is the one whose CLI binary,
+/// reviewer family and home a review would later use, and synthesizing a spec for an arbitrary
+/// target authorized a home nothing here could ever route to. Returns the first non-ambient entry
+/// for `reviewer` whose effective home is the requested one; the caller then adopts that entry's
+/// selector and `bin`.
+///
+/// Matching is by effective home rather than by label, so an explicit home and the configured named
+/// profile it resolves to are the same target in either direction. Alternate spellings of one home
+/// go through [`crate::pathcmp::identity_path_matches`], which confirms on disk — so a differently
+/// spelled home that does not exist yet fails closed and the caller is told the configured label to
+/// use instead.
+///
+/// Called first in [`run_setup`] — before the setup lock, journal recovery, CLI resolution or any
+/// directory creation — so a rejected target leaves nothing behind and opens no browser.
+fn configured_setup_spec<'a>(
+    cfg: &'a Config,
+    reviewer: ReviewerKind,
+    selector: &ProfileSelector,
+    base: &Path,
+) -> Result<&'a ReviewerSpec, Failure> {
+    let requested_home = crate::profile::resolve_home(selector, reviewer, Some(base))
+        .map_err(errors::bad_request)?
+        .ok_or_else(|| errors::bad_request("Setup requires a configured non-ambient profile."))?;
+    let mut choices = Vec::new();
+    for spec in &cfg.reviewers {
+        if spec.reviewer != reviewer || spec.profile.is_ambient() {
+            continue;
+        }
+        choices.push(spec.profile.label());
+        let configured_home = crate::profile::resolve_home(&spec.profile, reviewer, Some(base))
+            .map_err(errors::bad_request)?
+            .expect("a non-ambient selector resolves to a home");
+        if crate::pathcmp::identity_path_matches(
+            &requested_home,
+            &configured_home.to_string_lossy(),
+        ) {
+            return Ok(spec);
+        }
+    }
+    let configured = if choices.is_empty() {
+        "none; configure a profile for this reviewer and restart the server".to_string()
+    } else {
+        choices.join(", ")
+    };
+    Err(errors::bad_request(format!(
+        "Setup target {} is not configured for {} in this server's reviewer chain. \
+         Configured profiles: {configured}.",
+        selector.label(),
+        reviewer.as_str(),
+    )))
+}
+
 fn parse_login(args: &Value) -> Result<bool, Failure> {
     match args.get("login") {
         None | Some(Value::Null) => Ok(false),
@@ -1380,6 +1451,131 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         crate::testutil::temp_dir("cross-review-setup-tests")
+    }
+
+    fn claude_profile_config() -> Config {
+        Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+            "--claude-profile".into(),
+            "ruckus".into(),
+        ])
+        .expect("config")
+    }
+
+    #[test]
+    fn setup_rejects_an_unconfigured_profile_before_creating_state() {
+        let _guard = crate::profile::isolate_profile_base();
+        let base = crate::profile::profile_base().unwrap();
+        let cfg = claude_profile_config();
+        for login in [false, true] {
+            let failure = run_setup(
+                &cfg,
+                &serde_json::json!({"reviewer": "claude", "profile": "default", "login": login}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+            assert_eq!(failure.code, "BAD_REQUEST");
+            assert!(failure.summary.contains("profile:default"));
+            assert!(failure.summary.contains("profile:ruckus"));
+            assert!(
+                !base.exists(),
+                "a rejected target must not create setup state"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_selects_a_configured_fallback_and_preserves_its_binary() {
+        let base = temp_dir();
+        let mut cfg = codex_config();
+        let mut fallback = claude_profile_config().reviewers.remove(0);
+        fallback.bin = Some(base.join("custom-claude.exe"));
+        cfg.reviewers.push(fallback.clone());
+        let selected = configured_setup_spec(
+            &cfg,
+            ReviewerKind::Claude,
+            &ProfileSelector::Named("ruckus".into()),
+            &base,
+        )
+        .unwrap();
+        assert_eq!(selected, &fallback);
+    }
+
+    #[test]
+    fn setup_matches_explicit_homes_but_rejects_other_homes_and_families() {
+        let base = temp_dir();
+        let mut cfg = claude_profile_config();
+        let named = ProfileSelector::Named("ruckus".into());
+        let home = crate::profile::resolve_home(&named, ReviewerKind::Claude, Some(&base))
+            .unwrap()
+            .unwrap();
+        let explicit = ProfileSelector::ExplicitHome(home.clone());
+        assert!(configured_setup_spec(&cfg, ReviewerKind::Claude, &explicit, &base).is_ok());
+        cfg.reviewers[0].profile = explicit.clone();
+        assert!(configured_setup_spec(&cfg, ReviewerKind::Claude, &named, &base).is_ok());
+        assert!(configured_setup_spec(&cfg, ReviewerKind::Codex, &explicit, &base).is_err());
+        let other = ProfileSelector::ExplicitHome(base.join("other"));
+        assert!(configured_setup_spec(&cfg, ReviewerKind::Claude, &other, &base).is_err());
+
+        std::fs::create_dir_all(&home).unwrap();
+        let alternate = ProfileSelector::ExplicitHome(PathBuf::from(
+            home.to_string_lossy().to_uppercase().replace('\\', "/"),
+        ));
+        assert!(configured_setup_spec(&cfg, ReviewerKind::Claude, &alternate, &base).is_ok());
+    }
+
+    #[test]
+    fn setup_rejects_profiles_for_an_ambient_only_reviewer() {
+        let base = temp_dir();
+        let failure = configured_setup_spec(
+            &codex_config(),
+            ReviewerKind::Codex,
+            &ProfileSelector::Named("default".into()),
+            &base,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "BAD_REQUEST");
+        assert!(failure.summary.contains("configure a profile"));
+    }
+
+    #[test]
+    fn relogin_approval_does_not_require_working_old_credentials() {
+        let home = temp_dir();
+        let cfg = claude_profile_config();
+        let adapter = crate::reviewer::for_kind(ReviewerKind::Claude);
+        let selector = ProfileSelector::Named("ruckus".into());
+        for (account_file, expected) in [
+            (None, "Unavailable"),
+            (Some("invalid json"), "Unavailable"),
+            (
+                Some(
+                    r#"{"oauthAccount":{"accountUuid":"old-account","organizationUuid":"old-org"}}"#,
+                ),
+                "old-org/old-account",
+            ),
+        ] {
+            if let Some(contents) = account_file {
+                std::fs::write(home.join(".claude.json"), contents).unwrap();
+            }
+            let details = provision_approval_details(
+                &cfg,
+                &home,
+                ReviewerKind::Claude,
+                &selector,
+                adapter.as_ref(),
+                Operation::Relogin,
+            );
+            let account = details
+                .rows
+                .iter()
+                .find(|row| row.label == "Stored account (not authenticated; to be replaced)")
+                .expect("old account is shown without claiming authentication");
+            assert_eq!(account.value, expected);
+            assert!(!home.join(".credentials.json").exists());
+        }
     }
 
     #[test]
@@ -1886,6 +2082,48 @@ mod tests {
             })
             .unwrap_or(false);
         assert!(!staging_left, "the staging directory is rolled back");
+    }
+
+    #[test]
+    fn relogin_still_rejects_invalid_new_credentials_without_replacing_the_old_home() {
+        let base = temp_dir();
+        let cfg = codex_config();
+        let selector = ProfileSelector::Named("work".into());
+        let home = crate::profile::secure_profile_dir(&selector, ReviewerKind::Codex, Some(&base))
+            .unwrap()
+            .into_path();
+        std::fs::write(home.join("auth.json"), "old signed-out state").unwrap();
+        let adapter = crate::reviewer::for_kind(ReviewerKind::Codex);
+        let session = SetupSession::begin(&base, &home).unwrap();
+        let login = |staging: &Path, _scratch: &Path, _cancel: &std::sync::atomic::AtomicBool| {
+            std::fs::write(staging.join("auth.json"), "{}").unwrap();
+            crate::reviewer::LoginOutcome {
+                success: true,
+                timed_out: false,
+                cancelled: false,
+                exit: Some(0),
+                uncontained: false,
+            }
+        };
+        let failure = provision_after_approval(
+            &cfg,
+            &base,
+            &home,
+            ReviewerKind::Codex,
+            &selector,
+            adapter.as_ref(),
+            Path::new("codex.exe"),
+            Operation::Relogin,
+            session,
+            &RequestCancel::new(),
+            &login,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "PROFILE_IDENTITY_MISMATCH");
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            "old signed-out state"
+        );
     }
 
     #[test]

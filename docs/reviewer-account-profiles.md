@@ -1,7 +1,14 @@
 # Reviewer account profiles
 
-Status: **plan**, not yet implemented. This note fixes the scope and the mechanism before any
-code lands, so the reviewer has something to argue with rather than a diff to reverse-engineer.
+Status: **shipped**. This note was written as a plan, before any code landed, and is kept as the
+design of record — the scope, the mechanism, and the arguments for them — rather than rewritten into
+a description of the tree. Treat its "will" as "does" for the mechanism itself (profile homes, the
+allowlist, the human-gated setup tool); the explicitly-deferred items it names, such as the full
+visual profile manager, are still deferred. The authority for current behaviour is
+[../README.md](../README.md) and the code; where this note disagrees with them, they win.
+[reviewer-account-profiles-status.md](reviewer-account-profiles-status.md) records how it was built
+phase by phase, but it is a historical build log and is stale by construction — read it for the
+evidence trail, not for current status.
 
 Following the README's discipline, claims are marked **[verified]** (checked against this tree or a
 cited source), **[assumed]** (believed but not verified here — an implementation task must confirm),

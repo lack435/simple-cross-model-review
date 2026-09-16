@@ -1,9 +1,14 @@
 # Reviewer account profiles — implementation plan
 
-Status: **plan**, no code yet. The "why" and the decisions live in
+Status: **shipped**. The "why" and the decisions live in
 [reviewer-account-profiles.md](reviewer-account-profiles.md); this is the "how" — file-by-file work,
-phasing, and tests — to converge before writing code. Markers as in the design note:
-**[verified]** / **[assumed]** / **[decided]**. Line references are illustrative.
+phasing, and tests. It was written to converge before writing code and is kept as the implementation
+contract: the `[fN]` markers it defines are cited from the code, so it is maintained where the code
+moves out from under it rather than rewritten. Markers as in the design note: **[verified]** /
+**[assumed]** / **[decided]**. Line references are illustrative. For current behaviour read
+[../README.md](../README.md) and the code;
+[reviewer-account-profiles-status.md](reviewer-account-profiles-status.md) is a historical build log
+of how each phase landed and what gate approved it, not a statement of current status.
 
 ## Phasing
 
@@ -412,9 +417,29 @@ credential file is genuinely inside it.
     the existing home is untouched. Never log in directly over a valid home.
   - Rollback is scoped by an **ownership/generation marker**: a run removes **only** what it created
     (its staging dir / freshly-created dir), never a pre-existing home. [f2]
-- New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine: classify the operation
-  (above) → validate the name → **human approval** (below) → [provision/stage as needed] → confirm the
-  resolved account → **only then commit the allowlist entry**.
+- New MCP tool (`src/tools.rs` / `src/mcp.rs`), as an ordered state machine. The order as built
+  (`run_setup`, `src/setup.rs`): validate the arguments — reviewer, and `profile`/`home` exclusivity
+  plus the safe-name rule (`parse_selector`) → **match the request to a configured chain entry**
+  (below) → take the per-home setup lock and replay any crashed prior run's journal (`SetupSession::
+  begin`, [f23]) → **classify the operation** on home existence, which is why classification is after
+  recovery and not before ([f-r2.4]) → **human approval** (below) → [provision/stage as needed] →
+  confirm the resolved account → **only then commit the allowlist entry**.
+- **The target must be a profile this server is configured with** (`configured_setup_spec`). Setup takes
+  the first non-ambient chain entry for the requested reviewer whose **effective home** is the requested
+  one, and uses that entry's selector and CLI binary; anything else is `BAD_REQUEST` before the setup
+  lock, journal recovery, CLI resolution or any directory creation, so a rejected target creates no state
+  and opens no browser. The tool description lists the configured targets. Two consequences worth stating
+  plainly: a profile must be configured (and the server restarted) *before* it can be set up — there is no
+  path from an ambient-only server to a provisioned profile in one step — and matching by home rather than
+  by label means an explicit home and the named profile it resolves to are interchangeable, but an
+  alternate *spelling* of a home that does not exist yet fails closed (`identity_path_matches` confirms on
+  disk), and the caller is told which configured label to use.
+- **Re-login does not require the old credentials to work.** The approval page shows the account stored
+  in the home for the human's benefit, read from the local account file (`fingerprint_at`) with no CLI
+  call and no auth probe, labelled as unauthenticated and `Unavailable` when unreadable. A signed-out or
+  expired home is the case re-login exists to repair, so gating approval on a successful probe of the
+  account being *replaced* made it unrepairable. The commit prerequisite is unchanged: the **new** login
+  is verified (`confirm_setup_identity` + subscription method) before the staged home is swapped in.
 - **[f18/f6] Approval authorizes the *intent*; the commit prerequisite depends on the operation.**
   Human approval does **not** itself write the allowlist entry — it moves the profile into a
   **provisional/in-setup** state. For **first-provision** and **re-login**, the `(launch_root →
