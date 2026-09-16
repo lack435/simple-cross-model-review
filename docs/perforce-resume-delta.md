@@ -74,15 +74,25 @@ Only **token-heavy textual content** participates in elision:
 - **Elidable:** a file's textual `p4 diff` section, and a **pending** added file's body (read
   from the workspace and rendered separately at `src/vcs/perforce.rs:565`, `:628`, `:951`).
 - **Never elidable — rendered in full every turn:** binary files, deletes, files opened but
-  restored to depot content (no diff section), unreadable/omitted content, content that
-  required **lossy UTF-8 decoding** (see invariant 1), and every metadata note. These are
+  restored to depot content (including line-ending-only differences; no diff section),
+  unreadable/omitted content, content that required **lossy UTF-8 decoding** (see invariant 1),
+  and every metadata note. These are
   already one-liners, so eliding them saves nothing and only widens the attack surface.
-  `p4 diff -du` runs **without** `-t` (`src/vcs/perforce.rs:595`), so a same-type binary edit
+  `p4 diff -du -dl` runs **without** `-t`, so a same-type binary edit
   yields identical *empty* textual evidence on both turns; making binary non-elidable removes
   that hazard outright.
 - **Server-side added content (submitted/shelved):** `describe` and the shelved command omit
   `-a` (`src/vcs/perforce.rs:308`, `:715`), which Perforce requires to emit added bodies, so
   that content is not captured today and is classified **omitted / non-elidable** in v1.
+
+Pending workspace text diffs ignore line endings (`-dl`) before the shared capture budget
+is applied. An EOL-only open is named in the listing as having no textual changes ignoring
+line endings; content, space and tab changes still produce hunks. Submitted/shelved diffs
+and added-file contents retain their existing behavior. `-dl` is documented as far back as
+the [Perforce 2003.2 command reference](https://legacy-docs.perforce.com/doc.032/manuals/cmdref/diff.html).
+The combined `-du -dl` invocation and capture behavior were tested with P4/P4D
+2025.2/2907753 on Windows. Run `test-perforce-line-endings.ps1` (requires `p4`, `p4d` and
+`cargo`) for the synthetic local-server regression; it makes no model calls.
 
 ## Complete case coverage
 

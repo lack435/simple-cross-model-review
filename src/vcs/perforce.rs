@@ -1209,7 +1209,10 @@ impl<'a> P4<'a> {
                 ));
                 break;
             }
-            let out = match self.run(&["diff", "-du", depot.as_str()], "") {
+            // Text files are rendered with the client's LineEnd on sync. Ignore only line
+            // endings so an editor switching CRLF to LF cannot spend the capture budget on
+            // a whole-file diff; spaces, tabs and real edits must still be reviewed (#130).
+            let out = match self.run(&["diff", "-du", "-dl", depot.as_str()], "") {
                 Some(out) if out.success => out,
                 Some(out) if out.cancelled => return CaptureOne::Cancelled,
                 Some(out) => {
@@ -1258,7 +1261,7 @@ impl<'a> P4<'a> {
             }
             let body = match strip_unified_file_header(&out.stdout) {
                 HeaderStrip::Body(body) => body,
-                // No output (or a header with no hunks): the open is identical to the depot. A
+                // No output (or a header with no hunks): identical ignoring line endings. A
                 // real no-op, recorded explicitly rather than as an omission -- so it never forces
                 // the segment incomplete and is never confused with a diff we could not capture.
                 HeaderStrip::Empty => {
@@ -1298,7 +1301,7 @@ impl<'a> P4<'a> {
             // Surfaced in the listing (which does not gate completeness), so the reviewer can see
             // these opens carry no delta rather than wondering whether their diffs were lost.
             listing.push_str(&format!(
-                "(no textual changes vs the depot: {})\n",
+                "(no textual changes vs the depot, ignoring line endings: {})\n",
                 unchanged
                     .iter()
                     .map(|d| safe_label(d))
