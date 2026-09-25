@@ -234,8 +234,9 @@ fn moved_store_note_from(base: &Path, legacy: &Path) -> Option<String> {
 /// default is not) or no package copy matches.
 ///
 /// Read-only, and only called on an error path, so the `Packages` scan costs nothing on a working
-/// store. Identity is checked through [`crate::winsec::dir_identity_no_follow`], so a junction planted
-/// at a candidate is refused rather than followed.
+/// store. [`crate::winsec::dir_identity_no_follow`] refuses a reparse point only at the final
+/// component; an intermediate junction is followed. That is accepted rather than guarded against:
+/// the worst a planted junction can do is produce a misleading advisory, never change the failure.
 pub fn redirected_store_note(base: &Path) -> Option<String> {
     let local = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
