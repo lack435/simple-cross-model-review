@@ -61,8 +61,9 @@ identity is the counter-example to follow in reverse: the profile *is* identity,
   Result<Option<PathBuf>>`): `Ambient` → `None` (inherit). `Named(n)` →
   `{base}\profiles\{reviewer}\{n}`. `ExplicitHome(p)` → its own canonical form; no containment (it is
   deliberately outside the root) but local/trusted-only (Phase 3 gates it). `base` =
-  `%CROSS_REVIEW_HOME%`, else `%LOCALAPPDATA%\cross-review` — **[decided]** deliberately *not*
-  `--state-dir`, which is user/repo-settable and must never determine a credential home.
+  `%CROSS_REVIEW_HOME%`, else `%USERPROFILE%\.cross-review` (originally `%LOCALAPPDATA%\cross-review`;
+  moved because packaged hosts redirect AppData, see `reviewer-account-profiles.md`) —
+  **[decided]** deliberately *not* `--state-dir`, which is user/repo-settable and must never determine a credential home.
 - **[f5] Do NOT reuse `codex_sterile_dir` unchanged.** That function
   (`src/reviewer/mod.rs` ~487) canonicalizes *before* testing the reparse attribute and checks
   containment against `cfg.cwd` — safe for its own use (a temp-parented dir it owns), wrong for a
@@ -322,7 +323,7 @@ use). A fresh resolution here mirrors the `resolved_bin` re-resolution already d
 
 ### Allowlist store
 
-A per-machine store under `%CROSS_REVIEW_HOME%` / `%LOCALAPPDATA%\cross-review` — **[decided]** a
+A per-machine store under `%CROSS_REVIEW_HOME%` / `%USERPROFILE%\.cross-review` — **[decided]** a
 fixed, ACL-protected location the repo cannot point at (never `--state-dir`).
 
 **[f19] One entry schema, used everywhere:** an entry binds `(launch_root) → (canonical effective_home

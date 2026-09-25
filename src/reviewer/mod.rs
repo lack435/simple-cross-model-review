@@ -319,7 +319,7 @@ impl Drop for SterileDir {
 ///
 /// The state directory is normally ours and well outside the project, but not always: it
 /// is user-settable via `--state-dir`, and its own fallback puts it under the project when
-/// `LOCALAPPDATA` is unset. A state directory inside the project would make this "neutral"
+/// no profile base resolves. A state directory inside the project would make this "neutral"
 /// directory anything but, so that case is rejected in favour of the temp directory.
 pub fn neutral_dir(cfg: &Config) -> PathBuf {
     if cfg.state_dir.is_dir() && !is_within(&cfg.state_dir, &cfg.cwd) {

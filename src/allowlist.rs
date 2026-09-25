@@ -15,7 +15,7 @@
 //! cross-process exclusive lock. Any ACL/verification/parse failure is treated as untrusted and fails
 //! closed — every profile use is refused rather than risk honouring a tampered store.
 //!
-//! The location is fixed under `%CROSS_REVIEW_HOME%` / `%LOCALAPPDATA%\cross-review` (never
+//! The location is fixed under `%CROSS_REVIEW_HOME%` / `%USERPROFILE%\.cross-review` (never
 //! `--state-dir`, which a repo can point anywhere): a repo must not be able to choose where its own
 //! authorization is recorded.
 
@@ -92,7 +92,7 @@ pub struct AllowlistStore {
 }
 
 impl AllowlistStore {
-    /// The store under a resolved base (`%CROSS_REVIEW_HOME%` / `%LOCALAPPDATA%\cross-review`).
+    /// The store under a resolved base (`%CROSS_REVIEW_HOME%` / `%USERPROFILE%\.cross-review`).
     pub fn at(base: &Path) -> Self {
         Self {
             dir: base.join("auth"),
@@ -100,7 +100,7 @@ impl AllowlistStore {
     }
 
     /// The store for the current machine, or `None` when no base is resolvable (neither
-    /// `CROSS_REVIEW_HOME` nor `LOCALAPPDATA` is set) — in which case nothing can be authorized.
+    /// `CROSS_REVIEW_HOME` nor `USERPROFILE` is set) — in which case nothing can be authorized.
     pub fn current() -> Option<Self> {
         crate::profile::profile_base().map(|base| Self::at(&base))
     }
@@ -153,7 +153,7 @@ impl AllowlistStore {
     ) -> io::Result<bool> {
         // Secure the directory first (create + ACL + verify), so the file we write and lock lives in a
         // directory only this user can write. `{base}` itself is created plain (it inherits the
-        // user-scoped %LOCALAPPDATA% ACL); `{base}\auth` gets the protected DACL.
+        // user-scoped ACL of its parent); `{base}\auth` gets the protected DACL.
         if let Some(base) = self.dir.parent() {
             std::fs::create_dir_all(base)?;
         }

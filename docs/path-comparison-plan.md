@@ -66,7 +66,7 @@ separator/normalization core where it does not alter their fold or fail-directio
 
 | Site | Current | Why it must not move |
 |------|---------|----------------------|
-| `src/config.rs:1225` state-dir hash | `fnv1a64(&cwd.to_string_lossy().to_lowercase())` | The fold is baked into a durable directory name under `%LOCALAPPDATA%\cross-review\`. Changing it would relocate the default state dir and orphan in-flight sessions for affected users. |
+| `src/config.rs:1225` state-dir hash | `fnv1a64(&cwd.to_string_lossy().to_lowercase())` | The fold is baked into a durable directory name under the profile base (`%CROSS_REVIEW_HOME%`, else `%USERPROFILE%\.cross-review\`; `%LOCALAPPDATA%\cross-review\` when this plan was written). Changing it would relocate the default state dir and orphan in-flight sessions for affected users. |
 
 This looks like "another path lowercase" but it is not a comparison at all -- it is a hash
 input. Unifying it with Family A would be a silent data-migration bug. **The plan explicitly
@@ -75,7 +75,7 @@ leaves it as-is** and adds a comment marking it a frozen key, so the next reader
 
 **Scope of the risk (so the freeze is justified, not overstated):** the hash only names the
 *default* state dir. It is bypassed entirely when `--state-dir` is passed (both MCP configs can
-set it), and there is a project-local fallback when `%LOCALAPPDATA%` is unset (`src/config.rs:1228`).
+set it), and there is a project-local fallback when no profile base resolves (`default_state_dir` in `src/config.rs`).
 And an ASCII-only `cwd` is unaffected by an ASCII-vs-Unicode fold swap in the first place --
 `to_lowercase` and `eq_ignore_ascii_case` agree on ASCII. So the relocation would hit only
 default-state users whose `cwd` contains a non-ASCII character with case. That is a real but

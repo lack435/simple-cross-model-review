@@ -44,8 +44,8 @@ authentication docs); **[verified]** the tool already relies on `codex_home()` r
 A **profile** is a dedicated config home holding one signed-in account:
 
 ```
-%LOCALAPPDATA%\cross-review\profiles\codex\<name>\     -> CODEX_HOME
-%LOCALAPPDATA%\cross-review\profiles\claude\<name>\    -> CLAUDE_CONFIG_DIR
+%USERPROFILE%\.cross-review\profiles\codex\<name>\     -> CODEX_HOME
+%USERPROFILE%\.cross-review\profiles\claude\<name>\    -> CLAUDE_CONFIG_DIR
 ```
 
 `cross-review` sets the variable **on the child `Command` only** (`.env(...)`), never on its own
@@ -60,7 +60,15 @@ still override it. See correctness requirement 1 (auth-var precedence) below.
 
 - `--codex-profile <name>` / `--claude-profile <name>`: resolve to
   `{base}\profiles\{reviewer}\{name}`, where `{base}` is `%CROSS_REVIEW_HOME%` or, unset,
-  `%LOCALAPPDATA%\cross-review`.
+  `%USERPROFILE%\.cross-review`. **[verified]** The default was `%LOCALAPPDATA%\cross-review` until a
+  packaged (MSIX) host broke it: Windows redirects `%LOCALAPPDATA%` writes from a packaged app's
+  process tree, including the Claude desktop app's, into `%LOCALAPPDATA%\Packages\<package>\LocalCache`.
+  Copy-on-write gave the copied `auth` files an empty DACL (`D:AI`), because our `auth` DACL is
+  deliberately non-inheritable, so the store failed verification and setup could not open its lock.
+  Redirection covers only AppData, so the default moved to the user profile. An old store is not
+  migrated: its entries bind the old profile homes, and the user re-runs setup once. A
+  `PROFILE_NOT_AUTHORIZED` refusal says so when it finds the old store, and a store that fails to open
+  or verify reports a detected redirection by name.
 - `--codex-home <abs>` / `--claude-config-dir <abs>`: explicit escape hatch (local/trusted-only). It
   and the profile-name flag for the same family are **mutually exclusive on one entry** — setting both
   is a parse error, not a precedence contest (an ambiguous combination fails closed rather than
@@ -115,7 +123,7 @@ machine. This is what makes a team repo safe to configure.
 
 The reverse direction (`.codex/config.toml`, Claude reviewing) adds `--claude-profile <name>` the
 same way. Nothing per-person is ever committed; the only per-person state — the signed-in account —
-lives in `%LOCALAPPDATA%`, outside the repo, with nothing to `.gitignore`.
+lives in `%USERPROFILE%\.cross-review`, outside the repo, with nothing to `.gitignore`.
 
 ## Setup UX: terminal-less, subscription OAuth
 
