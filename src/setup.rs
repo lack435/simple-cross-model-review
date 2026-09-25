@@ -611,7 +611,7 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
 
     let base = crate::profile::profile_base().ok_or_else(|| {
         errors::bad_request(
-            "No profile base is configured: set CROSS_REVIEW_HOME (or ensure LOCALAPPDATA is set) so \
+            "No profile base is configured: set CROSS_REVIEW_HOME (or ensure USERPROFILE is set) so \
              there is a fixed, protected location to record the authorization.",
         )
     })?;
@@ -630,7 +630,12 @@ pub fn run_setup(cfg: &Config, args: &Value, request: &RequestCancel) -> Result<
                  try again.",
             )
         } else {
-            setup_failure(format!("Could not start setup: {e}"))
+            let mut message = format!("Could not start setup: {e}");
+            if let Some(note) = crate::profile::redirected_store_note(&base) {
+                message.push_str("\n\n");
+                message.push_str(&note);
+            }
+            setup_failure(message)
         }
     })?;
 

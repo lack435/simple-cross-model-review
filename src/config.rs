@@ -1342,7 +1342,7 @@ impl Config {
         };
         let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&cwd));
         // Backstop the explicit `--state-dir` check above for the *derived* default: `default_state_dir`
-        // joins `%LOCALAPPDATA%` (or, without it, `cwd`), and a relative `LOCALAPPDATA` -- or a relative
+        // joins the profile base (or, without one, `cwd`), and a relative base -- or a relative
         // `cwd` reaching the fallback -- would yield a relative state dir that resolves against each
         // process's launch directory. Two callers would then key the per-session lease and the Codex
         // sterile directory on one text but open different locks, letting them stomp one sterile
@@ -1350,7 +1350,7 @@ impl Config {
         if !state_dir.is_absolute() {
             return Err(format!(
                 "the state directory resolved to a relative path ('{}'); set an absolute --state-dir, \
-                 or an absolute %LOCALAPPDATA% and --cwd",
+                 or an absolute CROSS_REVIEW_HOME (or USERPROFILE) and --cwd",
                 state_dir.display()
             ));
         }
@@ -1468,10 +1468,17 @@ impl Config {
 
         match self.profile_authorized(spec, &home)? {
             Some(account) => Ok(Some(AuthorizedHome { home, account })),
-            None => Err(refuse(
-                "no authorization on file for this launch root, profile home, and account. Run the \
-                 profile setup to authorize this repository for this profile.",
-            )),
+            None => {
+                let mut detail = String::from(
+                    "no authorization on file for this launch root, profile home, and account. Run \
+                     the profile setup to authorize this repository for this profile.",
+                );
+                if let Some(note) = base.as_deref().and_then(crate::profile::moved_store_note) {
+                    detail.push_str("\n\n");
+                    detail.push_str(&note);
+                }
+                Err(refuse(&detail))
+            }
         }
     }
 
@@ -1510,9 +1517,16 @@ impl Config {
             reviewer_family: spec.reviewer.as_str().to_string(),
             account_fingerprint: fingerprint.clone(),
         };
-        let authorized = store
-            .is_authorized(&query)
-            .map_err(|e| refuse(format!("the authorization store could not be trusted: {e}")))?;
+        let authorized = store.is_authorized(&query).map_err(|e| {
+            let mut detail = format!("the authorization store could not be trusted: {e}");
+            if let Some(note) = crate::profile::profile_base()
+                .and_then(|b| crate::profile::redirected_store_note(&b))
+            {
+                detail.push_str("\n\n");
+                detail.push_str(&note);
+            }
+            refuse(detail)
+        })?;
         Ok(authorized.then_some(fingerprint))
     }
 
@@ -2130,7 +2144,7 @@ fn default_state_dir(cwd: &Path) -> PathBuf {
         .take(40)
         .collect();
     // FROZEN persistence key -- not a comparison. This `to_lowercase` fold is baked into a
-    // durable directory name under %LOCALAPPDATA%\cross-review\, so changing it (e.g. to
+    // durable directory name under the profile base, so changing it (e.g. to
     // `pathcmp`'s ASCII fold for "consistency") would relocate the default state dir and orphan
     // in-flight sessions for users whose cwd has a case-bearing non-ASCII character. Do NOT unify
     // it with `pathcmp` without a migration. See docs/path-comparison-plan.md (Family C).
@@ -2140,10 +2154,14 @@ fn default_state_dir(cwd: &Path) -> PathBuf {
         fnv1a64(&cwd.to_string_lossy().to_lowercase())
     );
 
-    match std::env::var_os("LOCALAPPDATA") {
-        Some(base) if !base.is_empty() => PathBuf::from(base).join("cross-review").join(key),
-        // No LOCALAPPDATA (unusual, but do not fail): keep state beside the project.
-        _ => cwd.join(".cross-review").join(key),
+    // The same base as the profile store, so the state follows `CROSS_REVIEW_HOME` and stays out of
+    // `%LOCALAPPDATA%`, where a packaged host's redirection would split it between two views (see
+    // `profile::profile_base`). Moving the base from `%LOCALAPPDATA%\cross-review` orphans sessions
+    // recorded there; they rebaseline like any other lost session. The key itself is unchanged.
+    match crate::profile::profile_base() {
+        Some(base) => base.join(key),
+        // No base (unusual, but do not fail): keep state beside the project.
+        None => cwd.join(".cross-review").join(key),
     }
 }
 
@@ -2181,7 +2199,7 @@ OPTIONS:
                               level otherwise.
   --bin <path>                Path to the reviewer CLI. Default: resolved from PATH.
   --codex-profile <name>      Run the codex reviewer under a dedicated account profile (a named
-  --claude-profile <name>     config home under %CROSS_REVIEW_HOME% or %LOCALAPPDATA%\\cross-review),
+  --claude-profile <name>     config home under %CROSS_REVIEW_HOME% or %USERPROFILE%\\.cross-review),
                               claude equivalent --claude-profile, so a review bills the intended
                               account regardless of the desktop app. Name: letters, digits, '.',
                               '_', '-'. Using a profile requires the working root to be authorized
@@ -2238,7 +2256,8 @@ OPTIONS:
                               A repair re-states a block the reviewer already computed.
                               Default: 180.
   --state-dir <path>          Where named sessions are recorded.
-                              Default: %LOCALAPPDATA%\cross-review\<project>-<hash>
+                              Default: %CROSS_REVIEW_HOME%\<project>-<hash>, else
+                              %USERPROFILE%\.cross-review\<project>-<hash>
   --sandbox <mode>            Codex sandbox policy. Default: read-only.
   --codex-fast-mode           Turn on Codex fast mode (off by default). Adds
                               -c service_tier="fast" and -c features.fast_mode=true

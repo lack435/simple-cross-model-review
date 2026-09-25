@@ -3533,9 +3533,16 @@ impl Job {
                 }
                 // Fail closed on any other lock-setup failure rather than racing a setup swap (f7).
                 Err(e) => {
+                    let mut summary = format!("Could not take the per-profile review lock: {e}");
+                    if let Some(note) = crate::profile::profile_base()
+                        .and_then(|b| crate::profile::redirected_store_note(&b))
+                    {
+                        summary.push_str("\n\n");
+                        summary.push_str(&note);
+                    }
                     return Err(Failure::new(
                         "PROFILE_HOME_LOCK_FAILED",
-                        format!("Could not take the per-profile review lock: {e}"),
+                        summary,
                         "Could not take the per-profile review lock; refusing to run the review \
                          unsynchronised with setup. Check the profile store directory's permissions.",
                     ));

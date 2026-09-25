@@ -1,7 +1,7 @@
 //! Windows security descriptors, for locking a credential directory or the authorization store to
 //! the current user.
 //!
-//! Everything under `%LOCALAPPDATA%\cross-review` that gates a review — the allowlist store, a
+//! Everything under the profile base that gates a review — the allowlist store, a
 //! provisioned profile home — must be readable and writable by **only** the current user (plus the
 //! machine's SYSTEM and Administrators, per Windows norms), with inheritance removed so a permissive
 //! ACL on a parent directory cannot widen it. An attacker who could write the store could authorize

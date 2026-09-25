@@ -133,8 +133,19 @@ thread_local! {
 }
 
 /// The base directory profiles live under: `%CROSS_REVIEW_HOME%` when set, else
-/// `%LOCALAPPDATA%\cross-review`. Deliberately independent of `--state-dir`, which is user- and
+/// `%USERPROFILE%\.cross-review`. Deliberately independent of `--state-dir`, which is user- and
 /// repo-settable and must never determine a credential home. `None` when neither is set.
+///
+/// The default is outside `%LOCALAPPDATA%` on purpose (the same overlay as issue #117). A process
+/// started by a packaged (MSIX) desktop app -- including the Claude desktop app, and everything that
+/// app launches -- has its `%LOCALAPPDATA%` writes redirected by Windows into
+/// `%LOCALAPPDATA%\Packages\<package>\LocalCache\Local`, and copy-on-write gives each copied store
+/// file the permissions of its new parent. Our `auth` directory's DACL is deliberately
+/// non-inheritable, so a copied `allowlist.json` or lock file ends up with an *empty* DACL: unreadable,
+/// and rejected by [`crate::winsec::verify_restrictive_dacl`]. The same machine then also has two
+/// divergent stores, one per view. Redirection applies only to AppData, so a base under the user
+/// profile is one store every host sees. Verified on a machine with the packaged Claude app: the
+/// redirected copies had DACL `D:AI` (no ACEs) while `C:\dev` writes were not redirected.
 pub fn profile_base() -> Option<PathBuf> {
     // A test that isolates its base (issue #99) wins over the real machine environment, so
     // authorization is deterministic regardless of the developer's real store.
@@ -142,16 +153,119 @@ pub fn profile_base() -> Option<PathBuf> {
     if let Some(base) = PROFILE_BASE_OVERRIDE.with(|c| c.borrow().clone()) {
         return Some(base);
     }
-    if let Some(h) = std::env::var_os("CROSS_REVIEW_HOME") {
+    base_from(
+        std::env::var_os("CROSS_REVIEW_HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+/// [`profile_base`]'s resolution rule, separated from the environment so it can be tested without
+/// mutating process-global variables.
+fn base_from(
+    cross_review_home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(h) = cross_review_home {
         let p = PathBuf::from(h);
         if !p.as_os_str().is_empty() {
             return Some(p);
         }
     }
+    user_profile
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(".cross-review"))
+}
+
+/// Where the store lived before the default moved out of `%LOCALAPPDATA%`:
+/// `%LOCALAPPDATA%\cross-review`. Only read, to tell a user their old authorizations did not come
+/// along; nothing is ever migrated from it.
+fn legacy_base() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("cross-review"))
+}
+
+/// A remediation note for a profile that is not authorized, when the likely reason is that the store
+/// moved: `base` has no allowlist yet, but the pre-move `%LOCALAPPDATA%\cross-review` store has one.
+/// `None` otherwise (including when `base` *is* the legacy location, via `CROSS_REVIEW_HOME`).
+///
+/// Deliberately advisory. Credentials and authorizations are not copied across: an allowlist entry
+/// binds the canonical profile home, which moved, so an old entry could not authorize the new home
+/// anyway, and copying credentials is not something to automate. The user re-runs setup once.
+pub fn moved_store_note(base: &Path) -> Option<String> {
+    moved_store_note_from(base, legacy_base().as_deref()?)
+}
+
+fn moved_store_note_from(base: &Path, legacy: &Path) -> Option<String> {
+    if crate::pathcmp::identity_eq_str(&base.to_string_lossy(), &legacy.to_string_lossy()) {
+        return None;
+    }
+    let allowlist = |root: &Path| root.join("auth").join("allowlist.json");
+    // The new store must be definitely absent: an inconclusive `try_exists` yields no note.
+    if !matches!(allowlist(base).try_exists(), Ok(false)) {
+        return None;
+    }
+    // The old store counts as present when it is visible but unreadable. A legacy file that a
+    // packaged host's redirection copied has an empty DACL, so querying it fails with access denied
+    // (verified); that store is exactly the one this note is for.
+    match allowlist(legacy).try_exists() {
+        Ok(true) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        _ => return None,
+    }
+    Some(format!(
+        "The cross-review store moved from {} to {}, and repository authorizations and named \
+         profiles' sign-ins do not carry over. Run the profile setup once for each profile this \
+         repository uses (with \"login\": true to sign a named profile in again). The old store can \
+         be deleted afterwards.",
+        legacy.display(),
+        base.display()
+    ))
+}
+
+/// A diagnostic for a store that failed to open or verify, when the reason is that Windows is
+/// redirecting it: `base` is the same directory (volume + file index) as
+/// `%LOCALAPPDATA%\Packages\<package>\LocalCache\Local\<same relative path>` for some installed
+/// package. Inside the redirecting app's process tree the two paths open the same object (verified
+/// with the packaged Claude app); outside it they are separate directories, so a stale per-package
+/// copy should not produce a note there. `None` when `base` is not under `%LOCALAPPDATA%` (the
+/// default is not) or no package copy matches.
+///
+/// Read-only, and only called on an error path, so the `Packages` scan costs nothing on a working
+/// store. Identity is checked through [`crate::winsec::dir_identity_no_follow`], so a junction planted
+/// at a candidate is refused rather than followed.
+pub fn redirected_store_note(base: &Path) -> Option<String> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())?;
+    redirected_store_note_from(base, &local)
+}
+
+fn redirected_store_note_from(base: &Path, local_app_data: &Path) -> Option<String> {
+    let relative = base.strip_prefix(local_app_data).ok()?;
+    let identity = crate::winsec::dir_identity_no_follow(base).ok()?;
+    for entry in std::fs::read_dir(local_app_data.join("Packages"))
+        .ok()?
+        .flatten()
+    {
+        let copy = entry.path().join("LocalCache").join("Local").join(relative);
+        if crate::winsec::dir_identity_no_follow(&copy).ok() == Some(identity) {
+            return Some(format!(
+                "The cross-review store at {} is being redirected by the packaged app '{}' to {}. \
+                 Windows copies files that app's processes write under %LOCALAPPDATA% into a \
+                 per-package location, and the copies lose the store's permissions. Set \
+                 CROSS_REVIEW_HOME to a folder outside %LOCALAPPDATA% (or unset it to use the \
+                 default, %USERPROFILE%\\.cross-review), restart the host, and run the profile setup \
+                 again.",
+                base.display(),
+                entry.file_name().to_string_lossy(),
+                copy.display()
+            ));
+        }
+    }
+    None
 }
 
 /// Restores the previous [`profile_base`] override when dropped. Held for the duration of a test that
@@ -250,7 +364,7 @@ pub(crate) fn resolve_home(
         ProfileSelector::Named(name) => {
             validate_profile_name(name)?;
             let base = base.ok_or_else(|| {
-                "cannot resolve a named profile: neither CROSS_REVIEW_HOME nor LOCALAPPDATA is set"
+                "cannot resolve a named profile: neither CROSS_REVIEW_HOME nor USERPROFILE is set"
                     .to_string()
             })?;
             let root = profile_root(base, reviewer);
@@ -362,7 +476,7 @@ pub fn secure_profile_dir(
             validate_profile_name(name).map_err(io::Error::other)?;
             let base = base.ok_or_else(|| {
                 io::Error::other(
-                    "cannot provision a named profile: neither CROSS_REVIEW_HOME nor LOCALAPPDATA \
+                    "cannot provision a named profile: neither CROSS_REVIEW_HOME nor USERPROFILE \
                      is set",
                 )
             })?;
@@ -372,7 +486,7 @@ pub fn secure_profile_dir(
                     base.display()
                 )));
             }
-            // The trusted anchor: `{base}` inherits the user-scoped %LOCALAPPDATA% ACL (created plain),
+            // The trusted anchor: `{base}` inherits its parent's user-scoped ACL (created plain),
             // then is opened no-follow — rejecting `{base}` itself being a reparse point. Everything
             // below is created and locked by handle-relative descent, so it is checked structurally.
             std::fs::create_dir_all(base)?;
@@ -455,7 +569,7 @@ pub fn secure_staging_dir(
             validate_profile_name(name).map_err(io::Error::other)?;
             let base = base.ok_or_else(|| {
                 io::Error::other(
-                    "cannot provision a named profile: no CROSS_REVIEW_HOME/LOCALAPPDATA",
+                    "cannot provision a named profile: no CROSS_REVIEW_HOME/USERPROFILE",
                 )
             })?;
             if !base.is_absolute() {
@@ -606,7 +720,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("CROSS_REVIEW_HOME") || err.contains("LOCALAPPDATA"),
+            err.contains("CROSS_REVIEW_HOME") || err.contains("USERPROFILE"),
             "{err}"
         );
     }
@@ -764,5 +878,120 @@ mod tests {
             .is_err(),
             "an explicit home under a junctioned ancestor must be refused"
         );
+    }
+
+    #[test]
+    fn base_defaults_to_the_user_profile_not_local_app_data() {
+        // The default must sit outside %LOCALAPPDATA%, which a packaged host redirects.
+        assert_eq!(
+            base_from(None, Some(r"C:\Users\u".into())),
+            Some(PathBuf::from(r"C:\Users\u\.cross-review"))
+        );
+    }
+
+    #[test]
+    fn cross_review_home_overrides_the_default_base() {
+        assert_eq!(
+            base_from(Some(r"D:\store".into()), Some(r"C:\Users\u".into())),
+            Some(PathBuf::from(r"D:\store"))
+        );
+        // An empty override is ignored rather than resolving to a relative base.
+        assert_eq!(
+            base_from(Some("".into()), Some(r"C:\Users\u".into())),
+            Some(PathBuf::from(r"C:\Users\u\.cross-review"))
+        );
+    }
+
+    #[test]
+    fn no_base_without_an_override_or_a_user_profile() {
+        assert_eq!(base_from(None, None), None);
+        assert_eq!(base_from(None, Some("".into())), None);
+    }
+
+    /// Write an `auth\allowlist.json` under `root`, the file whose presence marks a used store.
+    fn plant_allowlist(root: &Path) {
+        let auth = root.join("auth");
+        std::fs::create_dir_all(&auth).expect("mkdir auth");
+        std::fs::write(auth.join("allowlist.json"), b"{\"entries\":[]}").expect("write allowlist");
+    }
+
+    #[test]
+    fn moved_store_note_fires_when_only_the_legacy_store_is_populated() {
+        let dir = temp_dir();
+        let base = dir.join("new");
+        let legacy = dir.join("legacy");
+        plant_allowlist(&legacy);
+        let note = moved_store_note_from(&base, &legacy).expect("a note for a moved store");
+        assert!(note.contains(&legacy.display().to_string()), "{note}");
+        assert!(note.contains(&base.display().to_string()), "{note}");
+    }
+
+    #[test]
+    fn moved_store_note_is_silent_once_the_new_store_is_in_use() {
+        let dir = temp_dir();
+        let base = dir.join("new");
+        let legacy = dir.join("legacy");
+        plant_allowlist(&legacy);
+        plant_allowlist(&base);
+        assert_eq!(moved_store_note_from(&base, &legacy), None);
+    }
+
+    #[test]
+    fn moved_store_note_is_silent_without_a_legacy_store() {
+        let dir = temp_dir();
+        assert_eq!(
+            moved_store_note_from(&dir.join("new"), &dir.join("legacy")),
+            None
+        );
+    }
+
+    #[test]
+    fn moved_store_note_is_silent_when_the_base_is_the_legacy_location() {
+        // CROSS_REVIEW_HOME pointed back at the old location: nothing moved. The comparison is the
+        // Windows identity fold, so a case or separator difference is the same location.
+        let dir = temp_dir();
+        let legacy = dir.join("Legacy");
+        plant_allowlist(&legacy);
+        let same = PathBuf::from(legacy.to_string_lossy().to_lowercase());
+        assert_eq!(moved_store_note_from(&same, &legacy), None);
+    }
+
+    #[test]
+    fn redirected_store_note_ignores_a_base_outside_local_app_data() {
+        let dir = temp_dir();
+        let local = dir.join("Local");
+        let base = dir.join("elsewhere").join(".cross-review");
+        std::fs::create_dir_all(&base).expect("mkdir base");
+        std::fs::create_dir_all(local.join("Packages")).expect("mkdir packages");
+        assert_eq!(redirected_store_note_from(&base, &local), None);
+    }
+
+    #[test]
+    fn redirected_store_note_ignores_a_separate_package_copy() {
+        // A per-package copy that is a different directory is not redirection: outside the packaged
+        // app's process tree, a stale copy must not produce a note. The positive case needs a real
+        // packaged-app overlay, which a unit test cannot create; it was verified by hand (see
+        // `profile_base`).
+        let dir = temp_dir();
+        let local = dir.join("Local");
+        let base = local.join("cross-review");
+        std::fs::create_dir_all(&base).expect("mkdir base");
+        let copy = local
+            .join("Packages")
+            .join("Some.App_abc")
+            .join("LocalCache")
+            .join("Local")
+            .join("cross-review");
+        std::fs::create_dir_all(&copy).expect("mkdir copy");
+        assert_eq!(redirected_store_note_from(&base, &local), None);
+    }
+
+    #[test]
+    fn redirected_store_note_is_silent_without_a_packages_directory() {
+        let dir = temp_dir();
+        let local = dir.join("Local");
+        let base = local.join("cross-review");
+        std::fs::create_dir_all(&base).expect("mkdir base");
+        assert_eq!(redirected_store_note_from(&base, &local), None);
     }
 }

@@ -25,7 +25,7 @@
 # that home is re-logged to a different account mid-review, the switch guard fails the
 # review closed rather than delivering it under the wrong account -- it cannot undo billing
 # that already happened. "work" is only a label; it resolves to a private directory under
-# %CROSS_REVIEW_HOME% / %LOCALAPPDATA%\cross-review, so this line is identical on every
+# %CROSS_REVIEW_HOME% / %USERPROFILE%\.cross-review, so this line is identical on every
 # machine and commits no per-person state.
 #
 # Each machine sets the label up once, from a chat session in this checkout. To provision a

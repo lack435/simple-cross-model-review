@@ -135,6 +135,8 @@ The essentials:
 --claude-profile <name>     Pin the reviewer to a named account/config home rather than the
 --codex-profile <name>      ambient login, so the review bills that account and loads none of
                             your config. Provisioned once with cross_model_setup_profile.
+                            Stored under %CROSS_REVIEW_HOME%, default %USERPROFILE%\.cross-review
+                            (not %LOCALAPPDATA%, which packaged hosts redirect).
 --claude-config-dir <path>  Explicit config-home path instead of a managed profile label.
 --codex-home <path>
 --min-usage-remaining <n>    Proactive gate (codex): skip this entry when last-observed usage
@@ -156,7 +158,8 @@ The essentials:
 --max-policy-idle-seconds <n>   The idle window for the above. Default 300.
 --no-incremental-resume      Disable the incremental-diff optimization on resumed turns.
 --cwd <path>                 Review root. Defaults to the server's working directory.
---state-dir <path>           Where named sessions live.
+--state-dir <path>           Where named sessions live. Default: a per-project folder under the
+                            same base as the profiles.
 --sandbox <mode>             Codex sandbox policy. Default read-only.
 --codex-fast-mode            Turn on Codex fast mode. Off by default.
 --vcs <auto|git|perforce>    Which version control the change backend uses. Default auto.
