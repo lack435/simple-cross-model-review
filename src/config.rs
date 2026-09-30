@@ -1924,25 +1924,37 @@ impl Config {
         // no-shell boundary and diff handling, so it does not fall through to the shared shell-based
         // block below.
         if reviewer == ReviewerKind::Claude && evidence_enabled {
-            let history = match self.vcs {
-                Vcs::Git => " `repository_history` and `repository_revision` walk commit history and read revisions.",
-                Vcs::Perforce => " `repository_history` and `repository_revision` report unsupported (this service makes no new Perforce network calls).",
+            // `repository_diff` is Git-only in the evidence service (it answers `unsupported` for
+            // Perforce), so it is advertised only on Git (issue #136).
+            let (tools, history) = match self.vcs {
+                Vcs::Git => (
+                    "`repository_scope`, `repository_list`, `repository_search`, \
+                     `repository_read`, `repository_change`, and `repository_diff`",
+                    " `repository_history` and `repository_revision` walk commit history and read revisions.",
+                ),
+                Vcs::Perforce => (
+                    "`repository_scope`, `repository_list`, `repository_search`, \
+                     `repository_read`, and `repository_change`",
+                    " `repository_diff`, `repository_history` and `repository_revision` report unsupported (this service makes no new Perforce network calls).",
+                ),
             };
             let mut out = format!(
                 "You can read and search files with Read, Grep and Glob (scoped to this directory \
                  tree, reachable by absolute path), and you have read-only repository evidence \
-                 tools: `repository_scope`, `repository_list`, `repository_search`, \
-                 `repository_read`, `repository_change`, and `repository_diff`.{history} Their \
-                 paths are relative to the reviewed repository root, and continuation cursors page a \
-                 truncated result. You have no shell."
+                 tools: {tools}.{history} Their paths are relative to the reviewed repository \
+                 root, and continuation cursors page a truncated result. You have no shell."
             );
             if diff_supplied {
-                out.push_str(
+                let past = match self.vcs {
+                    Vcs::Git => "read the live tree, search it, and walk history",
+                    Vcs::Perforce => "read the live tree and search it",
+                };
+                out.push_str(&format!(
                     "\n\nThe change under review is captured for you and appears below under \
                      \"Change under review\"; it stays the authoritative selected change. Use the \
-                     evidence tools to look *past* it -- read the live tree, search it, and walk \
-                     history for context and to verify what the captured diff shows.",
-                );
+                     evidence tools to look *past* it -- {past} for context and to verify what the \
+                     captured diff shows."
+                ));
             } else if self.vcs == Vcs::Git {
                 out.push_str(
                     "\n\nThe change under review is the live working tree. Diff it on demand with \
@@ -1957,10 +1969,10 @@ impl Config {
             } else {
                 out.push_str(
                     "\n\nNo selected change was captured (an empty or unavailable range). Obtain \
-                     the change yourself through the evidence tools -- read the working tree and \
-                     walk history. If you can neither see a captured change nor obtain one through \
-                     the evidence tools, the review is inconclusive: do NOT approve -- say so under \
-                     \"What I could not check\".",
+                     what you can through the evidence tools -- read and search the working tree. \
+                     If you can neither see a captured change nor obtain one through the evidence \
+                     tools, the review is inconclusive: do NOT approve -- say so under \"What I \
+                     could not check\".",
                 );
             }
             return out;
@@ -4346,6 +4358,38 @@ mod tests {
         let (captures, caveat) = cfg.capture_caller_summary();
         assert!(captures.contains("`change`"), "{captures}");
         assert!(caveat.contains("p4 edit"), "{caveat}");
+    }
+
+    #[test]
+    fn an_evidence_claude_on_perforce_is_not_offered_git_only_tools_issue_136() {
+        // Issue #136 put a profile-pinned Claude on the evidence path for Perforce, where the service
+        // answers `unsupported` for repository_diff/history/revision. Its access text must not list
+        // them as available, and must not tell it to walk history when nothing was captured.
+        let cfg =
+            Config::from_args(&args(&["--reviewer", "claude", "--vcs", "perforce"])).expect("cfg");
+        for diff_supplied in [true, false] {
+            let caps = cfg.reviewer_capabilities_of(ReviewerKind::Claude, diff_supplied, true);
+            assert!(
+                caps.contains("`repository_read`, and `repository_change`."),
+                "{caps}"
+            );
+            assert!(
+                caps.contains(
+                    "`repository_diff`, `repository_history` and `repository_revision` report \
+                     unsupported"
+                ),
+                "{caps}"
+            );
+            assert!(!caps.contains("walk history"), "{caps}");
+        }
+
+        // Git keeps repository_diff in the available list.
+        let git = Config::from_args(&args(&["--reviewer", "claude", "--vcs", "git"])).expect("cfg");
+        let caps = git.reviewer_capabilities_of(ReviewerKind::Claude, false, true);
+        assert!(
+            caps.contains("`repository_change`, and `repository_diff`."),
+            "{caps}"
+        );
     }
 
     #[test]

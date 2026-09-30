@@ -104,7 +104,7 @@ handled?", or "am I missing a simpler approach?". The reviewer reads the reposit
 same read-only evidence service and answers in prose — no findings, no verdict, nothing to act
 on mechanically. By default it reads the tree and captures no diff; pass `include_change: true`
 to also show it the configured change. It requires the evidence service, so it runs only on a
-reviewer that provides one (Codex, or a profile-pinned shell-less Claude).
+reviewer that provides one (Codex, or a profile-pinned shell-less Claude, on git or Perforce).
 
 ## Configuration
 

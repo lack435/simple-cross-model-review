@@ -1046,10 +1046,8 @@ impl App {
         let prior = match prior {
             Some(record) => match self.cfg.resume_entry_index(&record) {
                 Some(entry) => {
-                    let now_mode = crate::reviewer::reviewer_cwd_mode(
-                        &self.cfg,
-                        self.cfg.reviewers[entry].reviewer,
-                    );
+                    let now_mode =
+                        crate::reviewer::reviewer_cwd_mode(&self.cfg, &self.cfg.reviewers[entry]);
                     let then_mode = record
                         .reviewer_cwd_mode
                         .as_deref()
@@ -1128,13 +1126,14 @@ impl App {
                 first_evidence_incapable_entry(&self.cfg, start_index)
             };
             if let Some(idx) = incapable {
+                let spec = &self.cfg.reviewers[idx];
                 return Err(errors::evidence_unavailable(format!(
                     "a consult requires the read-only evidence service, but reviewer entry #{} ({}) \
-                     cannot provide it (an ambient or shell-enabled Claude has no evidence service); \
-                     a consult reachable from this chain could run on it. Use a Codex reviewer, or a \
-                     profile-pinned, shell-less Claude.",
+                     cannot provide it: {}; a consult reachable from this chain could run on it. \
+                     {EVIDENCE_CAPABLE_REVIEWER_HINT}",
                     idx,
-                    self.cfg.reviewers[idx].describe(),
+                    spec.describe(),
+                    evidence_ineligibility(&self.cfg, spec).unwrap_or("unknown reason"),
                 )));
             }
         }
@@ -2101,6 +2100,27 @@ impl App {
                     ));
                 }
             }
+            // A Claude entry's evidence eligibility is configuration, not CLI or auth state, so it
+            // does not change `ready` -- but consults (and, on git, reviews) are refused without it,
+            // so a `ready: yes` entry must not read as able to run them (issue #136).
+            if spec.reviewer == crate::config::ReviewerKind::Claude {
+                match evidence_ineligibility(&self.cfg, spec) {
+                    None => out.push_str(
+                        "evidence path: yes (profile-pinned, shell-less, isolated; reviews and \
+                         consults read through the evidence service)\n",
+                    ),
+                    Some(why) => {
+                        let refused = match self.cfg.vcs {
+                            crate::config::Vcs::Git => "git reviews and consults",
+                            crate::config::Vcs::Perforce => "consults",
+                        };
+                        out.push_str(&format!(
+                            "evidence path: NO - {why}; {refused} on this entry are refused \
+                             (EVIDENCE_UNAVAILABLE)\n"
+                        ));
+                    }
+                }
+            }
             // The proactive usage gate, when the chain is armed: this entry's configured minimum
             // and its last-observed headroom (a store read, no CLI call beyond the auth check
             // above). Claude's signal is categorical, Codex's numeric -- shown as reported.
@@ -2123,7 +2143,7 @@ impl App {
             .cfg
             .reviewers
             .iter()
-            .any(|spec| spec.reviewer == crate::config::ReviewerKind::Codex)
+            .any(|spec| entry_provides_evidence(&self.cfg, spec))
         {
             match crate::evidence::readiness(&self.cfg) {
                 // The drift-tracking state earns its place on this line: since issue #86 a tree too
@@ -3619,8 +3639,8 @@ impl Job {
         // per-turn evidence capability. Build and handshake it before the findings write-ahead
         // marker: any failure here starts no reviewer process and advances no conversation.
         // Evidence is built for Codex (always) and for an in-scope Claude.
-        // THE eligibility decision (reviews f2/f3): a profile-pinned, shell-less, git-top-level,
-        // default-rules, isolated Claude. The same predicate gates evidence setup here and is keyed
+        // THE eligibility decision (reviews f2/f3): a profile-pinned, shell-less, default-rules,
+        // isolated Claude (at the git top-level on git; any Perforce root). The same predicate gates evidence setup here and is keyed
         // on by invocation, parse, output_limits, and the capability preamble, so none of them
         // disagree. Requiring a profile (f2) keeps an ambient Claude -- whose ~/.claude user config
         // the granular flags do not disable and the project-only sterile cwd does not cover -- on the
@@ -3632,7 +3652,8 @@ impl Job {
             claude_in_scope,
             authorized_start.is_some()
                 && self.spec.reviewer == crate::config::ReviewerKind::Claude
-                && crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some(),
+                && crate::reviewer::claude_absolute_read_rules(&self.cfg, self.spec.reviewer)
+                    .is_ok(),
             "claude evidence eligibility must match the authorized-profile form"
         );
         // Section-7 (f4): whether the captured change is too thin to stand on its own -- empty
@@ -3739,11 +3760,12 @@ impl Job {
         // be handed no change AND skip the gate — free to approve blind. Refuse it before spawning,
         // as the plan requires (resolved decision 1). Consults are informal and exempt.
         if !is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_none() {
-            return Err(errors::evidence_unavailable(
+            return Err(errors::evidence_unavailable(format!(
                 "a git review needs the read-only evidence service to deliver the change live, but \
-                 it is unavailable for this reviewer -- an ambient Claude has no evidence path. Pin \
-                 a profile for the Claude reviewer (--claude-profile), or use the Codex reviewer.",
-            ));
+                 reviewer {} cannot provide it: {}. {EVIDENCE_CAPABLE_REVIEWER_HINT}",
+                self.spec.describe(),
+                evidence_ineligibility(&self.cfg, &self.spec).unwrap_or("unknown reason"),
+            )));
         }
 
         // Findings write-ahead: mark before the reviewer runs, cleared only once the turn is durably
@@ -3773,14 +3795,17 @@ impl Job {
             .as_ref()
             .map(|p| crate::findings::render_digest(&p.findings));
 
-        // When the reviewer runs from a neutral working directory, its process cwd is not the
-        // project, so it must be told to read by absolute path and the caller's context paths --
-        // which it would otherwise resolve against the neutral dir -- are made absolute under the
-        // working root. `None` (the common case) leaves both as they were.
-        let neutral = crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer);
+        // When a Claude reviewer runs from a neutral or sterile working directory, its process cwd
+        // is not the project, so it must be told to read by absolute path and the caller's context
+        // paths -- which its Read tool would otherwise resolve against that directory -- are made
+        // absolute under the working root. An isolated Codex also runs outside the project but
+        // reads through the evidence tools, whose paths are root-relative, so it keeps them as
+        // given. `None` (the common case) leaves both as they were.
+        let claude_outside_project = claude_in_scope
+            || crate::reviewer::claude_neutral_target(&self.cfg, self.spec.reviewer).is_some();
         let (neutral_root, context_paths): (Option<&std::path::Path>, std::borrow::Cow<[String]>) =
-            match (&neutral, &evidence_setup) {
-                (Some(_), _) => (
+            match (claude_outside_project, &evidence_setup) {
+                (true, _) => (
                     Some(self.cfg.cwd.as_path()),
                     std::borrow::Cow::Owned(
                         self.context_paths
@@ -3789,11 +3814,11 @@ impl Job {
                             .collect(),
                     ),
                 ),
-                (None, Some(_)) if self.cfg.isolate_reviewer => (
+                (false, Some(_)) if self.cfg.isolate_reviewer => (
                     Some(self.cfg.cwd.as_path()),
                     std::borrow::Cow::Borrowed(&self.context_paths),
                 ),
-                (None, _) => (None, std::borrow::Cow::Borrowed(&self.context_paths)),
+                (false, _) => (None, std::borrow::Cow::Borrowed(&self.context_paths)),
             };
         // The isolated Codex change is available through repository_change. Do not duplicate it
         // into the prompt (or let prompt size become the service's effective pagination limit).
@@ -4473,8 +4498,7 @@ impl Job {
                             // The working-directory mode this turn ran in, so a later resume can
                             // detect a mode change it cannot survive and rebind fresh.
                             reviewer_cwd_mode: crate::reviewer::reviewer_cwd_mode(
-                                &self.cfg,
-                                self.spec.reviewer,
+                                &self.cfg, &self.spec,
                             ),
                             // The account identity this turn ran under, so a resume that would cross
                             // an account or profile is refused. Taken from the identity **pinned at
@@ -4764,13 +4788,32 @@ fn wrong_result_tool_error(id: &str, expected: crate::registry::JobKind) -> Fail
     ))
 }
 
+/// What an operator can change so a reviewer entry provides the evidence service; appended to the
+/// `EVIDENCE_UNAVAILABLE` refusals that name an ineligible entry.
+const EVIDENCE_CAPABLE_REVIEWER_HINT: &str =
+    "Use a Codex reviewer, or a Claude reviewer that is profile-pinned (--claude-profile), \
+     shell-less, isolated, and on the default read rules (on git, with --cwd at the repository \
+     root).";
+
 /// Whether a single reviewer entry can provide the read-only evidence service a consult requires.
 /// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a
-/// profile-pinned, shell-less, git-top-level, isolated Claude ([`claude_evidence_enabled`]). An
-/// ambient or shell-enabled Claude has no evidence service, so a consult must not run on it.
+/// profile-pinned, shell-less, default-rules, isolated Claude ([`claude_evidence_enabled`]), on
+/// either backend. An ambient or shell-enabled Claude has no evidence service, so a consult must
+/// not run on it.
 fn entry_provides_evidence(cfg: &Config, spec: &crate::config::ReviewerSpec) -> bool {
-    spec.reviewer == crate::config::ReviewerKind::Codex
-        || crate::reviewer::claude::claude_evidence_enabled(cfg, spec)
+    evidence_ineligibility(cfg, spec).is_none()
+}
+
+/// Why `spec` cannot provide the evidence service, for the refusal and `status` to name; `None`
+/// when it can. The one source [`entry_provides_evidence`] decides on.
+fn evidence_ineligibility(
+    cfg: &Config,
+    spec: &crate::config::ReviewerSpec,
+) -> Option<&'static str> {
+    if spec.reviewer == crate::config::ReviewerKind::Codex {
+        return None;
+    }
+    crate::reviewer::claude::claude_evidence_ineligibility(cfg, spec)
 }
 
 /// The consult evidence-eligibility gate over the *reachable* chain (f3). A fresh consult starting at
@@ -6507,6 +6550,42 @@ mod tests {
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
+    }
+
+    #[test]
+    fn a_profile_pinned_claude_on_perforce_passes_the_consult_evidence_gate_issue_136() {
+        // Issue #136: the gate used to reject every Claude on Perforce, because eligibility keyed on
+        // the git-only neutral-cwd optimisation. A profile-pinned, shell-less, isolated Claude on
+        // Perforce provides the evidence service; an ambient one still does not, and the refusal
+        // names the missing profile rather than blaming a shell.
+        let root = crate::testutil::temp_dir("cross-review-p4-consult-gate");
+        let p4_claude = |extra: &[&str]| {
+            let mut args: Vec<String> = [
+                "--reviewer",
+                "claude",
+                "--level",
+                "standard:claude-opus-4-8:medium",
+                "--vcs",
+                "perforce",
+                "--cwd",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            args.push(root.to_string_lossy().into_owned());
+            args.extend(extra.iter().map(|s| s.to_string()));
+            Config::from_args(&args).expect("config")
+        };
+
+        let pinned = p4_claude(&["--claude-profile", "work"]);
+        assert_eq!(first_evidence_incapable_entry(&pinned, 0), None);
+        assert_eq!(evidence_ineligibility(&pinned, pinned.primary()), None);
+
+        let ambient = p4_claude(&[]);
+        assert_eq!(first_evidence_incapable_entry(&ambient, 0), Some(0));
+        let why = evidence_ineligibility(&ambient, ambient.primary()).expect("ineligible");
+        assert!(why.contains("--claude-profile"), "{why}");
+        assert!(!why.contains("shell"), "{why}");
     }
 
     #[test]

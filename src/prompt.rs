@@ -154,9 +154,10 @@ pub fn build(parts: &PromptParts) -> String {
         ));
         // When the reviewer runs outside the project, relative paths resolve against the wrong
         // directory, so it must be told to read by absolute path. Rendered even under
-        // `--no-preamble`: without it a real review cannot read the code. The working root is
-        // the git top-level here (a precondition of running neutral), so every path shown in the
-        // change/status listings is relative to it -- one rule for all of them.
+        // `--no-preamble`: without it a real review cannot read the code. On git the working root
+        // is the git top-level here (a precondition of running outside the project), and Perforce
+        // paths are working-root-relative, so every path shown in the change/status listings is
+        // relative to it -- one rule for all of them.
         if let Some(root) = parts.neutral_root {
             out.push_str(&reading_files_section(root));
         }
