@@ -157,8 +157,9 @@ that moves, and why the move is safe:
    auth. (A shell-enabled / non-qualifying isolated Claude is out of scope and unchanged.)
 2. A thin, empty, or stale in-prompt capture is **mitigated, not eliminated** (corrected per
    review f1). The evidence tools let the reviewer read the **live working tree**
-   (`repository_read` / `repository_list` / `repository_search`) and walk **history**
-   (`repository_history`, then `repository_revision` per commit) to gain context, verify claims,
+   (`repository_read` / `repository_list` / `repository_search`) and, on Git, walk **history**
+   (`repository_history`, then `repository_revision` per commit; both report `unsupported` on
+   Perforce, where the evidence is the live tree plus the captured change) to gain context, verify claims,
    and catch what a thin capture omitted — so it is no longer blind to everything outside its
    prompt. It does **not** let the reviewer reconstruct an exact selected diff the parent failed
    to capture: the service has no live ref/range-diff operation (`repository_revision` takes a
@@ -202,9 +203,25 @@ working shell) so it can self-serve via git — see the rationale at `mod.rs:947
 cross-review gate chose **option (a)**: the evidence service is given to Claude *exactly when the
 centralized `claude_evidence_enabled(cfg, spec)` predicate holds* — a **profile-pinned** (impl f2,
 below), shell-less, git, default-rules Claude whose cwd is the git toplevel (the
-`claude_neutral_target` conditions **plus** a pinned profile). Shell-enabled, ambient, or otherwise
+`claude_neutral_target` conditions **plus** a pinned profile; see the issue #136 note below for how
+that became backend-independent). Shell-enabled, ambient, or otherwise
 non-qualifying Claude is **unchanged**: it keeps `--safe-mode`, the repo cwd (or neutral cwd), and
 its shell. It gets no evidence, so no missing-evidence false-approval risk arises for it.
+
+**Superseded in part by issue #136: eligibility no longer depends on `claude_neutral_target`.**
+Keying the predicate on the neutral-cwd conditions made it Git-only by accident: that helper returns
+`None` for any non-Git backend, so a profile-pinned, shell-less, isolated Claude on Perforce was
+refused every consult. The shared conditions now live in `claude_absolute_read_rules` (Claude,
+isolation on, shell-less, default read rules, an absolute-scopable root, and — **on Git only** — cwd
+at the git top-level). `claude_evidence_enabled` is those plus a pinned profile, on either backend;
+`claude_neutral_target` is those plus the Git backend and a verified neutral directory. The evidence
+path never used the neutral directory — it runs from the separately verified sterile directory
+(`codex_sterile_dir`: empty, outside the working root, no `.git` ancestor) — so dropping that check
+from the evidence predicate moves no boundary. A Perforce evidence Claude takes the same treatment as
+on Git (sterile cwd, absolute read rules, granular flags instead of `--safe-mode`, evidence server)
+and gets the Perforce subset of the tools (`repository_diff`/`history`/`revision` report unsupported;
+its captured changelist stays in the prompt, and through `repository_change`). Verified with a live
+consult against a real Perforce workspace.
 
 **The evidence path also requires a pinned profile home (impl review f2).** `claude_neutral_target`
 qualifies an *ambient* Claude (no `--claude-profile`) too, but for ambient runs `CLAUDE_CONFIG_DIR`
@@ -231,7 +248,8 @@ capture is guaranteed for the in-scope path with no config change. The revert is
 
 Compute the §0 predicate once — call it `evidence_enabled` (= the `evidence` argument being
 `Some`, which the parent sets exactly when `claude_evidence_enabled(cfg, spec)` holds — a pinned
-profile plus the `claude_neutral_target` conditions, which already imply `isolate_reviewer`). **The flag swap keys on `evidence_enabled`, NOT on a
+profile plus the `claude_absolute_read_rules` conditions — `claude_neutral_target`'s before issue
+#136 — which already imply `isolate_reviewer`). **The flag swap keys on `evidence_enabled`, NOT on a
 bare `if cfg.isolate_reviewer` — that broader condition is the f7 trap** (it would strip
 `--safe-mode` from a shell-enabled Claude that stays on the repo cwd). Three branches:
 
@@ -270,7 +288,8 @@ rather than the `--safe-mode` rationale it documents today.
 Today the bundle is captured and the `EvidenceInvocation` constructed only for the Codex path
 (`src/tools.rs:~3305`; `mod.rs:246-247`, gated at `tools.rs:3190`). Extend that gate to also fire
 for the **in-scope Claude path** — i.e. when `claude_evidence_enabled(cfg, spec)` holds (the §0
-predicate: a pinned profile plus the `claude_neutral_target` conditions), so a shell-enabled or
+predicate: a pinned profile plus the `claude_absolute_read_rules` conditions — originally the
+`claude_neutral_target` conditions, split out by issue #136), so a shell-enabled or
 ambient Claude is excluded — reusing the identical capture→bundle machinery.
 
 **`EvidenceInvocation.sterile_dir` IS set for in-scope Claude (corrected per f8), and is what wires
@@ -280,8 +299,11 @@ how the verified-empty directory reaches the child process and replaces the poss
 neutral dir that reopened f2. The owning `SterileDir` lives in the `evidence_setup` tuple for the
 whole turn (as Codex's already does), so the directory stays alive through the child and is dropped
 when the turn ends. So `executable`, `bundle_file`, `nonce`, and `sterile_dir` are all used for
-Claude; the read-scope rules still come from `claude_neutral_target` (absolute, pinned to the repo
-root) so Read/Grep/Glob keep reaching the repo from the sterile cwd.
+Claude; the read-scope rules come from `claude_absolute_read_rules` (absolute, pinned to the repo
+root) so Read/Grep/Glob keep reaching the repo from the sterile cwd. (Originally they came from
+`claude_neutral_target`; issue #136 split that out, because the neutral-cwd optimisation is Git-only
+and the evidence path is not. `claude_neutral_target` now applies only to a Claude *without*
+evidence, on Git.)
 
 **Do not trip the in-prompt capture suppression (review f3).** The parent currently sets
 `prompt_change = None` whenever `evidence_setup.is_some()` (`src/tools.rs:3273-3279`), because
@@ -312,8 +334,8 @@ client specifically.
 
 **On the `evidence_enabled` path only** (§0 — the shell-enabled / non-qualifying path keeps its
 current preamble and gets no evidence guidance): tell the reviewer the evidence tools exist and are
-the way to look **past** the captured change — read the live working tree, search, and walk history
-— and that the captured change is also in the prompt and remains the authoritative selected change
+the way to look **past** the captured change — read the live working tree, search, and (on Git
+only) walk history — and that the captured change is also in the prompt and remains the authoritative selected change
 (f1). One safety line (§7, f4): if the reviewer has **neither** a non-empty captured change **nor**
 working evidence tools, the review is inconclusive and must not be approved. Keep this short; the
 tool descriptions carry the detail, as they do for Codex.
@@ -348,8 +370,10 @@ the current possibly-repo, possibly-non-empty cwd:
   make the shared helper require emptiness) is already satisfied — no new helper is needed. Empty
   subsumes "no `.claude` layer / no `CLAUDE.md`": an empty dir has neither. (Rename it from
   `codex_`-prefixed to a reviewer-neutral name when it gains a second caller.)
-- In-scope (per §0) means the reviewer already runs from a neutral cwd today via
-  `claude_neutral_target`; this swaps that neutral dir for the verified-empty sterile dir. The
+- In-scope (per §0) meant, on Git, a reviewer that already ran from a neutral cwd via
+  `claude_neutral_target`; this swaps that neutral dir for the verified-empty sterile dir. (Since
+  issue #136 an in-scope Perforce Claude, which never had a neutral cwd, runs from the sterile dir
+  too.) The
   out-of-scope shell-enabled path keeps the repo cwd and `--safe-mode` unchanged, so the
   "never fall back to repo cwd" concern does not arise — there is no in-scope run without a sterile
   cwd (the same `state_dir`/`session` that names the sterile dir is always present).
@@ -601,7 +625,7 @@ identifies a false-approval (not lost-review) risk.
   the final result), feeding the gate's health check (f4); auto-memory disable key in the
   `--settings` blob, or **pre-launch** scrub-and-verify of `CLAUDE_CONFIG_DIR` (`:105`) per §8 (f6).
 - **The single eligibility predicate** `claude_evidence_enabled(cfg, spec)` (§0, f7; profile + the
-  `claude_neutral_target` conditions)
+  `claude_absolute_read_rules` conditions, on Git or Perforce — issue #136)
   gates every hook below; there is no second, looser condition. Shell-enabled / non-qualifying
   isolated Claude keeps `--safe-mode`, the repo cwd, its shell, and gets no evidence.
 - `src/reviewer/mod.rs` / `src/tools.rs` — construct + pass `EvidenceInvocation` for the **in-scope

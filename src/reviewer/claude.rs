@@ -91,28 +91,33 @@ impl Reviewer for ClaudeReviewer {
         // switches, the read scope moves from the relative `./**` (which would now point at the
         // neutral dir) to absolute rules pinned to `cfg.cwd`.
         // An in-scope Claude (evidence present -- the parent sets it only when
-        // `claude_neutral_target` qualifies) runs from the verified-empty sterile directory the
-        // parent built, reading the repo through absolute rules pinned to `cfg.cwd`. Without
-        // evidence, the existing neutral-cwd optimisation or the project cwd applies. Fail closed
-        // rather than run a granular-flag Claude in the project cwd, which would re-open the f2
-        // configuration-contamination risk.
-        let neutral = super::claude_neutral_target(cfg, spec.reviewer);
-        let (cwd, allowed_tools): (&Path, &[String]) = match (evidence, &neutral) {
-            (Some(ev), Some((_, rules))) => {
-                let dir = ev.sterile_dir.ok_or_else(|| {
-                    std::io::Error::other(
-                        "in-scope Claude evidence is missing its sterile working directory",
-                    )
+        // `claude_evidence_enabled` holds) runs from the verified-empty sterile directory the
+        // parent built, reading the repo through absolute rules pinned to `cfg.cwd`, on either
+        // backend. Without evidence, the git-only neutral-cwd optimisation or the project cwd
+        // applies. Fail closed rather than run a granular-flag Claude in the project cwd, which
+        // would re-open the f2 configuration-contamination risk.
+        let evidence_rules;
+        let neutral;
+        let (cwd, allowed_tools): (&Path, &[String]) = if let Some(ev) = evidence {
+            evidence_rules =
+                super::claude_absolute_read_rules(cfg, spec.reviewer).map_err(|why| {
+                    std::io::Error::other(format!(
+                        "in-scope Claude evidence present without absolute read rules \
+                         (inconsistent state): {why}"
+                    ))
                 })?;
-                (dir, rules.as_slice())
+            let dir = ev.sterile_dir.ok_or_else(|| {
+                std::io::Error::other(
+                    "in-scope Claude evidence is missing its sterile working directory",
+                )
+            })?;
+            (dir, evidence_rules.as_slice())
+        } else {
+            neutral = super::claude_neutral_target(cfg, spec.reviewer);
+            match &neutral {
+                Some((dir, rules)) => (dir.as_path(), rules.as_slice()),
+                None => (cfg.cwd.as_path(), &cfg.allowed_tools),
             }
-            (Some(_), None) => {
-                return Err(std::io::Error::other(
-                    "in-scope Claude evidence present without a neutral target (inconsistent state)",
-                ));
-            }
-            (None, Some((dir, rules))) => (dir.as_path(), rules.as_slice()),
-            (None, None) => (cfg.cwd.as_path(), &cfg.allowed_tools),
         };
         cmd.current_dir(cwd);
         // Profile: for an authorized non-ambient profile, run in a controlled environment against
@@ -557,17 +562,35 @@ fn from_result_document(
 /// classification never runs raw stdout through the generic classifier. See
 /// `docs/usage-remaining-gate.md`.
 /// Whether this Claude turn is the in-scope evidence path (plan section 0): a **profile-pinned**,
-/// shell-less, git-top-level, default-rules, isolated Claude. This is THE eligibility decision --
-/// the parent gates evidence setup on it, and `parse`, `output_limits`, the capability preamble, and
-/// the argv tests all key on it too, so every one of them agrees for a given `(cfg, spec)` (review
-/// f3, the profile-dimension analogue of f7's single-predicate rule). The profile requirement is
-/// review f2: an ambient Claude has no controlled config home, so it keeps `--safe-mode` and gets no
-/// evidence. A named profile that reached here is authorized (an unauthorized one is refused
-/// upstream), so `!Ambient` is equivalent to the parent's `authorized_start.is_some()`.
+/// shell-less, default-rules, isolated Claude, on git (with cwd at the git top-level) or Perforce. This is
+/// THE eligibility decision -- the parent gates evidence setup on it, and `parse`, `output_limits`,
+/// the capability preamble, and the argv tests all key on it too, so every one of them agrees for a
+/// given `(cfg, spec)` (review f3, the profile-dimension analogue of f7's single-predicate rule). The
+/// profile requirement is review f2: an ambient Claude has no controlled config home, so it keeps
+/// `--safe-mode` and gets no evidence. A named profile that reached here is authorized (an
+/// unauthorized one is refused upstream), so `!Ambient` is equivalent to the parent's
+/// `authorized_start.is_some()`.
+///
+/// It does not depend on the git-only neutral-cwd optimisation (`claude_neutral_target`): the
+/// evidence path runs from the sterile directory on either backend (issue #136).
 pub(crate) fn claude_evidence_enabled(cfg: &Config, spec: &ReviewerSpec) -> bool {
-    spec.reviewer == crate::config::ReviewerKind::Claude
-        && !matches!(spec.profile, crate::profile::ProfileSelector::Ambient)
-        && super::claude_neutral_target(cfg, spec.reviewer).is_some()
+    claude_evidence_ineligibility(cfg, spec).is_none()
+}
+
+/// Why `spec` is not on the in-scope evidence path, worded for an operator; `None` when it is.
+/// The single source of [`claude_evidence_enabled`], so a diagnostic can never name a different
+/// reason than the one that actually decided.
+pub(crate) fn claude_evidence_ineligibility(
+    cfg: &Config,
+    spec: &ReviewerSpec,
+) -> Option<&'static str> {
+    if spec.reviewer != crate::config::ReviewerKind::Claude {
+        return Some("it is not a Claude reviewer");
+    }
+    if matches!(spec.profile, crate::profile::ProfileSelector::Ambient) {
+        return Some("no Claude profile is pinned (--claude-profile), so it runs ambient");
+    }
+    super::claude_absolute_read_rules(cfg, spec.reviewer).err()
 }
 
 /// Evidence-service health read from the reviewer's `stream-json`, for the section-7 (f4) gate.
@@ -1012,9 +1035,9 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config {
-        // A non-git working root keeps Claude off the evidence path (`claude_neutral_target` requires
-        // a git top-level), so these tests exercise the buffered `json` parse used off the evidence
-        // path. The in-scope stream path is covered by the `stream_json`/usage-gate tests.
+        // An ambient Claude at a non-git working root is off the evidence path (no pinned profile,
+        // and the git backend requires a git top-level), so these tests exercise the buffered `json`
+        // parse used off the evidence path. The in-scope stream path is covered by the `stream_json`/usage-gate tests.
         let dir = crate::testutil::temp_dir("cross-review-claude-parse");
         Config::from_args(&[
             "--reviewer".into(),

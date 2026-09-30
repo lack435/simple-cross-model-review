@@ -502,12 +502,14 @@ pub fn spawn_failed(reviewer: &str, bin: &str, detail: impl Into<String>) -> Fai
 pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
     Failure::new(
         "EVIDENCE_UNAVAILABLE",
-        "The isolated Codex evidence service could not be proved available, so the review was not started.",
-        "The Codex reviewer could not receive its required read-only repository evidence service. \
-         Check that this cross-review executable can start its hidden evidence mode, that the \
-         configured state/temp directory is writable, and that Codex supports strict required MCP \
-         server configuration. Then retry the review. Do not bypass the failure with reviewer shell \
-         allow rules; the review has NOT been performed.",
+        "The read-only evidence service could not be provided to the reviewer, so the review was not started.",
+        "The reviewer could not receive its required read-only repository evidence service; the \
+         detail says why. If it names a reviewer configuration that cannot use the service (for \
+         example an ambient or shell-enabled Claude), change that configuration as it describes. \
+         Otherwise check that this cross-review executable can start its hidden evidence mode, that \
+         the configured state/temp directory is writable, and that the reviewer CLI supports strict \
+         MCP server configuration. Then retry. Do not bypass the failure with reviewer shell allow \
+         rules; the review has NOT been performed.",
     )
     .with_detail(detail)
 }
@@ -517,8 +519,8 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
 /// its evidence transport failed, so the review would rest on less than the intended change. Keeps
 /// the `EVIDENCE_UNAVAILABLE` code
 /// (the caller's action -- stop, do not self-review, re-run -- is the same) but with a message
-/// accurate to the runtime case: the startup `evidence_unavailable` wording ("Codex", "was not
-/// started") would misreport this, which is the class of bug AGENTS.md names.
+/// accurate to the runtime case: the startup `evidence_unavailable` wording ("could not be
+/// provided", "was not started") would misreport this, which is the class of bug AGENTS.md names.
 pub fn evidence_review_too_thin(detail: impl Into<String>) -> Failure {
     Failure::new(
         "EVIDENCE_UNAVAILABLE",

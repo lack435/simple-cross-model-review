@@ -39,7 +39,7 @@ fn test_claude_evidence<'a>() -> EvidenceInvocation<'a> {
 }
 
 /// Evidence exactly as the parent (`tools.rs`) decides it for this config: Codex always; Claude only
-/// when `claude_neutral_target` qualifies (the in-scope shell-less path of plan section 0). This is
+/// when `claude_evidence_enabled` holds (the in-scope shell-less path of plan section 0). This is
 /// what keeps these argv tests faithful to the real gating.
 fn evidence_for(cfg: &Config) -> Option<EvidenceInvocation<'_>> {
     match cfg.primary().reviewer {
@@ -355,6 +355,83 @@ fn claude_stays_in_the_working_root_when_a_gate_is_not_met() {
             "a gate is unmet, so the reviewer must stay in the working root: {extra:?}"
         );
     }
+}
+
+#[test]
+fn claude_on_perforce_takes_the_evidence_path_when_profile_pinned_issue_136() {
+    // Issue #136: evidence eligibility used to key on the git-only neutral-cwd optimisation, so a
+    // profile-pinned, shell-less, isolated Claude on Perforce was refused every consult. It must
+    // take the same evidence treatment as on git -- sterile cwd, absolute read rules pinned to the
+    // working root, the evidence server and granular isolation instead of --safe-mode -- whether or
+    // not the workspace happens to sit at a git top-level.
+    let plain = crate::testutil::temp_dir("cross-review-argv-p4-root");
+    let coincidental_git = crate::testutil::temp_dir("cross-review-argv-p4-gitroot");
+    std::fs::write(coincidental_git.join(".git"), b"gitdir: elsewhere").expect("mark git");
+    let state = crate::testutil::temp_dir("cross-review-argv-p4-state");
+    for root in [&plain, &coincidental_git] {
+        let cfg = config_at(
+            root,
+            Some(&state),
+            &["claude", "--vcs", "perforce", "--claude-profile", "test"],
+        );
+        assert!(
+            crate::reviewer::claude::claude_evidence_enabled(&cfg, cfg.primary()),
+            "{}: {:?}",
+            root.display(),
+            crate::reviewer::claude::claude_evidence_ineligibility(&cfg, cfg.primary())
+        );
+        // Still no git-only neutral-cwd optimisation on Perforce: only the evidence path moves it.
+        assert!(crate::reviewer::claude_neutral_target(&cfg, cfg.primary().reviewer).is_none());
+        assert_eq!(
+            crate::reviewer::reviewer_cwd_mode(&cfg, cfg.primary()),
+            crate::reviewer::CWD_MODE_NEUTRAL
+        );
+
+        assert_eq!(
+            cwd_of(&ClaudeReviewer, &cfg),
+            Path::new("C:\\fake\\sterile-claude-cwd")
+        );
+        let args = argv(&ClaudeReviewer, &cfg, None);
+        let root = cfg.cwd.to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            values_after(&args, "--allowed-tools"),
+            vec![
+                format!("Read({root}/**)"),
+                format!("Grep({root}/**)"),
+                format!("Glob({root}/**)"),
+                "mcp__cross_review_evidence".to_string(),
+            ],
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--safe-mode"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--disable-slash-commands"),
+            "{args:?}"
+        );
+        assert_eq!(
+            value_after(&args, "--mcp-config").as_deref(),
+            Some("C:\\fake\\claude-mcp.json")
+        );
+    }
+
+    // Ambient on Perforce stays out, and says why rather than blaming a shell.
+    let ambient = config_at(&plain, Some(&state), &["claude", "--vcs", "perforce"]);
+    let why = crate::reviewer::claude::claude_evidence_ineligibility(&ambient, ambient.primary())
+        .expect("ambient is ineligible");
+    assert!(why.contains("--claude-profile"), "{why}");
+    assert_eq!(cwd_of(&ClaudeReviewer, &ambient), ambient.cwd);
+
+    // The git top-level requirement is still git's alone: the same root forced to the git backend
+    // (auto-detect would call it Perforce) is refused, and names that reason.
+    let git_subdir = config_at(
+        &plain,
+        Some(&state),
+        &["claude", "--vcs", "git", "--claude-profile", "test"],
+    );
+    let why =
+        crate::reviewer::claude::claude_evidence_ineligibility(&git_subdir, git_subdir.primary())
+            .expect("a non-top-level git root is ineligible");
+    assert!(why.contains("git top-level"), "{why}");
 }
 
 #[test]
@@ -714,12 +791,12 @@ fn codex_sterile_directory_refuses_any_existing_entry() {
 fn codex_session_mode_separates_sterile_evidence_from_project_cwd() {
     let isolated = config(&["codex"]);
     assert_eq!(
-        crate::reviewer::reviewer_cwd_mode(&isolated, crate::config::ReviewerKind::Codex),
+        crate::reviewer::reviewer_cwd_mode(&isolated, isolated.primary()),
         crate::reviewer::CWD_MODE_CODEX_EVIDENCE
     );
     let opted_out = config(&["codex", "--allow-reviewer-config"]);
     assert_eq!(
-        crate::reviewer::reviewer_cwd_mode(&opted_out, crate::config::ReviewerKind::Codex),
+        crate::reviewer::reviewer_cwd_mode(&opted_out, opted_out.primary()),
         crate::reviewer::CWD_MODE_PROJECT
     );
 }

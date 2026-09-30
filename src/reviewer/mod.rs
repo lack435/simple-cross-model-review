@@ -958,45 +958,16 @@ pub fn claude_neutral_target(
     cfg: &Config,
     reviewer: ReviewerKind,
 ) -> Option<(PathBuf, Vec<String>)> {
-    // Claude only: isolated Codex uses its own sterile cwd plus evidence-service path.
-    if reviewer != ReviewerKind::Claude {
-        return None;
-    }
     // Git backend only. The cache churn we are fixing comes from Claude Code's git context, and
     // the neutral-cwd path listings assume git-shaped output. A Perforce review whose workspace
     // happens to sit inside a git repo (so `is_git_toplevel` would be true) emits working-root-
     // relative Perforce paths, not git `a/`/`b/` diffs, so it must stay in project-cwd mode.
+    // (The evidence path is separate: it runs from the sterile directory on either backend, see
+    // `claude_absolute_read_rules`.)
     if cfg.vcs != crate::config::Vcs::Git {
         return None;
     }
-    // Isolation must be on. `--allow-reviewer-config` opts into loading project/user config,
-    // which needs the project as cwd.
-    if !cfg.isolate_reviewer {
-        return None;
-    }
-    // Shell-less only: this helper predates the separate Codex evidence path. A shell-enabled
-    // Claude reviewer runs git itself against the working tree, so it needs the project as cwd; a
-    // shell-less one reaches the change only through the cwd-agnostic evidence service, so it can
-    // run from a neutral cwd. Use the active entry's predicate, not the primary's, so a
-    // Codex->shell-less-Claude fallback is judged on Claude.
-    if cfg.reviewer_has_shell_of(reviewer) {
-        return None;
-    }
-    // Only the default read rules can be translated to absolute form safely; a caller-supplied
-    // relative rule would lose access from a neutral cwd.
-    if !cfg.allowed_tools_are_default() {
-        return None;
-    }
-    // Only when `cfg.cwd` is the git top-level. Then the working root is the repository root, so
-    // every captured path (git-status is repo-root-relative, diff/untracked are working-root-
-    // relative) shares one origin -- the absolute root we hand the reviewer -- and there is no
-    // sub-directory ambiguity to resolve. It is also the only case where a git context that our
-    // move would remove actually exists here.
-    if !is_git_toplevel(&cfg.cwd) {
-        return None;
-    }
-    // The path must be representable as a safe absolute glob prefix.
-    let rules = crate::config::absolute_scoped_rules(&cfg.cwd)?;
+    let rules = claude_absolute_read_rules(cfg, reviewer).ok()?;
     // The neutral directory must be verified to have no `.git` ancestor, or we would just move
     // the problem into a different repository. Fail closed if it cannot be confirmed.
     let dir = neutral_dir(cfg);
@@ -1006,12 +977,65 @@ pub fn claude_neutral_target(
     Some((dir, rules))
 }
 
-/// The cwd/evidence mode for the reviewer that would run this turn, recorded on the session and
-/// compared on resume.
-pub fn reviewer_cwd_mode(cfg: &Config, reviewer: ReviewerKind) -> &'static str {
-    if reviewer == ReviewerKind::Codex && cfg.isolate_reviewer {
+/// Whether a Claude reviewer can run outside the project with absolute read-scope rules pinned to
+/// the working root, and if so those rules; if not, the first unmet condition, worded for an
+/// operator. Every condition fails *closed*.
+///
+/// This is the backend-independent half of the Claude evidence eligibility
+/// (`claude::claude_evidence_enabled` adds the profile requirement) and the shared precondition of
+/// the git-only neutral-cwd optimisation (`claude_neutral_target` adds the backend and the
+/// neutral-directory check). The evidence path does not need either of those: it runs from the
+/// separately verified sterile directory (`codex_sterile_dir`), whatever the backend (issue #136).
+pub fn claude_absolute_read_rules(
+    cfg: &Config,
+    reviewer: ReviewerKind,
+) -> Result<Vec<String>, &'static str> {
+    // Claude only: isolated Codex uses its own sterile cwd plus evidence-service path.
+    if reviewer != ReviewerKind::Claude {
+        return Err("it is not a Claude reviewer");
+    }
+    // Isolation must be on. `--allow-reviewer-config` opts into loading project/user config,
+    // which needs the project as cwd.
+    if !cfg.isolate_reviewer {
+        return Err("reviewer configuration isolation is off (--allow-reviewer-config)");
+    }
+    // Shell-less only. A shell-enabled Claude reviewer runs its VCS itself against the working
+    // tree, so it needs the project as cwd; a shell-less one reaches the change only through the
+    // prompt and the cwd-agnostic evidence service, so it can run from outside the project. Use
+    // the active entry's predicate, not the primary's, so a Codex->shell-less-Claude fallback is
+    // judged on Claude.
+    if cfg.reviewer_has_shell_of(reviewer) {
+        return Err("the reviewer has a shell (Bash in --tools)");
+    }
+    // Only the default read rules can be translated to absolute form safely; a caller-supplied
+    // relative rule would lose access from outside the project.
+    if !cfg.allowed_tools_are_default() {
+        return Err("--allow-tools overrides the default read rules");
+    }
+    // Git only: only when `cfg.cwd` is the git top-level. Then the working root is the repository
+    // root, so every captured path (git-status is repo-root-relative, diff/untracked are
+    // working-root-relative) shares one origin -- the absolute root we hand the reviewer -- and
+    // there is no sub-directory ambiguity to resolve. Perforce paths are all working-root-relative,
+    // so they have one origin already.
+    if cfg.vcs == crate::config::Vcs::Git && !is_git_toplevel(&cfg.cwd) {
+        return Err(
+            "the working root is not the git top-level (--cwd must be the repository root)",
+        );
+    }
+    // The path must be representable as a safe absolute glob prefix.
+    crate::config::absolute_scoped_rules(&cfg.cwd)
+        .ok_or("the working root cannot be expressed as an absolute read scope")
+}
+
+/// The cwd/evidence mode for the reviewer entry that would run this turn, recorded on the session
+/// and compared on resume. An in-scope evidence Claude runs from the sterile directory rather than
+/// the project, so it is out of project mode on either backend.
+pub fn reviewer_cwd_mode(cfg: &Config, spec: &ReviewerSpec) -> &'static str {
+    if spec.reviewer == ReviewerKind::Codex && cfg.isolate_reviewer {
         CWD_MODE_CODEX_EVIDENCE
-    } else if claude_neutral_target(cfg, reviewer).is_some() {
+    } else if claude::claude_evidence_enabled(cfg, spec)
+        || claude_neutral_target(cfg, spec.reviewer).is_some()
+    {
         CWD_MODE_NEUTRAL
     } else {
         CWD_MODE_PROJECT
