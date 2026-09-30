@@ -1147,6 +1147,7 @@ impl Core {
             && path.is_empty();
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
+        let autocrlf = self.bundle.worktree_autocrlf;
         let cancel = Arc::clone(&self.cancel);
         let composed = run_bounded_walk(&CHILD_WATCHDOG, "git diff", received_at, move || {
             compose_diff(
@@ -1154,6 +1155,7 @@ impl Core {
                 &base_ep,
                 &head_ep,
                 &path,
+                autocrlf,
                 &limits,
                 &cancel,
                 received_at,
@@ -2550,11 +2552,13 @@ struct ComposedDiff {
 /// Resolve the endpoints, run the tracked diff, and — for a working-tree head — compose the
 /// untracked files `git diff` omits (f2). Runs on the watchdog-bounded worker. The text carries a
 /// one-line header naming the resolved base, so the reviewer sees what it is diffing against.
+#[allow(clippy::too_many_arguments)]
 fn compose_diff(
     root: &Path,
     base: &DiffEndpoint,
     head: &DiffEndpoint,
     path: &str,
+    autocrlf: Option<super::AutoCrlf>,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
@@ -2594,9 +2598,24 @@ fn compose_diff(
         }
     }
     let spec_refs: Vec<&str> = spec.iter().map(String::as_str).collect();
-    let tracked = super::git::diff(root, &spec_refs, path, limits, cancel, received_at)?;
-    let (files, insertions, deletions) =
-        super::git::numstat(root, &spec_refs, path, limits, cancel, received_at)?;
+    let tracked = super::git::diff(
+        root,
+        &spec_refs,
+        path,
+        autocrlf,
+        limits,
+        cancel,
+        received_at,
+    )?;
+    let (files, insertions, deletions) = super::git::numstat(
+        root,
+        &spec_refs,
+        path,
+        autocrlf,
+        limits,
+        cancel,
+        received_at,
+    )?;
 
     let mut complete = true;
     let mut untracked_files = 0usize;
@@ -2757,6 +2776,7 @@ mod tests {
             limits: limits.clone(),
             initial_stamp: initial_stamp(root, &limits, vcs),
             page_bytes_ceiling: None,
+            worktree_autocrlf: None,
         }
     }
 
