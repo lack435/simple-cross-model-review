@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{EvidenceError, Limits};
+use super::{AutoCrlf, EvidenceError, Limits};
 
 /// Why a Git command produced no output, classified finely enough for the enumeration's fallback
 /// rule (issue #86).
@@ -208,19 +208,24 @@ pub fn revision(
 /// the closed `--diff`-style hardening is preserved. Untracked files are *not* part of this output —
 /// `git diff` never lists them — and are composed in by the caller from `reviewable_paths`; this
 /// function is the tracked half only.
+///
+/// `autocrlf` is the checkout's resolved `core.autocrlf` ([`effective_autocrlf`]), re-applied so the
+/// working tree is compared the way native Git would stage it (issue #135).
 pub fn diff(
     root: &Path,
     spec: &[&str],
     path: &str,
+    autocrlf: Option<AutoCrlf>,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
-    let mut args = vec![
+    let mut args = autocrlf_override(autocrlf);
+    args.extend([
         "diff".to_string(),
         "--no-ext-diff".to_string(),
         "--no-textconv".to_string(),
-    ];
+    ]);
     args.extend(spec.iter().map(|s| s.to_string()));
     if !path.is_empty() {
         args.push("--".into());
@@ -264,16 +269,18 @@ pub fn numstat(
     root: &Path,
     spec: &[&str],
     path: &str,
+    autocrlf: Option<AutoCrlf>,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<(usize, usize, usize), EvidenceError> {
-    let mut args = vec![
+    let mut args = autocrlf_override(autocrlf);
+    args.extend([
         "diff".to_string(),
         "--numstat".to_string(),
         "--no-ext-diff".to_string(),
         "--no-textconv".to_string(),
-    ];
+    ]);
     args.extend(spec.iter().map(|s| s.to_string()));
     if !path.is_empty() {
         args.push("--".into());
@@ -293,6 +300,109 @@ pub fn numstat(
         deletions += deleted.parse::<usize>().unwrap_or(0);
     }
     Ok((files, insertions, deletions))
+}
+
+/// The `-c` pair re-applying a resolved `core.autocrlf`, or nothing when there is none to apply.
+fn autocrlf_override(autocrlf: Option<AutoCrlf>) -> Vec<String> {
+    match autocrlf {
+        Some(value) => vec!["-c".to_string(), value.config_override().to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// The checkout's effective `core.autocrlf` as the user's own Git sees it -- system, global, and
+/// repository config, in Git's precedence -- or `None` when it is unset, cannot be read, or cannot
+/// be applied faithfully.
+///
+/// These are the only Git calls made *without* the runner's config isolation, and they are
+/// deliberately narrow: they run in the parent (which has the user's environment; the evidence child
+/// may not), they only read keys with `git config --get`, which touches neither the index nor hooks,
+/// and the answer is reduced to the closed [`AutoCrlf`] enum before anything uses it. `None` leaves
+/// the diff exactly as it was before issue #135: noisier, never thinner.
+///
+/// It is also `None` whenever a user-level attributes file could apply. Such a file can mark paths
+/// `-text`, which native Git honours but the isolated child may not see (a configured
+/// `core.attributesFile` is dropped with the global config, and the default one depends on an
+/// environment the child may not have). Forwarding `autocrlf` then could normalize away an
+/// end-of-line change native Git would show -- a review thinner than it looks -- so the setting is
+/// withheld rather than applied partially.
+pub fn effective_autocrlf(root: &Path) -> Option<AutoCrlf> {
+    if user_attributes_may_apply(root) {
+        return None;
+    }
+    // `--type=bool-or-str` canonicalizes the way Git itself reads the key: a valueless `autocrlf`
+    // is `true`, an empty one `false`, `input` stays `input`. Unset exits 1: Git's default applies.
+    let value = git_config_get(root, &["--type=bool-or-str", "--get", "core.autocrlf"])?;
+    AutoCrlf::parse(&value)
+}
+
+/// Whether a user-level attributes file could affect this checkout: a `core.attributesFile` set at
+/// any level, or the default `$XDG_CONFIG_HOME/git/attributes` (else `~/.config/git/attributes`).
+/// Unanswerable counts as yes, which withholds the override (the noisier, safe direction).
+fn user_attributes_may_apply(root: &Path) -> bool {
+    match git_config_status(root, &["--get", "core.attributesFile"]) {
+        Some(ConfigLookup::Unset) => {}
+        Some(ConfigLookup::Set(_)) | None => return true,
+    }
+    let mut defaults = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        defaults.push(std::path::PathBuf::from(xdg).join("git").join("attributes"));
+    }
+    for home in ["HOME", "USERPROFILE"] {
+        if let Some(h) = std::env::var_os(home).filter(|v| !v.is_empty()) {
+            defaults.push(
+                std::path::PathBuf::from(h)
+                    .join(".config")
+                    .join("git")
+                    .join("attributes"),
+            );
+        }
+    }
+    defaults.iter().any(|p| p.try_exists().unwrap_or(true))
+}
+
+enum ConfigLookup {
+    Set(String),
+    Unset,
+}
+
+/// `git config <args>` in `root` under the user's own configuration. `Some(Unset)` for the documented
+/// "key not found" exit 1; `None` for any other failure.
+fn git_config_status(root: &Path, args: &[&str]) -> Option<ConfigLookup> {
+    let bin = crate::reviewer::on_path("git")?;
+    let mut command = Command::new(bin);
+    command
+        .arg("--no-pager")
+        .args(["-c", "core.fsmonitor="])
+        .arg("config")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_PAGER", "")
+        .env("PAGER", "");
+    let output = crate::reviewer::run(
+        command,
+        "",
+        Duration::from_secs(10),
+        &AtomicBool::new(false),
+    )
+    .ok()?;
+    if output.timed_out || output.cancelled || output.stdout_truncated {
+        return None;
+    }
+    if output.success {
+        return Some(ConfigLookup::Set(
+            output.stdout.lines().next().unwrap_or("").to_string(),
+        ));
+    }
+    (output.exit == Some(1)).then_some(ConfigLookup::Unset)
+}
+
+/// The value of a set key, or `None` when it is unset or unreadable.
+fn git_config_get(root: &Path, args: &[&str]) -> Option<String> {
+    match git_config_status(root, args)? {
+        ConfigLookup::Set(value) => Some(value),
+        ConfigLookup::Unset => None,
+    }
 }
 
 /// Resolve a revision to a full commit object id, or `None` if it does not name one.
@@ -626,6 +736,120 @@ mod tests {
             return None;
         }
         Some(dir)
+    }
+
+    #[test]
+    fn autocrlf_parses_every_git_spelling_and_rejects_the_rest() {
+        assert_eq!(AutoCrlf::parse("input"), Some(AutoCrlf::Input));
+        for t in ["true", "TRUE", "yes", "on", "1", " true\n"] {
+            assert_eq!(AutoCrlf::parse(t), Some(AutoCrlf::True), "{t:?}");
+        }
+        for f in ["false", "no", "off", "0"] {
+            assert_eq!(AutoCrlf::parse(f), Some(AutoCrlf::False), "{f:?}");
+        }
+        // Ambiguous raw emptiness is not guessed at; `--type=bool-or-str` never produces it.
+        assert_eq!(AutoCrlf::parse(""), None);
+        assert_eq!(AutoCrlf::parse("core.fsmonitor=evil"), None);
+        assert_eq!(AutoCrlf::parse("crlf"), None);
+    }
+
+    /// Issue #135's own verification fixture: an LF-normalized blob checked out with CRLF, one line
+    /// edited. Under the runner's isolated config (no system/global `core.autocrlf`) the working
+    /// tree diffs as a whole-file rewrite; with the checkout's `core.autocrlf` re-applied it is the
+    /// one semantic hunk native Git shows. A `-text` file keeps its real line-ending change.
+    #[test]
+    fn a_crlf_checkout_of_an_lf_blob_diffs_as_its_semantic_hunk_issue_135() {
+        let Some(dir) = repo("evidence-autocrlf") else {
+            return;
+        };
+        let root = dir.as_path();
+        std::fs::write(root.join(".gitattributes"), "raw.txt -text\n").unwrap();
+        std::fs::write(root.join("f.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(root.join("raw.txt"), "x\ny\n").unwrap();
+        assert!(git(root, &["-c", "core.autocrlf=false", "add", "."]));
+        assert!(git(root, &["commit", "-qm", "base"]));
+        std::fs::write(root.join("f.txt"), "a\r\nB\r\nc\r\n").unwrap();
+        std::fs::write(root.join("raw.txt"), "x\r\ny\r\n").unwrap();
+
+        let limits = Limits::default();
+        let cancel = AtomicBool::new(false);
+        let stat = |autocrlf, path: &str| {
+            numstat(
+                root,
+                &["HEAD"],
+                path,
+                autocrlf,
+                &limits,
+                &cancel,
+                Instant::now(),
+            )
+            .unwrap()
+        };
+        // The bug: isolated config, no override -- every line of f.txt reads as changed.
+        assert_eq!(stat(None, "f.txt"), (1, 3, 3));
+        // The fix: the checkout's autocrlf re-applied -- only the edited line.
+        assert_eq!(stat(Some(AutoCrlf::True), "f.txt"), (1, 1, 1));
+        let patch = diff(
+            root,
+            &["HEAD"],
+            "f.txt",
+            Some(AutoCrlf::True),
+            &limits,
+            &cancel,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(patch.contains("-b\n") && patch.contains("+B\n"), "{patch}");
+        assert!(
+            !patch.contains("-a\n") && !patch.contains("-c\n"),
+            "{patch}"
+        );
+        // `-text` opts out of conversion, so its line-ending change is real and still shown.
+        assert_eq!(stat(Some(AutoCrlf::True), "raw.txt"), (1, 2, 2));
+        // An explicit `false` is honoured too: the CRLF bytes would be committed, so they show.
+        assert_eq!(stat(Some(AutoCrlf::False), "f.txt"), (1, 3, 3));
+    }
+
+    #[test]
+    fn effective_autocrlf_honours_repository_config_over_system_and_global() {
+        let Some(dir) = repo("evidence-autocrlf-resolve") else {
+            return;
+        };
+        let root = dir.as_path();
+        // A user-level attributes file on the test machine withholds the override by design (see
+        // `a_user_attributes_file_withholds_the_override`); this test needs that path clear.
+        if user_attributes_may_apply(root) {
+            eprintln!("skipping: a user-level git attributes file applies on this machine");
+            return;
+        }
+        assert!(git(root, &["config", "core.autocrlf", "input"]));
+        assert_eq!(effective_autocrlf(root), Some(AutoCrlf::Input));
+        assert!(git(root, &["config", "core.autocrlf", "off"]));
+        assert_eq!(effective_autocrlf(root), Some(AutoCrlf::False));
+        // A valueless boolean is `true` to Git, and so here (review f2).
+        assert!(git(root, &["config", "--unset", "core.autocrlf"]));
+        let config = root.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[core]\n\tautocrlf\n");
+        std::fs::write(&config, text).unwrap();
+        assert_eq!(effective_autocrlf(root), Some(AutoCrlf::True));
+    }
+
+    #[test]
+    fn a_user_attributes_file_withholds_the_override() {
+        // Review f1: a `core.attributesFile` the isolated child cannot see may mark paths `-text`;
+        // forwarding autocrlf would then normalize away an end-of-line change native Git shows.
+        let Some(dir) = repo("evidence-autocrlf-attrs") else {
+            return;
+        };
+        let root = dir.as_path();
+        assert!(git(root, &["config", "core.autocrlf", "true"]));
+        assert!(git(
+            root,
+            &["config", "core.attributesFile", "C:/nowhere/attributes"]
+        ));
+        assert!(user_attributes_may_apply(root));
+        assert_eq!(effective_autocrlf(root), None);
     }
 
     // `--cached` alone would pass half of this. The untracked half is what proves the second

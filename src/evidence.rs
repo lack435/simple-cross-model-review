@@ -82,6 +82,44 @@ impl From<crate::config::Vcs> for VcsKind {
     }
 }
 
+/// The reviewed checkout's effective `core.autocrlf` (issue #135). The service's Git runner
+/// disables system and global config for isolation, which also hid this one setting -- and Git for
+/// Windows sets it in the *system* config. Without it a CRLF working copy of an LF-normalized blob
+/// diffs as a whole-file rewrite that native Git, and the commit, would not contain. Resolved once
+/// by the parent (which has the user's full environment) and carried as a closed enum, so only a
+/// validated value is re-injected with `-c`; nothing else from that config reaches the service.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoCrlf {
+    True,
+    False,
+    Input,
+}
+
+impl AutoCrlf {
+    /// Parse a `git config --type=bool-or-str` value of `core.autocrlf`: `input`, or a boolean (the
+    /// canonical `true`/`false`, plus Git's other spellings for robustness). Anything else --
+    /// including an empty string, whose meaning depends on whether the key had a value at all -- is
+    /// `None`, which leaves Git's own default in force.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "input" => Some(Self::Input),
+            "true" | "yes" | "on" | "1" => Some(Self::True),
+            "false" | "no" | "off" | "0" => Some(Self::False),
+            _ => None,
+        }
+    }
+
+    /// The `-c` override that reproduces this setting for the isolated runner.
+    pub fn config_override(self) -> &'static str {
+        match self {
+            Self::True => "core.autocrlf=true",
+            Self::False => "core.autocrlf=false",
+            Self::Input => "core.autocrlf=input",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -319,6 +357,10 @@ pub struct Bundle {
     /// version within one process tree, so there is no cross-version bundle to migrate.
     #[serde(default)]
     pub page_bytes_ceiling: Option<u32>,
+    /// The checkout's effective `core.autocrlf`, for a Git bundle; `None` when unset, unresolvable,
+    /// or not Git (see [`AutoCrlf`]). Defaulted for the same reason as `page_bytes_ceiling`.
+    #[serde(default)]
+    pub worktree_autocrlf: Option<AutoCrlf>,
 }
 
 impl Bundle {
@@ -340,6 +382,11 @@ impl Bundle {
         // review to refuse. Before issue #86 a working root with more than `max_files` entries --
         // a vendored engine tree is enough -- failed here and took the whole review with it.
         let initial_stamp = core::initial_stamp(&canonical, &limits, vcs.into());
+        let worktree_autocrlf = if vcs == crate::config::Vcs::Git {
+            git::effective_autocrlf(&canonical)
+        } else {
+            None
+        };
         let bundle = Self {
             schema_version: SCHEMA_VERSION,
             nonce: nonce.to_string(),
@@ -351,6 +398,7 @@ impl Bundle {
             limits,
             initial_stamp,
             page_bytes_ceiling,
+            worktree_autocrlf,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -1338,6 +1386,41 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_git_bundle_carries_the_checkouts_autocrlf_and_a_perforce_one_does_not_issue_135() {
+        // The parent resolves core.autocrlf with the user's full config and hands the service only
+        // the validated enum; the service's own runner still sees no system or global config.
+        let Some(git) = crate::reviewer::on_path("git") else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        let dir = temp_dir("evidence-bundle-autocrlf");
+        let ok = |args: &[&str]| {
+            Command::new(&git)
+                .args(args)
+                .current_dir(dir.as_path())
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(ok(&["init", "-q"]) && ok(&["config", "core.autocrlf", "input"]));
+        assert_eq!(
+            bundle(dir.as_path()).worktree_autocrlf,
+            Some(AutoCrlf::Input)
+        );
+        let p4 = Bundle::create(
+            dir.as_path(),
+            crate::config::Vcs::Perforce,
+            "nonce-1",
+            "working tree".into(),
+            "captured".into(),
+            Some("diff".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p4.worktree_autocrlf, None);
     }
 
     #[test]
