@@ -22,11 +22,15 @@ const field = (text: string, name: string): string | null =>
 const asRecord = (v: unknown): Record_ | null =>
   typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record_) : null
 
-/** The machine envelope: `structuredContent` when core hands it over, else the `_OUT` text block. */
+/**
+ * The machine envelope: `structuredContent` when core hands it over, else the `_OUT` text block,
+ * else the text itself. When a tool declares an output schema, core gives the model (and so `text`)
+ * the structured result serialised as JSON in place of the text body, with no `_OUT` block in it.
+ */
 const envelopeOf = (result: unknown, text: string): Record_ | null => {
   const structured = asRecord(asRecord(result)?.structuredContent)
   if (structured) return structured
-  const json = ENVELOPE.exec(text)?.[2]
+  const json = ENVELOPE.exec(text)?.[2] ?? (text.trimStart().startsWith('{') ? text : undefined)
   if (json === undefined) return null
   try {
     return asRecord(JSON.parse(json))
@@ -235,8 +239,13 @@ export const register: Register = on => {
     }
 
     const known = await target($, str(args.review_id), str(args.session))
-    const reviewId = field(text, 'review_id') ?? known?.reviewId ?? null
-    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? null
+    // Only an answered call carries an envelope; an error's structured body says nothing about a job.
+    const env = ran.deny === undefined && !ran.isError ? envelopeOf(ran.result, text) : null
+    // A bare-JSON result has no `review_id:` line and may not carry the id, so the call's own
+    // argument names the job it answered.
+    const reviewId =
+      field(text, 'review_id') ?? str(env?.review_id) ?? known?.reviewId ?? (env ? str(args.review_id) : null)
+    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? str(env?.session)
     // A job this mod never saw is recorded only from a response that names it; an error for one
     // (an unknown or evicted id) says nothing about any job the band shows.
     if (!known && (ran.deny !== undefined || ran.isError || !reviewId || !session)) return ran
@@ -267,7 +276,6 @@ export const register: Register = on => {
       return ran
     }
 
-    const env = envelopeOf(ran.result, text)
     const status = str(env?.result_status) ?? str(env?.status) ?? field(text, 'status')
     const turn = num(env?.turn) ?? base.turn
 
