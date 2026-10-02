@@ -4,24 +4,27 @@ A Claude Code mod that draws a band above the prompt showing the cross-review re
 the session has started, one row each, and where each one stands:
 
 ```
-cross-review  ⟳ fix-autocrlf               t2  running 4m12s                        ✕
-              ✎ feat-x                     t1  changes requested · 3 open
-              ✓ docs                       t3  converged
-              ✗ other                          RATE_LIMITED
+cross-review  (running)   fix-autocrlf   t2  running 4m12s                    (x)
+              (changes)   feat-x         t1  changes requested . 3 open
+              (ok)        docs           t3  converged
+              (failed)    other              RATE_LIMITED
 ```
 
 Running jobs come first with their elapsed time (redrawn every 5s while one runs), then the three
-most recently finished. The `✕` at the right drops the finished rows. The band sits above whatever
-else is drawn there (another mod's band, the engine's own) rather than replacing it.
+most recently finished. The close button at the right drops the finished rows. The band sits above
+whatever else is drawn there (another mod's band, the engine's own) rather than replacing it.
 
-| Glyph | Meaning |
+| Glyph (drawn as) | Meaning |
 | --- | --- |
-| `⟳` cyan | running |
-| `✓` green | `converged`, or a consult that was answered |
-| `✎` yellow | `changes_requested`, with the open-finding count |
-| `⚠` red | `escalate` or `rebaseline` |
-| `✗` red | the job failed, with its code (`RATE_LIMITED`, `SESSION_BUSY`, ...) |
-| `⊘` gray | cancelled |
+| U+27F3 cyan | running |
+| U+2713 green | `converged`, or a consult that was answered |
+| U+270E yellow | `changes_requested`, with the open-finding count |
+| U+26A0 red | `escalate` or `rebaseline` |
+| U+2717 red | the job failed, with its code (`RATE_LIMITED`, `SESSION_BUSY`, ...) |
+| U+2298 gray | cancelled |
+
+The glyphs are written as `\uXXXX` escapes in the source, so every file in this folder is plain
+ASCII.
 
 It is not part of the `cross-review` binary and the server knows nothing about it. It only watches
 the calls the agent makes to the `cross_model_*` tools and reads their responses: the `review_id:`
