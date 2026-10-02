@@ -1,0 +1,7 @@
+{
+  "name": "cross-review-status",
+  "version": "0.1.0",
+  "description": "Status line showing the state of every cross-review review and consult this session has started",
+  "author": { "name": "simple-cross-model-review", "url": "https://github.com/lack435/simple-cross-model-review" },
+  "types": "./types/index.d.ts"
+}

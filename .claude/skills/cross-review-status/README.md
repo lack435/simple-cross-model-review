@@ -1,0 +1,46 @@
+# cross-review-status
+
+A Claude Code mod that pins one status line under the prompt showing every cross-review review and
+consult the session has started, and where each one stands:
+
+```
+cross-review · ⟳ fix-autocrlf t2 4m · ✎ feat-x t1 changes requested (3 open) · ✓ docs converged · ⚠ other RATE_LIMITED
+```
+
+Running jobs come first with their elapsed time (refreshed every 15s), then each session's latest
+result, newest first, four at most.
+
+| Glyph | Meaning |
+| --- | --- |
+| `⟳` | running |
+| `✓` | `converged`, or a consult that finished |
+| `✎` | `changes_requested`, with the open-finding count |
+| `⚠` | `escalate`, `rebaseline`, or a failure code (`RATE_LIMITED`, `SESSION_BUSY`, ...) |
+| `⊘` | cancelled |
+
+It is not part of the `cross-review` binary and the server knows nothing about it. It only watches
+the calls the agent makes to the `cross_model_*` tools and reads their responses: the `review_id:`
+and `session:` lines of a start, and the machine envelope of a result (`structuredContent`, or the
+`CROSS_REVIEW_ENVELOPE_OUT` block in the text). It never changes a call or its result. Any MCP
+server name works; it matches on the tool name's `cross_model_*` suffix.
+
+## Using it
+
+In this repository it loads by itself: Claude Code loads a plugin from a project's
+`.claude/skills/<name>/` folder. To use it in another repository, copy this folder into that
+repository's `.claude/skills/`, or into `~/.claude/skills/` to have it everywhere. Nothing is
+built or installed.
+
+The mod API is early access and may change between Claude Code releases. If the line stops
+appearing after an update, run `claude plugin validate .claude/skills/cross-review-status`.
+
+## Developing it
+
+```
+claude plugin validate .claude/skills/cross-review-status
+claude plugin test .claude/skills/cross-review-status
+```
+
+The tests feed the hooks canned server responses through the engine; they call no model. Claude
+Code writes the API's type declarations into `.claude-plugin/types/` when it loads the mod
+(gitignored), which `tsconfig.json` extends for an editor.

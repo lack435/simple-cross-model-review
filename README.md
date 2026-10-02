@@ -97,6 +97,10 @@ While a collect is open the server emits MCP `notifications/progress` every 30 s
 client supplied a progress token — the current phase, elapsed time, how recently the reviewer
 was confirmed alive, and how much output has arrived.
 
+In Claude Code, the [`cross-review-status`](.claude/skills/cross-review-status/) mod keeps a status
+line showing each review the session has started and where it stands. It loads by itself in this
+repository; copy the folder into another repository's `.claude/skills/` to use it there.
+
 ### Consults
 
 `cross_model_consult` is a lighter path for "does this direction look right?", "where is X
