@@ -65,11 +65,11 @@ test('a started review shows as running, then its outcome', async ($, on) => {
   })
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
-  expect(await band($)).toEqual({ rows: ['⟳ feat-x t1 running 0s'], keepsEngine: true })
+  expect(await band($)).toEqual({ rows: ['\u27F3 feat-x t1 running 0s'], keepsEngine: true })
 
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-1' })
   for (const surface of ['terminal', 'desktop'] as const) {
-    expect((await band($, surface)).rows).toEqual(['✎ feat-x t1 changes requested · 3 open'])
+    expect((await band($, surface)).rows).toEqual(['\u270E feat-x t1 changes requested \u00B7 3 open'])
   }
 })
 
@@ -82,10 +82,10 @@ test('a resumed review reads its turn; a failure keeps its code', async ($, on) 
   })
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
-  expect((await band($)).rows).toEqual(['⟳ feat-x t2 running 0s'])
+  expect((await band($)).rows).toEqual(['\u27F3 feat-x t2 running 0s'])
 
   await $.tool.call({ tool: T, session: 'other', instructions: 'x' })
-  expect((await band($)).rows).toEqual(['⟳ feat-x t2 running 0s', '✗ other SESSION_BUSY'])
+  expect((await band($)).rows).toEqual(['\u27F3 feat-x t2 running 0s', '\u2717 other SESSION_BUSY'])
 })
 
 test('a refused start leaves the running review in place', async ($, on) => {
@@ -98,7 +98,7 @@ test('a refused start leaves the running review in place', async ($, on) => {
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
-  expect((await band($)).rows).toEqual(['⟳ feat-x t1 running 0s'])
+  expect((await band($)).rows).toEqual(['\u27F3 feat-x t1 running 0s'])
 })
 
 test('a collect by session updates that session, and zero open is shown', async ($, on) => {
@@ -118,7 +118,7 @@ test('a collect by session updates that session, and zero open is shown', async 
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await $.tool.call({ tool: `${T}_result`, session: 'feat-x' })
-  expect((await band($)).rows).toEqual(['✎ feat-x t1 changes requested · 0 open'])
+  expect((await band($)).rows).toEqual(['\u270E feat-x t1 changes requested \u00B7 0 open'])
 })
 
 test('a review started before the mod loaded keeps parentheses in its name', async ($, on) => {
@@ -135,7 +135,7 @@ test('a review started before the mod loaded keeps parentheses in its name', asy
   })
 
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-5' })
-  expect((await band($)).rows).toEqual(['✓ feat (ui) t3 converged'])
+  expect((await band($)).rows).toEqual(['\u2713 feat (ui) t3 converged'])
 })
 
 test('an error for an id the mod never saw records nothing, and touches no session', async ($, on) => {
@@ -150,7 +150,7 @@ test('an error for an id the mod never saw records nothing, and touches no sessi
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-9-9', session: 'feat-x' })
-  expect((await band($)).rows).toEqual(['⟳ feat-x t1 running 0s'])
+  expect((await band($)).rows).toEqual(['\u27F3 feat-x t1 running 0s'])
 })
 
 test('elapsed time advances while a job runs, and nothing ticks once none does', async ($, on) => {
@@ -168,7 +168,7 @@ test('elapsed time advances while a job runs, and nothing ticks once none does',
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await clock.advance(65_000)
-  expect((await band($)).rows).toEqual(['⟳ feat-x t1 running 1m05s'])
+  expect((await band($)).rows).toEqual(['\u27F3 feat-x t1 running 1m05s'])
   // 65s at one tick per 5s, plus the one `put` makes: the counter does see ticks.
   expect(ticks).toBeGreaterThan(10)
 
@@ -199,7 +199,7 @@ test('clear drops finished jobs and keeps running ones', async ($, on) => {
   const ui = await mountBand($)
   await ui.press({ key: 'clear' })
   await ui.unmount()
-  expect((await band($)).rows).toEqual(['⟳ live t1 running 0s'])
+  expect((await band($)).rows).toEqual(['\u27F3 live t1 running 0s'])
 })
 
 test('a result the model reads as bare structured JSON still finishes the job', async ($, on) => {
@@ -222,7 +222,7 @@ test('a result the model reads as bare structured JSON still finishes the job', 
 
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-10' })
-  expect((await band($)).rows).toEqual(['✓ feat-x t2 converged'])
+  expect((await band($)).rows).toEqual(['\u2713 feat-x t2 converged'])
 })
 
 test('a bare JSON result rebuilds a job started before the mod loaded', async ($, on) => {
@@ -230,5 +230,5 @@ test('a bare JSON result rebuilds a job started before the mod loaded', async ($
   harness(on, { [`${T}_result`]: [{ text: JSON.stringify(structured) }] })
 
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-11' })
-  expect((await band($)).rows).toEqual(['✓ late t3 converged'])
+  expect((await band($)).rows).toEqual(['\u2713 late t3 converged'])
 })

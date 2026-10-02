@@ -55,19 +55,19 @@ type Look = { glyph: string; color: string; label: string }
 const look = (r: Review, now: number): Look => {
   switch (r.status) {
     case 'running':
-      return { glyph: '⟳', color: 'cyan', label: `running ${elapsed(now - r.startedAt)}` }
+      return { glyph: '\u27F3', color: 'cyan', label: `running ${elapsed(now - r.startedAt)}` }
     case 'cancelled':
-      return { glyph: '⊘', color: 'gray', label: 'cancelled' }
+      return { glyph: '\u2298', color: 'gray', label: 'cancelled' }
     case 'failed':
-      return { glyph: '✗', color: 'red', label: r.code ?? 'failed' }
+      return { glyph: '\u2717', color: 'red', label: r.code ?? 'failed' }
     case 'completed':
-      if (r.kind === 'consult' || r.outcome === null) return { glyph: '✓', color: 'green', label: 'answered' }
-      if (r.outcome === 'converged') return { glyph: '✓', color: 'green', label: 'converged' }
+      if (r.kind === 'consult' || r.outcome === null) return { glyph: '\u2713', color: 'green', label: 'answered' }
+      if (r.outcome === 'converged') return { glyph: '\u2713', color: 'green', label: 'converged' }
       if (r.outcome === 'changes_requested') {
-        const open = r.openCount === null ? '' : ` · ${r.openCount} open`
-        return { glyph: '✎', color: 'yellow', label: `changes requested${open}` }
+        const open = r.openCount === null ? '' : ` \u00B7 ${r.openCount} open`
+        return { glyph: '\u270E', color: 'yellow', label: `changes requested${open}` }
       }
-      return { glyph: '⚠', color: 'red', label: r.outcome.replace(/_/g, ' ') }
+      return { glyph: '\u26A0', color: 'red', label: r.outcome.replace(/_/g, ' ') }
   }
 }
 
@@ -180,7 +180,7 @@ export const register: Register = on => {
           {hasFinished ? (
             <Box flexShrink={0}>
               {/* Drawn as the X other bands close with: the desktop does not yet draw role="dismiss" itself. */}
-              <Button key="clear" label="✕" plain dimColor role="dismiss" onPress={() => clearFinished($)} />
+              <Button key="clear" label={'\u2715'} plain dimColor role="dismiss" onPress={() => clearFinished($)} />
             </Box>
           ) : null}
         </Box>
