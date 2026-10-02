@@ -114,6 +114,21 @@ test('a review started before the mod loaded keeps parentheses in its name', asy
   expect(statuses.at(-1)).toBe('cross-review · ✓ feat (ui) t3 converged')
 })
 
+test('an error for an id the mod never saw records nothing, and touches no session', async ($, on) => {
+  const unknown = { text: "REQUEST REJECTED\ncode: BAD_REQUEST\n\nNo review with review_id 'rv-9-9' exists\n", isError: true }
+  const statuses = harness(on, {
+    [T]: [{ text: started('rv-1-6', 'feat-x (new)') }],
+    [`${T}_result`]: [unknown, unknown],
+  })
+
+  await $.tool.call({ tool: `${T}_result`, review_id: 'rv-9-9' })
+  expect(statuses).toEqual([])
+
+  await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
+  await $.tool.call({ tool: `${T}_result`, review_id: 'rv-9-9', session: 'feat-x' })
+  expect(statuses.at(-1)).toBe('cross-review · ⟳ feat-x t1 0s')
+})
+
 test('other tools pass through untouched', async ($, on) => {
   const statuses = harness(on, { 'mcp__other__thing': [{ text: 'review_id: nope' }] })
   await $.tool.call({ tool: 'mcp__other__thing' })

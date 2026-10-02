@@ -87,18 +87,18 @@ const put = async ($: EngineInterface, r: Review) => {
   await refresh($)
 }
 
-/** The job a `_result` / `_cancel` call names: by `review_id`, else by `session` as the server allows. */
+/**
+ * The job a call names, looked up as the server does (src/tools.rs): by `review_id` when one is
+ * given, and only by `session` when it is not.
+ */
 const target = async (
   $: EngineInterface,
   reviewId: string | null,
   session: string | null,
 ): Promise<Review | null> => {
   const all = (await read($, reviews)) as Record<string, Review>
-  return (
-    (reviewId === null ? undefined : Object.values(all).find(r => r.reviewId === reviewId)) ??
-    (session === null ? undefined : all[session]) ??
-    null
-  )
+  if (reviewId !== null) return Object.values(all).find(r => r.reviewId === reviewId) ?? null
+  return session === null ? null : (all[session] ?? null)
 }
 
 // The suffix the server prints after a session name on a result: `(turn 2)`, `(turn 1, new review)`.
@@ -160,11 +160,12 @@ export const register: Register = on => {
       return ran
     }
 
-    const reviewId = str(args.review_id) ?? field(text, 'review_id')
-    const askedSession = str(args.session)
-    const known = await target($, reviewId, askedSession)
-    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? askedSession
-    if (!known && (!reviewId || !session)) return ran
+    const known = await target($, str(args.review_id), str(args.session))
+    const reviewId = field(text, 'review_id') ?? known?.reviewId ?? null
+    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? null
+    // A job this mod never saw is recorded only from a response that names it; an error for one
+    // (an unknown or evicted id) says nothing about any job the status line shows.
+    if (!known && (ran.deny !== undefined || ran.isError || !reviewId || !session)) return ran
     // A job started before this mod loaded: rebuild what we can from the response.
     const base: Review = known ? { ...known, reviewId: reviewId ?? known.reviewId } : {
       session: session ?? '',
