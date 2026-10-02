@@ -1,6 +1,6 @@
 # cross-review-status
 
-A Claude Code mod that draws a band above the prompt showing every cross-review review and consult
+A Claude Code mod that draws a band above the prompt showing the cross-review reviews and consults
 the session has started, one row each, and where each one stands:
 
 ```

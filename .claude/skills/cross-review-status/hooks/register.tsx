@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Review, ReviewKind } from '../types'
 
@@ -81,9 +81,26 @@ const tick = async ($: EngineInterface) => {
   await update($, clock, () => now)
 }
 
+// Advances `now` while a job runs, and only then: armed when one starts, cancelled once none is
+// left. A reload drops it with the old module; `session.start` arms it again if a job still runs.
+let ticker: Timer | null = null
+
+const pace = async ($: EngineInterface) => {
+  const isRunning = Object.values((await read($, reviews)) as Record<string, Review>).some(
+    r => r.status === 'running',
+  )
+  if (isRunning && ticker === null) {
+    ticker = $.clock.every(TICK_MS, () => void tick($).then(() => pace($)))
+  } else if (!isRunning && ticker !== null) {
+    ticker.cancel()
+    ticker = null
+  }
+}
+
 const put = async ($: EngineInterface, r: Review) => {
   await update($, reviews, prev => ({ ...(prev as Record<string, Review>), [r.session]: r }))
   await tick($)
+  await pace($)
 }
 
 const clearFinished = ($: EngineInterface) =>
@@ -112,13 +129,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     // 0.1.0 pinned a status line, which outlives a reload of the module; take it down.
     $.ui.status(undefined)
-    // Redraws elapsed times only while something is running.
-    $.clock.every(TICK_MS, () => {
-      void read($, reviews).then(all => {
-        if (Object.values(all as Record<string, Review>).some(r => r.status === 'running')) void tick($)
-      })
-    })
     await tick($)
+    await pace($)
     return next(e)
   })
 

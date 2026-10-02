@@ -98,8 +98,9 @@ client supplied a progress token — the current phase, elapsed time, how recent
 was confirmed alive, and how much output has arrived.
 
 In Claude Code, the [`cross-review-status`](.claude/skills/cross-review-status/) mod draws a band
-above the prompt showing each review the session has started and where it stands. It loads by itself in this
-repository; copy the folder into another repository's `.claude/skills/` to use it there.
+above the prompt showing the reviews the session has started and where they stand: every running
+one, and the three most recently finished. It loads by itself in this repository; copy the folder
+into another repository's `.claude/skills/` to use it there.
 
 ### Consults
 

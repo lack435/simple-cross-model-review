@@ -13,7 +13,7 @@ const envelope = (id: string, value: object, session = 'feat-x (turn 1, new revi
 
 /** Answers each cross-review tool with the canned text queued for it. */
 const harness = (on: On, answers: Record<string, { text: string; isError?: boolean }[]>) => {
-  mock.clock(on, { now: 1_000_000 })
+  const clock = mock.clock(on, { now: 1_000_000 })
   on('tool.call', ($, e) => {
     const next = answers[e.tool]?.shift()
     if (!next) throw new Error(`no answer queued for ${e.tool}`)
@@ -21,6 +21,7 @@ const harness = (on: On, answers: Record<string, { text: string; isError?: boole
   })
   // The engine's own band beneath the plugins: a marker the mod must keep.
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text', key: 'engine', children: ['engine band'] }))
+  return clock
 }
 
 const BAND_PROPS = {
@@ -150,6 +151,31 @@ test('an error for an id the mod never saw records nothing, and touches no sessi
   await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
   await $.tool.call({ tool: `${T}_result`, review_id: 'rv-9-9', session: 'feat-x' })
   expect((await band($)).rows).toEqual(['⟳ feat-x t1 running 0s'])
+})
+
+test('elapsed time advances while a job runs, and nothing ticks once none does', async ($, on) => {
+  const clock = harness(on, {
+    [T]: [{ text: started('rv-1-9', 'feat-x (new)') }],
+    [`${T}_result`]: [
+      { text: envelope('rv-1-9', { result_status: 'completed', turn: 1, outcome: 'converged', open_count: 0 }) },
+    ],
+  })
+  let ticks = 0
+  on('state.set', { plugin: 'cross-review-status', key: 'now' }, ($, e, next) => {
+    ticks += 1
+    return next(e)
+  })
+
+  await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
+  await clock.advance(65_000)
+  expect((await band($)).rows).toEqual(['⟳ feat-x t1 running 1m05s'])
+  // 65s at one tick per 5s, plus the one `put` makes: the counter does see ticks.
+  expect(ticks).toBeGreaterThan(10)
+
+  await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-9' })
+  const settled = ticks
+  await clock.advance(60_000)
+  expect(ticks).toBe(settled)
 })
 
 test('other tools pass through untouched', async ($, on) => {
