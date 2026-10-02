@@ -20,6 +20,6 @@ export type Review = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'cross-review-status': { reviews: Record<string, Review> }
+    'cross-review-status': { reviews: Record<string, Review>; now: number }
   }
 }

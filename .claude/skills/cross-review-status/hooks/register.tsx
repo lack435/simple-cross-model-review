@@ -4,12 +4,15 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Review, ReviewKind } from '../types'
 
 const reviews = atom({ plugin: 'cross-review-status', key: 'reviews' } as const, {})
+// The time the band draws elapsed times against, advanced by a timer while a job runs.
+const clock = atom({ plugin: 'cross-review-status', key: 'now' } as const, 0)
 
 // Any server name: `.mcp.json` calls it `cross-review`, but a user may not.
 const TOOL = /^mcp__.+__cross_model_(review|consult)(_result|_cancel)?$/
 const ENVELOPE = /<<<CROSS_REVIEW_ENVELOPE_OUT:([^>\n]+)>>>\n([\s\S]*?)\n<<<CROSS_REVIEW_ENVELOPE_OUT_END:\1>>>/
-const SHOWN = 4
-const TICK_MS = 15_000
+// Finished jobs kept in the band beside every running one.
+const FINISHED_SHOWN = 3
+const TICK_MS = 5_000
 
 type Record_ = Record<string, unknown>
 
@@ -35,57 +38,58 @@ const envelopeOf = (result: unknown, text: string): Record_ | null => {
 const num = (v: unknown): number | null => (typeof v === 'number' ? v : null)
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null)
 
-const ago = (ms: number): string => {
+const elapsed = (ms: number): string => {
   const s = Math.max(0, Math.round(ms / 1000))
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
-  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}s`
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 }
 
-const clip = (s: string, n = 24) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+type Look = { glyph: string; color: string; label: string }
 
-const describe = (r: Review, now: number): string => {
-  const name = `${r.kind === 'consult' ? 'consult ' : ''}${clip(r.session)}${r.turn ? ` t${r.turn}` : ''}`
+const look = (r: Review, now: number): Look => {
   switch (r.status) {
     case 'running':
-      return `⟳ ${name} ${ago(now - r.startedAt)}`
+      return { glyph: '⟳', color: 'cyan', label: `running ${elapsed(now - r.startedAt)}` }
     case 'cancelled':
-      return `⊘ ${name} cancelled`
+      return { glyph: '⊘', color: 'gray', label: 'cancelled' }
     case 'failed':
-      return `⚠ ${name} ${r.code ?? 'failed'}`
+      return { glyph: '✗', color: 'red', label: r.code ?? 'failed' }
     case 'completed':
-      if (r.kind === 'consult' || r.outcome === null) return `✓ ${name} done`
-      if (r.outcome === 'converged') return `✓ ${name} converged`
+      if (r.kind === 'consult' || r.outcome === null) return { glyph: '✓', color: 'green', label: 'answered' }
+      if (r.outcome === 'converged') return { glyph: '✓', color: 'green', label: 'converged' }
       if (r.outcome === 'changes_requested') {
-        return `✎ ${name} changes requested${r.openCount === null ? '' : ` (${r.openCount} open)`}`
+        const open = r.openCount === null ? '' : ` · ${r.openCount} open`
+        return { glyph: '✎', color: 'yellow', label: `changes requested${open}` }
       }
-      return `⚠ ${name} ${r.outcome}`
+      return { glyph: '⚠', color: 'red', label: r.outcome.replace(/_/g, ' ') }
   }
 }
 
-const refresh = async ($: EngineInterface) => {
-  const all = Object.values((await read($, reviews)) as Record<string, Review>)
-  if (all.length === 0) {
-    $.ui.status(undefined)
-    return
-  }
+/** Running jobs, then the most recently finished ones. */
+const shown = (all: Review[]): Review[] => {
+  const running = all.filter(r => r.status === 'running').sort((a, b) => a.startedAt - b.startedAt)
+  const finished = all
+    .filter(r => r.status !== 'running')
+    .sort((a, b) => (b.finishedAt ?? b.startedAt) - (a.finishedAt ?? a.startedAt))
+  return [...running, ...finished.slice(0, FINISHED_SHOWN)]
+}
+
+const tick = async ($: EngineInterface) => {
   const now = await $.clock.now()
-  const ordered = all.sort((a, b) =>
-    a.status === 'running' && b.status !== 'running'
-      ? -1
-      : b.status === 'running' && a.status !== 'running'
-        ? 1
-        : (b.finishedAt ?? b.startedAt) - (a.finishedAt ?? a.startedAt),
-  )
-  const parts = ordered.slice(0, SHOWN).map(r => describe(r, now))
-  const more = ordered.length - SHOWN
-  $.ui.status(`cross-review · ${parts.join(' · ')}${more > 0 ? ` · +${more}` : ''}`)
+  await update($, clock, () => now)
 }
 
 const put = async ($: EngineInterface, r: Review) => {
   await update($, reviews, prev => ({ ...(prev as Record<string, Review>), [r.session]: r }))
-  await refresh($)
+  await tick($)
 }
+
+const clearFinished = ($: EngineInterface) =>
+  update($, reviews, prev =>
+    Object.fromEntries(Object.entries(prev as Record<string, Review>).filter(([, r]) => r.status === 'running')),
+  )
 
 /**
  * The job a call names, looked up as the server does (src/tools.rs): by `review_id` when one is
@@ -106,9 +110,67 @@ const RESULT_SESSION_SUFFIX = / \(turn \d+(?:, [a-z ]+)?\)$/
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    $.clock.every(TICK_MS, () => void refresh($))
-    await refresh($)
+    // 0.1.0 pinned a status line, which outlives a reload of the module; take it down.
+    $.ui.status(undefined)
+    // Redraws elapsed times only while something is running.
+    $.clock.every(TICK_MS, () => {
+      void read($, reviews).then(all => {
+        if (Object.values(all as Record<string, Review>).some(r => r.status === 'running')) void tick($)
+      })
+    })
+    await tick($)
     return next(e)
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Whatever the plugins beneath and the engine draw stays, below this plugin's rows.
+    const below = await next(e)
+    const rows = shown(Object.values((await read($, reviews)) as Record<string, Review>))
+    if (e.props.hasSurvey || rows.length === 0) return below
+
+    const now = await read($, clock)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const hasFinished = rows.some(r => r.status !== 'running')
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" gap={2}>
+          <Box flexShrink={0}>
+            <Text bold>cross-review</Text>
+          </Box>
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+            {rows.map(r => {
+              const { glyph, color, label } = look(r, now)
+              return (
+                <Box key={`row:${r.session}`} flexDirection="row" gap={1}>
+                  <Box flexShrink={0}>
+                    <Text color={color}>{glyph}</Text>
+                  </Box>
+                  <Box flexShrink={1} minWidth={0}>
+                    <Text wrap="truncate-end">{r.kind === 'consult' ? `consult ${r.session}` : r.session}</Text>
+                  </Box>
+                  {r.turn === null ? null : (
+                    <Box flexShrink={0}>
+                      <Text dimColor>{`t${r.turn}`}</Text>
+                    </Box>
+                  )}
+                  <Box flexShrink={0}>
+                    <Text color={color}>{label}</Text>
+                  </Box>
+                </Box>
+              )
+            })}
+          </Box>
+          {hasFinished ? (
+            <Box flexShrink={0}>
+              {/* Drawn as the X other bands close with: the desktop does not yet draw role="dismiss" itself. */}
+              <Button key="clear" label="✕" plain dimColor role="dismiss" onPress={() => clearFinished($)} />
+            </Box>
+          ) : null}
+        </Box>
+        {below}
+      </Box>
+    )
   })
 
   on('tool.call', async ($, e, next) => {
@@ -164,7 +226,7 @@ export const register: Register = on => {
     const reviewId = field(text, 'review_id') ?? known?.reviewId ?? null
     const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? null
     // A job this mod never saw is recorded only from a response that names it; an error for one
-    // (an unknown or evicted id) says nothing about any job the status line shows.
+    // (an unknown or evicted id) says nothing about any job the band shows.
     if (!known && (ran.deny !== undefined || ran.isError || !reviewId || !session)) return ran
     // A job started before this mod loaded: rebuild what we can from the response.
     const base: Review = known ? { ...known, reviewId: reviewId ?? known.reviewId } : {

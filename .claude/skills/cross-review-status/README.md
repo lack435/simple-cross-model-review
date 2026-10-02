@@ -1,22 +1,27 @@
 # cross-review-status
 
-A Claude Code mod that pins one status line under the prompt showing every cross-review review and
-consult the session has started, and where each one stands:
+A Claude Code mod that draws a band above the prompt showing every cross-review review and consult
+the session has started, one row each, and where each one stands:
 
 ```
-cross-review · ⟳ fix-autocrlf t2 4m · ✎ feat-x t1 changes requested (3 open) · ✓ docs converged · ⚠ other RATE_LIMITED
+cross-review  ⟳ fix-autocrlf               t2  running 4m12s                        ✕
+              ✎ feat-x                     t1  changes requested · 3 open
+              ✓ docs                       t3  converged
+              ✗ other                          RATE_LIMITED
 ```
 
-Running jobs come first with their elapsed time (refreshed every 15s), then each session's latest
-result, newest first, four at most.
+Running jobs come first with their elapsed time (redrawn every 5s while one runs), then the three
+most recently finished. The `✕` at the right drops the finished rows. The band sits above whatever
+else is drawn there (another mod's band, the engine's own) rather than replacing it.
 
 | Glyph | Meaning |
 | --- | --- |
-| `⟳` | running |
-| `✓` | `converged`, or a consult that finished |
-| `✎` | `changes_requested`, with the open-finding count |
-| `⚠` | `escalate`, `rebaseline`, or a failure code (`RATE_LIMITED`, `SESSION_BUSY`, ...) |
-| `⊘` | cancelled |
+| `⟳` cyan | running |
+| `✓` green | `converged`, or a consult that was answered |
+| `✎` yellow | `changes_requested`, with the open-finding count |
+| `⚠` red | `escalate` or `rebaseline` |
+| `✗` red | the job failed, with its code (`RATE_LIMITED`, `SESSION_BUSY`, ...) |
+| `⊘` gray | cancelled |
 
 It is not part of the `cross-review` binary and the server knows nothing about it. It only watches
 the calls the agent makes to the `cross_model_*` tools and reads their responses: the `review_id:`
@@ -31,7 +36,7 @@ In this repository it loads by itself: Claude Code loads a plugin from a project
 repository's `.claude/skills/`, or into `~/.claude/skills/` to have it everywhere. Nothing is
 built or installed.
 
-The mod API is early access and may change between Claude Code releases. If the line stops
+The mod API is early access and may change between Claude Code releases. If the band stops
 appearing after an update, run `claude plugin validate .claude/skills/cross-review-status`.
 
 ## Developing it
