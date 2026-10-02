@@ -57,7 +57,7 @@ const describe = (r: Review, now: number): string => {
       if (r.kind === 'consult' || r.outcome === null) return `✓ ${name} done`
       if (r.outcome === 'converged') return `✓ ${name} converged`
       if (r.outcome === 'changes_requested') {
-        return `✎ ${name} changes requested${r.openCount ? ` (${r.openCount} open)` : ''}`
+        return `✎ ${name} changes requested${r.openCount === null ? '' : ` (${r.openCount} open)`}`
       }
       return `⚠ ${name} ${r.outcome}`
   }
@@ -87,9 +87,22 @@ const put = async ($: EngineInterface, r: Review) => {
   await refresh($)
 }
 
-const byId = async ($: EngineInterface, reviewId: string): Promise<Review | null> =>
-  Object.values((await read($, reviews)) as Record<string, Review>).find(r => r.reviewId === reviewId) ??
-  null
+/** The job a `_result` / `_cancel` call names: by `review_id`, else by `session` as the server allows. */
+const target = async (
+  $: EngineInterface,
+  reviewId: string | null,
+  session: string | null,
+): Promise<Review | null> => {
+  const all = (await read($, reviews)) as Record<string, Review>
+  return (
+    (reviewId === null ? undefined : Object.values(all).find(r => r.reviewId === reviewId)) ??
+    (session === null ? undefined : all[session]) ??
+    null
+  )
+}
+
+// The suffix the server prints after a session name on a result: `(turn 2)`, `(turn 1, new review)`.
+const RESULT_SESSION_SUFFIX = / \(turn \d+(?:, [a-z ]+)?\)$/
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -114,6 +127,8 @@ export const register: Register = on => {
       const reviewId = field(text, 'review_id')
       const asked = str(args.session) ?? 'review'
       if (ran.deny !== undefined || ran.isError || !reviewId || !session) {
+        // A refused start (SESSION_BUSY, most often) leaves the job already running untouched.
+        if ((await target($, null, asked))?.status === 'running') return ran
         await put($, {
           session: asked,
           reviewId: reviewId ?? '',
@@ -145,13 +160,15 @@ export const register: Register = on => {
       return ran
     }
 
-    const reviewId = str(args.review_id)
-    if (!reviewId) return ran
-    const known = await byId($, reviewId)
+    const reviewId = str(args.review_id) ?? field(text, 'review_id')
+    const askedSession = str(args.session)
+    const known = await target($, reviewId, askedSession)
+    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? askedSession
+    if (!known && (!reviewId || !session)) return ran
     // A job started before this mod loaded: rebuild what we can from the response.
-    const base: Review = known ?? {
-      session: (field(text, 'session') ?? reviewId).replace(/ \(.*\)$/, ''),
-      reviewId,
+    const base: Review = known ? { ...known, reviewId: reviewId ?? known.reviewId } : {
+      session: session ?? '',
+      reviewId: reviewId ?? '',
       kind,
       turn: null,
       status: 'running',
