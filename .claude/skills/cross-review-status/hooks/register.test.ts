@@ -201,3 +201,26 @@ test('clear drops finished jobs and keeps running ones', async ($, on) => {
   await ui.unmount()
   expect((await band($)).rows).toEqual(['⟳ live t1 running 0s'])
 })
+
+test('a result the model reads as bare structured JSON still finishes the job', async ($, on) => {
+  // What core hands the model for a tool with an output schema: the structured result as JSON,
+  // with neither a `status:` line nor the `_OUT` block.
+  const structured = {
+    converged: true,
+    findings: [],
+    open_count: 0,
+    outcome: 'converged',
+    result_status: 'completed',
+    session: 'feat-x',
+    turn: 2,
+    verdict: 'approve',
+  }
+  harness(on, {
+    [T]: [{ text: started('rv-1-10', 'feat-x (resumed, turn 2)') }],
+    [`${T}_result`]: [{ text: JSON.stringify(structured) }],
+  })
+
+  await $.tool.call({ tool: T, session: 'feat-x', instructions: 'x' })
+  await $.tool.call({ tool: `${T}_result`, review_id: 'rv-1-10' })
+  expect((await band($)).rows).toEqual(['✓ feat-x t2 converged'])
+})

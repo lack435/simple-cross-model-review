@@ -22,11 +22,15 @@ const field = (text: string, name: string): string | null =>
 const asRecord = (v: unknown): Record_ | null =>
   typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record_) : null
 
-/** The machine envelope: `structuredContent` when core hands it over, else the `_OUT` text block. */
+/**
+ * The machine envelope: `structuredContent` when core hands it over, else the `_OUT` text block,
+ * else the text itself. When a tool declares an output schema, core gives the model (and so `text`)
+ * the structured result serialised as JSON in place of the text body, with no `_OUT` block in it.
+ */
 const envelopeOf = (result: unknown, text: string): Record_ | null => {
   const structured = asRecord(asRecord(result)?.structuredContent)
   if (structured) return structured
-  const json = ENVELOPE.exec(text)?.[2]
+  const json = ENVELOPE.exec(text)?.[2] ?? (text.trimStart().startsWith('{') ? text : undefined)
   if (json === undefined) return null
   try {
     return asRecord(JSON.parse(json))
