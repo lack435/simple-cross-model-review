@@ -239,8 +239,13 @@ export const register: Register = on => {
     }
 
     const known = await target($, str(args.review_id), str(args.session))
-    const reviewId = field(text, 'review_id') ?? known?.reviewId ?? null
-    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? null
+    // Only an answered call carries an envelope; an error's structured body says nothing about a job.
+    const env = ran.deny === undefined && !ran.isError ? envelopeOf(ran.result, text) : null
+    // A bare-JSON result has no `review_id:` line and may not carry the id, so the call's own
+    // argument names the job it answered.
+    const reviewId =
+      field(text, 'review_id') ?? str(env?.review_id) ?? known?.reviewId ?? (env ? str(args.review_id) : null)
+    const session = field(text, 'session')?.replace(RESULT_SESSION_SUFFIX, '') ?? str(env?.session)
     // A job this mod never saw is recorded only from a response that names it; an error for one
     // (an unknown or evicted id) says nothing about any job the band shows.
     if (!known && (ran.deny !== undefined || ran.isError || !reviewId || !session)) return ran
@@ -271,7 +276,6 @@ export const register: Register = on => {
       return ran
     }
 
-    const env = envelopeOf(ran.result, text)
     const status = str(env?.result_status) ?? str(env?.status) ?? field(text, 'status')
     const turn = num(env?.turn) ?? base.turn
 
