@@ -56,6 +56,15 @@ requester's feedback on the draft also lands here.
   commit-to-commit diff exactly. That last point corroborates the byte-identity assumption on
   one real repository. It does not replace the tests that pin it.
 
+**Revision note (r3 → r4).** Round 3 resolved f5 and f6, and confirmed three things: the
+configured-index `chain_index` is correct, the binding stays fail-closed through the attest
+tool, and the attest tool is proportionate to the 422 case. It raised **f7** (major), accepted:
+the attest tool's latest-turn check used the process-local registry and was not atomic with the
+hook. A later turn in another server process, or one that started mid-attest, could be missed.
+The fix reuses existing machinery and adds none. Attest takes the **same per-session lease** a
+review takes, checks the **durable** `SessionRecord`'s `cli_session_id` and `turns` under it,
+and holds the lease through the hook.
+
 ## What the issue asks, and what this plan does instead
 
 Issue #142 asks the server to post a GitHub commit status (`cross-review: success`) on the
@@ -397,12 +406,29 @@ hit the first case in practice.
 `cross_model_review_attest` takes a `review_id` (or a `session`, meaning that session's most
 recent review). It:
 
-1. **Requires the review to be the session's latest turn, and converged.** A later turn in the
-   same session, finished or still running, makes it refuse (`not_latest_turn`). This matters:
-   if turn 3 converged on content X and turn 4 re-reviewed the same X and raised a finding,
-   attesting via turn 3 would launder turn 4's finding. It also requires that the review
-   completed, was a git review, and has `outcome == converged`. Otherwise it reports
-   `not_converged` or `not_git`.
+1. **Requires the review to be the session's latest turn, and converged, against durable
+   state and under the session lease** (f7). This matters: if turn 3 converged on content X and
+   turn 4 re-reviewed the same X and raised a finding, attesting via turn 3 would launder turn
+   4's finding. The in-process registry cannot answer "is this the latest turn". It is
+   process-local (`src/registry.rs`), while sessions are shared across server processes
+   through `--state-dir`, so a later turn run by another process is invisible to it. Instead:
+   1. Acquire the **existing per-session lease**, the same `ExclusiveLock` on
+      `session::session_lock_path` that a review takes before it reads the session record
+      (`src/tools.rs`), with the same `SESSION_LEASE_WAIT`. A failure to acquire it is the
+      existing `SESSION_LEASED` error.
+   2. Under the lease, read the durable `SessionRecord`. Require that its `cli_session_id` and
+      `turns` equal the ones the review's turn recorded, both retained on the registry record
+      with the binding inputs. Any mismatch is `not_latest_turn`. That covers a later turn from
+      any process, a `fresh` rebind (new `cli_session_id`) and an expired or forgotten session.
+   3. **Hold the lease through the binding check and the hook**, releasing it only after the
+      hook's quiescence. No turn can start or finish on the session while an attest is deciding
+      and firing, in any process. A review that arrives meanwhile waits on the lease exactly as
+      it waits on another review today, bounded by the hook's timeout plus the check.
+
+   It also requires that the review completed, was a git review, and has
+   `outcome == converged`. Otherwise it reports `not_converged` or `not_git`. These are read
+   from the registry record, which is authoritative for its own turn's outcome. The durable
+   check above is what establishes that the turn is still the latest.
 2. **Re-runs the binding check** against the **current** `HEAD`, using the binding inputs
    retained from that turn: the agreed digest, `base`, `base_source` and the turn's
    `Option<AutoCrlf>`. Same function, same fail-closed rules. So "converged on uncommitted work,
@@ -504,7 +530,12 @@ All unit tests, no network and no model calls (the issue's "fake status sink"):
     and the child is gone afterwards.
 - **Attest tool**, with the recording runner fake:
   - It fires on the latest converged turn after a matching commit, with `trigger: "attest"`.
-  - It refuses `not_latest_turn` when a later turn exists, finished or running.
+  - It refuses `not_latest_turn` when the durable session record has moved on, whether a
+    later `turns` value or a different `cli_session_id` from a `fresh` rebind. Each is written
+    by a *separate* store instance, standing in for another server process, so the test
+    proves the registry is not what decides.
+  - It holds the session lease from validation through hook quiescence: a review started
+    while the hook runs blocks on the lease until the attest finishes.
   - It reports `not_converged`, `not_git`, and `review_not_available` (an evicted or unknown
     id).
   - `head_does_not_match_review` after a non-matching commit.
