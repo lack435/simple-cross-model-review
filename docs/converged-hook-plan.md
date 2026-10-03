@@ -26,6 +26,36 @@ and accepted:
   runner's pattern: stdin written on its own thread, and both streams drained on their own
   threads with a bounded tail. A large-output test is added.
 
+**Revision note (r2 → r3).** Round 2 resolved f1–f4 and raised two more, both accepted. The
+requester's feedback on the draft also lands here.
+
+- **f5** (major): r2 quiesced the job only on timeout. A hook whose direct process exits 0 while
+  a helper is still posting would have been reported `succeeded` before the post finished. Now
+  **every** exit, not just a timeout, is followed by a bounded wait for the job to quiesce.
+  `succeeded` requires exit 0 **and** an empty job. Otherwise the job is terminated and the
+  hook reported `failed` (`not_quiesced`).
+- **f6** (minor): r2 promised `hook: skipped (cancelled)`. A cancelled or failed review returns
+  an error, not a completed result, so it has no result context to carry a `hook` field. The row
+  is removed: a cancelled review never runs the hook and has no `hook` field, like any failed
+  review.
+- **Requester: committed is not enough, it must be pushed.** GitHub rejects a status on a
+  commit it does not have (HTTP 422). A review that converges on a committed-but-unpushed
+  change would report `hook: failed`, and the only recovery would have been another model
+  call. So the no-model **`cross_model_review_attest`** tool moves from open question to scope
+  (see "Re-attesting without a model call"). It also covers "converged on uncommitted work,
+  then committed exactly that". The README tells authors to push before the final turn.
+- **Requester: fallback reviewers.** When the primary reviewer is rate-limited the chain can
+  fall back to an entry from the *calling* agent's own model family. Parsing the `reviewer`
+  string to detect that is fragile. The payload now carries `chain_index`, `reviewer_kind`,
+  `model` and `effort` as separate fields, so a hook can refuse a same-family review. The server
+  does not decide this: it does not know the caller's family.
+- **Requester confirmations**, recorded as data, not as resolved review findings: firing only
+  on `converged` with the binding in the server is agreed; deferring carry-forward is fine for
+  them (their ruleset does not require up-to-date branches); and on their repository the
+  isolated worktree diff of a committed, non-LFS binary (`.uasset`) matched the
+  commit-to-commit diff exactly. That last point corroborates the byte-identity assumption on
+  one real repository. It does not replace the tests that pin it.
+
 ## What the issue asks, and what this plan does instead
 
 Issue #142 asks the server to post a GitHub commit status (`cross-review: success`) on the
@@ -72,6 +102,9 @@ In:
    committed change `base..HEAD`.
 3. A JSON payload on the hook's stdin, in the shape the requester asked for.
 4. The hook's result reported in the review result (a new `hook` field and a text-body line).
+5. A no-model `cross_model_review_attest` tool that re-runs the binding check for a session's
+   latest converged turn against the current `HEAD` and fires the hook. It is for the
+   push-after-convergence and commit-after-convergence cases.
 
 Out (each is a deliberate cut, per AGENTS.md "How much rigor, and where"):
 
@@ -83,7 +116,7 @@ Out (each is a deliberate cut, per AGENTS.md "How much rigor, and where"):
 - **Carry-forward across a clean sync** (issue item 5). After a merge from the default branch,
   the fork point moves and the diff text shifts even when the branch's own change is unchanged.
   Re-attesting that needs a second, weaker binding (`git patch-id --stable` over
-  `merge-base..HEAD`) and a new no-model tool call. That is a follow-up issue, and arguably
+  `merge-base..HEAD`) layered onto `cross_model_review_attest`. That is a follow-up issue, and arguably
   something the hook-owning repository can do itself, since the payload carries `base` and
   `captured_head`. Until then, the workaround after a sync is to re-review on the same
   session. An unchanged change re-converges in one turn, at the cost of one model call.
@@ -236,7 +269,7 @@ parentheses:
 | condition | skip reason |
 | --- | --- |
 | a hook is configured | (field is `null`, not `skipped`) |
-| the review was not cancelled | `cancelled` |
+| the review completed (not cancelled, not failed) | (no completed result, so no `hook` field; f6) |
 | the run is a review, not a consult | (consults carry no `hook` field) |
 | `vcs == git` | `not_git` |
 | `outcome == converged` | `not_converged` |
@@ -265,12 +298,20 @@ parentheses:
 - Working directory: the working root.
 - Environment: the server's, unchanged. The payload is on stdin, so no new environment
   variables.
-- Timeout: `--on-converged-timeout-seconds`. On expiry, terminate the job, then wait briefly
-  (bounded) for `active_processes` to reach zero, and report `timed_out`. If the job cannot be
-  terminated, or does not quiesce in the bound, the report says so (`timed_out`, with reason
-  `not_quiesced`), so the caller knows a straggler may still act. The job handle is held until
-  then, and `KILL_ON_JOB_CLOSE` remains the backstop on server exit.
-- Exit code 0 is `succeeded`; anything else is `failed`, with the code.
+- **Quiescence on every exit** (f5). When the direct child exits, the runner waits, bounded
+  by what remains of the timeout, for `active_processes` to reach zero. A helper the hook
+  started (a backgrounded `gh api`, say) is still part of the hook's work, and the result must
+  not report success before it finishes. If the job does not empty in the bound, terminate it.
+- Timeout: `--on-converged-timeout-seconds` covers the whole hook, direct child and
+  descendants. On expiry, terminate the job, then wait briefly (bounded) for it to empty.
+- Status:
+  - `succeeded`: exit code 0 **and** the job emptied on its own.
+  - `failed`: a non-zero exit (with the code); exit 0 with descendants still running at the
+    deadline (reason `not_quiesced`, the job then terminated); or no containment
+    (`no_containment`).
+  - `timed_out`: the timeout fired. If the job still did not empty after termination, the
+    reason is `not_quiesced`, so the caller knows a straggler may still act.
+  - `KILL_ON_JOB_CLOSE` remains the backstop on server exit.
 - Output: the last 2 KiB of combined stdout and stderr is kept for the result, passed through
   `strip_marker_lines` like every other string in the result context. The full output also
   goes to the server's stderr log.
@@ -299,7 +340,12 @@ plus the fields a status poster needs to be precise:
   "session": "feat/horizon-fill",
   "turn": 3,
   "review_id": "rv-...",
+  "trigger": "review",
   "reviewer": "codex gpt-5.6-luna (effort=xhigh)",
+  "reviewer_kind": "codex",
+  "model": "gpt-5.6-luna",
+  "effort": "xhigh",
+  "chain_index": 0,
   "captured_head": "<full HEAD object id>",
   "tree_clean": true,
   "base": "<full merge-base object id>",
@@ -317,7 +363,21 @@ plus the fields a status poster needs to be precise:
   what the binding check proves. It is stronger than "the working tree was clean at some
   instant".
 - `reviewer` is the same string as the result's `reviewer` field: the chain entry that actually
-  ran, including a fallback.
+  ran, including a fallback. It is for humans. **Hooks should key on the separate fields**
+  (requester feedback):
+  - `reviewer_kind`: `codex` or `claude`.
+  - `model` and `effort`: the full pinned id and the effort.
+  - `chain_index`: the position in the configured `--reviewer` chain of the entry that ran.
+    `0` is the primary. It is the configured index (`i` in the `walk` loop in `src/tools.rs`),
+    not the walk position, so it is honest in two cases: when the proactive usage gate skipped
+    the primary before the walk started, and when a resumed session is bound to an entry that
+    was itself a fallback on turn 1. Either way a non-zero value means "not the primary".
+  
+  A repository whose rule is "the other model, never the caller's own family" refuses on
+  `chain_index != 0`, or on `reviewer_kind`. The server cannot make that decision: it does not
+  know the calling agent's family.
+- `trigger` is `review` when the hook fires at the end of a review turn and `attest` when it
+  fires from `cross_model_review_attest`.
 - **The payload carries no reviewer-authored content.** It has no findings, no prose and no
   titles. Every field is server-derived (git object ids, digests, configuration) or
   caller-supplied (`session`). A hook script therefore cannot be steered by anything the
@@ -325,6 +385,48 @@ plus the fields a status poster needs to be precise:
   as data, not interpolate it into a shell command.
 - The payload's own `schema_version` is independent of the envelope's, so the hook contract can
   evolve on its own.
+
+## Re-attesting without a model call
+
+A review that converges on a commit the forge does not have yet (committed, not pushed) gets a
+`hook: failed` from a hook that posts a status: GitHub answers 422. A review that converges on
+uncommitted work gets `hook: skipped (head_does_not_match_review)`. In both cases the reviewed
+change is fine, and paying for another model call to re-fire the hook is waste. The requester
+hit the first case in practice.
+
+`cross_model_review_attest` takes a `review_id` (or a `session`, meaning that session's most
+recent review). It:
+
+1. **Requires the review to be the session's latest turn, and converged.** A later turn in the
+   same session, finished or still running, makes it refuse (`not_latest_turn`). This matters:
+   if turn 3 converged on content X and turn 4 re-reviewed the same X and raised a finding,
+   attesting via turn 3 would launder turn 4's finding. It also requires that the review
+   completed, was a git review, and has `outcome == converged`. Otherwise it reports
+   `not_converged` or `not_git`.
+2. **Re-runs the binding check** against the **current** `HEAD`, using the binding inputs
+   retained from that turn: the agreed digest, `base`, `base_source` and the turn's
+   `Option<AutoCrlf>`. Same function, same fail-closed rules. So "converged on uncommitted work,
+   then committed exactly that" passes, and "committed something else" does not.
+3. **Fires the hook** with `trigger: "attest"`, under the same runner and the same containment,
+   draining, quiescence and timeout rules, and **returns the same `hook` report object** as the
+   tool's result.
+
+The binding inputs live on the completed review's in-memory registry record (`src/registry.rs`)
+next to the rest of its result. They are **not persisted**: no session-record or ledger change,
+and nothing to migrate. When the record is evicted (the per-session cap on finished reviews) or
+the server restarts, the tool reports `review_not_available`, and the recovery is a re-review on
+the same session, which is exactly today's cost. That is a deliberate trade-off: persisting the
+inputs would let an attest outlive the server, but at the cost of a session-record change for a
+case that is already cheap to recover.
+
+What this tool does not do: it does not change the stored review's `hook` field. Collecting
+the review again shows the original turn-end report, and the attest call's own result is the
+record of the re-fire. It is not cancellable, and it makes no model call, so it is not billed.
+It does not handle carry-forward: after a sync the base moves and the digests differ, by
+design.
+
+The tool is listed only when a hook is configured. Called without one, it returns the
+standard invalid-arguments error naming `--on-converged`.
 
 ## The result
 
@@ -349,8 +451,10 @@ does not change, so no session or ledger is invalidated by the upgrade.
 ## Docs
 
 - README "Configuration": the three flags, the example, and a short "Gating merges on a
-  converged review" section. It covers the binding (commit before the final review turn), the
-  payload, and a minimal example script that posts a status with `gh api`. It notes honestly
+  converged review" section. It covers the binding: **commit and push before the final review
+  turn**, or push afterwards and call `cross_model_review_attest`. It also covers the payload
+  (including keying a same-family refusal on `chain_index` / `reviewer_kind`), and a minimal
+  example script that posts a status with `gh api`. It notes honestly
   that `gh` uses a personal token, so a ruleset that pins the required check to a GitHub App
   needs the script to mint an App installation token instead. The README also carries the
   issue's trust limit: this catches skipped and stale reviews, not a determined actor running
@@ -394,6 +498,21 @@ All unit tests, no network and no model calls (the issue's "fake status sink"):
     the bounded tail is retained, and it is marker-swept.
   - Containment failure (the job-creation seam forced to fail) reports `failed`
     (`no_containment`) and the program never starts, which a side-effect file proves.
+  - A hook whose direct process exits 0 while a spawned child sleeps and then writes a marker
+    file (f5): the runner waits for the child, and the marker exists before `succeeded` is
+    reported. With the child outliving the bound, the result is `failed` (`not_quiesced`),
+    and the child is gone afterwards.
+- **Attest tool**, with the recording runner fake:
+  - It fires on the latest converged turn after a matching commit, with `trigger: "attest"`.
+  - It refuses `not_latest_turn` when a later turn exists, finished or running.
+  - It reports `not_converged`, `not_git`, and `review_not_available` (an evicted or unknown
+    id).
+  - `head_does_not_match_review` after a non-matching commit.
+  - It uses the retained `Option<AutoCrlf>`, not a fresh lookup.
+  - It never changes the stored review's `hook` field.
+- **Payload**: `chain_index` is the configured index. The tests cover the primary, a
+  rate-limit fallback, a pre-start usage-gate skip, and a resume bound to a fallback entry.
+  `reviewer_kind`, `model` and `effort` match the entry that ran.
 - **Config**: flag parsing, the argument order is preserved, the half-configured startup
   errors, and the program resolution rules (bare name through `on_path`, relative path joined
   to the working root).
@@ -411,8 +530,7 @@ fires it. That costs tokens, and is mentioned to the user before it runs.
    includes `outcome`, which may mean they want every turn. Firing on every turn, with the
    binding fact passed as data, would let a naive hook post `success` on `HEAD` whenever
    `outcome == converged` without checking `tree_clean`, which moves the safety rule into
-   every hook script. The plan keeps the rule in the server. Revisit only on a concrete need.
-2. **A no-model `attest` tool** that re-runs the binding check against the latest converged
-   turn and fires the hook. This covers "converged on uncommitted work, then committed exactly
-   that". It is the natural home for carry-forward later. Deferred: committing before the final
-   turn costs nothing today.
+   every hook script. The plan keeps the rule in the server, and the requester has agreed.
+2. **Carry-forward** (issue item 5) would naturally extend `cross_model_review_attest` with a
+   second binding (patch-id over `merge-base..HEAD`). It is still deferred; the requester
+   confirmed they do not need it.
