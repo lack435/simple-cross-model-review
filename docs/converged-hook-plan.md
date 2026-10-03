@@ -66,6 +66,48 @@ The fix reuses existing machinery and adds none. Attest takes the **same per-ses
 review takes, checks the **durable** `SessionRecord`'s `cli_session_id` and `turns` under it,
 and holds the lease through the hook.
 
+## Implementation status
+
+Implemented on `feat/converged-hook`: `src/hook.rs` (payload, binding check, contained runner,
+turn-end gating); `committed_change_digest` / `resolve_head` in `src/evidence/core.rs`, built on a
+`compose_diff` → `compose_resolved` split, so the served text and the committed text come from
+the same code; the flags and their resolution in `src/config.rs`; `turn_end_hook` /
+`attestable_for` and `App::attest` in `src/tools.rs`; the `hook` result field (envelope v4) in
+`src/findings.rs`; and the conditional tool in `src/mcp.rs`.
+
+**The byte-identity assumption is verified**, not just assumed. On a clean checkout, the worktree
+composition and the `base..H` composition produce equal digests for a modification, an
+addition, a deletion, a binary file and non-ASCII content
+(`a_clean_checkout_serves_exactly_the_committed_change`). They also agree on a CRLF checkout
+under its own `core.autocrlf` (`a_crlf_checkout_matches_only_under_its_own_autocrlf`).
+
+Where the implementation differs from the plan text, and why:
+
+- **A cancel that lands after the turn completed** reports `hook: skipped (cancelled)`. f6
+  removed `cancelled` only for reviews that end as a *failure*, which have no result to carry
+  the field. A completed turn whose cancel flag was set by then still has a result, and not
+  firing is the honest reading of a cancel.
+- **`core.autocrlf` has no observable effect on the committed side.** A commit-to-commit diff
+  never touches the working tree, so `autocrlf` cannot change it. The setting only shapes the
+  *served* worktree diff, and that effect is already captured in the served digest. The value is
+  still passed through, as f2 asked: it is harmless and keeps "same code, same options" literally
+  true. The planned test that attest "uses the retained value, not a fresh lookup" was not written
+  because nothing observable separates the two.
+- **Two more skip reasons**, both fail-closed: `session_not_recorded`, for a converged turn
+  whose durable record cannot be read back under the lease (which should not happen, since
+  `converged` implies durable), and `review_not_available` for attest, covering an evicted,
+  unknown or pre-restart review.
+- **Hook output**: the retained tail of each stream is logged to stderr, not the whole stream,
+  so the bounded-memory drain stays bounded.
+- **`chain_index`**: `turn_end_hook` is tested with a fallback entry (index 1), and the payload
+  says `1` / `claude`. The walk's `ran_index = Some(i)` assignment is one line and is not
+  exercised through a full walk, which would need a real reviewer. `smoke.ps1` covers the
+  primary path end to end.
+
+Found in passing, filed separately: git reviews always report `captured: null`, because the
+serve record is deleted before the `captured:` line is built from it (issue #143). This feature
+avoids that by reading its binding inputs inside `attempt`, while the record still exists.
+
 ## What the issue asks, and what this plan does instead
 
 Issue #142 asks the server to post a GitHub commit status (`cross-review: success`) on the

@@ -489,6 +489,9 @@ pub struct App {
     /// rather than the server exiting — see `docs/reviewer-fallback-chain.md`. Checked before
     /// the session lease and before any reviewer preflight, so an invalid chain touches nothing.
     chain_error: Option<Failure>,
+    /// The converged-review hook runner (issue #142), `None` unless `--on-converged` is configured.
+    /// Shared with each review job (the turn-end fire) and used by `cross_model_review_attest`.
+    hook_runner: Option<Arc<dyn crate::hook::HookRunner>>,
 }
 
 impl App {
@@ -503,6 +506,10 @@ impl App {
             .map(errors::invalid_reviewer_chain);
         // Read before `cfg` moves into the Arc below.
         let cfg_max_concurrent = cfg.max_concurrent_reviews;
+        let hook_runner = cfg.on_converged.clone().map(|hook| {
+            Arc::new(crate::hook::ProcessRunner::new(hook, cfg.cwd.clone()))
+                as Arc<dyn crate::hook::HookRunner>
+        });
         Self {
             cfg: Arc::new(cfg),
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
@@ -511,7 +518,15 @@ impl App {
             usage: Arc::new(usage),
             preflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
             chain_error,
+            hook_runner,
         }
+    }
+
+    /// Replace the hook runner with a test double (the issue's "fake status sink").
+    #[cfg(test)]
+    pub fn with_hook_runner(mut self, runner: Arc<dyn crate::hook::HookRunner>) -> Self {
+        self.hook_runner = Some(runner);
+        self
     }
 
     /// The recorded usage history, for the `--usage` report.
@@ -1301,6 +1316,7 @@ impl App {
             kind,
             cancel,
             _lease: Some(lease),
+            hook_runner: self.hook_runner.clone(),
         };
 
         let spawned = std::thread::Builder::new()
@@ -1741,6 +1757,13 @@ impl App {
         // for snapshots from older in-memory callers that never populated the count, and it must not
         // be capped at the example limit.
         let denial_count = snapshot.denial_count.max(snapshot.denials.len());
+        // The hook's reason and output tail are swept like every other string here: the output is
+        // the hook script's, and it reaches both channels.
+        let hook = snapshot.hook.clone().map(|mut h| {
+            h.reason = h.reason.map(|r| sweep(&r));
+            h.output = h.output.map(|o| sweep(&o));
+            h
+        });
         let ctx = crate::findings::ResultContext {
             reviewer: reviewer.as_deref(),
             resumed: snapshot.resumed,
@@ -1752,6 +1775,7 @@ impl App {
             denials: &denials,
             denial_count,
             denial_count_is_floor: snapshot.denial_count_is_floor,
+            hook: hook.as_ref(),
         };
 
         let mut out = String::new();
@@ -1797,6 +1821,12 @@ impl App {
         // below; a clean delta or a by-design full capture does not.
         if let Some(disposition) = ctx.disposition {
             out.push_str(&format!("disposition: {disposition}\n\n"));
+        }
+
+        // The converged-review hook (issue #142), whenever one is configured: the absence of this
+        // line means no hook is wired up, never that one silently did nothing.
+        if let Some(hook) = ctx.hook {
+            out.push_str(&format!("hook:      {}\n\n", hook.summary()));
         }
 
         // The union both channels report, in the order both render it: the envelope's own
@@ -2191,6 +2221,19 @@ impl App {
             "session state: {}\n",
             self.sessions.path().display()
         ));
+        // The converged-review hook (issue #142): visible before a review is spent on it.
+        match &self.cfg.on_converged {
+            Some(hook) => out.push_str(&format!(
+                "converged hook: {}{} (timeout {}s)\n",
+                hook.program.display(),
+                hook.args
+                    .iter()
+                    .map(|a| format!(" {a}"))
+                    .collect::<String>(),
+                hook.timeout.as_secs()
+            )),
+            None => out.push_str("converged hook: off (no --on-converged)\n"),
+        }
 
         if self.metrics.enabled() {
             let (summary, report) = self.metrics.summarise();
@@ -2243,6 +2286,96 @@ impl App {
     /// below and by the protocol layer when a client cancels the request that owns it.
     pub fn cancel_review(&self, id: &str) -> bool {
         self.registry.cancel(id)
+    }
+
+    /// Whether a converged-review hook is configured, so `cross_model_review_attest` is offered.
+    pub fn has_hook(&self) -> bool {
+        self.hook_runner.is_some()
+    }
+
+    /// `cross_model_review_attest` (issue #142; plan "Re-attesting without a model call"): re-run
+    /// the binding check for a session's latest converged review against the **current** `HEAD`,
+    /// and fire the hook, without a model call. For a review that converged before its change was
+    /// committed, or before it was pushed (a forge rejects a status on a commit it does not have).
+    ///
+    /// The review must still be its session's latest turn, established against **durable** state
+    /// under the **session lease** (plan f7): the process-local registry cannot see a later turn run
+    /// by another server process, so the check reads the `SessionRecord` and requires the
+    /// `cli_session_id` and `turns` this turn left behind. The lease is held through the hook, so no
+    /// turn can start or finish on the session while an attest decides and fires. A precondition
+    /// that does not hold is reported as a `skipped` hook report, not an error; a missing hook, a
+    /// missing argument and a busy session are errors.
+    pub fn attest(&self, args: &Value) -> Result<String, Failure> {
+        use crate::hook::{reason, HookReport};
+        let runner = self.hook_runner.as_deref().ok_or_else(|| {
+            errors::bad_request(
+                "cross_model_review_attest needs a converged hook; this server was started \
+                 without --on-converged.",
+            )
+        })?;
+        let id = match (string_arg(args, "review_id"), string_arg(args, "session")) {
+            (Some(id), _) => Some(id),
+            (None, Some(session)) => self
+                .registry
+                .latest_for_session(&session, crate::registry::JobKind::Review),
+            (None, None) => {
+                return Err(errors::bad_request("'review_id' or 'session' is required."))
+            }
+        };
+        let render = |report: HookReport| {
+            let sweep = |s: &str| crate::findings::strip_marker_lines(s);
+            let report = HookReport {
+                reason: report.reason.map(|r| sweep(&r)),
+                output: report.output.map(|o| sweep(&o)),
+                ..report
+            };
+            format!(
+                "hook:      {}\n\n{}\n",
+                report.summary(),
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            )
+        };
+        let Some(snapshot) = id.as_deref().and_then(|id| self.registry.snapshot(id)) else {
+            // Evicted, never issued, or from before a restart: the binding inputs live only in
+            // memory, so the recovery is a re-review on the same session.
+            return Ok(render(HookReport::skipped("review_not_available")));
+        };
+        if snapshot.kind != crate::registry::JobKind::Review
+            || snapshot.status != crate::registry::Status::Completed
+        {
+            return Ok(render(HookReport::skipped(reason::NOT_CONVERGED)));
+        }
+        if self.cfg.vcs != crate::config::Vcs::Git {
+            return Ok(render(HookReport::skipped(reason::NOT_GIT)));
+        }
+        if snapshot.envelope.as_ref().map(|e| e.outcome)
+            != Some(crate::findings::Outcome::Converged)
+        {
+            return Ok(render(HookReport::skipped(reason::NOT_CONVERGED)));
+        }
+        let Some(att) = snapshot.attestable else {
+            return Ok(render(HookReport::skipped(reason::NO_CANONICAL_DIFF)));
+        };
+
+        let _lease = ExclusiveLock::acquire(
+            &session::session_lock_path(&self.cfg.state_dir, &att.session),
+            SESSION_LEASE_WAIT,
+        )
+        .map_err(|e| errors::session_leased(&att.session, e.to_string()))?;
+        let record = self.sessions.get_checked(&att.session).map_err(|_| {
+            errors::store_corrupt(&att.session, &self.sessions.path().display().to_string())
+        })?;
+        let still_latest =
+            record.is_some_and(|r| r.cli_session_id == att.cli_session_id && r.turns == att.turns);
+        if !still_latest {
+            return Ok(render(HookReport::skipped(reason::NOT_LATEST_TURN)));
+        }
+        Ok(render(crate::hook::fire(
+            runner,
+            &self.cfg.cwd,
+            &att,
+            crate::hook::Trigger::Attest,
+        )))
     }
 
     pub fn cancel(&self, args: &Value) -> Result<String, Failure> {
@@ -2368,6 +2501,9 @@ struct Job {
     /// Cross-process claim on the named session. Never read: it exists so that dropping
     /// the job releases the session for other server processes.
     _lease: Option<ExclusiveLock>,
+    /// See [`App::hook_runner`]. Fired at the end of a converged git review turn, while this job
+    /// still holds the session lease.
+    hook_runner: Option<Arc<dyn crate::hook::HookRunner>>,
 }
 
 /// The capture's outputs that `attempt` threads onward: the rendered change goes into the
@@ -2854,6 +2990,10 @@ impl Job {
         // the record must not attribute the previous entry's binary to it.
         let mut active_bin_resolved = true;
         let mut outcome: Option<Outcome> = None;
+        // The configured chain index of the entry whose attempt produced the outcome — the hook
+        // payload's `chain_index` (0 = primary). The configured index, not the walk position, so a
+        // pre-start usage-gate skip or a resume bound to a fallback entry still reads as non-primary.
+        let mut ran_index: Option<usize> = None;
 
         for (pos, &i) in walk.iter().enumerate() {
             // `effective_entry` applies the start entry's level override (a no-op for a mid-run
@@ -2966,6 +3106,7 @@ impl Job {
                 active_usage_key.as_deref(),
             ) {
                 Ok(mut o) => {
+                    ran_index = Some(i);
                     // The disposition and capture summary ride on the successful outcome so the
                     // response can render them. A failed turn keeps `None` (`Outcome::failed`): it
                     // sent no reviewable change.
@@ -3069,6 +3210,10 @@ impl Job {
         // which must not be attributed to it.
         let resolved_bin = active_bin_resolved.then(|| self.bin.to_string_lossy().into_owned());
 
+        // The converged-review hook (issue #142): after the turn is durably recorded, before the
+        // result is published, and still under this job's session lease.
+        self.turn_end_hook(&mut outcome, ran_index);
+
         self.finish_run(
             &mut guard,
             outcome,
@@ -3080,6 +3225,83 @@ impl Job {
             facts,
             metrics_attempts,
         );
+    }
+
+    /// Decide and, when the binding holds, fire the converged-review hook for this turn (issue #142;
+    /// `docs/converged-hook-plan.md`). Leaves `outcome.hook` `None` when no hook is configured, on a
+    /// consult, and on a failed turn (which has no completed result to carry it); otherwise records
+    /// the report. A hook failure adds one run warning and **never** changes the review: outcome,
+    /// ledger and resumability are already settled. On a converged git turn the binding inputs are
+    /// kept on the outcome so `cross_model_review_attest` can re-fire without a model call.
+    fn turn_end_hook(&self, outcome: &mut Outcome, ran_index: Option<usize>) {
+        let Some(runner) = self.hook_runner.as_deref() else {
+            return;
+        };
+        if self.is_consult() || outcome.failure.is_some() {
+            return;
+        }
+        let verdict = outcome.envelope.as_ref().map(|e| e.outcome);
+        let is_git = self.cfg.vcs == crate::config::Vcs::Git;
+        let converged = is_git && verdict == Some(crate::findings::Outcome::Converged);
+        let attestable = if converged {
+            self.attestable_for(outcome, ran_index)
+        } else {
+            Err(crate::hook::reason::NOT_CONVERGED)
+        };
+        let report = crate::hook::on_turn_end(
+            Some(runner),
+            is_git,
+            verdict,
+            self.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            attestable.as_ref().map_err(|r| *r),
+            &self.cfg.cwd,
+        );
+        if let Some(report) = report {
+            if report.is_failure() {
+                outcome.warnings.push(format!(
+                    "the converged hook did not succeed: {}. The review itself is unaffected; once \
+                     the cause is fixed, re-fire it without a model call through \
+                     cross_model_review_attest.",
+                    report.summary()
+                ));
+            }
+            outcome.hook = Some(report);
+        }
+        outcome.attestable = attestable.ok();
+    }
+
+    /// The binding inputs for a converged git turn: the served change from `attempt`, and the
+    /// durable session identity this turn left behind — read now, under this job's own lease, right
+    /// after `record_turn`, so an attest can later require the record has not moved on (plan f7).
+    fn attestable_for(
+        &self,
+        outcome: &Outcome,
+        ran_index: Option<usize>,
+    ) -> Result<crate::hook::Attestable, &'static str> {
+        use crate::hook::reason;
+        let served = outcome.served.clone().ok_or(reason::NO_CANONICAL_DIFF)?;
+        let record = self
+            .sessions
+            .get_checked(&self.session)
+            .ok()
+            .flatten()
+            .ok_or(reason::SESSION_NOT_RECORDED)?;
+        Ok(crate::hook::Attestable {
+            served,
+            review_id: self.id.clone(),
+            session: self.session.clone(),
+            turn: self.turn,
+            cli_session_id: record.cli_session_id,
+            turns: record.turns,
+            reviewer: outcome
+                .active
+                .clone()
+                .unwrap_or_else(|| self.spec.describe()),
+            reviewer_kind: self.spec.reviewer.as_str().to_string(),
+            model: self.spec.model.clone(),
+            effort: self.spec.effort.clone(),
+            chain_index: ran_index.unwrap_or(self.start_index),
+        })
     }
 
     /// Deliver an outcome, disarm the panic guard, and record the turn — the single exit both the
@@ -3674,6 +3896,9 @@ impl Job {
             && summary
                 .as_ref()
                 .map_or(true, |s| s.is_empty() || !s.is_complete());
+        // The `core.autocrlf` this turn's evidence bundle fixes, kept for the converged-hook binding
+        // check so it composes with exactly the setting the served diff was composed with (plan f2).
+        let mut turn_autocrlf: Option<crate::evidence::AutoCrlf> = None;
         let evidence_setup =
             if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
                 let executable = std::env::current_exe().map_err(|e| {
@@ -3711,6 +3936,7 @@ impl Job {
                     claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
                 )
                 .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                turn_autocrlf = bundle.worktree_autocrlf;
                 let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
                     .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
                 crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
@@ -4666,6 +4892,19 @@ impl Job {
             findings_marker_cleared,
         );
 
+        // The converged-hook binding inputs (issue #142), read *here* because the serve record is
+        // removed when `evidence_setup` drops at the end of this function. Only a git review with
+        // the evidence path has a canonical diff to bind; `run` decides whether the hook fires.
+        let served =
+            (!is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_some())
+                .then(|| {
+                    served_change(
+                        &read_serve_record_aggregate(&self.cfg, &self.id),
+                        turn_autocrlf,
+                    )
+                })
+                .flatten();
+
         Ok(Outcome {
             review: Some(parsed.text),
             failure: None,
@@ -4685,6 +4924,10 @@ impl Job {
             active: None,
             // `None` for a consult (no findings envelope); `Some` for a review.
             envelope,
+            served,
+            // Both decided by `run`, which knows the chain entry and holds the session lease.
+            hook: None,
+            attestable: None,
         })
     }
 }
@@ -5108,6 +5351,12 @@ struct DiffServeAggregate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonicalServe {
     base: String,
+    /// The resolved base commit (`base` token) and the operation's content digest, kept for the
+    /// converged-hook binding check (issue #142). All canonical operations that clear the floor share
+    /// one digest, so these are the agreed values. `None` when the record did not carry them, which
+    /// the binding check treats as unbindable (fail closed).
+    base_token: Option<String>,
+    digest: Option<String>,
     files: usize,
     insertions: usize,
     deletions: usize,
@@ -5180,6 +5429,14 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("branch-base")
                         .to_string(),
+                    base_token: value
+                        .get("base")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    digest: value
+                        .get("digest")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     files: files as usize,
                     insertions: u64_field("insertions"),
                     deletions: u64_field("deletions"),
@@ -5228,6 +5485,32 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         complete_canonical_terminal,
         canonical,
     }
+}
+
+/// The served canonical change a git turn's approval rested on, for the converged-hook binding
+/// check (issue #142): the agreed content digest, the resolved base commit and its source label from
+/// the complete+terminal canonical operation, plus the turn's `core.autocrlf`. `None` — unbindable,
+/// so the hook is skipped — when the floor was not cleared or the record lacks a digest or a full
+/// base object id.
+fn served_change(
+    agg: &DiffServeAggregate,
+    autocrlf: Option<crate::evidence::AutoCrlf>,
+) -> Option<crate::hook::ServedChange> {
+    if !agg.complete_canonical_terminal {
+        return None;
+    }
+    let c = agg.canonical.as_ref()?;
+    let base = c.base_token.clone()?;
+    let full_id = matches!(base.len(), 40 | 64) && base.bytes().all(|b| b.is_ascii_hexdigit());
+    if !full_id {
+        return None;
+    }
+    Some(crate::hook::ServedChange {
+        digest: c.digest.clone()?,
+        base,
+        base_source: c.base.clone(),
+        autocrlf,
+    })
 }
 
 /// Read and aggregate the serve-record file for a review, best-effort. An unreadable or absent file
@@ -7686,6 +7969,9 @@ mod tests {
             usage: crate::metrics::Usage::default(),
             active: None,
             envelope: None,
+            served: None,
+            hook: None,
+            attestable: None,
         }
     }
 
@@ -8003,6 +8289,7 @@ mod tests {
             kind: crate::registry::JobKind::Review,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
+            hook_runner: None,
         }
     }
 
@@ -8740,5 +9027,684 @@ mod tests {
         assert_eq!(fmt_bytes(1023), "1023 B");
         assert_eq!(fmt_bytes(1024), "1 KiB");
         assert_eq!(fmt_bytes(1024 * 1024), "1.0 MiB");
+    }
+}
+
+/// The converged-review hook's integration with the job, the result and the attest tool (issue
+/// #142). Real git, real session store, a recording hook runner — no model, no network.
+#[cfg(test)]
+mod converged_hook_tests {
+    use super::*;
+    use crate::hook::{reason, Attestable, HookReport, HookRunner, HookStatus, ServedChange};
+    use serde_json::json;
+    use std::path::Path;
+
+    const SOURCE: &str = "merge-base(HEAD, refs/remotes/origin/HEAD)";
+    const SESSION: &str = "feat/hook";
+
+    /// Records every payload; while running it also probes the session lease, so a test can prove
+    /// the attest holds it through the hook.
+    struct Recording {
+        calls: Mutex<Vec<String>>,
+        lease_probe: Option<(PathBuf, Mutex<Option<bool>>)>,
+    }
+
+    impl Recording {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                lease_probe: None,
+            })
+        }
+        fn probing(lock: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                lease_probe: Some((lock, Mutex::new(None))),
+            })
+        }
+        fn calls(&self) -> Vec<serde_json::Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| serde_json::from_str(p).unwrap())
+                .collect()
+        }
+    }
+
+    impl HookRunner for Recording {
+        fn run(&self, payload: &str) -> HookReport {
+            self.calls.lock().unwrap().push(payload.to_string());
+            if let Some((lock, got)) = &self.lease_probe {
+                let acquired = ExclusiveLock::acquire(lock, Duration::from_millis(50)).is_ok();
+                *got.lock().unwrap() = Some(acquired);
+            }
+            HookReport {
+                status: HookStatus::Succeeded,
+                reason: None,
+                captured_head: None,
+                exit_code: Some(0),
+                output: Some("posted".into()),
+            }
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let bin = crate::reviewer::on_path("git").expect("git on PATH");
+        let out = std::process::Command::new(bin)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit(root: &Path, file: &str, body: &str, msg: &str) -> String {
+        std::fs::write(root.join(file), body).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", msg]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    /// A repository with a base and a head commit, the served change for `base..head`, an app over
+    /// it with `runner`, and the state directory. `None` (test skipped) without git.
+    struct Fixture {
+        repo: crate::testutil::TempDir,
+        _state: crate::testutil::TempDir,
+        app: App,
+        served: ServedChange,
+        head: String,
+    }
+
+    fn fixture(name: &str, runner: Option<Arc<dyn HookRunner>>, extra: &[&str]) -> Option<Fixture> {
+        crate::reviewer::on_path("git")?;
+        let repo = crate::testutil::temp_dir(&format!("{name}-repo"));
+        let state = crate::testutil::temp_dir(&format!("{name}-state"));
+        let root = repo.as_path();
+        git(root, &["init", "-q"]);
+        let base = commit(root, "a.txt", "one\n", "base");
+        let head = commit(root, "a.txt", "one\ntwo\n", "head");
+        let digest = crate::evidence::committed_change_digest(
+            root,
+            &base,
+            SOURCE,
+            &head,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let mut args: Vec<String> = [
+            "--reviewer",
+            "codex",
+            "--level",
+            "standard:gpt-5.6-luna:max",
+            "--cwd",
+            &root.to_string_lossy(),
+            "--state-dir",
+            &state.as_path().to_string_lossy(),
+            "--vcs",
+            "git",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let mut app = App::new(Config::from_args(&args).expect("config"));
+        if let Some(runner) = runner {
+            app = app.with_hook_runner(runner);
+        }
+        Some(Fixture {
+            repo,
+            _state: state,
+            app,
+            served: ServedChange {
+                digest,
+                base,
+                base_source: SOURCE.into(),
+                autocrlf: None,
+            },
+            head,
+        })
+    }
+
+    fn envelope(nonce: &str, body: &str) -> crate::findings::Envelope {
+        crate::findings::evaluate_turn_for_test(
+            SESSION,
+            1,
+            nonce,
+            &crate::findings::block_text_for_test(nonce, body),
+        )
+        .envelope
+    }
+
+    const APPROVE: &str = r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#;
+    const CHANGES: &str = r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#;
+
+    /// Finish a review on the registry as a converged (or not) turn, with a durable session record,
+    /// and the binding inputs `run` would have kept. Returns the review id.
+    fn finish_review(f: &Fixture, body: &str, hook: Option<HookReport>) -> String {
+        let record = crate::session::record_test_turn(&f.app.sessions, SESSION, "thread-1");
+        let (id, _cancel) = f
+            .app
+            .registry()
+            .try_start(SESSION, crate::registry::JobKind::Review, 1, false)
+            .expect("start");
+        let env = envelope(&id, body);
+        let converged = env.outcome == crate::findings::Outcome::Converged;
+        let attestable = converged.then(|| Attestable {
+            served: f.served.clone(),
+            review_id: id.clone(),
+            session: SESSION.into(),
+            turn: 1,
+            cli_session_id: record.cli_session_id.clone(),
+            turns: record.turns,
+            reviewer: "OpenAI Codex (codex, model=gpt-5.6-luna, effort=max)".into(),
+            reviewer_kind: "codex".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "max".into(),
+            chain_index: 0,
+        });
+        f.app.registry().finish(
+            &id,
+            Outcome {
+                review: Some("prose".into()),
+                envelope: Some(env),
+                hook,
+                attestable,
+                resumable: true,
+                ..Outcome::no_turn()
+            },
+        );
+        id
+    }
+
+    fn attest(f: &Fixture, id: &str) -> Result<String, Failure> {
+        f.app.attest(&json!({ "review_id": id }))
+    }
+
+    #[test]
+    fn attest_fires_for_the_latest_converged_turn_with_the_attest_trigger() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-fires", Some(rec.clone()), &[]) else {
+            return;
+        };
+        let id = finish_review(&f, APPROVE, None);
+        let out = attest(&f, &id).expect("attest");
+        assert!(out.starts_with("hook:      succeeded"), "{out}");
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["trigger"], "attest");
+        assert_eq!(calls[0]["captured_head"], f.head);
+        assert_eq!(calls[0]["review_id"], id);
+        assert_eq!(calls[0]["chain_index"], 0);
+        // Collecting the review again still shows the turn-end report (here: none), not the attest.
+        assert!(f.app.registry().snapshot(&id).unwrap().hook.is_none());
+    }
+
+    #[test]
+    fn attest_by_session_name_resolves_the_latest_review() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-session", Some(rec.clone()), &[]) else {
+            return;
+        };
+        finish_review(&f, APPROVE, None);
+        let out = f
+            .app
+            .attest(&json!({ "session": SESSION }))
+            .expect("attest");
+        assert!(out.starts_with("hook:      succeeded"), "{out}");
+        assert_eq!(rec.calls().len(), 1);
+    }
+
+    #[test]
+    fn attest_after_committing_something_else_is_skipped() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-moved", Some(rec.clone()), &[]) else {
+            return;
+        };
+        let id = finish_review(&f, APPROVE, None);
+        commit(f.repo.as_path(), "a.txt", "one\ntwo\nthree\n", "more");
+        let out = attest(&f, &id).expect("attest");
+        assert!(out.contains(reason::HEAD_MISMATCH), "{out}");
+        assert!(rec.calls().is_empty());
+    }
+
+    /// The same content under a new commit (an amended message) is still exactly the reviewed
+    /// change, so it attests the *new* head.
+    #[test]
+    fn attest_follows_an_amend_that_keeps_the_reviewed_content() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-amend", Some(rec.clone()), &[]) else {
+            return;
+        };
+        let id = finish_review(&f, APPROVE, None);
+        git(
+            f.repo.as_path(),
+            &["commit", "-q", "--amend", "-m", "reworded"],
+        );
+        let amended = git(f.repo.as_path(), &["rev-parse", "HEAD"]);
+        assert_ne!(amended, f.head);
+        attest(&f, &id).expect("attest");
+        assert_eq!(rec.calls()[0]["captured_head"], amended);
+    }
+
+    /// f7: the durable record decides, not the registry. A later turn and a `fresh` rebind are each
+    /// written by a *separate* store instance, standing in for another server process.
+    #[test]
+    fn attest_refuses_once_the_durable_session_has_moved_on() {
+        for (case, cli) in [("later-turn", "thread-1"), ("fresh-rebind", "thread-2")] {
+            let rec = Recording::new();
+            let Some(f) = fixture(&format!("attest-moved-on-{case}"), Some(rec.clone()), &[])
+            else {
+                return;
+            };
+            let id = finish_review(&f, APPROVE, None);
+            let other_process = SessionStore::new(&f.app.cfg.state_dir);
+            crate::session::record_test_turn(&other_process, SESSION, cli);
+            let out = attest(&f, &id).expect("attest");
+            assert!(out.contains(reason::NOT_LATEST_TURN), "{case}: {out}");
+            assert!(rec.calls().is_empty(), "{case}");
+        }
+    }
+
+    /// f7: the lease is held from validation through the hook — a review arriving meanwhile
+    /// cannot take the session — and a session already held is refused as busy.
+    #[test]
+    fn attest_holds_the_session_lease_through_the_hook() {
+        let Some(probe_fixture) = fixture("attest-lease", None, &[]) else {
+            return;
+        };
+        let lock = session::session_lock_path(&probe_fixture.app.cfg.state_dir, SESSION);
+        let rec = Recording::probing(lock.clone());
+        let f = Fixture {
+            app: probe_fixture.app.with_hook_runner(rec.clone()),
+            ..probe_fixture
+        };
+        let id = finish_review(&f, APPROVE, None);
+        attest(&f, &id).expect("attest");
+        let got = *rec.lease_probe.as_ref().unwrap().1.lock().unwrap();
+        assert_eq!(
+            got,
+            Some(false),
+            "a competing lease was granted while the hook ran"
+        );
+
+        let held = ExclusiveLock::acquire(&lock, Duration::from_secs(1)).expect("lease");
+        let err = attest(&f, &id).unwrap_err();
+        assert_eq!(err.code, "SESSION_BUSY");
+        drop(held);
+    }
+
+    #[test]
+    fn attest_skips_what_it_cannot_bind() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-skips", Some(rec.clone()), &[]) else {
+            return;
+        };
+        let not_converged = finish_review(&f, CHANGES, None);
+        assert!(attest(&f, &not_converged)
+            .unwrap()
+            .contains(reason::NOT_CONVERGED));
+        assert!(attest(&f, "rv-0-999")
+            .unwrap()
+            .contains("review_not_available"));
+        assert!(rec.calls().is_empty());
+    }
+
+    #[test]
+    fn attest_without_a_hook_is_a_bad_request() {
+        let Some(f) = fixture("attest-nohook", None, &[]) else {
+            return;
+        };
+        assert!(!f.app.has_hook());
+        assert_eq!(
+            f.app.attest(&json!({"session": SESSION})).unwrap_err().code,
+            "BAD_REQUEST"
+        );
+    }
+
+    #[test]
+    fn the_hook_report_reaches_both_channels_and_null_means_unconfigured() {
+        let Some(f) = fixture("hook-render", None, &[]) else {
+            return;
+        };
+        let report = HookReport {
+            status: HookStatus::Succeeded,
+            reason: None,
+            captured_head: Some(f.head.clone()),
+            exit_code: Some(0),
+            output: Some("posted".into()),
+        };
+        let with = finish_review(&f, APPROVE, Some(report));
+        let (text, structured) = f
+            .app
+            .review_result_both(&json!({"review_id": with}), &RequestCancel::new())
+            .unwrap();
+        let structured = structured.unwrap();
+        assert_eq!(structured["hook"]["status"], "succeeded");
+        assert_eq!(structured["hook"]["captured_head"], f.head);
+        assert_eq!(structured["schema_version"], 4);
+        assert!(
+            text.contains("hook:      succeeded (exit 0, head "),
+            "{text}"
+        );
+
+        let Some(g) = fixture("hook-render-none", None, &[]) else {
+            return;
+        };
+        let without = finish_review(&g, APPROVE, None);
+        let (text, structured) = g
+            .app
+            .review_result_both(&json!({"review_id": without}), &RequestCancel::new())
+            .unwrap();
+        assert!(structured.unwrap()["hook"].is_null());
+        assert!(!text.contains("hook:"), "{text}");
+    }
+
+    #[test]
+    fn the_served_change_needs_a_cleared_floor_a_digest_and_a_full_base() {
+        let digest = "d".repeat(64);
+        let base = "a".repeat(40);
+        let op = |complete: bool, digest: &str, base: &str| {
+            format!(
+                r#"{{"op":"x","canonical":true,"complete":{complete},"terminal":true,"digest":"{digest}","base":"{base}","base_source":"{SOURCE}","files":1,"insertions":1,"deletions":0,"untracked":0}}"#
+            )
+        };
+        let served = served_change(&aggregate_serve_records(&op(true, &digest, &base)), None)
+            .expect("bindable");
+        assert_eq!(served.digest, digest);
+        assert_eq!(served.base, base);
+        assert_eq!(served.base_source, SOURCE);
+
+        assert!(
+            served_change(&aggregate_serve_records(&op(false, &digest, &base)), None).is_none()
+        );
+        assert!(
+            served_change(&aggregate_serve_records(&op(true, &digest, "abc123")), None).is_none()
+        );
+        let no_digest = format!(
+            r#"{{"op":"x","canonical":true,"complete":true,"terminal":true,"base":"{base}","base_source":"{SOURCE}","files":1}}"#
+        );
+        assert!(served_change(&aggregate_serve_records(&no_digest), None).is_none());
+    }
+}
+
+/// The turn-end decision inside `Job::run` (issue #142): what `turn_end_hook` does with a finished
+/// outcome. A real job and session store; a recording runner; no reviewer runs.
+#[cfg(test)]
+mod turn_end_hook_tests {
+    use super::*;
+    use crate::hook::{reason, HookReport, HookRunner, HookStatus, ServedChange};
+
+    struct Fixed {
+        status: HookStatus,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl HookRunner for Fixed {
+        fn run(&self, payload: &str) -> HookReport {
+            self.calls.lock().unwrap().push(payload.to_string());
+            HookReport {
+                status: self.status,
+                reason: None,
+                captured_head: None,
+                exit_code: Some(if self.status == HookStatus::Succeeded {
+                    0
+                } else {
+                    1
+                }),
+                output: None,
+            }
+        }
+    }
+
+    fn runner(status: HookStatus) -> Arc<Fixed> {
+        Arc::new(Fixed {
+            status,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    struct Setup {
+        _repo: crate::testutil::TempDir,
+        _state: crate::testutil::TempDir,
+        app: App,
+        served: ServedChange,
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let bin = crate::reviewer::on_path("git").expect("git");
+        let out = std::process::Command::new(bin)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn setup(name: &str) -> Option<Setup> {
+        crate::reviewer::on_path("git")?;
+        let repo = crate::testutil::temp_dir(&format!("{name}-repo"));
+        let state = crate::testutil::temp_dir(&format!("{name}-state"));
+        let root = repo.as_path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        git(root, &["commit", "-qam", "head"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let source = "merge-base(HEAD, refs/remotes/origin/HEAD)";
+        let digest = crate::evidence::committed_change_digest(
+            root,
+            &base,
+            source,
+            &head,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let args: Vec<String> = [
+            "--reviewer",
+            "codex",
+            "--level",
+            "standard:gpt-5.6-luna:max",
+            "--reviewer",
+            "claude",
+            "--level",
+            "standard:claude-opus-4-8:high",
+            "--cwd",
+            &root.to_string_lossy(),
+            "--state-dir",
+            &state.as_path().to_string_lossy(),
+            "--vcs",
+            "git",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        Some(Setup {
+            app: App::new(Config::from_args(&args).expect("config")),
+            _repo: repo,
+            _state: state,
+            served: ServedChange {
+                digest,
+                base,
+                base_source: source.into(),
+                autocrlf: None,
+            },
+        })
+    }
+
+    /// A job on `entry` of the chain, as the walk leaves it after that entry's attempt.
+    fn job(s: &Setup, entry: usize, kind: crate::registry::JobKind, hook: Arc<Fixed>) -> Job {
+        let app = &s.app;
+        Job {
+            cfg: Arc::clone(&app.cfg),
+            reviewer: Arc::from(reviewer::for_kind(app.cfg.reviewers[entry].reviewer)),
+            spec: app.cfg.reviewers[entry].clone(),
+            start_index: 0,
+            start_spec_override: None,
+            preflight: app.preflight.clone(),
+            registry: Arc::clone(&app.registry),
+            sessions: Arc::clone(&app.sessions),
+            metrics: Arc::clone(&app.metrics),
+            usage: Arc::clone(&app.usage),
+            pre_start_skips: Vec::new(),
+            pre_start_gated: Vec::new(),
+            start_usage_key: None,
+            bin: PathBuf::from("never-spawned.exe"),
+            id: "rv-9-1".into(),
+            session: "s".into(),
+            instructions: String::new(),
+            context_paths: Vec::new(),
+            changes: Vec::new(),
+            include_shelved: false,
+            include_change: false,
+            turn: 1,
+            gap_secs: None,
+            prior_cumulative: None,
+            prior_perforce_baseline: None,
+            prior_capture_identity: None,
+            prior_include_shelved: None,
+            prior_findings: None,
+            findings_marker_absent_on_entry: true,
+            kind,
+            cancel: Arc::new(AtomicBool::new(false)),
+            _lease: None,
+            hook_runner: Some(hook),
+        }
+    }
+
+    fn outcome(body: &str, served: Option<ServedChange>) -> Outcome {
+        let text = crate::findings::block_text_for_test("rv-9-1", body);
+        Outcome {
+            review: Some("prose".into()),
+            envelope: Some(
+                crate::findings::evaluate_turn_for_test("s", 1, "rv-9-1", &text).envelope,
+            ),
+            served,
+            active: Some("Anthropic Claude (claude, model=claude-opus-4-8)".into()),
+            resumable: true,
+            ..Outcome::no_turn()
+        }
+    }
+
+    const APPROVE: &str = r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#;
+    const CHANGES: &str = r#"{"verdict":"request_changes","prior_findings":[],"new_findings":[{"severity":"major","title":"t","detail":"d"}]}"#;
+
+    #[test]
+    fn a_converged_bound_turn_fires_with_the_configured_chain_index() {
+        let Some(s) = setup("turn-end-fires") else {
+            return;
+        };
+        crate::session::record_test_turn(&s.app.sessions, "s", "thread-9");
+        let hook = runner(HookStatus::Succeeded);
+        // The fallback entry (index 1) ran: the payload must say so, for a same-family refusal.
+        let j = job(&s, 1, crate::registry::JobKind::Review, hook.clone());
+        let mut o = outcome(APPROVE, Some(s.served.clone()));
+        j.turn_end_hook(&mut o, Some(1));
+        let report = o.hook.expect("hook report");
+        assert_eq!(report.status, HookStatus::Succeeded);
+        let calls = hook.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&calls[0]).unwrap();
+        assert_eq!(payload["trigger"], "review");
+        assert_eq!(payload["chain_index"], 1);
+        assert_eq!(payload["reviewer_kind"], "claude");
+        assert_eq!(payload["model"], "claude-opus-4-8");
+        let att = o.attestable.expect("kept for attest");
+        assert_eq!(att.cli_session_id, "thread-9");
+        assert_eq!(att.turns, 1);
+        assert!(o.warnings.is_empty());
+    }
+
+    #[test]
+    fn no_hook_field_on_a_failed_turn_or_a_consult() {
+        let Some(s) = setup("turn-end-none") else {
+            return;
+        };
+        let hook = runner(HookStatus::Succeeded);
+        let mut failed = Outcome::failed(errors::cancelled());
+        job(&s, 0, crate::registry::JobKind::Review, hook.clone())
+            .turn_end_hook(&mut failed, Some(0));
+        assert!(failed.hook.is_none() && failed.attestable.is_none());
+
+        let mut consult = outcome(APPROVE, Some(s.served.clone()));
+        job(&s, 0, crate::registry::JobKind::Consult, hook.clone())
+            .turn_end_hook(&mut consult, Some(0));
+        assert!(consult.hook.is_none());
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unbindable_or_unconverged_turns_skip_with_their_reason() {
+        let Some(s) = setup("turn-end-skips") else {
+            return;
+        };
+        let hook = runner(HookStatus::Succeeded);
+        let j = job(&s, 0, crate::registry::JobKind::Review, hook.clone());
+
+        let mut changes = outcome(CHANGES, Some(s.served.clone()));
+        j.turn_end_hook(&mut changes, Some(0));
+        assert_eq!(
+            changes.hook.unwrap().reason.as_deref(),
+            Some(reason::NOT_CONVERGED)
+        );
+        assert!(changes.attestable.is_none());
+
+        // Converged, but no durable record for the session yet.
+        let mut unrecorded = outcome(APPROVE, Some(s.served.clone()));
+        j.turn_end_hook(&mut unrecorded, Some(0));
+        assert_eq!(
+            unrecorded.hook.unwrap().reason.as_deref(),
+            Some(reason::SESSION_NOT_RECORDED)
+        );
+
+        crate::session::record_test_turn(&s.app.sessions, "s", "thread-9");
+        let mut unserved = outcome(APPROVE, None);
+        j.turn_end_hook(&mut unserved, Some(0));
+        assert_eq!(
+            unserved.hook.unwrap().reason.as_deref(),
+            Some(reason::NO_CANONICAL_DIFF)
+        );
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failing_hook_warns_and_never_changes_the_review() {
+        let Some(s) = setup("turn-end-fails") else {
+            return;
+        };
+        crate::session::record_test_turn(&s.app.sessions, "s", "thread-9");
+        let j = job(
+            &s,
+            0,
+            crate::registry::JobKind::Review,
+            runner(HookStatus::Failed),
+        );
+        let mut o = outcome(APPROVE, Some(s.served.clone()));
+        j.turn_end_hook(&mut o, Some(0));
+        assert_eq!(o.hook.as_ref().unwrap().status, HookStatus::Failed);
+        assert_eq!(o.warnings.len(), 1);
+        assert!(o.warnings[0].contains("cross_model_review_attest"));
+        assert_eq!(
+            o.envelope.as_ref().unwrap().outcome,
+            crate::findings::Outcome::Converged
+        );
+        assert!(o.resumable);
+        // Still attestable: the review converged; only the hook failed.
+        assert!(o.attestable.is_some());
     }
 }

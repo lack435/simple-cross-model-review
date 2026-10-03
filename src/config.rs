@@ -978,6 +978,11 @@ pub struct Config {
     /// A turn that keeps producing stdout is making progress and is never killed on this path. See
     /// `DEFAULT_MAX_POLICY_IDLE_SECS`.
     pub max_policy_idle: Duration,
+    /// The converged-review hook (`--on-converged`, issue #142): a program run with a JSON payload on
+    /// stdin when a git review converges on exactly a committed change. `None` (the default) turns
+    /// the feature off entirely. The program is resolved at startup (see `resolve_hook_program`);
+    /// see `src/hook.rs` and `docs/converged-hook-plan.md`.
+    pub on_converged: Option<crate::hook::HookConfig>,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -1033,6 +1038,9 @@ impl Config {
         // `--diff` (capture modes) was retired by #110: git reviews derive the change live through
         // repository_diff, so the flag is now rejected in the loop below rather than parsed here.
         let mut vcs_arg: Option<Vcs> = None;
+        let mut hook_program: Option<String> = None;
+        let mut hook_args: Vec<String> = Vec::new();
+        let mut hook_timeout_secs: Option<u64> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -1269,6 +1277,21 @@ impl Config {
                 "--allow-reviewer-config" | "--allow-reviewer-mcp" => isolate_reviewer = false,
                 "--no-metrics" => metrics = false,
                 "--no-incremental-resume" => resume_incremental_diff = false,
+                "--on-converged" => hook_program = Some(take("--on-converged")?),
+                "--on-converged-arg" => hook_args.push(take("--on-converged-arg")?),
+                "--on-converged-timeout-seconds" => {
+                    let v = take("--on-converged-timeout-seconds")?;
+                    let secs: u64 = v.parse().map_err(|_| {
+                        format!("--on-converged-timeout-seconds must be an integer, got '{v}'")
+                    })?;
+                    if secs == 0 || secs > crate::hook::MAX_TIMEOUT_SECS {
+                        return Err(format!(
+                            "--on-converged-timeout-seconds must be between 1 and {}, got {secs}",
+                            crate::hook::MAX_TIMEOUT_SECS
+                        ));
+                    }
+                    hook_timeout_secs = Some(secs);
+                }
                 other => return Err(format!("unknown argument '{other}' (try --help)")),
             }
             i += 1;
@@ -1292,6 +1315,26 @@ impl Config {
         // `--vcs auto` (or unset) resolves from the filesystem now that `cwd` is known. This
         // is the only place a backend is chosen, and it spawns nothing.
         let vcs = vcs_arg.unwrap_or_else(|| detect_vcs(&cwd));
+
+        // The converged hook. A half-configured hook (arguments or a timeout with no program) is a
+        // startup error rather than silently inert: a gate that never fires is worse than a server
+        // that will not start. The program is resolved now, so a typo is caught here too.
+        let on_converged = match hook_program {
+            Some(program) => Some(crate::hook::HookConfig {
+                program: resolve_hook_program(&program, &cwd)?,
+                args: hook_args,
+                timeout: Duration::from_secs(
+                    hook_timeout_secs.unwrap_or(crate::hook::DEFAULT_TIMEOUT_SECS),
+                ),
+            }),
+            None if !hook_args.is_empty() || hook_timeout_secs.is_some() => {
+                return Err(
+                    "--on-converged-arg and --on-converged-timeout-seconds need --on-converged"
+                        .to_string(),
+                )
+            }
+            None => None,
+        };
 
         // Finalise each entry into a `ReviewerSpec`, filling per-entry defaults. `finalize` is
         // fallible only for the `--default-level` cross-check (a level name must be declared).
@@ -1384,6 +1427,7 @@ impl Config {
             max_concurrent_reviews,
             max_policy_denials,
             max_policy_idle: Duration::from_secs(max_policy_idle_secs),
+            on_converged,
         })
     }
 
@@ -2126,6 +2170,48 @@ impl Config {
 /// Resolve a directory to an absolute path without the `\\?\` verbatim prefix that
 /// `canonicalize` adds on Windows. That prefix is correct but leaks into the reviewer's
 /// prompt and command line, where some tools mishandle it.
+/// Resolve `--on-converged <program>` to an executable path, at startup.
+///
+/// - A **bare name** (no path separator) is searched for on `PATH` ourselves — never left to
+///   `CreateProcess`, which looks in the application directory and the current directory first.
+///   That is the execution hazard documented on [`crate::reviewer::on_path`]; the current directory
+///   here is the repository. A bare name with an extension (`pwsh.exe`) must match exactly; one
+///   without is completed through `PATHEXT`.
+/// - A **relative path with a separator** is joined to the working root, where the hook also runs.
+/// - An **absolute path** is used as is.
+///
+/// The result must be an existing file; anything else is a startup error.
+fn resolve_hook_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let path = Path::new(program);
+    let bare = !program.contains(['/', '\\']) && !path.is_absolute();
+    let resolved = if bare {
+        if path.extension().is_some() {
+            std::env::var_os("PATH").and_then(|p| {
+                std::env::split_paths(&p)
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .map(|d| d.join(program))
+                    .find(|c| c.is_file())
+            })
+        } else {
+            crate::reviewer::on_path(program)
+        }
+    } else if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(cwd.join(path))
+    };
+    match resolved {
+        Some(p) if p.is_file() => Ok(p),
+        Some(p) => Err(format!(
+            "--on-converged program '{program}' does not exist (resolved to '{}')",
+            p.display()
+        )),
+        None => Err(format!(
+            "--on-converged program '{program}' was not found on PATH; give a full path"
+        )),
+    }
+}
+
 fn normalize_dir(dir: PathBuf) -> PathBuf {
     let resolved = dir.canonicalize().unwrap_or(dir);
     let text = resolved.to_string_lossy();
@@ -2324,6 +2410,21 @@ OPTIONS:
                               a turn still emitting output is never cut. Default 300
                               (max-effort Codex reasons silently for up to ~110s of
                               observed real turns); lower it for faster fails.
+
+CONVERGED-REVIEW HOOK (issue #142; off unless --on-converged is given):
+  --on-converged <program>    Run <program> when a git review converges on exactly a
+                              committed change (the reviewed diff is byte-identical to
+                              merge-base..HEAD). It gets a JSON payload on stdin --
+                              captured_head, base, session, review_id, reviewer,
+                              chain_index, ... -- and may do anything with it, e.g. post
+                              a commit status a branch ruleset requires. A bare name is
+                              searched on PATH; a relative path is under the working
+                              root. Runs as this server's user, contained in a job
+                              object, in the working root. Never changes the review.
+  --on-converged-arg <arg>    One argument for the hook program. Repeatable, in order.
+  --on-converged-timeout-seconds N
+                              Kill the hook and everything it started after N seconds.
+                              Default 60, max 600.
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
@@ -4559,5 +4660,151 @@ mod block_repair_flag_tests {
         ]))
         .expect("config");
         assert_eq!(cfg.block_repair_timeout.as_secs(), 90);
+    }
+}
+
+#[cfg(test)]
+mod converged_hook_flag_tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        super::tests::args(items)
+    }
+
+    fn cmd_exe() -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{root}\System32\cmd.exe")
+    }
+
+    #[test]
+    fn the_hook_is_off_by_default() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(cfg.on_converged.is_none());
+    }
+
+    #[test]
+    fn an_absolute_program_keeps_its_arguments_in_order_and_defaults_the_timeout() {
+        let exe = cmd_exe();
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--on-converged",
+            &exe,
+            "--on-converged-arg",
+            "/d",
+            "--on-converged-arg=/c",
+            "--on-converged-arg",
+            "post status.cmd",
+        ]))
+        .expect("config");
+        let hook = cfg.on_converged.expect("hook configured");
+        assert_eq!(hook.program, PathBuf::from(&exe));
+        assert_eq!(hook.args, vec!["/d", "/c", "post status.cmd"]);
+        assert_eq!(hook.timeout.as_secs(), crate::hook::DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_bare_name_resolves_through_path_with_or_without_its_extension() {
+        let hook = Config::from_args(&args(&["--reviewer", "codex", "--on-converged", "cmd"]))
+            .expect("config")
+            .on_converged
+            .unwrap();
+        assert!(hook.program.is_absolute(), "{}", hook.program.display());
+        assert!(hook.program.is_file());
+        let exact = Config::from_args(&args(&["--reviewer", "codex", "--on-converged", "cmd.exe"]))
+            .expect("config")
+            .on_converged
+            .unwrap();
+        assert!(exact.program.is_absolute());
+    }
+
+    #[test]
+    fn a_relative_path_resolves_under_the_working_root() {
+        let dir = crate::testutil::temp_dir("hook-cfg-rel");
+        std::fs::create_dir_all(dir.as_path().join("scripts")).unwrap();
+        std::fs::write(
+            dir.as_path().join("scripts").join("post.cmd"),
+            "@echo off\r\n",
+        )
+        .unwrap();
+        let root = dir.as_path().to_string_lossy().into_owned();
+        let hook = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--cwd",
+            &root,
+            "--on-converged",
+            r"scripts\post.cmd",
+        ]))
+        .expect("config")
+        .on_converged
+        .unwrap();
+        assert!(hook.program.ends_with(r"scripts\post.cmd"));
+        assert!(hook.program.is_file());
+    }
+
+    #[test]
+    fn misconfiguration_is_a_startup_error() {
+        let exe = cmd_exe();
+        for bad in [
+            vec!["--reviewer", "codex", "--on-converged-arg", "x"],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-converged-timeout-seconds",
+                "30",
+            ],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-converged",
+                "no-such-program-zz9",
+            ],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-converged",
+                r"C:\no\such\hook.exe",
+            ],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-converged",
+                exe.as_str(),
+                "--on-converged-timeout-seconds",
+                "0",
+            ],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-converged",
+                exe.as_str(),
+                "--on-converged-timeout-seconds",
+                "601",
+            ],
+        ] {
+            assert!(Config::from_args(&args(&bad)).is_err(), "{bad:?}");
+        }
+        let ok = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--on-converged",
+            exe.as_str(),
+            "--on-converged-timeout-seconds",
+            "600",
+        ]))
+        .expect("config");
+        assert_eq!(ok.on_converged.unwrap().timeout.as_secs(), 600);
+    }
+
+    #[test]
+    fn the_help_documents_the_hook_flags() {
+        for flag in [
+            "--on-converged <program>",
+            "--on-converged-arg <arg>",
+            "--on-converged-timeout-seconds N",
+        ] {
+            assert!(USAGE.contains(flag), "{flag}");
+        }
     }
 }

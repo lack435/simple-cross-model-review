@@ -174,6 +174,10 @@ The essentials:
 --no-preamble                Send the caller's instructions with nothing added (both paths).
 --allow-reviewer-config      Let the reviewer load project and user configuration.
 --no-metrics                 Stop recording per-turn token usage. On by default.
+--on-converged <program>     Run a hook when a git review converges on exactly a committed
+                            change. See "Gating merges on a converged review" below.
+--on-converged-arg <arg>     One argument for the hook program. Repeatable, in order.
+--on-converged-timeout-seconds <n>  Kill the hook and its children after n s. Default 60, max 600.
 --doctor                     Check CLI and auth from a terminal, then exit.
 --usage                      Print the recorded usage summary, then exit.
 ```
@@ -257,7 +261,7 @@ Every review carries a machine-readable envelope (verdict, findings with stable 
 reviewer explains why a finding it is holding open is still open, and it is present on every turn
 that ran. A client reading only `structuredContent` still gets everything that bears on how much
 weight the review deserves: `review_prose`, `captured`, `denial_count`, `warnings`, `resumable`,
-`reviewer`, `usage`. The full contract is in
+`reviewer`, `usage` — and `hook`, when a converged hook is configured. The full contract is in
 [`docs/structured-channel-parity.md`](docs/structured-channel-parity.md); the findings model and
 how carried-vs-re-examined findings work are in
 [`docs/finding-liveness.md`](docs/finding-liveness.md).
@@ -265,6 +269,74 @@ how carried-vs-re-examined findings work are in
 If a reviewer writes a good review but omits its machine block, the server asks once more for the
 block alone rather than discarding the turn (opt out with `--block-repair-attempts 0`). See
 [`docs/unstructured-turn-recovery.md`](docs/unstructured-turn-recovery.md).
+
+## Gating merges on a converged review
+
+`cross-review` can tell your forge that a converged cross-model review covered an exact commit,
+so a branch ruleset can require it as a status check (and auto-merge can wait on it). The server
+never talks to GitHub itself and holds no forge credentials. Instead it runs **your** hook:
+
+```json
+"args": [
+  "--reviewer", "codex", "...",
+  "--on-converged", "pwsh",
+  "--on-converged-arg", "-NoProfile",
+  "--on-converged-arg", "-File",
+  "--on-converged-arg", "scripts\\post-review-status.ps1"
+]
+```
+
+**When it fires.** Only when a git review's `outcome` is `converged` **and** the canonical diff the
+reviewer was served is byte-identical to `HEAD`'s committed change against the same fork point.
+Uncommitted edits, untracked files, or a `HEAD` that moved to different content all mean the
+hook is skipped, and the result says why. The server enforces this rule, so a naive hook can't
+post `success` for code the reviewer never saw. In practice: **commit and push before the final
+review turn.** If you converged first, commit (and push) exactly what was reviewed, then call
+`cross_model_review_attest`. It re-checks the commit and re-fires the hook without a model call.
+The tool is listed only when a hook is configured.
+
+**What it gets.** One JSON object on stdin:
+
+```json
+{"schema_version": 1, "event": "converged", "outcome": "converged", "trigger": "review",
+ "session": "feat/x", "turn": 3, "review_id": "rv-...",
+ "reviewer": "OpenAI Codex (codex, model=gpt-5.6-luna, effort=xhigh, bin=...)",
+ "reviewer_kind": "codex", "model": "gpt-5.6-luna", "effort": "xhigh", "chain_index": 0,
+ "captured_head": "<full sha>", "tree_clean": true, "base": "<merge-base sha>",
+ "base_source": "merge-base(HEAD, refs/remotes/origin/HEAD)", "diff_sha256": "...",
+ "repo_root": "C:\\dev\\repo", "server_version": "..."}
+```
+
+- `chain_index` is the configured `--reviewer` entry that ran (`0` is the primary). A repository
+  whose rule is "the other model, never the caller's own" should refuse on `chain_index != 0`
+  (or on `reviewer_kind`), because a rate-limited primary can fall back to another family.
+- The payload carries nothing the reviewer wrote. `session` is caller-supplied text: treat it as
+  data, never interpolate it into a command.
+
+A minimal hook (PowerShell, `gh` CLI):
+
+```powershell
+$p = [Console]::In.ReadToEnd() | ConvertFrom-Json
+if ($p.chain_index -ne 0) { Write-Error "fallback reviewer; not attesting"; exit 1 }
+gh api "repos/{owner}/{repo}/statuses/$($p.captured_head)" `
+  -f state=success -f context=cross-review `
+  -f description="converged: $($p.model), session $($p.session)"
+```
+
+`gh` posts with your personal token. A ruleset that pins the required check to a GitHub App
+needs the script to mint that App's installation token instead.
+
+**How it runs.** The hook runs as this server's user, in the working root, inside a job object
+(no containment, no launch). Its stdout and stderr are captured, never mixed into the MCP
+channel. `succeeded` means exit 0 **and** every process it started has finished. The timeout
+covers the whole process tree. The result's `hook` field (`null` when no hook is configured)
+reports `succeeded`, `failed`, `timed_out` or `skipped`, with the reason, the head, the exit code
+and the tail of its output. **The hook never changes the review:** a failure adds a warning, and
+`outcome` stands.
+
+**What it is not.** It catches skipped and stale reviews. It is not proof against someone running
+as the same OS user, who can run the hook script by hand. Design and review history:
+[`docs/converged-hook-plan.md`](docs/converged-hook-plan.md).
 
 ## When the reviewer is unavailable
 

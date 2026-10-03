@@ -587,6 +587,7 @@ fn dispatch_tool(app: &App, params: &Value, request: &RequestCancel) -> Value {
         "cross_model_consult" => app.start_consult(&args, request),
         "cross_model_review_status" => Ok(app.status()),
         "cross_model_review_cancel" => app.cancel(&args),
+        "cross_model_review_attest" if app.has_hook() => app.attest(&args),
         "cross_model_setup_profile" => app.setup_profile(&args, request),
         other => {
             return text_result(
@@ -1286,6 +1287,37 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     }
 
+    // Offered only when a converged hook is configured (issue #142): without one there is nothing
+    // for it to fire, and an unlisted tool cannot be mistaken for a gate that is wired up.
+    if app.has_hook() {
+        tools.push(json!({
+            "name": "cross_model_review_attest",
+            "description":
+                "Re-fire this server's converged-review hook for a session's latest converged \
+                 review, without a model call. Use it when the review converged before its change \
+                 was committed, or before it was pushed (a forge rejects a status on a commit it \
+                 does not have): commit and push, then call this. The server re-checks that the \
+                 reviewed diff is byte-identical to HEAD's committed change against the same base, \
+                 and that the review is still the session's latest turn, before running the hook. \
+                 Returns the hook report; a precondition that does not hold comes back as \
+                 'skipped' with the reason. Not billed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "review_id": {
+                        "type": "string",
+                        "description": "The converged review to attest. Preferred."
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "Alternatively, a session name: its most recent review."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
+
     tools
 }
 
@@ -1387,6 +1419,55 @@ mod tests {
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert!(!tool["description"].as_str().unwrap().is_empty());
         }
+    }
+
+    /// The attest tool exists only with a converged hook configured (issue #142): listed and
+    /// dispatched then, and an unknown tool otherwise.
+    #[test]
+    fn the_attest_tool_is_offered_only_with_a_hook() {
+        struct Never;
+        impl crate::hook::HookRunner for Never {
+            fn run(&self, _payload: &str) -> crate::hook::HookReport {
+                unreachable!("no review exists to attest")
+            }
+        }
+        let names = |app: &App| -> Vec<String> {
+            let response = handle_sync(app, "tools/list", &Value::Null, &json!(9));
+            response["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let plain = app();
+        assert!(!names(&plain)
+            .iter()
+            .any(|n| n == "cross_model_review_attest"));
+        let call = json!({"name": "cross_model_review_attest", "arguments": {"session": "s"}});
+        let refused = dispatch_tool(&plain, &call, &RequestCancel::new());
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool"));
+
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
+        let hooked = App::new(cfg).with_hook_runner(Arc::new(Never));
+        let listed = names(&hooked);
+        assert_eq!(
+            listed.last().map(String::as_str),
+            Some("cross_model_review_attest")
+        );
+        let answered = dispatch_tool(&hooked, &call, &RequestCancel::new());
+        let text = answered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("review_not_available"), "{text}");
     }
 
     #[test]
