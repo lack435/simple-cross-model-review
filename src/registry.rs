@@ -156,6 +156,13 @@ pub struct Review {
     /// The structured findings envelope this turn produced, once it has finished. `None` while
     /// running or on a failed turn; the completed-result renderer emits both channels from it.
     pub envelope: Option<crate::findings::Envelope>,
+    /// What the converged hook did this turn (issue #142). `None` when no hook is configured, on a
+    /// consult, and on a failed turn.
+    pub hook: Option<crate::hook::HookReport>,
+    /// The binding inputs of a converged git turn, kept in memory only so
+    /// `cross_model_review_attest` can re-fire the hook without a model call. Never persisted:
+    /// an evicted review or a restarted server answers `review_not_available`.
+    pub attestable: Option<crate::hook::Attestable>,
     pub cancel: Arc<AtomicBool>,
     /// Order in which this process finished the review, or 0 while it is still running.
     /// Assigned under the registry lock; see `State::finishes`.
@@ -192,6 +199,13 @@ pub struct Outcome {
     pub active: Option<String>,
     /// The structured findings envelope this turn produced. `None` on a failed turn.
     pub envelope: Option<crate::findings::Envelope>,
+    /// The served canonical change a git review turn approved, taken inside `attempt` while the
+    /// serve record still exists; the input to the converged-hook binding check. `None` otherwise.
+    pub served: Option<crate::hook::ServedChange>,
+    /// See [`Review::hook`].
+    pub hook: Option<crate::hook::HookReport>,
+    /// See [`Review::attestable`].
+    pub attestable: Option<crate::hook::Attestable>,
 }
 
 impl Outcome {
@@ -216,6 +230,9 @@ impl Outcome {
             usage: Usage::default(),
             active: None,
             envelope: None,
+            served: None,
+            hook: None,
+            attestable: None,
         }
     }
 
@@ -233,6 +250,9 @@ impl Outcome {
             usage: Usage::default(),
             active: None,
             envelope: None,
+            served: None,
+            hook: None,
+            attestable: None,
         }
     }
 
@@ -251,6 +271,9 @@ impl Outcome {
             usage: Usage::default(),
             active: None,
             envelope: None,
+            served: None,
+            hook: None,
+            attestable: None,
         }
     }
 }
@@ -439,6 +462,8 @@ impl Registry {
                 usage: Usage::default(),
                 active: None,
                 envelope: None,
+                hook: None,
+                attestable: None,
                 cancel: Arc::clone(&cancel),
                 finish_seq: 0,
             },
@@ -529,6 +554,8 @@ impl Registry {
                     review.active = outcome.active;
                 }
                 review.envelope = outcome.envelope;
+                review.hook = outcome.hook;
+                review.attestable = outcome.attestable;
                 match outcome.failure {
                     Some(failure) => {
                         review.status = Status::Failed;
@@ -755,6 +782,10 @@ pub struct Snapshot {
     /// The structured findings envelope, on a completed turn. `None` while running or on a
     /// failed turn.
     pub envelope: Option<crate::findings::Envelope>,
+    /// See [`Review::hook`].
+    pub hook: Option<crate::hook::HookReport>,
+    /// See [`Review::attestable`].
+    pub attestable: Option<crate::hook::Attestable>,
     /// The server had begun shutting down when this was taken. A `Running` snapshot with
     /// this set means the wait was cut short, not that the caller's budget ran out — and
     /// that no later call can collect the review, because the process is exiting.
@@ -787,6 +818,8 @@ impl Snapshot {
             usage: review.usage,
             active: review.active.clone(),
             envelope: review.envelope.clone(),
+            hook: review.hook.clone(),
+            attestable: review.attestable.clone(),
             shutting_down,
         }
     }

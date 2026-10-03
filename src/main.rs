@@ -21,6 +21,7 @@ mod digest;
 mod errors;
 mod evidence;
 mod findings;
+mod hook;
 mod mcp;
 mod metrics;
 mod pathcmp;

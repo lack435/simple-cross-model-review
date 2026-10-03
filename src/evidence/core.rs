@@ -2574,6 +2574,82 @@ fn compose_diff(
             ))
         }
     };
+    compose_resolved(
+        root,
+        base_token,
+        base_source,
+        head,
+        path,
+        autocrlf,
+        limits,
+        cancel,
+        received_at,
+    )
+}
+
+/// The digest of the `base..head` committed change, composed **exactly** as a served canonical diff
+/// is: the same header line naming `base_source`, the same `git diff` options, the same `autocrlf`.
+///
+/// This is the converged-hook binding check (issue #142, `docs/converged-hook-plan.md`). The served
+/// canonical diff is `branch-base..worktree`; when the working tree is exactly `head`'s committed
+/// content, the two compositions are byte-identical, so equal digests prove the reviewer was shown
+/// exactly `head`'s change against `base`. It is the same `compose_resolved` the served text came
+/// from, not a parallel reimplementation, so the two cannot drift apart; and any difference between
+/// them — real or merely formatting — makes the digests differ, which skips the hook rather than
+/// firing it. Both ids must be full object ids; anything else is refused before git runs.
+pub fn committed_change_digest(
+    root: &Path,
+    base: &str,
+    base_source: &str,
+    head: &str,
+    autocrlf: Option<super::AutoCrlf>,
+    limits: &Limits,
+) -> Result<String, EvidenceError> {
+    if !valid_object_id(base) || !valid_object_id(head) {
+        return Err(EvidenceError::new(
+            "invalid_arguments",
+            "the binding check needs full object ids for base and head",
+        ));
+    }
+    let cancel = AtomicBool::new(false);
+    let composed = compose_resolved(
+        root,
+        base.to_string(),
+        base_source.to_string(),
+        &DiffEndpoint::Commit(head.to_string()),
+        "",
+        autocrlf,
+        limits,
+        &cancel,
+        Instant::now(),
+    )?;
+    crate::digest::Fingerprint::of(composed.text.as_bytes())
+        .map(|f| f.sha256)
+        .ok_or_else(|| EvidenceError::new("provider_failed", "the SHA-256 digest is unavailable"))
+}
+
+/// `HEAD` as a full object id, through the isolated runner, or `None` when it does not resolve (an
+/// unborn branch).
+pub fn resolve_head(root: &Path, limits: &Limits) -> Result<Option<String>, EvidenceError> {
+    let cancel = AtomicBool::new(false);
+    super::git::resolve_commit(root, "HEAD", limits, &cancel, Instant::now())
+}
+
+/// [`compose_diff`] after the base is resolved: the header naming the resolved base, the tracked
+/// diff, and — for a working-tree head — the untracked files. Split out so the converged-hook binding
+/// check composes `base..head` through the very same code (see [`committed_change_digest`]).
+#[allow(clippy::too_many_arguments)]
+fn compose_resolved(
+    root: &Path,
+    base_token: String,
+    base_source: String,
+    head: &DiffEndpoint,
+    path: &str,
+    autocrlf: Option<super::AutoCrlf>,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<ComposedDiff, EvidenceError> {
     let mut spec: Vec<String> = Vec::new();
     let compose_untracked = matches!(head, DiffEndpoint::Worktree);
     match head {
@@ -3840,5 +3916,185 @@ mod tests {
         let scope = core.call("repository_scope", &json!({})).unwrap();
         let scope2 = core.call("repository_scope", &json!({})).unwrap();
         assert_eq!(scope["current_stamp"], scope2["current_stamp"]);
+    }
+
+    // ---- converged-hook binding check (issue #142) ----
+
+    /// Real git with a pinned identity and no signing, so commits work on any machine. `extra` goes
+    /// before the subcommand (e.g. `-c core.autocrlf=true`). Returns stdout, or `None` on failure.
+    ///
+    /// System and global config are excluded, as the isolated runner excludes them: a developer's
+    /// global `core.autocrlf=true` would otherwise make a `git checkout` here write CRLF that the
+    /// runner then diffs as a change, and the fixture would test the machine rather than the code.
+    fn git_out(root: &Path, extra: &[&str], args: &[&str]) -> Option<String> {
+        let bin = crate::reviewer::on_path("git")?;
+        let out = std::process::Command::new(bin)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .args(["-c", "user.email=test@example.invalid"])
+            .args(["-c", "user.name=test"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(extra)
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// A repository with a base commit and a head commit on top of it, returning (dir, base, head).
+    /// The head commit modifies, adds, deletes and binary-adds files, with non-ASCII content, so the
+    /// byte-identity check covers each diff shape. `extra` is applied to every git call, which is how
+    /// the CRLF fixture commits LF blobs while leaving CRLF in the working tree.
+    fn binding_repo(
+        name: &str,
+        extra: &[&str],
+        eol: &str,
+    ) -> Option<(crate::testutil::TempDir, String, String)> {
+        crate::reviewer::on_path("git")?;
+        let dir = temp_dir(name);
+        let root = dir.as_path().to_path_buf();
+        git_out(&root, extra, &["init", "-q"])?;
+        let w = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, body.replace('\n', eol)).unwrap();
+        };
+        w("keep.txt", "one\ntwo\nthree\n");
+        w("gone.txt", "to be deleted\n");
+        w("src/lib.rs", "fn main() {}\n");
+        git_out(&root, extra, &["add", "-A"])?;
+        git_out(&root, extra, &["commit", "-q", "-m", "base"])?;
+        let base = git_out(&root, extra, &["rev-parse", "HEAD"])?;
+        w("keep.txt", "one\nTWO — changed ✓\nthree\n");
+        w("src/new.rs", "pub fn added() {}\n");
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        fs::write(root.join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2, 255]).unwrap();
+        git_out(&root, extra, &["add", "-A"])?;
+        git_out(&root, extra, &["commit", "-q", "-m", "head"])?;
+        let head = git_out(&root, extra, &["rev-parse", "HEAD"])?;
+        Some((dir, base, head))
+    }
+
+    /// The digest the evidence server would serve for `base..worktree` with this header.
+    fn served_digest(root: &Path, base: &str, source: &str, autocrlf: Option<AutoCrlf>) -> String {
+        let cancel = AtomicBool::new(false);
+        let composed = compose_resolved(
+            root,
+            base.to_string(),
+            source.to_string(),
+            &DiffEndpoint::Worktree,
+            "",
+            autocrlf,
+            &Limits::default(),
+            &cancel,
+            Instant::now(),
+        )
+        .expect("served composition");
+        crate::digest::Fingerprint::of(composed.text.as_bytes())
+            .unwrap()
+            .sha256
+    }
+
+    use crate::evidence::AutoCrlf;
+
+    const SOURCE: &str = "merge-base(HEAD, refs/remotes/origin/HEAD)";
+
+    /// The load-bearing assumption of the binding (plan: "Assumed, to be verified in implementation"):
+    /// on a clean checkout the worktree diff and the commit-to-commit diff are byte-identical, across
+    /// a modification, an addition, a deletion, a binary file and non-ASCII content.
+    #[test]
+    fn a_clean_checkout_serves_exactly_the_committed_change() {
+        let Some((dir, base, head)) = binding_repo("binding-clean", &[], "\n") else {
+            eprintln!("skipping: git unavailable");
+            return;
+        };
+        let root = dir.as_path();
+        assert_eq!(
+            resolve_head(root, &Limits::default()).unwrap(),
+            Some(head.clone())
+        );
+        let served = served_digest(root, &base, SOURCE, None);
+        let committed =
+            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+        assert_eq!(served, committed);
+    }
+
+    /// The #135 shape: LF blobs checked out as CRLF. With the checkout's `core.autocrlf` re-applied
+    /// (as the evidence bundle does) the two compositions agree; without it the worktree diff is a
+    /// whole-file rewrite and they differ — a false *skip*, never a false fire.
+    #[test]
+    fn a_crlf_checkout_matches_only_under_its_own_autocrlf() {
+        let crlf = ["-c", "core.autocrlf=true"];
+        let Some((dir, base, head)) = binding_repo("binding-crlf", &crlf, "\r\n") else {
+            eprintln!("skipping: git unavailable");
+            return;
+        };
+        let root = dir.as_path();
+        let committed = committed_change_digest(
+            root,
+            &base,
+            SOURCE,
+            &head,
+            Some(AutoCrlf::True),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            served_digest(root, &base, SOURCE, Some(AutoCrlf::True)),
+            committed
+        );
+        assert_ne!(served_digest(root, &base, SOURCE, None), committed);
+    }
+
+    /// Anything the reviewer saw beyond the commit — an uncommitted edit, an untracked file — makes
+    /// the served text differ from the committed change, so the hook would be skipped.
+    #[test]
+    fn uncommitted_or_untracked_work_never_matches_the_commit() {
+        let Some((dir, base, head)) = binding_repo("binding-dirty", &[], "\n") else {
+            eprintln!("skipping: git unavailable");
+            return;
+        };
+        let root = dir.as_path();
+        let committed =
+            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+
+        fs::write(root.join("keep.txt"), "one\nuncommitted\nthree\n").unwrap();
+        assert_ne!(served_digest(root, &base, SOURCE, None), committed);
+        git_out(root, &[], &["checkout", "--", "keep.txt"]).unwrap();
+        assert_eq!(served_digest(root, &base, SOURCE, None), committed);
+
+        fs::write(root.join("stray.txt"), "untracked\n").unwrap();
+        assert_ne!(served_digest(root, &base, SOURCE, None), committed);
+    }
+
+    /// A different header (another base source) is a different served text: the check binds the
+    /// header too, so it cannot match a diff served against a different base description.
+    #[test]
+    fn the_binding_covers_the_header_and_refuses_short_ids() {
+        let Some((dir, base, head)) = binding_repo("binding-header", &[], "\n") else {
+            eprintln!("skipping: git unavailable");
+            return;
+        };
+        let root = dir.as_path();
+        let committed =
+            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+        assert_ne!(served_digest(root, &base, "HEAD", None), committed);
+        assert!(committed_change_digest(
+            root,
+            &base[..12],
+            SOURCE,
+            &head,
+            None,
+            &Limits::default()
+        )
+        .is_err());
+        assert!(
+            committed_change_digest(root, &base, SOURCE, "HEAD", None, &Limits::default()).is_err()
+        );
     }
 }

@@ -984,6 +984,41 @@ impl SharedLock {
 
 /// Lock path for a named review session, used to stop two server processes from
 /// resuming the same reviewer conversation at once.
+/// Record a minimal review turn under `cli_id`, for tests outside this module that need a durable
+/// session record (the converged-hook attest tests).
+#[cfg(test)]
+pub fn record_test_turn(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {
+    store
+        .record_turn(
+            name,
+            TurnFacts {
+                reviewer: "codex",
+                cli_session_id: cli_id,
+                model: "gpt-5.6-luna",
+                effort: "max",
+                cwd: "C:\\repo",
+                kind: KIND_REVIEW,
+                cumulative_usage: None,
+                changes: None,
+                head_sha: None,
+                base_sha: None,
+                backend: None,
+                include_shelved: None,
+                capture_identity: None,
+                perforce_baseline: None,
+                include_change: None,
+                diff_mode: None,
+                raw_bin: RawBin::PathSearch,
+                resolved_bin: String::new(),
+                findings_ledger: None,
+                terminal_reason: None,
+                reviewer_cwd_mode: "project",
+                profile_identity: None,
+            },
+        )
+        .expect("record turn")
+}
+
 pub fn session_lock_path(state_dir: &Path, session: &str) -> PathBuf {
     let safe: String = session
         .chars()

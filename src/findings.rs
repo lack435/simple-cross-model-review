@@ -39,8 +39,9 @@ use serde_json::{json, Value};
 /// unconditional on any turn that ran and adds the result-context group — `reviewer`, `resumed`,
 /// `resumable`, `usage`, `captured`, `disposition`, `denials`, `denial_count`,
 /// `denial_count_is_floor` — with `warnings` widened to the union the text body shows
-/// (issue #73; see `docs/structured-channel-parity.md`).
-pub const ENVELOPE_SCHEMA_VERSION: u32 = 3;
+/// (issue #73; see `docs/structured-channel-parity.md`). Version 4 adds `hook`, the converged-review
+/// hook's report — `null` when no hook is configured (issue #142; see `docs/converged-hook-plan.md`).
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 4;
 
 /// The **persisted ledger** schema version. Bumped only when the on-disk ledger shape changes in a
 /// way a previous version cannot read; a foreign record is refused rather than misread. Unchanged by
@@ -1123,6 +1124,9 @@ pub struct ResultContext<'a> {
     pub denial_count: usize,
     /// Whether `denial_count` is a lower bound because the source output was capped.
     pub denial_count_is_floor: bool,
+    /// The converged-review hook's report (issue #142), marker-swept by the caller. `None` when no
+    /// hook is configured, which renders `null`.
+    pub hook: Option<&'a crate::hook::HookReport>,
 }
 
 impl ResultContext<'_> {
@@ -1142,6 +1146,7 @@ impl ResultContext<'_> {
             denials: &[],
             denial_count: 0,
             denial_count_is_floor: false,
+            hook: None,
         }
     }
 }
@@ -1243,6 +1248,7 @@ impl Envelope {
             "denials": ctx.denials,
             "denial_count": ctx.denial_count,
             "denial_count_is_floor": ctx.denial_count_is_floor,
+            "hook": ctx.hook.map(|h| serde_json::to_value(h).unwrap_or(Value::Null)).unwrap_or(Value::Null),
         });
         // Guarantee object shape even if json! ever changed.
         if !v.is_object() {
@@ -1382,6 +1388,19 @@ pub fn output_schema() -> Value {
         "required": ["id", "severity", "status", "title", "detail", "first_seen_turn", "last_status_change_turn"],
         "additionalProperties": false
     });
+    // Built apart from `completed` only to stay under `json!`'s macro recursion limit.
+    let hook = json!({
+        "type": ["object", "null"],
+        "properties": {
+            "status": {"enum": ["succeeded", "failed", "timed_out", "skipped"]},
+            "reason": {"type": ["string", "null"]},
+            "captured_head": {"type": ["string", "null"]},
+            "exit_code": {"type": ["integer", "null"]},
+            "output": {"type": ["string", "null"]}
+        },
+        "required": ["status", "reason", "captured_head", "exit_code", "output"],
+        "additionalProperties": false
+    });
     let completed = json!({
         "type": "object",
         "properties": {
@@ -1413,7 +1432,8 @@ pub fn output_schema() -> Value {
             "disposition": {"type": ["string", "null"]},
             "denials": {"type": "array", "items": {"type": "string"}},
             "denial_count": {"type": "integer"},
-            "denial_count_is_floor": {"type": "boolean"}
+            "denial_count_is_floor": {"type": "boolean"},
+            "hook": hook
         },
         // Every key the completed renderer emits is required: `non_convergence_reason`,
         // `verdict_detail`, `open_count` and `total_count` are always present (as `null` when
@@ -1425,7 +1445,7 @@ pub fn output_schema() -> Value {
             "ledger_coverage", "findings_trusted", "open_count", "total_count", "findings",
             "warnings", "outcome", "review_prose", "review_prose_truncated", "block_repair",
             "reviewer", "resumed", "resumable", "usage", "captured", "disposition", "denials",
-            "denial_count", "denial_count_is_floor"
+            "denial_count", "denial_count_is_floor", "hook"
         ],
         "additionalProperties": false
     });
@@ -1802,6 +1822,14 @@ pub fn evaluate_turn_for_test(
         Budget::default(),
         0,
     )
+}
+
+/// A reviewer response carrying a valid machine block with `body`, for tests outside this module
+/// that need a real envelope (e.g. a converged one for the converged-hook tests).
+#[cfg(test)]
+pub fn block_text_for_test(nonce: &str, body: &str) -> String {
+    let (b, e) = markers(IN_TAG, nonce);
+    format!("prose\n{b}\n{body}\n{e}\n")
 }
 
 /// Build the ledger to persist and the completed envelope from an assessment (pure).
