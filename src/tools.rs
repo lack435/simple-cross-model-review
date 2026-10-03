@@ -2367,7 +2367,15 @@ impl App {
         })?;
         let still_latest =
             record.is_some_and(|r| r.cli_session_id == att.cli_session_id && r.turns == att.turns);
-        if !still_latest {
+        // A later turn that ran but was never durably recorded (a persistence failure, a resumed-id
+        // mismatch, an account refusal, a crash) leaves the record above unchanged — so the record
+        // alone would let this older approval launder that turn's findings (impl review f1). The
+        // findings write-ahead marker is the durable fact for exactly that case: written before every
+        // reviewer turn and cleared only once the turn is durably recorded, so a set (or unreadable)
+        // marker means a later turn may exist. Fail closed on it, as the resume gate does.
+        let later_turn_unrecorded = self.sessions.findings_marker_state(&att.session)
+            != crate::session::MarkerState::Absent;
+        if !still_latest || later_turn_unrecorded {
             return Ok(render(HookReport::skipped(reason::NOT_LATEST_TURN)));
         }
         Ok(render(crate::hook::fire(
@@ -9310,6 +9318,25 @@ mod converged_hook_tests {
             assert!(out.contains(reason::NOT_LATEST_TURN), "{case}: {out}");
             assert!(rec.calls().is_empty(), "{case}");
         }
+    }
+
+    /// Impl review f1: a later turn that ran but was never durably recorded leaves the record
+    /// unchanged, so the findings write-ahead marker — still set — is what refuses the attest.
+    #[test]
+    fn attest_refuses_while_a_later_turn_is_unrecorded() {
+        let rec = Recording::new();
+        let Some(f) = fixture("attest-unrecorded", Some(rec.clone()), &[]) else {
+            return;
+        };
+        let id = finish_review(&f, APPROVE, None);
+        // What a later turn does before launching its reviewer; a persistence failure leaves it set.
+        f.app.sessions.mark_findings_pending(SESSION).unwrap();
+        let out = attest(&f, &id).expect("attest");
+        assert!(out.contains(reason::NOT_LATEST_TURN), "{out}");
+        assert!(rec.calls().is_empty());
+        // Once a later turn is durably recorded the marker clears — and the record has moved on.
+        f.app.sessions.clear_findings_pending(SESSION).unwrap();
+        assert!(attest(&f, &id).unwrap().starts_with("hook:      succeeded"));
     }
 
     /// f7: the lease is held from validation through the hook — a review arriving meanwhile

@@ -456,7 +456,13 @@ fn run_process(
             job.terminate();
             let _ = child.kill();
             let quiet = quiesce(&job, Instant::now() + TERMINATE_QUIESCE);
-            let _ = child.wait();
+            // Reap the direct child, bounded: an unbounded `wait` after a termination that did not
+            // take would hang the review job and its session lease past the configured timeout
+            // (impl review f2). A child that will not die is reported `not_quiesced`, not waited on.
+            let reap_by = Instant::now() + TERMINATE_QUIESCE;
+            while Instant::now() < reap_by && matches!(child.try_wait(), Ok(None)) {
+                std::thread::sleep(POLL);
+            }
             if wait_failed {
                 HookReport::failed(reason::WAIT_FAILED)
             } else {

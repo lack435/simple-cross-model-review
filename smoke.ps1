@@ -344,7 +344,7 @@ COUNTER=1
     # tests pin the composition, but only a real turn proves the reviewer's own words arrive.
     $sc = $collected.result.structuredContent
     Assert-That 'the completed result carries structuredContent' ($null -ne $sc) $resultText
-    Assert-That 'the envelope is at the current schema version' ($sc.schema_version -eq 3) `
+    Assert-That 'the envelope is at the current schema version' ($sc.schema_version -eq 4) `
         "schema_version=$($sc.schema_version)"
     Assert-That 'a turn that ran carries its prose on the structured channel' `
         ($sc.review_prose -is [string]) "review_prose=$($sc.review_prose)"

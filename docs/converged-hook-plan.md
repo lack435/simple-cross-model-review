@@ -463,6 +463,11 @@ recent review). It:
       `turns` equal the ones the review's turn recorded, both retained on the registry record
       with the binding inputs. Any mismatch is `not_latest_turn`. That covers a later turn from
       any process, a `fresh` rebind (new `cli_session_id`) and an expired or forgotten session.
+      *(Added in implementation review, f1.)* Also require the session's **findings write-ahead
+      marker** to be absent. A later turn that ran but was never durably recorded leaves the
+      record unchanged, and the marker is the existing durable fact for that case: it is written
+      before every reviewer turn and cleared only after a durable record. A set or unreadable
+      marker is `not_latest_turn`, the same fail-closed rule the resume gate applies.
    3. **Hold the lease through the binding check and the hook**, releasing it only after the
       hook's quiescence. No turn can start or finish on the session while an attest is deciding
       and firing, in any process. A review that arrives meanwhile waits on the lease exactly as
