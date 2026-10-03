@@ -1,7 +1,8 @@
 # Converged-review hook — plan
 
 Status: **draft plan**, on `plan/converged-hook`, for issue #142. Cross-review session
-`plan-converged-hook` (Codex, gpt-5.6-luna, effort=xhigh). This is r2.
+`plan-converged-hook` (Codex, gpt-5.6-luna, effort=xhigh). This is r4: **converged at round 4**
+(7 findings raised, all accepted and resolved; none disputed).
 
 **Revision note (r1 → r2).** Round 1 raised four findings. All four were checked against the code
 and accepted:
