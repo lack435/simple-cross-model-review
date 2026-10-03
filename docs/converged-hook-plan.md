@@ -1,6 +1,30 @@
 # Converged-review hook — plan
 
-Status: **draft plan**, on `plan/converged-hook`, for issue #142. Not yet reviewed.
+Status: **draft plan**, on `plan/converged-hook`, for issue #142. Cross-review session
+`plan-converged-hook` (Codex, gpt-5.6-luna, effort=xhigh). This is r2.
+
+**Revision note (r1 → r2).** Round 1 raised four findings. All four were checked against the code
+and accepted:
+
+- **f1** (major): r1 said the serve-record aggregate supplies the digest and base commit. It does
+  not. `CanonicalServe` keeps only `base_source` and the counts, and `aggregate_serve_records`
+  uses the digest for agreement and then drops it. The binding check now says plainly that the
+  aggregate is **extended** to retain the agreed `digest`, the full `base` token and
+  `base_source`. A canonical op missing any of them fails closed.
+- **f2** (major): r1 recomputed `effective_autocrlf` at hook time. The evidence bundle fixes it
+  once per turn, so a config or attributes change mid-review could make the two compositions use
+  different options. That only ever causes a false *skip*: different options give different
+  bytes, and different bytes never fire. Still, it is a hole in the "same code, same options"
+  claim, and closing it is cheap. The parent built the bundle, so it already holds the value, and
+  the check now reuses that exact `Option<AutoCrlf>` instead of recomputing it.
+- **f3** (major): r1 presented job-object reaping as guaranteed. `JobObject::new()` can return
+  `None`, and the reviewer runner proceeds uncontained when it does. The hook runner now **fails
+  closed**: no job, or a failed `spawn_in_job` (which is already fail-closed: it kills the
+  suspended child rather than resume it uncontained), means the hook is reported `failed` and
+  never launched. Timeout terminates the job, then does a bounded quiescence check.
+- **f4** (minor): r1 did not say piped output is drained concurrently. It now reuses the reviewer
+  runner's pattern: stdin written on its own thread, and both streams drained on their own
+  threads with a bounded tail. A large-output test is added.
 
 ## What the issue asks, and what this plan does instead
 
@@ -159,13 +183,20 @@ In the parent, after a turn finalizes with `outcome == converged`, for a git rev
 
 1. Read the turn's serve-record aggregate (`read_serve_record_aggregate`, already used by the
    floor). The floor guarantees every canonical op on a converged turn shares one digest, and
-   at least one was complete and paged to its end. Take that digest `D`, plus that op's
-   `base` and `base_source`. If any is missing, which a converged git turn should never
-   produce, skip with `no_canonical_diff`. Fail closed.
+   at least one was complete and paged to its end. **Today the aggregate does not keep what
+   the check needs** (f1): `CanonicalServe` (`src/tools.rs`) holds only `base_source` and the
+   counts, and the digest is used for agreement and then dropped. Extend it to retain the
+   agreed `digest`, the `base` token (the full merge-base object id the evidence server wrote,
+   `src/evidence/core.rs` `first_diff_page`) and `base_source`, taken from the
+   complete+terminal canonical op. The `base` must also be a valid full object id. If any of
+   them is missing or malformed, skip with `no_canonical_diff`. Fail closed.
 2. Resolve `HEAD` to a full object id `H` (the existing `git::resolve_commit`).
 3. Compose the `base..H` diff text with the **same composition code** the evidence server used
    for the served text: same header line (`# repository_diff base {base_source} = {base}`),
-   same `git::diff` options, same `effective_autocrlf` override. Hash it with the same
+   same `git::diff` options, and the **same `core.autocrlf` value the turn's evidence bundle
+   was built with** (f2). The parent creates the bundle (`Bundle::create` in the
+   `evidence_setup` block of `src/tools.rs`), so it keeps that `Option<AutoCrlf>` and passes it
+   through, rather than calling `effective_autocrlf` again at hook time. Hash it with the same
    `digest::Fingerprint`. This is a refactor of `compose_diff` in `src/evidence/core.rs` so the
    header and tracked-diff part can be called from the parent with an explicit base commit
    and head commit, instead of a parallel reimplementation that could drift from it.
@@ -213,18 +244,32 @@ parentheses:
 
 ### Running the hook
 
-- Spawned with `winjob::JobObject::spawn_in_job`, so the whole process tree is reaped on
-  timeout and on server exit (`KILL_ON_JOB_CLOSE`). That matters here because `pwsh`, `gh`
-  and `git` all spawn helpers.
-- **stdin**: the JSON payload, then closed. **stdout and stderr**: piped and captured, never
-  inherited. The server's stdout is MCP protocol traffic, and an inherited handle would let
-  any `Write-Output` in a hook script corrupt it. This is the one mistake in this feature
-  that would break the server outright, so a test pins it.
+- **Containment is required, not best-effort** (f3). The hook needs a `JobObject::new()`
+  (`KILL_ON_JOB_CLOSE`) and is started with `JobObject::spawn_in_job`. That creates the child
+  suspended, assigns it, and only then resumes it; if assignment fails, it kills the suspended
+  child rather than resume it uncontained. If either step fails, the hook is reported `failed`
+  (`no_containment`) and **never runs**. This deliberately differs from the reviewer runner,
+  which warns and proceeds uncontained. A hook that escapes its timeout could post a stale
+  status long after the result said `timed_out`, and `pwsh`, `gh` and `git` all spawn helpers.
+  (`spawn_in_job` and `active_processes` are currently `#[allow(dead_code)]`, waiting on the
+  login runner. This feature becomes their first caller.)
+- **stdin**: the JSON payload, written on its own thread, then closed. **stdout and stderr**:
+  piped and captured, never inherited. The server's stdout is MCP protocol traffic, and an
+  inherited handle would let any `Write-Output` in a hook script corrupt it. This is the one
+  mistake in this feature that would break the server outright, so a test pins it.
+- **Both streams are drained concurrently** (f4), on their own threads, with a bounded
+  retained tail, following `reviewer::run` and its `drain` helper. Draining after `wait` would
+  deadlock as soon as a chatty hook fills a pipe buffer. After the child exits, a short drain
+  grace lets a straggler that still holds a pipe finish, and then the readers are abandoned.
+  They own nothing the result needs.
 - Working directory: the working root.
 - Environment: the server's, unchanged. The payload is on stdin, so no new environment
   variables.
-- Timeout: `--on-converged-timeout-seconds`. On expiry, terminate the job and report
-  `timed_out`.
+- Timeout: `--on-converged-timeout-seconds`. On expiry, terminate the job, then wait briefly
+  (bounded) for `active_processes` to reach zero, and report `timed_out`. If the job cannot be
+  terminated, or does not quiesce in the bound, the report says so (`timed_out`, with reason
+  `not_quiesced`), so the caller knows a straggler may still act. The job handle is held until
+  then, and `KILL_ON_JOB_CLOSE` remains the backstop on server exit.
 - Exit code 0 is `succeeded`; anything else is `failed`, with the code.
 - Output: the last 2 KiB of combined stdout and stderr is kept for the result, passed through
   `strip_marker_lines` like every other string in the result context. The full output also
@@ -327,7 +372,13 @@ All unit tests, no network and no model calls (the issue's "fake status sink"):
   - `HEAD` moved to a different commit after the serve record: digests differ, same reason.
   - `HEAD` moved to a different commit with the **same** change (amended message): fires for
     the new `H`. This is correct: the reviewed change is that commit's change.
-  - A serve record with no canonical digest: `no_canonical_diff`.
+  - A serve record with no canonical digest, no `base`, or a malformed `base`:
+    `no_canonical_diff`.
+  - The aggregate retains the agreed digest, base and base_source from the complete+terminal
+    canonical op (extends the existing `serve_record_aggregate_*` tests).
+  - The check composes with the autocrlf value it is handed, not a fresh lookup. A test
+    changes the repository's `core.autocrlf` between "serve" and check and asserts the
+    turn's value is used.
 - **Gating**, through a hook-runner seam (a trait or closure the job calls, replaced by a
   recording fake in tests): the hook is invoked exactly when vcs is git, the outcome is
   converged, the review is not cancelled and the binding passes; every other combination
@@ -338,8 +389,11 @@ All unit tests, no network and no model calls (the issue's "fake status sink"):
   - Hook stdout does not reach the server's stdout: the child writes to stdout, and the test
     asserts it lands in the captured tail.
   - A non-zero exit is `failed` with the code.
-  - Timeout is `timed_out`, and the grandchild is gone (job reaping).
-  - The output tail is bounded and marker-swept.
+  - Timeout is `timed_out`, and the grandchild is gone (job reaping, quiescence observed).
+  - A hook writing several MiB to both stdout and stderr completes without deadlock. Only
+    the bounded tail is retained, and it is marker-swept.
+  - Containment failure (the job-creation seam forced to fail) reports `failed`
+    (`no_containment`) and the program never starts, which a side-effect file proves.
 - **Config**: flag parsing, the argument order is preserved, the half-configured startup
   errors, and the program resolution rules (bare name through `on_path`, relative path joined
   to the working root).
