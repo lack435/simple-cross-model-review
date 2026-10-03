@@ -3119,14 +3119,12 @@ impl Job {
                     // response can render them. A failed turn keeps `None` (`Outcome::failed`): it
                     // sent no reviewable change.
                     o.disposition = disposition.take();
-                    o.capture_summary = capture_summary.take();
-                    // A git review derived its change live, so there is no static capture summary;
-                    // build the caller-facing captured: line from what the evidence server served
-                    // (mechanism 5). Only a successful attempt reaches here, so the serve-record is
-                    // complete and the gate above already passed.
-                    if o.capture_summary.is_none() && self.cfg.vcs == crate::config::Vcs::Git {
-                        o.capture_summary = serve_record_capture_summary(&self.cfg, &self.id);
-                    }
+                    // A static capture (Perforce) wins; otherwise keep the summary `attempt` built
+                    // from what the evidence server served (mechanism 5). It must be built *there*:
+                    // the serve record is removed when `attempt` returns, and re-reading it here
+                    // always found nothing, so every git review reported `captured: null` (#143).
+                    let served_summary = o.capture_summary.take();
+                    o.capture_summary = capture_summary.take().or(served_summary);
                     outcome = Some(o);
                     break;
                 }
@@ -4900,18 +4898,21 @@ impl Job {
             findings_marker_cleared,
         );
 
-        // The converged-hook binding inputs (issue #142), read *here* because the serve record is
-        // removed when `evidence_setup` drops at the end of this function. Only a git review with
-        // the evidence path has a canonical diff to bind; `run` decides whether the hook fires.
-        let served =
-            (!is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_some())
-                .then(|| {
-                    served_change(
-                        &read_serve_record_aggregate(&self.cfg, &self.id),
-                        turn_autocrlf,
-                    )
-                })
-                .flatten();
+        // What the evidence server served this turn, read *here* and only here: the serve record is
+        // removed when `evidence_setup` drops at the end of this function, so any later read finds
+        // nothing (#143). One read feeds both the caller-facing `captured:` line (mechanism 5) and,
+        // for a review, the converged-hook binding inputs (issue #142; `run` decides whether the
+        // hook fires). Only a git turn with the evidence path has a serve record.
+        let served_record = (self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_some())
+            .then(|| read_serve_record_aggregate(&self.cfg, &self.id));
+        let served_summary = served_record.as_ref().and_then(capture_summary_from);
+        let served = if is_consult {
+            None
+        } else {
+            served_record
+                .as_ref()
+                .and_then(|agg| served_change(agg, turn_autocrlf))
+        };
 
         Ok(Outcome {
             review: Some(parsed.text),
@@ -4924,9 +4925,10 @@ impl Job {
             // capture plus the fresh-vs-resumed framing only `run` holds, and `active` from the
             // entry the walk settled on.
             disposition: None,
-            // Likewise filled in by `run`, which holds the capture. Rides the successful outcome
-            // for the response; a failed attempt renders as an error and shows no `captured:` line.
-            capture_summary: None,
+            // A git turn's summary of what was served, built above while the serve record exists;
+            // `run` substitutes a static capture (Perforce) when it has one. Rides the successful
+            // outcome for the response; a failed attempt renders as an error with no `captured:`.
+            capture_summary: served_summary,
             resumable,
             usage: parsed.usage,
             active: None,
@@ -5534,10 +5536,11 @@ fn read_serve_record_aggregate(cfg: &Config, nonce: &str) -> DiffServeAggregate 
 /// Build the caller-facing `captured:` summary for a git review from the serve-record's canonical
 /// operation (mechanism 5) — reporting what the evidence server served the reviewer on demand, in
 /// place of the retired static capture. `None` when no canonical diff was served, so no `captured:`
-/// line is rendered (which is also the shape the gate already failed an approval on).
-fn serve_record_capture_summary(cfg: &Config, nonce: &str) -> Option<crate::vcs::CaptureSummary> {
-    let agg = read_serve_record_aggregate(cfg, nonce);
-    let c = agg.canonical?;
+/// line is rendered (which is also the shape the gate already failed an approval on). Takes the
+/// aggregate rather than reading the file, because the caller must read it before the record is
+/// removed (#143).
+fn capture_summary_from(agg: &DiffServeAggregate) -> Option<crate::vcs::CaptureSummary> {
+    let c = agg.canonical.clone()?;
     Some(crate::vcs::CaptureSummary::Git {
         range: c.base,
         files: c.files,
@@ -9733,5 +9736,77 @@ mod turn_end_hook_tests {
         assert!(o.resumable);
         // Still attestable: the review converged; only the hook failed.
         assert!(o.attestable.is_some());
+    }
+}
+
+/// Issue #143: a git review's `captured:` line is built from the serve record, which only exists
+/// while `attempt` holds it.
+#[cfg(test)]
+mod captured_summary_tests {
+    use super::*;
+
+    fn canonical_op(complete: bool) -> String {
+        format!(
+            r#"{{"op":"x","canonical":true,"complete":{complete},"terminal":true,"digest":"{}","base":"{}","base_source":"merge-base(HEAD, refs/remotes/origin/HEAD)","files":3,"insertions":10,"deletions":2,"untracked":1}}"#,
+            "d".repeat(64),
+            "a".repeat(40)
+        )
+    }
+
+    #[test]
+    fn a_served_canonical_diff_yields_a_captured_summary() {
+        let summary = capture_summary_from(&aggregate_serve_records(&canonical_op(true)))
+            .expect("a complete canonical op is summarised");
+        let crate::vcs::CaptureSummary::Git {
+            range,
+            files,
+            insertions,
+            deletions,
+            untracked_files,
+            complete,
+            ..
+        } = summary
+        else {
+            panic!("not a git summary");
+        };
+        assert_eq!(range, "merge-base(HEAD, refs/remotes/origin/HEAD)");
+        assert_eq!(
+            (files, insertions, deletions, untracked_files),
+            (3, 10, 2, 1)
+        );
+        assert!(complete);
+        // Nothing served whole, nothing claimed.
+        assert!(capture_summary_from(&aggregate_serve_records(&canonical_op(false))).is_none());
+        assert!(capture_summary_from(&aggregate_serve_records("")).is_none());
+    }
+
+    /// The bug itself: the record `attempt` owns is deleted when its handle drops, so the summary
+    /// must be built while the handle is alive. A read after the drop finds nothing — which is what
+    /// `run` used to do, and why every git review reported `captured: null`.
+    #[test]
+    fn the_serve_record_is_gone_once_its_handle_drops() {
+        let state = crate::testutil::temp_dir("captured-lifetime");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+            "--state-dir".into(),
+            state.as_path().to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let nonce = "rv-143-1";
+        let path = crate::evidence::serve_record_path(&cfg, nonce).expect("path");
+        std::fs::write(&path, canonical_op(true)).unwrap();
+        let handle = crate::evidence::BundleFile { path };
+
+        let while_held = capture_summary_from(&read_serve_record_aggregate(&cfg, nonce));
+        assert!(
+            while_held.is_some(),
+            "the summary is available while attempt holds the record"
+        );
+        drop(handle);
+        let after_drop = capture_summary_from(&read_serve_record_aggregate(&cfg, nonce));
+        assert!(after_drop.is_none(), "a read after the drop finds nothing");
     }
 }

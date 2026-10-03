@@ -359,6 +359,13 @@ COUNTER=1
         ($sc.PSObject.Properties.Name -join ',')
     Assert-That 'a turn that ran names the reviewer that ran it' `
         ($sc.reviewer -is [string]) "reviewer=$($sc.reviewer)"
+    # Issue #143: a git review that converged was served the whole canonical diff (the approval
+    # floor requires it), so it must say what it was served. The summary used to be built after the
+    # serve record was deleted, and every git review reported captured: null.
+    if ($sc.outcome -eq 'converged') {
+        Assert-That 'a converged git review reports what it was served' `
+            ($sc.captured -is [string] -and $sc.captured.Length -gt 0) "captured=$($sc.captured)"
+    }
     Write-Host $resultText
 
     Write-Host "`n=== 5. resuming the same review session ===" -ForegroundColor Cyan
