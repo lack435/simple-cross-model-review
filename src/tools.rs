@@ -923,9 +923,8 @@ impl App {
                     // Narrowing `cwd` loosens every "this directory is outside the working root"
                     // check (the neutral, sterile and capability directories): a state directory
                     // inside the repository but outside the worktree would pass them. Refuse that
-                    // configuration rather than audit each check. With the state directory outside
-                    // the server root, those checks answer exactly as they do for the server root.
-                    if crate::reviewer::is_within(&self.cfg.state_dir, &self.cfg.cwd) {
+                    // configuration rather than audit each check (see `state_dir_is_outside`).
+                    if !crate::worktree::state_dir_is_outside(&self.cfg.state_dir, &self.cfg.cwd) {
                         return Err(errors::bad_request(format!(
                             "'root' cannot be used while the state directory ({}) is inside the \
                              working root; point --state-dir outside the repository, or review \

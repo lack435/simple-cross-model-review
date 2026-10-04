@@ -53,8 +53,45 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     Some(crate::config::normalize_dir(resolved))
 }
 
+/// Exact identity of two canonical paths. Deliberately not case-folded: `canonical` already returns
+/// each directory's on-disk spelling, so two spellings of one directory compare equal here, while a
+/// distinct sibling in a per-directory case-sensitive tree (differing only by case) does not.
 fn same(a: &Path, b: &Path) -> bool {
-    crate::pathcmp::identity_eq_str(&a.to_string_lossy(), &b.to_string_lossy())
+    a == b
+}
+
+/// Whether canonical `path` lies strictly inside canonical `root`, compared component by component
+/// and exactly (see [`same`]), so containment is judged on physical directories, not on a
+/// case-folded spelling.
+fn strictly_within(path: &Path, root: &Path) -> bool {
+    path != root && path.starts_with(root)
+}
+
+/// The physical location of `path`: canonicalized when it exists, else its nearest existing
+/// ancestor canonicalized with the remaining components re-joined, so a junction anywhere along it
+/// is followed. `None` when no ancestor resolves.
+fn physical(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Some(mut resolved) = canonical(cur) {
+            resolved.extend(rest.iter().rev());
+            return Some(resolved);
+        }
+        rest.push(cur.file_name()?.to_owned());
+        cur = cur.parent()?;
+    }
+}
+
+/// Whether the state directory is physically outside the server's working root. A worktree root
+/// narrows `cwd`, which loosens every "this directory is outside the working root" check (the
+/// neutral, sterile and capability directories); with the state directory physically outside the
+/// server root, those checks answer for the worktree exactly as they do for the server root.
+/// Judged on the physical path, so a `--state-dir` junction into the repository is caught, and
+/// case-folded, which refuses more rather than less. Unresolvable reads as inside (fail closed).
+pub fn state_dir_is_outside(state_dir: &Path, server_root: &Path) -> bool {
+    let server = canonical(server_root).unwrap_or_else(|| server_root.to_path_buf());
+    physical(state_dir).is_some_and(|dir| !crate::reviewer::is_within(&dir, &server))
 }
 
 /// Resolve a caller-supplied `root` against the server's working root. `Ok` is the canonical
@@ -72,10 +109,16 @@ pub fn resolve(server_root: &Path, requested: &str) -> Result<PathBuf, String> {
             "'root' {requested:?} does not exist or cannot be resolved."
         ));
     };
-    if same(&root, server_root) {
+    let Some(server) = canonical(server_root) else {
+        return Err(format!(
+            "this server's working root {} cannot be resolved.",
+            server_root.display()
+        ));
+    };
+    if same(&root, &server) {
         return Ok(server_root.to_path_buf());
     }
-    if !crate::reviewer::is_within(&root, server_root) {
+    if !strictly_within(&root, &server) {
         return Err(format!(
             "'root' {} is outside this server's working root {}. Only a git worktree nested \
              inside the working root can be reviewed (for example <repo>\\.claude\\worktrees\\<name>).",
@@ -233,6 +276,40 @@ pub(crate) mod tests {
         let outside = repo.parent().unwrap();
         let err = resolve(&repo, &outside.to_string_lossy()).unwrap_err();
         assert!(err.contains("outside this server's working root"), "{err}");
+    }
+
+    /// Exactness does not break the ordinary case-insensitive volume: another spelling of the same
+    /// directory canonicalizes to its on-disk name and is accepted as that worktree.
+    #[test]
+    fn a_differently_cased_spelling_of_the_worktree_resolves_to_it() {
+        let (_dir, repo, wt) = repo_with_worktree("wt-case");
+        let got = resolve(&repo, ".CLAUDE/Worktrees/B").unwrap();
+        assert_eq!(got, wt);
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let out = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd runs");
+        assert!(out.status.success(), "mklink /J failed");
+    }
+
+    /// Review f1: a state directory spelled outside the repository but junctioned into it is
+    /// physically inside, and is caught; so is a not-yet-created directory below that junction.
+    #[test]
+    fn a_state_dir_junctioned_into_the_repository_is_inside() {
+        let (_dir, repo, _wt) = repo_with_worktree("wt-state-junction");
+        let elsewhere = crate::testutil::temp_dir("wt-state-junction-out");
+        std::fs::create_dir_all(repo.join("state")).unwrap();
+        let link = elsewhere.as_path().join("state-link");
+        junction(&link, &repo.join("state"));
+        assert!(!state_dir_is_outside(&link, &repo));
+        assert!(!state_dir_is_outside(&link.join("not-yet"), &repo));
+        assert!(!state_dir_is_outside(&repo.join("state"), &repo));
+        assert!(state_dir_is_outside(elsewhere.as_path(), &repo));
     }
 
     #[test]
