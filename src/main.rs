@@ -38,6 +38,7 @@ mod usage;
 mod vcs;
 mod winjob;
 mod winsec;
+mod worktree;
 
 use std::sync::Arc;
 

@@ -437,6 +437,14 @@ pub fn resolve_commit(
     }
 }
 
+/// `git worktree list --porcelain` for the repository at `root`, through the same isolated runner
+/// as every other evidence command. The per-call review root (issue #146) is accepted only when it
+/// is one of the entries this lists.
+pub fn list_worktrees(root: &Path, limits: &Limits) -> Result<String, EvidenceError> {
+    let args = ["worktree", "list", "--porcelain"].map(String::from);
+    run(root, &args, limits, &AtomicBool::new(false), Instant::now())
+}
+
 /// The merge-base of two commits — the branch's fork point when called as `merge_base(HEAD,
 /// upstream)`. `None` when the two share no history. Both arguments are full object ids the handler
 /// already resolved and validated.

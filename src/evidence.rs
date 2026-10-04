@@ -563,6 +563,7 @@ pub fn write_claude_mcp_config(
 /// The converged-hook binding check's two git reads (issue #142), exposed from the private `core`
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
 pub use core::{committed_change_digest, resolve_head};
+pub use git::list_worktrees;
 
 /// The nonce-bound serve-record file for one review (retire-capture-modes mechanism 3). Deterministic
 /// from the capability dir and nonce, so the child (`serve_stdio`, deriving it from the bundle's own

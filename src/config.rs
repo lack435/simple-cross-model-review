@@ -2212,7 +2212,7 @@ fn resolve_hook_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn normalize_dir(dir: PathBuf) -> PathBuf {
+pub(crate) fn normalize_dir(dir: PathBuf) -> PathBuf {
     let resolved = dir.canonicalize().unwrap_or(dir);
     let text = resolved.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {

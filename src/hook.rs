@@ -98,6 +98,9 @@ pub struct Attestable {
     pub effort: String,
     /// The configured `--reviewer` chain index of the entry that ran; `0` is the primary.
     pub chain_index: usize,
+    /// The root this turn reviewed: the server's working root, or the worktree the call named
+    /// (issue #146). An attest checks the binding against, and fires the hook in, this root.
+    pub root: PathBuf,
 }
 
 /// What fired the hook.
@@ -196,26 +199,26 @@ impl HookReport {
 /// Runs the hook program. A trait so the gating and attest logic are testable with a recording fake
 /// (the issue's "fake status sink"); production uses [`ProcessRunner`].
 pub trait HookRunner: Send + Sync {
-    /// Run the hook with `payload` on stdin. The returned report's `captured_head` is filled in by
-    /// [`fire`], not here.
-    fn run(&self, payload: &str) -> HookReport;
+    /// Run the hook in `root` with `payload` on stdin. The returned report's `captured_head` is
+    /// filled in by [`fire`], not here. `root` is per call, not per runner: a review of a worktree
+    /// (issue #146) attests that worktree's `HEAD`, from inside it.
+    fn run(&self, root: &Path, payload: &str) -> HookReport;
 }
 
-/// The production runner: a contained child process in the working root.
+/// The production runner: a contained child process in the reviewed root.
 pub struct ProcessRunner {
     cfg: HookConfig,
-    root: PathBuf,
 }
 
 impl ProcessRunner {
-    pub fn new(cfg: HookConfig, root: PathBuf) -> Self {
-        Self { cfg, root }
+    pub fn new(cfg: HookConfig) -> Self {
+        Self { cfg }
     }
 }
 
 impl HookRunner for ProcessRunner {
-    fn run(&self, payload: &str) -> HookReport {
-        run_process(&self.cfg, &self.root, payload, JobObject::new)
+    fn run(&self, root: &Path, payload: &str) -> HookReport {
+        run_process(&self.cfg, root, payload, JobObject::new)
     }
 }
 
@@ -286,7 +289,7 @@ pub fn fire(
         Ok(head) => head,
         Err(report) => return report,
     };
-    let mut report = runner.run(&payload(att, &head, trigger, root));
+    let mut report = runner.run(root, &payload(att, &head, trigger, root));
     report.captured_head = Some(head);
     report
 }
@@ -520,7 +523,7 @@ mod tests {
     }
 
     impl HookRunner for Recording {
-        fn run(&self, payload: &str) -> HookReport {
+        fn run(&self, _root: &Path, payload: &str) -> HookReport {
             self.calls.lock().unwrap().push(payload.to_string());
             let mut r = HookReport::with(HookStatus::Succeeded, None);
             r.exit_code = Some(0);
@@ -541,6 +544,7 @@ mod tests {
             model: "gpt-5.6-luna".into(),
             effort: "xhigh".into(),
             chain_index: 0,
+            root: PathBuf::from("."),
         }
     }
 
