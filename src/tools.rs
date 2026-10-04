@@ -507,8 +507,7 @@ impl App {
         // Read before `cfg` moves into the Arc below.
         let cfg_max_concurrent = cfg.max_concurrent_reviews;
         let hook_runner = cfg.on_converged.clone().map(|hook| {
-            Arc::new(crate::hook::ProcessRunner::new(hook, cfg.cwd.clone()))
-                as Arc<dyn crate::hook::HookRunner>
+            Arc::new(crate::hook::ProcessRunner::new(hook)) as Arc<dyn crate::hook::HookRunner>
         });
         Self {
             cfg: Arc::new(cfg),
@@ -901,6 +900,50 @@ impl App {
             }
         }
 
+        // The per-call review root (issue #146): one of this repository's own git worktrees, nested
+        // inside the working root. Resolved here -- before the lease and any preflight, so a bad
+        // root costs nothing -- into a config whose `cwd` is that worktree. Everything root-scoped
+        // downstream (resume identity, evidence eligibility, the evidence bundle, read rules,
+        // prompt, session record, converged hook) reads `cfg`; what belongs to the server and not
+        // the root (state dir, launch root and the profile allowlist keyed on it, preflight, usage
+        // keys) keeps reading `self.cfg`.
+        let cfg: Arc<Config> = match args.get("root") {
+            None | Some(Value::Null) => Arc::clone(&self.cfg),
+            Some(Value::String(s)) if !s.trim().is_empty() => {
+                if self.cfg.vcs != crate::config::Vcs::Git {
+                    return Err(errors::bad_request(
+                        "'root' selects a git worktree, but this working root is Perforce. Omit it.",
+                    ));
+                }
+                let root = crate::worktree::resolve(&self.cfg.cwd, s.trim())
+                    .map_err(errors::bad_request)?;
+                if root == self.cfg.cwd {
+                    Arc::clone(&self.cfg)
+                } else {
+                    // Narrowing `cwd` loosens every "this directory is outside the working root"
+                    // check (the neutral, sterile and capability directories): a state directory
+                    // inside the repository but outside the worktree would pass them. Refuse that
+                    // configuration rather than audit each check (see `state_dir_is_outside`).
+                    if !crate::worktree::state_dir_is_outside(&self.cfg.state_dir, &self.cfg.cwd) {
+                        return Err(errors::bad_request(format!(
+                            "'root' cannot be used while the state directory ({}) is inside the \
+                             working root; point --state-dir outside the repository, or review \
+                             from the working root.",
+                            self.cfg.state_dir.display()
+                        )));
+                    }
+                    let mut scoped = (*self.cfg).clone();
+                    scoped.cwd = root;
+                    Arc::new(scoped)
+                }
+            }
+            Some(_) => {
+                return Err(errors::bad_request(
+                    "'root' must be a non-empty path to a git worktree of this repository.",
+                ))
+            }
+        };
+
         let changes = parse_change_arg(args)?;
         // Parsed strictly rather than coerced: a non-boolean silently becoming `false` would
         // drop a caller's intent to review a shelf without any error.
@@ -1039,7 +1082,7 @@ impl App {
         // survives for the not-stale ones.
         if let Some(record) = &prior {
             if let Some(reason) = resume_block(
-                &self.cfg,
+                &cfg,
                 record,
                 &changes_canonical,
                 expected_kind,
@@ -1059,10 +1102,9 @@ impl App {
         // here -- the mode is judged on the exact entry that will run, never a default. A record
         // predating the field reads as "project". See `docs/resume-cache-cwd-invalidation.md`.
         let prior = match prior {
-            Some(record) => match self.cfg.resume_entry_index(&record) {
+            Some(record) => match cfg.resume_entry_index(&record) {
                 Some(entry) => {
-                    let now_mode =
-                        crate::reviewer::reviewer_cwd_mode(&self.cfg, &self.cfg.reviewers[entry]);
+                    let now_mode = crate::reviewer::reviewer_cwd_mode(&cfg, &cfg.reviewers[entry]);
                     let then_mode = record
                         .reviewer_cwd_mode
                         .as_deref()
@@ -1135,20 +1177,19 @@ impl App {
         // is checked. See `docs/cross-model-consult-plan.md` (f3).
         if is_consult {
             let incapable = if prior.is_some() {
-                (!entry_provides_evidence(&self.cfg, &self.cfg.reviewers[start_index]))
-                    .then_some(start_index)
+                (!entry_provides_evidence(&cfg, &cfg.reviewers[start_index])).then_some(start_index)
             } else {
-                first_evidence_incapable_entry(&self.cfg, start_index)
+                first_evidence_incapable_entry(&cfg, start_index)
             };
             if let Some(idx) = incapable {
-                let spec = &self.cfg.reviewers[idx];
+                let spec = &cfg.reviewers[idx];
                 return Err(errors::evidence_unavailable(format!(
                     "a consult requires the read-only evidence service, but reviewer entry #{} ({}) \
                      cannot provide it: {}; a consult reachable from this chain could run on it. \
                      {EVIDENCE_CAPABLE_REVIEWER_HINT}",
                     idx,
                     spec.describe(),
-                    evidence_ineligibility(&self.cfg, spec).unwrap_or("unknown reason"),
+                    evidence_ineligibility(&cfg, spec).unwrap_or("unknown reason"),
                 )));
             }
         }
@@ -1247,8 +1288,10 @@ impl App {
             return Err(errors::cancelled());
         }
 
+        let server_root = (cfg.cwd != self.cfg.cwd).then(|| self.cfg.cwd.clone());
+        let review_root = server_root.is_some().then(|| cfg.cwd.clone());
         let job = Job {
-            cfg: Arc::clone(&self.cfg),
+            cfg,
             reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
             spec: self.cfg.reviewers[start_index].clone(),
             start_index,
@@ -1317,6 +1360,7 @@ impl App {
             cancel,
             _lease: Some(lease),
             hook_runner: self.hook_runner.clone(),
+            server_root,
         };
 
         let spawned = std::thread::Builder::new()
@@ -1366,6 +1410,9 @@ impl App {
         // understates the effort a review actually runs at (docs/review-levels-plan.md §4b / f6).
         if let Some(line) = &level_report_line {
             out.push_str(&format!("{line}\n"));
+        }
+        if let Some(root) = &review_root {
+            out.push_str(&format!("root:      {}\n", root.display()));
         }
         if !changes.is_empty() {
             out.push_str(&format!(
@@ -2378,9 +2425,16 @@ impl App {
         if !still_latest || later_turn_unrecorded {
             return Ok(render(HookReport::skipped(reason::NOT_LATEST_TURN)));
         }
+        // A worktree review (issue #146) attests that worktree, so it must still be one.
+        if let Err(why) = crate::worktree::recheck(&self.cfg.cwd, &att.root) {
+            return Ok(render(HookReport::skipped(format!(
+                "{}: {why}",
+                reason::BINDING_CHECK_FAILED
+            ))));
+        }
         Ok(render(crate::hook::fire(
             runner,
-            &self.cfg.cwd,
+            &att.root,
             &att,
             crate::hook::Trigger::Attest,
         )))
@@ -2512,6 +2566,10 @@ struct Job {
     /// See [`App::hook_runner`]. Fired at the end of a converged git review turn, while this job
     /// still holds the session lease.
     hook_runner: Option<Arc<dyn crate::hook::HookRunner>>,
+    /// The server's own working root, set only when this job reviews a worktree named by the
+    /// call's `root` (issue #146; `cfg.cwd` is then that worktree). Used to re-check the worktree
+    /// just before the evidence bundle pins it.
+    server_root: Option<PathBuf>,
 }
 
 /// The capture's outputs that `attempt` threads onward: the rendered change goes into the
@@ -3307,6 +3365,7 @@ impl Job {
             model: self.spec.model.clone(),
             effort: self.spec.effort.clone(),
             chain_index: ran_index.unwrap_or(self.start_index),
+            root: self.cfg.cwd.clone(),
         })
     }
 
@@ -3928,6 +3987,10 @@ impl Job {
                 } else {
                     format!("{}\n{}", change_label, capture_warnings.join("\n"))
                 };
+                if let Some(server_root) = &self.server_root {
+                    crate::worktree::recheck(server_root, &self.cfg.cwd)
+                        .map_err(errors::evidence_unavailable)?;
+                }
                 let bundle = crate::evidence::Bundle::create(
                     &self.cfg.cwd,
                     self.cfg.vcs,
@@ -8301,6 +8364,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
             hook_runner: None,
+            server_root: None,
         }
     }
 
@@ -8476,6 +8540,115 @@ mod tests {
             assert_eq!(err.code, "BAD_REQUEST", "level={bad:?}");
             assert!(err.summary.contains("level"), "{}", err.summary);
         }
+    }
+
+    /// An app serving a fresh repository that has a linked worktree at `.claude/worktrees/b`, with
+    /// its state directory outside the repository.
+    fn worktree_app(tag: &str) -> (Vec<crate::testutil::TempDir>, App, PathBuf) {
+        let (repo_dir, repo, wt) = crate::worktree::tests::repo_with_worktree(tag);
+        let state = crate::testutil::temp_dir(&format!("{tag}-state"));
+        let app = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
+                "--vcs".into(),
+                "git".into(),
+                "--cwd".into(),
+                repo.to_string_lossy().into_owned(),
+                "--state-dir".into(),
+                state.to_string_lossy().into_owned(),
+            ])
+            .expect("cfg"),
+        );
+        (vec![repo_dir, state], app, wt)
+    }
+
+    /// Issue #146: a bad `root` is a request error, refused before the lease, and never reaches a
+    /// reviewer -- whether malformed, outside the working root, or not one of its worktrees.
+    #[test]
+    fn a_root_that_is_not_a_nested_worktree_is_refused() {
+        let (_dirs, app, _wt) = worktree_app("root-refused");
+        std::fs::create_dir_all(app.cfg.cwd.join("src")).unwrap();
+        let outside = app.cfg.cwd.parent().unwrap().to_string_lossy().into_owned();
+        for (root, want) in [
+            (json!(123), "must be a non-empty path"),
+            (json!("  "), "must be a non-empty path"),
+            (json!(outside), "outside this server's working root"),
+            (json!("src"), "not a git worktree"),
+            (json!(".claude/worktrees/missing"), "does not exist"),
+        ] {
+            for start in [App::start_review, App::start_consult] {
+                let err = start(
+                    &app,
+                    &json!({"instructions": "look", "question": "q", "root": root}),
+                    &RequestCancel::new(),
+                )
+                .unwrap_err();
+                assert_eq!(err.code, "BAD_REQUEST", "root={root}");
+                assert!(err.summary.contains(want), "root={root}: {}", err.summary);
+            }
+        }
+    }
+
+    #[test]
+    fn a_perforce_server_refuses_root() {
+        let app = App::new(
+            Config::from_args(&[
+                "--reviewer".into(),
+                "codex".into(),
+                "--level".into(),
+                "standard:gpt-5.6-luna:max".into(),
+                "--vcs".into(),
+                "perforce".into(),
+            ])
+            .expect("cfg"),
+        );
+        let err = app
+            .start_review(
+                &json!({"instructions": "look", "change": "1", "root": "wt"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains("Perforce"), "{}", err.summary);
+    }
+
+    /// A state directory inside the repository would sit outside a nested worktree, which would
+    /// pass the "outside the working root" checks on the neutral, sterile and capability
+    /// directories. That configuration refuses `root` rather than loosen them.
+    #[test]
+    fn root_is_refused_while_the_state_dir_is_inside_the_repository() {
+        let (_dirs, app, _wt) = worktree_app("root-state-inside");
+        let mut cfg = (*app.cfg).clone();
+        cfg.state_dir = cfg.cwd.join(".cross-review-state");
+        let app = App::new(cfg);
+        let err = app
+            .start_review(
+                &json!({"instructions": "look", "root": ".claude/worktrees/b"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(err.summary.contains("state directory"), "{}", err.summary);
+    }
+
+    /// The session is bound to the root that created it: a session started on the working root is
+    /// not resumed against a worktree (and so, symmetrically, the reverse). This is the existing
+    /// cwd identity gate, reached because the per-call config carries the worktree as `cwd`.
+    #[test]
+    fn a_session_is_not_resumed_against_a_different_root() {
+        let (_dirs, app, _wt) = worktree_app("root-resume");
+        seed_resumable_record(&app, "feature");
+        let err = app
+            .start_review(
+                &json!({"instructions": "look", "session": "feature", "root": ".claude/worktrees/b"}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "SESSION_NOT_RESUMABLE", "{}", err.summary);
+        assert!(format!("{err:?}").contains("working root"), "{err:?}");
     }
 
     /// A turn in which no reviewer ran reports no reviewer, no capture and no disposition — on
@@ -9084,7 +9257,7 @@ mod converged_hook_tests {
     }
 
     impl HookRunner for Recording {
-        fn run(&self, payload: &str) -> HookReport {
+        fn run(&self, _root: &std::path::Path, payload: &str) -> HookReport {
             self.calls.lock().unwrap().push(payload.to_string());
             if let Some((lock, got)) = &self.lease_probe {
                 let acquired = ExclusiveLock::acquire(lock, Duration::from_millis(50)).is_ok();
@@ -9219,6 +9392,7 @@ mod converged_hook_tests {
             model: "gpt-5.6-luna".into(),
             effort: "max".into(),
             chain_index: 0,
+            root: f.app.cfg.cwd.clone(),
         });
         f.app.registry().finish(
             &id,
@@ -9477,7 +9651,7 @@ mod turn_end_hook_tests {
     }
 
     impl HookRunner for Fixed {
-        fn run(&self, payload: &str) -> HookReport {
+        fn run(&self, _root: &std::path::Path, payload: &str) -> HookReport {
             self.calls.lock().unwrap().push(payload.to_string());
             HookReport {
                 status: self.status,
@@ -9614,6 +9788,7 @@ mod turn_end_hook_tests {
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
             hook_runner: Some(hook),
+            server_root: None,
         }
     }
 

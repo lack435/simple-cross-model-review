@@ -1245,6 +1245,32 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     }
 
+    // The per-call review root (issue #146) selects one of this repository's git worktrees, so a
+    // Perforce server never advertises it (and refuses it if passed).
+    if cfg.vcs == crate::config::Vcs::Git {
+        let root_prop = json!({
+            "type": "string",
+            "description":
+                "Optional. Review a git worktree of this repository instead of the server's working \
+                 root -- for example a parallel fix in <repo>/.claude/worktrees/<name> -- without \
+                 switching the main checkout's branch. Must be nested inside the working root and \
+                 listed by `git worktree list`; a relative path is taken from the working root. The \
+                 change is that worktree's branch against its fork point, and the session is bound to \
+                 it: a resume must name the same root (use fresh:true to move)."
+        });
+        for tool in tools.iter_mut() {
+            let is_start = matches!(
+                tool["name"].as_str(),
+                Some("cross_model_review") | Some("cross_model_consult")
+            );
+            if is_start {
+                if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+                    props.insert("root".to_string(), root_prop.clone());
+                }
+            }
+        }
+    }
+
     // The review "level" preset is advertised only when the primary entry declares at least one
     // level. A server with no levels behaves exactly as before: no `level` property, and
     // additionalProperties:false rejects a stray one. The advertised menu is the primary's — the
@@ -1427,7 +1453,7 @@ mod tests {
     fn the_attest_tool_is_offered_only_with_a_hook() {
         struct Never;
         impl crate::hook::HookRunner for Never {
-            fn run(&self, _payload: &str) -> crate::hook::HookReport {
+            fn run(&self, _root: &std::path::Path, _payload: &str) -> crate::hook::HookReport {
                 unreachable!("no review exists to attest")
             }
         }

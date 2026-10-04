@@ -210,6 +210,15 @@ disabled (`diff.external`, textconv, `core.fsmonitor`); `repository_diff` accept
 ids or a closed sentinel set, never a raw ref or option. Full behavior:
 [`docs/retire-capture-modes.md`](docs/retire-capture-modes.md).
 
+To review a **git worktree** of the served repository instead of the working root — say, a parallel
+fix an agent built in `<repo>\.claude\worktrees\<name>` — pass its path as `root` to
+`cross_model_review` or `cross_model_consult`, with no branch switch in the main checkout. The root
+must be listed by `git worktree list` *and* nested inside the working root; anything else is refused,
+so the reviewer's read scope only ever narrows. The change is that worktree's branch against its own
+fork point, the converged hook attests that worktree's `HEAD`, and the session is bound to the root
+that started it. `root` is refused while `--state-dir` lies inside the repository. Account
+authorization is unaffected: it stays keyed on the directory the server was launched from.
+
 For **Perforce** (`--vcs perforce`, or `auto` in a workspace with no `.git`), the change is an
 explicit list of changelists named per call in the `change` argument (`"43650"`,
 `"43650,43651"`, or `["43650","43651"]`); it is required, with no default. Details, including
