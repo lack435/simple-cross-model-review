@@ -586,6 +586,28 @@ fn the_auth_preflight_never_runs_inside_the_reviewed_project() {
 }
 
 #[test]
+fn a_state_dir_junctioned_into_the_project_is_not_the_neutral_dir() {
+    // Issue #148: a `--state-dir` spelled outside the project but junctioned into it is physically
+    // inside, so the neutral directory must fall back to temp rather than run from it.
+    let root = crate::testutil::temp_dir("neutral-dir-junction");
+    let project = root.as_path().join("project");
+    let elsewhere = root.as_path().join("elsewhere");
+    std::fs::create_dir_all(project.join("state")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let link = elsewhere.join("state");
+    assert!(
+        crate::testutil::make_junction(&link, &project.join("state")),
+        "mklink /J failed"
+    );
+    let cfg = config_at(&project, Some(&link), &["claude"]);
+    assert_eq!(crate::reviewer::neutral_dir(&cfg), std::env::temp_dir());
+
+    // Control: a state directory that really is outside the project is still used.
+    let cfg = config_at(&project, Some(&elsewhere), &["claude"]);
+    assert_eq!(crate::reviewer::neutral_dir(&cfg), elsewhere);
+}
+
+#[test]
 fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
     let root = crate::testutil::temp_dir("codex-sterile-root");
     let state = crate::testutil::temp_dir("codex-sterile-state");

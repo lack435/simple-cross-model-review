@@ -89,6 +89,7 @@ fn physical(path: &Path) -> Option<PathBuf> {
 /// server root, those checks answer for the worktree exactly as they do for the server root.
 /// Judged on the physical path, so a `--state-dir` junction into the repository is caught, and
 /// case-folded, which refuses more rather than less. Unresolvable reads as inside (fail closed).
+/// Also `reviewer::neutral_dir`'s check (issue #148), against whatever `cwd` it is given.
 pub fn state_dir_is_outside(state_dir: &Path, server_root: &Path) -> bool {
     let server = canonical(server_root).unwrap_or_else(|| server_root.to_path_buf());
     physical(state_dir).is_some_and(|dir| !crate::reviewer::is_within(&dir, &server))
