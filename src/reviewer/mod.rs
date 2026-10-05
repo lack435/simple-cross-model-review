@@ -321,18 +321,18 @@ impl Drop for SterileDir {
 /// is user-settable via `--state-dir`, and its own fallback puts it under the project when
 /// no profile base resolves. A state directory inside the project would make this "neutral"
 /// directory anything but, so that case is rejected in favour of the temp directory.
+///
+/// Judged on the state directory's physical location (issue #148): `--state-dir` is kept as
+/// spelled, so a path written outside the project but junctioned into it would pass a lexical
+/// check while sitting physically inside. One that cannot be resolved reads as inside.
 pub fn neutral_dir(cfg: &Config) -> PathBuf {
-    if cfg.state_dir.is_dir() && !is_within(&cfg.state_dir, &cfg.cwd) {
+    if cfg.state_dir.is_dir() && crate::worktree::state_dir_is_outside(&cfg.state_dir, &cfg.cwd) {
         cfg.state_dir.clone()
     } else {
         std::env::temp_dir()
     }
 }
 
-/// Is `path` inside `root`? Compared case-insensitively, as Windows paths are.
-///
-/// Shared with the diff capture, which uses it as a security check rather than a
-/// convenience, so there is deliberately one implementation and not two.
 /// The user's home directory, for locating a CLI's local account/session files. Honours the
 /// platform's usual variables (`USERPROFILE` on Windows, then `HOME`). `None` if neither is set.
 pub fn home_dir() -> Option<PathBuf> {
@@ -895,6 +895,14 @@ pub fn assert_profile_identity(
     Ok(())
 }
 
+/// Is `path` inside `root`? Compared case-insensitively, as Windows paths are.
+///
+/// Lexical only: it compares the spellings it is given and follows no junction or symlink. A
+/// caller asking where a directory physically is must resolve both sides first, as the sterile
+/// and capability directories do and `worktree::state_dir_is_outside` does for `neutral_dir`.
+///
+/// Shared with the Perforce change capture, which uses it as a security check rather than a
+/// convenience, so there is deliberately one implementation and not two.
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let path = normalize_windows_path(path);
     let root = normalize_windows_path(root);
