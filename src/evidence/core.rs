@@ -83,6 +83,16 @@ static LIVE_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_WALK_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const WALK_WORKER_CAP: usize = 3;
 
+/// The most wall-clock one `repository_search` spends walking and scanning before it answers with
+/// what it has (issue #151). The request budget alone was not enough: the dispatcher is serial and
+/// Codex issues evidence calls concurrently (`Promise.all` in its code mode, verified in a rollout),
+/// so a search that spent the whole budget on a large tree left every concurrent sibling queued
+/// behind it to fail. Half the budget lets a second concurrent search still do real work.
+const SEARCH_SLICE_MS: u64 = 10_000;
+/// Kept back from the request budget at the end of a slice for building and writing the response.
+const SEARCH_RESERVE_MS: u64 = 2_000;
+const _: () = assert!(SEARCH_SLICE_MS + SEARCH_RESERVE_MS <= REQUEST_BUDGET_MS);
+
 /// Child-process operations (`repository_history`, `repository_revision`) get a third pool, for the
 /// same reason walks got the second: a wedged Git command must not spend capacity reads need.
 ///
@@ -304,7 +314,7 @@ fn run_bounded_stamp(
         move || {
             let stamp = match &source {
                 Some(paths) => {
-                    accept_git_paths(&root, paths, limits.max_path_bytes as usize, &cancel)
+                    accept_git_paths(&root, paths, limits.max_path_bytes as usize, &cancel, None)
                         .and_then(|(accepted, dropped)| {
                             // A stamp over a set that lost paths is not comparable with one that
                             // did not: the next scan may lose a different set, and the difference
@@ -502,6 +512,8 @@ pub struct Core {
     /// Injecting the bound beats sleeping in a test: the assertion stays deterministic and the
     /// suite stays fast.
     walk_watchdog: &'static ReadWatchdog,
+    /// `SEARCH_SLICE_MS`, injectable for the same reason `walk_watchdog` is.
+    search_slice: Duration,
 }
 
 impl Core {
@@ -539,6 +551,7 @@ impl Core {
             cancel,
             serve_record: None,
             walk_watchdog: &WALK_WATCHDOG,
+            search_slice: Duration::from_millis(SEARCH_SLICE_MS),
         })
     }
 
@@ -593,7 +606,8 @@ impl Core {
                 "request_expired",
                 format!(
                     "the request waited longer than the {REQUEST_BUDGET_MS}ms evidence request \
-                     budget before it could be dispatched; retry it"
+                     budget before it could be dispatched; retry it. The evidence service answers \
+                     one call at a time, so calls issued concurrently queue behind each other"
                 ),
             ));
         }
@@ -797,10 +811,34 @@ impl Core {
             ));
         }
         let path = optional_string(args, "path")?.unwrap_or_default();
+        // The search answers by `stop_at` with whatever it has (issue #151): the walk and the scan
+        // both stop there and report what they did not cover, instead of running on into the hard
+        // deadline and losing everything to an error.
+        let stop_at = search_stop_at(received_at, Instant::now(), self.search_slice);
+        if received_at.elapsed() >= Duration::from_millis(REQUEST_BUDGET_MS - SEARCH_RESERVE_MS) {
+            return Err(EvidenceError::new(
+                "deadline_exceeded",
+                format!(
+                    "this search waited {}s behind concurrent evidence calls and has no time left \
+                     to run; the evidence service answers one call at a time, so issue searches \
+                     one after another (or narrow 'path') rather than many at once",
+                    received_at.elapsed().as_secs()
+                ),
+            ));
+        }
         // Base resolution and the tree walk run together on a bounded worker (#71); the per-file
         // reads below go through the same watchdog as `repository_read` (#61). Every stage of this
         // operation now derives its wait from the one request budget.
-        let (files, walk_complete) = self.resolve_and_walk(&path, received_at)?;
+        let (files, walk_complete) = self.resolve_and_walk(&path, received_at, stop_at)?;
+        // Each per-file read is bounded by the slice rather than the whole request budget: the read
+        // watchdog measures its remaining budget from a receipt, and this is the receipt whose
+        // budget ends at `stop_at` -- never later than the real one, since `stop_at` is inside it.
+        let read_receipt = stop_at
+            .checked_sub(Duration::from_millis(REQUEST_BUDGET_MS))
+            .unwrap_or(received_at);
+        let listed = files.len();
+        let mut searched = 0usize;
+        let mut time_limited = Instant::now() >= stop_at;
         let mut matches = Vec::new();
         let mut source_complete = walk_complete;
         for file in files {
@@ -810,7 +848,12 @@ impl Core {
                     "evidence search was cancelled",
                 ));
             }
-            deadline(received_at, &self.bundle.limits)?;
+            if Instant::now() >= stop_at {
+                time_limited = true;
+                source_complete = false;
+                break;
+            }
+            searched += 1;
             let bytes = match run_bounded_read(
                 ReadJob {
                     target: ReadTarget::Resolved(file.clone()),
@@ -818,11 +861,13 @@ impl Core {
                     max_path_bytes: self.bundle.limits.max_path_bytes as usize,
                     max_file_bytes: self.bundle.limits.max_file_bytes as usize,
                 },
-                received_at,
+                read_receipt,
             ) {
                 Ok(output) => output.bytes,
                 Err(_) => {
                     source_complete = false;
+                    // A read cut off by the slice is the slice ending, whichever file it was on.
+                    time_limited |= Instant::now() >= stop_at;
                     continue;
                 }
             };
@@ -850,13 +895,22 @@ impl Core {
                 break;
             }
         }
-        self.first_page(
+        let mut page = self.first_page(
             "repository_search",
             matches,
             limit,
             "matches",
             source_complete,
-        )
+        )?;
+        // What the scan covered, so a `complete: false` says *why*: a time-limited search can be
+        // continued by narrowing `path`, which a match-capped one does not need.
+        if let Some(object) = page.as_object_mut() {
+            object.insert("files_searched".into(), json!(searched));
+            object.insert("files_unsearched".into(), json!(listed - searched));
+            object.insert("listing_complete".into(), json!(walk_complete));
+            object.insert("time_limited".into(), json!(time_limited));
+        }
+        Ok(page)
     }
 
     fn read(
@@ -1283,6 +1337,7 @@ impl Core {
         &self,
         path: &str,
         received_at: Instant,
+        stop_at: Instant,
     ) -> Result<(Vec<PathBuf>, bool), EvidenceError> {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
@@ -1361,11 +1416,11 @@ impl Core {
             received_at,
             move || {
                 let Some(paths) = &paths else {
-                    return walk_files(&walk_root, &base, &limits, &cancel, received_at)
+                    return walk_files(&walk_root, &base, &limits, &cancel, received_at, stop_at)
                         .map(|(files, complete)| (files, !complete));
                 };
                 let (accepted, dropped) =
-                    accept_git_paths(&walk_root, paths, max_path_bytes, &cancel)?;
+                    accept_git_paths(&walk_root, paths, max_path_bytes, &cancel, Some(stop_at))?;
                 let files = accepted
                     .into_iter()
                     // A path that vanished between the enumeration and the stat has nothing to read.
@@ -1393,12 +1448,23 @@ impl Core {
 
 /// The blocking walk itself, over owned inputs so it can run on a detached worker that borrows
 /// nothing from `Core`.
+/// When a search dispatched at `dispatched` must stop: one `slice` of work, but never past the point
+/// that leaves `SEARCH_RESERVE_MS` of the request budget (measured from receipt) to answer in.
+fn search_stop_at(received_at: Instant, dispatched: Instant, slice: Duration) -> Instant {
+    let budget_end =
+        received_at + Duration::from_millis(REQUEST_BUDGET_MS.saturating_sub(SEARCH_RESERVE_MS));
+    (dispatched + slice).min(budget_end)
+}
+
+/// `stop_at` ends the walk early with the files found so far and `complete: false` (issue #151); the
+/// hard request deadline still errors, as before.
 fn walk_files(
     root: &Path,
     base: &Path,
     limits: &Limits,
     cancel: &AtomicBool,
     start: Instant,
+    stop_at: Instant,
 ) -> Result<(Vec<PathBuf>, bool), EvidenceError> {
     {
         if base.is_file() {
@@ -1411,7 +1477,7 @@ fn walk_files(
             ));
         }
         let mut queue = VecDeque::from([base.to_path_buf()]);
-        let mut files = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
         while let Some(dir) = queue.pop_front() {
             if cancel.load(Ordering::Acquire) {
                 return Err(EvidenceError::new(
@@ -1420,6 +1486,10 @@ fn walk_files(
                 ));
             }
             deadline(start, limits)?;
+            if Instant::now() >= stop_at {
+                files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+                return Ok((files, false));
+            }
             let dir_meta = fs::symlink_metadata(&dir)
                 .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
             if metadata_is_reparse(&dir_meta) {
@@ -1433,10 +1503,19 @@ fn walk_files(
                     "directory changed to resolve outside the repository root",
                 ));
             }
+            // Checked per entry, not only per directory: one huge flat directory is enough to spend
+            // the slice (review f2 on #151).
+            let partial = |mut files: Vec<PathBuf>| {
+                files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+                Ok((files, false))
+            };
             let mut children = Vec::new();
             for entry in
                 fs::read_dir(&dir).map_err(|e| EvidenceError::new("read_failed", e.to_string()))?
             {
+                if Instant::now() >= stop_at {
+                    return partial(files);
+                }
                 let entry = entry.map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
                 if excluded_name(&entry.file_name()) {
                     continue;
@@ -1445,6 +1524,9 @@ fn walk_files(
             }
             children.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
             for child in children {
+                if Instant::now() >= stop_at {
+                    return partial(files);
+                }
                 let meta = fs::symlink_metadata(&child)
                     .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
                 if metadata_is_reparse(&meta) {
@@ -1884,11 +1966,14 @@ struct Accepted {
 /// A path that fails is *skipped*, not fatal: Git listing something this service will not look at
 /// is not an error, and one bad index entry must not lose the whole scan. The returned flag says
 /// whether anything was dropped, so a scan that lost paths cannot report itself whole.
+/// `stop_at`, when given, ends the pass early with the paths accepted so far, reported as `dropped`
+/// so the caller does not read the shorter set as whole (issue #151).
 fn accept_git_paths(
     root: &Path,
     paths: &[String],
     max_path_bytes: usize,
     cancel: &AtomicBool,
+    stop_at: Option<Instant>,
 ) -> Result<(Vec<Accepted>, bool), EvidenceError> {
     let cancelled = || {
         cancel
@@ -1908,6 +1993,10 @@ fn accept_git_paths(
     'paths: for raw in paths {
         if let Some(e) = cancelled() {
             return Err(e);
+        }
+        if stop_at.is_some_and(|t| Instant::now() >= t) {
+            dropped = true;
+            break;
         }
         let Ok(clean) = validate_relative_path(max_path_bytes, raw) else {
             dropped = true;
@@ -2845,6 +2934,80 @@ mod tests {
         }
     }
 
+    /// Issue #151: a search reports what it covered, and one that runs out of its slice answers with
+    /// a partial result rather than an error.
+    #[test]
+    fn a_search_reports_its_coverage_and_answers_partially_when_its_slice_ends() {
+        let dir = temp_dir("evidence-search-slice");
+        for i in 0..5 {
+            fs::write(dir.as_path().join(format!("f{i}.txt")), "needle\n").unwrap();
+        }
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let whole = core
+            .call("repository_search", &json!({"query":"needle"}))
+            .unwrap();
+        assert_eq!(whole["matches"].as_array().unwrap().len(), 5);
+        assert_eq!(whole["files_searched"], 5);
+        assert_eq!(whole["files_unsearched"], 0);
+        assert_eq!(whole["listing_complete"], true);
+        assert_eq!(whole["time_limited"], false);
+        assert_eq!(whole["complete"], true);
+
+        core.search_slice = Duration::ZERO;
+        let cut = core
+            .call("repository_search", &json!({"query":"needle"}))
+            .unwrap();
+        assert_eq!(cut["time_limited"], true);
+        assert_eq!(cut["complete"], false);
+        assert_eq!(cut["files_searched"], 0);
+    }
+
+    /// A request whose budget was spent waiting behind concurrent calls says so, instead of starting
+    /// a search it cannot finish.
+    #[test]
+    fn a_search_whose_budget_was_spent_queued_explains_itself() {
+        let dir = temp_dir("evidence-search-queued");
+        fs::write(dir.as_path().join("a.txt"), "needle\n").unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let queued =
+            Instant::now() - Duration::from_millis(REQUEST_BUDGET_MS - SEARCH_RESERVE_MS + 500);
+        let err = core
+            .call_with_receipt("repository_search", &json!({"query":"needle"}), queued)
+            .unwrap_err();
+        assert_eq!(err.code, "deadline_exceeded");
+        assert!(err.message.contains("concurrent"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_stop_point_is_one_slice_but_never_past_the_reserve() {
+        let now = Instant::now();
+        let slice = Duration::from_millis(SEARCH_SLICE_MS);
+        assert_eq!(search_stop_at(now, now, slice), now + slice);
+        let late = now + Duration::from_millis(REQUEST_BUDGET_MS - SEARCH_RESERVE_MS - 1_000);
+        assert_eq!(
+            search_stop_at(now, late, slice),
+            now + Duration::from_millis(REQUEST_BUDGET_MS - SEARCH_RESERVE_MS)
+        );
+    }
+
+    #[test]
+    fn a_walk_past_its_stop_point_returns_what_it_found_as_incomplete() {
+        let dir = temp_dir("evidence-walk-stop");
+        fs::write(dir.as_path().join("a.txt"), "x").unwrap();
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (files, complete) = walk_files(
+            &root,
+            &root,
+            &Limits::default(),
+            &cancel,
+            Instant::now(),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(files.is_empty() && !complete);
+    }
+
     #[test]
     fn read_list_search_and_change_are_bounded_and_paged() {
         let dir = temp_dir("evidence-core");
@@ -3034,7 +3197,7 @@ mod tests {
         listed.sort();
 
         let cancel = AtomicBool::new(false);
-        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel, None).unwrap();
         let kept: Vec<&str> = accepted.iter().map(|a| a.relative.as_str()).collect();
         assert_eq!(kept, ["keep.txt", "sub/nested.txt", "vanished.txt"]);
         assert!(dropped, "dropping paths must clear the completeness flag");
@@ -3058,7 +3221,7 @@ mod tests {
         let listed = ["tracked.txt".to_string()];
         let cancel = AtomicBool::new(false);
         let stamp = |root: &Path| {
-            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel).unwrap();
+            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel, None).unwrap();
             let rows: Vec<String> = accepted
                 .iter()
                 .map(|a| stamp_row(&a.relative, a.meta.as_ref()))
@@ -3359,7 +3522,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let listed = ["here.txt".to_string(), "gone.txt".to_string()];
-        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel, None).unwrap();
         assert_eq!(accepted.len(), 2);
         assert!(
             !dropped,
@@ -3370,7 +3533,7 @@ mod tests {
         // file, which is the same class of hole as an unreadable one.
         fs::create_dir(root.join("wrong-kind")).unwrap();
         let listed = ["here.txt".to_string(), "wrong-kind".to_string()];
-        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel, None).unwrap();
         assert_eq!(accepted.len(), 1);
         assert!(dropped);
 
@@ -3402,7 +3565,7 @@ mod tests {
             "cancelled"
         );
         assert_eq!(
-            accept_git_paths(&root, &["a.txt".to_string()], 4096, &cancel)
+            accept_git_paths(&root, &["a.txt".to_string()], 4096, &cancel, None)
                 .unwrap_err()
                 .code,
             "cancelled"
@@ -3447,7 +3610,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let listed = ["gone-dir/a.txt".to_string(), "kept.txt".to_string()];
 
-        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel).unwrap();
+        let (accepted, dropped) = accept_git_paths(&root, &listed, 4096, &cancel, None).unwrap();
         assert!(
             !dropped,
             "a removed directory is an observation, not a hole"
@@ -3467,7 +3630,7 @@ mod tests {
         fs::create_dir(root.join("gone-dir")).unwrap();
         fs::write(root.join("gone-dir").join("a.txt"), "here").unwrap();
         let stamp = |root: &Path| {
-            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel).unwrap();
+            let (accepted, _) = accept_git_paths(root, &listed, 4096, &cancel, None).unwrap();
             digest_rows(
                 &accepted
                     .iter()
