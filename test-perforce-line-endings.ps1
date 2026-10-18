@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
   Regression for #130 using synthetic files in a disposable local Perforce server.
+  Also covers a pending delete: its removed content must be captured (follow-up to #151).
   Requires p4, p4d and cargo. No model calls or access to an existing depot.
 #>
 [CmdletBinding()]
@@ -57,6 +58,7 @@ View:
     [IO.File]::WriteAllText((Join-Path $workspace 'a-eol-only.txt'), $large, $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'b-mixed.txt'), $large + "semantic-before`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'c-whitespace.txt'), "space change`ntab change`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $workspace 'd-deleted.txt'), "deleted-line-one`ndeleted-line-two`n", $utf8)
     Invoke-TestP4 add -t text "$workspace\..." | Out-Null
     Invoke-TestP4 submit -d 'Synthetic baseline' | Out-Null
     $created = @"
@@ -69,6 +71,8 @@ Description:
     if (($created -join '') -notmatch 'Change (\d+) created') { throw 'No pending changelist was created.' }
     $env:CROSS_REVIEW_P4_TEST_CL = $Matches[1]
     Invoke-TestP4 edit -c $env:CROSS_REVIEW_P4_TEST_CL "$workspace\..." | Out-Null
+    Invoke-TestP4 revert "$workspace\d-deleted.txt" | Out-Null
+    Invoke-TestP4 delete -c $env:CROSS_REVIEW_P4_TEST_CL "$workspace\d-deleted.txt" | Out-Null
     [IO.File]::WriteAllText((Join-Path $workspace 'a-eol-only.txt'), $large.Replace("`n", "`r`n"), $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'b-mixed.txt'), $large.Replace("`n", "`r`n") + "semantic-after`r`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'c-whitespace.txt'), "space  change`r`ntab`tchange`r`n", $utf8)
@@ -88,12 +92,13 @@ Description:
     if ($testExit -ne 0) { throw "Capture test failed:`n$output" }
     foreach ($expected in @(
         '(no textual changes vs the depot, ignoring line endings: //depot/a-eol-only.txt)',
-        '+semantic-after', '+space  change', "+tab`tchange"
+        '+semantic-after', '+space  change', "+tab`tchange",
+        '-deleted-line-one', '-deleted-line-two'
     )) {
         if (-not $output.Contains($expected)) { throw "Capture lost expected evidence: $expected" }
     }
     if ($output.Contains('live warning:')) { throw "Capture was incomplete:`n$output" }
-    Write-Host 'PASS: EOL-only changes use no diff budget; mixed content, spaces and tabs survive capture.'
+    Write-Host 'PASS: EOL-only changes use no diff budget; mixed content, spaces and tabs survive capture; a deleted file shows its removed content.'
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
     foreach ($name in $saved.Keys) {

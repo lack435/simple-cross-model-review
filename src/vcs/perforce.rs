@@ -1088,6 +1088,7 @@ impl<'a> P4<'a> {
         let mut units = Vec::new();
         let mut present_depots = Vec::new();
         let mut edit_targets: Vec<String> = Vec::new();
+        let mut delete_targets: Vec<String> = Vec::new();
         // depot -> working-root-relative label, so a diff section can be given its local heading.
         let mut local_by_depot: BTreeMap<String, String> = BTreeMap::new();
         let mut adds: Vec<(String, PathBuf)> = Vec::new(); // (depot, local)
@@ -1157,18 +1158,19 @@ impl<'a> P4<'a> {
                 }
                 ActionKind::Edit => edit_targets.push(file.depot.clone()),
                 ActionKind::Add => adds.push((file.depot.clone(), local)),
-                ActionKind::Delete => {
-                    // `p4 diff` skips deletes, so unlike a git diff the removed content is not
-                    // shown -- only the fact of the deletion, in the listing. Say so and mark
-                    // the changelist incomplete: a reviewer must not read a delete-only
-                    // changelist as fully covered.
+                // `p4 diff` skips deletes, so the removed content is fetched from the depot below
+                // (`p4 print` of the have-revision) and shown as an all-removed diff -- for a
+                // change whose risk is lost content, the reviewer needs to see what was lost.
+                // A binary or untyped delete has no text to show, so it stays an omission.
+                ActionKind::Delete if !is_diffable_text(&file.depot, &opened) => {
                     complete = false;
                     omissions.push(format!(
-                        "`{}` is deleted; the removed content is not shown (p4 does not diff \
-                         deletes).",
+                        "`{}` is deleted; it is binary or has no known text type, so the removed \
+                         content is not shown.",
                         safe_label(&file.depot)
                     ));
                 }
+                ActionKind::Delete => delete_targets.push(file.depot.clone()),
                 ActionKind::Other => {
                     complete = false;
                     omissions.push(format!(
@@ -1297,6 +1299,87 @@ impl<'a> P4<'a> {
                 !cut && !output_cut,
             ));
         }
+        // Deleted text files: the have-revision's content, printed from the depot, as a diff that
+        // removes every line. A `TextDiff` unit against that revision -- the comparator a delete
+        // is taken against, exactly as for an edit -- so the resume delta treats it like any other
+        // diffed file. Shares the edit-diff cap and the diff budget.
+        for (printed, depot) in delete_targets.iter().enumerate() {
+            if edit_targets.len().min(MAX_EDIT_DIFFS) + printed >= MAX_EDIT_DIFFS {
+                complete = false;
+                omissions.push(format!(
+                    "more than {MAX_EDIT_DIFFS} files were open for edit or delete; the remaining \
+                     {} deleted files' content was not fetched (diff cap reached).",
+                    delete_targets.len() - printed
+                ));
+                break;
+            }
+            let Some(rev) = rev_by_depot.get(depot.as_str()).cloned().flatten() else {
+                complete = false;
+                omissions.push(format!(
+                    "`{}` is deleted, but its have-revision is unknown, so the removed content is \
+                     not shown.",
+                    safe_label(depot)
+                ));
+                continue;
+            };
+            let spec = format!("{depot}#{rev}");
+            let out = match self.run(&["print", "-q", spec.as_str()], "") {
+                Some(out) if out.success => out,
+                Some(out) if out.cancelled => return CaptureOne::Cancelled,
+                Some(out) => {
+                    complete = false;
+                    omissions.push(format!(
+                        "`p4 print {}` failed, so the deleted content is missing: {}",
+                        safe_label(&spec),
+                        first_line(&out.diagnostics())
+                    ));
+                    continue;
+                }
+                None => {
+                    complete = false;
+                    omissions.push(format!(
+                        "`p4 print {}` could not be run, so the deleted content is missing.",
+                        safe_label(&spec)
+                    ));
+                    continue;
+                }
+            };
+            let output_cut = out.stdout_truncated || out.stdout_lossy || out.stdout_incomplete;
+            if output_cut {
+                complete = false;
+                omissions.push(format!(
+                    "`p4 print {}` output was cut short or did not decode cleanly, so the deleted \
+                     content may be incomplete.",
+                    safe_label(&spec)
+                ));
+            }
+            // NUL backstop for a file typed as text that is not: never rendered raw.
+            if out.stdout.contains('\0') {
+                complete = false;
+                omissions.push(format!(
+                    "`{}` is deleted and its content is binary, so it is not shown.",
+                    safe_label(depot)
+                ));
+                continue;
+            }
+            let (hunk, cut) = budget.take_diff(removal_hunk(&out.stdout));
+            if cut {
+                diff_truncated = true;
+                complete = false;
+            }
+            let local = local_by_depot
+                .get(depot)
+                .cloned()
+                .unwrap_or_else(|| depot.clone());
+            units.push(Unit::text_diff(
+                depot.clone(),
+                Some(rev),
+                local,
+                hunk,
+                !cut && !output_cut,
+            ));
+        }
+
         if !unchanged.is_empty() {
             // Surfaced in the listing (which does not gate completeness), so the reviewer can see
             // these opens carry no delta rather than wondering whether their diffs were lost.
@@ -2504,6 +2587,25 @@ fn split_rev(spec: &str) -> Option<String> {
 /// producing an empty diff section with no omission and slipping a binary file into the inventory
 /// (gate finding) -- so anything not explicitly text (including a missing/empty type tag) is
 /// treated as non-diffable and omitted.
+/// A unified-diff hunk that removes every line of `content` -- how a deleted file's content is
+/// shown, in the same shape `p4 diff -du` gives an edit. Empty content is an empty body: there is
+/// nothing to remove, and the listing already records the delete.
+fn removal_hunk(content: &str) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let mut out = format!("@@ -1,{} +0,0 @@\n", lines.len());
+    for line in &lines {
+        out.push('-');
+        out.push_str(line);
+    }
+    if !content.ends_with('\n') {
+        out.push_str("\n\\ No newline at end of file\n");
+    }
+    out
+}
+
 fn is_diffable_text(depot: &str, opened: &[OpenedFile]) -> bool {
     opened
         .iter()
@@ -2976,6 +3078,16 @@ Change 5 by u@c on 2026/01/01\n\n\
         );
         // Root: null is a legitimate Perforce root and is accepted (only presence is required).
         assert!(is_client_spec("Client:\tws\nRoot:\tnull\n", "ws"));
+    }
+
+    #[test]
+    fn a_deleted_files_content_renders_as_an_all_removed_hunk() {
+        assert_eq!(removal_hunk("a\nb\n"), "@@ -1,2 +0,0 @@\n-a\n-b\n");
+        assert_eq!(
+            removal_hunk("a\nlast"),
+            "@@ -1,2 +0,0 @@\n-a\n-last\n\\ No newline at end of file\n"
+        );
+        assert_eq!(removal_hunk(""), "");
     }
 
     #[test]
