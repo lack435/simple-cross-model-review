@@ -340,6 +340,19 @@ fn staging_overrides(
         ]);
     };
     for driver in isolated_filter_drivers(root, limits, cancel, received_at)? {
+        // `-c` splits at the first `=`, so a driver whose (quoted-subsection) name contains one
+        // cannot be overridden this way -- the override would set a different key and leave the
+        // program in force. No real driver is named so; refuse rather than run it (review f1, #156).
+        if driver.contains('=') {
+            return Err(EvidenceError::new(
+                "provider_failed",
+                format!(
+                    "the repository configures a Git filter driver named '{driver}', which the \
+                     evidence service cannot disable because its name contains '='; working-tree \
+                     diffs are refused while it is configured"
+                ),
+            ));
+        }
         if !(staging.lfs && driver == "lfs") {
             disable(&mut args, &driver);
         }
@@ -934,6 +947,42 @@ mod tests {
             ran(),
             "the fixture must be able to observe a configured filter running"
         );
+    }
+
+    /// Review f1 on #156: a driver whose name contains `=` cannot be overridden with `-c`, so the
+    /// working-tree diff is refused and its program never runs.
+    #[test]
+    fn a_driver_named_with_an_equals_sign_refuses_the_diff() {
+        let Some(dir) = repo("evidence-filter-equals") else {
+            return;
+        };
+        let root = dir.as_path();
+        std::fs::write(root.join("a.sec"), "base\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "-qm", "base"]));
+        std::fs::write(root.join(".gitattributes"), "*.sec filter=evil=driver\n").unwrap();
+        assert!(git(
+            root,
+            &["config", "filter.evil=driver.clean", "touch clean.marker"]
+        ));
+        std::fs::write(root.join("a.sec"), "changed\n").unwrap();
+        let cancel = AtomicBool::new(false);
+        let limits = Limits::default();
+        let err = diff(
+            root,
+            &["HEAD"],
+            "",
+            Staging::default(),
+            &limits,
+            &cancel,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("evil=driver"), "{}", err.message);
+        assert!(!root.join("clean.marker").exists());
+        // The fixture is live: plain Git does run that driver.
+        let _ = git(root, &["diff", "HEAD"]);
+        assert!(root.join("clean.marker").exists());
     }
 
     /// Issue #150 (review f1): a repository's own `filter.lfs.*` never runs in the isolated runner,
