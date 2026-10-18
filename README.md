@@ -211,7 +211,9 @@ gate ensures a formal *approve* was actually served that complete diff, end to e
 cannot rest on less than the whole change. Git reviews require the evidence path — the Codex reviewer
 always has it; the Claude reviewer needs a pinned `--claude-profile` — and a git review without it is
 refused before it runs. `git` is resolved from PATH and run with a hostile repository's config
-disabled (`diff.external`, textconv, `core.fsmonitor`); `repository_diff` accepts only full object
+disabled (`diff.external`, textconv, `core.fsmonitor`, and every configured `filter.<driver>` clean
+or process program, so a path such a driver would transform is diffed raw: noisier, never thinner;
+Git LFS paths are instead staged as their pointers by the server's own filter); `repository_diff` accepts only full object
 ids or a closed sentinel set, never a raw ref or option. Full behavior:
 [`docs/retire-capture-modes.md`](docs/retire-capture-modes.md).
 
