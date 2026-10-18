@@ -220,7 +220,7 @@ pub fn diff(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
-    let mut args = staging_overrides(staging);
+    let mut args = staging_overrides(root, staging, limits, cancel, received_at)?;
     args.extend([
         "diff".to_string(),
         "--no-ext-diff".to_string(),
@@ -274,7 +274,7 @@ pub fn numstat(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<(usize, usize, usize), EvidenceError> {
-    let mut args = staging_overrides(staging);
+    let mut args = staging_overrides(root, staging, limits, cancel, received_at)?;
     args.extend([
         "diff".to_string(),
         "--numstat".to_string(),
@@ -310,10 +310,39 @@ pub fn numstat(
 /// If the command cannot be built, the override is an *empty* `process`, never nothing: Git then
 /// runs neither a configured `process` nor a `clean` for `filter=lfs` paths (verified, Git 2.55) and
 /// with `required=false` stages them raw. A configured LFS program is never left in force.
-fn staging_overrides(staging: Staging) -> Vec<String> {
+///
+/// Every *other* filter driver the isolated runner can see is disabled the same way. A diff of the
+/// working tree runs the `clean` (or `process`) program of each path's `filter` attribute, and the
+/// isolated config still includes the repository's own -- so a reviewer choosing which paths to diff
+/// could make the service run any program `.git/config` names as a filter, with whatever side
+/// effects it has (`git-lfs clean` writes `.git/lfs/objects`). That is the same class of route
+/// `--no-textconv` and `--no-ext-diff` close. The cost is fidelity, in the safe direction: a path
+/// whose driver would have transformed it is staged raw, so its diff is noisier than native Git's and
+/// a converged-hook binding over it fails closed. If the drivers cannot be enumerated the diff is
+/// refused rather than run with an unknown program in force.
+fn staging_overrides(
+    root: &Path,
+    staging: Staging,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Vec<String>, EvidenceError> {
     let mut args = Vec::new();
     if let Some(value) = staging.autocrlf {
         args.extend(["-c".to_string(), value.config_override().to_string()]);
+    }
+    let disable = |args: &mut Vec<String>, driver: &str| {
+        args.extend([
+            "-c".to_string(),
+            format!("filter.{driver}.process="),
+            "-c".to_string(),
+            format!("filter.{driver}.required=false"),
+        ]);
+    };
+    for driver in isolated_filter_drivers(root, limits, cancel, received_at)? {
+        if !(staging.lfs && driver == "lfs") {
+            disable(&mut args, &driver);
+        }
     }
     if staging.lfs {
         let command = crate::lfs::filter_command().unwrap_or_default();
@@ -324,7 +353,47 @@ fn staging_overrides(staging: Staging) -> Vec<String> {
             "filter.lfs.required=false".to_string(),
         ]);
     }
-    args
+    Ok(args)
+}
+
+/// The filter driver names (`filter.<name>.*`) in the configuration the isolated runner itself reads
+/// -- repository and worktree config and whatever they include, since system and global are off --
+/// deduplicated. Read through the same runner so the set is exactly the one a diff would see.
+fn isolated_filter_drivers(
+    root: &Path,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Vec<String>, EvidenceError> {
+    let out = run_classified(
+        root,
+        &["config", "--list", "-z"],
+        limits,
+        cancel,
+        received_at,
+    )
+    .map_err(GitFailure::into_evidence)?;
+    Ok(filter_drivers_in(&out))
+}
+
+/// Parse `git config --list -z` output (`key\nvalue\0` per entry) for filter driver names. The
+/// section and variable are lowercased by Git; the driver (subsection) keeps its case and may itself
+/// contain dots, so the name is everything between `filter.` and the last `.`.
+fn filter_drivers_in(listing: &str) -> Vec<String> {
+    let mut drivers: Vec<String> = Vec::new();
+    for entry in listing.split('\0') {
+        let key = entry.split('\n').next().unwrap_or("");
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((driver, _variable)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if !driver.is_empty() && !drivers.iter().any(|d| d == driver) {
+            drivers.push(driver.to_string());
+        }
+    }
+    drivers
 }
 
 /// Whether the user's own Git applies an LFS filter here: `filter.lfs.process` or `filter.lfs.clean`
@@ -793,6 +862,80 @@ mod tests {
         assert_eq!(AutoCrlf::parse("crlf"), None);
     }
 
+    #[test]
+    fn filter_driver_names_are_parsed_from_the_config_listing() {
+        let listing = "core.bare\nfalse\0filter.lfs.clean\ngit-lfs clean -- %f\0\
+                       filter.lfs.process\ngit-lfs filter-process\0\
+                       filter.Crypt.v2.clean\ngit-crypt clean\0filter.x\n\0\0";
+        assert_eq!(filter_drivers_in(listing), ["lfs", "Crypt.v2"]);
+        assert!(filter_drivers_in("").is_empty());
+    }
+
+    /// No repository-configured filter program runs in the isolated runner, LFS or not, with or
+    /// without LFS staging (follow-up to issue #150). Staged raw instead, the change still shows.
+    #[test]
+    fn no_configured_filter_program_runs_in_the_isolated_runner() {
+        let Some(dir) = repo("evidence-filter-drivers") else {
+            return;
+        };
+        let root = dir.as_path();
+        let no_filter = [
+            "-c",
+            "filter.secret.process=",
+            "-c",
+            "filter.secret.required=false",
+        ];
+        std::fs::write(root.join(".gitattributes"), "*.sec filter=secret\n").unwrap();
+        std::fs::write(root.join("a.sec"), "base\n").unwrap();
+        assert!(git(root, &[&no_filter[..], &["add", "."]].concat()));
+        assert!(git(root, &["commit", "-qm", "base"]));
+        assert!(git(
+            root,
+            &["config", "filter.secret.clean", "touch clean.marker"]
+        ));
+        assert!(git(root, &["config", "filter.secret.required", "true"]));
+        std::fs::write(root.join("a.sec"), "changed\n").unwrap();
+        let ran = || root.join("clean.marker").exists();
+
+        let limits = Limits::default();
+        let cancel = AtomicBool::new(false);
+        for lfs in [false, true] {
+            let staging = Staging {
+                autocrlf: None,
+                lfs,
+            };
+            let patch = diff(
+                root,
+                &["HEAD"],
+                "",
+                staging,
+                &limits,
+                &cancel,
+                Instant::now(),
+            )
+            .unwrap();
+            assert!(patch.contains("+changed"), "{patch}");
+            let (files, _, _) = numstat(
+                root,
+                &["HEAD"],
+                "",
+                staging,
+                &limits,
+                &cancel,
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(files, 1);
+            assert!(!ran());
+        }
+        // The fixture can see a run: the same diff through plain Git runs the program.
+        assert!(git(root, &["diff", "HEAD"]));
+        assert!(
+            ran(),
+            "the fixture must be able to observe a configured filter running"
+        );
+    }
+
     /// Issue #150 (review f1): a repository's own `filter.lfs.*` never runs in the isolated runner,
     /// whether the override names this binary or is the empty fallback used when it cannot. The
     /// last step proves the fixture can see a run: with no LFS staging the configured program does.
@@ -841,6 +984,8 @@ mod tests {
         run(root, &fallback, &limits, &cancel, Instant::now()).unwrap();
         assert!(!ran());
 
+        // Without LFS staging the configured program does not run either (it is disabled like any
+        // other driver); plain Git shows the fixture can observe a run.
         let _ = diff(
             root,
             &["HEAD"],
@@ -850,6 +995,8 @@ mod tests {
             &cancel,
             Instant::now(),
         );
+        assert!(!ran());
+        let _ = git(root, &["diff", "HEAD"]);
         assert!(
             ran(),
             "the fixture must be able to observe a configured filter running"
