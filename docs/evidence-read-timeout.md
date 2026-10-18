@@ -302,7 +302,13 @@ this removes. So:
   budget. That needs a client pipelining enough concurrent requests to saturate the queue *and*
   stall the dispatcher; the real MCP client issues evidence calls serially and never does, and the
   residual is the same unobservable class as raw transport latency (we cannot stamp a request before
-  we read it), covered by the margin. Attempt 1 waits up to the per-attempt cap or the remaining
+  we read it), covered by the margin. **Corrected by issue #151:** the premise is false. Codex's
+  code mode issues evidence calls concurrently (`Promise.all`; verified in a reviewer rollout).
+  A burst of slow searches past the 8-slot queue went unread, started its budget late, and was
+  abandoned at the 30s client ceiling. The queue is now 64 slots, so a realistic burst is stamped
+  on arrival. Each `repository_search` also stops at a 10s slice and returns a partial result
+  (`time_limited`, `files_searched`, `files_unsearched`, `listing_complete`), so concurrent
+  siblings still get budget to run. Attempt 1 waits up to the per-attempt cap or the remaining
   budget, whichever is smaller, and a retry runs **only if** the remaining budget (after backoff)
   still allows a meaningful attempt, bounded by that remainder — not a fresh cap.
 - **The end-to-end claim is scoped honestly, not overstated (f8, f12, f13).** State precisely what

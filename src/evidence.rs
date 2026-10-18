@@ -735,7 +735,14 @@ pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceErro
     // client issues evidence calls serially (request → response), so it never does. The residual is
     // the same unobservable class as raw transport latency (we cannot stamp a request before we
     // read it) and is covered by the budget margin, not a silent gap.
-    let (sender, receiver) = mpsc::sync_channel::<(Instant, Result<Vec<u8>, EvidenceError>)>(8);
+    //
+    // Issue #151: that premise was wrong. Codex's code mode issues evidence calls concurrently
+    // (`Promise.all`, verified in a reviewer rollout), and with an 8-slot queue the ninth and later
+    // calls of a burst sat unread, started their budget late, and answered after the client had
+    // already abandoned them. 64 slots stamp a realistic burst on arrival, so every call answers
+    // inside the client's ceiling -- with a result, or an in-band refusal -- for at most
+    // 64 x `max_request_bytes` (4 MiB at the default) of buffered requests.
+    let (sender, receiver) = mpsc::sync_channel::<(Instant, Result<Vec<u8>, EvidenceError>)>(64);
     let reader_cancel = Arc::clone(&cancel);
     let reader_cancellations = Arc::clone(&cancellations);
     let reader = std::thread::Builder::new()
@@ -1135,7 +1142,11 @@ pub fn tool_definitions() -> Vec<Value> {
             "repository_search",
             "Search UTF-8 files for a literal string. Searching a directory covers only the files \
              'scan_scope' describes, so files Git ignores are not searched; naming an ignored file \
-             as 'path' searches it anyway. Check 'complete' before reading no matches as absence.",
+             as 'path' searches it anyway. Check 'complete' before reading no matches as absence. \
+             A search answers within a few seconds with what it covered: 'time_limited' true means \
+             it stopped early ('files_unsearched' were listed but not searched, and \
+             'listing_complete' false means the listing itself was cut short), so narrow 'path' and \
+             search again. The service answers one call at a time; concurrent searches queue.",
             &[
                 ("query", "string"),
                 ("path", "string"),
