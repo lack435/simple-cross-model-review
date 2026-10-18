@@ -1353,7 +1353,7 @@ impl Config {
         // that will not start. The program is resolved now, so a typo is caught here too.
         let on_converged = match hook_program {
             Some(program) => Some(crate::hook::HookConfig {
-                program: resolve_hook_program(&program, &cwd)?,
+                program: resolve_hook_program("--on-converged", &program, &cwd)?,
                 args: hook_args,
                 timeout: Duration::from_secs(
                     hook_timeout_secs.unwrap_or(crate::hook::DEFAULT_TIMEOUT_SECS),
@@ -1376,7 +1376,7 @@ impl Config {
         let on_event = match event_program {
             Some(program) => Some(crate::events::EventConfig {
                 hook: crate::hook::HookConfig {
-                    program: resolve_hook_program(&program, &cwd)?,
+                    program: resolve_hook_program("--on-event", &program, &cwd)?,
                     args: event_args,
                     timeout: Duration::from_secs(
                         event_timeout_secs.unwrap_or(crate::events::DEFAULT_TIMEOUT_SECS),
@@ -2231,7 +2231,8 @@ impl Config {
 /// Resolve a directory to an absolute path without the `\\?\` verbatim prefix that
 /// `canonicalize` adds on Windows. That prefix is correct but leaks into the reviewer's
 /// prompt and command line, where some tools mishandle it.
-/// Resolve `--on-converged <program>` to an executable path, at startup.
+/// Resolve a hook's `<program>` to an executable path, at startup. `flag` (`--on-converged` or
+/// `--on-event`) names the option in the error, so a wrong path says which hook it is (issue #161).
 ///
 /// - A **bare name** (no path separator) is searched for on `PATH` ourselves — never left to
 ///   `CreateProcess`, which looks in the application directory and the current directory first.
@@ -2242,7 +2243,7 @@ impl Config {
 /// - An **absolute path** is used as is.
 ///
 /// The result must be an existing file; anything else is a startup error.
-fn resolve_hook_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+fn resolve_hook_program(flag: &str, program: &str, cwd: &Path) -> Result<PathBuf, String> {
     let path = Path::new(program);
     let bare = !program.contains(['/', '\\']) && !path.is_absolute();
     let resolved = if bare {
@@ -2264,11 +2265,11 @@ fn resolve_hook_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
     match resolved {
         Some(p) if p.is_file() => Ok(p),
         Some(p) => Err(format!(
-            "--on-converged program '{program}' does not exist (resolved to '{}')",
+            "{flag} program '{program}' does not exist (resolved to '{}')",
             p.display()
         )),
         None => Err(format!(
-            "--on-converged program '{program}' was not found on PATH; give a full path"
+            "{flag} program '{program}' was not found on PATH; give a full path"
         )),
     }
 }
@@ -4963,6 +4964,27 @@ mod event_hook_flag_tests {
         let cfg = parse(&["--on-event", &exe, "--on-event-arg", "--json"]).unwrap();
         assert!(!cfg.status_json);
         assert_eq!(cfg.on_event.unwrap().hook.args, ["--json"]);
+    }
+
+    /// Issue #161: a hook program that cannot be resolved is reported under the flag that named it,
+    /// so with both hooks configured the error says which one is wrong.
+    #[test]
+    fn an_unresolvable_hook_program_names_its_own_flag() {
+        let exe = cmd_exe();
+        for (flag, other) in [
+            ("--on-event", "--on-converged"),
+            ("--on-converged", "--on-event"),
+        ] {
+            for program in [r"C:\nope-zz9\hook.exe", "nope-hook-zz9.exe"] {
+                let err =
+                    Config::from_args(&args(&["--reviewer", "codex", other, &exe, flag, program]))
+                        .unwrap_err();
+                assert!(
+                    err.starts_with(&format!("{flag} program '{program}'")),
+                    "{err}"
+                );
+            }
+        }
     }
 
     #[test]
