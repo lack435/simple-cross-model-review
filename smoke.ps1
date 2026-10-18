@@ -15,6 +15,7 @@
   .\smoke.ps1 -Reviewer codex
   .\smoke.ps1 -Reviewer claude
   .\smoke.ps1 -Reviewer codex -ProveBlockRepair
+  .\smoke.ps1 -Reviewer codex -OnEvent
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +42,12 @@ param(
     # through that. Never touches dist\ or any binary built without the feature: the hook is
     # compiled out of everything else, which is the point of it being a Cargo feature rather than
     # an environment variable a shipped binary could inherit.
-    [switch]$ProveBlockRepair
+    [switch]$ProveBlockRepair,
+
+    # Also run the server with an --on-event hook (issue #152) that appends every lifecycle event to
+    # a file, and check after shutdown that every turn the round trip started was reported started
+    # and then ended exactly once.
+    [switch]$OnEvent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +98,12 @@ if ($Reviewer -eq 'claude') { $serverArgs += @('--claude-profile', $ClaudeProfil
 # Keep smoke-test sessions out of the real per-project state.
 $stateDir = Join-Path ([System.IO.Path]::GetTempPath()) "cross-review-smoke-$PID"
 $serverArgs += @('--state-dir', $stateDir)
+$eventsFile = Join-Path $stateDir 'events.jsonl'
+if ($OnEvent) {
+    $appendEvent = "[Console]::In.ReadToEnd() | Add-Content -LiteralPath '$eventsFile' -Encoding UTF8"
+    $serverArgs += @('--on-event', 'powershell.exe', '--on-event-arg', '-NoProfile',
+        '--on-event-arg', '-NonInteractive', '--on-event-arg', '-Command', '--on-event-arg', $appendEvent)
+}
 
 Write-Host "==> launching: $Exe $($serverArgs -join ' ')" -ForegroundColor Cyan
 
@@ -678,7 +690,33 @@ INCLUDE-CHANGE-OK
 finally {
     if ($proc -and -not $proc.HasExited) {
         $stdin.Close()
-        if (-not $proc.WaitForExit(5000)) { $proc.Kill() }
+        # With -OnEvent the server drains its event queue before exiting, so give it longer.
+        $exitWaitMs = if ($OnEvent) { 30000 } else { 5000 }
+        if (-not $proc.WaitForExit($exitWaitMs)) { $proc.Kill() }
+    }
+    if ($OnEvent) {
+        Write-Host "`n=== lifecycle events (--on-event) ===" -ForegroundColor Cyan
+        $events = @()
+        if (Test-Path $eventsFile) {
+            $events = @(Get-Content $eventsFile -Encoding UTF8 | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+        }
+        Assert-That 'the event hook recorded events' ($events.Count -gt 0) $eventsFile
+        $terminal = @('turn_completed', 'turn_failed', 'turn_cancelled')
+        $byId = $events | Group-Object review_id
+        foreach ($g in $byId) {
+            $names = @($g.Group | ForEach-Object { $_.event })
+            $ends = @($names | Where-Object { $terminal -contains $_ })
+            $ok = ($names[0] -eq 'turn_started') -and ($ends.Count -eq 1) -and ($terminal -contains $names[-1])
+            Assert-That "events for $($g.Name) are started-then-one-terminal" $ok ($names -join ', ')
+        }
+        $completedReview = @($events | Where-Object { $_.event -eq 'turn_completed' -and $_.kind -eq 'review' -and $_.outcome })
+        Assert-That 'a completed review event carries its outcome' ($completedReview.Count -gt 0) ''
+        $completedConsult = @($events | Where-Object { $_.event -eq 'turn_completed' -and $_.kind -eq 'consult' })
+        Assert-That 'a completed consult event was recorded' ($completedConsult.Count -gt 0) ''
+        $cancelled = @($events | Where-Object { $_.event -eq 'turn_cancelled' })
+        Assert-That 'a cancelled turn was reported as cancelled' ($cancelled.Count -gt 0) ''
+        $leaked = @($events | Where-Object { $null -ne $_.findings })
+        Assert-That 'no finding text without --on-event-include-findings' ($leaked.Count -eq 0) ''
     }
     if ($stderrSub) { Unregister-Event -SubscriptionId $stderrSub.Id -ErrorAction SilentlyContinue }
 

@@ -19,6 +19,7 @@ mod codeentry;
 mod config;
 mod digest;
 mod errors;
+mod events;
 mod evidence;
 mod findings;
 mod hook;
@@ -117,5 +118,8 @@ fn main() {
         return;
     }
 
-    mcp::serve(app);
+    mcp::serve(Arc::clone(&app));
+    // `serve` does not wait for running reviews, so the `--on-event` hook (issue #152) is told which
+    // turns this exit ends, and queued events get a bounded chance to be delivered.
+    app.drain_events();
 }

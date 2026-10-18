@@ -983,6 +983,10 @@ pub struct Config {
     /// the feature off entirely. The program is resolved at startup (see `resolve_hook_program`);
     /// see `src/hook.rs` and `docs/converged-hook-plan.md`.
     pub on_converged: Option<crate::hook::HookConfig>,
+    /// The lifecycle event hook (`--on-event`, issue #152): a program run, fire and forget, with a
+    /// JSON envelope on stdin for every review and consult turn that starts or ends. `None` (the
+    /// default) turns it off. See `src/events.rs`.
+    pub on_event: Option<crate::events::EventConfig>,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -1041,6 +1045,10 @@ impl Config {
         let mut hook_program: Option<String> = None;
         let mut hook_args: Vec<String> = Vec::new();
         let mut hook_timeout_secs: Option<u64> = None;
+        let mut event_program: Option<String> = None;
+        let mut event_args: Vec<String> = Vec::new();
+        let mut event_timeout_secs: Option<u64> = None;
+        let mut event_include_findings = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -1292,6 +1300,22 @@ impl Config {
                     }
                     hook_timeout_secs = Some(secs);
                 }
+                "--on-event" => event_program = Some(take("--on-event")?),
+                "--on-event-arg" => event_args.push(take("--on-event-arg")?),
+                "--on-event-include-findings" => event_include_findings = true,
+                "--on-event-timeout-seconds" => {
+                    let v = take("--on-event-timeout-seconds")?;
+                    let secs: u64 = v.parse().map_err(|_| {
+                        format!("--on-event-timeout-seconds must be an integer, got '{v}'")
+                    })?;
+                    if secs == 0 || secs > crate::hook::MAX_TIMEOUT_SECS {
+                        return Err(format!(
+                            "--on-event-timeout-seconds must be between 1 and {}, got {secs}",
+                            crate::hook::MAX_TIMEOUT_SECS
+                        ));
+                    }
+                    event_timeout_secs = Some(secs);
+                }
                 other => return Err(format!("unknown argument '{other}' (try --help)")),
             }
             i += 1;
@@ -1332,6 +1356,28 @@ impl Config {
                     "--on-converged-arg and --on-converged-timeout-seconds need --on-converged"
                         .to_string(),
                 )
+            }
+            None => None,
+        };
+        // The event hook, under the same rule: a half-configured one is a startup error.
+        let on_event = match event_program {
+            Some(program) => Some(crate::events::EventConfig {
+                hook: crate::hook::HookConfig {
+                    program: resolve_hook_program(&program, &cwd)?,
+                    args: event_args,
+                    timeout: Duration::from_secs(
+                        event_timeout_secs.unwrap_or(crate::events::DEFAULT_TIMEOUT_SECS),
+                    ),
+                },
+                include_findings: event_include_findings,
+            }),
+            None if !event_args.is_empty()
+                || event_timeout_secs.is_some()
+                || event_include_findings =>
+            {
+                return Err("--on-event-arg, --on-event-timeout-seconds and \
+                            --on-event-include-findings need --on-event"
+                    .to_string())
             }
             None => None,
         };
@@ -1428,6 +1474,7 @@ impl Config {
             max_policy_denials,
             max_policy_idle: Duration::from_secs(max_policy_idle_secs),
             on_converged,
+            on_event,
         })
     }
 
@@ -2425,6 +2472,24 @@ CONVERGED-REVIEW HOOK (issue #142; off unless --on-converged is given):
   --on-converged-timeout-seconds N
                               Kill the hook and everything it started after N seconds.
                               Default 60, max 600.
+
+LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
+  --on-event <program>        Run <program> for every review and consult turn that
+                              starts, completes, fails or is cancelled, with a JSON
+                              envelope on stdin: event, kind, review_id, session, turn,
+                              working_root, level, reviewer (cli, model, effort,
+                              chain_index, fallback), started_at, finished_at, outcome,
+                              verdict, open_count, total_count, open_by_severity,
+                              warnings, denial_count, error_code, ... Fire and forget:
+                              events run one at a time in order on a background
+                              thread, and nothing the hook does affects a review.
+                              Resolved like --on-converged; contained in a job object;
+                              started without a console window.
+  --on-event-arg <arg>        One argument for the event program. Repeatable, in order.
+  --on-event-timeout-seconds N
+                              Kill the event hook after N seconds. Default 10, max 600.
+  --on-event-include-findings Also send each finding's title and detail, which can
+                              quote source code. Off by default.
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
@@ -4803,6 +4868,91 @@ mod converged_hook_flag_tests {
             "--on-converged <program>",
             "--on-converged-arg <arg>",
             "--on-converged-timeout-seconds N",
+        ] {
+            assert!(USAGE.contains(flag), "{flag}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_hook_flag_tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        super::tests::args(items)
+    }
+
+    fn cmd_exe() -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{root}\System32\cmd.exe")
+    }
+
+    #[test]
+    fn the_event_hook_is_off_by_default_and_parses_when_given() {
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert!(cfg.on_event.is_none());
+        let exe = cmd_exe();
+        let ev = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--on-event",
+            &exe,
+            "--on-event-arg",
+            "/d",
+            "--on-event-arg",
+            "/c",
+            "--on-event-timeout-seconds",
+            "5",
+            "--on-event-include-findings",
+        ]))
+        .expect("config")
+        .on_event
+        .expect("event hook");
+        assert_eq!(ev.hook.args, ["/d", "/c"]);
+        assert_eq!(ev.hook.timeout, Duration::from_secs(5));
+        assert!(ev.include_findings);
+        let default = Config::from_args(&args(&["--reviewer", "codex", "--on-event", &exe]))
+            .expect("config")
+            .on_event
+            .expect("event hook");
+        assert_eq!(
+            default.hook.timeout,
+            Duration::from_secs(crate::events::DEFAULT_TIMEOUT_SECS)
+        );
+        assert!(!default.include_findings);
+        // Independent of --on-converged.
+        assert!(
+            Config::from_args(&args(&["--reviewer", "codex", "--on-event", &exe]))
+                .unwrap()
+                .on_converged
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_half_configured_event_hook_is_a_startup_error() {
+        let exe = cmd_exe();
+        for bad in [
+            vec!["--reviewer", "codex", "--on-event-arg", "x"],
+            vec!["--reviewer", "codex", "--on-event-timeout-seconds", "5"],
+            vec!["--reviewer", "codex", "--on-event-include-findings"],
+            vec!["--reviewer", "codex", "--on-event", "no-such-program-zz9"],
+            vec![
+                "--reviewer",
+                "codex",
+                "--on-event",
+                &exe,
+                "--on-event-timeout-seconds",
+                "0",
+            ],
+        ] {
+            assert!(Config::from_args(&args(&bad)).is_err(), "{bad:?}");
+        }
+        for flag in [
+            "--on-event <program>",
+            "--on-event-arg <arg>",
+            "--on-event-timeout-seconds N",
+            "--on-event-include-findings",
         ] {
             assert!(USAGE.contains(flag), "{flag}");
         }

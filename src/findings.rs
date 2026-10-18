@@ -99,7 +99,7 @@ pub enum Status {
 
 impl Status {
     /// Whether this status counts toward `open_count`.
-    fn is_open(self) -> bool {
+    pub fn is_open(self) -> bool {
         !matches!(self, Status::Resolved)
     }
 }
