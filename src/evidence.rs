@@ -708,10 +708,19 @@ fn read_bundle(path: &Path, expected_nonce: &str) -> Result<Bundle, EvidenceErro
     Ok(bundle)
 }
 
+/// Intake queue capacity: a turn's whole call limit, so no call of a turn can wait unread in the pipe
+/// while its client-side clock runs (issue #151). A call past the limit is refused on dispatch anyway.
+/// Clamped so a bundle's limit cannot size the buffer arbitrarily; at the default (96 calls) the
+/// worst case is 97 x `max_request_bytes`, about 6 MiB, and real requests are a few hundred bytes.
+fn intake_slots(limits: &Limits) -> usize {
+    (limits.max_calls as usize).clamp(8, 1024) + 1
+}
+
 pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceError> {
     let bundle = read_bundle(path, expected_nonce)?;
     let max_request = bundle.limits.max_request_bytes as usize;
     let max_response = bundle.limits.max_response_bytes as usize;
+    let queue_slots = intake_slots(&bundle.limits);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancellations = Arc::new(RequestCancellations::default());
     let mut core = core::Core::new_with_cancel(bundle, Arc::clone(&cancel))?;
@@ -739,10 +748,11 @@ pub fn serve_stdio(path: &Path, expected_nonce: &str) -> Result<(), EvidenceErro
     // Issue #151: that premise was wrong. Codex's code mode issues evidence calls concurrently
     // (`Promise.all`, verified in a reviewer rollout), and with an 8-slot queue the ninth and later
     // calls of a burst sat unread, started their budget late, and answered after the client had
-    // already abandoned them. 64 slots stamp a realistic burst on arrival, so every call answers
-    // inside the client's ceiling -- with a result, or an in-band refusal -- for at most
-    // 64 x `max_request_bytes` (4 MiB at the default) of buffered requests.
-    let (sender, receiver) = mpsc::sync_channel::<(Instant, Result<Vec<u8>, EvidenceError>)>(64);
+    // already abandoned them. The queue now holds a whole turn's calls (see `intake_slots`), so
+    // every call of any burst is stamped on arrival and answers inside the client's ceiling -- with a
+    // result, or an in-band refusal.
+    let (sender, receiver) =
+        mpsc::sync_channel::<(Instant, Result<Vec<u8>, EvidenceError>)>(queue_slots);
     let reader_cancel = Arc::clone(&cancel);
     let reader_cancellations = Arc::clone(&cancellations);
     let reader = std::thread::Builder::new()
@@ -1377,6 +1387,18 @@ fn validate_nonce(nonce: &str) -> Result<(), EvidenceError> {
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+
+    /// Issue #151: the intake queue holds every call a turn may make, so none waits unread.
+    #[test]
+    fn the_intake_queue_holds_a_whole_turn_of_calls() {
+        let limits = Limits::default();
+        assert!(intake_slots(&limits) > limits.max_calls as usize);
+        let huge = Limits {
+            max_calls: u32::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(intake_slots(&huge), 1025);
+    }
 
     #[test]
     fn status_session_name_is_unreachable_by_user_sessions() {

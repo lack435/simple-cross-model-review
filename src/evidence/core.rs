@@ -830,6 +830,12 @@ impl Core {
         // reads below go through the same watchdog as `repository_read` (#61). Every stage of this
         // operation now derives its wait from the one request budget.
         let (files, walk_complete) = self.resolve_and_walk(&path, received_at, stop_at)?;
+        // Each per-file read is bounded by the slice rather than the whole request budget: the read
+        // watchdog measures its remaining budget from a receipt, and this is the receipt whose
+        // budget ends at `stop_at` -- never later than the real one, since `stop_at` is inside it.
+        let read_receipt = stop_at
+            .checked_sub(Duration::from_millis(REQUEST_BUDGET_MS))
+            .unwrap_or(received_at);
         let listed = files.len();
         let mut searched = 0usize;
         let mut time_limited = Instant::now() >= stop_at;
@@ -855,7 +861,7 @@ impl Core {
                     max_path_bytes: self.bundle.limits.max_path_bytes as usize,
                     max_file_bytes: self.bundle.limits.max_file_bytes as usize,
                 },
-                received_at,
+                read_receipt,
             ) {
                 Ok(output) => output.bytes,
                 Err(_) => {
@@ -1495,10 +1501,19 @@ fn walk_files(
                     "directory changed to resolve outside the repository root",
                 ));
             }
+            // Checked per entry, not only per directory: one huge flat directory is enough to spend
+            // the slice (review f2 on #151).
+            let partial = |mut files: Vec<PathBuf>| {
+                files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+                Ok((files, false))
+            };
             let mut children = Vec::new();
             for entry in
                 fs::read_dir(&dir).map_err(|e| EvidenceError::new("read_failed", e.to_string()))?
             {
+                if Instant::now() >= stop_at {
+                    return partial(files);
+                }
                 let entry = entry.map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
                 if excluded_name(&entry.file_name()) {
                     continue;
@@ -1507,6 +1522,9 @@ fn walk_files(
             }
             children.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
             for child in children {
+                if Instant::now() >= stop_at {
+                    return partial(files);
+                }
                 let meta = fs::symlink_metadata(&child)
                     .map_err(|e| EvidenceError::new("read_failed", e.to_string()))?;
                 if metadata_is_reparse(&meta) {
