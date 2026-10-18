@@ -220,7 +220,7 @@ pub fn diff(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
-    let mut args = staging_overrides(root, staging, limits, cancel, received_at)?;
+    let mut args = staging_overrides(root, spec, staging, limits, cancel, received_at)?;
     args.extend([
         "diff".to_string(),
         "--no-ext-diff".to_string(),
@@ -274,7 +274,7 @@ pub fn numstat(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<(usize, usize, usize), EvidenceError> {
-    let mut args = staging_overrides(root, staging, limits, cancel, received_at)?;
+    let mut args = staging_overrides(root, spec, staging, limits, cancel, received_at)?;
     args.extend([
         "diff".to_string(),
         "--numstat".to_string(),
@@ -322,12 +322,17 @@ pub fn numstat(
 /// refused rather than run with an unknown program in force.
 fn staging_overrides(
     root: &Path,
+    spec: &[&str],
     staging: Staging,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<Vec<String>, EvidenceError> {
     let mut args = Vec::new();
+    // Only a working-tree diff (a single endpoint, no `--cached`) reads files through a filter; an
+    // index or commit-to-commit diff compares stored objects. Those need no driver enumeration and
+    // are never refused for one (review f2 on #156) -- the converged-hook binding is one.
+    let reads_worktree = spec.len() == 1 && spec[0] != "--cached";
     if let Some(value) = staging.autocrlf {
         args.extend(["-c".to_string(), value.config_override().to_string()]);
     }
@@ -339,7 +344,12 @@ fn staging_overrides(
             format!("filter.{driver}.required=false"),
         ]);
     };
-    for driver in isolated_filter_drivers(root, limits, cancel, received_at)? {
+    let drivers = if reads_worktree {
+        isolated_filter_drivers(root, limits, cancel, received_at)?
+    } else {
+        Vec::new()
+    };
+    for driver in drivers {
         // `-c` splits at the first `=`, so a driver whose (quoted-subsection) name contains one
         // cannot be overridden this way -- the override would set a different key and leave the
         // program in force. No real driver is named so; refuse rather than run it (review f1, #156).
@@ -980,6 +990,27 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("evil=driver"), "{}", err.message);
         assert!(!root.join("clean.marker").exists());
+        // Object-to-object comparisons read no working-tree file and are not refused.
+        assert!(diff(
+            root,
+            &["--cached", "HEAD"],
+            "",
+            Staging::default(),
+            &limits,
+            &cancel,
+            Instant::now()
+        )
+        .is_ok());
+        assert!(diff(
+            root,
+            &["HEAD", "HEAD"],
+            "",
+            Staging::default(),
+            &limits,
+            &cancel,
+            Instant::now()
+        )
+        .is_ok());
         // The fixture is live: plain Git does run that driver.
         let _ = git(root, &["diff", "HEAD"]);
         assert!(root.join("clean.marker").exists());
