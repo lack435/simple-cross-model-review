@@ -717,6 +717,17 @@ finally {
         Assert-That 'a cancelled turn was reported as cancelled' ($cancelled.Count -gt 0) ''
         $leaked = @($events | Where-Object { $null -ne $_.findings })
         Assert-That 'no finding text without --on-event-include-findings' ($leaked.Count -eq 0) ''
+
+        # `--status --json` reads the status log the event worker wrote, read-only.
+        $statusText = (& $Exe @serverArgs --status --json) -join "`n"
+        # Windows PowerShell's ConvertFrom-Json emits a JSON array as one object; unroll it.
+        $status = @($statusText | ConvertFrom-Json | ForEach-Object { $_ })
+        $smokeStatus = @($status | Where-Object { $_.session -eq 'smoke' })
+        Assert-That '--status --json reports the smoke session' ($smokeStatus.Count -eq 1) $statusText
+        if ($smokeStatus.Count -eq 1) {
+            Assert-That "the smoke session's latest event is terminal" `
+                ($terminal -contains $smokeStatus[0].event) ($smokeStatus[0] | ConvertTo-Json -Depth 4)
+        }
     }
     if ($stderrSub) { Unregister-Event -SubscriptionId $stderrSub.Id -ErrorAction SilentlyContinue }
 

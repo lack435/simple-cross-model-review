@@ -100,6 +100,12 @@ fn main() {
         }
     };
 
+    if cfg.status_json {
+        // Read-only and ahead of the state-directory creation, like `--usage` (issue #152).
+        println!("{}", events::status_report(&cfg.state_dir));
+        return;
+    }
+
     if usage_report {
         // Ahead of the state-directory creation below, so this really is read-only: the
         // README promises `--usage` only reads the local log, and creating a directory

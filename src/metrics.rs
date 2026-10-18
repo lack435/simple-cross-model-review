@@ -753,7 +753,7 @@ impl ReadReport {
 /// A filename-safe tag for this machine, so logs from several machines can share a
 /// directory. Falls back to a constant rather than failing: a log that lands in the wrong
 /// bucket is far better than no log.
-fn host_tag() -> String {
+pub(crate) fn host_tag() -> String {
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
