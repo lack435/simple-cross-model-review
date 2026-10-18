@@ -120,6 +120,17 @@ impl AutoCrlf {
     }
 }
 
+/// How the isolated runner turns working-tree files into what Git would stage, so a worktree diff
+/// matches the one the user's own Git (and the commit) would produce: the checkout's `core.autocrlf`
+/// (issue #135) and, when the user's Git applies an LFS filter, this binary's pointer-computing clean
+/// filter (issue #150, see `crate::lfs`). A commit-to-commit diff reads no working-tree file, so
+/// neither changes it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Staging {
+    pub autocrlf: Option<AutoCrlf>,
+    pub lfs: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -361,6 +372,19 @@ pub struct Bundle {
     /// or not Git (see [`AutoCrlf`]). Defaulted for the same reason as `page_bytes_ceiling`.
     #[serde(default)]
     pub worktree_autocrlf: Option<AutoCrlf>,
+    /// Whether the user's Git applies an LFS filter to this checkout, so the service stages LFS
+    /// paths through `crate::lfs` (issue #150). Defaulted for the same reason as `page_bytes_ceiling`.
+    #[serde(default)]
+    pub worktree_lfs: bool,
+}
+
+impl Bundle {
+    pub fn staging(&self) -> Staging {
+        Staging {
+            autocrlf: self.worktree_autocrlf,
+            lfs: self.worktree_lfs,
+        }
+    }
 }
 
 impl Bundle {
@@ -382,11 +406,13 @@ impl Bundle {
         // review to refuse. Before issue #86 a working root with more than `max_files` entries --
         // a vendored engine tree is enough -- failed here and took the whole review with it.
         let initial_stamp = core::initial_stamp(&canonical, &limits, vcs.into());
-        let worktree_autocrlf = if vcs == crate::config::Vcs::Git {
+        let is_git = vcs == crate::config::Vcs::Git;
+        let worktree_autocrlf = if is_git {
             git::effective_autocrlf(&canonical)
         } else {
             None
         };
+        let worktree_lfs = is_git && git::native_lfs_filter(&canonical);
         let bundle = Self {
             schema_version: SCHEMA_VERSION,
             nonce: nonce.to_string(),
@@ -399,6 +425,7 @@ impl Bundle {
             initial_stamp,
             page_bytes_ceiling,
             worktree_autocrlf,
+            worktree_lfs,
         };
         bundle.validate()?;
         Ok(bundle)

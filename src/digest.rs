@@ -56,6 +56,21 @@ extern "system" {
         cbBuffer: u32,
         dwFlags: u32,
     ) -> i32;
+    /// Create a reusable hash object for [`Sha256Stream`]. With a null `pbHashObject` CNG allocates
+    /// the object itself (Windows 7+), so no size query is needed.
+    fn BCryptCreateHash(
+        hAlgorithm: *mut c_void,
+        phHash: *mut *mut c_void,
+        pbHashObject: *mut u8,
+        cbHashObject: u32,
+        pbSecret: *mut u8,
+        cbSecret: u32,
+        dwFlags: u32,
+    ) -> i32;
+    /// Feed bytes to a hash object. `pbInput` is not written (as with [`BCryptHash`]).
+    fn BCryptHashData(hHash: *mut c_void, pbInput: *mut u8, cbInput: u32, dwFlags: u32) -> i32;
+    fn BCryptFinishHash(hHash: *mut c_void, pbOutput: *mut u8, cbOutput: u32, dwFlags: u32) -> i32;
+    fn BCryptDestroyHash(hHash: *mut c_void) -> i32;
 }
 
 /// A lowercase-hex token of `n` cryptographically-random bytes (`2n` chars), or `None` if the OS
@@ -105,6 +120,67 @@ pub fn sha256(bytes: &[u8]) -> Option<[u8; 32]> {
     (status == STATUS_SUCCESS).then_some(out)
 }
 
+/// Incremental SHA-256 over input too large to hold at once: an LFS-tracked working-tree file can be
+/// gigabytes (issue #150). Same CNG provider as [`sha256`]; any failed call poisons the stream, so
+/// [`Sha256Stream::finish`] returns `None` rather than a digest of part of the input.
+pub struct Sha256Stream {
+    handle: *mut c_void,
+    ok: bool,
+}
+
+impl Sha256Stream {
+    pub fn new() -> Option<Self> {
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `phHash` points at a local the call fills in; the object buffer is null with length
+        // zero, which asks CNG to allocate it; the secret is null with length zero (unkeyed).
+        let status = unsafe {
+            BCryptCreateHash(
+                BCRYPT_SHA256_ALG_HANDLE,
+                &mut handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                0,
+            )
+        };
+        (status == STATUS_SUCCESS && !handle.is_null()).then_some(Self { handle, ok: true })
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(u32::MAX as usize) {
+            // SAFETY: the handle is live until `Drop`; CNG reads exactly `cbInput` bytes and does not
+            // write through the input pointer (see `sha256`).
+            let status = unsafe {
+                BCryptHashData(
+                    self.handle,
+                    chunk.as_ptr() as *mut u8,
+                    chunk.len() as u32,
+                    0,
+                )
+            };
+            self.ok &= status == STATUS_SUCCESS;
+        }
+    }
+
+    pub fn finish(self) -> Option<[u8; 32]> {
+        let mut out = [0u8; 32];
+        // SAFETY: the handle is live; the output buffer is exactly the 32-byte SHA-256 length.
+        let status =
+            unsafe { BCryptFinishHash(self.handle, out.as_mut_ptr(), out.len() as u32, 0) };
+        (self.ok && status == STATUS_SUCCESS).then_some(out)
+    }
+}
+
+impl Drop for Sha256Stream {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `BCryptCreateHash` and is destroyed exactly once, here.
+        unsafe {
+            BCryptDestroyHash(self.handle);
+        }
+    }
+}
+
 /// A content fingerprint: the SHA-256 digest and the input length.
 ///
 /// The length is stored alongside the digest so that a false "unchanged" would require a
@@ -127,7 +203,7 @@ impl Fingerprint {
 }
 
 /// Lowercase hex encoding, so a digest is a stable, human-readable string in the store.
-fn to_hex(bytes: &[u8]) -> String {
+pub fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -153,6 +229,18 @@ mod tests {
             to_hex(&sha256(b"abc").expect("digest of abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// The stream agrees with the one-shot digest however the input is split, and on empty input.
+    #[test]
+    fn sha256_stream_matches_the_one_shot_digest() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut stream = Sha256Stream::new().expect("stream");
+        for chunk in data.chunks(7_919) {
+            stream.update(chunk);
+        }
+        assert_eq!(stream.finish(), sha256(&data));
+        assert_eq!(Sha256Stream::new().unwrap().finish(), sha256(b""));
     }
 
     #[test]

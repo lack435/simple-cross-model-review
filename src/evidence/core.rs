@@ -1147,7 +1147,7 @@ impl Core {
             && path.is_empty();
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
-        let autocrlf = self.bundle.worktree_autocrlf;
+        let staging = self.bundle.staging();
         let cancel = Arc::clone(&self.cancel);
         let composed = run_bounded_walk(&CHILD_WATCHDOG, "git diff", received_at, move || {
             compose_diff(
@@ -1155,7 +1155,7 @@ impl Core {
                 &base_ep,
                 &head_ep,
                 &path,
-                autocrlf,
+                staging,
                 &limits,
                 &cancel,
                 received_at,
@@ -2558,7 +2558,7 @@ fn compose_diff(
     base: &DiffEndpoint,
     head: &DiffEndpoint,
     path: &str,
-    autocrlf: Option<super::AutoCrlf>,
+    staging: super::Staging,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
@@ -2580,7 +2580,7 @@ fn compose_diff(
         base_source,
         head,
         path,
-        autocrlf,
+        staging,
         limits,
         cancel,
         received_at,
@@ -2618,7 +2618,10 @@ pub fn committed_change_digest(
         base_source.to_string(),
         &DiffEndpoint::Commit(head.to_string()),
         "",
-        autocrlf,
+        super::Staging {
+            autocrlf,
+            lfs: false,
+        },
         limits,
         &cancel,
         Instant::now(),
@@ -2645,7 +2648,7 @@ fn compose_resolved(
     base_source: String,
     head: &DiffEndpoint,
     path: &str,
-    autocrlf: Option<super::AutoCrlf>,
+    staging: super::Staging,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
@@ -2674,24 +2677,9 @@ fn compose_resolved(
         }
     }
     let spec_refs: Vec<&str> = spec.iter().map(String::as_str).collect();
-    let tracked = super::git::diff(
-        root,
-        &spec_refs,
-        path,
-        autocrlf,
-        limits,
-        cancel,
-        received_at,
-    )?;
-    let (files, insertions, deletions) = super::git::numstat(
-        root,
-        &spec_refs,
-        path,
-        autocrlf,
-        limits,
-        cancel,
-        received_at,
-    )?;
+    let tracked = super::git::diff(root, &spec_refs, path, staging, limits, cancel, received_at)?;
+    let (files, insertions, deletions) =
+        super::git::numstat(root, &spec_refs, path, staging, limits, cancel, received_at)?;
 
     let mut complete = true;
     let mut untracked_files = 0usize;
@@ -2853,6 +2841,7 @@ mod tests {
             initial_stamp: initial_stamp(root, &limits, vcs),
             page_bytes_ceiling: None,
             worktree_autocrlf: None,
+            worktree_lfs: false,
         }
     }
 
@@ -3982,6 +3971,18 @@ mod tests {
 
     /// The digest the evidence server would serve for `base..worktree` with this header.
     fn served_digest(root: &Path, base: &str, source: &str, autocrlf: Option<AutoCrlf>) -> String {
+        served_digest_staged(
+            root,
+            base,
+            source,
+            Staging {
+                autocrlf,
+                lfs: false,
+            },
+        )
+    }
+
+    fn served_digest_staged(root: &Path, base: &str, source: &str, staging: Staging) -> String {
         let cancel = AtomicBool::new(false);
         let composed = compose_resolved(
             root,
@@ -3989,7 +3990,7 @@ mod tests {
             source.to_string(),
             &DiffEndpoint::Worktree,
             "",
-            autocrlf,
+            staging,
             &Limits::default(),
             &cancel,
             Instant::now(),
@@ -4000,7 +4001,7 @@ mod tests {
             .sha256
     }
 
-    use crate::evidence::AutoCrlf;
+    use crate::evidence::{AutoCrlf, Staging};
 
     const SOURCE: &str = "merge-base(HEAD, refs/remotes/origin/HEAD)";
 
@@ -4049,6 +4050,64 @@ mod tests {
             committed
         );
         assert_ne!(served_digest(root, &base, SOURCE, None), committed);
+    }
+
+    /// Issue #150: an LFS-tracked file committed as its pointer. Whether the working copy holds the
+    /// pointer (`GIT_LFS_SKIP_SMUDGE`) or the hydrated payload, the served diff — staged through
+    /// `crate::lfs`, as the service does when the user's Git has an LFS filter — is exactly the
+    /// committed change; a hydrated file whose content really changed still is not. Without the filter
+    /// the hydrated copy diffs as its raw payload, which is the reported false mismatch.
+    #[test]
+    fn an_lfs_file_binds_hydrated_or_as_a_pointer_but_not_when_changed() {
+        if crate::reviewer::on_path("git").is_none() {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        let dir = temp_dir("binding-lfs");
+        let root = dir.as_path();
+        git_out(root, &[], &["init", "-q"]).unwrap();
+        fs::write(root.join("keep.txt"), "base\n").unwrap();
+        git_out(root, &[], &["add", "-A"]).unwrap();
+        git_out(root, &[], &["commit", "-q", "-m", "base"]).unwrap();
+        let base = git_out(root, &[], &["rev-parse", "HEAD"]).unwrap();
+
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i * 31 % 256) as u8).collect();
+        let oid = crate::digest::to_hex(&crate::digest::sha256(&payload).unwrap());
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            payload.len()
+        );
+        // Committed as the pointer, which is what `git lfs` stores; this fixture's Git has no LFS
+        // filter, so the pointer bytes are staged as written.
+        fs::write(
+            root.join(".gitattributes"),
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        fs::write(root.join("asset.bin"), &pointer).unwrap();
+        git_out(root, &[], &["add", "-A"]).unwrap();
+        git_out(root, &[], &["commit", "-q", "-m", "lfs"]).unwrap();
+        let head = git_out(root, &[], &["rev-parse", "HEAD"]).unwrap();
+        let committed =
+            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+        let lfs = Staging {
+            autocrlf: None,
+            lfs: true,
+        };
+
+        // Pointer-only checkout.
+        assert_eq!(served_digest_staged(root, &base, SOURCE, lfs), committed);
+
+        // Hydrated checkout of the same head.
+        fs::write(root.join("asset.bin"), &payload).unwrap();
+        assert_eq!(served_digest_staged(root, &base, SOURCE, lfs), committed);
+        assert_ne!(served_digest(root, &base, SOURCE, None), committed);
+
+        // A hydrated file that really changed.
+        let mut changed = payload.clone();
+        changed[0] ^= 1;
+        fs::write(root.join("asset.bin"), &changed).unwrap();
+        assert_ne!(served_digest_staged(root, &base, SOURCE, lfs), committed);
     }
 
     /// Anything the reviewer saw beyond the commit — an uncommitted edit, an untracked file — makes

@@ -22,6 +22,7 @@ mod errors;
 mod evidence;
 mod findings;
 mod hook;
+mod lfs;
 mod mcp;
 mod metrics;
 mod pathcmp;
@@ -51,6 +52,13 @@ fn main() {
     // Internal evidence mode is handled before normal configuration by construction. The child
     // therefore cannot load reviewer credentials, create review state, or expose an App/MCP review
     // tool recursively; its entire surface lives in `evidence`.
+    // Git LFS clean-filter mode (issue #150): the evidence service's isolated Git spawns this
+    // binary as `filter.lfs.process`. Like evidence mode it is dispatched before any configuration
+    // is read, and it speaks only Git's filter protocol on stdin/stdout.
+    if args.first().map(String::as_str) == Some(lfs::FILTER_FLAG) {
+        std::process::exit(lfs::serve_stdio());
+    }
+
     if args.first().map(String::as_str) == Some(evidence::SERVER_FLAG) {
         if args.len() != 3 {
             eprintln!(
