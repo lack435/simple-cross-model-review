@@ -23,8 +23,8 @@ use std::io::{self, BufRead, BufReader, Write};
 /// Hidden argv flag selecting filter mode; handled in `main` before any configuration is read.
 pub const FILTER_FLAG: &str = "--lfs-filter-process";
 
-/// What `git-lfs` writes as the first pointer line.
-const POINTER_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
+/// The pointer spec version `git-lfs` writes.
+const POINTER_VERSION: &str = "https://git-lfs.github.com/spec/v1";
 
 /// `git-lfs` only treats content shorter than this as a possible pointer.
 const POINTER_MAX: usize = 1024;
@@ -32,13 +32,18 @@ const POINTER_MAX: usize = 1024;
 /// The largest pkt-line payload (`LARGE_PACKET_DATA_MAX`).
 const PKT_MAX: usize = 65516;
 
-/// The `filter.lfs.process` value naming this executable in filter mode, or `None` when its path
-/// cannot be quoted for the shell Git runs filters through (a `'` in it). `None` leaves the
-/// runner as it was before issue #150: noisier for a hydrated LFS file, never thinner.
+/// The `filter.lfs.process` value naming this executable in filter mode, single-quoted for the POSIX
+/// shell Git runs filters through (an embedded `'` becomes `'\''`). `None` only when the running
+/// executable cannot be located or its path is not Unicode; the runner then disables the filter
+/// rather than leave a configured one in force (see `git::staging_overrides`).
 pub fn filter_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    let exe = exe.to_str()?.replace('\\', "/");
-    (!exe.contains('\'')).then(|| format!("'{exe}' {FILTER_FLAG}"))
+    Some(shell_command(exe.to_str()?))
+}
+
+fn shell_command(exe: &str) -> String {
+    let quoted = exe.replace('\\', "/").replace('\'', "'\\''");
+    format!("'{quoted}' {FILTER_FLAG}")
 }
 
 /// Filter mode's entry point: serve Git's filter protocol on stdin/stdout. Returns the exit code.
@@ -217,30 +222,82 @@ impl Cleaner {
 
 /// The canonical pointer text `git-lfs` writes for content with this SHA-256 and size.
 fn pointer(oid: &str, size: u64) -> String {
-    format!("{POINTER_VERSION}\noid sha256:{oid}\nsize {size}\n")
+    format!("version {POINTER_VERSION}\noid sha256:{oid}\nsize {size}\n")
 }
 
-/// Whether `bytes` is exactly a canonical pointer, so passing it through is what `git-lfs` would
-/// store. Anything less exact is hashed as content, which can only make the diff noisier.
+/// The pointer `version` values `git-lfs` accepts (`v1Aliases` in its `lfs/pointer.go`).
+const VERSION_ALIASES: [&str; 3] = [
+    "http://git-media.io/v/2",
+    "https://hawser.github.com/spec/v1",
+    POINTER_VERSION,
+];
+
+/// Whether `git-lfs clean` would treat `bytes` (already under [`POINTER_MAX`]) as a pointer and
+/// store them unchanged, rather than hash them as content.
+///
+/// The rule this must keep is one-directional: everything accepted here must be a pointer to
+/// `git-lfs` too. Passing through what `git-lfs` would hash could make a changed file read as its
+/// committed pointer (a false bind); hashing what it would pass through only makes the diff differ
+/// (a false skip). So this is a strict subset of `git-lfs`'s `DecodePointer` grammar: the input is
+/// whitespace-trimmed; non-empty lines are `key value` split at the first space, with `\r` dropped;
+/// `version` is first and one of [`VERSION_ALIASES`]; any `ext-<digit>-<word>` lines with distinct
+/// priorities come next, then `oid`, then `size` (a non-negative `int64`), and nothing after.
+/// Probed against `git-lfs/3.7.1 clean`: surrounding whitespace, CRLF, a missing final newline, the
+/// `hawser` alias, an extension and `size 0` pass through; an out-of-range or negative size is
+/// hashed.
 fn is_pointer(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
-    let mut lines = text.split_terminator('\n');
-    let (Some(version), Some(oid), Some(size), None) =
-        (lines.next(), lines.next(), lines.next(), lines.next())
-    else {
+    let mut lines = text
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split_once(' ').unwrap_or((l, "")));
+    if !matches!(lines.next(), Some(("version", v)) if VERSION_ALIASES.contains(&v)) {
         return false;
+    }
+    let mut priorities = Vec::new();
+    let oid = loop {
+        match lines.next() {
+            Some(("oid", value)) => break value,
+            Some((key, value)) => {
+                let Some(priority) = extension_priority(key) else {
+                    return false;
+                };
+                if priorities.contains(&priority) || !is_sha256_oid(value) {
+                    return false;
+                }
+                priorities.push(priority);
+            }
+            None => return false,
+        }
     };
-    let oid_ok = oid.strip_prefix("oid sha256:").is_some_and(|h| {
+    let size_ok = matches!(
+        lines.next(),
+        Some(("size", n)) if !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && n.parse::<i64>().is_ok()
+    );
+    is_sha256_oid(oid) && size_ok && lines.next().is_none()
+}
+
+/// `sha256:` and 64 lowercase hex digits (`parseOid` and `oidRE` in `git-lfs`).
+fn is_sha256_oid(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|h| {
         h.len() == 64
             && h.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    });
-    let size_ok = size
-        .strip_prefix("size ")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    version == POINTER_VERSION && oid_ok && size_ok && text.ends_with('\n')
+    })
+}
+
+/// The priority digit of an `ext-<digit>-<name>` key whose name is all word characters.
+fn extension_priority(key: &str) -> Option<u8> {
+    let rest = key.strip_prefix("ext-")?;
+    let (digit, name) = (rest.as_bytes().first()?, rest.get(1..)?.strip_prefix('-')?);
+    let word = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    (digit.is_ascii_digit() && word).then_some(*digit)
 }
 
 /// In the unit-test binary, run filter mode before the test harness starts when Git spawns this
@@ -280,15 +337,67 @@ mod tests {
         assert_eq!(clean(b"hello"), expected.as_bytes());
     }
 
+    /// Each case was probed against `git-lfs/3.7.1 clean`: `true` means it stored the input
+    /// unchanged, `false` that it hashed it as content.
     #[test]
-    fn a_pointer_and_an_empty_file_pass_through() {
-        let p = pointer(&"a".repeat(64), 12345);
-        assert_eq!(clean(p.as_bytes()), p.as_bytes());
+    fn pointer_recognition_matches_git_lfs() {
+        let oid = "a".repeat(64);
+        let v1 = format!("version {POINTER_VERSION}");
+        let cases = [
+            (format!("{v1}\noid sha256:{oid}\nsize 12\n"), true),
+            (format!("  {v1}\noid sha256:{oid}\nsize 12\n\n"), true),
+            (format!("{v1}\r\noid sha256:{oid}\r\nsize 12\r\n"), true),
+            (format!("{v1}\noid sha256:{oid}\nsize 12"), true),
+            (
+                format!("version https://hawser.github.com/spec/v1\noid sha256:{oid}\nsize 12\n"),
+                true,
+            ),
+            (
+                format!("{v1}\next-0-foo sha256:{oid}\noid sha256:{oid}\nsize 12\n"),
+                true,
+            ),
+            (format!("{v1}\noid sha256:{oid}\nsize 0\n"), true),
+            (
+                format!("{v1}\noid sha256:{oid}\nsize 99999999999999999999\n"),
+                false,
+            ),
+            (format!("{v1}\noid sha256:{oid}\nsize -1\n"), false),
+        ];
+        for (input, passes) in cases {
+            assert_eq!(is_pointer(input.as_bytes()), passes, "{input:?}");
+            assert_eq!(
+                clean(input.as_bytes()) == input.as_bytes(),
+                passes,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// Cases the subset refuses (hashing them can only cause a false skip): no version line, an
+    /// unknown version, a duplicate extension priority, a malformed oid, an extra line.
+    #[test]
+    fn anything_outside_the_grammar_is_hashed() {
+        let oid = "b".repeat(64);
+        let v1 = format!("version {POINTER_VERSION}");
+        for input in [
+            format!("oid sha256:{oid}\nsize 1\n"),
+            format!("version https://example.invalid/v9\noid sha256:{oid}\nsize 1\n"),
+            format!("{v1}\next-1-a sha256:{oid}\next-1-b sha256:{oid}\noid sha256:{oid}\nsize 1\n"),
+            format!("{v1}\noid sha256:{}\nsize 1\n", "B".repeat(64)),
+            format!("{v1}\noid sha256:{oid}\nsize 1\nextra x\n"),
+            format!("{v1}\noid sha256:{oid} \nsize 1\n"),
+        ] {
+            assert!(!is_pointer(input.as_bytes()), "{input:?}");
+        }
         assert!(clean(b"").is_empty());
-        // Not exactly canonical: hashed as content, not passed through.
-        let loose = p.replace("size", "size  ");
-        assert_ne!(clean(loose.as_bytes()), loose.as_bytes());
-        assert!(!is_pointer(p.trim_end().as_bytes()));
+    }
+
+    #[test]
+    fn the_command_quotes_any_path_for_the_shell() {
+        assert_eq!(
+            shell_command(r"C:\it's here\cross-review.exe"),
+            format!("'C:/it'\\''s here/cross-review.exe' {FILTER_FLAG}")
+        );
     }
 
     fn pkt(s: &str) -> Vec<u8> {

@@ -306,20 +306,23 @@ pub fn numstat(
 /// filter. `process` rather than `clean` because only a `process` overrides a repository-level one
 /// (see `crate::lfs`); `required=false` so a filter that cannot start leaves the diff as it was
 /// before issue #150 -- noisier, and a binding that fails closed -- rather than failing the request.
+///
+/// If the command cannot be built, the override is an *empty* `process`, never nothing: Git then
+/// runs neither a configured `process` nor a `clean` for `filter=lfs` paths (verified, Git 2.55) and
+/// with `required=false` stages them raw. A configured LFS program is never left in force.
 fn staging_overrides(staging: Staging) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(value) = staging.autocrlf {
         args.extend(["-c".to_string(), value.config_override().to_string()]);
     }
     if staging.lfs {
-        if let Some(command) = crate::lfs::filter_command() {
-            args.extend([
-                "-c".to_string(),
-                format!("filter.lfs.process={command}"),
-                "-c".to_string(),
-                "filter.lfs.required=false".to_string(),
-            ]);
-        }
+        let command = crate::lfs::filter_command().unwrap_or_default();
+        args.extend([
+            "-c".to_string(),
+            format!("filter.lfs.process={command}"),
+            "-c".to_string(),
+            "filter.lfs.required=false".to_string(),
+        ]);
     }
     args
 }
@@ -788,6 +791,69 @@ mod tests {
         assert_eq!(AutoCrlf::parse(""), None);
         assert_eq!(AutoCrlf::parse("core.fsmonitor=evil"), None);
         assert_eq!(AutoCrlf::parse("crlf"), None);
+    }
+
+    /// Issue #150 (review f1): a repository's own `filter.lfs.*` never runs in the isolated runner,
+    /// whether the override names this binary or is the empty fallback used when it cannot. The
+    /// last step proves the fixture can see a run: with no LFS staging the configured program does.
+    #[test]
+    fn a_configured_lfs_program_never_runs_under_lfs_staging_issue_150() {
+        let Some(dir) = repo("evidence-lfs-config") else {
+            return;
+        };
+        let root = dir.as_path();
+        let no_filter = [
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false",
+        ];
+        std::fs::write(root.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        std::fs::write(root.join("a.bin"), "base\n").unwrap();
+        assert!(git(root, &[&no_filter[..], &["add", "."]].concat()));
+        assert!(git(root, &["commit", "-qm", "base"]));
+        assert!(git(
+            root,
+            &["config", "filter.lfs.process", "touch process.marker"]
+        ));
+        assert!(git(
+            root,
+            &["config", "filter.lfs.clean", "touch clean.marker"]
+        ));
+        std::fs::write(root.join("a.bin"), [9u8, 9]).unwrap();
+        let ran = || root.join("process.marker").exists() || root.join("clean.marker").exists();
+
+        let limits = Limits::default();
+        let cancel = AtomicBool::new(false);
+        let lfs = Staging {
+            autocrlf: None,
+            lfs: true,
+        };
+        let patch = diff(root, &["HEAD"], "", lfs, &limits, &cancel, Instant::now()).unwrap();
+        assert!(patch.contains("+oid sha256:"), "{patch}");
+        assert!(!ran());
+
+        let fallback: Vec<String> = [&no_filter[..], &["diff", "HEAD"]]
+            .concat()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        run(root, &fallback, &limits, &cancel, Instant::now()).unwrap();
+        assert!(!ran());
+
+        let _ = diff(
+            root,
+            &["HEAD"],
+            "",
+            Staging::default(),
+            &limits,
+            &cancel,
+            Instant::now(),
+        );
+        assert!(
+            ran(),
+            "the fixture must be able to observe a configured filter running"
+        );
     }
 
     /// Issue #135's own verification fixture: an LF-normalized blob checked out with CRLF, one line
