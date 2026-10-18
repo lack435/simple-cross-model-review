@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
   Regression for #130 using synthetic files in a disposable local Perforce server.
+  Also covers a pending delete: its removed content must be captured (follow-up to #151).
   Requires p4, p4d and cargo. No model calls or access to an existing depot.
 #>
 [CmdletBinding()]
@@ -16,6 +17,7 @@ $settings = @{
     P4USER = 'eol-test'; P4CLIENT = 'eol-test'; P4CHARSET = 'utf8'; P4PASSWD = ''
     P4CONFIG = 'cross-review-no-config-' + [guid]::NewGuid()
     P4ENVIRO = (Join-Path $root 'p4enviro')
+    P4TICKETS = (Join-Path $root 'p4tickets.txt')
     P4DIFF = ''; P4DIFFUNICODE = ''
     CROSS_REVIEW_P4_TEST_CWD = $workspace
     CROSS_REVIEW_P4_TEST_CL = ''
@@ -27,21 +29,39 @@ $listener.Start()
 $settings.P4PORT = "127.0.0.1:$($listener.LocalEndpoint.Port)"
 $listener.Stop()
 $process = $null
+# Windows PowerShell writes a native command's piped stdin in [Console]::InputEncoding. On a
+# host where that is UTF-8 with a BOM, p4 reads the BOM as part of the first spec field
+# ("Unknown field name" for Client:) or of a password ("Password invalid.").
+$savedInputEncoding = [Console]::InputEncoding
 function Invoke-TestP4 {
     $result = @($input | & p4 @args)
     if ($LASTEXITCODE -ne 0) { throw "p4 $args failed ($LASTEXITCODE)" }
     $result
 }
 try {
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
     foreach ($name in $settings.Keys) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
     & $P4d -r $server -xi | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the Unicode test server.' }
+    # p4d 2026.1 is secure by default: it forces security=4 even over an explicit lower value,
+    # stops autocreating users, and only lets a super user set a first password (then forces a
+    # reset). Keep security=4 and restore the older defaults for the rest, so the test user is
+    # created, sets its own password and logs in for a ticket. A no-op on pre-2026.1 servers.
+    foreach ($configurable in 'dm.user.noautocreate=0', 'dm.user.resetpassword=0', 'dm.user.setinitialpasswd=1') {
+        & $P4d -r $server "-cset $configurable" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not set $configurable on the test server." }
+    }
     $process = Start-Process -FilePath $P4d -ArgumentList @('-r', "`"$server`"", '-p', $settings.P4PORT, '-L', "`"$(Join-Path $root 'server.log')`"") -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds 1
     if ($process.HasExited) { throw 'The disposable p4d did not start.' }
+    # A throwaway password for a throwaway server, strong enough for security=4. It goes in on
+    # stdin because security>=2 refuses 'p4 passwd -P'; the ticket lands in the isolated P4TICKETS.
+    $password = 'Eol-' + [guid]::NewGuid().ToString('N').Substring(0, 12) + '-7a'
+    "$password`n$password" | Invoke-TestP4 passwd | Out-Null
+    $password | Invoke-TestP4 login | Out-Null
     @"
 Client: eol-test
 Owner: eol-test
@@ -57,6 +77,7 @@ View:
     [IO.File]::WriteAllText((Join-Path $workspace 'a-eol-only.txt'), $large, $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'b-mixed.txt'), $large + "semantic-before`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'c-whitespace.txt'), "space change`ntab change`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $workspace 'd-deleted.txt'), "deleted-line-one`ndeleted-line-two`n", $utf8)
     Invoke-TestP4 add -t text "$workspace\..." | Out-Null
     Invoke-TestP4 submit -d 'Synthetic baseline' | Out-Null
     $created = @"
@@ -69,6 +90,8 @@ Description:
     if (($created -join '') -notmatch 'Change (\d+) created') { throw 'No pending changelist was created.' }
     $env:CROSS_REVIEW_P4_TEST_CL = $Matches[1]
     Invoke-TestP4 edit -c $env:CROSS_REVIEW_P4_TEST_CL "$workspace\..." | Out-Null
+    Invoke-TestP4 revert "$workspace\d-deleted.txt" | Out-Null
+    Invoke-TestP4 delete -c $env:CROSS_REVIEW_P4_TEST_CL "$workspace\d-deleted.txt" | Out-Null
     [IO.File]::WriteAllText((Join-Path $workspace 'a-eol-only.txt'), $large.Replace("`n", "`r`n"), $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'b-mixed.txt'), $large.Replace("`n", "`r`n") + "semantic-after`r`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $workspace 'c-whitespace.txt'), "space  change`r`ntab`tchange`r`n", $utf8)
@@ -88,14 +111,16 @@ Description:
     if ($testExit -ne 0) { throw "Capture test failed:`n$output" }
     foreach ($expected in @(
         '(no textual changes vs the depot, ignoring line endings: //depot/a-eol-only.txt)',
-        '+semantic-after', '+space  change', "+tab`tchange"
+        '+semantic-after', '+space  change', "+tab`tchange",
+        '-deleted-line-one', '-deleted-line-two'
     )) {
         if (-not $output.Contains($expected)) { throw "Capture lost expected evidence: $expected" }
     }
     if ($output.Contains('live warning:')) { throw "Capture was incomplete:`n$output" }
-    Write-Host 'PASS: EOL-only changes use no diff budget; mixed content, spaces and tabs survive capture.'
+    Write-Host 'PASS: EOL-only changes use no diff budget; mixed content, spaces and tabs survive capture; a deleted file shows its removed content.'
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
+    [Console]::InputEncoding = $savedInputEncoding
     foreach ($name in $saved.Keys) {
         if ($null -eq $saved[$name]) {
             Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
