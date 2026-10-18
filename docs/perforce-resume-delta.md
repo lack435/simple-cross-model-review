@@ -71,9 +71,13 @@ whole.
 
 Only **token-heavy textual content** participates in elision:
 
-- **Elidable:** a file's textual `p4 diff` section, and a **pending** added file's body (read
-  from the workspace and rendered separately at `src/vcs/perforce.rs:565`, `:628`, `:951`).
-- **Never elidable — rendered in full every turn:** binary files, deletes, files opened but
+- **Elidable:** a file's textual `p4 diff` section, a **pending** added file's body (read
+  from the workspace and rendered separately at `src/vcs/perforce.rs:565`, `:628`, `:951`), and,
+  since issue #159, a **pending** deleted text file's removed content. That content is printed from
+  its have-revision (`p4 print -q depot#rev`) as an all-removed hunk, and it is a text-diff unit
+  against that revision like any edit.
+- **Never elidable — rendered in full every turn:** binary files, deletes whose content could not
+  be shown (binary or untyped, unknown have-revision, a failed or cut `p4 print`), files opened but
   restored to depot content (including line-ending-only differences; no diff section),
   unreadable/omitted content, content that required **lossy UTF-8 decoding** (see invariant 1),
   and every metadata note. These are

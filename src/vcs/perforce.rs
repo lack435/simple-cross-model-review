@@ -1676,8 +1676,8 @@ fn render(
              these changelist(s) earlier in this same session, and that conversation is still in \
              your context. Below, every file that is **byte-identical to what you were already \
              shown** is collapsed to a one-line marker; only files that changed since your last \
-             turn are shown in full. Non-elidable evidence (binary, deleted or omitted files) is \
-             still shown. Re-check your earlier findings against the changes below rather than \
+             turn are shown in full. Non-elidable evidence (binary or omitted files, and deletes \
+             whose content could not be shown) is still shown. Re-check your earlier findings against the changes below rather than \
              treating this as the entire change.\n\n",
         );
     }
@@ -2590,7 +2590,13 @@ fn split_rev(spec: &str) -> Option<String> {
 /// A unified-diff hunk that removes every line of `content` -- how a deleted file's content is
 /// shown, in the same shape `p4 diff -du` gives an edit. Empty content is an empty body: there is
 /// nothing to remove, and the listing already records the delete.
+///
+/// `p4 print` renders text in the client's `LineEnd`, which may be CRLF or CR-only (`mac`), so line
+/// endings are normalised to LF first: split on `\n` alone, a CR-only file would become one
+/// malformed "line" (review f1 on #159). Ignoring line endings matches the edit diffs (`-dl`).
 fn removal_hunk(content: &str) -> String {
+    let normalised = content.replace("\r\n", "\n").replace('\r', "\n");
+    let content = normalised.as_str();
     if content.is_empty() {
         return String::new();
     }
@@ -3088,6 +3094,10 @@ Change 5 by u@c on 2026/01/01\n\n\
             "@@ -1,2 +0,0 @@\n-a\n-last\n\\ No newline at end of file\n"
         );
         assert_eq!(removal_hunk(""), "");
+        // Every client LineEnd renders to the same hunk.
+        for text in ["a\r\nb\r\n", "a\rb\r", "a\nb\n"] {
+            assert_eq!(removal_hunk(text), "@@ -1,2 +0,0 @@\n-a\n-b\n", "{text:?}");
+        }
     }
 
     #[test]
