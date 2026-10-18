@@ -18,7 +18,7 @@
 //! code, are included only with `--on-event-include-findings`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -101,8 +101,19 @@ impl EventSink {
     /// Start the worker that runs the hook in `cwd` -- the state directory, deliberately not a
     /// repository: an event consumer has no business in the reviewed tree. `None` if the thread
     /// cannot be spawned; the server then runs without events, as a failing hook would leave it.
+    ///
+    /// Each event is also appended to the state directory's status log ([`status_log_path`]) before
+    /// the hook runs, without finding text, for `--status --json` (best effort: a write failure is
+    /// logged and the hook still runs).
     pub fn spawn(cfg: EventConfig, cwd: PathBuf) -> Option<Self> {
+        let log = status_log_path(&cwd);
         Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
+            if let Err(e) = append_status(&log, payload) {
+                eprintln!(
+                    "cross-review: could not append to the status log {}: {e}",
+                    log.display()
+                );
+            }
             let dir = if cwd.is_dir() {
                 cwd.clone()
             } else {
@@ -269,6 +280,100 @@ impl EventSink {
     }
 }
 
+/// The status log in `state_dir`: one JSON envelope per line, named for the machine like the usage
+/// log, so logs gathered from several machines do not collide.
+pub fn status_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(format!("status-{}.jsonl", crate::metrics::host_tag()))
+}
+
+/// Append one envelope to the status log, with finding text removed whatever the hook was sent.
+/// One `write_all` of the whole line on an append handle, so concurrent servers sharing the state
+/// directory interleave whole lines.
+fn append_status(log: &Path, payload: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut value: Value = serde_json::from_str(payload)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("findings".into(), Value::Null);
+    }
+    let mut line = value.to_string();
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?
+        .write_all(line.as_bytes())
+}
+
+/// `cross-review --status --json`: the latest envelope of each session, as a JSON array sorted by
+/// session name. A session's latest status-log record wins; a saved session with none (it predates
+/// `--on-event`, or the hook was not configured) gets a minimal envelope from its session record,
+/// with `event` null. Read-only: nothing is created or written.
+pub fn status_report(state_dir: &Path) -> String {
+    let mut latest: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(status_log_path(state_dir)) {
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(session) = value.get("session").and_then(Value::as_str) {
+                latest.insert(session.to_string(), value);
+            }
+        }
+    }
+    for (name, record) in crate::session::SessionStore::new(state_dir).list() {
+        latest
+            .entry(name.clone())
+            .or_insert_with(|| record_envelope(&name, &record));
+    }
+    let all: Vec<Value> = latest.into_values().collect();
+    serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into())
+}
+
+/// The envelope shape for a session known only from its record: what the record holds is filled in
+/// (the last turn number, reviewer, kind, root, and when it was last updated), the rest is null.
+fn record_envelope(name: &str, record: &crate::session::SessionRecord) -> Value {
+    let turn = Turn {
+        kind: if record.kind.as_deref() == Some(crate::session::KIND_CONSULT) {
+            JobKind::Consult
+        } else {
+            JobKind::Review
+        },
+        review_id: String::new(),
+        session: name.to_string(),
+        turn: record.turns,
+        resumed: record.turns > 1,
+        root: PathBuf::from(&record.cwd),
+        level: None,
+        started_at: UNIX_EPOCH + Duration::from_secs(record.updated_unix),
+        entry: Entry {
+            cli: record.reviewer.clone(),
+            model: record.model.clone(),
+            effort: record.effort.clone(),
+            chain_index: 0,
+            fallback: false,
+        },
+    };
+    let mut value = envelope(
+        &turn,
+        "",
+        &turn.entry,
+        Some(UNIX_EPOCH + Duration::from_secs(record.updated_unix)),
+    );
+    if let Some(object) = value.as_object_mut() {
+        object.insert("event".into(), Value::Null);
+        object.insert("review_id".into(), Value::Null);
+        object.insert("started_at".into(), Value::Null);
+        object.insert("resumed".into(), Value::Null);
+        object.insert("reviewer".into(), {
+            let mut r = object["reviewer"].clone();
+            r["chain_index"] = Value::Null;
+            r["fallback"] = Value::Null;
+            r
+        });
+    }
+    value
+}
+
 fn event_for(failure: Option<&Failure>) -> &'static str {
     match failure {
         None => "turn_completed",
@@ -395,6 +500,62 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         seen.lock().unwrap().clone()
+    }
+
+    /// The status log keeps the latest envelope per session without finding text, and
+    /// `--status --json` reports it, filling sessions with no record from the session store.
+    #[test]
+    fn the_status_report_shows_each_sessions_latest_event() {
+        let dir = crate::testutil::temp_dir("events-status");
+        let log = status_log_path(dir.as_path());
+        let mut t = turn();
+        let started = envelope(&t, "turn_started", &t.entry, None).to_string();
+        append_status(&log, &started).unwrap();
+        let mut done = envelope(&t, "turn_completed", &t.entry, Some(now()));
+        done["findings"] = json!([{"title": "secret source"}]);
+        append_status(&log, &done.to_string()).unwrap();
+        t.session = "other".into();
+        append_status(
+            &log,
+            &envelope(&t, "turn_started", &t.entry, None).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log.with_file_name("ignored.jsonl"),
+            "not part of the report\n",
+        )
+        .unwrap();
+
+        let report: Vec<Value> = serde_json::from_str(&status_report(dir.as_path())).unwrap();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0]["session"], "other");
+        assert_eq!(report[0]["event"], "turn_started");
+        assert_eq!(report[1]["session"], "s");
+        assert_eq!(report[1]["event"], "turn_completed");
+        assert!(
+            report[1]["findings"].is_null(),
+            "finding text never reaches the log"
+        );
+        // A missing state directory is an empty report, not an error.
+        assert_eq!(status_report(&dir.as_path().join("absent")), "[]");
+    }
+
+    /// A saved session with no recorded event is still listed, from its session record.
+    #[test]
+    fn a_session_without_events_gets_a_minimal_record() {
+        let dir = crate::testutil::temp_dir("events-status-record");
+        let store = crate::session::SessionStore::new(dir.as_path());
+        crate::session::tests::record(&store, "only-saved", "thread-1");
+        let report: Vec<Value> = serde_json::from_str(&status_report(dir.as_path())).unwrap();
+        assert_eq!(report.len(), 1);
+        let r = &report[0];
+        assert_eq!(r["session"], "only-saved");
+        assert!(r["event"].is_null() && r["review_id"].is_null());
+        assert_eq!(r["turn"], 1);
+        assert_eq!(r["kind"], "review");
+        assert_eq!(r["reviewer"]["cli"], "codex");
+        assert_eq!(r["working_root"], r"C:\repo");
+        assert!(r["finished_at"].is_string());
     }
 
     #[test]

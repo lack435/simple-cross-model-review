@@ -392,6 +392,14 @@ are `null`:
 - **Finding text is opt-in.** Finding titles and details can quote source code, so they are sent only with `--on-event-include-findings`.
 - **Warnings are prose,** the same strings the result carries. There are no warning codes yet.
 
+**Catching up after a restart.** A consumer that missed events can run
+`cross-review <the MCP entry's arguments> --status --json`. It prints a JSON array with each
+session's latest envelope.
+
+- **Where it comes from:** while `--on-event` is configured, every event is also appended to `status-<host>.jsonl` in the state directory. Finding text is always stripped from that file.
+- **Sessions with no recorded event** (saved before `--on-event`, or with it off) get a minimal record built from `sessions.json`, with `event` set to `null`.
+- **Read-only:** like `--usage`, it creates and writes nothing.
+
 ## When the reviewer is unavailable
 
 The tool call fails loudly with a machine-readable code, an explanation, and the exact

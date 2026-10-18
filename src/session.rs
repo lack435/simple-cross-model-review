@@ -1048,7 +1048,7 @@ pub fn now_unix() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
@@ -1058,7 +1058,7 @@ mod tests {
         crate::testutil::temp_dir("cross-review-session-tests")
     }
 
-    fn record(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {
+    pub(crate) fn record(store: &SessionStore, name: &str, cli_id: &str) -> SessionRecord {
         store
             .record_turn(
                 name,

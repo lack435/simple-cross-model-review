@@ -2494,6 +2494,9 @@ LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
 
 OTHER:
   --doctor                    Check the reviewer CLI and auth, then exit.
+  --status --json             Print each session's latest lifecycle event (the
+                              --on-event envelope) as a JSON array, then exit. Read-only.
+                              Sessions without a recorded event get a minimal record.
   --usage                     Print the recorded per-turn usage summary, then exit.
                               Reads every usage*.jsonl in the state directory, so
                               point --state-dir at a copied-together directory to roll
