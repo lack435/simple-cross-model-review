@@ -86,16 +86,9 @@ fn main() {
 
     let doctor = args.iter().any(|a| a == "--doctor");
     let usage_report = args.iter().any(|a| a == "--usage");
-    let status_report = args.iter().any(|a| a == "--status");
-    let json = args.iter().any(|a| a == "--json");
-    if status_report && !json {
-        eprintln!("cross-review: --status needs --json (the only output format)\n");
-        eprintln!("Run with --help for usage.");
-        std::process::exit(2);
-    }
     let args: Vec<String> = args
         .into_iter()
-        .filter(|a| !matches!(a.as_str(), "--doctor" | "--usage" | "--status" | "--json"))
+        .filter(|a| a != "--doctor" && a != "--usage")
         .collect();
 
     let cfg = match Config::from_args(&args) {
@@ -107,7 +100,7 @@ fn main() {
         }
     };
 
-    if status_report {
+    if cfg.status_json {
         // Read-only and ahead of the state-directory creation, like `--usage` (issue #152).
         println!("{}", events::status_report(&cfg.state_dir));
         return;

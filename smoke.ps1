@@ -720,7 +720,8 @@ finally {
 
         # `--status --json` reads the status log the event worker wrote, read-only.
         $statusText = (& $Exe @serverArgs --status --json) -join "`n"
-        $status = @($statusText | ConvertFrom-Json)
+        # Windows PowerShell's ConvertFrom-Json emits a JSON array as one object; unroll it.
+        $status = @($statusText | ConvertFrom-Json | ForEach-Object { $_ })
         $smokeStatus = @($status | Where-Object { $_.session -eq 'smoke' })
         Assert-That '--status --json reports the smoke session' ($smokeStatus.Count -eq 1) $statusText
         if ($smokeStatus.Count -eq 1) {

@@ -81,6 +81,11 @@ pub struct EventSink {
     include_findings: bool,
     /// Events queued or running, so shutdown can wait for them (see [`drain`](Self::drain)).
     pending: Arc<AtomicUsize>,
+    /// The status log every event is appended to, synchronously at emission (see [`send`]).
+    /// `None` only in tests.
+    ///
+    /// [`send`]: Self::send
+    log: Option<PathBuf>,
     /// Which turns are live, and whether shutdown has swept them. One lock, held across each
     /// terminal emission, so a turn's terminal event is claimed exactly once: either by the turn or
     /// by the shutdown sweep, never both and never neither (review f1 on #152).
@@ -102,18 +107,11 @@ impl EventSink {
     /// repository: an event consumer has no business in the reviewed tree. `None` if the thread
     /// cannot be spawned; the server then runs without events, as a failing hook would leave it.
     ///
-    /// Each event is also appended to the state directory's status log ([`status_log_path`]) before
-    /// the hook runs, without finding text, for `--status --json` (best effort: a write failure is
-    /// logged and the hook still runs).
+    /// Each event is also appended to the state directory's status log ([`status_log_path`]),
+    /// without finding text, for `--status --json`.
     pub fn spawn(cfg: EventConfig, cwd: PathBuf) -> Option<Self> {
         let log = status_log_path(&cwd);
-        Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
-            if let Err(e) = append_status(&log, payload) {
-                eprintln!(
-                    "cross-review: could not append to the status log {}: {e}",
-                    log.display()
-                );
-            }
+        let mut sink = Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
             let dir = if cwd.is_dir() {
                 cwd.clone()
             } else {
@@ -129,7 +127,9 @@ impl EventSink {
             if report.is_failure() || report.status == crate::hook::HookStatus::Skipped {
                 eprintln!("cross-review: --on-event hook {}", report.summary());
             }
-        })
+        })?;
+        sink.log = Some(log);
+        Some(sink)
     }
 
     /// [`spawn`](Self::spawn) with the runner injected: a seam for tests, not a setting.
@@ -154,6 +154,7 @@ impl EventSink {
             tx,
             include_findings,
             pending,
+            log: None,
             state: Mutex::new(Live::default()),
         })
     }
@@ -162,7 +163,20 @@ impl EventSink {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Record one event: appended to the status log here, on the emitting thread and under the
+    /// state lock, then queued for the hook. Synchronous on purpose (review f3 on the status log):
+    /// a turn's terminal event is emitted before its session lease is released, so the next turn
+    /// -- in this process or another -- can only append after it, and file order is lifecycle
+    /// order per session. Only the hook, which may be slow, runs asynchronously.
     fn send(&self, payload: Value) {
+        if let Some(log) = &self.log {
+            if let Err(e) = append_status(log, &payload) {
+                eprintln!(
+                    "cross-review: could not append to the status log {}: {e}",
+                    log.display()
+                );
+            }
+        }
         self.pending.fetch_add(1, Ordering::AcqRel);
         if let Err(e) = self.tx.try_send(payload.to_string()) {
             self.pending.fetch_sub(1, Ordering::AcqRel);
@@ -286,17 +300,21 @@ pub fn status_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join(format!("status-{}.jsonl", crate::metrics::host_tag()))
 }
 
-/// Append one envelope to the status log, with finding text removed whatever the hook was sent.
-/// One `write_all` of the whole line on an append handle, so concurrent servers sharing the state
-/// directory interleave whole lines.
-fn append_status(log: &Path, payload: &str) -> std::io::Result<()> {
+/// Append one envelope to the status log, with finding text removed whatever the hook is sent.
+/// Under the same cross-process lock pattern the usage log uses, so servers sharing a state
+/// directory never interleave a line.
+fn append_status(log: &Path, payload: &Value) -> std::io::Result<()> {
     use std::io::Write;
-    let mut value: Value = serde_json::from_str(payload)?;
+    let mut value = payload.clone();
     if let Some(object) = value.as_object_mut() {
         object.insert("findings".into(), Value::Null);
     }
     let mut line = value.to_string();
     line.push('\n');
+    let _lock = crate::session::ExclusiveLock::acquire(
+        &log.with_extension("jsonl.lock"),
+        Duration::from_secs(2),
+    )?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -509,17 +527,13 @@ mod tests {
         let dir = crate::testutil::temp_dir("events-status");
         let log = status_log_path(dir.as_path());
         let mut t = turn();
-        let started = envelope(&t, "turn_started", &t.entry, None).to_string();
+        let started = envelope(&t, "turn_started", &t.entry, None);
         append_status(&log, &started).unwrap();
         let mut done = envelope(&t, "turn_completed", &t.entry, Some(now()));
         done["findings"] = json!([{"title": "secret source"}]);
-        append_status(&log, &done.to_string()).unwrap();
+        append_status(&log, &done).unwrap();
         t.session = "other".into();
-        append_status(
-            &log,
-            &envelope(&t, "turn_started", &t.entry, None).to_string(),
-        )
-        .unwrap();
+        append_status(&log, &envelope(&t, "turn_started", &t.entry, None)).unwrap();
         std::fs::write(
             log.with_file_name("ignored.jsonl"),
             "not part of the report\n",

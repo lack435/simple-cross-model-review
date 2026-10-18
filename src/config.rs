@@ -987,6 +987,10 @@ pub struct Config {
     /// JSON envelope on stdin for every review and consult turn that starts or ends. `None` (the
     /// default) turns it off. See `src/events.rs`.
     pub on_event: Option<crate::events::EventConfig>,
+    /// `--status --json`: print each session's latest lifecycle envelope and exit (issue #152).
+    /// Parsed here rather than stripped from argv beforehand, so an option *value* spelled
+    /// `--json` (an `--on-event-arg`, say) is never mistaken for the flag.
+    pub status_json: bool,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -1049,6 +1053,8 @@ impl Config {
         let mut event_args: Vec<String> = Vec::new();
         let mut event_timeout_secs: Option<u64> = None;
         let mut event_include_findings = false;
+        let mut status_flag = false;
+        let mut json_flag = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -1303,6 +1309,8 @@ impl Config {
                 "--on-event" => event_program = Some(take("--on-event")?),
                 "--on-event-arg" => event_args.push(take("--on-event-arg")?),
                 "--on-event-include-findings" => event_include_findings = true,
+                "--status" => status_flag = true,
+                "--json" => json_flag = true,
                 "--on-event-timeout-seconds" => {
                     let v = take("--on-event-timeout-seconds")?;
                     let secs: u64 = v.parse().map_err(|_| {
@@ -1359,6 +1367,11 @@ impl Config {
             }
             None => None,
         };
+        match (status_flag, json_flag) {
+            (true, false) => return Err("--status needs --json (its only output format)".into()),
+            (false, true) => return Err("--json is only an output format for --status".into()),
+            _ => {}
+        }
         // The event hook, under the same rule: a half-configured one is a startup error.
         let on_event = match event_program {
             Some(program) => Some(crate::events::EventConfig {
@@ -1475,6 +1488,7 @@ impl Config {
             max_policy_idle: Duration::from_secs(max_policy_idle_secs),
             on_converged,
             on_event,
+            status_json: status_flag,
         })
     }
 
@@ -4931,6 +4945,24 @@ mod event_hook_flag_tests {
                 .on_converged
                 .is_none()
         );
+    }
+
+    #[test]
+    fn status_and_json_are_flags_only_where_a_flag_is_expected() {
+        let exe = cmd_exe();
+        let base = ["--reviewer", "codex", "--level", "s:m:low"];
+        let parse = |extra: &[&str]| {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend_from_slice(extra);
+            Config::from_args(&args(&v))
+        };
+        assert!(parse(&["--status", "--json"]).unwrap().status_json);
+        assert!(parse(&["--status"]).is_err());
+        assert!(parse(&["--json"]).is_err());
+        // An option value spelled like the flag is a value.
+        let cfg = parse(&["--on-event", &exe, "--on-event-arg", "--json"]).unwrap();
+        assert!(!cfg.status_json);
+        assert_eq!(cfg.on_event.unwrap().hook.args, ["--json"]);
     }
 
     #[test]
