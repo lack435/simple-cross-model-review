@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{AutoCrlf, EvidenceError, Limits};
+use super::{AutoCrlf, EvidenceError, Limits, Staging};
 
 /// Why a Git command produced no output, classified finely enough for the enumeration's fallback
 /// rule (issue #86).
@@ -209,18 +209,18 @@ pub fn revision(
 /// `git diff` never lists them — and are composed in by the caller from `reviewable_paths`; this
 /// function is the tracked half only.
 ///
-/// `autocrlf` is the checkout's resolved `core.autocrlf` ([`effective_autocrlf`]), re-applied so the
-/// working tree is compared the way native Git would stage it (issue #135).
+/// `staging` re-applies how native Git would stage the working tree: the checkout's resolved
+/// `core.autocrlf` ([`effective_autocrlf`], issue #135) and the LFS clean filter (issue #150).
 pub fn diff(
     root: &Path,
     spec: &[&str],
     path: &str,
-    autocrlf: Option<AutoCrlf>,
+    staging: Staging,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
-    let mut args = autocrlf_override(autocrlf);
+    let mut args = staging_overrides(staging);
     args.extend([
         "diff".to_string(),
         "--no-ext-diff".to_string(),
@@ -269,12 +269,12 @@ pub fn numstat(
     root: &Path,
     spec: &[&str],
     path: &str,
-    autocrlf: Option<AutoCrlf>,
+    staging: Staging,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<(usize, usize, usize), EvidenceError> {
-    let mut args = autocrlf_override(autocrlf);
+    let mut args = staging_overrides(staging);
     args.extend([
         "diff".to_string(),
         "--numstat".to_string(),
@@ -302,12 +302,44 @@ pub fn numstat(
     Ok((files, insertions, deletions))
 }
 
-/// The `-c` pair re-applying a resolved `core.autocrlf`, or nothing when there is none to apply.
-fn autocrlf_override(autocrlf: Option<AutoCrlf>) -> Vec<String> {
-    match autocrlf {
-        Some(value) => vec!["-c".to_string(), value.config_override().to_string()],
-        None => Vec::new(),
+/// The `-c` pairs re-applying [`Staging`]: a resolved `core.autocrlf`, and this binary as the LFS
+/// filter. `process` rather than `clean` because only a `process` overrides a repository-level one
+/// (see `crate::lfs`); `required=false` so a filter that cannot start leaves the diff as it was
+/// before issue #150 -- noisier, and a binding that fails closed -- rather than failing the request.
+///
+/// If the command cannot be built, the override is an *empty* `process`, never nothing: Git then
+/// runs neither a configured `process` nor a `clean` for `filter=lfs` paths (verified, Git 2.55) and
+/// with `required=false` stages them raw. A configured LFS program is never left in force.
+fn staging_overrides(staging: Staging) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(value) = staging.autocrlf {
+        args.extend(["-c".to_string(), value.config_override().to_string()]);
     }
+    if staging.lfs {
+        let command = crate::lfs::filter_command().unwrap_or_default();
+        args.extend([
+            "-c".to_string(),
+            format!("filter.lfs.process={command}"),
+            "-c".to_string(),
+            "filter.lfs.required=false".to_string(),
+        ]);
+    }
+    args
+}
+
+/// Whether the user's own Git applies an LFS filter here: `filter.lfs.process` or `filter.lfs.clean`
+/// set at any level. Read the way [`effective_autocrlf`] reads its key, and only ever reduced to a
+/// bool: the configured program is never run, only the fact that one is configured is forwarded.
+/// Unanswerable is `false`, which leaves the runner as it was before issue #150.
+pub fn native_lfs_filter(root: &Path) -> bool {
+    ["filter.lfs.process", "filter.lfs.clean"]
+        .iter()
+        .any(|key| {
+            matches!(
+                git_config_status(root, &["--get", key]),
+                Some(ConfigLookup::Set(v)) if !v.trim().is_empty()
+            )
+        })
 }
 
 /// The checkout's effective `core.autocrlf` as the user's own Git sees it -- system, global, and
@@ -761,6 +793,69 @@ mod tests {
         assert_eq!(AutoCrlf::parse("crlf"), None);
     }
 
+    /// Issue #150 (review f1): a repository's own `filter.lfs.*` never runs in the isolated runner,
+    /// whether the override names this binary or is the empty fallback used when it cannot. The
+    /// last step proves the fixture can see a run: with no LFS staging the configured program does.
+    #[test]
+    fn a_configured_lfs_program_never_runs_under_lfs_staging_issue_150() {
+        let Some(dir) = repo("evidence-lfs-config") else {
+            return;
+        };
+        let root = dir.as_path();
+        let no_filter = [
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false",
+        ];
+        std::fs::write(root.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        std::fs::write(root.join("a.bin"), "base\n").unwrap();
+        assert!(git(root, &[&no_filter[..], &["add", "."]].concat()));
+        assert!(git(root, &["commit", "-qm", "base"]));
+        assert!(git(
+            root,
+            &["config", "filter.lfs.process", "touch process.marker"]
+        ));
+        assert!(git(
+            root,
+            &["config", "filter.lfs.clean", "touch clean.marker"]
+        ));
+        std::fs::write(root.join("a.bin"), [9u8, 9]).unwrap();
+        let ran = || root.join("process.marker").exists() || root.join("clean.marker").exists();
+
+        let limits = Limits::default();
+        let cancel = AtomicBool::new(false);
+        let lfs = Staging {
+            autocrlf: None,
+            lfs: true,
+        };
+        let patch = diff(root, &["HEAD"], "", lfs, &limits, &cancel, Instant::now()).unwrap();
+        assert!(patch.contains("+oid sha256:"), "{patch}");
+        assert!(!ran());
+
+        let fallback: Vec<String> = [&no_filter[..], &["diff", "HEAD"]]
+            .concat()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        run(root, &fallback, &limits, &cancel, Instant::now()).unwrap();
+        assert!(!ran());
+
+        let _ = diff(
+            root,
+            &["HEAD"],
+            "",
+            Staging::default(),
+            &limits,
+            &cancel,
+            Instant::now(),
+        );
+        assert!(
+            ran(),
+            "the fixture must be able to observe a configured filter running"
+        );
+    }
+
     /// Issue #135's own verification fixture: an LF-normalized blob checked out with CRLF, one line
     /// edited. Under the runner's isolated config (no system/global `core.autocrlf`) the working
     /// tree diffs as a whole-file rewrite; with the checkout's `core.autocrlf` re-applied it is the
@@ -786,7 +881,10 @@ mod tests {
                 root,
                 &["HEAD"],
                 path,
-                autocrlf,
+                Staging {
+                    autocrlf,
+                    lfs: false,
+                },
                 &limits,
                 &cancel,
                 Instant::now(),
@@ -801,7 +899,10 @@ mod tests {
             root,
             &["HEAD"],
             "f.txt",
-            Some(AutoCrlf::True),
+            Staging {
+                autocrlf: Some(AutoCrlf::True),
+                lfs: false,
+            },
             &limits,
             &cancel,
             Instant::now(),

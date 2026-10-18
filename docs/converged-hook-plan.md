@@ -81,6 +81,18 @@ addition, a deletion, a binary file and non-ASCII content
 (`a_clean_checkout_serves_exactly_the_committed_change`). They also agree on a CRLF checkout
 under its own `core.autocrlf` (`a_crlf_checkout_matches_only_under_its_own_autocrlf`).
 
+**Issue #150 (verified, Git 2.55 / git-lfs 3.7.1):** the assumption did not hold for a hydrated
+Git LFS file. The isolated runner drops the system and global `filter.lfs.*` that `git lfs install`
+writes. So the worktree diff read the payload where the commit holds the pointer, and every
+approval of such a branch skipped with `head_does_not_match_review`. The fix: when the user's own
+Git has an LFS filter, the bundle sets `worktree_lfs`, and the service's runner registers this
+binary as `filter.lfs.process` (`src/lfs.rs`). That filter computes the pointer `git-lfs clean`
+would write, without running the configured program and without writing `.git/lfs/objects`.
+`process` rather than `clean` because an empty `filter.lfs.process=` does not unset a
+repository-level one: Git then fails the filter. A hydrated checkout and a pointer-only one of
+the same head now both bind. A hydrated file whose content changed still does not
+(`an_lfs_file_binds_hydrated_or_as_a_pointer_but_not_when_changed`).
+
 Where the implementation differs from the plan text, and why:
 
 - **A cancel that lands after the turn completed** reports `hook: skipped (cancelled)`. f6
