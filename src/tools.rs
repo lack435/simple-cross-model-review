@@ -492,6 +492,8 @@ pub struct App {
     /// The converged-review hook runner (issue #142), `None` unless `--on-converged` is configured.
     /// Shared with each review job (the turn-end fire) and used by `cross_model_review_attest`.
     hook_runner: Option<Arc<dyn crate::hook::HookRunner>>,
+    /// The lifecycle event hook's queue (issue #152), `None` unless `--on-event` is configured.
+    events: Option<Arc<crate::events::EventSink>>,
 }
 
 impl App {
@@ -509,6 +511,11 @@ impl App {
         let hook_runner = cfg.on_converged.clone().map(|hook| {
             Arc::new(crate::hook::ProcessRunner::new(hook)) as Arc<dyn crate::hook::HookRunner>
         });
+        let events = cfg
+            .on_event
+            .clone()
+            .and_then(|e| crate::events::EventSink::spawn(e, cfg.state_dir.clone()))
+            .map(Arc::new);
         Self {
             cfg: Arc::new(cfg),
             registry: Arc::new(Registry::with_max_concurrent(cfg_max_concurrent)),
@@ -518,6 +525,20 @@ impl App {
             preflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
             chain_error,
             hook_runner,
+            events,
+        }
+    }
+
+    /// At shutdown, give queued lifecycle events (issue #152) a bounded chance to be delivered.
+    pub fn drain_events(&self) {
+        if let Some(events) = &self.events {
+            events.drain(std::time::Duration::from_secs(
+                self.cfg
+                    .on_event
+                    .as_ref()
+                    .map_or(0, |e| e.hook.timeout.as_secs())
+                    .clamp(1, 30),
+            ));
         }
     }
 
@@ -1282,7 +1303,39 @@ impl App {
         // review_id has not been delivered, so a cancellation kills it. If it already arrived,
         // never spawn the CLI at all -- but still record a terminal state, or the session stays
         // claimed by a review that no worker will ever finish.
+        // What every lifecycle event of this turn shares (issue #152), fixed now that it has an id.
+        let event_turn = self.events.as_ref().map(|_| {
+            let spec = &self.cfg.reviewers[start_index];
+            let (model, effort) = match &start_spec_override {
+                Some(ov) => (ov.model.clone(), ov.effort.clone()),
+                None => (spec.model.clone(), spec.effort.clone()),
+            };
+            crate::events::Turn {
+                kind,
+                review_id: id.clone(),
+                session: session.clone(),
+                turn,
+                resumed,
+                root: cfg.cwd.clone(),
+                level: level_arg.clone(),
+                started_at: std::time::SystemTime::now(),
+                entry: crate::events::Entry {
+                    cli: spec.reviewer.as_str().to_string(),
+                    model,
+                    effort,
+                    chain_index: start_index,
+                    fallback: false,
+                },
+            }
+        });
+        let emit_failed = |failure: &Failure| {
+            if let (Some(events), Some(turn)) = (&self.events, &event_turn) {
+                events.failed(turn, failure);
+            }
+        };
+
         if request.attach_owned(&id) {
+            emit_failed(&errors::cancelled());
             self.registry
                 .finish(&id, Outcome::failed(errors::cancelled()));
             return Err(errors::cancelled());
@@ -1361,21 +1414,26 @@ impl App {
             _lease: Some(lease),
             hook_runner: self.hook_runner.clone(),
             server_root,
+            events: self.events.clone(),
+            event_turn: event_turn.clone(),
         };
 
+        // Announced before the worker exists, so no event of this turn can arrive ahead of it.
+        if let (Some(events), Some(turn)) = (&self.events, &event_turn) {
+            events.started(turn);
+        }
         let spawned = std::thread::Builder::new()
             .name(format!("review-{id}"))
             .spawn(move || job.run(resume_id));
 
         if let Err(e) = spawned {
-            self.registry.finish(
-                &id,
-                Outcome::failed(errors::spawn_failed(
-                    self.cfg.reviewers[start_index].reviewer.as_str(),
-                    "worker thread",
-                    e.to_string(),
-                )),
+            let failure = errors::spawn_failed(
+                self.cfg.reviewers[start_index].reviewer.as_str(),
+                "worker thread",
+                e.to_string(),
             );
+            emit_failed(&failure);
+            self.registry.finish(&id, Outcome::failed(failure));
         }
 
         // A consult and a review announce themselves differently: the noun, and which result tool
@@ -2570,6 +2628,10 @@ struct Job {
     /// call's `root` (issue #146; `cfg.cwd` is then that worktree). Used to re-check the worktree
     /// just before the evidence bundle pins it.
     server_root: Option<PathBuf>,
+    /// The lifecycle event hook's queue and this turn's shared event fields (issue #152). Both
+    /// `None` unless `--on-event` is configured.
+    events: Option<Arc<crate::events::EventSink>>,
+    event_turn: Option<crate::events::Turn>,
 }
 
 /// The capture's outputs that `attempt` threads onward: the rendered change goes into the
@@ -2621,13 +2683,18 @@ struct FinishGuard<'a> {
     registry: &'a Registry,
     id: &'a str,
     armed: bool,
+    /// The lifecycle event hook (issue #152), told too, so a crashed turn does not look running.
+    events: Option<(&'a crate::events::EventSink, &'a crate::events::Turn)>,
 }
 
 impl Drop for FinishGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.registry
-                .finish(self.id, Outcome::failed(errors::worker_panicked(self.id)));
+            let failure = errors::worker_panicked(self.id);
+            if let Some((events, turn)) = self.events {
+                events.failed(turn, &failure);
+            }
+            self.registry.finish(self.id, Outcome::failed(failure));
         }
     }
 }
@@ -2790,6 +2857,7 @@ impl Job {
             registry: &self.registry,
             id: &self.id,
             armed: true,
+            events: self.events.as_deref().zip(self.event_turn.as_ref()),
         };
 
         // Bounded-growth check, before anything else this turn touches: if the prior ledger is
@@ -2821,6 +2889,7 @@ impl Job {
                     envelope: Some(envelope),
                     ..Outcome::no_turn()
                 };
+                self.emit_finished(&outcome, None);
                 self.finish_run(
                     &mut guard,
                     outcome,
@@ -3277,6 +3346,7 @@ impl Job {
         // The converged-review hook (issue #142): after the turn is durably recorded, before the
         // result is published, and still under this job's session lease.
         self.turn_end_hook(&mut outcome, ran_index);
+        self.emit_finished(&outcome, ran_index);
 
         self.finish_run(
             &mut guard,
@@ -3297,6 +3367,26 @@ impl Job {
     /// the report. A hook failure adds one run warning and **never** changes the review: outcome,
     /// ledger and resumability are already settled. On a converged git turn the binding inputs are
     /// kept on the outcome so `cross_model_review_attest` can re-fire without a model call.
+    /// Tell the lifecycle event hook (issue #152) how this turn ended, naming the entry that served
+    /// it: `ran_index` when an entry ran (`self.spec` is then that entry, level override included),
+    /// otherwise the entry the turn started on.
+    fn emit_finished(&self, outcome: &Outcome, ran_index: Option<usize>) {
+        let (Some(events), Some(turn)) = (&self.events, &self.event_turn) else {
+            return;
+        };
+        let entry = match ran_index {
+            Some(i) => crate::events::Entry {
+                cli: self.spec.reviewer.as_str().to_string(),
+                model: self.spec.model.clone(),
+                effort: self.spec.effort.clone(),
+                chain_index: i,
+                fallback: i != self.start_index,
+            },
+            None => turn.entry.clone(),
+        };
+        events.finished(turn, &entry, outcome);
+    }
+
     fn turn_end_hook(&self, outcome: &mut Outcome, ran_index: Option<usize>) {
         let Some(runner) = self.hook_runner.as_deref() else {
             return;
@@ -8365,6 +8455,8 @@ mod tests {
             _lease: None,
             hook_runner: None,
             server_root: None,
+            events: None,
+            event_turn: None,
         }
     }
 
@@ -9789,6 +9881,8 @@ mod turn_end_hook_tests {
             _lease: None,
             hook_runner: Some(hook),
             server_root: None,
+            events: None,
+            event_turn: None,
         }
     }
 

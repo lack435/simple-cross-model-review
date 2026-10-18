@@ -386,6 +386,22 @@ fn run_process(
     payload: &str,
     make_job: impl FnOnce() -> Option<JobObject>,
 ) -> HookReport {
+    run_process_with_flags(cfg, root, payload, make_job, 0)
+}
+
+/// `CREATE_NO_WINDOW`: a console program started from this console-less server would otherwise get
+/// a console window of its own.
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// [`run_process`] with extra process-creation flags (the lifecycle event hook passes
+/// [`CREATE_NO_WINDOW`], issue #152).
+pub fn run_process_with_flags(
+    cfg: &HookConfig,
+    root: &Path,
+    payload: &str,
+    make_job: impl FnOnce() -> Option<JobObject>,
+    creation_flags: u32,
+) -> HookReport {
     let Some(job) = make_job() else {
         return HookReport::failed(reason::NO_CONTAINMENT);
     };
@@ -397,7 +413,7 @@ fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let mut child = match job.spawn_in_job(&mut command) {
+    let mut child = match job.spawn_in_job_with_flags(&mut command, creation_flags) {
         Ok(child) => child,
         Err(e) => return HookReport::failed(format!("{}: {e}", reason::SPAWN_FAILED)),
     };

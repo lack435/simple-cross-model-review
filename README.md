@@ -178,6 +178,11 @@ The essentials:
                             change. See "Gating merges on a converged review" below.
 --on-converged-arg <arg>     One argument for the hook program. Repeatable, in order.
 --on-converged-timeout-seconds <n>  Kill the hook and its children after n s. Default 60, max 600.
+--on-event <program>         Run a program for every review/consult turn that starts or ends.
+                            See "Following every review from outside the client" below.
+--on-event-arg <arg>         One argument for the event program. Repeatable, in order.
+--on-event-timeout-seconds <n>  Kill the event hook after n s. Default 10, max 600.
+--on-event-include-findings  Also send finding titles and details (can quote source code).
 --doctor                     Check CLI and auth from a terminal, then exit.
 --usage                      Print the recorded usage summary, then exit.
 ```
@@ -346,6 +351,46 @@ and the tail of its output. **The hook never changes the review:** a failure add
 **What it is not.** It catches skipped and stale reviews. It is not proof against someone running
 as the same OS user, who can run the hook script by hand. Design and review history:
 [`docs/converged-hook-plan.md`](docs/converged-hook-plan.md).
+
+## Following every review from outside the client
+
+`--on-event <program>` runs your program for every review and consult turn that starts,
+completes, fails or is cancelled. It is how a dashboard, or anything else outside the calling MCP
+client, can follow reviews started from Claude Code, Codex or any other client. It is off by
+default.
+
+```json
+"--on-event", "pwsh", "--on-event-arg", "-NoProfile",
+"--on-event-arg", "-File", "--on-event-arg", "C:\\tools\\post-review-event.ps1"
+```
+
+Each run gets one JSON object on stdin. Every event has the same keys; any that do not apply
+are `null`:
+
+```json
+{"schema_version": 1, "event": "turn_completed", "kind": "review", "review_id": "rv-...",
+ "session": "feat/x", "turn": 2, "resumed": true, "working_root": "C:\\dev\\repo",
+ "level": null,
+ "reviewer": {"cli": "codex", "model": "gpt-5.6-luna", "effort": "xhigh", "chain_index": 0, "fallback": false},
+ "started_at": "2026-10-17T21:04:05.123Z", "finished_at": "2026-10-17T21:12:40.002Z",
+ "outcome": "changes_requested", "verdict": "changes", "structured": true,
+ "open_count": 2, "total_count": 3, "open_by_severity": {"critical": 0, "major": 1, "minor": 1},
+ "warnings": ["..."], "denial_count": 0, "error_code": null,
+ "host": "WORKSTATION", "server_version": "..."}
+```
+
+- **The events:**
+  - `turn_started`
+  - `turn_completed`, carrying `outcome`, `verdict` and the counts. On a consult the review fields stay `null`.
+  - `turn_failed`, carrying `error_code`. `SERVER_EXITED` means the server shut down while the turn was still running.
+  - `turn_cancelled`.
+- **Fire and forget.** Events run one at a time, in order, on a background thread. The server never waits for the hook and never reads its output, so a hook that fails, hangs or exits non-zero cannot delay a review or change its result. Its failures go to stderr and are otherwise ignored.
+- **It is trusted code.** Like `--on-converged`, it runs as the server's user and is not sandboxed. It runs in the state directory, not the repository. Nothing stops it from touching the repository while a review is reading it, so write a hook that only reports.
+  - A hook that falls far behind has events dropped rather than queued without limit.
+  - `--on-event-timeout-seconds` (default 10, max 600) kills a hook that hangs.
+  - The program starts without a console window and is contained in a job object, like `--on-converged`.
+- **Finding text is opt-in.** Finding titles and details can quote source code, so they are sent only with `--on-event-include-findings`.
+- **Warnings are prose,** the same strings the result carries. There are no warning codes yet.
 
 ## When the reviewer is unavailable
 

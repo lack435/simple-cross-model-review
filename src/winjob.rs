@@ -200,7 +200,14 @@ impl JobObject {
     /// login child via the handle closing (f-b1).
     #[allow(dead_code)] // caller lands with the login runner (reviewer::run_login, #15 part 3b).
     pub fn spawn_in_job(&self, cmd: &mut Command) -> io::Result<Child> {
-        cmd.creation_flags(CREATE_SUSPENDED);
+        self.spawn_in_job_with_flags(cmd, 0)
+    }
+
+    /// [`spawn_in_job`](Self::spawn_in_job) with extra process-creation flags OR'd in -- for example
+    /// `CREATE_NO_WINDOW`, which `creation_flags` would otherwise lose, since setting the flags
+    /// replaces them.
+    pub fn spawn_in_job_with_flags(&self, cmd: &mut Command, extra: u32) -> io::Result<Child> {
+        cmd.creation_flags(CREATE_SUSPENDED | extra);
         let mut child = cmd.spawn()?;
         if !self.assign(&child) {
             let assign_err = io::Error::last_os_error();
