@@ -403,7 +403,9 @@ fn isolated_filter_drivers(
 /// section and variable are lowercased by Git; the driver (subsection) keeps its case and may itself
 /// contain dots, so the name is everything between `filter.` and the last `.`.
 fn filter_drivers_in(listing: &str) -> Vec<String> {
-    let mut drivers: Vec<String> = Vec::new();
+    // A set, not a scanned Vec: the listing is repository-controlled, so deduplication must not be
+    // quadratic in it (review f3 on #156).
+    let mut drivers: BTreeSet<&str> = BTreeSet::new();
     for entry in listing.split('\0') {
         let key = entry.split('\n').next().unwrap_or("");
         let Some(rest) = key.strip_prefix("filter.") else {
@@ -412,11 +414,11 @@ fn filter_drivers_in(listing: &str) -> Vec<String> {
         let Some((driver, _variable)) = rest.rsplit_once('.') else {
             continue;
         };
-        if !driver.is_empty() && !drivers.iter().any(|d| d == driver) {
-            drivers.push(driver.to_string());
+        if !driver.is_empty() {
+            drivers.insert(driver);
         }
     }
-    drivers
+    drivers.into_iter().map(str::to_string).collect()
 }
 
 /// Whether the user's own Git applies an LFS filter here: `filter.lfs.process` or `filter.lfs.clean`
@@ -890,7 +892,7 @@ mod tests {
         let listing = "core.bare\nfalse\0filter.lfs.clean\ngit-lfs clean -- %f\0\
                        filter.lfs.process\ngit-lfs filter-process\0\
                        filter.Crypt.v2.clean\ngit-crypt clean\0filter.x\n\0\0";
-        assert_eq!(filter_drivers_in(listing), ["lfs", "Crypt.v2"]);
+        assert_eq!(filter_drivers_in(listing), ["Crypt.v2", "lfs"]);
         assert!(filter_drivers_in("").is_empty());
     }
 
