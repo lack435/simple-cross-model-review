@@ -18,7 +18,8 @@ wrongly) as candidate follow-ups:
 
 - **`Full` is gated on whole-segment completeness.** A changelist records a `Full` baseline
   only when every segment is `complete` — no per-file omission at all. So a changelist that
-  contains an out-of-root, binary, or deleted file (a per-file omission) records `Disabled` and
+  contains an out-of-root, binary, or omitted file — including a deleted file whose content could
+  not be shown (a per-file omission) — records `Disabled` and
   will not elide next turn, even though its *other* files are perfectly elidable. The design's
   finer "complete inventory vs complete unit" split (invariant 4) would let those files collapse;
   the implementation takes the stricter line. This is the main saving left on the table for mixed
@@ -107,7 +108,8 @@ The combined `-du -dl` invocation and capture behavior were tested with P4/P4D
 | **Submitted** | immutable | **all elidable units** collapse. Non-elidable notes still render |
 
 Note the framing: a re-review collapses *all elidable units*, not "the whole changelist" —
-binary/deleted/omitted evidence is still shown every turn. The reviewer-facing note says
+binary or omitted evidence, including a delete whose content could not be shown, is still shown
+every turn. The reviewer-facing note says
 exactly that, so the reviewer never reads a collapsed prompt as "nothing here changed."
 
 ## Identity and inventory
@@ -323,8 +325,8 @@ backend mismatch on read invalidates it to absent.
 
 A framing note up front, mirroring git's follow-up preamble (`render` in `src/vcs/git.rs`):
 the reviewer saw the **complete captured evidence** for the changelist(s) earlier in this
-session (not the full changelist — server-side added bodies are omitted and binary/deleted
-files are represented by notes), **all elidable files** are collapsed to one line, only what
+session (not the full changelist — server-side added bodies are omitted, and binary files and
+deletes whose content could not be shown are represented by notes), **all elidable files** are collapsed to one line, only what
 moved is shown in full, non-elidable evidence is still shown, and it should re-check its
 earlier findings. Then the per-file transition lines, including the
 explicit *removed*, *restored-to-depot*, and *shelf-no-longer-in-scope* notes. This replaces
