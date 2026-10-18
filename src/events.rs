@@ -6,15 +6,19 @@
 //! It is the general sibling of `--on-converged` ([`crate::hook`]) and reuses its contained runner,
 //! with one difference that matters: this hook is **fire and forget**. Events go onto a bounded
 //! queue drained by one worker thread, which runs the hook once per event, in order, each under its
-//! timeout. Emitting never blocks a review, and nothing the hook does -- failing, hanging, exiting
-//! non-zero -- reaches a review; it is logged to stderr and otherwise ignored. A full queue drops
-//! the event with a stderr line rather than wait.
+//! timeout. Emitting never blocks a review, and the server never waits on the hook or reads its
+//! output: a hook that fails, hangs or exits non-zero is logged to stderr and otherwise ignored. A
+//! full queue drops the event with a stderr line rather than wait.
+//!
+//! It is trusted code, as `--on-converged` is: it runs as the server's user, unsandboxed. It runs in
+//! the state directory rather than the repository, but nothing stops a hook from touching the tree
+//! a review is reading -- the guarantee is about the server's behaviour, not the hook's.
 //!
 //! The envelope is built only from server state. Finding titles and details, which can quote source
 //! code, are included only with `--on-event-include-findings`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -73,12 +77,20 @@ pub struct Turn {
 
 /// The queue end of the hook's worker. Cheap to share: emitting is a `try_send`.
 pub struct EventSink {
-    tx: SyncSender<(PathBuf, String)>,
+    tx: SyncSender<String>,
     include_findings: bool,
     /// Events queued or running, so shutdown can wait for them (see [`drain`](Self::drain)).
     pending: Arc<AtomicUsize>,
-    /// Turns that have started and not yet ended, so a shutdown that kills them can still say so.
-    live: Mutex<HashMap<String, Turn>>,
+    /// Which turns are live, and whether shutdown has swept them. One lock, held across each
+    /// terminal emission, so a turn's terminal event is claimed exactly once: either by the turn or
+    /// by the shutdown sweep, never both and never neither (review f1 on #152).
+    state: Mutex<Live>,
+}
+
+#[derive(Default)]
+struct Live {
+    turns: HashMap<String, Turn>,
+    shut: bool,
 }
 
 /// The `error_code` of a turn the server's exit ended: the process does not wait for running
@@ -86,13 +98,19 @@ pub struct EventSink {
 pub const SERVER_EXITED: &str = "SERVER_EXITED";
 
 impl EventSink {
-    /// Start the worker that runs the hook. `None` if the thread cannot be spawned; the server then
-    /// runs without events, which is what a hook failure would mean anyway.
-    pub fn spawn(cfg: EventConfig) -> Option<Self> {
-        Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |root, payload| {
+    /// Start the worker that runs the hook in `cwd` -- the state directory, deliberately not a
+    /// repository: an event consumer has no business in the reviewed tree. `None` if the thread
+    /// cannot be spawned; the server then runs without events, as a failing hook would leave it.
+    pub fn spawn(cfg: EventConfig, cwd: PathBuf) -> Option<Self> {
+        Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
+            let dir = if cwd.is_dir() {
+                cwd.clone()
+            } else {
+                std::env::temp_dir()
+            };
             let report = crate::hook::run_process_with_flags(
                 &cfg.hook,
-                root,
+                &dir,
                 payload,
                 crate::winjob::JobObject::new,
                 crate::hook::CREATE_NO_WINDOW,
@@ -107,16 +125,16 @@ impl EventSink {
     fn spawn_with(
         include_findings: bool,
         slots: usize,
-        run: impl Fn(&Path, &str) + Send + 'static,
+        run: impl Fn(&str) + Send + 'static,
     ) -> Option<Self> {
-        let (tx, rx) = mpsc::sync_channel::<(PathBuf, String)>(slots);
+        let (tx, rx) = mpsc::sync_channel::<String>(slots);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = Arc::clone(&pending);
         std::thread::Builder::new()
             .name("event-hook".into())
             .spawn(move || {
-                for (root, payload) in rx {
-                    run(&root, &payload);
+                for payload in rx {
+                    run(&payload);
                     worker_pending.fetch_sub(1, Ordering::AcqRel);
                 }
             })
@@ -125,44 +143,41 @@ impl EventSink {
             tx,
             include_findings,
             pending,
-            live: Mutex::new(HashMap::new()),
+            state: Mutex::new(Live::default()),
         })
     }
 
-    fn send(&self, root: &Path, payload: Value) {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn send(&self, payload: Value) {
         self.pending.fetch_add(1, Ordering::AcqRel);
-        match self.tx.try_send((root.to_path_buf(), payload.to_string())) {
-            Ok(()) => {}
-            Err(e) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
-                if let TrySendError::Full(_) = e {
-                    eprintln!(
-                        "cross-review: --on-event hook is not keeping up; an event was dropped"
-                    )
-                }
+        if let Err(e) = self.tx.try_send(payload.to_string()) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            if let TrySendError::Full(_) = e {
+                eprintln!("cross-review: --on-event hook is not keeping up; an event was dropped")
             }
         }
     }
 
     /// At shutdown: report every turn still live as `turn_failed` with [`SERVER_EXITED`] -- the
     /// process does not wait for running reviews, so they would otherwise look running forever to a
-    /// consumer -- then wait up to `max` for queued events to be delivered. Bounded: a hook that
-    /// hangs costs the exit at most `max`, never more.
+    /// consumer -- then wait up to `max` for queued events to be delivered. After the sweep no
+    /// event is emitted for a swept turn, so none is reported twice. Bounded: a hook that hangs
+    /// costs the exit at most `max`, never more.
     pub fn drain(&self, max: Duration) {
-        let orphans: Vec<Turn> = self
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain()
-            .map(|(_, t)| t)
-            .collect();
-        for turn in orphans {
-            let mut value = envelope(&turn, "turn_failed", &turn.entry, Some(now()));
-            value
-                .as_object_mut()
-                .expect("envelope is an object")
-                .insert("error_code".into(), json!(SERVER_EXITED));
-            self.send(&turn.root, value);
+        {
+            let mut state = self.lock();
+            state.shut = true;
+            for (_, turn) in state.turns.drain() {
+                let mut value = envelope(&turn, "turn_failed", &turn.entry, Some(now()));
+                value
+                    .as_object_mut()
+                    .expect("envelope is an object")
+                    .insert("error_code".into(), json!(SERVER_EXITED));
+                self.send(value);
+            }
         }
         let deadline = Instant::now() + max;
         while self.pending.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
@@ -170,21 +185,18 @@ impl EventSink {
         }
     }
 
-    /// The turn was registered and its worker started.
+    /// The turn was registered and its worker is about to start.
     pub fn started(&self, turn: &Turn) {
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn.review_id.clone(), turn.clone());
-        self.send(
-            &turn.root,
-            envelope(turn, "turn_started", &turn.entry, None),
-        );
+        let mut state = self.lock();
+        if state.shut {
+            return;
+        }
+        state.turns.insert(turn.review_id.clone(), turn.clone());
+        self.send(envelope(turn, "turn_started", &turn.entry, None));
     }
 
     /// The turn reached a terminal state with this outcome, served by `entry`.
     pub fn finished(&self, turn: &Turn, entry: &Entry, outcome: &Outcome) {
-        self.ended(turn);
         let mut value = envelope(
             turn,
             event_for(outcome.failure.as_ref()),
@@ -192,38 +204,41 @@ impl EventSink {
             Some(now()),
         );
         let object = value.as_object_mut().expect("envelope is an object");
-        object.insert("warnings".into(), json!(outcome.warnings));
         object.insert("denial_count".into(), json!(outcome.denial_count));
         match &outcome.failure {
             Some(failure) => {
+                object.insert("warnings".into(), json!(outcome.warnings));
                 object.insert("error_code".into(), json!(failure.code));
             }
             None => self.completed_fields(object, outcome),
         }
-        self.send(&turn.root, value);
+        self.terminal(turn, value);
     }
 
     /// The turn ended before a worker could produce an outcome (spawn failure, early cancel, panic).
     pub fn failed(&self, turn: &Turn, failure: &Failure) {
-        self.ended(turn);
         let mut value = envelope(turn, event_for(Some(failure)), &turn.entry, Some(now()));
         value
             .as_object_mut()
             .expect("envelope is an object")
             .insert("error_code".into(), json!(failure.code));
-        self.send(&turn.root, value);
+        self.terminal(turn, value);
     }
 
-    fn ended(&self, turn: &Turn) {
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&turn.review_id);
+    /// Claim and send a turn's terminal event, under the lock the shutdown sweep takes.
+    fn terminal(&self, turn: &Turn, value: Value) {
+        let mut state = self.lock();
+        let was_live = state.turns.remove(&turn.review_id).is_some();
+        if state.shut && !was_live {
+            return;
+        }
+        self.send(value);
     }
 
     fn completed_fields(&self, object: &mut Map<String, Value>, outcome: &Outcome) {
         // A consult has no findings envelope: the review fields stay null.
         let Some(env) = &outcome.envelope else {
+            object.insert("warnings".into(), json!(outcome.warnings));
             return;
         };
         let mut by_severity = json!({"critical": 0, "major": 0, "minor": 0});
@@ -237,6 +252,11 @@ impl EventSink {
                 }
             }
         }
+        // The same union the completed result carries (review f3 on #152).
+        object.insert(
+            "warnings".into(),
+            json!(crate::findings::warnings_with(env, &outcome.warnings)),
+        );
         object.insert("outcome".into(), json!(env.outcome));
         object.insert("verdict".into(), json!(env.verdict));
         object.insert("structured".into(), json!(env.structured));
@@ -291,6 +311,8 @@ fn envelope(turn: &Turn, event: &str, entry: &Entry, finished: Option<SystemTime
         "warnings": [],
         "denial_count": null,
         "error_code": null,
+        // Only ever an array with `--on-event-include-findings`, on a completed review.
+        "findings": null,
         "host": std::env::var("COMPUTERNAME").ok(),
         "server_version": env!("CARGO_PKG_VERSION"),
     })
@@ -355,7 +377,7 @@ mod tests {
     fn recording(include_findings: bool) -> (EventSink, Seen) {
         let seen: Seen = Arc::default();
         let sink_seen = Arc::clone(&seen);
-        let sink = EventSink::spawn_with(include_findings, 4, move |_, payload| {
+        let sink = EventSink::spawn_with(include_findings, 4, move |payload| {
             sink_seen
                 .lock()
                 .unwrap()
@@ -443,12 +465,31 @@ mod tests {
         assert_eq!(last["error_code"], SERVER_EXITED);
     }
 
+    /// A turn that finishes after the shutdown sweep reported it is not reported again.
+    #[test]
+    fn a_turn_finishing_after_the_sweep_is_reported_once() {
+        let (sink, seen) = recording(false);
+        let t = turn();
+        sink.started(&t);
+        sink.drain(Duration::from_secs(5));
+        sink.failed(&t, &crate::errors::cancelled());
+        sink.started(&t);
+        sink.drain(Duration::from_secs(5));
+        let events = wait_for(&seen, 2);
+        let names: Vec<_> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["turn_started", "turn_failed"]);
+        assert_eq!(events[1]["error_code"], SERVER_EXITED);
+    }
+
     #[test]
     fn a_hook_that_does_not_keep_up_drops_events_instead_of_blocking() {
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let worker_gate = Arc::clone(&gate);
-        let sink = EventSink::spawn_with(false, 1, move |_, _| {
+        let sink = EventSink::spawn_with(false, 1, move |_| {
             let _wait = worker_gate.lock().unwrap();
         })
         .unwrap();

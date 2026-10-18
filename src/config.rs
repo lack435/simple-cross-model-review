@@ -2482,9 +2482,10 @@ LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
                               verdict, open_count, total_count, open_by_severity,
                               warnings, denial_count, error_code, ... Fire and forget:
                               events run one at a time in order on a background
-                              thread, and nothing the hook does affects a review.
-                              Resolved like --on-converged; contained in a job object;
-                              started without a console window.
+                              thread; the server never waits on the hook or reads
+                              its output. Trusted code, like --on-converged: it runs
+                              as this server's user, in the state directory, contained
+                              in a job object, without a console window.
   --on-event-arg <arg>        One argument for the event program. Repeatable, in order.
   --on-event-timeout-seconds N
                               Kill the event hook after N seconds. Default 10, max 600.

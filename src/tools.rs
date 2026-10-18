@@ -514,7 +514,7 @@ impl App {
         let events = cfg
             .on_event
             .clone()
-            .and_then(crate::events::EventSink::spawn)
+            .and_then(|e| crate::events::EventSink::spawn(e, cfg.state_dir.clone()))
             .map(Arc::new);
         Self {
             cfg: Arc::new(cfg),

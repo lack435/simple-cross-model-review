@@ -384,7 +384,8 @@ are `null`:
   - `turn_completed`, carrying `outcome`, `verdict` and the counts. On a consult the review fields stay `null`.
   - `turn_failed`, carrying `error_code`. `SERVER_EXITED` means the server shut down while the turn was still running.
   - `turn_cancelled`.
-- **Fire and forget.** Events run one at a time, in order, on a background thread. Nothing the hook does can delay or change a review: its failures go to stderr and are otherwise ignored.
+- **Fire and forget.** Events run one at a time, in order, on a background thread. The server never waits for the hook and never reads its output, so a hook that fails, hangs or exits non-zero cannot delay a review or change its result. Its failures go to stderr and are otherwise ignored.
+- **It is trusted code.** Like `--on-converged`, it runs as the server's user and is not sandboxed. It runs in the state directory, not the repository. Nothing stops it from touching the repository while a review is reading it, so write a hook that only reports.
   - A hook that falls far behind has events dropped rather than queued without limit.
   - `--on-event-timeout-seconds` (default 10, max 600) kills a hook that hangs.
   - The program starts without a console window and is contained in a job object, like `--on-converged`.

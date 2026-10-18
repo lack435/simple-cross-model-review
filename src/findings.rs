@@ -1201,9 +1201,15 @@ pub fn completed_result(env: &Envelope, ctx: &ResultContext, nonce: &str) -> Com
 /// already swept where their context is built; `strip_marker_lines` is idempotent, so sweeping them
 /// again costs nothing and means this function's output is neutralised whatever it was handed.)
 pub fn warning_union(env: &Envelope, ctx: &ResultContext) -> Vec<String> {
+    warnings_with(env, ctx.run_warnings)
+}
+
+/// [`warning_union`] from the run warnings alone, for a consumer with no `ResultContext` (the
+/// lifecycle event hook, issue #152).
+pub fn warnings_with(env: &Envelope, run_warnings: &[String]) -> Vec<String> {
     env.warnings
         .iter()
-        .chain(ctx.run_warnings.iter())
+        .chain(run_warnings.iter())
         .map(|w| strip_marker_lines(w))
         .collect()
 }
