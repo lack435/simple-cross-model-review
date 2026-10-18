@@ -81,11 +81,6 @@ pub struct EventSink {
     include_findings: bool,
     /// Events queued or running, so shutdown can wait for them (see [`drain`](Self::drain)).
     pending: Arc<AtomicUsize>,
-    /// The status log every event is appended to, synchronously at emission (see [`send`]).
-    /// `None` only in tests.
-    ///
-    /// [`send`]: Self::send
-    log: Option<PathBuf>,
     /// Which turns are live, and whether shutdown has swept them. One lock, held across each
     /// terminal emission, so a turn's terminal event is claimed exactly once: either by the turn or
     /// by the shutdown sweep, never both and never neither (review f1 on #152).
@@ -108,10 +103,23 @@ impl EventSink {
     /// cannot be spawned; the server then runs without events, as a failing hook would leave it.
     ///
     /// Each event is also appended to the state directory's status log ([`status_log_path`]),
-    /// without finding text, for `--status --json`.
+    /// without finding text, for `--status --json` -- by this worker, before the hook runs, so the
+    /// emitting review thread never waits on the log's lock or the disk. Appends from several
+    /// servers may land out of lifecycle order; [`status_report`] does not rely on file order.
     pub fn spawn(cfg: EventConfig, cwd: PathBuf) -> Option<Self> {
         let log = status_log_path(&cwd);
-        let mut sink = Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
+        Self::spawn_with(cfg.include_findings, QUEUE_SLOTS, move |payload| {
+            match serde_json::from_str::<Value>(payload) {
+                Ok(value) => {
+                    if let Err(e) = append_status(&log, &value) {
+                        eprintln!(
+                            "cross-review: could not append to the status log {}: {e}",
+                            log.display()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("cross-review: an event could not be logged: {e}"),
+            }
             let dir = if cwd.is_dir() {
                 cwd.clone()
             } else {
@@ -127,9 +135,7 @@ impl EventSink {
             if report.is_failure() || report.status == crate::hook::HookStatus::Skipped {
                 eprintln!("cross-review: --on-event hook {}", report.summary());
             }
-        })?;
-        sink.log = Some(log);
-        Some(sink)
+        })
     }
 
     /// [`spawn`](Self::spawn) with the runner injected: a seam for tests, not a setting.
@@ -154,7 +160,6 @@ impl EventSink {
             tx,
             include_findings,
             pending,
-            log: None,
             state: Mutex::new(Live::default()),
         })
     }
@@ -163,20 +168,7 @@ impl EventSink {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record one event: appended to the status log here, on the emitting thread and under the
-    /// state lock, then queued for the hook. Synchronous on purpose (review f3 on the status log):
-    /// a turn's terminal event is emitted before its session lease is released, so the next turn
-    /// -- in this process or another -- can only append after it, and file order is lifecycle
-    /// order per session. Only the hook, which may be slow, runs asynchronously.
     fn send(&self, payload: Value) {
-        if let Some(log) = &self.log {
-            if let Err(e) = append_status(log, &payload) {
-                eprintln!(
-                    "cross-review: could not append to the status log {}: {e}",
-                    log.display()
-                );
-            }
-        }
         self.pending.fetch_add(1, Ordering::AcqRel);
         if let Err(e) = self.tx.try_send(payload.to_string()) {
             self.pending.fetch_sub(1, Ordering::AcqRel);
@@ -323,17 +315,37 @@ fn append_status(log: &Path, payload: &Value) -> std::io::Result<()> {
 }
 
 /// `cross-review --status --json`: the latest envelope of each session, as a JSON array sorted by
-/// session name. A session's latest status-log record wins; a saved session with none (it predates
-/// `--on-event`, or the hook was not configured) gets a minimal envelope from its session record,
-/// with `event` null. Read-only: nothing is created or written.
+/// session name. A saved session with no logged event (it predates `--on-event`, or the hook was
+/// not configured) gets a minimal envelope from its session record, with `event` null. Read-only:
+/// nothing is created or written.
+///
+/// "Latest" is by lifecycle, not by file position: the newest turn (its `started_at`, which every
+/// event of a turn shares) wins, and within one turn a terminal event beats `turn_started`. Lines
+/// from several servers can be appended out of order (each server's worker writes asynchronously),
+/// so file order only breaks an exact tie.
 pub fn status_report(state_dir: &Path) -> String {
+    let rank = |v: &Value| {
+        let started = v
+            .get("started_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let terminal = v.get("event").and_then(Value::as_str) != Some("turn_started");
+        (started, terminal)
+    };
     let mut latest: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     if let Ok(text) = std::fs::read_to_string(status_log_path(state_dir)) {
         for line in text.lines() {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            if let Some(session) = value.get("session").and_then(Value::as_str) {
+            let Some(session) = value.get("session").and_then(Value::as_str) else {
+                continue;
+            };
+            let newer = latest
+                .get(session)
+                .map_or(true, |held| rank(&value) >= rank(held));
+            if newer {
                 latest.insert(session.to_string(), value);
             }
         }
@@ -552,6 +564,37 @@ mod tests {
         );
         // A missing state directory is an empty report, not an error.
         assert_eq!(status_report(&dir.as_path().join("absent")), "[]");
+    }
+
+    /// Lines appended out of lifecycle order -- a previous turn's terminal event written after the
+    /// next turn started, by a slower server -- still report the newest turn.
+    #[test]
+    fn the_status_report_orders_by_lifecycle_not_file_position() {
+        let dir = crate::testutil::temp_dir("events-status-order");
+        let log = status_log_path(dir.as_path());
+        let old = turn();
+        let mut new = turn();
+        new.turn = 3;
+        new.started_at = old.started_at + Duration::from_secs(60);
+        append_status(&log, &envelope(&old, "turn_started", &old.entry, None)).unwrap();
+        append_status(&log, &envelope(&new, "turn_started", &new.entry, None)).unwrap();
+        append_status(
+            &log,
+            &envelope(&old, "turn_completed", &old.entry, Some(now())),
+        )
+        .unwrap();
+        let report: Vec<Value> = serde_json::from_str(&status_report(dir.as_path())).unwrap();
+        assert_eq!(report[0]["turn"], 3);
+        assert_eq!(report[0]["event"], "turn_started");
+        // Within one turn the terminal event wins wherever it sits.
+        append_status(
+            &log,
+            &envelope(&new, "turn_completed", &new.entry, Some(now())),
+        )
+        .unwrap();
+        append_status(&log, &envelope(&new, "turn_started", &new.entry, None)).unwrap();
+        let report: Vec<Value> = serde_json::from_str(&status_report(dir.as_path())).unwrap();
+        assert_eq!(report[0]["event"], "turn_completed");
     }
 
     /// A saved session with no recorded event is still listed, from its session record.
