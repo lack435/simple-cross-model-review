@@ -866,6 +866,8 @@ impl Core {
                 Ok(output) => output.bytes,
                 Err(_) => {
                     source_complete = false;
+                    // A read cut off by the slice is the slice ending, whichever file it was on.
+                    time_limited |= Instant::now() >= stop_at;
                     continue;
                 }
             };

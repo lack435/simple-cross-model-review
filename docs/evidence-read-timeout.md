@@ -305,8 +305,10 @@ this removes. So:
   we read it), covered by the margin. **Corrected by issue #151:** the premise is false. Codex's
   code mode issues evidence calls concurrently (`Promise.all`; verified in a reviewer rollout).
   A burst of slow searches past the 8-slot queue went unread, started its budget late, and was
-  abandoned at the 30s client ceiling. The queue is now 64 slots, so a realistic burst is stamped
-  on arrival. Each `repository_search` also stops at a 10s slice and returns a partial result
+  abandoned at the 30s client ceiling. The queue now holds a whole turn's calls: `max_calls` + 1,
+  clamped to 9..=1025 slots, which is 97 at the default. So every call of any burst is stamped on
+  arrival. Buffering is bounded by that count times `max_request_bytes`, about 6 MiB at the
+  defaults; real requests are a few hundred bytes. Each `repository_search` also stops at a 10s slice and returns a partial result
   (`time_limited`, `files_searched`, `files_unsearched`, `listing_complete`), so concurrent
   siblings still get budget to run. Attempt 1 waits up to the per-attempt cap or the remaining
   budget, whichever is smaller, and a retry runs **only if** the remaining budget (after backoff)
