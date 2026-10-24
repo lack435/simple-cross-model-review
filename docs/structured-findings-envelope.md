@@ -506,8 +506,20 @@ So:
 - The reviewer's block uses the **`CROSS_REVIEW_FINDINGS_IN` input marker** (disjoint from the
   server's `CROSS_REVIEW_ENVELOPE_OUT`, see [the envelope](#the-envelope)), delimited by **exact
   begin/end sentinel lines carrying a per-review nonce**, on their own lines — not by a bare
-  ```` ```json ```` fence, and not by a fixed marker either. The
-  nonce is derived from the server's unique review id (ids are `rv-<pid>-<counter>`, so each
+  ```` ```json ```` fence, and not by a fixed marker either.
+
+  > **Amended (issue #163).** The prompt still asks for each marker on its own line, but the
+  > extractor no longer requires it: a nonce-exact marker is found anywhere in the text, and the
+  > block is what lies between the begin and end markers. Requiring the line break threw away
+  > turns whose block was unambiguous. 29 of 748 recorded reviewer responses had run a marker onto
+  > the end of a sentence or onto the JSON's closing brace, and on turn 1 that left the session
+  > permanently `legacy_uncovered`. The exactly-one rule counts every occurrence of the begin
+  > marker, so a marker quoted inline is ambiguity, not something skipped (none of those 748 did
+  > that). The nonce, not the line position, is what defeats a lookalike. For the same reason
+  > `strip_marker_lines` now also defangs a marker in the middle of a line, by putting a space after
+  > its `<<<`. It still drops a line that starts with one.
+
+  The nonce is derived from the server's unique review id (ids are `rv-<pid>-<counter>`, so each
   review's markers differ) and is placed in the prompt only, never in the repository. This
   defeats the round-2 case of a repository embedding a *static* lookalike sentinel in its own
   source and having it quoted back as the sole block: a fixed marker could be forged from source

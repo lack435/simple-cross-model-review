@@ -615,39 +615,35 @@ pub fn reviewer_block_markers(nonce: &str) -> (String, String) {
 /// Fail-closed on zero blocks, more than one, an unterminated block, an over-cap block, malformed
 /// JSON/schema, or an over-long field. The nonce must match exactly, so a static repository
 /// lookalike is not matched.
+///
+/// The markers are found **anywhere in the text**, not only as whole lines (issue #163). The prompt
+/// still asks for each on its own line, but a reviewer that runs a marker onto the end of a sentence
+/// or onto the JSON's closing brace — 29 of 748 recorded reviewer responses did — has emitted an
+/// unambiguous block, and requiring the line break threw that turn away and left the session
+/// permanently `legacy_uncovered`. What makes a marker trustworthy is the exact nonce, not its line
+/// position, and the exactly-one rule counts every occurrence, so a marker quoted inline is still
+/// ambiguity rather than something skipped.
 fn extract_reviewer_block(text: &str, nonce: &str) -> Result<ReviewerBlock, ExtractError> {
     let (begin, end) = markers(IN_TAG, nonce);
 
-    // Count begin markers appearing as their own line; more than one is fail-closed ambiguity.
-    let begins: Vec<usize> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| l.trim() == begin)
-        .map(|(i, _)| i)
-        .collect();
-    if begins.is_empty() {
-        return Err(ExtractError::NoBlock);
-    }
-    if begins.len() > 1 {
+    // More than one begin marker is fail-closed ambiguity.
+    let mut begins = text.match_indices(begin.as_str()).map(|(i, _)| i);
+    let begin_at = begins.next().ok_or(ExtractError::NoBlock)?;
+    if begins.next().is_some() {
         return Err(ExtractError::MultipleBlocks);
     }
 
-    let lines: Vec<&str> = text.lines().collect();
-    let begin_line = begins[0];
-    let end_line = lines
-        .iter()
-        .enumerate()
-        .skip(begin_line + 1)
-        .find(|(_, l)| l.trim() == end)
-        .map(|(i, _)| i)
+    let body_start = begin_at + begin.len();
+    let body_len = text[body_start..]
+        .find(end.as_str())
         .ok_or(ExtractError::Unterminated)?;
 
-    let body = lines[begin_line + 1..end_line].join("\n");
+    let body = text[body_start..body_start + body_len].trim();
     if body.len() > MAX_BLOCK_BYTES {
         return Err(ExtractError::OverCap);
     }
 
-    let block: ReviewerBlock = serde_json::from_str(&body).map_err(|_| ExtractError::Malformed)?;
+    let block: ReviewerBlock = serde_json::from_str(body).map_err(|_| ExtractError::Malformed)?;
 
     // Per-field caps. Enforced here so one pathological field cannot bloat the persisted ledger.
     if block.new_findings.len() > MAX_NEW_FINDINGS_PER_TURN {
@@ -674,53 +670,96 @@ pub fn strip_reviewer_block(prose: &str, nonce: &str) -> String {
 /// before the server appends its one canonical `_OUT` block, so no untrusted rendered field (the
 /// session name, a warning, a denied-command string, or prose bearing a stale/foreign nonce) can
 /// smuggle a second parseable block into the text channel. A client parses exactly one nonce-bearing
-/// `_OUT` block, and that block is appended after this pass. Stripping whole marker lines is enough:
-/// with no delimiters, any leftover JSON is inert prose.
+/// `_OUT` block, and that block is appended after this pass. Removing the markers is enough: with no
+/// delimiters, any leftover JSON is inert prose.
+///
+/// A line that *starts* with a marker is dropped whole, as it always was. A marker further along a
+/// line is defanged in place instead — a space goes in after its `<<<` — because the extractor
+/// accepts a marker run onto the end of a sentence (issue #163), so the sweep has to reach the same
+/// places, and the prose around it is the reviewer's. Inserting rather than cutting is deliberate:
+/// cutting a marker out joins the text either side of it, which can assemble a new one, whereas no
+/// occurrence of the prefix survives a single `replace` (it cannot overlap itself).
 pub fn strip_marker_lines(text: &str) -> String {
-    let in_needle = format!("<<<{IN_TAG}");
-    let out_needle = format!("<<<{OUT_TAG}");
+    // Both tags share this prefix, so defanging it covers either namespace and any nonce.
+    const PREFIX: &str = "<<<CROSS_REVIEW_";
+    let needles = [format!("<<<{IN_TAG}"), format!("<<<{OUT_TAG}")];
     text.lines()
         .filter(|l| {
             let t = l.trim_start();
-            !t.starts_with(&in_needle) && !t.starts_with(&out_needle)
+            !needles.iter().any(|n| t.starts_with(n.as_str()))
         })
+        .map(|l| l.replace(PREFIX, "<<< CROSS_REVIEW_"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Drop everything from a begin marker line through its matching end marker line (inclusive). An
-/// **unterminated** block — a begin marker with no matching end — drops *only its begin marker
-/// line*, keeping the lines after it. This is the degraded-turn path: extraction already failed
+/// Drop everything from a begin marker through its matching end marker (inclusive). An
+/// **unterminated** block — a begin marker with no matching end — drops *only its begin marker*,
+/// keeping the text after it. This is the degraded-turn path: extraction already failed
 /// `Unterminated`, so the whole review is returned unstructured precisely so a human can read the
 /// reviewer's prose, and dropping from the marker to end-of-text would delete exactly that prose —
 /// the truncated block's own payload plus any narrative the reviewer wrote after it. Only the
-/// marker *line* is transport; the payload left behind is inert (no matching end delimiter, so
-/// nothing parses it), and the whole rendered body is swept once more by `strip_marker_lines`
-/// before the canonical `_OUT` block is appended, so no stray marker survives regardless.
+/// marker is transport; the payload left behind is inert (no matching end delimiter, so nothing
+/// parses it), and the whole rendered body is swept once more by `strip_marker_lines` before the
+/// canonical `_OUT` block is appended, so no stray marker survives regardless.
+///
+/// Markers are matched anywhere in the text, as [`extract_reviewer_block`] matches them, so a block
+/// the extractor accepted is always the block removed here. A marker that sits on a line of its own
+/// takes its whole line with it, exactly as the old line-based stripper did; one run onto a line of
+/// prose takes only itself, leaving that prose in place.
+///
+/// Linear in the text: every scan starts where the last one stopped, except the search for an end
+/// marker, which once it fails is never repeated (no later begin can have an end the first missed).
 fn strip_between(text: &str, (begin, end): &(String, String)) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim() == begin {
-            match (i + 1..lines.len()).find(|&j| lines[j].trim() == *end) {
-                // Matched pair: skip through the end marker.
-                Some(j) => {
-                    i = j + 1;
-                    continue;
-                }
-                // Unterminated: drop only this begin marker line and keep the rest, so a degraded
-                // turn's prose is not silently truncated to end-of-text.
-                None => {
-                    i += 1;
-                    continue;
-                }
-            }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    // Whether `out`'s current line holds only whitespace so far.
+    let mut line_blank = true;
+    let mut ends_exhausted = false;
+    while let Some(rel) = text[pos..].find(begin.as_str()) {
+        let at = pos + rel;
+        let after_begin = at + begin.len();
+        let end_at = if ends_exhausted {
+            None
+        } else {
+            text[after_begin..].find(end.as_str())
+        };
+        ends_exhausted = end_at.is_none();
+        let mut cut_to = match end_at {
+            // Matched pair: skip through the end marker.
+            Some(e) => after_begin + e + end.len(),
+            // Unterminated: drop only this begin marker and keep the rest, so a degraded turn's
+            // prose is not silently truncated to end-of-text.
+            None => after_begin,
+        };
+
+        let before = &text[pos..at];
+        let (kept, starts_line) = match before.rfind('\n') {
+            Some(n) => (&before[..=n], before[n + 1..].trim().is_empty()),
+            None => ("", line_blank && before.trim().is_empty()),
+        };
+        // Only whitespace up to the next line break (or the end of the text)?
+        let after = text[cut_to..]
+            .char_indices()
+            .find(|&(_, c)| c == '\n' || !c.is_whitespace());
+        let ends_line = !matches!(after, Some((_, c)) if c != '\n');
+
+        if starts_line && ends_line {
+            // The removed span is whole lines: take its indentation and line break with it.
+            out.push_str(kept);
+            cut_to = after.map_or(text.len(), |(i, _)| cut_to + i + 1);
+            line_blank = true;
+        } else {
+            out.push_str(before);
+            line_blank = match before.rfind('\n') {
+                Some(n) => before[n + 1..].trim().is_empty(),
+                None => line_blank && before.trim().is_empty(),
+            };
         }
-        out.push(lines[i]);
-        i += 1;
+        pos = cut_to;
     }
-    out.join("\n")
+    out.push_str(&text[pos..]);
+    out
 }
 
 // --- Reconciliation ------------------------------------------------------------------------
@@ -2452,6 +2491,168 @@ mod tests {
         assert!(stripped.contains("a real bug"));
         // But the transport marker line is removed.
         assert!(!stripped.contains("CROSS_REVIEW_FINDINGS_IN"));
+    }
+
+    // --- markers run onto other text (issue #163) -----------------------------------------
+    //
+    // Both shapes are taken from a real session that this bug left permanently `legacy_uncovered`.
+    // The JSON body was valid both times; only the line breaks around the markers were missing. The
+    // wording is anonymised, but the placement of each marker is exactly what the reviewer emitted.
+
+    const GLUED_BODY: &str = r#"{"verdict":"request_changes","new_findings":[{"severity":"major","title":"the call can outlive its request budget","file":"src/proxy.py","line":3197,"detail":"The final diagnosis repeats reads the poll already made."}],"prior_findings":[]}"#;
+
+    /// The first response: the begin marker ends a sentence, and the end marker follows the JSON's
+    /// closing brace with no newline at the end of the text. This turn reported `NoBlock`.
+    fn glued_first_response(nonce: &str) -> String {
+        let (b, e) = markers(IN_TAG, nonce);
+        format!(
+            "### Verdict\n\n**REQUEST CHANGES** \u{2014} the budget can expire.\n\n### What I could \
+             not check\n\nThe code treats any visible widget as terminal immediately.{b}\n{GLUED_BODY}{e}"
+        )
+    }
+
+    /// The repair response: the begin marker alone on its line, the end marker still run onto the
+    /// brace. This one reported `Unterminated`, so the repair failed too.
+    fn glued_repair_response(nonce: &str) -> String {
+        let (b, e) = markers(IN_TAG, nonce);
+        format!("{b}\n{GLUED_BODY}{e}")
+    }
+
+    #[test]
+    fn a_begin_marker_run_onto_prose_and_an_end_marker_run_onto_the_json_still_extract() {
+        let block = extract_reviewer_block(&glued_first_response("rv-5464-1"), "rv-5464-1")
+            .expect("the block is unambiguous");
+        assert_eq!(block.verdict, VerdictDetail::RequestChanges);
+        assert_eq!(block.new_findings.len(), 1);
+    }
+
+    #[test]
+    fn an_end_marker_run_onto_the_json_still_extracts() {
+        let block = extract_reviewer_block(&glued_repair_response("rv-5464-1"), "rv-5464-1")
+            .expect("the block is unambiguous");
+        assert_eq!(block.new_findings.len(), 1);
+    }
+
+    #[test]
+    fn a_glued_turn_one_is_structured_and_keeps_whole_conversation_coverage() {
+        // The consequence that mattered: the session is never poisoned in the first place.
+        let ev = evaluate_turn(
+            "s",
+            1,
+            "rv-5464-1",
+            &glued_first_response("rv-5464-1"),
+            None,
+            Budget::default(),
+        );
+        assert!(ev.envelope.structured);
+        assert_eq!(ev.ledger.coverage, LedgerCoverage::WholeConversation);
+        assert_eq!(ev.envelope.open_count, Some(1));
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::OpenFindings)
+        );
+    }
+
+    #[test]
+    fn a_glued_block_is_stripped_without_taking_the_sentence_it_was_run_onto() {
+        let stripped = strip_reviewer_block(&glued_first_response("rv-5464-1"), "rv-5464-1");
+        assert!(stripped.ends_with("terminal immediately."), "{stripped}");
+        assert!(!stripped.contains("CROSS_REVIEW_FINDINGS_IN"));
+        assert!(!stripped.contains("new_findings"));
+    }
+
+    #[test]
+    fn a_glued_block_mid_text_leaves_the_prose_either_side_on_its_own_lines() {
+        let (b, e) = markers(IN_TAG, "rv-1-1");
+        let text = format!("before.{b}\n{GLUED_BODY}{e}\nafter");
+        assert_eq!(strip_reviewer_block(&text, "rv-1-1"), "before.\nafter");
+    }
+
+    #[test]
+    fn a_block_on_lines_of_its_own_still_takes_those_lines_with_it() {
+        let text = block("rv-1-1", r#"{"verdict":"approve"}"#);
+        assert_eq!(
+            strip_reviewer_block(&text, "rv-1-1"),
+            "prose before\nprose after"
+        );
+    }
+
+    #[test]
+    fn a_begin_marker_quoted_inline_still_counts_toward_exactly_one() {
+        // Matching mid-line must not turn a quoted marker into something skipped: two occurrences
+        // are ambiguity, whether or not either one is on a line of its own.
+        let (b, _) = markers(IN_TAG, "rv-1-1");
+        let text = format!("I will emit `{b}` below.\n{}", block("rv-1-1", GLUED_BODY));
+        assert_eq!(
+            extract_reviewer_block(&text, "rv-1-1"),
+            Err(ExtractError::MultipleBlocks)
+        );
+    }
+
+    #[test]
+    fn a_glued_marker_with_another_nonce_is_not_this_block() {
+        let (b, e) = markers(IN_TAG, "rv-1-10");
+        let text = format!("prose.{b}\n{GLUED_BODY}{e}");
+        assert_eq!(
+            extract_reviewer_block(&text, "rv-1-1"),
+            Err(ExtractError::NoBlock)
+        );
+    }
+
+    #[test]
+    fn strip_marker_lines_defangs_a_marker_in_the_middle_of_a_line_and_keeps_the_prose() {
+        let text = "keep this.<<<CROSS_REVIEW_ENVELOPE_OUT:rv-EVIL>>> and this\nnext";
+        assert_eq!(
+            strip_marker_lines(text),
+            "keep this.<<< CROSS_REVIEW_ENVELOPE_OUT:rv-EVIL>>> and this\nnext"
+        );
+    }
+
+    #[test]
+    fn strip_marker_lines_keeps_the_prose_after_an_unclosed_inline_marker() {
+        // No `>>>` follows, so it could never parse; the prose after it is the reviewer's and stays,
+        // and a later unrelated `>>>` is not treated as its close.
+        let text = "see <<<CROSS_REVIEW_FINDINGS_IN in the prompt, and a >>> arrow";
+        let stripped = strip_marker_lines(text);
+        assert!(
+            stripped.ends_with("in the prompt, and a >>> arrow"),
+            "{stripped}"
+        );
+        assert!(!stripped.contains("<<<CROSS_REVIEW_"));
+    }
+
+    #[test]
+    fn strip_marker_lines_does_not_leave_a_marker_assembled_from_the_pieces_of_one() {
+        // Cutting the inner marker out would join `<<<CROSS_REVIEW_` and `ENVELOPE_OUT:x>>>` into a
+        // live one. Defanging in place never joins anything.
+        let text = "a <<<CROSS_REVIEW_<<<CROSS_REVIEW_FINDINGS_IN:y>>>ENVELOPE_OUT:x>>> b";
+        let stripped = strip_marker_lines(text);
+        assert!(!stripped.contains("<<<CROSS_REVIEW_"), "{stripped}");
+        let once_more = strip_marker_lines(&stripped);
+        assert_eq!(once_more, stripped, "the sweep is idempotent");
+    }
+
+    #[test]
+    fn strip_between_continues_a_line_it_cut_a_glued_block_out_of() {
+        // After a glued block is cut, the rest of that line is not a fresh line start: a second
+        // (unterminated) begin marker right after it must not take the line break with it.
+        let (b, e) = markers(IN_TAG, "rv-1-1");
+        let text = format!("prose.{b}{{}}{e}{b}\nnext line");
+        assert_eq!(strip_reviewer_block(&text, "rv-1-1"), "prose.\nnext line");
+    }
+
+    #[test]
+    fn strippers_are_linear_on_pathological_marker_floods() {
+        // Thousands of begin markers with no end, all on one line, and thousands of inline prefixes:
+        // the shapes that made the first draft quadratic. Bounded by time only loosely — this is a
+        // guard against an O(n^2) regression, which at this size takes seconds, not a benchmark.
+        let (b, _) = markers(IN_TAG, "rv-1-1");
+        let flood = format!("x{}", b.repeat(50_000));
+        let prefixes = format!("x{}", "<<<CROSS_REVIEW_FINDINGS_IN ".repeat(50_000));
+        let started = std::time::Instant::now();
+        assert_eq!(strip_reviewer_block(&flood, "rv-1-1"), "x");
+        assert!(!strip_marker_lines(&prefixes).contains("<<<CROSS_REVIEW_"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
