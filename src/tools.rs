@@ -1869,10 +1869,16 @@ impl App {
             h.output = h.output.map(|o| sweep(&o));
             h
         });
+        // A `rebaseline` outcome means this session cannot continue, so it is never advertised as
+        // resumable beside it, whether or not the record was saved (issue #163).
+        let rebaseline = snapshot
+            .envelope
+            .as_ref()
+            .is_some_and(|e| !e.outcome.allows_resume());
         let ctx = crate::findings::ResultContext {
             reviewer: reviewer.as_deref(),
             resumed: snapshot.resumed,
-            resumable: snapshot.resumable,
+            resumable: snapshot.resumable && !rebaseline,
             usage: usage.as_deref(),
             captured: captured.as_deref(),
             disposition: disposition.as_deref(),
@@ -1977,7 +1983,14 @@ impl App {
         );
 
         // Only promise continuity when it actually exists.
-        if ctx.resumable {
+        if rebaseline {
+            out.push_str(&format!(
+                "Note: this session cannot continue (outcome rebaseline): calling \
+                 cross_model_review with session \"{}\" again cannot converge. Start the next review \
+                 with fresh: true, carrying any still-open findings into its instructions.\n",
+                snapshot.session
+            ));
+        } else if ctx.resumable {
             out.push_str(&format!(
                 "After you have addressed the feedback, call cross_model_review again with session \
                  \"{}\" to have the same reviewer re-check the work with its earlier findings still \
@@ -8962,6 +8975,30 @@ mod tests {
         assert!(!text.contains("disposition:"), "{text}");
     }
 
+    /// The other half of issue #163's rule: a saved session whose outcome is not `rebaseline` is
+    /// still reported resumable, with the continuity note.
+    #[test]
+    fn a_saved_session_without_a_rebaseline_is_reported_resumable() {
+        let ev = crate::findings::evaluate_turn_for_test(
+            "default",
+            1,
+            "rv-resume-1",
+            &crate::findings::block_text_for_test(
+                "rv-resume-1",
+                r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
+            ),
+        );
+        assert!(ev.envelope.converged);
+        let (text, structured) = render_both_for(Outcome {
+            review: Some(ev.review_prose.clone()),
+            envelope: Some(ev.envelope),
+            ..richly_contextual_outcome()
+        });
+        let value = structured.expect("structuredContent");
+        assert_eq!(value["resumable"], json!(true));
+        assert!(text.contains("re-check the work"), "{text}");
+    }
+
     /// The context group carries what a caller needs to judge whether the review was thin, and the
     /// denial count is never presented as exact when it is a floor.
     #[test]
@@ -8974,7 +9011,15 @@ mod tests {
             .contains("12 files"));
         assert_eq!(value["denial_count"], json!(7));
         assert_eq!(value["denial_count_is_floor"], json!(true));
-        assert_eq!(value["resumable"], json!(true));
+        // The turn is unstructured, so its outcome is `rebaseline`, and a saved session is still not
+        // advertised as resumable beside it (issue #163) -- on either channel.
+        assert_eq!(value["outcome"], json!("rebaseline"));
+        assert_eq!(value["resumable"], json!(false));
+        assert!(
+            text.contains("this session cannot continue (outcome rebaseline)"),
+            "{text}"
+        );
+        assert!(!text.contains("re-check the work"), "{text}");
         assert!(value["reviewer"]
             .as_str()
             .expect("reviewer")

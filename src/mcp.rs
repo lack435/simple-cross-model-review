@@ -1030,7 +1030,10 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  the field to switch on: `converged` (stop), `changes_requested` (act on \
                  `findings`, then re-review the same session), `escalate` (the reviewer's own \
                  judgement needs a person), or `rebaseline` (this session cannot continue -- a \
-                 human decides, then starts a fresh review carrying the still-open findings). When \
+                 human decides, then starts a fresh review with `fresh: true` carrying the \
+                 still-open findings; `resumable` is always false beside it, and the warnings say \
+                 what to carry, which after a degraded first turn is nothing beyond acting on \
+                 `review_prose`). When \
                  `structured` is false the reviewer produced no machine-readable record this turn: \
                  `findings` is empty because there is nothing in it, not because there was nothing \
                  wrong.\n\n\
@@ -1040,7 +1043,8 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  record, not the whole review. Beside it, `captured` says what change the reviewer \
                  was actually shown, `denial_count` how many commands it was refused (a lower bound \
                  when `denial_count_is_floor` is true), `warnings` everything that qualifies the \
-                 turn, and `resumable` whether this session can be continued. A review run on a \
+                 turn, and `resumable` whether this session can be continued (never true beside \
+                 `rebaseline`). A review run on a \
                  truncated capture, or one that spent its turn on blocked commands, is thinner than \
                  it looks -- those fields are how you tell.\n\n\
                  If it fails, the review did not happen: stop and tell the user what the error \

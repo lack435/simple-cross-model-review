@@ -220,6 +220,15 @@ A permanently-uncovered session therefore always reports `ledger_unavailable` (*
 rebaseline**), never `open_findings` ("re-review"), no matter how many findings it also has — so the
 loop cannot be lured into re-reviewing a session it can never converge.
 
+Two signals keep that from reading as an invitation to resume (issue #163). `resumable` is `false`
+beside every `rebaseline` outcome (`Outcome::allows_resume`), even though a `ledger_unavailable`
+session still *accepts* a resume — it simply cannot converge from one. And every `ledger_unavailable`
+turn carries a warning, derived from the final envelope at render time, saying resuming cannot
+converge and what a fresh review must carry. On a degraded turn 1 the ledger is empty, so that
+warning says there is nothing to carry by hand: act on the findings in `review_prose` and retry with
+`fresh: true` — the safe retry the round-6 answers below already name. The coverage lattice itself is
+unchanged: a broken session still never converges.
+
 > **Retired (post-#73):** an earlier design had an `approve_with_comments` verdict and a matching
 > `reviewer_withheld_approve` reason (an `escalate` livelock guard: `open_count == 0` but the reviewer
 > declined a clean approve). It was removed because "approve with comments" is near-universally read as
