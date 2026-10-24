@@ -266,6 +266,15 @@ impl Outcome {
             | Some(SessionStagnant) => Outcome::Rebaseline,
         }
     }
+
+    /// Whether a session whose turn came back with this outcome may be reported as resumable.
+    /// False only for `Rebaseline`, which means the session cannot continue: reporting it beside
+    /// `resumable: true` told a caller to stop and to resume at once (issue #163). A
+    /// `ledger_unavailable` session will in fact still accept a resume, but no resumed turn can ever
+    /// converge, so advertising it as resumable promises something it cannot deliver.
+    pub fn allows_resume(self) -> bool {
+        !matches!(self, Outcome::Rebaseline)
+    }
 }
 
 /// Whether this turn asked the reviewer to re-emit its machine block, and how that went. Absent when
@@ -1125,6 +1134,40 @@ impl Envelope {
         self.review_prose.is_some()
     }
 
+    /// What a `ledger_unavailable` turn tells the caller to do, which its reason alone does not say:
+    /// that resuming can never converge, and what — if anything — a fresh review must carry.
+    ///
+    /// Derived from the final envelope when the warnings are rendered, like `outcome` from the
+    /// reason, so it cannot disagree with whichever constructor built the envelope. A degraded
+    /// turn 1 is called out on its own (issue #163): its ledger is empty, so the rebaseline there
+    /// is a plain `fresh` retry once its prose findings are acted on, not a hand-carried ledger. A
+    /// `fresh: true` retry is also turn 1 with an empty ledger, so the wording still tells it to carry
+    /// whatever its own instructions brought in from the session it replaced.
+    fn coverage_guidance(&self) -> Option<String> {
+        if self.non_convergence_reason != Some(NonConvergenceReason::LedgerUnavailable) {
+            return None;
+        }
+        Some(if self.turn == 1 && self.findings.is_empty() {
+            "this was the session's first turn and it left no machine record, so this session can \
+             never converge and should not be resumed. Its ledger is empty, so it holds nothing to \
+             carry by hand: act on the findings in review_prose, then start the next review with \
+             fresh: true -- still carrying any findings this review's own instructions brought in \
+             from an earlier session, which the ledger never held."
+                .to_string()
+        } else {
+            let coverage = serde_json::to_value(self.ledger_coverage)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            format!(
+                "this session's ledger does not cover the whole conversation ({coverage}), so no \
+                 later turn can converge, however clean: do not resume it. Start a fresh review \
+                 (fresh: true) carrying the still-open findings, and any finding an unstructured \
+                 turn raised only in its review_prose."
+            )
+        })
+    }
+
     /// Record that a block repair ran, and how it went.
     pub fn with_block_repair(mut self, repair: BlockRepair) -> Self {
         self.block_repair = Some(repair);
@@ -1246,8 +1289,10 @@ pub fn warning_union(env: &Envelope, ctx: &ResultContext) -> Vec<String> {
 /// [`warning_union`] from the run warnings alone, for a consumer with no `ResultContext` (the
 /// lifecycle event hook, issue #152).
 pub fn warnings_with(env: &Envelope, run_warnings: &[String]) -> Vec<String> {
+    let guidance = env.coverage_guidance();
     env.warnings
         .iter()
+        .chain(guidance.iter())
         .chain(run_warnings.iter())
         .map(|w| strip_marker_lines(w))
         .collect()
@@ -4290,6 +4335,113 @@ mod repair_tests {
             Some(NonConvergenceReason::LedgerUnavailable)
         );
         assert_eq!(ev.envelope.outcome, Outcome::Rebaseline);
+    }
+
+    /// Issue #163: a degraded turn 1 reports `rebaseline`, but its ledger is empty, so the warnings
+    /// must say the retry is a plain `fresh` once the prose findings are acted on -- not a
+    /// hand-carried ledger, and not a resume.
+    #[test]
+    fn a_degraded_turn_one_is_told_its_rebaseline_is_a_plain_fresh_retry() {
+        let ev = finalize_turn(
+            assess_turn("s", 1, "rv-1-1", "prose only", None),
+            Budget::default(),
+            0,
+        );
+        assert_eq!(ev.envelope.ledger_coverage, LedgerCoverage::LegacyUncovered);
+        assert_eq!(ev.envelope.outcome, Outcome::Rebaseline);
+        let warnings = warnings_with(&ev.envelope, &[]);
+        let guidance: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("fresh: true"))
+            .collect();
+        assert_eq!(guidance.len(), 1, "{warnings:?}");
+        assert!(
+            guidance[0].contains("nothing to carry by hand"),
+            "{warnings:?}"
+        );
+        assert!(guidance[0].contains("review_prose"), "{warnings:?}");
+        // A `fresh` retry also lands here, so findings carried in its instructions are not waved away.
+        assert!(
+            guidance[0].contains("from an earlier session"),
+            "{warnings:?}"
+        );
+        // Derived at render, so the not-durable path's `carry_warnings` cannot duplicate it.
+        assert!(!ev
+            .envelope
+            .warnings
+            .iter()
+            .any(|w| w.contains("fresh: true")));
+    }
+
+    /// Issue #163: a later turn on a broken session -- even a clean, structured approve -- is told it
+    /// can never converge and must not be resumed.
+    #[test]
+    fn a_broken_session_turn_is_told_resuming_cannot_converge() {
+        let prior_state = prior(vec![open_finding("f1")], LedgerCoverage::LegacyUncovered);
+        let ev = evaluate_turn(
+            "s",
+            3,
+            "rv-1-3",
+            &block(
+                "rv-1-3",
+                r#"{"verdict":"approve","prior_findings":[{"id":"f1","status":"resolved"}],"new_findings":[]}"#,
+            ),
+            Some(prior_state),
+            Budget::default(),
+        );
+        assert!(ev.envelope.structured);
+        assert_eq!(ev.envelope.open_count, Some(0));
+        assert_eq!(ev.envelope.outcome, Outcome::Rebaseline);
+        let warnings = warnings_with(&ev.envelope, &[]);
+        assert!(
+            warnings.iter().any(|w| w.contains("(legacy_uncovered)")
+                && w.contains("do not resume it")
+                && w.contains("fresh: true")),
+            "{warnings:?}"
+        );
+        assert!(!warnings.iter().any(|w| w.contains("nothing to carry")));
+    }
+
+    #[test]
+    fn coverage_guidance_is_only_for_ledger_unavailable() {
+        let ev = evaluate_turn(
+            "s",
+            1,
+            "rv-1-1",
+            &block(
+                "rv-1-1",
+                r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#,
+            ),
+            None,
+            Budget::default(),
+        );
+        assert!(ev.envelope.converged);
+        assert!(ev.envelope.coverage_guidance().is_none());
+    }
+
+    /// `resumable` is never reported beside `rebaseline` (issue #163); every other outcome leaves it
+    /// to whether the session was saved.
+    #[test]
+    fn only_rebaseline_forbids_advertising_a_resume() {
+        use NonConvergenceReason::*;
+        for reason in [
+            None,
+            Some(OpenFindings),
+            Some(VerdictContradiction),
+            Some(EvidenceIncomplete),
+            Some(ReviewerBlocked),
+            Some(LedgerUnavailable),
+            Some(TurnNotDurable),
+            Some(LedgerTooLarge),
+            Some(SessionStagnant),
+        ] {
+            let outcome = Outcome::from_reason(reason);
+            assert_eq!(
+                outcome.allows_resume(),
+                outcome != Outcome::Rebaseline,
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]
