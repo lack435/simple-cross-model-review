@@ -1032,8 +1032,8 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  judgement needs a person), or `rebaseline` (this session cannot continue -- a \
                  human decides, then starts a fresh review with `fresh: true` carrying the \
                  still-open findings; `resumable` is always false beside it, and the warnings say \
-                 what to carry, which after a degraded first turn is nothing beyond acting on \
-                 `review_prose`). When \
+                 what to carry: after a degraded first turn the ledger holds nothing, so act on \
+                 `review_prose` and carry only what your own instructions brought in). When \
                  `structured` is false the reviewer produced no machine-readable record this turn: \
                  `findings` is empty because there is nothing in it, not because there was nothing \
                  wrong.\n\n\

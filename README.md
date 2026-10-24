@@ -270,7 +270,7 @@ Switch on `outcome`:
 | `converged` | The machine contract passed. | Stop. (It certifies the structured contract, not that a human read the prose.) |
 | `changes_requested` | Findings are open, the verdict and count disagree, or the reviewer was not shown the whole current change (`evidence_incomplete`). | Act on `findings`, re-review the same session. |
 | `escalate` | The reviewer blocked. | A person decides; re-reviewing keeps producing this. |
-| `rebaseline` | This session cannot continue — coverage broke, the turn was not durable, the ledger is over budget, or the session stalled. `resumable` is always `false` beside it. | A person decides, then starts a fresh review (`fresh: true`) carrying the still-open findings. When coverage broke on turn 1 the ledger is empty, so the warning says there is nothing to carry: act on the findings in `review_prose` and retry with `fresh: true`. |
+| `rebaseline` | This session cannot continue — coverage broke, the turn was not durable, the ledger is over budget, or the session stalled. `resumable` is always `false` beside it. | A person decides, then starts a fresh review (`fresh: true`) carrying the still-open findings. When coverage broke on turn 1 the ledger is empty, so the warning says it holds nothing to carry: act on the findings in `review_prose` and retry with `fresh: true`, still carrying anything your own instructions brought in from an earlier session. |
 
 Every review carries a machine-readable envelope (verdict, findings with stable ids, a
 `converged` signal) alongside prose. Read `review_prose`, not only `findings` — it is where the

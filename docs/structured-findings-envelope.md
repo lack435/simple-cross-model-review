@@ -225,8 +225,9 @@ beside every `rebaseline` outcome (`Outcome::allows_resume`), even though a `led
 session still *accepts* a resume — it simply cannot converge from one. And every `ledger_unavailable`
 turn carries a warning, derived from the final envelope at render time, saying resuming cannot
 converge and what a fresh review must carry. On a degraded turn 1 the ledger is empty, so that
-warning says there is nothing to carry by hand: act on the findings in `review_prose` and retry with
-`fresh: true` — the safe retry the round-6 answers below already name. The coverage lattice itself is
+warning says the ledger holds nothing to carry: act on the findings in `review_prose` and retry with
+`fresh: true`, still carrying any findings the caller's own instructions brought in from an earlier
+session (a `fresh` retry is also turn 1 with an empty ledger) — the safe retry the round-6 answers below already name. The coverage lattice itself is
 unchanged: a broken session still never converges.
 
 > **Retired (post-#73):** an earlier design had an `approve_with_comments` verdict and a matching

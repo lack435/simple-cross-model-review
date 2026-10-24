@@ -104,7 +104,7 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   findings into a fresh one (`resumable` is always `false` beside it: a `ledger_unavailable` session
   still accepts a resume, but no resumed turn can converge). A degraded turn 1 is the cheap case:
   its ledger is empty, so act on the findings in `review_prose` and retry with `fresh: true` — the
-  warning says so. `rebaseline` with `session_stagnant` is that case and nothing worse: the
+  warning says so — still carrying any findings your instructions brought in from an earlier session. `rebaseline` with `session_stagnant` is that case and nothing worse: the
   session went several turns without raising or resolving anything, so it was stopped. Every finding
   comes back unchanged and still open — **it is not a hint that they are stale or fixed**, and the
   warning names them precisely so you can carry them across. Re-read them, address them, and open a

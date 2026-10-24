@@ -1140,16 +1140,19 @@ impl Envelope {
     /// Derived from the final envelope when the warnings are rendered, like `outcome` from the
     /// reason, so it cannot disagree with whichever constructor built the envelope. A degraded
     /// turn 1 is called out on its own (issue #163): its ledger is empty, so the rebaseline there
-    /// is a plain `fresh` retry once its prose findings are acted on, not a hand-carried ledger.
+    /// is a plain `fresh` retry once its prose findings are acted on, not a hand-carried ledger. A
+    /// `fresh: true` retry is also turn 1 with an empty ledger, so the wording still tells it to carry
+    /// whatever its own instructions brought in from the session it replaced.
     fn coverage_guidance(&self) -> Option<String> {
         if self.non_convergence_reason != Some(NonConvergenceReason::LedgerUnavailable) {
             return None;
         }
         Some(if self.turn == 1 && self.findings.is_empty() {
             "this was the session's first turn and it left no machine record, so this session can \
-             never converge and should not be resumed. Its ledger is empty, so there is nothing to \
+             never converge and should not be resumed. Its ledger is empty, so it holds nothing to \
              carry by hand: act on the findings in review_prose, then start the next review with \
-             fresh: true."
+             fresh: true -- still carrying any findings this review's own instructions brought in \
+             from an earlier session, which the ledger never held."
                 .to_string()
         } else {
             let coverage = serde_json::to_value(self.ledger_coverage)
@@ -4357,6 +4360,11 @@ mod repair_tests {
             "{warnings:?}"
         );
         assert!(guidance[0].contains("review_prose"), "{warnings:?}");
+        // A `fresh` retry also lands here, so findings carried in its instructions are not waved away.
+        assert!(
+            guidance[0].contains("from an earlier session"),
+            "{warnings:?}"
+        );
         // Derived at render, so the not-durable path's `carry_warnings` cannot duplicate it.
         assert!(!ev
             .envelope
