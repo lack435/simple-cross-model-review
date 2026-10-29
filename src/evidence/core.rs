@@ -2934,6 +2934,47 @@ mod tests {
         }
     }
 
+    /// Issue #167: a companion repository's server runs under its own nonce, so a cursor minted by
+    /// one server is unknown to another and refused, instead of silently continuing that server's
+    /// own operation. With a shared nonce the two would mint identical tokens.
+    #[test]
+    fn a_cursor_from_another_server_is_refused_when_the_nonces_differ() {
+        let dir_a = temp_dir("evidence-cursor-a");
+        let dir_b = temp_dir("evidence-cursor-b");
+        let with_nonce = |root: &Path, nonce: &str| {
+            let mut b = bundle(root);
+            b.nonce = nonce.into();
+            Core::new(b).unwrap()
+        };
+        let page = |core: &mut Core| {
+            core.call("repository_change", &json!({"limit_bytes": 2}))
+                .unwrap()["cursor"]
+                .as_str()
+                .expect("a first page leaves a cursor")
+                .to_string()
+        };
+
+        let mut primary = with_nonce(dir_a.as_path(), "rv-1-1");
+        let mut companion = with_nonce(dir_b.as_path(), "rv-1-1-c-assets");
+        let cursor = page(&mut primary);
+        page(&mut companion);
+        assert!(
+            companion
+                .call("repository_change", &json!({ "cursor": cursor }))
+                .is_err(),
+            "a primary cursor must not continue the companion's operation"
+        );
+
+        // The hazard this guards against: under one shared nonce the same token exists on both.
+        let mut shared_a = with_nonce(dir_a.as_path(), "rv-1-1");
+        let mut shared_b = with_nonce(dir_b.as_path(), "rv-1-1");
+        let cursor = page(&mut shared_a);
+        page(&mut shared_b);
+        assert!(shared_b
+            .call("repository_change", &json!({ "cursor": cursor }))
+            .is_ok());
+    }
+
     /// Issue #151: a search reports what it covered, and one that runs out of its slice answers with
     /// a partial result rather than an error.
     #[test]

@@ -32,8 +32,12 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Upper bound on `--on-converged-timeout-seconds`. The hook runs before the review result is
 /// published (and, for an attest, under the session lease), so an unbounded hook would hold both.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
-/// The payload's own schema version, independent of the result envelope's.
+/// The payload's own schema version, independent of the result envelope's. A review that declared
+/// no companion repository emits exactly this, byte for byte as before companions existed.
 pub const PAYLOAD_SCHEMA_VERSION: u32 = 1;
+/// The payload schema version for a review that declared companion repositories (issue #167):
+/// version 1 plus a `companions` array. Additive; a version-1 consumer can ignore it.
+pub const PAYLOAD_SCHEMA_VERSION_COMPANIONS: u32 = 2;
 /// How much of the hook's combined output the result keeps.
 const OUTPUT_TAIL_BYTES: usize = 2048;
 /// How often the runner checks whether the hook (and its descendants) have finished.
@@ -51,6 +55,9 @@ pub mod reason {
     pub const NO_CANONICAL_DIFF: &str = "no_canonical_diff";
     pub const SESSION_NOT_RECORDED: &str = "session_not_recorded";
     pub const HEAD_MISMATCH: &str = "head_does_not_match_review";
+    /// A declared companion repository's committed change no longer matches what was served. The
+    /// reason is this prefix, `: `, and the companion's name.
+    pub const COMPANION_HEAD_MISMATCH: &str = "companion_head_does_not_match_review";
     pub const BINDING_CHECK_FAILED: &str = "binding_check_failed";
     pub const NO_CONTAINMENT: &str = "no_containment";
     pub const SPAWN_FAILED: &str = "spawn_failed";
@@ -101,6 +108,18 @@ pub struct Attestable {
     /// The root this turn reviewed: the server's working root, or the worktree the call named
     /// (issue #146). An attest checks the binding against, and fires the hook in, this root.
     pub root: PathBuf,
+    /// Every companion repository the review declared (issue #167), each with the change its own
+    /// server served. Bound exactly like the root: the hook fires only if each one's committed
+    /// `base..HEAD` still matches. Empty for a single-repository review.
+    pub companions: Vec<ServedCompanion>,
+}
+
+/// One declared companion repository's served canonical change, for the converged-hook binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedCompanion {
+    pub name: String,
+    pub root: PathBuf,
+    pub served: ServedChange,
 }
 
 /// What fired the hook.
@@ -179,6 +198,11 @@ impl HookReport {
                     "{reason}: the reviewed change is not exactly HEAD's committed change; commit \
                      everything, including untracked files, then re-review"
                 ),
+                r if r.starts_with(reason::COMPANION_HEAD_MISMATCH) => format!(
+                    "{reason}: the companion repository's reviewed change is not exactly its HEAD's \
+                     committed change; commit everything there, including untracked files, then \
+                     re-review"
+                ),
                 _ => reason.clone(),
             });
         }
@@ -250,8 +274,17 @@ pub fn check_binding(root: &Path, served: &ServedChange) -> Result<String, HookR
 
 /// The JSON object the hook reads on stdin. Every field is server-derived or caller-supplied
 /// (`session`); nothing the reviewer wrote reaches it.
-pub fn payload(att: &Attestable, head: &str, trigger: Trigger, root: &Path) -> String {
-    json!({
+///
+/// `companion_heads` holds each declared companion's bound `HEAD`, in `att.companions` order. With
+/// none declared the payload is version 1 exactly; otherwise it is version 2, adding `companions`.
+pub fn payload(
+    att: &Attestable,
+    head: &str,
+    trigger: Trigger,
+    root: &Path,
+    companion_heads: &[String],
+) -> String {
+    let mut value = json!({
         "schema_version": PAYLOAD_SCHEMA_VERSION,
         "event": "converged",
         // Always "converged" / true today: the hook only fires then. Kept so the payload is
@@ -274,8 +307,27 @@ pub fn payload(att: &Attestable, head: &str, trigger: Trigger, root: &Path) -> S
         "diff_sha256": att.served.digest,
         "repo_root": root.to_string_lossy(),
         "server_version": env!("CARGO_PKG_VERSION"),
-    })
-    .to_string()
+    });
+    if !att.companions.is_empty() {
+        // `tree_clean` then covers every listed repository: each binding check passed.
+        value["schema_version"] = json!(PAYLOAD_SCHEMA_VERSION_COMPANIONS);
+        value["companions"] = att
+            .companions
+            .iter()
+            .zip(companion_heads)
+            .map(|(c, head)| {
+                json!({
+                    "name": c.name,
+                    "repo_root": c.root.to_string_lossy(),
+                    "captured_head": head,
+                    "base": c.served.base,
+                    "base_source": c.served.base_source,
+                    "diff_sha256": c.served.digest,
+                })
+            })
+            .collect();
+    }
+    value.to_string()
 }
 
 /// Check the binding, then run the hook for the matching commit.
@@ -289,7 +341,25 @@ pub fn fire(
         Ok(head) => head,
         Err(report) => return report,
     };
-    let mut report = runner.run(root, &payload(att, &head, trigger, root));
+    // Every declared companion repository is bound the same way (issue #167): a commit that moved
+    // any of them since the review skips the hook, naming the repository.
+    let mut companion_heads = Vec::with_capacity(att.companions.len());
+    for c in &att.companions {
+        match check_binding(&c.root, &c.served) {
+            Ok(head) => companion_heads.push(head),
+            Err(report) => {
+                let reason = match report.reason.as_deref() {
+                    Some(reason::HEAD_MISMATCH) => {
+                        format!("{}: {}", reason::COMPANION_HEAD_MISMATCH, c.name)
+                    }
+                    Some(other) => format!("{other} (companion '{}')", c.name),
+                    None => format!("{} (companion '{}')", reason::BINDING_CHECK_FAILED, c.name),
+                };
+                return HookReport::skipped(reason);
+            }
+        }
+    }
+    let mut report = runner.run(root, &payload(att, &head, trigger, root, &companion_heads));
     report.captured_head = Some(head);
     report
 }
@@ -561,6 +631,7 @@ mod tests {
             effort: "xhigh".into(),
             chain_index: 0,
             root: PathBuf::from("."),
+            companions: Vec::new(),
         }
     }
 
@@ -688,9 +759,17 @@ mod tests {
     fn the_payload_carries_the_requested_shape_and_no_reviewer_prose() {
         let att = attestable(dummy_served());
         let head = "b".repeat(40);
-        let v: serde_json::Value =
-            serde_json::from_str(&payload(&att, &head, Trigger::Attest, Path::new("C:\\r")))
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload(
+            &att,
+            &head,
+            Trigger::Attest,
+            Path::new("C:\\r"),
+            &[],
+        ))
+        .unwrap();
+        // Without a companion the payload is version 1, with no `companions` key at all.
+        assert_eq!(v["schema_version"], PAYLOAD_SCHEMA_VERSION);
+        assert!(v.get("companions").is_none(), "{v}");
         assert_eq!(v["outcome"], "converged");
         assert_eq!(v["event"], "converged");
         assert_eq!(v["trigger"], "attest");

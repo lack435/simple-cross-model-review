@@ -95,6 +95,39 @@ pub struct PromptParts<'a> {
     /// means the process cwd is the working root and relative reads resolve correctly.
     /// Rendered regardless of `--no-preamble`: it is operational, not framing.
     pub neutral_root: Option<&'a Path>,
+    /// The companion repositories this review declared (issue #167). Rendered on every turn, and
+    /// regardless of `--no-preamble`: the reviewer needs to know which server reads which repository,
+    /// and that an approval requires each one's whole change. Empty for the common single-root case.
+    pub companions: &'a [crate::companion::Companion],
+}
+
+/// The companion-repositories section (issue #167): each companion's name, root and evidence server.
+/// For a formal review it also states the approval floor, which covers every listed repository.
+fn companions_section(companions: &[crate::companion::Companion], formal: bool) -> String {
+    let mut out = String::from(
+        "\n## Companion repositories\n\nThis change spans more than one git repository. Besides the \
+         reviewed repository root, these companion repositories are part of it. Each is read through \
+         its own evidence server, whose tools are the same `repository_*` tools with paths relative \
+         to that companion's root; its change is its current branch against its own fork point:\n\n",
+    );
+    for c in companions {
+        out.push_str(&format!(
+            "- `{}`: {} (evidence server `{}`)\n",
+            c.name,
+            c.root.display(),
+            c.server_name()
+        ));
+    }
+    if formal {
+        out.push_str(
+            "\nTo return APPROVE you must have been served, this turn, the complete change of the \
+             reviewed repository root **and of every companion above**: call each server's \
+             `repository_diff` with `base: \"branch-base\"` and `head: \"worktree\"`, without `path`, \
+             following every continuation cursor until `complete: true`. Cursors belong to the server \
+             that issued them; never pass one to a different server.\n",
+        );
+    }
+    out
 }
 
 pub fn build(parts: &PromptParts) -> String {
@@ -161,6 +194,10 @@ pub fn build(parts: &PromptParts) -> String {
         if let Some(root) = parts.neutral_root {
             out.push_str(&reading_files_section(root));
         }
+    }
+
+    if !parts.companions.is_empty() {
+        out.push_str(&companions_section(parts.companions, true));
     }
 
     // The machine-readable findings-block contract is rendered on every turn (the nonce changes
@@ -245,6 +282,8 @@ pub struct ConsultPromptParts<'a> {
     pub change: Option<&'a str>,
     pub resumed_capture_note: Option<&'a str>,
     pub neutral_root: Option<&'a Path>,
+    /// The companion repositories this consult declared; see [`PromptParts::companions`].
+    pub companions: &'a [crate::companion::Companion],
 }
 
 /// Assemble a consult prompt. Mirrors [`build`]'s structure — preamble and capabilities on the first
@@ -306,6 +345,11 @@ pub fn build_consult(parts: &ConsultPromptParts) -> String {
         }
     }
 
+    // A consult has no approval floor, so only which server reads which repository is stated.
+    if !parts.companions.is_empty() {
+        out.push_str(&companions_section(parts.companions, false));
+    }
+
     if parts.resumed {
         out.push_str(&format!("\n{CONSULT_FOLLOW_UP_GUIDANCE}\n"));
     }
@@ -350,7 +394,14 @@ pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -
 /// the reviewer looks at the whole current change, so its verdict may legitimately change, and the
 /// re-emitted block is authoritative. Its `repository_diff` calls append to this turn's serve-record,
 /// which is what the evidence floor re-checks afterward.
-pub fn evidence_repair(nonce: &str, prior_digest: Option<&str>) -> String {
+///
+/// `unmet_companions` names the evidence servers of declared companion repositories (issue #167)
+/// whose complete change was not served this turn; the reviewer is asked to pull each of those too.
+pub fn evidence_repair(
+    nonce: &str,
+    prior_digest: Option<&str>,
+    unmet_companions: &[String],
+) -> String {
     let mut s = String::new();
     s.push_str("## Judge the whole current change before your verdict stands\n\n");
     s.push_str(
@@ -366,6 +417,18 @@ pub fn evidence_repair(nonce: &str, prior_digest: Option<&str>) -> String {
          the finding. Do not approve on the strength of an earlier turn's view. Re-emit your prose \
          review and your machine block reflecting this decision.\n\n",
     );
+    if !unmet_companions.is_empty() {
+        s.push_str(&format!(
+            "This change also spans companion repositories, and their complete change was not served \
+             either. Make the same `repository_diff` call on each of these evidence servers too, \
+             following that server's own continuation cursors to `complete: true`: {}.\n\n",
+            unmet_companions
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     s.push_str(&machine_block_section(nonce, prior_digest));
     s.push('\n');
     s
@@ -486,6 +549,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -513,6 +577,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -593,6 +658,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(first.contains("## Your access"));
         assert!(first.contains("You have no shell."));
@@ -612,6 +678,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(!resumed.contains("## Your access"));
     }
@@ -633,6 +700,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
@@ -659,6 +727,7 @@ mod tests {
                 nonce: None,
                 prior_findings_digest: None,
                 neutral_root: None,
+                companions: &[],
             });
             assert!(text.contains("## Change under review"), "resumed={resumed}");
             assert!(text.contains("+ added a line"), "resumed={resumed}");
@@ -684,6 +753,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
@@ -708,6 +778,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         };
         // First turn: suppressed even when supplied -- there is no prior snapshot to differ
         // from.
@@ -737,6 +808,7 @@ mod tests {
             nonce: Some("rv-42-4"),
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         };
 
         // Turn 1 already receives the full capability block from the caller. The compact reminder
@@ -783,6 +855,7 @@ mod tests {
                 nonce: Some("rv-42-7"),
                 prior_findings_digest: None,
                 neutral_root: None,
+                companions: &[],
             });
             assert!(
                 text.contains("## Machine-readable findings block (required)"),
@@ -823,6 +896,7 @@ mod tests {
             nonce: Some("rv-42-3"),
             prior_findings_digest: Some(digest),
             neutral_root: None,
+            companions: &[],
         });
         assert!(text.contains(digest));
         // A restatement is a claim, so the contract asks only for what was re-examined and says
@@ -858,6 +932,7 @@ mod tests {
             nonce: Some("rv-42-1"),
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(first.contains("empty array on this first turn"));
         assert!(!first.contains("exactly once"));
@@ -880,6 +955,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(!text.contains("Machine-readable findings block"));
     }
@@ -901,6 +977,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root,
+            companions: &[],
         };
         let text = build(&parts(Some(Path::new("C:\\repo"))));
         assert!(text.contains("## Reading files"), "{text}");
@@ -928,6 +1005,7 @@ mod tests {
             nonce: None,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         });
         assert!(!text.contains("flagged"));
     }
@@ -988,6 +1066,7 @@ mod repair_prompt_tests {
             nonce,
             prior_findings_digest: None,
             neutral_root: None,
+            companions: &[],
         };
         let text = build(&parts(Some("rv-9-3")));
         assert!(text.trim_end().ends_with(BLOCK_REMINDER), "{text}");
@@ -1023,6 +1102,7 @@ mod consult_prompt_tests {
             change: None,
             resumed_capture_note: None,
             neutral_root: None,
+            companions: &[],
         }
     }
 

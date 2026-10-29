@@ -991,6 +991,13 @@ pub struct Config {
     /// Parsed here rather than stripped from argv beforehand, so an option *value* spelled
     /// `--json` (an `--on-event-arg`, say) is never mistaken for the flag.
     pub status_json: bool,
+    /// Companion repositories configured with `--companion` (issue #167), resolved and validated at
+    /// startup. Empty unless configured. See `src/companion.rs`.
+    pub companions: Vec<crate::companion::Companion>,
+    /// The companions one review declared, a subset of `companions` in declaration order. Always
+    /// empty on the server's own config; set only on the per-call config `start` builds, as `cwd`
+    /// is for a per-call `root`, so everything downstream reads one place.
+    pub declared_companions: Vec<crate::companion::Companion>,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -1051,6 +1058,7 @@ impl Config {
         let mut hook_timeout_secs: Option<u64> = None;
         let mut event_program: Option<String> = None;
         let mut event_args: Vec<String> = Vec::new();
+        let mut companion_args: Vec<(String, String)> = Vec::new();
         let mut event_timeout_secs: Option<u64> = None;
         let mut event_include_findings = false;
         let mut status_flag = false;
@@ -1308,6 +1316,9 @@ impl Config {
                 }
                 "--on-event" => event_program = Some(take("--on-event")?),
                 "--on-event-arg" => event_args.push(take("--on-event-arg")?),
+                "--companion" => {
+                    companion_args.push(crate::companion::parse_flag(&take("--companion")?)?)
+                }
                 "--on-event-include-findings" => event_include_findings = true,
                 "--status" => status_flag = true,
                 "--json" => json_flag = true,
@@ -1456,6 +1467,14 @@ impl Config {
                 state_dir.display()
             ));
         }
+        // Resolved last, once the state directory every companion must stay disjoint from is known.
+        let companions = crate::companion::resolve_all(
+            &companion_args,
+            &cwd,
+            vcs,
+            &state_dir,
+            &std::env::temp_dir(),
+        )?;
 
         Ok(Self {
             reviewers,
@@ -1489,6 +1508,8 @@ impl Config {
             on_converged,
             on_event,
             status_json: status_flag,
+            companions,
+            declared_companions: Vec::new(),
         })
     }
 
@@ -2488,6 +2509,18 @@ CONVERGED-REVIEW HOOK (issue #142; off unless --on-converged is given):
                               Kill the hook and everything it started after N seconds.
                               Default 60, max 600.
 
+COMPANION REPOSITORIES (issue #167; off unless --companion is given):
+  --companion <name>=<path>   A second git repository a review may declare with
+                              companions: ["<name>"]. Its change (its branch against its
+                              own fork point) is served through its own read-only
+                              evidence server, and an approval converges only if every
+                              declared repository's whole change was served. Repeatable.
+                              <name> is 1-16 of a-z, 0-9 and '-', starting with a letter;
+                              a relative <path> is under the working root. The path must
+                              be a git toplevel reached without junctions or symlinks,
+                              separate from the working root and other companions, and
+                              disjoint from the state and temp directories. Git only.
+
 LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
   --on-event <program>        Run <program> for every review and consult turn that
                               starts, completes, fails or is cancelled, with a JSON
@@ -3444,6 +3477,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: None,
         };
         // Matches the fallback entry (index 1), not the primary.
@@ -3552,6 +3586,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: None,
         };
         // A session persisted at the base pair binds back.
@@ -3610,6 +3645,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: named("personal"),
         };
         // The selector is part of entry identity, so a record created under 'personal' binds to
@@ -3665,6 +3701,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: None,
         };
         assert_eq!(cfg.resume_entry_index(&rec), Some(0));
@@ -3722,6 +3759,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: None,
         };
         // Two same-model/different-bin codex entries: a legacy record is ambiguous -> no match.

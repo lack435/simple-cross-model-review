@@ -16,6 +16,7 @@
   .\smoke.ps1 -Reviewer claude
   .\smoke.ps1 -Reviewer codex -ProveBlockRepair
   .\smoke.ps1 -Reviewer codex -OnEvent
+  .\smoke.ps1 -Reviewer claude -Companion
 #>
 [CmdletBinding()]
 param(
@@ -47,7 +48,12 @@ param(
     # Also run the server with an --on-event hook (issue #152) that appends every lifecycle event to
     # a file, and check after shutdown that every turn the round trip started was reported started
     # and then ended exactly once.
-    [switch]$OnEvent
+    [switch]$OnEvent,
+
+    # Also configure a scratch companion repository (issue #167) beside this checkout and run one
+    # review that declares it: the reviewer must read a marker that exists only in the companion's
+    # change, through the companion's own evidence server. Costs one more review turn.
+    [switch]$Companion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -103,6 +109,36 @@ if ($OnEvent) {
     $appendEvent = "[Console]::In.ReadToEnd() | Add-Content -LiteralPath '$eventsFile' -Encoding UTF8"
     $serverArgs += @('--on-event', 'powershell.exe', '--on-event-arg', '-NoProfile',
         '--on-event-arg', '-NonInteractive', '--on-event-arg', '-Command', '--on-event-arg', $appendEvent)
+}
+
+# The companion lives beside this checkout, not under %TEMP%: a companion must be disjoint from the
+# temp and state directories (the smoke's state directory is under %TEMP%).
+$companionDir = $null
+$companionMarker = "COMPANION-MARKER-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+if ($Companion) {
+    $companionDir = Join-Path (Split-Path $PSScriptRoot -Parent) "cross-review-smoke-companion-$PID"
+    New-Item -ItemType Directory -Path $companionDir -Force | Out-Null
+    function Invoke-CompanionGit {
+        param([string[]]$GitArgs)
+        # Native stderr under the script-wide 'Stop' preference would abort on a harmless warning;
+        # judge git by its exit code instead, as the instrumented build above does for cargo.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & git -C $companionDir -c user.email=smoke@example.invalid -c user.name=smoke `
+            -c commit.gpgsign=false @GitArgs 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($code -ne 0) { throw "git $($GitArgs -join ' ') failed in the companion (exit $code)" }
+    }
+    Invoke-CompanionGit @('init', '-q', '-b', 'main')
+    Set-Content -LiteralPath (Join-Path $companionDir 'base.txt') -Value 'base' -Encoding ASCII
+    Invoke-CompanionGit @('add', '-A')
+    Invoke-CompanionGit @('commit', '-q', '-m', 'base')
+    # A fork point for branch-base: the companion has no remote, so pin origin/main at the base.
+    Invoke-CompanionGit @('update-ref', 'refs/remotes/origin/main', 'HEAD')
+    # The change: one untracked file whose only copy of the marker is in the companion.
+    Set-Content -LiteralPath (Join-Path $companionDir 'generated.txt') -Value $companionMarker -Encoding ASCII
+    $serverArgs += @('--companion', "smokeasset=$companionDir")
 }
 
 Write-Host "==> launching: $Exe $($serverArgs -join ' ')" -ForegroundColor Cyan
@@ -533,6 +569,68 @@ INCLUDE-CHANGE-OK
     # refused. This is what the capture-contract binding exists to protect (issue #105).
     Write-Host $icResult
 
+    if ($Companion) {
+        Write-Host "`n=== 5d. a review declaring a companion repository ===" -ForegroundColor Cyan
+        $reviewTool = @($list.result.tools | Where-Object { $_.name -eq 'cross_model_review' })[0]
+        Assert-That 'tools/list advertises the configured companion' `
+            (@($reviewTool.inputSchema.properties.companions.items.enum) -contains 'smokeasset') `
+            ($reviewTool.inputSchema.properties | ConvertTo-Json -Depth 6)
+
+        # An unconfigured name is refused before anything runs, naming the configured ones.
+        $badCompanion = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{ instructions = 'x'; session = 'smoke-companion-bad'; companions = @('nope') }
+        } -TimeoutSeconds 30
+        $badCompanionText = Get-ToolText $badCompanion
+        Assert-That 'an unconfigured companion is refused, naming the configured ones' `
+            (($badCompanion.result.isError -eq $true) -and ($badCompanionText -match 'smokeasset')) `
+            $badCompanionText
+
+        $companionInstructions = @'
+This is an automated smoke test of companion repositories. Do not review any code. Do not use the
+shell. This change also spans a companion repository, read through its own evidence server (see the
+"Companion repositories" section). Call repository_diff with base "branch-base" and head "worktree"
+on the primary evidence server AND on the companion's evidence server, paging each to the end. The
+companion's change adds one file whose content is a marker beginning COMPANION-MARKER-. Reply with
+exactly two lines and nothing else:
+SMOKE-COMPANION-OK
+MARKER=<the complete marker you read in the companion's diff>
+'@
+        $compStart = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{
+                instructions = $companionInstructions
+                session      = 'smoke-companion'
+                companions   = @('smokeasset')
+            }
+        } -TimeoutSeconds 60
+        $compStartText = Get-ToolText $compStart
+        Assert-That 'companion review start is not an error' ($compStart.result.isError -eq $false) $compStartText
+        $compId = ([regex]::Match($compStartText, 'review_id:\s*(\S+)')).Groups[1].Value
+        Assert-That 'a companion review_id was returned' (-not [string]::IsNullOrWhiteSpace($compId)) $compStartText
+
+        $compCollected = $null
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            $compCollected = Send-Rpc -Method 'tools/call' -Params @{
+                name      = 'cross_model_review_result'
+                arguments = @{ review_id = $compId; wait_seconds = 120 }
+            } -TimeoutSeconds 300
+            $text = Get-ToolText $compCollected
+            if ($text -notmatch 'status:\s+running') { break }
+            Write-Host "  still running (poll $attempt)" -ForegroundColor DarkGray
+        }
+        $compResult = Get-ToolText $compCollected
+        Assert-That 'companion review completed' ($compResult -match 'status:\s+completed') $compResult
+        Assert-That 'the reviewer answered the companion smoke' ($compResult -match 'SMOKE-COMPANION-OK') $compResult
+        Assert-That 'the reviewer read the marker only the companion server serves' `
+            ($compResult -match [regex]::Escape($companionMarker)) $compResult
+        if ($Reviewer -eq 'codex') {
+            Assert-That 'the companion turn used the evidence service' `
+                ($compResult -match 'evidence service completed (?:[2-9]|[1-9][0-9]+) tool call') $compResult
+        }
+        Write-Host $compResult
+    }
+
     Write-Host "`n=== 6. error handling ===" -ForegroundColor Cyan
     $bad = Send-Rpc -Method 'tools/call' -Params @{
         name = 'cross_model_review'; arguments = @{ session = 'nope' }
@@ -685,6 +783,12 @@ INCLUDE-CHANGE-OK
         Assert-That 'the include_change consult recorded its capture contract' `
             ($null -ne $icSession -and $icSession.kind -eq 'consult' -and $icSession.include_change -eq $true) `
             (Get-Content $sessionsFile -Raw)
+        if ($Companion) {
+            $compSession = $saved.sessions.'smoke-companion'
+            Assert-That 'the companion session recorded its companion binding' `
+                ($null -ne $compSession -and @($compSession.companions).Count -eq 1 -and
+                 $compSession.companions[0].name -eq 'smokeasset') (Get-Content $sessionsFile -Raw)
+        }
     }
 }
 finally {
@@ -741,6 +845,7 @@ finally {
             ($stderrText -notmatch 'rejected: blocked by policy') $stderrText
     }
     Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($companionDir) { Remove-Item $companionDir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''

@@ -154,8 +154,12 @@ impl Reviewer for ClaudeReviewer {
         // In scope, allow-list the evidence server in the SAME --allowed-tools list. Under
         // --permission-mode dontAsk the MCP tools are otherwise denied even though they connect
         // (verified in Phase 0); a server-level entry allows all seven repository_* tools.
-        if evidence.is_some() {
-            cmd.arg(format!("mcp__{}", crate::evidence::SERVER_NAME));
+        // One entry per evidence server, so a declared companion repository's server (issue #167)
+        // is allowed exactly as the working root's is, and an undeclared one is never listed.
+        if let Some(ev) = evidence {
+            for (server, _, _) in ev.servers() {
+                cmd.arg(format!("mcp__{server}"));
+            }
         }
         cmd.args(["--disallowed-tools", DENIED_TOOLS]);
         // Isolation posture. The whole thing keys on `evidence` (the plan's `evidence_enabled`
@@ -682,9 +686,12 @@ fn evidence_application_error_code(item: &Value) -> Option<String> {
 /// carries that `id` as `tool_use_id` and `is_error` (absent on success).
 pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
     use std::collections::HashSet;
-    let server_prefix = format!("mcp__{}__", crate::evidence::SERVER_NAME);
-    let content_prefix = format!("mcp__{}__repository_", crate::evidence::SERVER_NAME);
-    let scope_tool = format!("mcp__{}__repository_scope", crate::evidence::SERVER_NAME);
+    // `mcp__<server>__<tool>`, where `<server>` is any of this turn's evidence servers: the
+    // working root's or a companion repository's (issue #167).
+    let evidence_tool = |name: &str| -> Option<String> {
+        let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+        crate::evidence::is_evidence_server(server).then(|| tool.to_string())
+    };
     // tool_use ids: all evidence calls, and the content (non-scope) subset.
     let mut evidence_ids: HashSet<String> = HashSet::new();
     let mut content_ids: HashSet<String> = HashSet::new();
@@ -709,12 +716,12 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
                         continue;
                     }
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-                    if !name.starts_with(&server_prefix) {
+                    let Some(tool) = evidence_tool(name) else {
                         continue;
-                    }
+                    };
                     if let Some(id) = item.get("id").and_then(Value::as_str) {
                         evidence_ids.insert(id.to_string());
-                        if name.starts_with(&content_prefix) && name != scope_tool {
+                        if tool.starts_with("repository_") && tool != "repository_scope" {
                             content_ids.insert(id.to_string());
                         }
                     }
@@ -1521,6 +1528,26 @@ mod tests {
         let h = claude_evidence_health(&ok);
         assert!(h.content_call_succeeded && !h.transport_error && h.is_ok());
         assert!(h.warnings().is_empty());
+
+        // A companion repository's server (issue #167) is an evidence server too: its content
+        // call counts, its scope call does not, and an unrelated server is ignored.
+        let companion = |tool: &str, id: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"mcp__cross_review_evidence_assets__{tool}"}}]}}}}"#
+            )
+        };
+        let h =
+            claude_evidence_health(&[companion("repository_diff", "c1"), result("c1")].join("\n"));
+        assert!(h.content_call_succeeded, "a companion diff is content");
+        let h =
+            claude_evidence_health(&[companion("repository_scope", "c2"), result("c2")].join("\n"));
+        assert!(
+            !h.content_call_succeeded,
+            "a companion scope call is not content"
+        );
+        let other = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"o1","name":"mcp__cross_review_evidence_Bad__repository_diff"}]}}"#;
+        let h = claude_evidence_health(&[other.to_string(), result("o1")].join("\n"));
+        assert!(!h.content_call_succeeded, "not one of our server names");
 
         // The exact regression from the live Claude turns: successful content plus ordinary in-band
         // tool errors remains healthy. The caller gets a compact warning instead of losing the

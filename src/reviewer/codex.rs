@@ -148,57 +148,39 @@ impl Reviewer for CodexReviewer {
             cmd.arg("--ignore-rules");
         }
         let command = toml_path(evidence.executable)?;
-        let bundle = toml_path(evidence.bundle_file)?;
-        let nonce = toml_string(evidence.nonce);
         let evidence_cwd = toml_path(evidence.sterile_dir.unwrap_or(&cfg.cwd))?;
         let enabled_tools =
             serde_json::to_string(&crate::evidence::TOOLS).map_err(std::io::Error::other)?;
-        cmd.args([
-            "-c",
-            &format!(
-                "mcp_servers.{}.command={command}",
-                crate::evidence::SERVER_NAME
-            ),
-        ]);
-        cmd.args([
-            "-c",
-            &format!(
-                "mcp_servers.{}.args=[{}, {bundle}, {nonce}]",
-                crate::evidence::SERVER_NAME,
-                toml_string(crate::evidence::SERVER_FLAG)
-            ),
-        ]);
-        for value in [
-            format!("mcp_servers.{}.required=true", crate::evidence::SERVER_NAME),
-            format!("mcp_servers.{}.enabled=true", crate::evidence::SERVER_NAME),
-            format!(
-                "mcp_servers.{}.enabled_tools={enabled_tools}",
-                crate::evidence::SERVER_NAME
-            ),
-            format!(
-                "mcp_servers.{}.disabled_tools=[]",
-                crate::evidence::SERVER_NAME
-            ),
-            format!("mcp_servers.{}.env={{}}", crate::evidence::SERVER_NAME),
-            format!(
-                "mcp_servers.{}.cwd={evidence_cwd}",
-                crate::evidence::SERVER_NAME
-            ),
-            format!(
-                "mcp_servers.{}.startup_timeout_sec=15",
-                crate::evidence::SERVER_NAME
-            ),
-            format!(
-                "mcp_servers.{}.tool_timeout_sec={}",
-                crate::evidence::SERVER_NAME,
-                crate::evidence::CODEX_TOOL_TIMEOUT_SECS
-            ),
-            format!(
-                "mcp_servers.{}.default_tools_approval_mode=\"approve\"",
-                crate::evidence::SERVER_NAME
-            ),
-        ] {
-            cmd.args(["-c", &value]);
+        // One identical block per evidence server: the working root's, then one per declared
+        // companion repository (issue #167). `required=true` on each means a companion server that
+        // fails to start fails the run rather than letting the review go ahead without it.
+        for (server, bundle_file, nonce) in evidence.servers() {
+            let bundle = toml_path(bundle_file)?;
+            let nonce = toml_string(nonce);
+            cmd.args(["-c", &format!("mcp_servers.{server}.command={command}")]);
+            cmd.args([
+                "-c",
+                &format!(
+                    "mcp_servers.{server}.args=[{}, {bundle}, {nonce}]",
+                    toml_string(crate::evidence::SERVER_FLAG)
+                ),
+            ]);
+            for value in [
+                format!("mcp_servers.{server}.required=true"),
+                format!("mcp_servers.{server}.enabled=true"),
+                format!("mcp_servers.{server}.enabled_tools={enabled_tools}"),
+                format!("mcp_servers.{server}.disabled_tools=[]"),
+                format!("mcp_servers.{server}.env={{}}"),
+                format!("mcp_servers.{server}.cwd={evidence_cwd}"),
+                format!("mcp_servers.{server}.startup_timeout_sec=15"),
+                format!(
+                    "mcp_servers.{server}.tool_timeout_sec={}",
+                    crate::evidence::CODEX_TOOL_TIMEOUT_SECS
+                ),
+                format!("mcp_servers.{server}.default_tools_approval_mode=\"approve\""),
+            ] {
+                cmd.args(["-c", &value]);
+            }
         }
         cmd.arg("-o").arg(&last_message_file);
 
@@ -841,8 +823,10 @@ fn parse_events(stdout: &str) -> Events {
                 }
                 let is_evidence = item.and_then(|i| i.get("type")).and_then(Value::as_str)
                     == Some("mcp_tool_call")
-                    && item.and_then(|i| i.get("server")).and_then(Value::as_str)
-                        == Some(crate::evidence::SERVER_NAME);
+                    && item
+                        .and_then(|i| i.get("server"))
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::evidence::is_evidence_server);
                 if is_evidence {
                     events.evidence_calls = events.evidence_calls.saturating_add(1);
                     if let Some(error) = item.and_then(|i| i.get("error")).filter(|e| !e.is_null())

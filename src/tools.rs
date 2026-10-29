@@ -965,6 +965,19 @@ impl App {
             }
         };
 
+        // Companion repositories (issue #167): a set of configured names, resolved here -- before the
+        // lease, like `root` -- onto the per-call config. Roots always come from the server's startup
+        // configuration, never from anything relative to a per-call `root`. Parsed strictly: the
+        // server does not enforce the schema, so a stray or malformed value is refused, not ignored.
+        let cfg: Arc<Config> = match parse_companions_arg(args, &self.cfg.companions)? {
+            declared if declared.is_empty() => cfg,
+            declared => {
+                let mut scoped = (*cfg).clone();
+                scoped.declared_companions = declared;
+                Arc::new(scoped)
+            }
+        };
+
         let changes = parse_change_arg(args)?;
         // Parsed strictly rather than coerced: a non-boolean silently becoming `false` would
         // drop a caller's intent to review a shelf without any error.
@@ -2314,6 +2327,20 @@ impl App {
         }
 
         out.push_str(&format!("working root:  {}\n", self.cfg.cwd.display()));
+        // Companion repositories (issue #167): what a review may declare, and whether each still
+        // passes the checks a turn will re-run. A failing one does not block reviews that omit it.
+        for c in &self.cfg.companions {
+            let state =
+                match crate::companion::recheck(c, &self.cfg.state_dir, &std::env::temp_dir()) {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("NO - {e}"),
+                };
+            out.push_str(&format!(
+                "companion:     {} = {} ({state})\n",
+                c.name,
+                c.root.display()
+            ));
+        }
         out.push_str(&format!("turn timeout:  {}s\n", self.cfg.timeout.as_secs()));
         out.push_str(&format!(
             "resume limits: {}, {} (a session past either is refused, not silently restarted)\n",
@@ -2502,6 +2529,22 @@ impl App {
                 "{}: {why}",
                 reason::BINDING_CHECK_FAILED
             ))));
+        }
+        // Each companion repository (issue #167) must still be the repository the review read, and
+        // still pass every startup check, before its binding is trusted.
+        for c in &att.companions {
+            let companion = crate::companion::Companion {
+                name: c.name.clone(),
+                root: c.root.clone(),
+            };
+            if let Err(why) =
+                crate::companion::recheck(&companion, &self.cfg.state_dir, &std::env::temp_dir())
+            {
+                return Ok(render(HookReport::skipped(format!(
+                    "{}: {why}",
+                    reason::BINDING_CHECK_FAILED
+                ))));
+            }
         }
         Ok(render(crate::hook::fire(
             runner,
@@ -3469,6 +3512,7 @@ impl Job {
             effort: self.spec.effort.clone(),
             chain_index: ran_index.unwrap_or(self.start_index),
             root: self.cfg.cwd.clone(),
+            companions: outcome.served_companions.clone(),
         })
     }
 
@@ -3621,6 +3665,13 @@ impl Job {
             attempts,
             captured,
         });
+    }
+
+    /// The declared companion repositories (issue #167) whose complete canonical diff was **not**
+    /// served this turn, read from each companion server's own serve record (named from its own
+    /// nonce). A missing or unreadable record aggregates to "not served", which fails closed.
+    fn companions_not_served(&self) -> Vec<crate::companion::Companion> {
+        unserved_companions(&self.cfg, &self.id)
     }
 
     /// Clear this turn's findings write-ahead marker after a failure that provably started no child
@@ -4067,96 +4118,131 @@ impl Job {
         // The `core.autocrlf` this turn's evidence bundle fixes, kept for the converged-hook binding
         // check so it composes with exactly the setting the served diff was composed with (plan f2).
         let mut turn_autocrlf: Option<crate::evidence::AutoCrlf> = None;
-        let evidence_setup =
-            if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
-                let executable = std::env::current_exe().map_err(|e| {
-                    errors::evidence_unavailable(format!(
-                        "cannot resolve the running cross-review executable: {e}"
-                    ))
-                })?;
-                let sterile = if self.cfg.isolate_reviewer {
-                    Some(
-                        crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
-                            .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                let change_label = summary
-                    .map(crate::vcs::CaptureSummary::summary)
-                    .unwrap_or_else(|| "no selected change was captured".to_string());
-                let status_summary = if capture_warnings.is_empty() {
-                    change_label.clone()
-                } else {
-                    format!("{}\n{}", change_label, capture_warnings.join("\n"))
-                };
-                if let Some(server_root) = &self.server_root {
-                    crate::worktree::recheck(server_root, &self.cfg.cwd)
-                        .map_err(errors::evidence_unavailable)?;
-                }
-                let bundle = crate::evidence::Bundle::create(
-                    &self.cfg.cwd,
-                    self.cfg.vcs,
-                    &self.id,
-                    change_label,
-                    status_summary,
-                    change.map(str::to_string),
-                    // An in-scope Claude reviewer reads evidence through Claude Code's MCP client,
-                    // which truncates or diverts a tool result past its output cap; page text tools
-                    // in Claude-safe slices so a large repository_diff still reaches the model
-                    // (issue #114). Codex has no such cap and is served at the full limit.
-                    claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
-                )
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-                turn_autocrlf = bundle.worktree_autocrlf;
-                let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
-                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-                crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
-                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-                // An in-scope Claude reaches the server through a generated --mcp-config file; Codex
-                // injects it through its own -c overrides and needs none.
-                let mcp_config_file = if claude_in_scope {
-                    Some(
-                        crate::evidence::write_claude_mcp_config(
-                            &self.cfg,
-                            &executable,
-                            &bundle_file.path,
-                            &self.id,
-                        )
-                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
-                // appends to it, the parent reads it after the run, and dropping this handle at turn
-                // end removes it. It is created **fresh** (truncating), so a stale file left by a
-                // crashed earlier run that happened to reuse this process-local id cannot be read as
-                // this review's records (f4). `None` if the path cannot be resolved or created — a
-                // missing sink fails the gate closed at read time rather than here.
-                let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
-                    .ok()
-                    .and_then(|path| {
-                        std::fs::File::create(&path)
-                            .ok()
-                            .map(|_| crate::evidence::BundleFile { path })
-                    });
-                Some((
-                    executable,
-                    sterile,
-                    bundle_file,
-                    mcp_config_file,
-                    serverecord_file,
+        let evidence_setup = if self.spec.reviewer == crate::config::ReviewerKind::Codex
+            || claude_in_scope
+        {
+            let executable = std::env::current_exe().map_err(|e| {
+                errors::evidence_unavailable(format!(
+                    "cannot resolve the running cross-review executable: {e}"
                 ))
+            })?;
+            let sterile = if self.cfg.isolate_reviewer {
+                Some(
+                    crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
+                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                )
             } else {
                 None
             };
+            let change_label = summary
+                .map(crate::vcs::CaptureSummary::summary)
+                .unwrap_or_else(|| "no selected change was captured".to_string());
+            let status_summary = if capture_warnings.is_empty() {
+                change_label.clone()
+            } else {
+                format!("{}\n{}", change_label, capture_warnings.join("\n"))
+            };
+            if let Some(server_root) = &self.server_root {
+                crate::worktree::recheck(server_root, &self.cfg.cwd)
+                    .map_err(errors::evidence_unavailable)?;
+            }
+            let bundle = crate::evidence::Bundle::create(
+                &self.cfg.cwd,
+                self.cfg.vcs,
+                &self.id,
+                change_label,
+                status_summary,
+                change.map(str::to_string),
+                // An in-scope Claude reviewer reads evidence through Claude Code's MCP client,
+                // which truncates or diverts a tool result past its output cap; page text tools
+                // in Claude-safe slices so a large repository_diff still reaches the model
+                // (issue #114). Codex has no such cap and is served at the full limit.
+                claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
+            )
+            .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            turn_autocrlf = bundle.worktree_autocrlf;
+            let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+            // One more unchanged single-root evidence server per declared companion repository
+            // (issue #167), each with its own nonce, so the cursors, diff op ids and files each
+            // server mints never collide with another's.
+            let mut companions = Vec::new();
+            for c in &self.cfg.declared_companions {
+                companions.push(
+                    CompanionEvidence::build(c, &self.cfg, &self.id, &executable, claude_in_scope)
+                        .map_err(errors::evidence_unavailable)?,
+                );
+            }
+            // An in-scope Claude reaches the servers through one generated --mcp-config file;
+            // Codex injects them through its own -c overrides and needs none.
+            let mcp_config_file = if claude_in_scope {
+                let names: Vec<String> = companions
+                    .iter()
+                    .map(|e| e.companion.server_name())
+                    .collect();
+                let mut servers: Vec<(&str, &std::path::Path, &str)> = vec![(
+                    crate::evidence::SERVER_NAME,
+                    bundle_file.path.as_path(),
+                    self.id.as_str(),
+                )];
+                for (e, name) in companions.iter().zip(&names) {
+                    servers.push((name.as_str(), e.bundle_file.path.as_path(), &e.nonce));
+                }
+                Some(
+                    crate::evidence::write_claude_mcp_config(
+                        &self.cfg,
+                        &executable,
+                        &servers,
+                        &self.id,
+                    )
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
+            // appends to it, the parent reads it after the run, and dropping this handle at turn
+            // end removes it. It is created **fresh** (truncating), so a stale file left by a
+            // crashed earlier run that happened to reuse this process-local id cannot be read as
+            // this review's records (f4). `None` if the path cannot be resolved or created — a
+            // missing sink fails the gate closed at read time rather than here.
+            let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
+                .ok()
+                .and_then(|path| {
+                    std::fs::File::create(&path)
+                        .ok()
+                        .map(|_| crate::evidence::BundleFile { path })
+                });
+            Some((
+                executable,
+                sterile,
+                bundle_file,
+                mcp_config_file,
+                serverecord_file,
+                companions,
+            ))
+        } else {
+            None
+        };
 
         // A git review requires the evidence path to deliver the change live and to arm the
         // fail-closed gate (mechanism 4 / f7). Codex always has it; an ambient (unprofiled, or
         // shell-enabled) Claude does not, and since git no longer pre-captures, such a review would
         // be handed no change AND skip the gate — free to approve blind. Refuse it before spawning,
         // as the plan requires (resolved decision 1). Consults are informal and exempt.
+        // A declared companion repository (issue #167) is readable only through its own evidence
+        // server, so a reviewer without the evidence path could never be served it. Refused for a
+        // consult too: the consult would otherwise be told about servers it does not have.
+        if !self.cfg.declared_companions.is_empty() && evidence_setup.is_none() {
+            return Err(errors::evidence_unavailable(format!(
+                "companion repositories are read only through the read-only evidence service, but \
+                 reviewer {} cannot provide it: {}. {EVIDENCE_CAPABLE_REVIEWER_HINT}",
+                self.spec.describe(),
+                evidence_ineligibility(&self.cfg, &self.spec).unwrap_or("unknown reason"),
+            )));
+        }
         if !is_consult && self.cfg.vcs == crate::config::Vcs::Git && evidence_setup.is_none() {
             return Err(errors::evidence_unavailable(format!(
                 "a git review needs the read-only evidence service to deliver the change live, but \
@@ -4245,6 +4331,7 @@ impl Job {
                 change: prompt_change,
                 resumed_capture_note,
                 neutral_root,
+                companions: &self.cfg.declared_companions,
             })
         } else {
             prompt::build(&PromptParts {
@@ -4267,6 +4354,7 @@ impl Job {
                 nonce: Some(&self.id),
                 prior_findings_digest: prior_findings_digest.as_deref(),
                 neutral_root,
+                companions: &self.cfg.declared_companions,
             })
         };
         // Reported back through the out-parameter so it survives the error paths below:
@@ -4274,13 +4362,21 @@ impl Job {
         *prompt_bytes = text.len();
 
         let evidence_invocation = evidence_setup.as_ref().map(
-            |(executable, sterile, bundle, mcp_config, _serverecord)| {
+            |(executable, sterile, bundle, mcp_config, _serverecord, companions)| {
                 crate::reviewer::EvidenceInvocation {
                     executable,
                     bundle_file: &bundle.path,
                     nonce: &self.id,
                     sterile_dir: sterile.as_ref().map(crate::reviewer::SterileDir::path),
                     mcp_config_file: mcp_config.as_ref().map(|f| f.path.as_path()),
+                    companions: companions
+                        .iter()
+                        .map(|e| crate::reviewer::CompanionServer {
+                            server_name: e.companion.server_name(),
+                            bundle_file: &e.bundle_file.path,
+                            nonce: e.nonce.clone(),
+                        })
+                        .collect(),
                 }
             },
         );
@@ -4559,12 +4655,14 @@ impl Job {
                 && !repair_refused_on_account
             {
                 let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+                let unmet_companions = self.companions_not_served();
                 let looked_at_something = agg.any_diff
                     || evidence_health
                         .as_ref()
                         .is_some_and(|h| h.content_call_succeeded);
                 let floor_unmet = !looked_at_something
-                    || (assessment.provisional_approve() && !agg.complete_canonical_terminal);
+                    || (assessment.provisional_approve()
+                        && (!agg.complete_canonical_terminal || !unmet_companions.is_empty()));
                 if floor_unmet {
                     if let Some(target) = repair_target.as_deref() {
                         // Attempted-but-unconfirmed until a structured re-review clears it.
@@ -4572,6 +4670,10 @@ impl Job {
                         let evidence_prompt = crate::prompt::evidence_repair(
                             &self.id,
                             assessment.prior_digest().as_deref(),
+                            &unmet_companions
+                                .iter()
+                                .map(crate::companion::Companion::server_name)
+                                .collect::<Vec<_>>(),
                         );
                         *prompt_bytes = prompt_bytes.saturating_add(evidence_prompt.len());
                         match self.run_block_repair(
@@ -4673,20 +4775,41 @@ impl Job {
             // excluded (no `repository_diff`); its evidence is gated by the health early-return above.
             let turn_eval = if evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
                 let agg = read_serve_record_aggregate(&self.cfg, &self.id);
+                // Every declared companion repository (issue #167) must clear the same floor as the
+                // working root: its complete canonical diff, served this turn by its own server.
+                let unmet_companions = self.companions_not_served();
                 let looked_at_something = agg.any_diff
                     || evidence_health
                         .as_ref()
                         .is_some_and(|h| h.content_call_succeeded);
-                crate::findings::apply_evidence_floor(
+                let complete_canonical = agg.complete_canonical_terminal
+                    && unmet_companions.is_empty()
+                    // An unconfirmed repair (attempted, no usable re-review) cannot re-affirm an
+                    // approval even if it pulled the diff, so the whole-change proof is withheld.
+                    && !evidence_repair_unconfirmed;
+                let floored = crate::findings::apply_evidence_floor(
                     turn_eval,
                     crate::findings::EvidenceCoverage {
                         looked_at_something,
-                        // An unconfirmed repair (attempted, no usable re-review) cannot re-affirm an
-                        // approval even if it pulled the diff, so the whole-change proof is withheld.
-                        complete_canonical: agg.complete_canonical_terminal
-                            && !evidence_repair_unconfirmed,
+                        complete_canonical,
                     },
-                )
+                );
+                if !unmet_companions.is_empty()
+                    && floored.envelope.non_convergence_reason
+                        == Some(crate::findings::NonConvergenceReason::EvidenceIncomplete)
+                {
+                    warnings_from_repair.push(format!(
+                        "the complete change of companion repositor{} {} was not served this turn, so \
+                         an approval could not stand; re-review this session.",
+                        if unmet_companions.len() == 1 { "y" } else { "ies" },
+                        unmet_companions
+                            .iter()
+                            .map(|c| format!("'{}'", c.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                floored
             } else {
                 turn_eval
             };
@@ -4911,6 +5034,9 @@ impl Job {
                                 &self.spec,
                                 authorized_start.as_ref(),
                             )),
+                            companions: crate::session::CompanionBinding::from_declared(
+                                &self.cfg.declared_companions,
+                            ),
                         },
                     ) {
                         Ok(_) => {
@@ -5079,6 +5205,30 @@ impl Job {
                 .as_ref()
                 .and_then(|agg| served_change(agg, turn_autocrlf))
         };
+        // Each declared companion repository's served change (issue #167), read from its own serve
+        // record while it still exists. A companion with none leaves the whole turn unattestable:
+        // the hook must never fire on a review that bound only some of its repositories.
+        let served_companions: Option<Vec<crate::hook::ServedCompanion>> = match &evidence_setup {
+            Some((.., companions)) if served.is_some() => companions
+                .iter()
+                .map(|e| {
+                    served_change(
+                        &read_serve_record_aggregate(&self.cfg, &e.nonce),
+                        e.autocrlf,
+                    )
+                    .map(|served| crate::hook::ServedCompanion {
+                        name: e.companion.name.clone(),
+                        root: e.companion.root.clone(),
+                        served,
+                    })
+                })
+                .collect(),
+            _ => Some(Vec::new()),
+        };
+        let (served, served_companions) = match served_companions {
+            Some(list) => (served, list),
+            None => (None, Vec::new()),
+        };
 
         Ok(Outcome {
             review: Some(parsed.text),
@@ -5101,6 +5251,7 @@ impl Job {
             // `None` for a consult (no findings envelope); `Some` for a review.
             envelope,
             served,
+            served_companions,
             // Both decided by `run`, which knows the chain entry and holds the session lease.
             hook: None,
             attestable: None,
@@ -5332,6 +5483,37 @@ fn resume_block(
         ));
     }
 
+    // A session follows one set of companion repositories (issue #167), name and root alike: the
+    // reviewer's conversation holds what it was served from exactly those, and a different set is
+    // different work. `None` on either side is the empty set, so a record from before companions
+    // existed resumes unchanged under a call that declares none.
+    let requested = session::CompanionBinding::from_declared(&cfg.declared_companions);
+    let bound = record.companions.as_deref().unwrap_or(&[]);
+    let wanted = requested.as_deref().unwrap_or(&[]);
+    let same_set = bound.len() == wanted.len()
+        && bound
+            .iter()
+            .zip(wanted)
+            .all(|(b, w)| b.name == w.name && crate::pathcmp::identity_eq_str(&b.root, &w.root));
+    if !same_set {
+        let show = |set: &[session::CompanionBinding]| {
+            if set.is_empty() {
+                "no companions".to_string()
+            } else {
+                set.iter()
+                    .map(|c| format!("{} ({})", c.name, c.root))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        return Some(format!(
+            "it is bound to {}, but this call declares {}. A session follows one set of companion \
+             repositories; start a fresh review (fresh: true) to change it, or use a new session name.",
+            show(bound),
+            show(wanted)
+        ));
+    }
+
     // A session belongs to the capture backend that created it. A git record must never satisfy
     // the Perforce binding logic (a git record carries no `changes`, which would otherwise read
     // as "unbound"), nor a Perforce record be resumed under git. `None` is a record written
@@ -5504,6 +5686,80 @@ fn resume_block(
 /// `turn_not_durable` are recorded as ledger coverage, and promoting either here would turn one
 /// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
 /// because an over-budget turn always reports it at rank 0.
+/// The companions `cfg` declares whose own serve record (named from the companion's nonce for
+/// `review_id`) does not show a complete, terminal, agreeing canonical diff. See
+/// [`Job::companions_not_served`].
+fn unserved_companions(cfg: &Config, review_id: &str) -> Vec<crate::companion::Companion> {
+    cfg.declared_companions
+        .iter()
+        .filter(|c| {
+            !read_serve_record_aggregate(cfg, &c.nonce(review_id)).complete_canonical_terminal
+        })
+        .cloned()
+        .collect()
+}
+
+/// One declared companion repository's evidence for one turn (issue #167): its own bundle, nonce
+/// and serve-record file, all dropped (and removed) with the turn like the working root's.
+struct CompanionEvidence {
+    companion: crate::companion::Companion,
+    nonce: String,
+    bundle_file: crate::evidence::BundleFile,
+    /// `None` if the file could not be created; a missing sink fails the gate closed at read time,
+    /// exactly as for the working root.
+    _serverecord_file: Option<crate::evidence::BundleFile>,
+    /// The `core.autocrlf` this companion's bundle fixed, for its converged-hook binding check.
+    autocrlf: Option<crate::evidence::AutoCrlf>,
+}
+
+impl CompanionEvidence {
+    /// Re-check the companion against this turn's state and temp directories, then build, write and
+    /// handshake its bundle and create its serve-record file fresh, all keyed on its own nonce.
+    fn build(
+        c: &crate::companion::Companion,
+        cfg: &Config,
+        review_id: &str,
+        executable: &std::path::Path,
+        claude_in_scope: bool,
+    ) -> Result<Self, String> {
+        crate::companion::recheck(c, &cfg.state_dir, &std::env::temp_dir())?;
+        let nonce = c.nonce(review_id);
+        let label = format!(
+            "companion repository '{}': its change is its current branch against its own fork \
+             point, served live by repository_diff (base \"branch-base\", head \"worktree\")",
+            c.name
+        );
+        let bundle = crate::evidence::Bundle::create(
+            &c.root,
+            crate::config::Vcs::Git,
+            &nonce,
+            label.clone(),
+            label,
+            None,
+            claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
+        )
+        .map_err(|e| format!("companion '{}': {e}", c.name))?;
+        let bundle_file = crate::evidence::write_bundle(cfg, &bundle)
+            .map_err(|e| format!("companion '{}': {e}", c.name))?;
+        crate::evidence::handshake(executable, &bundle_file.path, &nonce)
+            .map_err(|e| format!("companion '{}': {e}", c.name))?;
+        let serverecord_file = crate::evidence::serve_record_path(cfg, &nonce)
+            .ok()
+            .and_then(|path| {
+                std::fs::File::create(&path)
+                    .ok()
+                    .map(|_| crate::evidence::BundleFile { path })
+            });
+        Ok(Self {
+            companion: c.clone(),
+            nonce,
+            bundle_file,
+            _serverecord_file: serverecord_file,
+            autocrlf: bundle.worktree_autocrlf,
+        })
+    }
+}
+
 /// What a review's `repository_diff` serve-records add up to (retire-capture-modes mechanisms 3/4).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct DiffServeAggregate {
@@ -5799,6 +6055,63 @@ fn string_arg(args: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Parse the `companions` request argument (issue #167) against the configured companions. Absent,
+/// null or an empty array declares none. Every entry must be a distinct configured name; the result
+/// keeps the caller's order. An unknown name, or any value when none are configured, is refused with
+/// the configured list so the caller can correct it.
+fn parse_companions_arg(
+    args: &Value,
+    configured: &[crate::companion::Companion],
+) -> Result<Vec<crate::companion::Companion>, Failure> {
+    let items = match args.get("companions") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            return Err(errors::bad_request(
+                "'companions' must be an array of configured companion names.",
+            ))
+        }
+    };
+    let available = || {
+        if configured.is_empty() {
+            "this server has no companion repositories configured (--companion); omit \
+             'companions'"
+                .to_string()
+        } else {
+            format!(
+                "configured companions: {}",
+                configured
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    let mut declared: Vec<crate::companion::Companion> = Vec::new();
+    for item in items {
+        let Some(name) = item.as_str() else {
+            return Err(errors::bad_request(format!(
+                "'companions' entries must be names; {}.",
+                available()
+            )));
+        };
+        let Some(c) = configured.iter().find(|c| c.name == name) else {
+            return Err(errors::bad_request(format!(
+                "'companions' names '{name}', which is not configured; {}.",
+                available()
+            )));
+        };
+        if declared.iter().any(|d| d.name == c.name) {
+            return Err(errors::bad_request(format!(
+                "'companions' names '{name}' more than once."
+            )));
+        }
+        declared.push(c.clone());
+    }
+    Ok(declared)
 }
 
 /// Parse the `change` request argument into validated changelist numbers.
@@ -6901,6 +7214,7 @@ mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: None,
+            companions: None,
             profile_identity: None,
         }
     }
@@ -7205,6 +7519,95 @@ mod tests {
         assert!(reason.contains("working root"), "{reason}");
     }
 
+    fn companion(name: &str, root: &str) -> crate::companion::Companion {
+        crate::companion::Companion {
+            name: name.into(),
+            root: std::path::PathBuf::from(root),
+        }
+    }
+
+    #[test]
+    fn a_session_resumes_only_under_the_same_companion_set() {
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
+        let now = 1_000_000;
+        let assets = companion("assets", r"C:\dev\assets");
+        let docs = companion("docs", r"C:\dev\docs");
+        let with = |declared: Vec<crate::companion::Companion>| {
+            let mut c = cfg.clone();
+            c.declared_companions = declared;
+            c
+        };
+
+        // A record from before companions existed resumes under a call that declares none.
+        let legacy = record_matching(&cfg, 1, now);
+        assert!(legacy.companions.is_none());
+        assert!(resume_block(&cfg, &legacy, &[], session::KIND_REVIEW, false, now).is_none());
+        // ...but not under one that adds a companion.
+        let reason = resume_block(
+            &with(vec![assets.clone()]),
+            &legacy,
+            &[],
+            session::KIND_REVIEW,
+            false,
+            now,
+        )
+        .expect("adding a companion is refused");
+        assert!(
+            reason.contains("no companions") && reason.contains("assets"),
+            "{reason}"
+        );
+
+        // The same set resumes regardless of declaration order, and a case-only root difference is
+        // the same root.
+        let mut bound = record_matching(&cfg, 1, now);
+        bound.companions =
+            session::CompanionBinding::from_declared(&[docs.clone(), assets.clone()]);
+        let reordered = with(vec![companion("assets", r"c:/DEV/assets"), docs.clone()]);
+        assert!(resume_block(&reordered, &bound, &[], session::KIND_REVIEW, false, now).is_none());
+
+        // Dropping one, or the same name at a different root, is refused.
+        for call in [
+            with(vec![assets.clone()]),
+            with(vec![
+                companion("assets", r"C:\elsewhere\assets"),
+                docs.clone(),
+            ]),
+            cfg.clone(),
+        ] {
+            let reason = resume_block(&call, &bound, &[], session::KIND_REVIEW, false, now)
+                .expect("a different companion set is refused");
+            assert!(reason.contains("fresh: true"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn the_companions_argument_is_parsed_strictly() {
+        let configured = vec![companion("assets", r"C:\a"), companion("docs", r"C:\d")];
+        let parse = |v: Value| parse_companions_arg(&v, &configured);
+        assert!(parse(json!({})).unwrap().is_empty());
+        assert!(parse(json!({"companions": null})).unwrap().is_empty());
+        assert!(parse(json!({"companions": []})).unwrap().is_empty());
+        let got = parse(json!({"companions": ["docs", "assets"]})).unwrap();
+        assert_eq!(
+            got.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["docs", "assets"]
+        );
+        let err = parse(json!({"companions": ["art"]})).unwrap_err();
+        assert!(err.summary.contains("assets, docs"), "{}", err.summary);
+        assert!(parse(json!({"companions": ["assets", "assets"]})).is_err());
+        assert!(parse(json!({"companions": "assets"})).is_err());
+        assert!(parse(json!({"companions": [1]})).is_err());
+        // A server with none configured refuses any declaration, saying so.
+        let err = parse_companions_arg(&json!({"companions": ["assets"]}), &[]).unwrap_err();
+        assert!(err.summary.contains("no companion"), "{}", err.summary);
+    }
+
     #[test]
     fn a_terminal_ledger_too_large_session_is_refused_resume() {
         let cfg = Config::from_args(&[
@@ -7316,6 +7719,7 @@ mod tests {
                     ),
                     terminal_reason: terminal.clone(),
                     reviewer_cwd_mode: crate::reviewer::CWD_MODE_PROJECT,
+                    companions: None,
                     profile_identity: None,
                 },
             )
@@ -8147,6 +8551,7 @@ mod tests {
             active: None,
             envelope: None,
             served: None,
+            served_companions: Vec::new(),
             hook: None,
             attestable: None,
         }
@@ -8889,6 +9294,7 @@ mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "repo",
+                    companions: None,
                     profile_identity: None,
                 },
             )
@@ -9530,6 +9936,7 @@ mod converged_hook_tests {
             effort: "max".into(),
             chain_index: 0,
             root: f.app.cfg.cwd.clone(),
+            companions: Vec::new(),
         });
         f.app.registry().finish(
             &id,
@@ -9594,6 +10001,83 @@ mod converged_hook_tests {
         let out = attest(&f, &id).expect("attest");
         assert!(out.contains(reason::HEAD_MISMATCH), "{out}");
         assert!(rec.calls().is_empty());
+    }
+
+    /// A companion repository (issue #167) is bound like the working root: the hook fires with a
+    /// version-2 payload listing it, and a commit that moves it afterwards skips the hook, naming it.
+    #[test]
+    fn a_companion_is_bound_and_a_later_companion_commit_skips_the_hook() {
+        let Some(f) = fixture("companion-bind", None, &[]) else {
+            return;
+        };
+        let assets = crate::testutil::temp_dir("companion-bind-assets");
+        let aroot = assets.as_path();
+        git(aroot, &["init", "-q"]);
+        let abase = commit(aroot, "gen.bin", "v1\n", "base");
+        let ahead = commit(aroot, "gen.bin", "v2\n", "head");
+        let adigest = crate::evidence::committed_change_digest(
+            aroot,
+            &abase,
+            SOURCE,
+            &ahead,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        let att = Attestable {
+            served: f.served.clone(),
+            review_id: "rv-1-1".into(),
+            session: SESSION.into(),
+            turn: 1,
+            cli_session_id: "thread".into(),
+            turns: 1,
+            reviewer: "r".into(),
+            reviewer_kind: "codex".into(),
+            model: "m".into(),
+            effort: "e".into(),
+            chain_index: 0,
+            root: f.repo.as_path().to_path_buf(),
+            companions: vec![crate::hook::ServedCompanion {
+                name: "assets".into(),
+                root: aroot.to_path_buf(),
+                served: ServedChange {
+                    digest: adigest,
+                    base: abase.clone(),
+                    base_source: SOURCE.into(),
+                    autocrlf: None,
+                },
+            }],
+        };
+        let rec = Recording::new();
+        let report = crate::hook::fire(
+            rec.as_ref(),
+            f.repo.as_path(),
+            &att,
+            crate::hook::Trigger::Review,
+        );
+        assert_eq!(report.status, HookStatus::Succeeded, "{report:?}");
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["schema_version"], 2);
+        assert_eq!(calls[0]["captured_head"], f.head);
+        assert_eq!(calls[0]["companions"][0]["name"], "assets");
+        assert_eq!(calls[0]["companions"][0]["captured_head"], ahead);
+        assert_eq!(calls[0]["companions"][0]["base"], abase);
+
+        commit(aroot, "gen.bin", "v3\n", "regenerated");
+        let report = crate::hook::fire(
+            rec.as_ref(),
+            f.repo.as_path(),
+            &att,
+            crate::hook::Trigger::Review,
+        );
+        assert_eq!(report.status, HookStatus::Skipped);
+        let why = report.reason.unwrap_or_default();
+        assert!(
+            why.starts_with(reason::COMPANION_HEAD_MISMATCH) && why.ends_with("assets"),
+            "{why}"
+        );
+        assert_eq!(rec.calls().len(), 1, "the hook did not run again");
     }
 
     /// The same content under a new commit (an amended message) is still exactly the reviewed
@@ -10122,5 +10606,52 @@ mod captured_summary_tests {
         drop(handle);
         let after_drop = capture_summary_from(&read_serve_record_aggregate(&cfg, nonce));
         assert!(after_drop.is_none(), "a read after the drop finds nothing");
+    }
+
+    /// Each companion's floor is read from its own serve record, keyed on its own nonce, and the
+    /// working root's record never satisfies it (issue #167).
+    #[test]
+    fn a_companion_counts_as_served_only_from_its_own_complete_record() {
+        let state = crate::testutil::temp_dir("companion-floor");
+        let mut cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+            "--state-dir".into(),
+            state.as_path().to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let companion = |name: &str| crate::companion::Companion {
+            name: name.into(),
+            root: std::path::PathBuf::from(format!(r"C:\dev\{name}")),
+        };
+        cfg.declared_companions = vec![companion("assets"), companion("docs")];
+        let review_id = "rv-167-1";
+        let write = |nonce: &str, body: String| {
+            let path = crate::evidence::serve_record_path(&cfg, nonce).expect("path");
+            std::fs::write(&path, body).unwrap();
+            crate::evidence::BundleFile { path }
+        };
+        let names =
+            |v: Vec<crate::companion::Companion>| v.into_iter().map(|c| c.name).collect::<Vec<_>>();
+
+        // Only the working root served a complete diff: neither companion is served.
+        let _primary = write(review_id, canonical_op(true));
+        assert_eq!(
+            names(unserved_companions(&cfg, review_id)),
+            ["assets", "docs"]
+        );
+
+        // One companion served an incomplete diff, the other a complete one.
+        let _assets = write(&format!("{review_id}-c-assets"), canonical_op(false));
+        let _docs = write(&format!("{review_id}-c-docs"), canonical_op(true));
+        assert_eq!(names(unserved_companions(&cfg, review_id)), ["assets"]);
+
+        // A different review's companion record is not this review's.
+        assert_eq!(
+            names(unserved_companions(&cfg, "rv-167-2")),
+            ["assets", "docs"]
+        );
     }
 }

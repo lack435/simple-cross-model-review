@@ -202,6 +202,10 @@ pub struct Outcome {
     /// The served canonical change a git review turn approved, taken inside `attempt` while the
     /// serve record still exists; the input to the converged-hook binding check. `None` otherwise.
     pub served: Option<crate::hook::ServedChange>,
+    /// Each declared companion repository's served change (issue #167). Set only beside a `Some`
+    /// `served`: when any declared companion has none, `served` is `None` too, so the turn cannot
+    /// be attested at all. Empty for a single-repository review.
+    pub served_companions: Vec<crate::hook::ServedCompanion>,
     /// See [`Review::hook`].
     pub hook: Option<crate::hook::HookReport>,
     /// See [`Review::attestable`].
@@ -231,6 +235,7 @@ impl Outcome {
             active: None,
             envelope: None,
             served: None,
+            served_companions: Vec::new(),
             hook: None,
             attestable: None,
         }
@@ -251,6 +256,7 @@ impl Outcome {
             active: None,
             envelope: None,
             served: None,
+            served_companions: Vec::new(),
             hook: None,
             attestable: None,
         }
@@ -272,6 +278,7 @@ impl Outcome {
             active: None,
             envelope: None,
             served: None,
+            served_companions: Vec::new(),
             hook: None,
             attestable: None,
         }
