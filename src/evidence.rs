@@ -1287,7 +1287,10 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "repository_read",
-            "Read numbered UTF-8 lines from one repository-relative file.",
+            "Read numbered UTF-8 lines from one repository-relative file. A file over the \
+             per-file read cap is read only as far as the requested lines: its binary and UTF-8 \
+             checks cover only what was read, and 'sha256' and 'total_lines' are null unless the \
+             read reached the end of the file.",
             &[
                 ("path", "string"),
                 ("start_line", "integer"),
@@ -1437,8 +1440,8 @@ fn output_schema(name: &str) -> Value {
         ),
         "repository_read" => json!({
             "type":"object","properties":{
-                "path":{"type":"string"},"bytes":{"type":"integer"},"sha256":{"type":"string"},
-                "total_lines":{"type":"integer"},
+                "path":{"type":"string"},"bytes":{"type":"integer"},"sha256":{"type":["string","null"]},
+                "total_lines":{"type":["integer","null"]},
                 "lines":{"type":"array","items":{"type":"object","properties":{"line":{"type":"integer"},"text":{"type":"string"}},"required":["line","text"],"additionalProperties":false}},
                 "complete":{"type":"boolean"},"truncated":{"type":"boolean"},"cursor":{"type":"null"},
                 "drifted":{"type":["boolean","null"]},"drift_unavailable":{"type":["string","null"]}

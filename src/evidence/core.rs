@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -236,6 +236,17 @@ struct ReadJob {
     root: PathBuf,
     max_path_bytes: usize,
     max_file_bytes: usize,
+    /// `repository_read`'s requested lines. Set, a file over `max_file_bytes` is scanned through
+    /// this window instead of refused (issue #190); unset (search), it is refused as before.
+    window: Option<LineWindow>,
+}
+
+#[derive(Clone, Copy)]
+struct LineWindow {
+    /// 1-based.
+    start_line: usize,
+    line_count: usize,
+    max_line_bytes: usize,
 }
 
 impl ReadJob {
@@ -252,7 +263,26 @@ impl ReadJob {
 #[derive(Debug)]
 struct ReadOutput {
     resolved: PathBuf,
-    bytes: Vec<u8>,
+    content: ReadContent,
+}
+
+#[derive(Debug)]
+enum ReadContent {
+    /// The whole file, within `max_file_bytes`.
+    Whole(Vec<u8>),
+    /// A file over `max_file_bytes`, scanned only as far as the requested window.
+    Window(ScannedWindow),
+}
+
+/// What a windowed scan of an over-cap file established. The binary and UTF-8 checks cover only
+/// the bytes scanned; the digest and line count are known only when the scan reached the end.
+#[derive(Debug)]
+struct ScannedWindow {
+    bytes: u64,
+    lines: Vec<String>,
+    reached_end: bool,
+    total_lines: Option<usize>,
+    sha256: Option<String>,
 }
 
 /// The pure blocking sequence: resolve → `is_file` → open → verify → stat → read. Runs entirely on
@@ -277,8 +307,14 @@ fn read_job(job: ReadJob) -> Result<ReadOutput, ReadFailure> {
             ));
         }
     }
-    let bytes = read_file_bounded(&resolved, job.max_file_bytes, &job.root)?;
-    Ok(ReadOutput { resolved, bytes })
+    let (file, len) = open_verified(&resolved, &job.root)?;
+    let content = match job.window {
+        Some(window) if len > job.max_file_bytes as u64 => {
+            ReadContent::Window(scan_line_window(file, len, window, &job.path_label())?)
+        }
+        _ => ReadContent::Whole(read_open_bounded(file, len, job.max_file_bytes)?),
+    };
+    Ok(ReadOutput { resolved, content })
 }
 
 /// Run a read job under the production watchdog: a detached worker bounded by the receipt-anchored
@@ -861,11 +897,15 @@ impl Core {
                     root: self.root.clone(),
                     max_path_bytes: self.bundle.limits.max_path_bytes as usize,
                     max_file_bytes: self.bundle.limits.max_file_bytes as usize,
+                    window: None,
                 },
                 read_receipt,
             ) {
-                Ok(output) => output.bytes,
-                Err(_) => {
+                Ok(ReadOutput {
+                    content: ReadContent::Whole(bytes),
+                    ..
+                }) => bytes,
+                Ok(_) | Err(_) => {
                     source_complete = false;
                     // A read cut off by the slice is the slice ending, whichever file it was on.
                     time_limited |= Instant::now() >= stop_at;
@@ -937,27 +977,58 @@ impl Core {
                 root: self.root.clone(),
                 max_path_bytes: self.bundle.limits.max_path_bytes as usize,
                 max_file_bytes: self.bundle.limits.max_file_bytes as usize,
+                window: Some(LineWindow {
+                    start_line,
+                    line_count,
+                    max_line_bytes: self.bundle.limits.max_line_bytes as usize,
+                }),
             },
             received_at,
         )?;
-        let bytes = output.bytes;
-        if bytes.contains(&0) {
-            return Err(EvidenceError::new("binary", format!("'{path}' is binary")));
-        }
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| EvidenceError::new("non_utf8", format!("'{path}' is not UTF-8")))?;
-        let all: Vec<&str> = text.lines().collect();
-        let begin = start_line.saturating_sub(1).min(all.len());
-        let end = begin.saturating_add(line_count).min(all.len());
+        // A file within the per-file cap is read and judged whole. One over it was scanned only
+        // through the requested window (issue #190), so its digest and line count are null unless
+        // that scan reached the end of the file.
+        let (bytes, sha256, total_lines, window, begin, reached_end) = match &output.content {
+            ReadContent::Whole(bytes) => {
+                if bytes.contains(&0) {
+                    return Err(EvidenceError::new("binary", format!("'{path}' is binary")));
+                }
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    EvidenceError::new("non_utf8", format!("'{path}' is not UTF-8"))
+                })?;
+                let all: Vec<&str> = text.lines().collect();
+                let begin = start_line.saturating_sub(1).min(all.len());
+                let end = begin.saturating_add(line_count).min(all.len());
+                let fingerprint = crate::digest::Fingerprint::of(bytes).ok_or_else(|| {
+                    EvidenceError::new("digest_unavailable", "SHA-256 is unavailable")
+                })?;
+                (
+                    bytes.len() as u64,
+                    Some(fingerprint.sha256),
+                    Some(all.len()),
+                    all[begin..end].to_vec(),
+                    begin,
+                    end == all.len(),
+                )
+            }
+            ReadContent::Window(scanned) => (
+                scanned.bytes,
+                scanned.sha256.clone(),
+                scanned.total_lines,
+                scanned.lines.iter().map(String::as_str).collect(),
+                start_line - 1,
+                scanned.reached_end,
+            ),
+        };
         // Cap the returned window by the served-page ceiling's encoded size when one is set, so a
         // large file read is not truncated/diverted by a capped MCP client (issue #114, f2). The
         // `complete`/`truncated` fields below already report a short window, which the reviewer
         // continues from with `start_line`; no cursor is added (repository_read has none).
-        let end = match self.bundle.page_bytes_ceiling {
-            Some(ceiling) => encoded_line_window_end(&all, begin, end, ceiling as usize),
-            None => end,
+        let shown = match self.bundle.page_bytes_ceiling {
+            Some(ceiling) => encoded_line_window_end(&window, 0, window.len(), ceiling as usize),
+            None => window.len(),
         };
-        let mut lines = Vec::with_capacity(end.saturating_sub(begin));
+        let mut lines = Vec::with_capacity(shown);
         // Set when a single line's own encoded size exceeds the ceiling. `encoded_line_window_end`
         // always yields at least one line to guarantee progress, so a lone quote-heavy line (under
         // the raw `max_line_bytes` cap but over the ceiling once escaped) would otherwise be served
@@ -966,7 +1037,7 @@ impl Core {
         // losing the whole read (issue #114). Every other line already fits — the window's total
         // encoded size is bounded, so no line but a forced oversized first can be cut here.
         let mut line_truncated = false;
-        for (offset, line) in all[begin..end].iter().enumerate() {
+        for (offset, line) in window[..shown].iter().enumerate() {
             if line.len() > self.bundle.limits.max_line_bytes as usize {
                 return Err(EvidenceError::new(
                     "line_too_long",
@@ -985,9 +1056,7 @@ impl Core {
             };
             lines.push(json!({"line": begin + offset + 1, "text": text}));
         }
-        let complete = end == all.len() && !line_truncated;
-        let fingerprint = crate::digest::Fingerprint::of(&bytes)
-            .ok_or_else(|| EvidenceError::new("digest_unavailable", "SHA-256 is unavailable"))?;
+        let complete = reached_end && shown == window.len() && !line_truncated;
         // Only after the content is known good do we compute the (cached) drift stamp. The walk is
         // watchdog-bounded (below) so a first read whose stamp stalls still cannot hang the loop.
         // The reason travels with the verdict here as well as in `repository_scope`, because scope
@@ -995,9 +1064,9 @@ impl Core {
         let (drifted, drift_unavailable) = self.drift(received_at)?;
         Ok(json!({
             "path": relative_slash(&self.root, &output.resolved)?,
-            "bytes": bytes.len(),
-            "sha256": fingerprint.sha256,
-            "total_lines": all.len(),
+            "bytes": bytes,
+            "sha256": sha256,
+            "total_lines": total_lines,
             "lines": lines,
             "complete": complete,
             "truncated": !complete,
@@ -1949,6 +2018,13 @@ pub fn read_contained_file(root: &Path, raw: &str, max: usize) -> Result<Vec<u8>
 /// classifies its raw OS error so a transient sharing/lock violation is retryable (findings
 /// f10/f14). Runs on the read worker thread.
 fn read_file_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, ReadFailure> {
+    let (file, len) = open_verified(path, root)?;
+    read_open_bounded(file, len, max)
+}
+
+/// Open a resolved in-root file, verify the opened handle is still inside `root`, and return it
+/// positioned at the start with its length.
+fn open_verified(path: &Path, root: &Path) -> Result<(File, u64), ReadFailure> {
     let mut file = File::open(path).map_err(|e| {
         classify_read_io(
             "read_failed",
@@ -1961,14 +2037,19 @@ fn read_file_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, Re
         .metadata()
         .map_err(|e| classify_read_io("read_failed", "cannot stat open file", &e))?
         .len();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| classify_read_io("read_failed", "cannot seek open file", &e))?;
+    Ok((file, len))
+}
+
+/// Read a verified file whole, capped at `max`.
+fn read_open_bounded(file: File, len: u64, max: usize) -> Result<Vec<u8>, ReadFailure> {
     if len > max as u64 {
         return Err(ReadFailure::fatal(
             "file_too_large",
             format!("file is {len} bytes; cap is {max}"),
         ));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| classify_read_io("read_failed", "cannot seek open file", &e))?;
     let mut bytes = Vec::with_capacity(len as usize);
     file.take(max as u64 + 1)
         .read_to_end(&mut bytes)
@@ -1980,6 +2061,160 @@ fn read_file_bounded(path: &Path, max: usize, root: &Path) -> Result<Vec<u8>, Re
         ));
     }
     Ok(bytes)
+}
+
+/// Scan a verified file over the per-file cap as far as `window` needs and keep only its lines
+/// (issue #190), so memory is bounded by the window rather than the file. Lines split as
+/// `str::lines` splits them. The binary and UTF-8 checks cover every byte scanned; the digest and
+/// line count are returned only when the scan reached the end. Time is bounded by the read
+/// watchdog, as for a whole-file read.
+fn scan_line_window(
+    file: File,
+    len: u64,
+    window: LineWindow,
+    label: &str,
+) -> Result<ScannedWindow, ReadFailure> {
+    let read_error = |e: io::Error| classify_read_io("read_failed", "cannot read open file", &e);
+    let mut digest = crate::digest::Sha256Stream::new()
+        .ok_or_else(|| ReadFailure::fatal("digest_unavailable", "SHA-256 is unavailable"))?;
+    let mut reader = io::BufReader::with_capacity(64 * 1024, file);
+    let window_end = window.start_line.saturating_add(window.line_count);
+    // The cap plus a `\r` the line ending strips.
+    let keep = window.max_line_bytes.saturating_add(1);
+    let mut utf8_carry = Vec::new();
+    let mut line_no = 1usize; // the line the next byte belongs to
+    let mut partial = false; // a byte of `line_no` has been seen
+    let mut current = Vec::new();
+    let mut lines = Vec::new();
+    let reached_end = loop {
+        let chunk = reader.fill_buf().map_err(read_error)?;
+        if chunk.is_empty() {
+            break true;
+        }
+        if line_no >= window_end {
+            break false;
+        }
+        let mut used = 0;
+        while used < chunk.len() && line_no < window_end {
+            let rest = &chunk[used..];
+            let (segment, ends_line) = match rest.iter().position(|&b| b == b'\n') {
+                Some(i) => (&rest[..=i], true),
+                None => (rest, false),
+            };
+            if segment.contains(&0) {
+                return Err(ReadFailure::fatal("binary", format!("'{label}' is binary")));
+            }
+            if !utf8_feed(&mut utf8_carry, segment) {
+                return Err(ReadFailure::fatal(
+                    "non_utf8",
+                    format!("'{label}' is not UTF-8"),
+                ));
+            }
+            digest.update(segment);
+            used += segment.len();
+            if line_no >= window.start_line {
+                let body = if ends_line {
+                    &segment[..segment.len() - 1]
+                } else {
+                    segment
+                };
+                // Past `keep` the line is over the cap whatever ends it, so stop here rather than
+                // scan the rest of a huge unterminated line.
+                if current.len() + body.len() > keep {
+                    return Err(line_too_long(label));
+                }
+                current.extend_from_slice(body);
+            }
+            if ends_line {
+                if line_no >= window.start_line {
+                    if current.last() == Some(&b'\r') {
+                        current.pop();
+                    }
+                    lines.push(window_line(&mut current, window, label)?);
+                }
+                line_no += 1;
+                partial = false;
+            } else {
+                partial = true;
+            }
+        }
+        reader.consume(used);
+    };
+    if reached_end && !utf8_carry.is_empty() {
+        return Err(ReadFailure::fatal(
+            "non_utf8",
+            format!("'{label}' is not UTF-8"),
+        ));
+    }
+    // A last line with no newline still counts, as `str::lines` counts it.
+    if reached_end && partial && line_no >= window.start_line && line_no < window_end {
+        lines.push(window_line(&mut current, window, label)?);
+    }
+    let (total_lines, sha256) = if reached_end {
+        let sha256 = digest
+            .finish()
+            .ok_or_else(|| ReadFailure::fatal("digest_unavailable", "SHA-256 is unavailable"))?;
+        (
+            Some(line_no - 1 + usize::from(partial)),
+            Some(crate::digest::to_hex(&sha256)),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(ScannedWindow {
+        bytes: len,
+        lines,
+        reached_end,
+        total_lines,
+        sha256,
+    })
+}
+
+/// Finish one collected window line, refusing it as `repository_read` refuses an over-cap line.
+fn window_line(
+    current: &mut Vec<u8>,
+    window: LineWindow,
+    label: &str,
+) -> Result<String, ReadFailure> {
+    let bytes = std::mem::take(current);
+    if bytes.len() > window.max_line_bytes {
+        return Err(line_too_long(label));
+    }
+    // `utf8_feed` has already validated every byte, and a line ends on a character boundary.
+    String::from_utf8(bytes)
+        .map_err(|_| ReadFailure::fatal("non_utf8", format!("'{label}' is not UTF-8")))
+}
+
+fn line_too_long(label: &str) -> ReadFailure {
+    ReadFailure::fatal(
+        "line_too_long",
+        format!("'{label}' contains a line over the configured cap"),
+    )
+}
+
+/// Check one more slice of a byte stream for UTF-8 validity, carrying an incomplete trailing
+/// sequence (at most three bytes) into the next call. A carry left at the end is invalid.
+fn utf8_feed(carry: &mut Vec<u8>, mut bytes: &[u8]) -> bool {
+    while !carry.is_empty() {
+        let Some((&first, rest)) = bytes.split_first() else {
+            return true;
+        };
+        carry.push(first);
+        bytes = rest;
+        match std::str::from_utf8(carry) {
+            Ok(_) => carry.clear(),
+            Err(e) if e.error_len().is_none() => {}
+            Err(_) => return false,
+        }
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(e) if e.error_len().is_none() => {
+            carry.extend_from_slice(&bytes[e.valid_up_to()..]);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(windows)]
@@ -3878,6 +4113,134 @@ mod tests {
         );
     }
 
+    // Issue #190: a line window is served from a text file over the per-file cap instead of the
+    // whole file being refused. Its digest and line count are null until a read reaches the end.
+    #[test]
+    fn a_line_window_is_read_from_a_file_over_the_per_file_cap() {
+        let dir = temp_dir("evidence-read-over-cap");
+        let body = "// synthetic fixture\n".repeat(60_000);
+        assert!(body.len() > Limits::default().max_file_bytes as usize);
+        fs::write(dir.as_path().join("large.cpp"), &body).unwrap();
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+
+        let head = core
+            .call(
+                "repository_read",
+                &json!({"path":"large.cpp","start_line":1,"line_count":3}),
+            )
+            .unwrap();
+        assert_eq!(head["lines"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            head["lines"][2],
+            json!({"line":3,"text":"// synthetic fixture"})
+        );
+        assert_eq!(head["bytes"], json!(body.len()));
+        assert_eq!(head["complete"], json!(false));
+        assert_eq!(head["sha256"], Value::Null);
+        assert_eq!(head["total_lines"], Value::Null);
+
+        let tail = core
+            .call(
+                "repository_read",
+                &json!({"path":"large.cpp","start_line":59_999,"line_count":10}),
+            )
+            .unwrap();
+        assert_eq!(tail["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(tail["lines"][1]["line"], json!(60_000));
+        assert_eq!(tail["complete"], json!(true));
+        assert_eq!(tail["total_lines"], json!(60_000));
+        assert_eq!(
+            tail["sha256"],
+            json!(
+                crate::digest::Fingerprint::of(body.as_bytes())
+                    .unwrap()
+                    .sha256
+            )
+        );
+    }
+
+    // The windowed scan splits lines exactly as the whole-file read does: compare the two on the
+    // same files, with the cap forced below every file so the scan always runs.
+    #[test]
+    fn a_windowed_scan_matches_the_whole_file_read() {
+        let dir = temp_dir("evidence-read-scan-parity");
+        let mut small = bundle(dir.as_path());
+        small.limits.max_file_bytes = 1;
+        let mut whole = Core::new(bundle(dir.as_path())).unwrap();
+        let mut scanned = Core::new(small).unwrap();
+        let cases = [
+            "a\r\nb\n",
+            "a\nb",
+            "a\n\n",
+            "\r",
+            "x\n\r",
+            "\n\nz",
+            "héllo\nwörld ✓\n😀",
+        ];
+        for (i, content) in cases.iter().enumerate() {
+            let name = format!("f{i}.txt");
+            fs::write(dir.as_path().join(&name), content).unwrap();
+            for (start, count) in [(1, 1), (1, 10), (2, 1), (2, 5), (3, 1), (5, 2)] {
+                let args = json!({"path":name,"start_line":start,"line_count":count});
+                let w = whole.call("repository_read", &args).unwrap();
+                let s = scanned.call("repository_read", &args).unwrap();
+                let at = format!("{content:?} at {start}+{count}");
+                assert_eq!(s["lines"], w["lines"], "{at}");
+                assert_eq!(s["complete"], w["complete"], "{at}");
+                assert_eq!(s["bytes"], w["bytes"], "{at}");
+                if s["complete"] == json!(true) {
+                    assert_eq!(s["total_lines"], w["total_lines"], "{at}");
+                    assert_eq!(s["sha256"], w["sha256"], "{at}");
+                }
+            }
+        }
+    }
+
+    // The scan refuses what the whole-file read refuses, in the bytes it reads; bytes past the
+    // window are not read, so they cannot refuse it.
+    #[test]
+    fn a_windowed_scan_refuses_binary_non_utf8_and_long_lines_it_reads() {
+        let dir = temp_dir("evidence-read-scan-refusals");
+        let mut small = bundle(dir.as_path());
+        small.limits.max_file_bytes = 1;
+        small.limits.max_line_bytes = 8;
+        let mut core = Core::new(small).unwrap();
+        let mut code = |content: &[u8], start: usize| {
+            fs::write(dir.as_path().join("f.txt"), content).unwrap();
+            core.call(
+                "repository_read",
+                &json!({"path":"f.txt","start_line":start,"line_count":1}),
+            )
+            .err()
+            .map(|e| e.code)
+        };
+        assert_eq!(code(b"a\0\nb\n", 2), Some("binary"));
+        assert_eq!(code(b"\xff\nb\n", 2), Some("non_utf8"));
+        assert_eq!(code(b"a\nb\n\xe2\x9c", 3), Some("non_utf8"));
+        assert_eq!(code(b"a\n0123456789\n", 2), Some("line_too_long"));
+        // An over-cap line before the window is skipped, not refused, as in a whole-file read.
+        assert_eq!(code(b"0123456789\nb\n", 2), None);
+        assert_eq!(code(b"a\nb\0\xff", 1), None);
+    }
+
+    #[test]
+    fn utf8_feed_accepts_valid_text_split_anywhere() {
+        let text = "aé✓😀z".as_bytes();
+        for cut in 0..=text.len() {
+            for second in cut..=text.len() {
+                let mut carry = Vec::new();
+                assert!(utf8_feed(&mut carry, &text[..cut]));
+                assert!(utf8_feed(&mut carry, &text[cut..second]));
+                assert!(utf8_feed(&mut carry, &text[second..]));
+                assert!(carry.is_empty(), "cut at {cut}/{second}");
+            }
+        }
+        let mut carry = Vec::new();
+        assert!(utf8_feed(&mut carry, b"\xe2\x9c"));
+        assert!(!utf8_feed(&mut carry, b"a"));
+        assert!(!utf8_feed(&mut Vec::new(), b"\xc3\x28"));
+    }
+
     // Git present, root not a work tree: the scan refuses rather than quietly walking a tree the
     // caller declared to be Git. Surfacing the misconfiguration beats scanning the wrong thing.
     #[test]
@@ -4120,7 +4483,7 @@ mod tests {
     fn ok_output(bytes: &[u8]) -> ReadOutput {
         ReadOutput {
             resolved: PathBuf::from("x"),
-            bytes: bytes.to_vec(),
+            content: ReadContent::Whole(bytes.to_vec()),
         }
     }
 
@@ -4147,7 +4510,7 @@ mod tests {
         let fast = bounded_attempts(&watchdog, Instant::now(), "fast", || {
             || Ok(ok_output(b"hi"))
         });
-        assert_eq!(fast.unwrap().bytes, b"hi");
+        assert!(matches!(fast.unwrap().content, ReadContent::Whole(b) if b == b"hi"));
     }
 
     // A transient (retryable) failure on the first attempt recovers silently on the second, within
@@ -4179,7 +4542,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(result.unwrap().bytes, b"ok");
+        assert!(matches!(result.unwrap().content, ReadContent::Whole(b) if b == b"ok"));
         assert_eq!(
             built, 2,
             "should build a fresh worker for exactly one retry"
