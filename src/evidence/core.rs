@@ -3659,6 +3659,16 @@ mod tests {
             "{}",
             refused.message
         );
+        // With no path too: describe would list its files with no diffs, as if it edited nothing.
+        let refused = core
+            .call("repository_revision", &json!({"id":pending}))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments", "{}", refused.message);
+        assert!(
+            refused.message.contains("repository_change"),
+            "{}",
+            refused.message
+        );
         let shelf = core
             .call(
                 "repository_diff",

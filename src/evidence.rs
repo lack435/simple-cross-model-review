@@ -1323,8 +1323,8 @@ pub fn tool_definitions() -> Vec<Value> {
              'path' if given). Perforce: 'id' is a changelist number; without 'path' the changelist \
              is described with its diffs, with 'path' it is that file's content as of the \
              changelist. A shelved changelist is read as its shelved files; a pending changelist \
-             that is not shelved has no content on the server, so 'path' is refused for it (read \
-             the workspace file with repository_read).",
+             that is not shelved has no content on the server and is refused (read the change \
+             under review with repository_change, or a workspace file with repository_read).",
             &[
                 ("id", "string"),
                 ("path", "string"),

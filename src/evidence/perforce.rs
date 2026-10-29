@@ -63,6 +63,18 @@ pub fn revision(
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
     let state = change_state(root, access, change, limits, cancel, received_at)?;
+    let refusal = || {
+        not_on_server(
+            change,
+            "read the change under review with repository_change, or this workspace's file with \
+             repository_read",
+        )
+    };
+    // Refused with no path too: `p4 describe` shows no diffs for it, which reads as a changelist
+    // that edits nothing.
+    if state == (ChangeState::Pending { shelved: false }) {
+        return Err(refusal());
+    }
     if path.is_empty() {
         let number = change.to_string();
         let mut args = vec!["describe", "-du"];
@@ -80,13 +92,7 @@ pub fn revision(
              or omit path to describe the whole changelist",
         ));
     }
-    let spec = at_change(
-        &spec,
-        change,
-        state,
-        "read this workspace's file with repository_read, or the change under review with \
-         repository_change",
-    )?;
+    let spec = at_change(&spec, change, state).ok_or_else(refusal)?;
     run(
         root,
         access,
@@ -114,12 +120,8 @@ pub fn diff(
 ) -> Result<String, EvidenceError> {
     let spec = file_spec(root, path)?;
     let base_state = change_state(root, access, base, limits, cancel, received_at)?;
-    let left = at_change(
-        &spec,
-        base,
-        base_state,
-        "use a submitted or shelved changelist as 'base'",
-    )?;
+    let left = at_change(&spec, base, base_state)
+        .ok_or_else(|| not_on_server(base, "use a submitted or shelved changelist as 'base'"))?;
     match head {
         // `-f` diffs files that are not opened too: the question is how the workspace differs from
         // that changelist, not only what is checked out.
@@ -133,13 +135,13 @@ pub fn diff(
         ),
         Some(head) => {
             let head_state = change_state(root, access, head, limits, cancel, received_at)?;
-            let right = at_change(
-                &spec,
-                head,
-                head_state,
-                "omit 'head' to diff 'base' against this workspace, or read the change under \
-                 review with repository_change",
-            )?;
+            let right = at_change(&spec, head, head_state).ok_or_else(|| {
+                not_on_server(
+                    head,
+                    "omit 'head' to diff 'base' against this workspace, or read the change under \
+                     review with repository_change",
+                )
+            })?;
             run(
                 root,
                 access,
@@ -203,24 +205,24 @@ fn parse_change_state(text: &str) -> Option<ChangeState> {
 /// `spec` as of changelist `change`. A submitted changelist is a point in history (`@n`) and a
 /// shelved one its shelved revision (`@=n`). `@n` on a pending changelist would name the last
 /// submitted revision at or below it, silently hiding the pending edits, and one that is not
-/// shelved has no revision on the server at all, so it is refused with `instead`.
-fn at_change(
-    spec: &str,
-    change: u64,
-    state: ChangeState,
-    instead: &str,
-) -> Result<String, EvidenceError> {
+/// shelved has no revision on the server at all: `None`, refused with [`not_on_server`].
+fn at_change(spec: &str, change: u64, state: ChangeState) -> Option<String> {
     match state {
-        ChangeState::Submitted => Ok(format!("{spec}@{change}")),
-        ChangeState::Pending { shelved: true } => Ok(format!("{spec}@={change}")),
-        ChangeState::Pending { shelved: false } => Err(EvidenceError::new(
-            "invalid_arguments",
-            format!(
-                "changelist {change} is pending and not shelved, so its edits exist only in its \
-                 workspace; {instead}"
-            ),
-        )),
+        ChangeState::Submitted => Some(format!("{spec}@{change}")),
+        ChangeState::Pending { shelved: true } => Some(format!("{spec}@={change}")),
+        ChangeState::Pending { shelved: false } => None,
     }
+}
+
+/// The refusal for a pending changelist that is not shelved, with what to use `instead`.
+fn not_on_server(change: u64, instead: &str) -> EvidenceError {
+    EvidenceError::new(
+        "invalid_arguments",
+        format!(
+            "changelist {change} is pending and not shelved, so its edits exist only in its \
+             workspace; {instead}"
+        ),
+    )
 }
 
 /// A changelist number argument: decimal digits, greater than zero.
@@ -418,20 +420,18 @@ mod tests {
     #[test]
     fn a_changelist_resolves_to_history_the_shelf_or_a_refusal() {
         assert_eq!(
-            at_change(".\\a.txt", 5, ChangeState::Submitted, "x").unwrap(),
-            ".\\a.txt@5"
+            at_change(".\\a.txt", 5, ChangeState::Submitted).as_deref(),
+            Some(".\\a.txt@5")
         );
         assert_eq!(
-            at_change(".\\a.txt", 5, ChangeState::Pending { shelved: true }, "x").unwrap(),
-            ".\\a.txt@=5"
+            at_change(".\\a.txt", 5, ChangeState::Pending { shelved: true }).as_deref(),
+            Some(".\\a.txt@=5")
         );
-        let err = at_change(
-            ".\\a.txt",
-            5,
-            ChangeState::Pending { shelved: false },
-            "omit it",
-        )
-        .unwrap_err();
+        assert_eq!(
+            at_change(".\\a.txt", 5, ChangeState::Pending { shelved: false }),
+            None
+        );
+        let err = not_on_server(5, "omit it");
         assert_eq!(err.code, "invalid_arguments");
         assert!(err.message.contains("pending") && err.message.ends_with("omit it"));
     }
