@@ -1800,6 +1800,17 @@ fn resolve_existing_bounded(
     Ok(canonical)
 }
 
+/// Read the regular file `raw` (relative to the canonical directory `root`) through the same
+/// resolution and handle check every evidence read uses: no reparse point along it, resolved inside
+/// `root`, and the **opened handle** verified to still be inside `root`, capped at `max` bytes. The
+/// capture hook reads its converter's output files this way (issue #174), so a path the converter
+/// names can never redirect a read outside the directory the server created for it.
+pub fn read_contained_file(root: &Path, raw: &str, max: usize) -> Result<Vec<u8>, EvidenceError> {
+    let path =
+        resolve_existing_bounded(root, 1024, raw, false).map_err(ReadFailure::into_evidence)?;
+    read_file_bounded(&path, max, root).map_err(ReadFailure::into_evidence)
+}
+
 /// Open, verify, and read a resolved in-root file, capped at `max`. Every blocking stage
 /// classifies its raw OS error so a transient sharing/lock violation is retryable (findings
 /// f10/f14). Runs on the read worker thread.

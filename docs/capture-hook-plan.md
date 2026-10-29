@@ -89,6 +89,66 @@ accepted.
   capture** now covers all rendering, line diff and fallback alike. Past it, every remaining file is
   skipped without rendering, stays binary, and makes the capture incomplete (item 5).
 
+**Implementation notes (PR 1: shared pieces and Perforce).** Built as planned, with these
+findings from a real p4d (2025.2, `test-perforce-capture-hook.ps1`):
+
+- **Verified:** `p4 opened -ztag` reports `movedFile` on both halves of a pending move. Pending moves
+  pair into one `move` input.
+- **Verified false:** the assumption that `fstat -Ol` reports `movedFile` for historic revisions. It
+  does not, for a submitted or a shelved revision, and `describe -s` does not either. So, as the plan
+  allowed, those halves are converted as the add and the delete Perforce reports.
+- **Verified:** `fstat -Ol <spec>` returns `fileSize`, `digest` (the server's MD5) and `clientFile`
+  for a depot revision (`#rev`) and for a shelved file (`@=CL`). For an opened file, `fileSize` and
+  `digest` describe the have-revision. These are the depot-side size check and content digest.
+- **Found and fixed in passing (pre-existing):** a submitted changelist mapped local paths only for
+  files that had a diff section. A submitted binary add or delete has none (`describe` runs without
+  `-a`), so it was reported as "maps outside the working root" when it was simply binary. Every file
+  in the changelist's file list is now mapped.
+- **Deferral rather than removal.** A binary file the globs match is set aside at its binary site
+  instead of becoming an omission. If it is not converted, it gets back exactly the omission it would
+  have had. With no `--capture-hook`, capture output is unchanged, except for the deliberate fix
+  below for submitted adds and deletes, which were misreported before.
+- **`--capture-hook` with no `--capture-hook-glob` is a startup error.** Without a glob the hook could
+  never be offered a file, so this is refused rather than left silently inert.
+
+**Amendment (r7, maintainer feedback after convergence).** The maintainer, who runs a converter
+(an Unreal commandlet) against real changelists of 39–66 open files and hundreds of MB of art, raised
+seven points. All are adopted here, and the implementation PR's review covers this amendment.
+
+1. **Cost per turn.**
+   - `--capture-hook-max-file-bytes` (default 16 MiB). A side larger than that is never copied,
+     digested, downloaded or sent **by the capture hook**. Its size is checked first, from file
+     metadata, `git cat-file -s` or `p4 fstat` `fileSize`. Such a file is treated exactly as an
+     unmatched file. On git, that means it is listed as binary and does **not** make the
+     composition incomplete. On Perforce, a binary file left as an omission has always made its
+     changelist incomplete, and an excluded file does the same, no worse than today. The capture's
+     own pre-existing bounded reads are unchanged: a text-typed file is read before it is found to
+     hold a NUL. The limit governs only what the hook path adds.
+   - Separately, a cache lookup digests the live file **in place**, and the snapshot into `temp_dir`
+     is taken **only on a miss**. A re-review of unchanged files therefore copies nothing.
+   - r5 f25's guarantee still holds. A miss stores its result under the digest of the snapshot the
+     converter actually read. If the file changed between lookup and snapshot, the live re-digest
+     finds no entry, which is absent and therefore incomplete (items 3, 6 and 7).
+2. **Budget.** Generated text has its **own** 400 000-byte budget per capture, separate from the code
+   diff's `diff_remaining`, so a large code diff never crowds out converted text (items 4a and 6).
+3. **Large edits.** An output record may carry an optional `diff_text_file`. The server uses it in
+   place of computing its own diff, with the same containment, UTF-8, size and budget checks, and
+   still adds the provenance header. A converter that already writes a compact diff is then never
+   pushed into an oversized whole-file fallback (items 3 and 5).
+4. **`local_path`** is set for every file in the client view.
+   - On Perforce it comes from `fstat`'s `clientFile`, which covers submitted, shelved and deleted
+     files.
+   - On git it is always the worktree path (items 3, 6 and 7).
+5. **Snapshot names** keep the source file name: `temp_dir/<id>/base/<name>` and
+   `temp_dir/<id>/modified/<name>` (item 3).
+6. **Quiescence** is clarified. The runner never stops a converter for being silent. The only kill is
+   the overall `--capture-hook-timeout-seconds`. "Quiescence" is the bounded wait, *after* the main
+   process exits, for its other processes in the job to exit. A converter that runs for minutes
+   needs that timeout raised, and the turn timeout must allow it (item 2).
+7. **`--capture-hook-identity-file <path>`**, repeatable. Each file's bytes are part of the converter
+   identity, so an export-format version file the operator names invalidates the cache when it
+   changes (item 1).
+
 ## The problem, in one paragraph
 
 Many repositories keep real logic in binary files: engine assets, data tables, notebooks, binary
@@ -140,6 +200,9 @@ caller-chosen.
   `Config::max_wait_secs` (`config.rs:1779`), so a blocking collect still covers a whole review.
 - `--capture-hook-materialize`: the server writes both sides of every file to the hook's temp
   directory before the run.
+- `--capture-hook-max-file-bytes N` (default 16 MiB; r7). A side larger than this is excluded before
+  any copy, digest or download: the file stays binary and the capture is not made incomplete.
+- `--capture-hook-identity-file <path>`, repeatable (r7). Each file's bytes are part of the identity.
 - A half-configured hook is a startup error, as for the other hooks.
 - **Hook identity (r1 f1, r2 f1).** SHA-256 over all of:
   - a cache schema version;
@@ -147,7 +210,8 @@ caller-chosen.
   - every arg, and **the bytes of every arg that names an existing regular file** (absolute, or
     relative to the working root). This is how a script run through an interpreter (`pwsh -File
     convert.ps1`) is identified by its contents;
-  - the sorted globs and the materialize flag.
+  - the bytes of every `--capture-hook-identity-file` (r7);
+  - the sorted globs, the materialize flag and the size limit.
 
   The identity is recomputed at the start of every capture, so editing the program or a script in
   place invalidates its cache entries. A converter's *other* dependencies (modules it imports, its
@@ -163,7 +227,9 @@ caller-chosen.
 - a timeout over the whole process tree;
 - a quiescence check.
 
-It keeps only a 2 KiB output tail, though. It gains a collector option that returns **stdout as
+Quiescence is **not** an idle timeout. The runner never stops a converter for being silent. The only
+kill is the overall timeout. Quiescence is the bounded wait, after the main process exits, for the rest
+of the job's processes to exit (r7). It keeps only a 2 KiB output tail, though. It gains a collector option that returns **stdout as
 data**, bounded at 1 MiB (a JSON index, not the texts themselves), with a truncation flag. stderr
 keeps the tail. No second runner is written.
 
@@ -184,8 +250,10 @@ keeps the tail. No second runner is written.
   sides, read from `file` or fetched by `ref` (and the converter itself). `change` and `working_root` are informational. Results are cached and
   reused across changes in the same repository on that basis, and the README says so.
 - `ref` is the backend's revision name: a git blob or commit id, or a Perforce `depot#rev`.
-- **Snapshots (r5 f25).** `file` is always a **server-written snapshot** in `temp_dir`, never a path
-  into the working tree.
+- **Snapshots (r5 f25, r7).** `file` is always a **server-written snapshot** in `temp_dir`, never a
+  path into the working tree. It is named `temp_dir/<id>/base/<source file name>` or
+  `temp_dir/<id>/modified/<source file name>`, keeping the original name and extension. Snapshots are
+  taken only for files that **missed** the cache (item 4).
   - A working-tree side (a git worktree file, a Perforce pending local file) is always snapshotted.
     The server streams the file into `temp_dir` and computes its content digest in the same pass,
     so the digest is of exactly the snapshot's bytes.
@@ -193,16 +261,22 @@ keeps the tail. No second runner is written.
     `--capture-hook-materialize`, and otherwise left for the hook to fetch by `ref`. Its digest
     comes from the repository's own object identity (the blob or the depot revision's digest), which
     cannot change under the hook.
-  - `local_path` is informational. The contract requires a converter to read `file`, and the README
-    says why.
+  - `local_path` is informational and is set for **every** file in the client view (r7). On
+    Perforce it is `fstat`'s `clientFile`, including for submitted, shelved and deleted files; on git
+    it is the worktree path. The contract requires a converter to read content from `file` or `ref`,
+    and the README says why. A converter may use `local_path` to *name* things, such as an asset's
+    package path.
 
 **Output** is one JSON document on stdout:
-`{"files": [{"id", "path", "base_text_file"?, "modified_text_file"?}], "warnings": [..], "note"?}`.
+`{"files": [{"id", "path", "base_text_file"?, "modified_text_file"?, "diff_text_file"?}], "warnings": [..], "note"?}`.
 
 - **Records bind to inputs (r1 f4).**
   - Each record names an input `id`, and each `id` may appear at most once.
   - Its sides must match the input's change type: an edit or a move has both, an add has only
     `modified_text_file`, a delete only `base_text_file`.
+  - **Or** it carries `diff_text_file` (r7): the converter's own unified diff of the file. The server
+    uses it in place of computing a diff, after the same containment, UTF-8 and size checks, and
+    adds its provenance header. With a `diff_text_file` the side files are optional.
   - `path` is the display path. It must be the input's `path` plus a suffix containing no
     separator, for example `<path>.txt`.
   - A record that breaks any of these rules is dropped with a warning, and its file stays binary. An
@@ -231,6 +305,12 @@ keeps the tail. No second runner is written.
   - A missing side hashes as a fixed marker.
   - A content digest always covers the **whole** side, streamed through a fixed buffer, never a
     capped reader's prefix (r1 f2).
+  - **Lookup digests in place (r7).** A working-tree side is digested by streaming the live file,
+    without copying it. Only on a **miss** is it snapshotted into `temp_dir`. The miss's result is
+    stored under the key computed from the **snapshot's** digest, which is the bytes the converter
+    read. If the file changed between lookup and snapshot, that key differs from the live one, so the
+    next lookup is absent and the capture is incomplete. r5 f25 still holds, and unchanged files cost
+    a read, not a copy.
 - **Entry:** either **positive**, holding the display path, the rendered generated text (item 5),
   its byte length and the hook's note, or **negative**, meaning the hook ran on this input and
   returned no record for it (r4 f23). Every reader gets identical bytes for a key, which is the
@@ -244,9 +324,10 @@ keeps the tail. No second runner is written.
 
 ### 4a. Budget (r1 f3, r2 f3)
 
-Generated text gets a per-capture budget equal to the backend's diff budget (`MAX_DIFF_BYTES`,
-400 000 bytes, `vcs/shared.rs:29`). Files are taken in source-path order while their rendered text
-fits.
+Generated text gets its **own** per-capture budget of 400 000 bytes (the same size as `MAX_DIFF_BYTES`,
+`vcs/shared.rs:29`, but a separate allowance). It is not shared with the code diff, so a large code
+diff never leaves converted files without room (r7). Files are taken in source-path order while their
+rendered text fits.
 
 A file left out for budget **keeps its binary listing and makes the capture incomplete**:
 - **Perforce:** the segment is marked incomplete, as any omission makes it, and the incomplete
@@ -290,6 +371,9 @@ and AGENTS.md rules out adding a crate. So this is a small module:
     conversion)`.
 - **Header:** each file starts `# generated from <source> by the capture hook`, plus
   `# moved from <moved_from>` for a move.
+- **Converter-supplied diff (r7):** when a record carries `diff_text_file`, that text is used as the
+  body after the header, and no line diff runs. It is still counted against the per-capture input-byte
+  and output budgets.
 - **Determinism:** the same inputs always give the same bytes. Ties are broken by preferring
   deletions first, the conventional choice.
 
@@ -317,9 +401,12 @@ and AGENTS.md rules out adding a crate. So this is a small module:
     with one generated unit.
 - **Content digests (r2 f2).**
   - A depot side uses `p4 fstat -Ol` `digest` for that revision: the server's MD5, not computed by us.
-  - A pending local side is snapshotted into `temp_dir`, and its digest is SHA-256 of exactly the
-    snapshot's bytes, computed in the same streaming pass (r5 f25). That is the whole file, and it
-    is independent of `read_capped`, which truncates.
+  - A pending local side is digested in place for the lookup. On a miss it is snapshotted, and the
+    stored key uses the snapshot's digest (item 4, r7). The digest always covers the whole file,
+    independent of `read_capped`, which truncates.
+  - **Size first (r7).** `p4 fstat -Ol` returns `fileSize` and `clientFile` for each file. A side
+    over `--capture-hook-max-file-bytes` is excluded before any digest, snapshot or `p4 print`.
+    `clientFile` becomes `local_path`.
 - **The run.** After `p4.changelist` has run for every changelist and before `apply_elision`:
   1. Collect the matched inputs and look each one up in the cache.
   2. Send the misses to one hook run. Under materialize, `p4 print -o` writes each depot side to
@@ -334,8 +421,9 @@ and AGENTS.md rules out adding a crate. So this is a small module:
   full capture on the next resume (the AGENTS.md disposable-state rule).
 - **Render.** A `#### Generated text (from binary files)` section after the diff block, one fenced
   diff per generated unit, then the hook's `note`.
-- **Budget (r3 f18).** A generated unit is placed **whole or not at all**. A new `Budget::take_whole`
-  either takes the unit's full length from `diff_remaining` or takes nothing. The truncating
+- **Budget (r3 f18, r7).** A generated unit is placed **whole or not at all**. A new
+  `Budget::take_generated` either takes the unit's full length from its **own** `generated_remaining`
+  (item 4a) or takes nothing. The truncating
   `take_diff` is never used for generated text, so no partial generated hunk can appear. A unit that
   does not fit stays an omission and makes the segment incomplete (item 4a).
 - **Consult.** A Perforce consult with `include_change: true` goes through the same `capture`, so it
@@ -362,8 +450,13 @@ and AGENTS.md rules out adding a crate. So this is a small module:
   2. **Content digests** are SHA-256 of each side's raw bytes.
      - The base side comes from `git cat-file blob base:<base path>`, read in full and streamed,
        where the base path is `moved_from` for a move and `path` otherwise (r3 f15).
-     - The worktree side is snapshotted into `temp_dir`, and its digest is taken from the snapshot's
-       bytes in the same pass (r5 f25). The hook converts that snapshot.
+     - The worktree side is digested in place for the lookup. On a miss it is snapshotted, and the
+       result is stored under the snapshot's digest (item 4, r5 f25, r7). The hook converts that
+       snapshot.
+     - **Size first (r7):** a side over `--capture-hook-max-file-bytes` (worktree metadata, or
+       `git cat-file -s` for a blob) is excluded before any read. The composition applies the same
+       rule from the same sizes, so the served and committed compositions agree. An excluded file
+       is listed as binary, adds no generated-text line, and does not make the capture incomplete.
      - The child's composition later re-digests the live worktree file. A file that changed since
        the snapshot gets a different key, which is **absent**, so the composition is incomplete
        (r4 f23).

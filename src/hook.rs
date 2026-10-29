@@ -420,6 +420,33 @@ fn drain_tail(
     (buf, done_rx)
 }
 
+/// Drain a pipe keeping its first `cap + 1` bytes (so a caller can tell "exactly `cap`" from "more
+/// remained") and discarding the rest. The capture hook's stdout is data read from the start, not a
+/// diagnostic tail (issue #174).
+fn drain_head(
+    mut pipe: impl Read + Send + 'static,
+    cap: usize,
+) -> (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = mpsc::channel();
+    let sink = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut b = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = (cap + 1).saturating_sub(b.len());
+                    b.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    (buf, done_rx)
+}
+
 fn tail_text(buf: &Arc<Mutex<Vec<u8>>>, cap: usize) -> String {
     let b = buf.lock().unwrap_or_else(|e| e.into_inner());
     let start = b.len().saturating_sub(cap);
@@ -472,8 +499,50 @@ pub fn run_process_with_flags(
     make_job: impl FnOnce() -> Option<JobObject>,
     creation_flags: u32,
 ) -> HookReport {
+    run_process_inner(cfg, root, payload, make_job, creation_flags, None).0
+}
+
+/// A program's stdout, collected as data rather than kept as a diagnostic tail.
+#[derive(Debug, Default)]
+pub struct CollectedStdout {
+    /// At most the cap's worth of bytes, from the start of the stream.
+    pub bytes: Vec<u8>,
+    /// More than the cap was written; `bytes` is a prefix.
+    pub truncated: bool,
+}
+
+/// [`run_process_with_flags`], but stdout is collected **from the start** as data, up to
+/// `stdout_cap` bytes, instead of being kept as a 2 KiB tail (the capture hook, issue #174). The same
+/// containment, timeout and quiescence rules apply; stderr is still the diagnostic tail in the
+/// report's `output`. `None` stdout means the pipe could not be read at all.
+pub fn run_process_collecting(
+    cfg: &HookConfig,
+    root: &Path,
+    payload: &str,
+    make_job: impl FnOnce() -> Option<JobObject>,
+    creation_flags: u32,
+    stdout_cap: usize,
+) -> (HookReport, Option<CollectedStdout>) {
+    run_process_inner(
+        cfg,
+        root,
+        payload,
+        make_job,
+        creation_flags,
+        Some(stdout_cap),
+    )
+}
+
+fn run_process_inner(
+    cfg: &HookConfig,
+    root: &Path,
+    payload: &str,
+    make_job: impl FnOnce() -> Option<JobObject>,
+    creation_flags: u32,
+    collect_stdout: Option<usize>,
+) -> (HookReport, Option<CollectedStdout>) {
     let Some(job) = make_job() else {
-        return HookReport::failed(reason::NO_CONTAINMENT);
+        return (HookReport::failed(reason::NO_CONTAINMENT), None);
     };
     let mut command = Command::new(&cfg.program);
     command
@@ -485,7 +554,12 @@ pub fn run_process_with_flags(
     let started = Instant::now();
     let mut child = match job.spawn_in_job_with_flags(&mut command, creation_flags) {
         Ok(child) => child,
-        Err(e) => return HookReport::failed(format!("{}: {e}", reason::SPAWN_FAILED)),
+        Err(e) => {
+            return (
+                HookReport::failed(format!("{}: {e}", reason::SPAWN_FAILED)),
+                None,
+            )
+        }
     };
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -496,10 +570,10 @@ pub fn run_process_with_flags(
             let _ = stdin.flush();
         });
     }
-    let stdout = child
-        .stdout
-        .take()
-        .map(|p| drain_tail(p, OUTPUT_TAIL_BYTES));
+    let stdout = child.stdout.take().map(|p| match collect_stdout {
+        Some(cap) => drain_head(p, cap),
+        None => drain_tail(p, OUTPUT_TAIL_BYTES),
+    });
     let stderr = child
         .stderr
         .take()
@@ -567,7 +641,18 @@ pub fn run_process_with_flags(
     // only covers a reader still copying its last chunk.
     let grace = Instant::now() + DRAIN_GRACE;
     let mut collected = String::new();
+    let mut data: Option<CollectedStdout> = None;
     for (label, drained) in [("stdout", stdout), ("stderr", stderr)] {
+        if let (Some(cap), "stdout") = (collect_stdout, label) {
+            if let Some((buf, done)) = drained {
+                let _ = done.recv_timeout(grace.saturating_duration_since(Instant::now()));
+                let mut bytes = std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()));
+                let truncated = bytes.len() > cap;
+                bytes.truncate(cap);
+                data = Some(CollectedStdout { bytes, truncated });
+            }
+            continue;
+        }
         if let Some((buf, done)) = drained {
             let _ = done.recv_timeout(grace.saturating_duration_since(Instant::now()));
             let text = tail_text(&buf, OUTPUT_TAIL_BYTES);
@@ -584,7 +669,7 @@ pub fn run_process_with_flags(
             .unwrap_or(collected.len());
         report.output = Some(collected[start..].to_string());
     }
-    report
+    (report, data)
 }
 
 #[cfg(test)]

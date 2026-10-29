@@ -991,6 +991,10 @@ pub struct Config {
     /// Parsed here rather than stripped from argv beforehand, so an option *value* spelled
     /// `--json` (an `--on-event-arg`, say) is never mistaken for the flag.
     pub status_json: bool,
+    /// The capture hook (`--capture-hook`, issue #174): an operator-configured converter that turns
+    /// binary files in a change into text the review then covers. `None` (the default) leaves capture
+    /// exactly as it was. See `src/capture_hook.rs` and `docs/capture-hook-plan.md`.
+    pub capture_hook: Option<crate::capture_hook::CaptureHookConfig>,
     /// Companion repositories configured with `--companion` (issue #167), resolved and validated at
     /// startup. Empty unless configured. See `src/companion.rs`.
     pub companions: Vec<crate::companion::Companion>,
@@ -1061,6 +1065,13 @@ impl Config {
         let mut companion_args: Vec<(String, String)> = Vec::new();
         let mut event_timeout_secs: Option<u64> = None;
         let mut event_include_findings = false;
+        let mut capture_program: Option<String> = None;
+        let mut capture_args: Vec<String> = Vec::new();
+        let mut capture_globs: Vec<String> = Vec::new();
+        let mut capture_timeout_secs: Option<u64> = None;
+        let mut capture_materialize = false;
+        let mut capture_max_file_bytes: Option<u64> = None;
+        let mut capture_identity_files: Vec<String> = Vec::new();
         let mut status_flag = false;
         let mut json_flag = false;
 
@@ -1320,6 +1331,35 @@ impl Config {
                     companion_args.push(crate::companion::parse_flag(&take("--companion")?)?)
                 }
                 "--on-event-include-findings" => event_include_findings = true,
+                "--capture-hook" => capture_program = Some(take("--capture-hook")?),
+                "--capture-hook-arg" => capture_args.push(take("--capture-hook-arg")?),
+                "--capture-hook-glob" => {
+                    let g = take("--capture-hook-glob")?;
+                    crate::capture_hook::validate_glob(&g)?;
+                    capture_globs.push(g);
+                }
+                "--capture-hook-timeout-seconds" => {
+                    let v = take("--capture-hook-timeout-seconds")?;
+                    let secs: u64 = v.parse().ok().filter(|s| *s > 0).ok_or_else(|| {
+                        format!(
+                            "--capture-hook-timeout-seconds must be a positive integer, got '{v}'"
+                        )
+                    })?;
+                    capture_timeout_secs = Some(secs);
+                }
+                "--capture-hook-materialize" => capture_materialize = true,
+                "--capture-hook-max-file-bytes" => {
+                    let v = take("--capture-hook-max-file-bytes")?;
+                    let n: u64 = v.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                        format!(
+                            "--capture-hook-max-file-bytes must be a positive integer, got '{v}'"
+                        )
+                    })?;
+                    capture_max_file_bytes = Some(n);
+                }
+                "--capture-hook-identity-file" => {
+                    capture_identity_files.push(take("--capture-hook-identity-file")?)
+                }
                 "--status" => status_flag = true,
                 "--json" => json_flag = true,
                 "--on-event-timeout-seconds" => {
@@ -1384,6 +1424,66 @@ impl Config {
             _ => {}
         }
         // The event hook, under the same rule: a half-configured one is a startup error.
+        // The capture hook (issue #174), under the same rule as the other hooks: a half-configured
+        // one is a startup error, and the program is resolved now. A hook with no glob would never
+        // be handed a file, so that is refused too rather than left silently inert. Its timeout is
+        // clamped to the turn timeout.
+        let capture_hook = match capture_program {
+            Some(program) => {
+                if capture_globs.is_empty() {
+                    return Err(
+                        "--capture-hook needs at least one --capture-hook-glob naming \
+                                the binary files it converts"
+                            .to_string(),
+                    );
+                }
+                let mut identity_files = Vec::new();
+                for f in capture_identity_files {
+                    let p = std::path::Path::new(&f);
+                    let p = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cwd.join(p)
+                    };
+                    if !p.is_file() {
+                        return Err(format!(
+                            "--capture-hook-identity-file '{f}' is not a readable file"
+                        ));
+                    }
+                    identity_files.push(p);
+                }
+                Some(crate::capture_hook::CaptureHookConfig {
+                    hook: crate::hook::HookConfig {
+                        program: resolve_hook_program("--capture-hook", &program, &cwd)?,
+                        args: capture_args,
+                        timeout: Duration::from_secs(
+                            capture_timeout_secs
+                                .unwrap_or(crate::capture_hook::DEFAULT_TIMEOUT_SECS)
+                                .min(timeout_secs.max(1)),
+                        ),
+                    },
+                    globs: capture_globs,
+                    materialize: capture_materialize,
+                    max_file_bytes: capture_max_file_bytes
+                        .unwrap_or(crate::capture_hook::DEFAULT_MAX_FILE_BYTES),
+                    identity_files,
+                })
+            }
+            None if !capture_args.is_empty()
+                || !capture_globs.is_empty()
+                || capture_timeout_secs.is_some()
+                || capture_materialize
+                || capture_max_file_bytes.is_some()
+                || !capture_identity_files.is_empty() =>
+            {
+                return Err("--capture-hook-arg, --capture-hook-glob, \
+                            --capture-hook-timeout-seconds, --capture-hook-materialize, \
+                            --capture-hook-max-file-bytes and --capture-hook-identity-file need \
+                            --capture-hook"
+                    .to_string())
+            }
+            None => None,
+        };
         let on_event = match event_program {
             Some(program) => Some(crate::events::EventConfig {
                 hook: crate::hook::HookConfig {
@@ -1518,6 +1618,7 @@ impl Config {
             max_policy_idle: Duration::from_secs(max_policy_idle_secs),
             on_converged,
             on_event,
+            capture_hook,
             status_json: status_flag,
             companions,
             declared_companions: Vec::new(),
@@ -1801,8 +1902,15 @@ impl Config {
         let repair = per_repair
             .saturating_mul(self.block_repair_attempts as u64)
             .saturating_add(per_repair);
+        // The capture hook runs before the reviewer, within the turn, for up to its own timeout
+        // (issue #174, plan r1 f8), so a blocking collect must cover it too. Zero without one.
+        let capture_hook = self
+            .capture_hook
+            .as_ref()
+            .map_or(0, |h| h.hook.timeout.as_secs());
         let single = crate::vcs::CAPTURE_BUDGET
             .as_secs()
+            .saturating_add(capture_hook)
             .saturating_add(self.timeout.as_secs())
             .saturating_add(repair)
             .saturating_add(FINALIZATION_GRACE_SECS);
@@ -2533,6 +2641,28 @@ COMPANION REPOSITORIES (issue #167; off unless --companion is given):
                               state and temp directories. It may be inside the working
                               root only if the working root git-ignores it. Git only;
                               not with --allow-reviewer-config.
+
+CAPTURE HOOK (issue #174; off unless --capture-hook is given):
+  --capture-hook <program>    Convert binary files in a change to text the reviewer sees and
+                              the approval covers. Once per capture it gets JSON on stdin
+                              listing the matched files (snapshots of each side under a
+                              server-owned temp_dir) and answers with JSON naming the text
+                              files it wrote. Runs as this server's user, in a job object,
+                              with no console window. Results are cached by content.
+  --capture-hook-arg <arg>    One argument for it. Repeatable, in order.
+  --capture-hook-glob <pat>   Which files it gets (*, ** and ? only, case-insensitive).
+                              Repeatable; at least one is required.
+  --capture-hook-timeout-seconds N
+                              Kill it and everything it started after N seconds. Default
+                              120, at most --timeout-seconds. It is never stopped for
+                              being silent, only by this timeout.
+  --capture-hook-max-file-bytes N
+                              A side larger than N is never copied, read or sent; the file
+                              stays listed as binary. Default 16 MiB.
+  --capture-hook-materialize  Also write repository-history sides to its temp_dir.
+  --capture-hook-identity-file <path>
+                              A file whose contents are part of the converter's identity,
+                              so changing it invalidates cached conversions. Repeatable.
 
 LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
   --on-event <program>        Run <program> for every review and consult turn that
@@ -5062,6 +5192,86 @@ mod event_hook_flag_tests {
             "--on-event-arg <arg>",
             "--on-event-timeout-seconds N",
             "--on-event-include-findings",
+        ] {
+            assert!(USAGE.contains(flag), "{flag}");
+        }
+    }
+
+    /// Issue #174: the capture hook is off by default; configured, it needs a glob, clamps its
+    /// timeout to the turn's, counts in the blocking-collect budget, and rejects half a config.
+    #[test]
+    fn the_capture_hook_parses_validates_and_budgets() {
+        let exe = cmd_exe();
+        let base = ["--reviewer", "codex", "--level", "s:gpt-5.6-luna:max"];
+        let plain = Config::from_args(&args(&base)).unwrap();
+        assert!(plain.capture_hook.is_none());
+
+        let mut with = base.to_vec();
+        with.extend([
+            "--timeout-seconds",
+            "600",
+            "--capture-hook",
+            &exe,
+            "--capture-hook-glob",
+            "**/*.uasset",
+            "--capture-hook-timeout-seconds",
+            "900",
+            "--capture-hook-max-file-bytes",
+            "1024",
+        ]);
+        let cfg = Config::from_args(&args(&with)).unwrap();
+        let hook = cfg.capture_hook.as_ref().expect("configured");
+        assert_eq!(
+            hook.hook.timeout,
+            Duration::from_secs(600),
+            "clamped to the turn"
+        );
+        assert_eq!(hook.max_file_bytes, 1024);
+        assert_eq!(hook.globs, vec!["**/*.uasset".to_string()]);
+        let unhooked: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--timeout-seconds", "600"])
+            .collect();
+        assert_eq!(
+            cfg.max_wait_secs(),
+            Config::from_args(&args(&unhooked)).unwrap().max_wait_secs() + 600,
+            "the hook's timeout is part of the blocking-collect budget"
+        );
+
+        for bad in [
+            vec!["--capture-hook-glob", "*.bin"],
+            vec!["--capture-hook-arg", "x"],
+            vec!["--capture-hook-materialize"],
+            vec!["--capture-hook-max-file-bytes", "5"],
+            vec!["--capture-hook", &exe],
+            vec!["--capture-hook", &exe, "--capture-hook-glob", "*.[ch]"],
+            vec![
+                "--capture-hook",
+                &exe,
+                "--capture-hook-glob",
+                "*.bin",
+                "--capture-hook-max-file-bytes",
+                "0",
+            ],
+            vec![
+                "--capture-hook",
+                &exe,
+                "--capture-hook-glob",
+                "*.bin",
+                "--capture-hook-identity-file",
+                "no-such-file-zz9",
+            ],
+        ] {
+            let mut a = base.to_vec();
+            a.extend(bad.iter().copied());
+            assert!(Config::from_args(&args(&a)).is_err(), "{bad:?}");
+        }
+        for flag in [
+            "--capture-hook <program>",
+            "--capture-hook-glob <pat>",
+            "--capture-hook-max-file-bytes N",
+            "--capture-hook-identity-file <path>",
         ] {
             assert!(USAGE.contains(flag), "{flag}");
         }

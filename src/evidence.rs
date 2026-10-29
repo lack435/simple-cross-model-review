@@ -593,6 +593,7 @@ pub fn write_claude_mcp_config(
     Ok(BundleFile { path })
 }
 
+pub use core::read_contained_file;
 /// The converged-hook binding check's two git reads (issue #142), exposed from the private `core`
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
 pub use core::{committed_change_digest, resolve_head};
@@ -622,6 +623,20 @@ pub fn serve_record_path(
 }
 
 fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError> {
+    let dir = safe_subdir(cfg, "cross-review-evidence-bundles")?;
+    cleanup_capability_dir(&dir)?;
+    Ok(dir)
+}
+
+/// A server-owned directory named `name` in the capability-dir location (issue #174, plan item 3):
+/// under the state directory when that is outside the working root and inside no git repository,
+/// else under the system temp directory. The capture hook's cache and temp directories live here, so
+/// neither can land where git would list it as part of a reviewed change.
+pub fn server_owned_dir(cfg: &crate::config::Config, name: &str) -> Result<PathBuf, EvidenceError> {
+    safe_subdir(cfg, name).map(crate::config::normalize_dir)
+}
+
+fn safe_subdir(cfg: &crate::config::Config, name: &str) -> Result<PathBuf, EvidenceError> {
     let candidates = [cfg.state_dir.clone(), std::env::temp_dir()];
     let mut last = None;
     for base in candidates {
@@ -637,7 +652,7 @@ fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError>
         {
             continue;
         }
-        let dir = base.join("cross-review-evidence-bundles");
+        let dir = base.join(name);
         if let Err(e) = fs::create_dir_all(&dir) {
             last = Some(e);
             continue;
@@ -660,7 +675,6 @@ fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError>
             && !crate::reviewer::is_within(&canonical, &cfg.cwd)
             && crate::reviewer::verified_non_git_dir(&canonical)
         {
-            cleanup_capability_dir(&canonical)?;
             return Ok(canonical);
         }
     }
