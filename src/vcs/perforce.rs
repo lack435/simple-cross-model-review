@@ -31,6 +31,8 @@
 //! the only external input is the changelist *numbers*, validated numeric at parse time.
 
 use std::collections::BTreeMap;
+
+mod convert;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -116,6 +118,7 @@ pub fn capture(
     };
     // Every command from here runs as this client (global `-c`, injected in `run`).
     p4.client = Some(info.client.clone());
+    p4.hook = cfg.capture_hook.as_ref();
 
     // The capture identity binds the resume delta: the server, client, charset and client-spec
     // digest this turn ran under. Resolved once, up front, so it describes the same client every
@@ -152,6 +155,14 @@ pub fn capture(
             "None of the requested changelists could be captured, so the reviewer was given no \
              diff and reviewed the current state of the code instead. Skipped: {reasons}."
         ));
+    }
+
+    // The capture hook (issue #174): resolve every deferred binary file before the resume delta,
+    // so generated units are fingerprinted and collapsed like any other. With no hook nothing was
+    // deferred and this does nothing.
+    let mut hook_warnings = Vec::new();
+    if let Some(hook) = cfg.capture_hook.as_ref() {
+        hook_warnings = convert::run(&p4, cfg, hook, &mut segments, cancel);
     }
 
     // Decide the resume delta: collapse unchanged files only when the feature is on, the prior
@@ -225,7 +236,7 @@ pub fn capture(
 
     // Skipped changelists are a bound on the evidence the caller is reading, so they are
     // surfaced as a warning too, not only rendered into the prompt.
-    let mut warnings = Vec::new();
+    let mut warnings = hook_warnings;
     if !skipped.is_empty() {
         let reasons = skipped
             .iter()
@@ -432,6 +443,8 @@ impl Budget {
 // Per-changelist capture
 // ---------------------------------------------------------------------------
 
+// Built once per changelist and unpacked at once; boxing the segment would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum CaptureOne {
     Segment(Segment),
     Skipped(String),
@@ -467,6 +480,12 @@ struct Segment {
     /// ("removed") or are still present but no longer have a diff ("restored to depot"). Empty
     /// on a full capture.
     transitions: Vec<String>,
+    /// Binary files the capture hook's globs match (issue #174), set aside at their binary site
+    /// instead of becoming an omission. `convert::run` resolves every one: a converted file becomes
+    /// a `Generated` unit, anything else gets back the exact omission it would have had.
+    deferred: Vec<convert::Deferred>,
+    /// The capture hook's note for this changelist's generated files, when it gave one.
+    generated_note: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -551,6 +570,20 @@ impl Unit {
         }
     }
 
+    /// A capture-hook generated unit (issue #174): `local` is the converter's display path and
+    /// `comparator` encodes both sides' content digests, so a change to either side breaks a match.
+    fn generated(depot: String, comparator: String, local: String, body: String) -> Self {
+        Self {
+            depot,
+            kind: baseline::UnitKind::Generated,
+            comparator,
+            local,
+            body,
+            complete: true,
+            collapsed: false,
+        }
+    }
+
     /// The line count of the body, for the "unchanged (N lines)" collapse placeholder.
     fn line_count(&self) -> usize {
         self.body.lines().count()
@@ -572,6 +605,7 @@ fn kind_tag(kind: baseline::UnitKind) -> &'static str {
         baseline::UnitKind::TextDiff => "text-diff",
         baseline::UnitKind::AddBody => "add-body",
         baseline::UnitKind::Note => "note",
+        baseline::UnitKind::Generated => "generated",
     }
 }
 
@@ -812,6 +846,8 @@ impl<'a> P4<'a> {
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, false, false),
                 transitions: Vec::new(),
+                deferred: Vec::new(),
+                generated_note: None,
             });
         }
 
@@ -834,8 +870,12 @@ impl<'a> P4<'a> {
         };
 
         let sections = parse_describe_diff(&raw);
-        // Map every affected file's local location so out-of-root sections can be dropped.
-        let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
+        // Map every affected file's local location so out-of-root files can be dropped. Every file
+        // in the ledger, not only those with a diff section: a submitted add or delete has no
+        // section (`describe` runs without `-a`), and mapping only sections reported it as "maps
+        // outside the working root" when it was simply binary or content-free (found by the
+        // capture-hook live test, issue #174).
+        let (wheres, where_truncated) = self.where_of(meta.files.iter().map(|f| f.depot.as_str()));
 
         let mut listing = String::new();
         let mut units = Vec::new();
@@ -843,6 +883,7 @@ impl<'a> P4<'a> {
         let mut omissions = Vec::new();
         let mut complete = true;
         let mut diff_truncated = false;
+        let mut deferred = Vec::new();
 
         // Each source of truncation is reported separately, so the note names the command that
         // was cut rather than conflating them.
@@ -914,13 +955,29 @@ impl<'a> P4<'a> {
                 }
                 _ => {
                     // No textual hunk: binary, empty, or a pure add/delete describe records
-                    // without a diff. Labelled, never dropped silently.
-                    complete = false;
-                    omissions.push(format!(
+                    // without a diff. Labelled, never dropped silently -- or, when the capture
+                    // hook's globs match it, deferred to the hook (issue #174), which gives the
+                    // same note back if it does not convert the file.
+                    let note = format!(
                         "`{}` ({}) has no textual diff in the changelist (binary or content-free).",
                         safe_label(&file.depot),
                         file.action
-                    ));
+                    );
+                    match local {
+                        Some(WhereResult::Mapped(path)) if self.defers(&local_label) => deferred
+                            .push(convert::Deferred {
+                                depot: file.depot.clone(),
+                                action: file.action.clone(),
+                                local: path.clone(),
+                                note,
+                                rev: file.rev.clone(),
+                                moved_file: None,
+                            }),
+                        _ => {
+                            complete = false;
+                            omissions.push(note);
+                        }
+                    }
                 }
             }
         }
@@ -975,6 +1032,8 @@ impl<'a> P4<'a> {
             diff_truncated,
             omissions,
             transitions: Vec::new(),
+            deferred,
+            generated_note: None,
         })
     }
 
@@ -1030,6 +1089,8 @@ impl<'a> P4<'a> {
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, false, false),
                 transitions: Vec::new(),
+                deferred: Vec::new(),
+                generated_note: None,
             });
         }
 
@@ -1076,6 +1137,8 @@ impl<'a> P4<'a> {
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, opened_truncated, false),
                 transitions: Vec::new(),
+                deferred: Vec::new(),
+                generated_note: None,
             });
         }
 
@@ -1089,6 +1152,8 @@ impl<'a> P4<'a> {
         let mut present_depots = Vec::new();
         let mut edit_targets: Vec<String> = Vec::new();
         let mut delete_targets: Vec<String> = Vec::new();
+        let mut deferred: Vec<convert::Deferred> = Vec::new();
+        let mut path_by_depot: BTreeMap<String, PathBuf> = BTreeMap::new();
         // depot -> working-root-relative label, so a diff section can be given its local heading.
         let mut local_by_depot: BTreeMap<String, String> = BTreeMap::new();
         let mut adds: Vec<(String, PathBuf)> = Vec::new(); // (depot, local)
@@ -1141,6 +1206,7 @@ impl<'a> P4<'a> {
                 continue;
             }
             let local = local.expect("in_root implies a mapped local path");
+            path_by_depot.insert(file.depot.clone(), local.clone());
             local_by_depot.insert(file.depot.clone(), local_label);
 
             match ActionKind::of(&file.action) {
@@ -1150,11 +1216,12 @@ impl<'a> P4<'a> {
                 // silently, leaving the file in `present_depots` with no unit and no omission, and
                 // so a false "restored to depot" note next turn (gate finding 2). Omit it instead.
                 ActionKind::Edit if !is_diffable_text(&file.depot, &opened) => {
-                    omissions.push(format!(
+                    let note = format!(
                         "`{}` is a binary edit or has no known text type; p4 does not produce a \
                          text diff for it.",
                         safe_label(&file.depot)
-                    ));
+                    );
+                    self.defer_or_omit(&mut deferred, &mut omissions, file, &local, note);
                 }
                 ActionKind::Edit => edit_targets.push(file.depot.clone()),
                 ActionKind::Add => adds.push((file.depot.clone(), local)),
@@ -1163,12 +1230,14 @@ impl<'a> P4<'a> {
                 // change whose risk is lost content, the reviewer needs to see what was lost.
                 // A binary or untyped delete has no text to show, so it stays an omission.
                 ActionKind::Delete if !is_diffable_text(&file.depot, &opened) => {
-                    complete = false;
-                    omissions.push(format!(
+                    let note = format!(
                         "`{}` is deleted; it is binary or has no known text type, so the removed \
                          content is not shown.",
                         safe_label(&file.depot)
-                    ));
+                    );
+                    if !self.defer_or_omit(&mut deferred, &mut omissions, file, &local, note) {
+                        complete = false;
+                    }
                 }
                 ActionKind::Delete => delete_targets.push(file.depot.clone()),
                 ActionKind::Other => {
@@ -1355,11 +1424,25 @@ impl<'a> P4<'a> {
             }
             // NUL backstop for a file typed as text that is not: never rendered raw.
             if out.stdout.contains('\0') {
-                complete = false;
-                omissions.push(format!(
+                let note = format!(
                     "`{}` is deleted and its content is binary, so it is not shown.",
                     safe_label(depot)
-                ));
+                );
+                let deferrable = opened
+                    .iter()
+                    .find(|f| f.depot == *depot)
+                    .zip(path_by_depot.get(depot.as_str()));
+                match deferrable {
+                    Some((file, path)) => {
+                        if !self.defer_or_omit(&mut deferred, &mut omissions, file, path, note) {
+                            complete = false;
+                        }
+                    }
+                    None => {
+                        complete = false;
+                        omissions.push(note);
+                    }
+                }
                 continue;
             }
             let (hunk, cut) = budget.take_diff(removal_hunk(&out.stdout));
@@ -1414,10 +1497,16 @@ impl<'a> P4<'a> {
             // missing/unknown is skipped for the same reason it is not diffed: unknown evidence is
             // non-elidable, so it must not enter the inventory even if its bytes look like text.
             if !is_diffable_text(&depot, &opened) {
-                cl_omissions.push(format!(
+                let note = format!(
                     "`{}` is binary or has no known text type",
                     safe_label(&depot)
-                ));
+                );
+                match opened.iter().find(|f| f.depot == depot) {
+                    Some(file) if self.defers(&root_relative(&local, self.cwd)) => {
+                        deferred.push(convert::Deferred::of_opened(file, &local, note))
+                    }
+                    _ => cl_omissions.push(note),
+                }
                 continue;
             }
             if budget.added_remaining == 0 {
@@ -1435,7 +1524,13 @@ impl<'a> P4<'a> {
             };
             // NUL backstop for a file typed as text that is not: still never rendered raw.
             if bytes.contains(&0) {
-                cl_omissions.push(format!("`{}` is binary", safe_label(&depot)));
+                let note = format!("`{}` is binary", safe_label(&depot));
+                match opened.iter().find(|f| f.depot == depot) {
+                    Some(file) if self.defers(&root_relative(&local, self.cwd)) => {
+                        deferred.push(convert::Deferred::of_opened(file, &local, note))
+                    }
+                    _ => cl_omissions.push(note),
+                }
                 continue;
             }
             // Whether the read decoded losslessly decides whether the body can be a byte-faithful
@@ -1483,6 +1578,8 @@ impl<'a> P4<'a> {
             diff_truncated,
             omissions,
             transitions: Vec::new(),
+            deferred,
+            generated_note: None,
         })
     }
 
@@ -1535,6 +1632,7 @@ impl<'a> P4<'a> {
         let mut present_depots = Vec::new();
         let mut omissions = Vec::new();
         let mut complete = true;
+        let mut deferred: Vec<convert::Deferred> = Vec::new();
         let mut diff_truncated = false;
 
         for note in truncation_notes(false, false, where_truncated) {
@@ -1578,12 +1676,29 @@ impl<'a> P4<'a> {
 
             if section.body.trim().is_empty() {
                 // A shelved binary or content-free file: describe records the header with no
-                // hunk. Labelled, never dropped silently.
-                complete = false;
-                omissions.push(format!(
+                // hunk. Labelled, never dropped silently -- or deferred to the capture hook when
+                // its globs match (issue #174).
+                let note = format!(
                     "`{}` has no textual diff in the shelf (binary or content-free).",
                     safe_label(&section.depot)
-                ));
+                );
+                match local {
+                    Some(WhereResult::Mapped(path)) if self.defers(&local_label) => {
+                        deferred.push(convert::Deferred {
+                            depot: section.depot.clone(),
+                            // The shelf's own action is read from `fstat -Rs` when converting.
+                            action: "shelved".to_string(),
+                            local: path.clone(),
+                            note,
+                            rev: section.rev.clone(),
+                            moved_file: None,
+                        })
+                    }
+                    _ => {
+                        complete = false;
+                        omissions.push(note);
+                    }
+                }
                 continue;
             }
 
@@ -1639,6 +1754,8 @@ impl<'a> P4<'a> {
             diff_truncated,
             omissions,
             transitions: Vec::new(),
+            deferred,
+            generated_note: None,
         })
     }
 }
@@ -1829,6 +1946,44 @@ fn render(
             }
         }
 
+        // Text the capture hook generated from binary files (issue #174). Each unit is a rendered
+        // diff of the converted sides, already headed with its source.
+        let generated: Vec<&Unit> = seg
+            .units
+            .iter()
+            .filter(|u| u.kind == baseline::UnitKind::Generated)
+            .collect();
+        if !generated.is_empty() {
+            out.push_str("#### Generated text (from binary files)\n\n");
+            out.push_str(
+                "The server's capture hook converted these binary files to text. Each diff is \
+                 between the converted forms of the two sides, and is part of the change under \
+                 review.\n\n",
+            );
+            for unit in &generated {
+                out.push_str(&format!(
+                    "##### {}  (from {})\n\n",
+                    safe_label(&unit.local),
+                    safe_label(&unit.depot)
+                ));
+                if unit.collapsed {
+                    out.push_str(&format!(
+                        "(unchanged since your previous turn; {} lines omitted)\n\n",
+                        unit.line_count()
+                    ));
+                    continue;
+                }
+                push_fenced(&mut out, "diff", unit.body.trim_end_matches('\n'));
+                out.push('\n');
+            }
+            if let Some(note) = &seg.generated_note {
+                out.push_str(&format!(
+                    "Note from the capture hook: {}\n\n",
+                    safe_label(note)
+                ));
+            }
+        }
+
         // Files the reviewer saw last turn that are no longer diffed here -- removed from the
         // changelist, or restored to their depot revision. Only present on a resumed turn.
         if !seg.transitions.is_empty() {
@@ -1900,6 +2055,8 @@ struct P4<'a> {
     /// the workspace is resolved -- `p4 info` and `p4 clients` run client-less to derive it,
     /// and everything after runs bound to it.
     client: Option<String>,
+    /// The capture hook (issue #174), when configured: decides which binary files are deferred.
+    hook: Option<&'a crate::capture_hook::CaptureHookConfig>,
 }
 
 impl<'a> P4<'a> {
@@ -1912,6 +2069,7 @@ impl<'a> P4<'a> {
             }
         };
         Some(Self {
+            hook: None,
             bin,
             cwd,
             cancel,
@@ -1928,6 +2086,33 @@ impl<'a> P4<'a> {
     /// a `P4CONFIG` file in a parent directory still governs which server and client we talk
     /// to. That is unavoidable -- it is how the client resolves at all -- and it is why the
     /// client and root are rendered into the command label, so a wrong one is visible.
+    /// Whether the capture hook (issue #174) should be offered this binary file, by its
+    /// working-root-relative path. Always false without a hook, so capture is unchanged.
+    fn defers(&self, local_label: &str) -> bool {
+        self.hook.is_some_and(|h| h.matches(local_label))
+    }
+
+    /// Defer a pending binary file to the capture hook when its globs match, else record `note`
+    /// as an omission exactly as before. Returns whether it was deferred; the caller marks the
+    /// changelist incomplete only when it was not (a deferred file's completeness is settled by
+    /// `convert::run`).
+    fn defer_or_omit(
+        &self,
+        deferred: &mut Vec<convert::Deferred>,
+        omissions: &mut Vec<String>,
+        file: &OpenedFile,
+        local: &Path,
+        note: String,
+    ) -> bool {
+        if self.defers(&root_relative(local, self.cwd)) {
+            deferred.push(convert::Deferred::of_opened(file, local, note));
+            true
+        } else {
+            omissions.push(note);
+            false
+        }
+    }
+
     fn run(&self, args: &[&str], stdin: &str) -> Option<RunOutcome> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2231,6 +2416,9 @@ struct OpenedFile {
     /// which makes the resulting diff unit non-elidable rather than eliding against an unknown
     /// basis.
     have_rev: Option<String>,
+    /// `movedFile`: the other half of a pending move (verified on a real p4d, issue #174). Used
+    /// only to pair a moved binary into one capture-hook input.
+    moved_file: Option<String>,
 }
 
 struct DescribeMeta {
@@ -2246,6 +2434,9 @@ struct DescribeMeta {
 struct AffectedFile {
     depot: String,
     action: String,
+    /// `rev<N>` from `describe -s`: the revision this changelist created (submitted) or the base
+    /// revision (pending). Used only by the capture hook (issue #174).
+    rev: Option<String>,
 }
 
 struct DiffSection {
@@ -2364,6 +2555,7 @@ fn parse_opened_ztag(raw: &str) -> (Vec<OpenedFile>, bool) {
                 action,
                 ptype,
                 have_rev,
+                moved_file: rec.get("movedFile").filter(|m| !m.is_empty()).cloned(),
             })
         })
         .collect();
@@ -2415,6 +2607,7 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
     // depotFile<N>/action<N> collected by index so a file's parts stay together.
     let mut depots: BTreeMap<usize, String> = BTreeMap::new();
     let mut actions: BTreeMap<usize, String> = BTreeMap::new();
+    let mut revs: BTreeMap<usize, String> = BTreeMap::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -2444,6 +2637,10 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
                 if let Ok(n) = n.parse::<usize>() {
                     actions.insert(n, val.to_string());
                 }
+            } else if let Some(n) = key.strip_prefix("rev") {
+                if let Ok(n) = n.parse::<usize>() {
+                    revs.insert(n, val.to_string());
+                }
             }
         }
         i += 1;
@@ -2455,6 +2652,10 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
         .map(|(n, depot)| AffectedFile {
             depot,
             action: actions.get(&n).cloned().unwrap_or_default(),
+            rev: revs
+                .get(&n)
+                .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                .cloned(),
         })
         .collect();
     Some(DescribeMeta {
@@ -3108,6 +3309,7 @@ Change 5 by u@c on 2026/01/01\n\n\
                 action: "edit".into(),
                 ptype: ptype.into(),
                 have_rev: None,
+                moved_file: None,
             }]
         };
         assert!(is_diffable_text("//d/a", &opened("text")));
@@ -3300,6 +3502,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: Vec::new(),
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         };
         assert!(inventory(&[seg]).expect("digest available").is_empty());
     }
@@ -3320,6 +3524,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: Vec::new(),
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         };
         let prior = vec![baseline::InventoryEntry {
             change: 9,
@@ -3367,6 +3573,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: Vec::new(),
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         };
         let inv = inventory(&[seg]).expect("digest available");
         assert_eq!(inv.len(), 1, "only the complete unit is fingerprinted");
@@ -3407,6 +3615,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: Vec::new(),
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         };
         // Build the prior inventory from what the reviewer was shown last turn.
         let entry = |depot: &str, body: &str| baseline::InventoryEntry {
@@ -3469,6 +3679,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: Vec::new(),
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         };
         let prior_unit = Unit::text_diff(
             "//depot/a".into(),
@@ -3526,6 +3738,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             diff_truncated: false,
             omissions: vec!["`//depot/c` maps outside the working root".into()],
             transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
         }
     }
 
@@ -3715,6 +3929,89 @@ Change 5 by u@c on 2026/01/01\n\n\
             );
         } else {
             panic!("live capture produced no change; warnings above");
+        }
+    }
+
+    /// End-to-end capture hook (issue #174) against a real server: binary files matching the glob
+    /// come back as generated text, and a second capture of the same, unchanged files is served
+    /// from the cache without running the converter. Opt-in, driven by
+    /// `test-perforce-capture-hook.ps1`, which sets the change, workspace, converter script, the
+    /// strings the render must contain, and the converter's run-counter file.
+    #[test]
+    fn live_capture_hook_converts_binaries() {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let (Some(cl_raw), Some(cwd), Some(script), Some(expect), Some(counter)) = (
+            var("CROSS_REVIEW_P4_TEST_HOOK_CL"),
+            var("CROSS_REVIEW_P4_TEST_CWD"),
+            var("CROSS_REVIEW_P4_TEST_HOOK_SCRIPT"),
+            var("CROSS_REVIEW_P4_TEST_HOOK_EXPECT"),
+            var("CROSS_REVIEW_P4_TEST_HOOK_COUNTER"),
+        ) else {
+            eprintln!("skipping live capture-hook test: run test-perforce-capture-hook.ps1");
+            return;
+        };
+        let changes = crate::changeset::parse_changes(&cl_raw).expect("valid change");
+        let include_shelved = var("CROSS_REVIEW_P4_TEST_SHELVED").is_some();
+        let state = crate::testutil::temp_dir("p4-capture-hook-state");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+            "--vcs".into(),
+            "perforce".into(),
+            "--cwd".into(),
+            cwd,
+            "--state-dir".into(),
+            state.as_path().to_string_lossy().into_owned(),
+            "--capture-hook".into(),
+            "powershell".into(),
+            "--capture-hook-arg".into(),
+            "-NoProfile".into(),
+            "--capture-hook-arg".into(),
+            "-ExecutionPolicy".into(),
+            "--capture-hook-arg".into(),
+            "Bypass".into(),
+            "--capture-hook-arg".into(),
+            "-File".into(),
+            "--capture-hook-arg".into(),
+            script,
+            "--capture-hook-glob".into(),
+            "**/*.uasset".into(),
+            "--capture-hook-materialize".into(),
+        ])
+        .expect("config");
+        let cancel = AtomicBool::new(false);
+        let runs = || {
+            std::fs::read_to_string(&counter)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let cap = capture(&cfg, &changes, include_shelved, None, &cancel);
+        for w in &cap.warnings {
+            eprintln!("live warning: {w}");
+        }
+        let rendered = cap.change.as_ref().expect("a capture").rendered.clone();
+        eprintln!("----- rendered capture -----\n{rendered}");
+        assert!(
+            rendered.contains("Generated text (from binary files)"),
+            "no generated section"
+        );
+        for want in expect.split('|') {
+            assert!(rendered.contains(want), "missing {want:?}");
+        }
+        assert_eq!(runs(), 1, "the converter ran once for the whole capture");
+
+        // Unchanged files: the second capture is served from the cache, the converter not run.
+        let again = capture(&cfg, &changes, include_shelved, None, &cancel);
+        let rendered_again = again.change.as_ref().expect("a capture").rendered.clone();
+        assert_eq!(runs(), 1, "a cache hit must not run the converter again");
+        for want in expect.split('|') {
+            assert!(
+                rendered_again.contains(want),
+                "missing {want:?} on the cached capture"
+            );
         }
     }
 

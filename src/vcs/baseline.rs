@@ -18,7 +18,10 @@ use crate::digest::Fingerprint;
 /// invocation that produces the evidence changes, so a baseline written by an incompatible
 /// build is invalidated on read rather than compared across two formats. A `Full` baseline
 /// whose `schema` does not match this constant is treated as absent.
-pub const INVENTORY_SCHEMA: u32 = 1;
+///
+/// 2: adds [`UnitKind::Generated`] (the capture hook's converted text, issue #174), which feeds the
+/// fingerprint input; a version-1 baseline is read as unusable and costs one full capture.
+pub const INVENTORY_SCHEMA: u32 = 2;
 
 /// Which segment of a changelist an evidence unit belongs to. The same depot path has distinct
 /// evidence in each, so the basis is part of a unit's identity.
@@ -44,6 +47,9 @@ pub enum UnitKind {
     /// the inventory so the next turn can tell "still present, still non-elidable" from
     /// "removed", but never carries a fingerprint.
     Note,
+    /// Text the capture hook generated from a binary file (issue #174): a rendered diff of the
+    /// converted sides, elidable like any other body.
+    Generated,
 }
 
 /// One unit in the prior turn's inventory: its identity, and -- when it was a fully-shown

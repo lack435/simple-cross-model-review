@@ -380,6 +380,79 @@ and the tail of its output. **The hook never changes the review:** a failure add
 as the same OS user, who can run the hook script by hand. Design and review history:
 [`docs/converged-hook-plan.md`](docs/converged-hook-plan.md).
 
+## Reviewing binary files through a converter
+
+Some changes keep their real logic in binary files: engine assets, data tables, notebooks, binary
+config. A review normally sees such a file only by name. If your team already has a tool that turns
+these files into stable text, configure it as the **capture hook**. Its output then becomes part of
+the captured change the reviewer is shown, instead of text the caller pastes in.
+
+```json
+"args": [
+  "--reviewer", "codex", "...",
+  "--capture-hook", "pwsh",
+  "--capture-hook-arg", "-NoProfile",
+  "--capture-hook-arg", "-ExecutionPolicy", "--capture-hook-arg", "Bypass",
+  "--capture-hook-arg", "-File", "--capture-hook-arg", "tools\\convert-assets.ps1",
+  "--capture-hook-glob", "**/*.uasset",
+  "--capture-hook-timeout-seconds", "600",
+  "--capture-hook-max-file-bytes", "4194304",
+  "--capture-hook-identity-file", "tools\\export-format.version"
+]
+```
+
+**Which files.** Only files whose path matches a `--capture-hook-glob` reach the converter. Globs
+support `*`, `**` and `?`, and match case-insensitively. A side larger than
+`--capture-hook-max-file-bytes` (default 16 MiB) is never copied, read or sent; that file stays
+listed as binary, as it is today.
+
+**What the converter gets.** Once per capture, it receives one JSON document on stdin. Each matched
+file has:
+- a server-assigned `id`;
+- its `path` and `change_type` (`add`, `edit`, `delete` or `move`, with `moved_from`);
+- its `local_path` in the workspace;
+- a `base` and a `modified` side.
+
+Each side has a `ref` (a depot revision or the working-tree path), and a `file` when the server has
+written a **snapshot** of it under the `temp_dir` it supplies. Snapshots keep the original file name.
+Working-tree sides are always snapshotted; with `--capture-hook-materialize`, depot sides are
+snapshotted too. Otherwise the converter fetches a side by `ref`. **Read content from `file`
+(or `ref`), not `local_path`:** the snapshot is exactly the bytes the server recorded, so a file that
+changes while the converter runs can never be cached under the wrong content. `local_path` is for
+naming things, such as an asset's package path.
+
+**What it answers.** It writes one JSON document on stdout:
+`{"files": [...], "warnings": [...], "note": "..."}`. Each entry in `files` has:
+- the input `id`;
+- a display `path`, which is the input path plus a suffix such as `.txt`;
+- either `base_text_file` / `modified_text_file` (UTF-8 text files it wrote inside `temp_dir`; the
+  server diffs them), or its own unified diff in `diff_text_file`.
+
+A file it leaves out stays binary. A record that names an unknown id, has the wrong sides for its
+change type, or points outside `temp_dir` is dropped with a warning. A timeout, a nonzero exit or
+unreadable output is a warning too, and the review goes on with the files listed as binary.
+
+**How it runs.** As this server's user, in a job object, with no console window. It is stopped only
+by `--capture-hook-timeout-seconds` (default 120, at most `--timeout-seconds`), never for being
+silent. A converter that takes minutes needs that timeout raised.
+
+**Caching.** Results are cached by content: the converter's identity plus each side's digest. A
+re-review of unchanged files never runs it again. The identity covers the program, its arguments,
+the contents of any argument that names a file (so a script edited in place invalidates the cache),
+and every `--capture-hook-identity-file`. A converter whose output also depends on something else,
+such as its own modules or an export-format version, should name that file with
+`--capture-hook-identity-file`. A converter must produce output from the file sides alone, because
+results are reused across changes in the same repository. The cache lives under the state directory,
+outside every reviewed tree, and is trimmed oldest-first past 256 MiB.
+
+**Budget.** Generated text has its own 400 kB budget per capture, separate from the code diff.
+A converted file that doesn't fit stays listed as binary, and the capture is marked incomplete.
+
+**Today:** Perforce changes (pending, submitted and shelved), in reviews and in consults with
+`include_change`. A pending move pairs into one file. A submitted or shelved move is converted as the
+add and the delete Perforce reports, because those revisions carry no move link. Git changes are the
+next step; the design is in [`docs/capture-hook-plan.md`](docs/capture-hook-plan.md).
+
 ## Following every review from outside the client
 
 `--on-event <program>` runs your program for every review and consult turn that starts,

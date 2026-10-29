@@ -14,6 +14,8 @@ compile_error!(
 mod allowlist;
 mod approval;
 mod cancel;
+mod capture_cache;
+mod capture_hook;
 mod changeset;
 mod codeentry;
 mod companion;
@@ -36,6 +38,7 @@ mod session;
 mod setup;
 #[cfg(test)]
 mod testutil;
+mod textdiff;
 mod tools;
 mod usage;
 mod vcs;
