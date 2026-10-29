@@ -629,12 +629,24 @@ fn a_junction_at_the_reviewer_temp_directory_is_refused() {
         crate::testutil::make_junction(&state.join("tmp"), &project),
         "mklink /J failed"
     );
+    // Into the project: refused by where it physically lands, before anything is created.
     let err = crate::reviewer::tmp_file(&cfg, "t2", "codex-last.txt").unwrap_err();
-    assert!(err.to_string().contains("reparse point"), "{err}");
+    assert!(err.to_string().contains("physically inside"), "{err}");
     assert!(
         std::fs::read_dir(&project).unwrap().next().is_none(),
         "nothing was written into the project"
     );
+
+    // Anywhere else: still refused, as a reparse point, rather than written through.
+    std::fs::remove_dir(state.join("tmp")).unwrap();
+    let other = root.as_path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(
+        crate::testutil::make_junction(&state.join("tmp"), &other),
+        "mklink /J failed"
+    );
+    let err = crate::reviewer::tmp_file(&cfg, "t3", "codex-last.txt").unwrap_err();
+    assert!(err.to_string().contains("reparse point"), "{err}");
 }
 
 #[test]
