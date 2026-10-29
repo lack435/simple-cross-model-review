@@ -430,11 +430,15 @@ fn cat_blob(
         .ok_or_else(|| fail("no stdout".into()))?;
     // The pipe is read on its own thread so a stalled git cannot hold this one past the deadline;
     // when this function returns early the job is dropped, git dies, and the reader sees EOF.
-    let (tx, rx) = sync_channel::<Vec<u8>>(4);
+    // A read error is sent, not swallowed: an EOF the reader merely assumed would pass a partial
+    // blob off as whole (#180 review f5).
+    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
-        while let Ok(n) = out.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+        loop {
+            let chunk = out.read(&mut buf).map(|n| buf[..n].to_vec());
+            let end = !matches!(&chunk, Ok(c) if !c.is_empty());
+            if tx.send(chunk).is_err() || end {
                 break;
             }
         }
@@ -453,7 +457,9 @@ fn cat_blob(
             return Err(out_of_time());
         }
         match rx.recv_timeout(left.min(Duration::from_millis(100))) {
-            Ok(chunk) => {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Err(e)) => return Err(fail(format!("reading git cat-file blob {id}: {e}"))),
+            Ok(Ok(chunk)) => {
                 total += chunk.len() as u64;
                 if total > max {
                     return Ok(false);
@@ -461,7 +467,9 @@ fn cat_blob(
                 sink(&chunk).map_err(|e| fail(e.to_string()))?;
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(fail(format!("git cat-file blob {id} ended without EOF")))
+            }
         }
     }
     loop {
