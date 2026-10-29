@@ -262,6 +262,219 @@ pub fn untracked_paths(
     Ok((paths, complete))
 }
 
+/// One binary file in a diff (issue #174): its status letter (`A`, `M`, `D`, `R`, ...), the old path
+/// of a rename, and its (new) path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryChange {
+    pub status: char,
+    pub old_path: Option<String>,
+    pub path: String,
+}
+
+/// The binary files `spec` changes, with the capture hook's fixed rename options (`--find-renames=
+/// 50%`), so the parent prefill and every composition derive exactly the same list (plan r3 f16).
+/// A binary file is a `-\t-` row of `--numstat -z`; its status comes from `--name-status -z`, joined
+/// on the (new) path. Both run under the same staging overrides as the served diff, so an LFS path
+/// (staged as its pointer, which is text) is never binary here.
+pub fn binary_changes(
+    root: &Path,
+    spec: &[&str],
+    staging: Staging,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Vec<BinaryChange>, EvidenceError> {
+    let run_diff = |extra: &str| -> Result<String, EvidenceError> {
+        let mut args = staging_overrides(root, spec, staging, limits, cancel, received_at)?;
+        args.extend([
+            "diff".to_string(),
+            extra.to_string(),
+            "-z".to_string(),
+            "--find-renames=50%".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-textconv".to_string(),
+        ]);
+        args.extend(spec.iter().map(|s| s.to_string()));
+        run(root, &args, limits, cancel, received_at)
+    };
+    // `--numstat -z`: `a\tb\tpath\0`, or for a rename `a\tb\t\0old\0new\0`.
+    let numstat = run_diff("--numstat")?;
+    let mut binary: BTreeSet<String> = BTreeSet::new();
+    let mut tokens = numstat.split('\0');
+    while let Some(tok) = tokens.next() {
+        if tok.is_empty() {
+            continue;
+        }
+        let mut cols = tok.splitn(3, '\t');
+        let (Some(a), Some(b), Some(rest)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let path = if rest.is_empty() {
+            let _old = tokens.next();
+            tokens.next().unwrap_or("").to_string()
+        } else {
+            rest.to_string()
+        };
+        if a == "-" && b == "-" && !path.is_empty() {
+            binary.insert(path);
+        }
+    }
+    if binary.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `--name-status -z`: `S\0path\0`, or for a rename/copy `R100\0old\0new\0`.
+    let names = run_diff("--name-status")?;
+    let mut out = Vec::new();
+    let mut tokens = names.split('\0').filter(|t| !t.is_empty());
+    while let Some(status) = tokens.next() {
+        let letter = status.chars().next().unwrap_or('?');
+        let (old_path, path) = if matches!(letter, 'R' | 'C') {
+            let old = tokens.next().unwrap_or("").to_string();
+            (Some(old), tokens.next().unwrap_or("").to_string())
+        } else {
+            (None, tokens.next().unwrap_or("").to_string())
+        };
+        if binary.contains(&path) {
+            out.push(BinaryChange {
+                status: letter,
+                // A copy keeps its source; only a rename is a move.
+                old_path: (letter == 'R').then_some(old_path).flatten(),
+                path,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The object id of `rev:path`, or `None` when that path does not exist at `rev`.
+pub fn object_id(
+    root: &Path,
+    rev: &str,
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Option<String>, EvidenceError> {
+    let spec = format!("{rev}:{path}");
+    let args = [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        spec.as_str(),
+    ];
+    match run_classified(root, &args, limits, cancel, received_at) {
+        Ok(out) => Ok(Some(out.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(GitFailure::Failed(_)) => Ok(None),
+        Err(e) => Err(e.into_evidence()),
+    }
+}
+
+/// The size in bytes of an object.
+pub fn object_size(
+    root: &Path,
+    id: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<u64, EvidenceError> {
+    let args = ["cat-file", "-s", id].map(String::from);
+    let out = run(root, &args, limits, cancel, received_at)?;
+    out.trim()
+        .parse()
+        .map_err(|_| EvidenceError::new("provider_failed", "cat-file -s gave no size"))
+}
+
+/// SHA-256 of blob `id`'s raw bytes, streamed from `git cat-file blob` through a fixed buffer
+/// (binary-safe; the text runner is not). `None` past `max` bytes. The caller checks the object's
+/// size first; blobs are immutable, so the same id always gives the same digest.
+pub fn blob_digest(root: &Path, id: &str, max: u64) -> Result<Option<[u8; 32]>, EvidenceError> {
+    use std::io::Read;
+    let fail = |m: String| EvidenceError::new("provider_failed", m);
+    let bin = crate::reviewer::on_path("git").ok_or_else(|| fail("git is not on PATH".into()))?;
+    let mut child = Command::new(bin)
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "core.hooksPath=NUL",
+        ])
+        .args(["cat-file", "blob", id])
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| fail(e.to_string()))?;
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| fail("no stdout".into()))?;
+    let mut h =
+        crate::digest::Sha256Stream::new().ok_or_else(|| fail("sha256 unavailable".into()))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    let mut over = false;
+    loop {
+        let n = out.read(&mut buf).map_err(|e| fail(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max {
+            over = true;
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    if over {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    }
+    let status = child.wait().map_err(|e| fail(e.to_string()))?;
+    if !status.success() {
+        return Err(fail(format!("git cat-file blob {id} failed")));
+    }
+    Ok(h.finish())
+}
+
+/// Write blob `id` to `dest`, streamed straight to the file (binary-safe; the text runner is not).
+/// The caller checks the object's size first. Same isolated configuration as every other command.
+pub fn write_blob(root: &Path, id: &str, dest: &Path) -> Result<(), EvidenceError> {
+    let fail = |m: String| EvidenceError::new("provider_failed", m);
+    let bin = crate::reviewer::on_path("git").ok_or_else(|| fail("git is not on PATH".into()))?;
+    let file = std::fs::File::create(dest).map_err(|e| fail(e.to_string()))?;
+    let status = Command::new(bin)
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "core.hooksPath=NUL",
+        ])
+        .args(["cat-file", "blob", id])
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(file)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| fail(e.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(dest);
+        Err(fail(format!("git cat-file blob {id} failed")))
+    }
+}
+
 /// `git diff --numstat` counts for a resolved spec: (files, insertions, deletions). A binary file
 /// counts toward `files` but contributes no line counts (git renders it as `-\t-`). Feeds the
 /// serve-record so the caller-facing `captured:` line reports what was served (mechanism 5).

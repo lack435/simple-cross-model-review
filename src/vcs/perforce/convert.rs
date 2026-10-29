@@ -242,7 +242,23 @@ pub(super) fn run(
                     restore(&mut segments[seg], n);
                 }
             }
-            _ => {
+            // The converter examined this exact input and found no reviewable text: nothing was
+            // dropped, so it is listed in one line and the segment stays complete (as on git). An
+            // empty body marks it; a positive entry's rendered diff is never empty.
+            Some(Entry::Negative) => {
+                let comparator = format!(
+                    "declined:{}|{}",
+                    c.base.as_ref().map_or("-", |s| s.digest.as_str()),
+                    c.modified.as_ref().map_or("-", |s| s.digest.as_str())
+                );
+                segments[seg].units.push(Unit::generated(
+                    c.source.clone(),
+                    comparator,
+                    c.source.clone(),
+                    String::new(),
+                ));
+            }
+            None => {
                 for n in c.notes {
                     restore(&mut segments[seg], n);
                 }
@@ -634,12 +650,12 @@ fn convert_misses(
                 }
             }
         } else {
-            if declined.contains(&id) {
-                if let Some(k) = &key {
-                    let _ = cache.put(k, &Entry::Negative);
-                }
+            // A decline is placed as one, this turn as on a later cache hit.
+            let entry = declined.contains(&id).then_some(Entry::Negative);
+            if let (Some(k), Some(e)) = (&key, &entry) {
+                let _ = cache.put(k, e);
             }
-            out.placed.push((c.seg, None, c));
+            out.placed.push((c.seg, entry, c));
         }
     }
     if over_input_budget > 0 {

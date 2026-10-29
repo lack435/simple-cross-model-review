@@ -5,6 +5,7 @@
 //! argv fragment or shell command.
 
 mod core;
+pub mod generated;
 mod git;
 
 use std::collections::HashSet;
@@ -376,6 +377,11 @@ pub struct Bundle {
     /// paths through `crate::lfs` (issue #150). Defaulted for the same reason as `page_bytes_ceiling`.
     #[serde(default)]
     pub worktree_lfs: bool,
+    /// The capture hook's cache for this turn (issue #174), git only: every composition of the whole
+    /// change appends the generated text it holds. The child only reads the cache; the parent filled
+    /// it before the turn. Defaulted for the same reason as `page_bytes_ceiling`.
+    #[serde(default)]
+    pub capture_hook: Option<generated::GitCaptureHook>,
 }
 
 impl Bundle {
@@ -407,12 +413,14 @@ impl Bundle {
         // a vendored engine tree is enough -- failed here and took the whole review with it.
         let initial_stamp = core::initial_stamp(&canonical, &limits, vcs.into());
         let is_git = vcs == crate::config::Vcs::Git;
-        let worktree_autocrlf = if is_git {
-            git::effective_autocrlf(&canonical)
+        let Staging {
+            autocrlf: worktree_autocrlf,
+            lfs: worktree_lfs,
+        } = if is_git {
+            git_staging(&canonical)
         } else {
-            None
+            Staging::default()
         };
-        let worktree_lfs = is_git && git::native_lfs_filter(&canonical);
         let bundle = Self {
             schema_version: SCHEMA_VERSION,
             nonce: nonce.to_string(),
@@ -426,6 +434,7 @@ impl Bundle {
             page_bytes_ceiling,
             worktree_autocrlf,
             worktree_lfs,
+            capture_hook: None,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -596,7 +605,9 @@ pub fn write_claude_mcp_config(
 pub use core::read_contained_file;
 /// The converged-hook binding check's two git reads (issue #142), exposed from the private `core`
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
-pub use core::{committed_change_digest, resolve_head};
+pub use core::{
+    branch_base, committed_change_digest, contained_worktree_file, resolve_head, untracked_binaries,
+};
 pub use git::{ignores_untracked, list_worktrees, tracks_under};
 
 /// Whether an MCP server name is one of this server's evidence servers: the working root's
@@ -632,6 +643,16 @@ fn capability_dir(cfg: &crate::config::Config) -> Result<PathBuf, EvidenceError>
 /// under the state directory when that is outside the working root and inside no git repository,
 /// else under the system temp directory. The capture hook's cache and temp directories live here, so
 /// neither can land where git would list it as part of a reviewed change.
+/// The staging overrides a git checkout's served diff is composed with: its effective
+/// `core.autocrlf` and whether an LFS filter applies. The bundle and the capture hook's prefill both
+/// take them from here, so they list the same binary files.
+pub fn git_staging(root: &Path) -> Staging {
+    Staging {
+        autocrlf: git::effective_autocrlf(root),
+        lfs: git::native_lfs_filter(root),
+    }
+}
+
 pub fn server_owned_dir(cfg: &crate::config::Config, name: &str) -> Result<PathBuf, EvidenceError> {
     safe_subdir(cfg, name).map(crate::config::normalize_dir)
 }

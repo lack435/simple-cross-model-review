@@ -17,6 +17,7 @@
   .\smoke.ps1 -Reviewer codex -ProveBlockRepair
   .\smoke.ps1 -Reviewer codex -OnEvent
   .\smoke.ps1 -Reviewer claude -Companion
+  .\smoke.ps1 -Reviewer codex -CaptureHook
 #>
 [CmdletBinding()]
 param(
@@ -53,7 +54,13 @@ param(
     # Also configure a scratch companion repository (issue #167) beside this checkout and run one
     # review that declares it: the reviewer must read a marker that exists only in the companion's
     # change, through the companion's own evidence server. Costs one more review turn.
-    [switch]$Companion
+    [switch]$Companion,
+
+    # Also configure a capture hook (issue #174) and drop an untracked binary file into this
+    # checkout for the run: the reviewer must quote a marker that exists only in the converter's
+    # generated text, never in any file it can read. Costs one more review turn. The file is
+    # removed when the smoke ends.
+    [switch]$CaptureHook
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +146,33 @@ if ($Companion) {
     # The change: one untracked file whose only copy of the marker is in the companion.
     Set-Content -LiteralPath (Join-Path $companionDir 'generated.txt') -Value $companionMarker -Encoding ASCII
     $serverArgs += @('--companion', "smokeasset=$companionDir")
+}
+
+# The capture hook's binary lives in this checkout (untracked, uniquely named, removed in the
+# finally block); its converter lives in the state directory, outside every reviewed tree, so the
+# marker it writes is reachable only through the generated text.
+$captureAsset = $null
+$captureMarker = "CAPTURE-HOOK-MARKER-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+if ($CaptureHook) {
+    New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+    $assetName = "cross-review-smoke-asset-$PID.bin"
+    $captureAsset = Join-Path $PSScriptRoot $assetName
+    [IO.File]::WriteAllBytes($captureAsset, [byte[]](0x53, 0x00, 0x4D, 0x00, 0x4B, 0xFF))
+    $converter = Join-Path $stateDir 'convert.ps1'
+    @"
+`$in = [Console]::In.ReadToEnd() | ConvertFrom-Json
+`$files = @()
+foreach (`$f in `$in.files) {
+    `$out = Join-Path `$in.temp_dir ("`$(`$f.id)-modified.txt")
+    [IO.File]::WriteAllText(`$out, "asset $captureMarker``n")
+    `$files += @{ id = `$f.id; path = (`$f.path + '.txt'); modified_text_file = `$out }
+}
+@{ files = `$files } | ConvertTo-Json -Depth 5 -Compress
+"@ | Set-Content -LiteralPath $converter -Encoding UTF8
+    $serverArgs += @('--capture-hook', 'powershell.exe', '--capture-hook-arg', '-NoProfile',
+        '--capture-hook-arg', '-ExecutionPolicy', '--capture-hook-arg', 'Bypass',
+        '--capture-hook-arg', '-File', '--capture-hook-arg', $converter,
+        '--capture-hook-glob', $assetName)
 }
 
 Write-Host "==> launching: $Exe $($serverArgs -join ' ')" -ForegroundColor Cyan
@@ -631,6 +665,44 @@ MARKER=<the complete marker you read in the companion's diff>
         Write-Host $compResult
     }
 
+    if ($CaptureHook) {
+        Write-Host "`n=== 5e. a review whose change includes generated text ===" -ForegroundColor Cyan
+        $captureInstructions = @'
+This is an automated smoke test of the capture hook. Do not review any code. Do not use the shell.
+Call repository_diff with base "branch-base" and head "worktree" and page it to the end. The diff ends
+with a "# generated text (from binary files)" section, converted from an untracked binary file whose
+name begins cross-review-smoke-asset-. That text contains a marker beginning CAPTURE-HOOK-MARKER-.
+Reply with exactly two lines and nothing else:
+SMOKE-CAPTURE-OK
+MARKER=<the complete marker you read in the generated text>
+'@
+        $capStart = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{ instructions = $captureInstructions; session = 'smoke-capture-hook' }
+        } -TimeoutSeconds 120
+        $capStartText = Get-ToolText $capStart
+        Assert-That 'capture-hook review start is not an error' ($capStart.result.isError -eq $false) $capStartText
+        $capId = ([regex]::Match($capStartText, 'review_id:\s*(\S+)')).Groups[1].Value
+        Assert-That 'a capture-hook review_id was returned' (-not [string]::IsNullOrWhiteSpace($capId)) $capStartText
+
+        $capCollected = $null
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            $capCollected = Send-Rpc -Method 'tools/call' -Params @{
+                name      = 'cross_model_review_result'
+                arguments = @{ review_id = $capId; wait_seconds = 120 }
+            } -TimeoutSeconds 300
+            $text = Get-ToolText $capCollected
+            if ($text -notmatch 'status:\s+running') { break }
+            Write-Host "  still running (poll $attempt)" -ForegroundColor DarkGray
+        }
+        $capResult = Get-ToolText $capCollected
+        Assert-That 'capture-hook review completed' ($capResult -match 'status:\s+completed') $capResult
+        Assert-That 'the reviewer answered the capture-hook smoke' ($capResult -match 'SMOKE-CAPTURE-OK') $capResult
+        Assert-That 'the reviewer read the marker only the generated text holds' `
+            ($capResult -match [regex]::Escape($captureMarker)) $capResult
+        Write-Host $capResult
+    }
+
     Write-Host "`n=== 6. error handling ===" -ForegroundColor Cyan
     $bad = Send-Rpc -Method 'tools/call' -Params @{
         name = 'cross_model_review'; arguments = @{ session = 'nope' }
@@ -846,6 +918,7 @@ finally {
     }
     Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($companionDir) { Remove-Item $companionDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($captureAsset) { Remove-Item -LiteralPath $captureAsset -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''

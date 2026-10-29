@@ -1961,6 +1961,13 @@ fn render(
                  review.\n\n",
             );
             for unit in &generated {
+                if unit.body.is_empty() {
+                    out.push_str(&format!(
+                        "No generated text for {} (declined by the capture hook).\n\n",
+                        safe_label(&unit.depot)
+                    ));
+                    continue;
+                }
                 out.push_str(&format!(
                     "##### {}  (from {})\n\n",
                     safe_label(&unit.local),
@@ -4012,6 +4019,30 @@ Change 5 by u@c on 2026/01/01\n\n\
                 rendered_again.contains(want),
                 "missing {want:?} on the cached capture"
             );
+        }
+
+        // A change of converted and declined files only is complete, saves a baseline, and
+        // collapses on a resume (a declined file never made it incomplete).
+        if var("CROSS_REVIEW_P4_TEST_HOOK_RESUME").is_some() {
+            let summary = &cap.change.as_ref().expect("a capture").summary;
+            assert!(summary.is_complete(), "incomplete: {rendered}");
+            let saved = cap.perforce_baseline.clone().expect("a baseline");
+            assert!(
+                matches!(saved, baseline::PerforceBaseline::Full { .. }),
+                "no resume baseline was saved"
+            );
+            let identity = cap.capture_identity.clone().expect("an identity");
+            let resume = PerforceResume {
+                baseline: &saved,
+                identity: Some(&identity),
+                include_shelved: Some(include_shelved),
+            };
+            let resumed = capture(&cfg, &changes, include_shelved, Some(resume), &cancel);
+            let resumed = resumed.change.expect("a resumed capture").rendered;
+            eprintln!("----- resumed capture -----\n{resumed}");
+            assert!(resumed.contains("unchanged since your previous turn"));
+            assert!(resumed.contains("(declined by the capture hook)"));
+            assert_eq!(runs(), 1, "a resume must not run the converter again");
         }
     }
 

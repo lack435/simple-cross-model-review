@@ -111,6 +111,32 @@ findings from a real p4d (2025.2, `test-perforce-capture-hook.ps1`):
 - **`--capture-hook` with no `--capture-hook-glob` is a startup error.** Without a glob the hook could
   never be offered a file, so this is refused rather than left silently inert.
 
+**Implementation notes (PR 2: git).** Built as planned in item 7, with these decisions:
+
+- **One derivation, three callers.** `src/evidence/generated.rs` derives the binary inputs, digests
+  each side and composes the section. The parent's prefill, the child's `repository_diff` and the
+  binding's `committed_change_digest` all call it, so they cannot drift apart. Digests are
+  `sha256:<hex>` of raw bytes, the same form as Perforce's local sides. Blob digests are memoized by
+  object id, since a blob never changes.
+- **Containment.** A worktree side is digested and snapshotted only after it resolves inside the
+  working root through the handle-checked open the evidence reads use. A side that does not (a link
+  leading out) is excluded exactly like an oversized one, so a converter is never handed bytes from
+  outside the root.
+- **Where the section appears.** Only in a whole-change composition (`path` empty) with a worktree,
+  `HEAD` or commit head. An index head is exploratory and never binds, so it gets none.
+- **The untracked rule is hook-scoped.** An untracked file is listed as binary only when a glob
+  matches it, so without `--capture-hook` the composition is byte-identical to before.
+- **Prefill runs once per turn**, before the first reviewer attempt, for every git review and consult
+  when a hook is configured. Its warnings reach the caller and `status_summary`. Declared companion
+  repositories are not converted in this PR.
+- **Declined files no longer make a Perforce capture incomplete** (maintainer comment on #174,
+  2026-10-29). A converter often declines most files its glob matches, for example art beside
+  logic assets, and the old behaviour then cost every mixed change its resume baseline. A declined
+  file is now listed in one line and the segment stays complete, as on git. Files nothing examined
+  stay incomplete: over the size limit, a dropped record, a failed run, or over budget. A first-time
+  decline was also left as an omission (only a cache hit placed it); it is now placed on both paths.
+  Verified on a real p4d, including the resume baseline and the collapse.
+
 **Amendment (r7, maintainer feedback after convergence).** The maintainer, who runs a converter
 (an Unreal commandlet) against real changelists of 39–66 open files and hundreds of MB of art, raised
 seven points. All are adopted here, and the implementation PR's review covers this amendment.
