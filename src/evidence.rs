@@ -1322,7 +1322,9 @@ pub fn tool_definitions() -> Vec<Value> {
             "Read one revision. Git: 'id' is a full commit id, shown with its patch (narrowed to \
              'path' if given). Perforce: 'id' is a changelist number; without 'path' the changelist \
              is described with its diffs, with 'path' it is that file's content as of the \
-             changelist.",
+             changelist. A shelved changelist is read as its shelved files; a pending changelist \
+             that is not shelved has no content on the server and is refused (read the change \
+             under review with repository_change, or a workspace file with repository_read).",
             &[
                 ("id", "string"),
                 ("path", "string"),
@@ -1340,7 +1342,10 @@ pub fn tool_definitions() -> Vec<Value> {
              review the whole change, diff 'branch-base'..'worktree'; narrow with 'path' for focus. \
              Perforce: exploratory only, since the change under review is repository_change; \
              'path' and a 'base' changelist number are required, and 'head' is a changelist number \
-             or 'worktree' (the default).",
+             or 'worktree' (the default, this workspace's files). A submitted changelist is that \
+             point in history and a shelved one its shelved files; a pending changelist that is \
+             not shelved is refused, since its edits exist only in its workspace: to see this \
+             workspace's pending edits, omit 'head'.",
             &[
                 ("base", "string"),
                 ("head", "string"),

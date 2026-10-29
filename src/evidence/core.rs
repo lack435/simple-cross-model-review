@@ -3562,7 +3562,8 @@ mod tests {
 
     /// Live Perforce history/revision/diff (issue #183), driven by test-perforce-evidence.ps1 on a
     /// disposable p4d. `CROSS_REVIEW_P4_TEST_EVIDENCE` names the two submitted changelists that
-    /// edited `a.txt` (`first,second`); the workspace holds a third, pending edit of it.
+    /// edited `a.txt`, a pending changelist holding a third edit of it, and a shelved changelist
+    /// editing `b.txt` (`first,second,pending,shelved`; issue #188).
     #[test]
     fn live_perforce_history_revision_and_diff() {
         let (Ok(changes), Ok(cwd)) = (
@@ -3572,7 +3573,9 @@ mod tests {
             eprintln!("skipping live Perforce evidence test: set CROSS_REVIEW_P4_TEST_EVIDENCE");
             return;
         };
-        let (first, second) = changes.split_once(',').expect("first,second");
+        let [first, second, pending, shelved] = changes.split(',').collect::<Vec<_>>()[..] else {
+            panic!("expected first,second,pending,shelved: {changes}");
+        };
         let root = Path::new(&cwd);
         let cancel = AtomicBool::new(false);
         let mut bundle = bundle_for(root, VcsKind::Perforce);
@@ -3628,6 +3631,76 @@ mod tests {
             workspace.contains("-version two") && workspace.contains("+version three"),
             "{workspace}"
         );
+
+        // Issue #188: a pending changelist is never read as the submitted revision below it. One
+        // that is not shelved is refused with what to use instead; a shelved one is its shelf.
+        let refused = core
+            .call(
+                "repository_diff",
+                &json!({"path":"a.txt","base":second,"head":pending}),
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments", "{}", refused.message);
+        assert!(
+            refused.message.contains("omit 'head'"),
+            "{}",
+            refused.message
+        );
+        let refused = core
+            .call("repository_diff", &json!({"path":"a.txt","base":pending}))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments", "{}", refused.message);
+        let refused = core
+            .call("repository_revision", &json!({"id":pending,"path":"a.txt"}))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments", "{}", refused.message);
+        assert!(
+            refused.message.contains("repository_read"),
+            "{}",
+            refused.message
+        );
+        // With no path too: describe would list its files with no diffs, as if it edited nothing.
+        let refused = core
+            .call("repository_revision", &json!({"id":pending}))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments", "{}", refused.message);
+        assert!(
+            refused.message.contains("repository_change"),
+            "{}",
+            refused.message
+        );
+        let shelf = core
+            .call(
+                "repository_diff",
+                &json!({"path":"b.txt","base":first,"head":shelved}),
+            )
+            .unwrap();
+        let shelf = shelf["diff"].as_str().unwrap();
+        assert!(
+            shelf.contains("-bee") && shelf.contains("+bee shelved"),
+            "{shelf}"
+        );
+        let shelf_file = core
+            .call("repository_revision", &json!({"id":shelved,"path":"b.txt"}))
+            .unwrap();
+        assert_eq!(
+            shelf_file["content"],
+            "bee shelved
+",
+            "{shelf_file}"
+        );
+        let shelf_described = core
+            .call("repository_revision", &json!({"id":shelved}))
+            .unwrap();
+        let shelf_described = shelf_described["content"].as_str().unwrap();
+        assert!(
+            shelf_described.contains("+bee shelved"),
+            "{shelf_described}"
+        );
+        let missing = core
+            .call("repository_revision", &json!({"id":"999999"}))
+            .unwrap_err();
+        assert_eq!(missing.code, "invalid_arguments", "{}", missing.message);
         eprintln!("PASS: live Perforce history, revision and diff");
     }
 
