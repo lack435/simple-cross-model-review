@@ -4662,7 +4662,11 @@ impl Job {
                         .is_some_and(|h| h.content_call_succeeded);
                 let floor_unmet = !looked_at_something
                     || (assessment.provisional_approve()
-                        && (!agg.complete_canonical_terminal || !unmet_companions.is_empty()));
+                        && !whole_change_served(
+                            agg.complete_canonical_terminal,
+                            &unmet_companions,
+                            false,
+                        ));
                 if floor_unmet {
                     if let Some(target) = repair_target.as_deref() {
                         // Attempted-but-unconfirmed until a structured re-review clears it.
@@ -4782,11 +4786,13 @@ impl Job {
                     || evidence_health
                         .as_ref()
                         .is_some_and(|h| h.content_call_succeeded);
-                let complete_canonical = agg.complete_canonical_terminal
-                    && unmet_companions.is_empty()
-                    // An unconfirmed repair (attempted, no usable re-review) cannot re-affirm an
-                    // approval even if it pulled the diff, so the whole-change proof is withheld.
-                    && !evidence_repair_unconfirmed;
+                // An unconfirmed repair (attempted, no usable re-review) cannot re-affirm an
+                // approval even if it pulled the diff, so the whole-change proof is withheld.
+                let complete_canonical = whole_change_served(
+                    agg.complete_canonical_terminal,
+                    &unmet_companions,
+                    evidence_repair_unconfirmed,
+                );
                 let floored = crate::findings::apply_evidence_floor(
                     turn_eval,
                     crate::findings::EvidenceCoverage {
@@ -5208,26 +5214,15 @@ impl Job {
         // Each declared companion repository's served change (issue #167), read from its own serve
         // record while it still exists. A companion with none leaves the whole turn unattestable:
         // the hook must never fire on a review that bound only some of its repositories.
-        let served_companions: Option<Vec<crate::hook::ServedCompanion>> = match &evidence_setup {
-            Some((.., companions)) if served.is_some() => companions
-                .iter()
-                .map(|e| {
-                    served_change(
-                        &read_serve_record_aggregate(&self.cfg, &e.nonce),
-                        e.autocrlf,
-                    )
-                    .map(|served| crate::hook::ServedCompanion {
-                        name: e.companion.name.clone(),
-                        root: e.companion.root.clone(),
-                        served,
-                    })
-                })
-                .collect(),
-            _ => Some(Vec::new()),
-        };
-        let (served, served_companions) = match served_companions {
-            Some(list) => (served, list),
-            None => (None, Vec::new()),
+        let (served, served_companions) = match &evidence_setup {
+            Some((.., companions)) => bind_served(
+                &self.cfg,
+                served,
+                companions
+                    .iter()
+                    .map(|e| (&e.companion, e.nonce.as_str(), e.autocrlf)),
+            ),
+            None => (served, Vec::new()),
         };
 
         Ok(Outcome {
@@ -5486,7 +5481,10 @@ fn resume_block(
     // A session follows one set of companion repositories (issue #167), name and root alike: the
     // reviewer's conversation holds what it was served from exactly those, and a different set is
     // different work. `None` on either side is the empty set, so a record from before companions
-    // existed resumes unchanged under a call that declares none.
+    // existed resumes unchanged under a call that declares none. Roots compare exactly, not
+    // case-folded: both sides are canonical on-disk spellings (`companion::resolve_all`), so one
+    // directory always spells the same, while two spellings differing only by case are two
+    // directories in a case-sensitive tree, and the session must not move between them.
     let requested = session::CompanionBinding::from_declared(&cfg.declared_companions);
     let bound = record.companions.as_deref().unwrap_or(&[]);
     let wanted = requested.as_deref().unwrap_or(&[]);
@@ -5494,7 +5492,7 @@ fn resume_block(
         && bound
             .iter()
             .zip(wanted)
-            .all(|(b, w)| b.name == w.name && crate::pathcmp::identity_eq_str(&b.root, &w.root));
+            .all(|(b, w)| b.name == w.name && b.root == w.root);
     if !same_set {
         let show = |set: &[session::CompanionBinding]| {
             if set.is_empty() {
@@ -5686,6 +5684,56 @@ fn resume_block(
 /// `turn_not_durable` are recorded as ledger coverage, and promoting either here would turn one
 /// degraded turn into a permanently dead session. Behaviour for `ledger_too_large` is unchanged,
 /// because an over-budget turn always reports it at rank 0.
+/// The whole-change proof an approval needs (issue #167 extends it to companions): the working
+/// root's complete canonical diff, every declared companion's (none left in `unserved`), and no
+/// evidence repair left unconfirmed.
+fn whole_change_served(
+    primary_complete: bool,
+    unserved: &[crate::companion::Companion],
+    repair_unconfirmed: bool,
+) -> bool {
+    primary_complete && unserved.is_empty() && !repair_unconfirmed
+}
+
+/// Bind a turn's served change for the converged hook: the working root's `served`, plus each
+/// declared companion's, read from that companion's own serve record (by its nonce) while it still
+/// exists. All or nothing: if any companion has no complete served change, `served` is cleared too,
+/// so the turn cannot be attested and the hook can never fire on a review that bound only some of
+/// its repositories.
+fn bind_served<'a>(
+    cfg: &Config,
+    served: Option<crate::hook::ServedChange>,
+    companions: impl Iterator<
+        Item = (
+            &'a crate::companion::Companion,
+            &'a str,
+            Option<crate::evidence::AutoCrlf>,
+        ),
+    >,
+) -> (
+    Option<crate::hook::ServedChange>,
+    Vec<crate::hook::ServedCompanion>,
+) {
+    let Some(served) = served else {
+        return (None, Vec::new());
+    };
+    let bound: Option<Vec<crate::hook::ServedCompanion>> = companions
+        .map(|(c, nonce, autocrlf)| {
+            served_change(&read_serve_record_aggregate(cfg, nonce), autocrlf).map(|served| {
+                crate::hook::ServedCompanion {
+                    name: c.name.clone(),
+                    root: c.root.clone(),
+                    served,
+                }
+            })
+        })
+        .collect();
+    match bound {
+        Some(list) => (Some(served), list),
+        None => (None, Vec::new()),
+    }
+}
+
 /// The companions `cfg` declares whose own serve record (named from the companion's nonce for
 /// `review_id`) does not show a complete, terminal, agreeing canonical diff. See
 /// [`Job::companions_not_served`].
@@ -7563,16 +7611,18 @@ mod tests {
             "{reason}"
         );
 
-        // The same set resumes regardless of declaration order, and a case-only root difference is
-        // the same root.
+        // The same set resumes regardless of declaration order.
         let mut bound = record_matching(&cfg, 1, now);
         bound.companions =
             session::CompanionBinding::from_declared(&[docs.clone(), assets.clone()]);
-        let reordered = with(vec![companion("assets", r"c:/DEV/assets"), docs.clone()]);
+        let reordered = with(vec![assets.clone(), docs.clone()]);
         assert!(resume_block(&reordered, &bound, &[], session::KIND_REVIEW, false, now).is_none());
 
-        // Dropping one, or the same name at a different root, is refused.
+        // Dropping one, the same name at a different root, or at a root differing only by case (a
+        // distinct directory in a case-sensitive tree; canonical roots never differ by case for one
+        // directory) is refused.
         for call in [
+            with(vec![companion("assets", r"C:\dev\ASSETS"), docs.clone()]),
             with(vec![assets.clone()]),
             with(vec![
                 companion("assets", r"C:\elsewhere\assets"),
@@ -10653,5 +10703,114 @@ mod captured_summary_tests {
             names(unserved_companions(&cfg, "rv-167-2")),
             ["assets", "docs"]
         );
+    }
+
+    /// Issue #167, the wiring: an APPROVE served only the working root's diff is downgraded to
+    /// `changes_requested` / `evidence_incomplete` by the real floor; one served every repository's
+    /// converges.
+    #[test]
+    fn an_approval_converges_only_when_every_declared_repository_was_served() {
+        const APPROVE: &str = r#"{"verdict":"approve","prior_findings":[],"new_findings":[]}"#;
+        let nonce = "rv-167-3";
+        let assets = crate::companion::Companion {
+            name: "assets".into(),
+            root: std::path::PathBuf::from(r"C:\dev\assets"),
+        };
+        let floor = |complete_canonical: bool| {
+            let eval = crate::findings::evaluate_turn_for_test(
+                "s",
+                1,
+                nonce,
+                &crate::findings::block_text_for_test(nonce, APPROVE),
+            );
+            crate::findings::apply_evidence_floor(
+                eval,
+                crate::findings::EvidenceCoverage {
+                    looked_at_something: true,
+                    complete_canonical,
+                },
+            )
+            .envelope
+        };
+
+        let primary_only = floor(whole_change_served(
+            true,
+            std::slice::from_ref(&assets),
+            false,
+        ));
+        assert_eq!(
+            primary_only.outcome,
+            crate::findings::Outcome::ChangesRequested
+        );
+        assert_eq!(
+            primary_only.non_convergence_reason,
+            Some(crate::findings::NonConvergenceReason::EvidenceIncomplete)
+        );
+        assert_eq!(
+            floor(whole_change_served(true, &[], false)).outcome,
+            crate::findings::Outcome::Converged
+        );
+        // A companion missing, the root missing, or an unconfirmed repair each withhold the proof.
+        assert!(!whole_change_served(false, &[], false));
+        assert!(!whole_change_served(true, &[], true));
+    }
+
+    /// Issue #167, the hook binding: a served root binds only if every declared companion was
+    /// served too; otherwise the turn is left unattestable (`served` cleared).
+    #[test]
+    fn a_turn_binds_for_the_hook_only_when_every_companion_was_served() {
+        let state = crate::testutil::temp_dir("companion-bind-served");
+        let cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+            "--state-dir".into(),
+            state.as_path().to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let assets = crate::companion::Companion {
+            name: "assets".into(),
+            root: std::path::PathBuf::from(r"C:\dev\assets"),
+        };
+        let docs = crate::companion::Companion {
+            name: "docs".into(),
+            root: std::path::PathBuf::from(r"C:\dev\docs"),
+        };
+        let root_served = served_change(&aggregate_serve_records(&canonical_op(true)), None);
+        assert!(root_served.is_some());
+        let write = |nonce: &str, body: String| {
+            let path = crate::evidence::serve_record_path(&cfg, nonce).expect("path");
+            std::fs::write(&path, body).unwrap();
+            crate::evidence::BundleFile { path }
+        };
+        let _assets = write("rv-167-4-c-assets", canonical_op(true));
+        let both = [
+            (&assets, "rv-167-4-c-assets", None),
+            (&docs, "rv-167-4-c-docs", None),
+        ];
+
+        // `docs` has no serve record: nothing binds, so the hook reports no_canonical_diff.
+        let (served, companions) = bind_served(&cfg, root_served.clone(), both.into_iter());
+        assert!(served.is_none() && companions.is_empty());
+
+        // Once `docs` was served too, both bind beside the root.
+        let _docs = write("rv-167-4-c-docs", canonical_op(true));
+        let (served, companions) = bind_served(&cfg, root_served.clone(), both.into_iter());
+        assert!(served.is_some());
+        assert_eq!(
+            companions
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["assets", "docs"]
+        );
+
+        // An unserved root binds nothing, whatever the companions show.
+        let (served, companions) = bind_served(&cfg, None, both.into_iter());
+        assert!(served.is_none() && companions.is_empty());
+        // No companions: the root binds alone, exactly as before.
+        let (served, companions) = bind_served(&cfg, root_served, std::iter::empty());
+        assert!(served.is_some() && companions.is_empty());
     }
 }

@@ -261,6 +261,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn companions_need_reviewer_isolation() {
+        let l = layout("companion-isolation");
+        let err = crate::config::Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+            "--cwd".into(),
+            l.primary.to_string_lossy().into_owned(),
+            "--state-dir".into(),
+            l.state.to_string_lossy().into_owned(),
+            "--allow-reviewer-config".into(),
+            "--companion".into(),
+            format!("assets={}", l.assets.display()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--allow-reviewer-config"), "{err}");
+    }
+
+    #[test]
     fn names_follow_the_grammar() {
         for good in ["a", "assets", "art-2", "abcdefghijklmnop"] {
             validate_name(good).unwrap();

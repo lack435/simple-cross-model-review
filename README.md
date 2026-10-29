@@ -237,7 +237,8 @@ approval gate covers it too: an approve converges only if the complete change of
 committed change still matches. A companion must be a git top level reached without junctions or
 symlinks, separate from the working root and other companions, and disjoint from the state and temp
 directories; anything else is refused at startup. The calling agent can only name a configured
-companion, never a path, and the session is bound to the set it declared. Companions are git only.
+companion, never a path, and the session is bound to the set it declared. Companions are git only
+and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
 Design: [`docs/companion-repositories-plan.md`](docs/companion-repositories-plan.md).
 
 For **Perforce** (`--vcs perforce`, or `auto` in a workspace with no `.git`), the change is an

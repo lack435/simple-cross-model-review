@@ -1467,6 +1467,17 @@ impl Config {
                 state_dir.display()
             ));
         }
+        // Companion evidence servers are recognised by name shape (`evidence::is_evidence_server`),
+        // which is sound only while the reviewer loads no MCP server of its own: Codex runs with
+        // `--ignore-user-config` and Claude's evidence path with `--strict-mcp-config`, both of which
+        // `--allow-reviewer-config` turns off. Refuse the combination rather than widen the parsers.
+        if !companion_args.is_empty() && !isolate_reviewer {
+            return Err(
+                "--companion needs reviewer isolation; it cannot be combined with \
+                 --allow-reviewer-config"
+                    .to_string(),
+            );
+        }
         // Resolved last, once the state directory every companion must stay disjoint from is known.
         let companions = crate::companion::resolve_all(
             &companion_args,
@@ -2519,7 +2530,8 @@ COMPANION REPOSITORIES (issue #167; off unless --companion is given):
                               a relative <path> is under the working root. The path must
                               be a git toplevel reached without junctions or symlinks,
                               separate from the working root and other companions, and
-                              disjoint from the state and temp directories. Git only.
+                              disjoint from the state and temp directories. Git only;
+                              not with --allow-reviewer-config.
 
 LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
   --on-event <program>        Run <program> for every review and consult turn that
