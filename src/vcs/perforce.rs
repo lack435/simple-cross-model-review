@@ -3125,7 +3125,7 @@ mod tests {
     fn select_client_takes_the_host_matched_longest_root() {
         let clients = vec![
             spec("outer", "C:\\work\\project", "BUILDHOST"),
-            spec("nested", "C:\\work\\project\\Bobcat", "BUILDHOST"),
+            spec("nested", "C:\\work\\project\\Game", "BUILDHOST"),
             spec("otherbox", "C:\\work\\project", "OTHERBOX"),
         ];
         // Under the outer root but not the nested one -> outer wins.
@@ -3135,7 +3135,7 @@ mod tests {
         ));
         // Under the nested root -> the deeper client wins.
         assert!(matches!(
-            select_client(&clients, Path::new("C:\\work\\project\\Bobcat\\Sub"), "BUILDHOST"),
+            select_client(&clients, Path::new("C:\\work\\project\\Game\\Sub"), "BUILDHOST"),
             ClientChoice::One(c) if c.client == "nested"
         ));
     }

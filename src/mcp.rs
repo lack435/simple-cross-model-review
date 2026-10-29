@@ -1545,7 +1545,7 @@ mod tests {
             "--level".into(),
             "standard:claude-opus-4-8:medium".into(),
             "--claude-profile".into(),
-            "ruckus".into(),
+            "work".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -1555,7 +1555,7 @@ mod tests {
             .find(|tool| tool["name"] == "cross_model_setup_profile")
             .unwrap();
         let description = setup["description"].as_str().unwrap();
-        assert!(description.contains("claude profile:ruckus"));
+        assert!(description.contains("claude profile:work"));
         assert!(description.contains("unconfigured targets are rejected"));
     }
 
