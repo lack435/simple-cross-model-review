@@ -758,6 +758,19 @@ fn is_client_spec(raw: &str, client: &str) -> bool {
     field_value("Client:").as_deref() == Some(client) && field_value("Root:").is_some()
 }
 
+/// A normalized client spec without the two fields the server rewrites on its own: `Access:`, which
+/// moves forward whenever the client is used (every capture uses it), and `Update:`, the time the
+/// spec was last saved. Hashing them made the identity differ between almost every pair of turns,
+/// so incremental resume always fell back (issue #181). Every field that changes what a capture sees
+/// (`Root`, `AltRoots`, `Options`, `LineEnd`, `View`, `Stream`, ...) is kept. Field names start a
+/// line; a multi-line value (a `Description`) is indented, so its text is never mistaken for one.
+fn spec_for_digest(spec: &str) -> String {
+    spec.lines()
+        .filter(|line| !line.starts_with("Access:") && !line.starts_with("Update:"))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 /// Resolve the capture identity a resume binds to: the server, client, charset, and a digest of
 /// the canonical client spec (which folds in the view, root and `AltRoots`). The spec digest is
 /// `None` when `p4 client -o` fails or decodes lossily, which makes the identity unconfirmed and
@@ -780,7 +793,7 @@ fn resolve_capture_identity(p4: &P4, info: &Info) -> baseline::CaptureIdentity {
         .filter(|out| {
             out.success && !out.stdout_untrustworthy() && is_client_spec(&out.stdout, &info.client)
         })
-        .and_then(|out| Fingerprint::of(normalize(&out.stdout).as_bytes()))
+        .and_then(|out| Fingerprint::of(spec_for_digest(&normalize(&out.stdout)).as_bytes()))
         .map(|fp| fp.sha256);
     baseline::CaptureIdentity {
         server: info.server.clone(),
@@ -3294,6 +3307,46 @@ Change 5 by u@c on 2026/01/01\n\n\
         assert!(is_client_spec("Client:\tws\nRoot:\tnull\n", "ws"));
     }
 
+    /// The server's own timestamps do not change the digested spec; every field a capture depends on
+    /// does (issue #181).
+    #[test]
+    fn the_spec_digest_ignores_the_servers_timestamps() {
+        let spec = |stamps: &str, root: &str, view: &str| {
+            format!(
+                "# A Perforce Client Specification.\n\nClient:\tws\n\n{stamps}Owner:\tme\n\n\
+                 Description:\n\tAccess: in a description is text\n\nRoot:\t{root}\n\n\
+                 Options:\tnoallwrite noclobber\n\nView:\n\t{view}\n"
+            )
+        };
+        let view = "//depot/... //ws/...";
+        let a = spec(
+            "Update:\t2026/10/01 09:00:00\n\nAccess:\t2026/10/29 07:00:00\n\n",
+            "C:\\ws",
+            view,
+        );
+        let later = spec(
+            "Update:\t2026/10/02 09:00:00\n\nAccess:\t2026/10/29 07:19:51\n\n",
+            "C:\\ws",
+            view,
+        );
+        assert_eq!(spec_for_digest(&a), spec_for_digest(&later));
+        assert!(!spec_for_digest(&a).contains("2026/10"));
+        // A new client has neither line, and hashes exactly as its normalized spec did before.
+        let new = spec("", "C:\\ws", view);
+        assert_eq!(spec_for_digest(&new), new);
+        // A description line that merely reads like a field is kept.
+        assert!(spec_for_digest(&a).contains("\tAccess: in a description is text"));
+        // A field a capture depends on still changes the digested spec.
+        assert_ne!(
+            spec_for_digest(&a),
+            spec_for_digest(&spec("", "D:\\ws", view))
+        );
+        assert_ne!(
+            spec_for_digest(&a),
+            spec_for_digest(&spec("", "C:\\ws", "//depot/main/... //ws/..."))
+        );
+    }
+
     #[test]
     fn a_deleted_files_content_renders_as_an_all_removed_hunk() {
         assert_eq!(removal_hunk("a\nb\n"), "@@ -1,2 +0,0 @@\n-a\n-b\n");
@@ -4032,6 +4085,11 @@ Change 5 by u@c on 2026/01/01\n\n\
                 "no resume baseline was saved"
             );
             let identity = cap.capture_identity.clone().expect("an identity");
+            // Long enough for the server to move the client's Access: time (the harness lowers
+            // dm.domain.accessupdate), which must not break the resume (issue #181).
+            if let Some(gap) = var("CROSS_REVIEW_P4_TEST_RESUME_GAP_SECS") {
+                std::thread::sleep(std::time::Duration::from_secs(gap.parse().unwrap_or(0)));
+            }
             let resume = PerforceResume {
                 baseline: &saved,
                 identity: Some(&identity),
