@@ -13,9 +13,12 @@
 //! A companion is normally a sibling of the working root. It may also sit **inside** it (issue
 //! #170: a vendored engine kept as its own repository and listed in the primary's `.gitignore`), but
 //! only while the primary ignores it. An ignored directory contributes nothing to the primary's diff,
-//! untracked files included, so no file is ever certified by two servers. That is checked at startup
-//! and again every turn, so removing the ignore rule later refuses the companion rather than letting
-//! its files reach both diffs.
+//! untracked files included, and the working root must also track nothing under it (no force-added
+//! file, no gitlink), so no file is ever certified by two servers. That is checked at startup and
+//! again every turn, so removing the ignore rule later refuses the companion rather than letting its
+//! files reach both diffs. Certification rests only on each server's canonical diff; *reading* is
+//! another matter: like any ignored path, a nested companion stays readable by name through the
+//! working root's own evidence tools and read scope, exactly as it was before it was a companion.
 
 use std::path::{Path, PathBuf};
 
@@ -143,7 +146,31 @@ fn check_against_root(name: &str, root: &Path, cwd: &Path) -> Result<(), String>
                 cwd.display()
             )
         })?;
-    match crate::evidence::ignores_untracked(cwd, &rel, &crate::evidence::Limits::default()) {
+    let limits = crate::evidence::Limits::default();
+    // Ignored is not enough on its own: a file force-added under an ignored path, or a gitlink, is
+    // still in the working root's index and so in its diff (review f2).
+    match crate::evidence::tracks_under(cwd, &rel, &limits) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(format!(
+                "companion '{name}' ({}) is inside the working root ({}), which tracks files (or a \
+                 submodule) under `{rel}`; those would be reviewed as part of both repositories. \
+                 Untrack them in the working root (`git rm -r --cached {rel}`), or move the \
+                 companion outside it",
+                root.display(),
+                cwd.display()
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "companion '{name}' ({}) is inside the working root, and whether the working root \
+                 tracks anything under it could not be checked: {}",
+                root.display(),
+                e.message
+            ))
+        }
+    }
+    match crate::evidence::ignores_untracked(cwd, &rel, &limits) {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!(
             "companion '{name}' ({}) is inside the working root ({}) but the working root does not \
@@ -566,6 +593,21 @@ pub(crate) mod tests {
         init_repo(&deep);
         std::fs::write(l.primary.join(".gitignore"), "vendor/\n").unwrap();
         resolve("sdk", &deep).expect("under an ignored parent");
+
+        // A gitlink the working root force-added at the ignored path is in its diff: refused, both
+        // at startup and by the recheck of an already-accepted companion. (Git will not add a file
+        // *inside* a nested repository; a gitlink, or a file tracked before the nested repository
+        // existed, is how the working root comes to track something there.)
+        git(&l.primary, &["add", "-f", "vendor/sdk"]);
+        let err = resolve("sdk", &deep).unwrap_err();
+        assert!(err.contains("tracks files"), "{err}");
+        git(&l.primary, &["rm", "-q", "-f", "--cached", "vendor/sdk"]);
+        let sdk = resolve("sdk", &deep).expect("untracked again");
+        git(&l.primary, &["add", "-f", "vendor/sdk"]);
+        assert!(recheck(&sdk[0], &l.primary, &l.state, &l.temp)
+            .unwrap_err()
+            .contains("tracks files"));
+        git(&l.primary, &["rm", "-q", "-f", "--cached", "vendor/sdk"]);
 
         // A plain subdirectory, even an ignored one, is not a repository.
         let plain = l.primary.join("vendor").join("plain");

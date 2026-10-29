@@ -597,6 +597,15 @@ pub fn ignores_untracked(root: &Path, rel: &str, limits: &Limits) -> Result<bool
         .any(|dir| target.starts_with(dir)))
 }
 
+/// Whether the repository at `root` has any index entry at or under `rel` (root-relative,
+/// `/`-separated): a tracked file, including one force-added under an ignored path, or a gitlink.
+/// Such an entry is part of `root`'s own diff whatever the ignore rules say (issue #170, review f2).
+pub fn tracks_under(root: &Path, rel: &str, limits: &Limits) -> Result<bool, EvidenceError> {
+    let args = ["ls-files", "-z", "--", rel].map(String::from);
+    let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    Ok(out.split('\0').any(|entry| !entry.is_empty()))
+}
+
 /// The merge-base of two commits — the branch's fork point when called as `merge_base(HEAD,
 /// upstream)`. `None` when the two share no history. Both arguments are full object ids the handler
 /// already resolved and validated.

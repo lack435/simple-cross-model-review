@@ -596,7 +596,7 @@ pub fn write_claude_mcp_config(
 /// The converged-hook binding check's two git reads (issue #142), exposed from the private `core`
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
 pub use core::{committed_change_digest, resolve_head};
-pub use git::{ignores_untracked, list_worktrees};
+pub use git::{ignores_untracked, list_worktrees, tracks_under};
 
 /// Whether an MCP server name is one of this server's evidence servers: the working root's
 /// ([`SERVER_NAME`]) or a companion repository's (`<SERVER_NAME>_<name>`, issue #167). Only servers

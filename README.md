@@ -237,9 +237,11 @@ approval gate covers it too: an approve converges only if the complete change of
 committed change still matches. A companion must be a git top level reached without junctions or
 symlinks, separate from other companions, and disjoint from the state and temp directories. It is
 normally a sibling of the working root; it may also sit **inside** it — a vendored engine kept as its
-own repository, say — but only while the working root's `.gitignore` ignores it, so its files never
-reach the working root's diff as well. That is checked at startup and again every turn. Anything
-else is refused. The calling agent can only name a configured
+own repository, say — but only while the working root's `.gitignore` ignores it and the working
+root tracks nothing under it, so its files never reach the working root's diff as well. That is
+checked at startup and again every turn. (Like any ignored path, a nested companion's files stay
+readable by name through the working root's own tools; only its certification moves to its own
+server.) Anything else is refused. The calling agent can only name a configured
 companion, never a path, and the session is bound to the set it declared. Companions are git only
 and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
 Design: [`docs/companion-repositories-plan.md`](docs/companion-repositories-plan.md).
