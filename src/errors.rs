@@ -585,6 +585,30 @@ pub fn reviewer_crashed(reviewer: &str, exit: Option<i32>, detail: impl Into<Str
     .with_detail(detail)
 }
 
+/// The Claude CLI could not refresh its OAuth token because another Claude Code process held the
+/// refresh lock (issue #166). Transient and not an account problem: no model call ran, and the
+/// server retries it on its own (see `Job::run`) before ever reporting this. Reported only once
+/// those retries are spent, still carrying the CLI's own diagnostic.
+pub fn reviewer_busy(reviewer: &str, retries: u32, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWER_BUSY",
+        format!(
+            "The '{reviewer}' CLI could not refresh its sign-in token because another Claude Code \
+             process held the refresh lock; no model call ran."
+        ),
+        format!(
+            "The cross-model review could not start: the '{reviewer}' CLI reported that another \
+             Claude Code process was refreshing its OAuth token, and it was still locked after \
+             {retries} automatic retr{}. This is usually transient and is not a sign-in problem.\n\n\
+             Retry the review in a minute or two. If it keeps happening, close other Claude Code \
+             processes using the same account, or sign in again with `claude auth login`.\n\n\
+             The review has NOT been performed.",
+            if retries == 1 { "y" } else { "ies" }
+        ),
+    )
+    .with_detail(detail)
+}
+
 pub fn empty_review(reviewer: &str, detail: impl Into<String>) -> Failure {
     Failure::new(
         "EMPTY_REVIEW",

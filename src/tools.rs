@@ -3278,24 +3278,76 @@ impl Job {
             self.registry
                 .set_active(&self.id, self.spec.describe_with_bin(&self.bin));
 
-            facts.prompt_bytes = 0;
-            let attempt_started = std::time::Instant::now();
-            match self.attempt(
-                resume_id.as_deref(),
-                self.turn,
-                self.prior_cumulative,
-                CaptureOutputs {
-                    change: change.as_deref(),
-                    head_sha: head_sha.as_deref(),
-                    base_sha: base_sha.as_deref(),
-                    capture_identity: capture_identity.as_ref(),
-                    perforce_baseline: perforce_baseline.as_ref(),
-                    summary: capture_summary.as_ref(),
-                },
-                &capture_warnings,
-                &mut facts.prompt_bytes,
-                active_usage_key.as_deref(),
-            ) {
+            // A REVIEWER_BUSY attempt (the Claude CLI's OAuth refresh lock, issue #166) ran no model
+            // call, so the same entry is retried after a short wait, a bounded number of times and
+            // only inside the turn budget. Once that is spent the busy failure is reported, carrying
+            // the CLI's own diagnostic.
+            let mut busy_retries: u32 = 0;
+            let (attempt_result, attempt_started) = loop {
+                facts.prompt_bytes = 0;
+                let attempt_started = std::time::Instant::now();
+                let result = self.attempt(
+                    resume_id.as_deref(),
+                    self.turn,
+                    self.prior_cumulative,
+                    CaptureOutputs {
+                        change: change.as_deref(),
+                        head_sha: head_sha.as_deref(),
+                        base_sha: base_sha.as_deref(),
+                        capture_identity: capture_identity.as_ref(),
+                        perforce_baseline: perforce_baseline.as_ref(),
+                        summary: capture_summary.as_ref(),
+                    },
+                    &capture_warnings,
+                    &mut facts.prompt_bytes,
+                    active_usage_key.as_deref(),
+                );
+                let Err(failure) = &result else {
+                    break (result, attempt_started);
+                };
+                if failure.code != "REVIEWER_BUSY" {
+                    break (result, attempt_started);
+                }
+                let detail = failure.detail.clone().unwrap_or_default();
+                match busy_retry_wait(busy_retries, started.elapsed(), self.cfg.timeout) {
+                    Some(delay) => {
+                        eprintln!(
+                            "cross-review: {} reported its OAuth refresh lock busy; retrying in \
+                             {}s ({} of {BUSY_RETRIES})",
+                            self.spec.reviewer.as_str(),
+                            delay.as_secs(),
+                            busy_retries + 1
+                        );
+                        // A refused-before-the-model attempt is recorded for the metrics history
+                        // but not billed: the CLI failed before any model call.
+                        metrics_attempts.push(metrics::Attempt {
+                            reviewer: entry.reviewer.as_str().to_string(),
+                            model: entry.model.clone(),
+                            effort: entry.effort.clone(),
+                            resolved_bin: Some(self.bin.to_string_lossy().into_owned()),
+                            failure_code: "REVIEWER_BUSY".to_string(),
+                            wall_secs: attempt_started.elapsed().as_secs(),
+                            prompt_bytes: facts.prompt_bytes,
+                            billed: false,
+                        });
+                        if !sleep_unless_cancelled(delay, &self.cancel) {
+                            break (Err(errors::cancelled()), attempt_started);
+                        }
+                        busy_retries += 1;
+                    }
+                    None => {
+                        break (
+                            Err(errors::reviewer_busy(
+                                self.spec.reviewer.as_str(),
+                                busy_retries,
+                                detail,
+                            )),
+                            attempt_started,
+                        )
+                    }
+                }
+            };
+            match attempt_result {
                 Ok(mut o) => {
                     ran_index = Some(i);
                     // The disposition and capture summary ride on the successful outcome so the
@@ -5745,6 +5797,33 @@ fn unserved_companions(cfg: &Config, review_id: &str) -> Vec<crate::companion::C
         })
         .cloned()
         .collect()
+}
+
+/// How many times a REVIEWER_BUSY attempt is retried, and the wait before each (issue #166). The
+/// CLI's own advice is to retry in about a minute.
+const BUSY_RETRIES: u32 = 2;
+const BUSY_RETRY_DELAYS: [Duration; BUSY_RETRIES as usize] =
+    [Duration::from_secs(30), Duration::from_secs(60)];
+
+/// The wait before the next REVIEWER_BUSY retry, or `None` when the retries are spent or the wait
+/// would leave the turn no room to run inside its timeout.
+fn busy_retry_wait(retries_done: u32, elapsed: Duration, timeout: Duration) -> Option<Duration> {
+    let delay = *BUSY_RETRY_DELAYS.get(retries_done as usize)?;
+    // Leave at least as long again as the wait for the retried attempt itself.
+    (elapsed + delay * 2 < timeout).then_some(delay)
+}
+
+/// Sleep for `delay` in short steps, returning `false` as soon as `cancel` is set.
+fn sleep_unless_cancelled(delay: Duration, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    let step = Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(step.min(deadline - std::time::Instant::now()));
+    }
+    !cancel.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// One declared companion repository's evidence for one turn (issue #167): its own bundle, nonce
@@ -10656,6 +10735,51 @@ mod captured_summary_tests {
         drop(handle);
         let after_drop = capture_summary_from(&read_serve_record_aggregate(&cfg, nonce));
         assert!(after_drop.is_none(), "a read after the drop finds nothing");
+    }
+
+    /// Issue #166: a busy attempt is retried at most BUSY_RETRIES times, with the configured waits,
+    /// and never when the wait would leave the turn no room inside its timeout.
+    #[test]
+    fn busy_retries_are_bounded_by_count_and_by_the_turn_budget() {
+        let ten_min = Duration::from_secs(600);
+        assert_eq!(
+            busy_retry_wait(0, Duration::ZERO, ten_min),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            busy_retry_wait(1, Duration::from_secs(40), ten_min),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(busy_retry_wait(BUSY_RETRIES, Duration::ZERO, ten_min), None);
+        // 500s in, a 60s wait plus as long again for the retry would pass the 600s budget.
+        assert_eq!(busy_retry_wait(1, Duration::from_secs(500), ten_min), None);
+        // A turn timeout too short for any retry gets none.
+        assert_eq!(
+            busy_retry_wait(0, Duration::ZERO, Duration::from_secs(45)),
+            None
+        );
+
+        let errored = errors::reviewer_busy("claude", 2, "Failed to refresh OAuth token: ...");
+        assert_eq!(errored.code, "REVIEWER_BUSY");
+        assert!(
+            errored.remediation.contains("2 automatic retries"),
+            "{errored:?}"
+        );
+        assert!(
+            errored.remediation.contains("NOT been performed"),
+            "{errored:?}"
+        );
+        assert!(errored.detail.as_deref().unwrap().contains("OAuth"));
+    }
+
+    #[test]
+    fn a_busy_wait_stops_as_soon_as_the_review_is_cancelled() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert!(sleep_unless_cancelled(Duration::from_millis(10), &cancel));
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        assert!(!sleep_unless_cancelled(Duration::from_secs(30), &cancel));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 
     /// Each companion's floor is read from its own serve record, keyed on its own nonce, and the
