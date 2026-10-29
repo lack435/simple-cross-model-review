@@ -1078,10 +1078,7 @@ impl Core {
         received_at: Instant,
     ) -> Result<Value, EvidenceError> {
         if self.bundle.vcs != VcsKind::Git {
-            return Err(EvidenceError::new(
-                "unsupported",
-                "repository_history is unsupported for Perforce",
-            ));
+            return self.perforce_history(args, received_at);
         }
         let limit = limit_arg(
             args,
@@ -1128,10 +1125,7 @@ impl Core {
         received_at: Instant,
     ) -> Result<Value, EvidenceError> {
         if self.bundle.vcs != VcsKind::Git {
-            return Err(EvidenceError::new(
-                "unsupported",
-                "repository_revision is unsupported for Perforce",
-            ));
+            return self.perforce_revision(args, received_at);
         }
         let limit = limit_arg(
             args,
@@ -1172,10 +1166,7 @@ impl Core {
         received_at: Instant,
     ) -> Result<Value, EvidenceError> {
         if self.bundle.vcs != VcsKind::Git {
-            return Err(EvidenceError::new(
-                "unsupported",
-                "repository_diff is unsupported for Perforce",
-            ));
+            return self.perforce_diff(args, received_at);
         }
         let limit = limit_arg(
             args,
@@ -1219,6 +1210,146 @@ impl Core {
             )
         })?;
         self.first_diff_page(canonical, composed, limit)
+    }
+
+    /// The Perforce access the history, revision and diff tools run with, or why they cannot.
+    fn perforce_access(&self) -> Result<super::PerforceAccess, EvidenceError> {
+        self.bundle.perforce.clone().ok_or_else(|| {
+            EvidenceError::new(
+                "provider_unavailable",
+                "the Perforce workspace for this working root could not be resolved when the                  review started, so Perforce history, revisions and diffs are unavailable this turn",
+            )
+        })
+    }
+
+    /// `repository_history` on Perforce (issue #183): submitted changelists, newest first.
+    fn perforce_history(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
+        let limit = limit_arg(
+            args,
+            "limit",
+            self.bundle.limits.default_history,
+            self.bundle.limits.max_history,
+        )?;
+        if let Some(cursor) = optional_string(args, "cursor")? {
+            cursor_only(args, &["cursor", "limit"])?;
+            return self.cursor_page("repository_history", &cursor, limit, "commits");
+        }
+        let path = optional_string(args, "path")?.unwrap_or_default();
+        if !path.is_empty() {
+            self.validate_relative(&path)?;
+        }
+        let before = optional_string(args, "before")?
+            .map(|b| super::perforce::changelist(&b, "before"))
+            .transpose()?;
+        let access = self.perforce_access()?;
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let (changes, source_complete) =
+            run_bounded_walk(&CHILD_WATCHDOG, "p4 changes", received_at, move || {
+                super::perforce::history(
+                    &root,
+                    &access,
+                    &path,
+                    before,
+                    &limits,
+                    &cancel,
+                    received_at,
+                )
+            })?;
+        self.first_page(
+            "repository_history",
+            changes,
+            limit,
+            "commits",
+            source_complete,
+        )
+    }
+
+    /// `repository_revision` on Perforce (issue #183): a changelist described, or one file's content
+    /// as of a changelist.
+    fn perforce_revision(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
+        let limit = limit_arg(
+            args,
+            "limit_bytes",
+            self.bundle.limits.default_change_bytes,
+            self.bundle.limits.max_change_bytes,
+        )? as usize;
+        if let Some(cursor) = optional_string(args, "cursor")? {
+            cursor_only(args, &["cursor", "limit_bytes"])?;
+            return self.text_cursor("repository_revision", &cursor, limit, "content");
+        }
+        let change = super::perforce::changelist(&required_string(args, "id")?, "id")?;
+        let path = optional_string(args, "path")?.unwrap_or_default();
+        if !path.is_empty() {
+            self.validate_relative(&path)?;
+        }
+        let access = self.perforce_access()?;
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let text = run_bounded_walk(&CHILD_WATCHDOG, "p4 revision", received_at, move || {
+            super::perforce::revision(&root, &access, change, &path, &limits, &cancel, received_at)
+        })?;
+        self.first_text_page("repository_revision", text, limit, "content")
+    }
+
+    /// `repository_diff` on Perforce (issue #183): exploratory only. The change under review is
+    /// `repository_change`, so this records no serve-record and never counts as the canonical diff.
+    fn perforce_diff(
+        &mut self,
+        args: &serde_json::Map<String, Value>,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
+        let limit = limit_arg(
+            args,
+            "limit_bytes",
+            self.bundle.limits.default_change_bytes,
+            self.bundle.limits.max_change_bytes,
+        )? as usize;
+        if let Some(cursor) = optional_string(args, "cursor")? {
+            cursor_only(args, &["cursor", "limit_bytes"])?;
+            return self.text_cursor("repository_diff", &cursor, limit, "diff");
+        }
+        let path = optional_string(args, "path")?.unwrap_or_default();
+        let base = optional_string(args, "base")?;
+        let (Some(base), false) = (base, path.is_empty()) else {
+            return Err(EvidenceError::new(
+                "invalid_arguments",
+                "on Perforce, repository_diff needs a path and a base changelist number (head is a                  changelist number or 'worktree', the default); the change under review is                  repository_change",
+            ));
+        };
+        self.validate_relative(&path)?;
+        let base = super::perforce::changelist(&base, "base")?;
+        let head = match optional_string(args, "head")?.as_deref() {
+            None | Some("worktree") => None,
+            Some(head) => Some(super::perforce::changelist(head, "head")?),
+        };
+        let access = self.perforce_access()?;
+        let root = self.root.clone();
+        let limits = self.bundle.limits.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let text = run_bounded_walk(&CHILD_WATCHDOG, "p4 diff", received_at, move || {
+            super::perforce::diff(
+                &root,
+                &access,
+                &path,
+                base,
+                head,
+                &limits,
+                &cancel,
+                received_at,
+            )
+        })?;
+        self.first_text_page("repository_diff", text, limit, "diff")
     }
 
     /// First page of a `repository_diff`, recording the serve-record the parent's `captured:` line
@@ -2246,7 +2377,7 @@ fn deadline(start: Instant, limits: &Limits) -> Result<(), EvidenceError> {
 }
 
 #[cfg(windows)]
-fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+pub(super) fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
@@ -3052,6 +3183,7 @@ mod tests {
             worktree_autocrlf: None,
             worktree_lfs: false,
             capture_hook: None,
+            perforce: None,
         }
     }
 
@@ -3168,6 +3300,100 @@ mod tests {
         )
         .unwrap();
         assert!(files.is_empty() && !complete);
+    }
+
+    #[test]
+    fn perforce_history_revision_and_diff_without_access_say_why() {
+        // A Perforce bundle whose workspace could not be resolved answers each tool with the reason,
+        // and argument errors are still reported first where they apply (issue #183).
+        let dir = temp_dir("evidence-p4-noaccess");
+        let mut core = Core::new(bundle_for(dir.as_path(), VcsKind::Perforce)).unwrap();
+        for (tool, args) in [
+            ("repository_history", json!({})),
+            ("repository_revision", json!({"id":"12"})),
+            ("repository_diff", json!({"path":"a.txt","base":"12"})),
+        ] {
+            let err = core.call(tool, &args).unwrap_err();
+            assert_eq!(err.code, "provider_unavailable", "{tool}: {}", err.message);
+        }
+        let err = core
+            .call("repository_revision", &json!({"id":"abc"}))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_arguments");
+        let err = core.call("repository_diff", &json!({})).unwrap_err();
+        assert_eq!(err.code, "invalid_arguments");
+        assert!(err.message.contains("repository_change"), "{}", err.message);
+    }
+
+    /// Live Perforce history/revision/diff (issue #183), driven by test-perforce-evidence.ps1 on a
+    /// disposable p4d. `CROSS_REVIEW_P4_TEST_EVIDENCE` names the two submitted changelists that
+    /// edited `a.txt` (`first,second`); the workspace holds a third, pending edit of it.
+    #[test]
+    fn live_perforce_history_revision_and_diff() {
+        let (Ok(changes), Ok(cwd)) = (
+            std::env::var("CROSS_REVIEW_P4_TEST_EVIDENCE"),
+            std::env::var("CROSS_REVIEW_P4_TEST_CWD"),
+        ) else {
+            eprintln!("skipping live Perforce evidence test: set CROSS_REVIEW_P4_TEST_EVIDENCE");
+            return;
+        };
+        let (first, second) = changes.split_once(',').expect("first,second");
+        let root = Path::new(&cwd);
+        let cancel = AtomicBool::new(false);
+        let mut bundle = bundle_for(root, VcsKind::Perforce);
+        bundle.perforce =
+            Some(crate::vcs::perforce::evidence_access(root, &cancel).expect("access"));
+        let mut core = Core::new(bundle).unwrap();
+
+        let history = core
+            .call("repository_history", &json!({"path":"a.txt"}))
+            .unwrap();
+        let ids: Vec<&str> = history["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [second, first], "{history}");
+        let older = core
+            .call(
+                "repository_history",
+                &json!({"path":"a.txt","before":second}),
+            )
+            .unwrap();
+        assert_eq!(older["commits"].as_array().unwrap().len(), 1, "{older}");
+
+        let content = core
+            .call("repository_revision", &json!({"id":first,"path":"a.txt"}))
+            .unwrap();
+        assert_eq!(content["content"], "version one\n", "{content}");
+        let described = core
+            .call("repository_revision", &json!({"id":second}))
+            .unwrap();
+        let described = described["content"].as_str().unwrap();
+        assert!(described.contains("Second edit"), "{described}");
+        assert!(described.contains("+version two"), "{described}");
+
+        let across = core
+            .call(
+                "repository_diff",
+                &json!({"path":"a.txt","base":first,"head":second}),
+            )
+            .unwrap();
+        let across = across["diff"].as_str().unwrap();
+        assert!(
+            across.contains("-version one") && across.contains("+version two"),
+            "{across}"
+        );
+        let workspace = core
+            .call("repository_diff", &json!({"path":"a.txt","base":second}))
+            .unwrap();
+        let workspace = workspace["diff"].as_str().unwrap();
+        assert!(
+            workspace.contains("-version two") && workspace.contains("+version three"),
+            "{workspace}"
+        );
+        eprintln!("PASS: live Perforce history, revision and diff");
     }
 
     #[test]

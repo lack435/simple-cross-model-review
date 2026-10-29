@@ -4201,6 +4201,17 @@ impl Job {
                 )
                 .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
                 bundle.capture_hook = git_capture_hook.cloned();
+                // Perforce history, revision and diff run `p4` from the service (issue #183); a
+                // workspace that cannot be resolved costs only those three tools, not the review.
+                if self.cfg.vcs == crate::config::Vcs::Perforce {
+                    match crate::vcs::perforce::evidence_access(&self.cfg.cwd, &self.cancel) {
+                        Ok(access) => bundle.perforce = Some(access),
+                        Err(why) => eprintln!(
+                            "cross-review: Perforce history, revision and diff evidence is \
+                             unavailable this turn: {why}"
+                        ),
+                    }
+                }
                 turn_autocrlf = bundle.worktree_autocrlf;
                 turn_capture_hook = bundle.capture_hook.clone();
                 let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)

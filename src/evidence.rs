@@ -7,6 +7,7 @@
 mod core;
 pub mod generated;
 mod git;
+mod perforce;
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -382,7 +383,45 @@ pub struct Bundle {
     /// it before the turn. Defaulted for the same reason as `page_bytes_ceiling`.
     #[serde(default)]
     pub capture_hook: Option<generated::GitCaptureHook>,
+    /// How to reach the Perforce server, for a Perforce bundle (issue #183): the history, revision
+    /// and diff tools run read-only `p4` commands with it. `None` when not Perforce, or when the
+    /// parent could not resolve the workspace; those tools then say so. Defaulted for the same
+    /// reason as `page_bytes_ceiling`.
+    #[serde(default)]
+    pub perforce: Option<PerforceAccess>,
 }
+
+/// What the evidence service needs to run `p4` exactly as the parent's capture did (issue #183).
+///
+/// The service runs with a controlled environment and a sterile working directory, so a bare `p4`
+/// there could resolve a different server, user or client than the capture -- and serve evidence
+/// from the wrong place without any error. So the parent hands over the client it resolved for the
+/// working root and its own `P4*` settings. The service runs `p4` from the working root with those
+/// settings and `-c <client>`, so `P4CONFIG` files, the registry and the environment resolve as they
+/// did for the capture. `P4PASSWD` is deliberately not carried: the bundle is a file on disk.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerforceAccess {
+    pub client: String,
+    /// The user the parent resolved, passed as `-u`: the service's environment has no `USERNAME`,
+    /// which is p4's default user on Windows when `P4USER` is unset.
+    pub user: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// The parent environment variables [`PerforceAccess`] carries to the service's `p4` children.
+/// `USERPROFILE` is included because p4's default ticket and trust files live under it.
+pub const PERFORCE_ENV: &[&str] = &[
+    "P4PORT",
+    "P4USER",
+    "P4CLIENT",
+    "P4HOST",
+    "P4CHARSET",
+    "P4CONFIG",
+    "P4ENVIRO",
+    "P4TICKETS",
+    "P4TRUST",
+    "USERPROFILE",
+];
 
 impl Bundle {
     pub fn staging(&self) -> Staging {
@@ -435,6 +474,7 @@ impl Bundle {
             worktree_autocrlf,
             worktree_lfs,
             capture_hook: None,
+            perforce: None,
         };
         bundle.validate()?;
         Ok(bundle)
@@ -1263,7 +1303,9 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "repository_history",
-            "Read bounded Git commit history; unsupported for Perforce.",
+            "Read bounded commit history, newest first: Git commits, or Perforce submitted \
+             changelists. Narrow with 'path'; 'before' pages to entries older than a Git commit id \
+             or a Perforce changelist number.",
             &[
                 ("path", "string"),
                 ("before", "string"),
@@ -1274,7 +1316,10 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "repository_revision",
-            "Read a bounded full Git revision; unsupported for Perforce.",
+            "Read one revision. Git: 'id' is a full commit id, shown with its patch (narrowed to \
+             'path' if given). Perforce: 'id' is a changelist number; without 'path' the changelist \
+             is described with its diffs, with 'path' it is that file's content as of the \
+             changelist.",
             &[
                 ("id", "string"),
                 ("path", "string"),
@@ -1285,11 +1330,14 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "repository_diff",
-            "Diff the live working tree against a base, on demand; unsupported for Perforce. 'base' \
-             is the left side (default 'branch-base', the branch's fork point) and 'head' the right \
-             (default 'worktree', the live working tree including untracked files). Each is a full \
-             Git object id or one of the sentinels 'worktree', 'index', 'head', 'branch-base'. To \
-             review the whole change, diff 'branch-base'..'worktree'; narrow with 'path' for focus.",
+            "Diff on demand. Git: the live working tree against a base. 'base' is the left side \
+             (default 'branch-base', the branch's fork point) and 'head' the right (default \
+             'worktree', the live working tree including untracked files). Each is a full Git \
+             object id or one of the sentinels 'worktree', 'index', 'head', 'branch-base'. To \
+             review the whole change, diff 'branch-base'..'worktree'; narrow with 'path' for focus. \
+             Perforce: exploratory only, since the change under review is repository_change; \
+             'path' and a 'base' changelist number are required, and 'head' is a changelist number \
+             or 'worktree' (the default).",
             &[
                 ("base", "string"),
                 ("head", "string"),

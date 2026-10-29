@@ -337,6 +337,34 @@ pub fn capture(
     }
 }
 
+/// How the evidence service should reach the Perforce server for this working root (issue #183):
+/// the client the capture would resolve, and this process's `P4*` settings. Resolved the same way
+/// as [`capture`] (an ambient client covering the root, else one derived from the user's clients),
+/// so the service's `p4` runs as the same server, user and client. `Err` says why it could not be
+/// resolved; the service then reports its Perforce history, revision and diff tools unavailable.
+pub fn evidence_access(
+    cwd: &Path,
+    cancel: &AtomicBool,
+) -> Result<crate::evidence::PerforceAccess, String> {
+    let p4 = P4::new(cwd, cancel).ok_or_else(|| "p4 is not on PATH.".to_string())?;
+    let info = resolve_workspace(&p4, cwd)?;
+    if !info.trustworthy
+        || !is_real_identity_field(&info.client)
+        || !is_real_identity_field(&info.user)
+    {
+        return Err("the Perforce workspace for this working root could not be confirmed.".into());
+    }
+    let env = crate::evidence::PERFORCE_ENV
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|v| (key.to_string(), v)))
+        .collect();
+    Ok(crate::evidence::PerforceAccess {
+        client: info.client,
+        user: info.user,
+        env,
+    })
+}
+
 /// The Perforce resume disposition for the reasons the backend can see, in the plan's precedence.
 ///
 /// `None` when this turn did not carry a resume baseline into the backend -- a fresh turn, an
@@ -2189,9 +2217,13 @@ impl<'a> P4<'a> {
         if let Some(client) = &self.client {
             command.args(["-c", client]);
         }
+        // p4 takes its working directory from `PWD` ahead of the process's own, so a stale inherited
+        // one would pick up another directory's `P4CONFIG`. Pin it to the working root, as the
+        // evidence service does, so both resolve the same server and client (issue #183 review).
         command
             .args(args)
             .current_dir(self.cwd)
+            .env("PWD", crate::config::normalize_dir(self.cwd.to_path_buf()))
             .env_remove("P4DIFF")
             .env_remove("P4MERGE")
             .env_remove("P4DIFFHTML")

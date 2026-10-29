@@ -158,8 +158,8 @@ that moves, and why the move is safe:
 2. A thin, empty, or stale in-prompt capture is **mitigated, not eliminated** (corrected per
    review f1). The evidence tools let the reviewer read the **live working tree**
    (`repository_read` / `repository_list` / `repository_search`) and, on Git, walk **history**
-   (`repository_history`, then `repository_revision` per commit; both report `unsupported` on
-   Perforce, where the evidence is the live tree plus the captured change) to gain context, verify claims,
+   (`repository_history`, then `repository_revision` per commit; at the time of this plan both
+   reported `unsupported` on Perforce -- issue #183 later added them there) to gain context, verify claims,
    and catch what a thin capture omitted — so it is no longer blind to everything outside its
    prompt. It does **not** let the reviewer reconstruct an exact selected diff the parent failed
    to capture: the service has no live ref/range-diff operation (`repository_revision` takes a
@@ -176,8 +176,9 @@ that moves, and why the move is safe:
 
 ## Non-goals
 
-- Do not build a Perforce history/revision backend. The evidence service is Git-only for
-  history/revision today (`repository_history`/`repository_revision` return `unsupported` for
+- Do not build a Perforce history/revision backend. (Historical: issue #183 later built one,
+  separately.) When this plan was written the evidence service was Git-only for
+  history/revision (`repository_history`/`repository_revision` returned `unsupported` for
   Perforce; search/scope degrade to a filesystem walk). The Claude direction inherits exactly
   that subset — **the same subset the Codex direction already has** — so no Perforce work is
   required to reach parity. A p4 backend is a separate, independently-motivated plan that would
@@ -219,8 +220,9 @@ path never used the neutral directory — it runs from the separately verified s
 (`codex_sterile_dir`: empty, outside the working root, no `.git` ancestor) — so dropping that check
 from the evidence predicate moves no boundary. A Perforce evidence Claude takes the same treatment as
 on Git (sterile cwd, absolute read rules, granular flags instead of `--safe-mode`, evidence server)
-and gets the Perforce subset of the tools (`repository_diff`/`history`/`revision` report unsupported;
-its captured changelist stays in the prompt, and through `repository_change`). Verified with a live
+and gets the Perforce tools (at the time `repository_diff`/`history`/`revision` reported unsupported;
+issue #183 later added them on Perforce, see `docs/codex-reviewer-evidence-service.md`). Its
+captured changelist stays in the prompt, and through `repository_change`. Verified with a live
 consult against a real Perforce workspace.
 
 **The evidence path also requires a pinned profile home (impl review f2).** `claude_neutral_target`

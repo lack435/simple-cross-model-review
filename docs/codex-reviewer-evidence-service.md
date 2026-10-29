@@ -190,8 +190,9 @@ small defaults:
 - `repository_history(path?, before?, cursor?, limit?)` returns a normalized, bounded Git
   commit summary. A subsequent `repository_revision(id, path?, cursor?)` reads a validated
   Git revision through fixed provider-owned arguments. Reviewer input is data, never spliced
-  into an option or shell command. Perforce returns `unsupported` for both tools in this
-  implementation; its configured change remains available through `repository_change`.
+  into an option or shell command. Perforce returned `unsupported` for both tools in this
+  implementation (issue #183 later added them; see the update under the Perforce paragraph
+  below); its configured change remains available through `repository_change`.
 
 Every result reports `complete`, `truncated`, and a continuation cursor. A cap can reduce an
 answer, but it cannot silently label a prefix as the whole result. Cursors are opaque,
@@ -220,10 +221,22 @@ from the diff runner. No provider invokes a shell.
 
 Perforce list/search/read operate on the local workspace, and `repository_change` pages the
 snapshot the parent already captured under the existing Perforce policy. Perforce history or
-arbitrary revision reads would require new network calls, so this plan does not implement
-them. They return `unsupported` regardless of whether the reviewer's sandbox could reach the
-server. Adding them later requires a separate plan that names and secures each permitted p4
+arbitrary revision reads would require new network calls, so this plan did not implement
+them. They returned `unsupported` regardless of whether the reviewer's sandbox could reach the
+server. Adding them later required a separate plan that names and secures each permitted p4
 operation.
+
+**Update (issue #183):** Perforce now has history, revision and an exploratory diff. The
+reviewer is treated as non-malicious but fallible, so the design guards against mistakes, not
+attacks. Each tool is one fixed read-only command: `p4 changes -s submitted -t`,
+`p4 describe -du`, `p4 print -q`, `p4 diff -du -dl -f` and `p4 diff2 -du`. A reviewer path is
+escaped into a file spec under the working root (`...` is refused), and a revision is a validated
+changelist number, so reviewer input never becomes a subcommand, a flag or a wildcard. The commands
+run as the client the parent resolved for the working root, with the parent's `P4*` settings
+(`P4PASSWD` excluded) and `PWD` pinned to the root. That keeps evidence from coming from a
+different server or workspace than the captured change. The Perforce `repository_diff` is never
+the canonical diff and writes no serve-record. The change under review is still the captured
+`repository_change`. See `src/evidence/perforce.rs` and `test-perforce-evidence.ps1`.
 
 The configured change is captured once by the parent before the reviewer starts and stored
 in the capability bundle with the same omission accounting used in the prompt today. The
