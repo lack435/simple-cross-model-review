@@ -226,6 +226,10 @@ impl Reviewer for ClaudeReviewer {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
+            } else if oauth_refresh_locked(out, "") {
+                // Before the generic classifier, whose "oauth token" match would read the
+                // refresh-lock collision as an expired sign-in (issue #166).
+                errors::reviewer_busy("claude", out.diagnostics())
             } else {
                 super::failure_for(cfg, spec, out)
             }
@@ -465,7 +469,7 @@ fn from_result_document(
             .unwrap_or(false);
         if is_error || !out.success {
             if oauth_refresh_locked(out, &text) {
-                return Err(errors::reviewer_busy("claude", 0, out.diagnostics()));
+                return Err(errors::reviewer_busy("claude", out.diagnostics()));
             }
             let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
 
@@ -891,7 +895,7 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     // Before `classify`, whose "oauth token" match would read the refresh-lock collision as an
     // expired sign-in (issue #166). With no result event there is no result text, so only stderr.
     if oauth_refresh_locked(out, "") {
-        return Err(errors::reviewer_busy("claude", 0, out.diagnostics()));
+        return Err(errors::reviewer_busy("claude", out.diagnostics()));
     }
     Err(errors::classify(
         "claude",
@@ -1450,6 +1454,31 @@ mod tests {
         expired.stderr = "Failed to refresh OAuth token: invalid_grant".to_string();
         let err = parse_stream_json(cfg().primary(), &expired).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN", "{err:?}");
+
+        // The buffered `json` path (off the evidence path): unparseable stdout with the diagnostic
+        // on stderr is busy too, rather than reaching the generic classifier (review f2).
+        let mut buffered = outcome("", false);
+        buffered.stderr = diag.to_string();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &buffered, None)
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+        // And a buffered result document carrying it as its text, likewise.
+        let err = ClaudeReviewer
+            .parse(
+                &cfg(),
+                cfg().primary(),
+                &outcome(&result(diag), false),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // Rendered as a plain correction that asks for a retry, not a stop-and-escalate.
+        let shown = err.render_for_agent();
+        assert!(shown.starts_with("REQUEST REJECTED"), "{shown}");
+        assert!(!shown.contains("ACTION REQUIRED"), "{shown}");
+        assert!(shown.contains("same call again"), "{shown}");
     }
 
     #[test]
