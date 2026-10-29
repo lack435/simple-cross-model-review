@@ -2417,9 +2417,52 @@ pub fn failure_for(cfg: &Config, spec: &ReviewerSpec, out: &RunOutcome) -> Failu
 }
 
 /// Path for a CLI's final-message file. Cleaned up by the caller.
+///
+/// The directory is `<state_dir>/tmp`, and the reviewer CLI writes this file. A reparse point at
+/// that directory would redirect the write anywhere, the reviewed repository included, and no other
+/// check looks at it (issue #168), so it is refused. Checked on the directory itself, never on a
+/// canonicalized path, which would resolve straight through the junction. `create_dir_all` follows
+/// an existing junction, so the check runs after it.
 pub fn tmp_file(cfg: &Config, tmp_id: &str, name: &str) -> std::io::Result<PathBuf> {
     let dir = cfg.tmp_dir();
+    // A junction *above* it (a state directory junctioned into the repository) leaves `tmp` an
+    // ordinary directory that is physically inside the reviewed tree. What matters is where the
+    // write lands, so judge the physical location, junctions followed, against the reviewed root and
+    // every declared companion. A junctioned state directory elsewhere stays legitimate. Judged
+    // before anything is created: `state_dir_is_outside` resolves a path that does not exist yet
+    // through its nearest existing ancestor, so a refused location gets no `tmp` directory either.
+    let outside = crate::worktree::state_dir_is_outside(&dir, &cfg.cwd)
+        && cfg
+            .declared_companions
+            .iter()
+            .all(|c| crate::worktree::state_dir_is_outside(&dir, &c.root));
+    if !outside {
+        return Err(std::io::Error::other(format!(
+            "the reviewer temp directory {} is physically inside a reviewed repository; refusing \
+             to write there. Point --state-dir at a directory outside every reviewed repository.",
+            dir.display()
+        )));
+    }
     std::fs::create_dir_all(&dir)?;
+    let metadata = std::fs::symlink_metadata(&dir)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "the reviewer temp directory {} is a reparse point (junction or symlink); \
+                 refusing to write through it. Remove it so it can be recreated as a plain \
+                 directory.",
+                dir.display()
+            )));
+        }
+    }
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "the reviewer temp directory {} is not a directory",
+            dir.display()
+        )));
+    }
     Ok(dir.join(format!("{tmp_id}-{name}")))
 }
 

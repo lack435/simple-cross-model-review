@@ -610,6 +610,78 @@ fn a_state_dir_junctioned_into_the_project_is_not_the_neutral_dir() {
 }
 
 #[test]
+fn a_junction_at_the_reviewer_temp_directory_is_refused() {
+    // Issue #168: `<state_dir>/tmp` as a junction into the project would redirect the reviewer's
+    // final-message file there. `tmp_file` refuses it instead of writing through it.
+    let root = crate::testutil::temp_dir("tmp-dir-junction");
+    let project = root.as_path().join("project");
+    let state = root.as_path().join("state");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let cfg = config_at(&project, Some(&state), &["codex"]);
+
+    // Control: a plain directory (created on first use) is accepted.
+    let file = crate::reviewer::tmp_file(&cfg, "t1", "codex-last.txt").expect("plain dir");
+    assert!(file.starts_with(state.join("tmp")));
+
+    std::fs::remove_dir_all(state.join("tmp")).unwrap();
+    assert!(
+        crate::testutil::make_junction(&state.join("tmp"), &project),
+        "mklink /J failed"
+    );
+    // Into the project: refused by where it physically lands, before anything is created.
+    let err = crate::reviewer::tmp_file(&cfg, "t2", "codex-last.txt").unwrap_err();
+    assert!(err.to_string().contains("physically inside"), "{err}");
+    assert!(
+        std::fs::read_dir(&project).unwrap().next().is_none(),
+        "nothing was written into the project"
+    );
+
+    // Anywhere else: still refused, as a reparse point, rather than written through.
+    std::fs::remove_dir(state.join("tmp")).unwrap();
+    let other = root.as_path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(
+        crate::testutil::make_junction(&state.join("tmp"), &other),
+        "mklink /J failed"
+    );
+    let err = crate::reviewer::tmp_file(&cfg, "t3", "codex-last.txt").unwrap_err();
+    assert!(err.to_string().contains("reparse point"), "{err}");
+}
+
+#[test]
+fn a_state_dir_junctioned_into_the_project_cannot_host_the_reviewer_temp_directory() {
+    // Issue #168, review f1: a junction *above* `tmp` (the state directory itself, junctioned into
+    // the project) leaves `tmp` a plain directory that is physically inside the project.
+    let root = crate::testutil::temp_dir("tmp-dir-ancestor-junction");
+    let project = root.as_path().join("project");
+    let elsewhere = root.as_path().join("elsewhere");
+    std::fs::create_dir_all(project.join("state")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let link = elsewhere.join("state");
+    assert!(
+        crate::testutil::make_junction(&link, &project.join("state")),
+        "mklink /J failed"
+    );
+    let cfg = config_at(&project, Some(&link), &["codex"]);
+    let err = crate::reviewer::tmp_file(&cfg, "t1", "codex-last.txt").unwrap_err();
+    assert!(err.to_string().contains("physically inside"), "{err}");
+    // Refused before creation: no `tmp` directory appeared inside the project (review f2).
+    assert!(!project.join("state").join("tmp").exists());
+
+    // A state directory junctioned somewhere outside the project is still fine.
+    let outside = root.as_path().join("real-state");
+    std::fs::create_dir_all(&outside).unwrap();
+    let link2 = elsewhere.join("state2");
+    assert!(
+        crate::testutil::make_junction(&link2, &outside),
+        "mklink /J failed"
+    );
+    let cfg = config_at(&project, Some(&link2), &["codex"]);
+    crate::reviewer::tmp_file(&cfg, "t2", "codex-last.txt").expect("outside the project");
+}
+
+#[test]
 fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
     let root = crate::testutil::temp_dir("codex-sterile-root");
     let state = crate::testutil::temp_dir("codex-sterile-state");
