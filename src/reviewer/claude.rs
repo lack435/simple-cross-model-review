@@ -788,11 +788,13 @@ fn oauth_refresh_locked(out: &RunOutcome, result: Option<&Value>) -> bool {
             .as_deref()
             == Some("assistant")
     });
-    let model_turns = result
-        .and_then(|r| r.get("num_turns"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if assistant_event || model_turns > 0 {
+    // Absent is no evidence of a turn; present counts only as exactly numeric zero. A malformed or
+    // null value proves nothing either way, so it is not proof (review f5).
+    let no_turns = match result.and_then(|r| r.get("num_turns")) {
+        None => true,
+        Some(v) => v.as_u64() == Some(0),
+    };
+    if assistant_event || !no_turns {
         return false;
     }
     let is_lock = |s: &str| {
@@ -1463,6 +1465,19 @@ mod tests {
         );
         let err = parse_stream_json(cfg().primary(), &outcome(&with_turns, false)).unwrap_err();
         assert_ne!(err.code, "REVIEWER_BUSY", "{err:?}");
+        // A malformed or null num_turns is not proof of zero turns either; an explicit 0 is.
+        for turns in [r#""2""#, "null", "-1", "0"] {
+            let doc = format!(
+                r#"{{"type":"result","is_error":true,"num_turns":{turns},"result":{}}}"#,
+                serde_json::to_string(diag).unwrap()
+            );
+            let err = parse_stream_json(cfg().primary(), &outcome(&doc, false)).unwrap_err();
+            assert_eq!(
+                err.code == "REVIEWER_BUSY",
+                turns == "0",
+                "{turns}: {err:?}"
+            );
+        }
 
         // Text that only mentions the diagnostic, rather than opening with it, is not it.
         let quoted = format!("The log said: {diag}");
