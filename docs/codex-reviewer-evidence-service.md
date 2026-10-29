@@ -182,8 +182,12 @@ small defaults:
   returns path, line number, and a capped line excerpt. Literal search is the secure and
   dependency-free base contract; regex can be proposed later as a separate reviewed feature.
 - `repository_read(path, start_line?, line_count?)` returns numbered UTF-8 text lines plus
-  byte size and a content digest. Binary, non-UTF-8, over-limit, link-escaped, device, and
-  alternate-data-stream paths return explicit typed errors.
+  byte size and a content digest. Binary, non-UTF-8, link-escaped, device, and
+  alternate-data-stream paths return explicit typed errors. *(Update, issue #190: a file over
+  the per-file read cap is no longer refused. It is read only as far as the requested lines,
+  its binary and UTF-8 checks cover only what was read, and its digest and line count are
+  `null` unless the read reached the end of the file. A line over the per-line cap in the
+  requested window is still an error, and `repository_search` still skips over-cap files.)*
 - `repository_change(cursor?, limit_bytes?)` returns the already selected/captured change
   and omission metadata in pages rather than asking the reviewer to reconstruct it with
   `git diff` or `p4 describe`.

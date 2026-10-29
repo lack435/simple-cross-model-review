@@ -2079,13 +2079,12 @@ fn scan_line_window(
         .ok_or_else(|| ReadFailure::fatal("digest_unavailable", "SHA-256 is unavailable"))?;
     let mut reader = io::BufReader::with_capacity(64 * 1024, file);
     let window_end = window.start_line.saturating_add(window.line_count);
-    // Room for one byte over the cap plus a `\r` the line ending strips.
-    let keep = window.max_line_bytes.saturating_add(2);
+    // The cap plus a `\r` the line ending strips.
+    let keep = window.max_line_bytes.saturating_add(1);
     let mut utf8_carry = Vec::new();
     let mut line_no = 1usize; // the line the next byte belongs to
     let mut partial = false; // a byte of `line_no` has been seen
     let mut current = Vec::new();
-    let mut overflow = false;
     let mut lines = Vec::new();
     let reached_end = loop {
         let chunk = reader.fill_buf().map_err(read_error)?;
@@ -2119,16 +2118,19 @@ fn scan_line_window(
                 } else {
                     segment
                 };
-                let room = keep.saturating_sub(current.len());
-                overflow |= body.len() > room;
-                current.extend_from_slice(&body[..body.len().min(room)]);
+                // Past `keep` the line is over the cap whatever ends it, so stop here rather than
+                // scan the rest of a huge unterminated line.
+                if current.len() + body.len() > keep {
+                    return Err(line_too_long(label));
+                }
+                current.extend_from_slice(body);
             }
             if ends_line {
                 if line_no >= window.start_line {
                     if current.last() == Some(&b'\r') {
                         current.pop();
                     }
-                    lines.push(window_line(&mut current, &mut overflow, window, label)?);
+                    lines.push(window_line(&mut current, window, label)?);
                 }
                 line_no += 1;
                 partial = false;
@@ -2146,7 +2148,7 @@ fn scan_line_window(
     }
     // A last line with no newline still counts, as `str::lines` counts it.
     if reached_end && partial && line_no >= window.start_line && line_no < window_end {
-        lines.push(window_line(&mut current, &mut overflow, window, label)?);
+        lines.push(window_line(&mut current, window, label)?);
     }
     let (total_lines, sha256) = if reached_end {
         let sha256 = digest
@@ -2171,20 +2173,23 @@ fn scan_line_window(
 /// Finish one collected window line, refusing it as `repository_read` refuses an over-cap line.
 fn window_line(
     current: &mut Vec<u8>,
-    overflow: &mut bool,
     window: LineWindow,
     label: &str,
 ) -> Result<String, ReadFailure> {
     let bytes = std::mem::take(current);
-    if std::mem::take(overflow) || bytes.len() > window.max_line_bytes {
-        return Err(ReadFailure::fatal(
-            "line_too_long",
-            format!("'{label}' contains a line over the configured cap"),
-        ));
+    if bytes.len() > window.max_line_bytes {
+        return Err(line_too_long(label));
     }
     // `utf8_feed` has already validated every byte, and a line ends on a character boundary.
     String::from_utf8(bytes)
         .map_err(|_| ReadFailure::fatal("non_utf8", format!("'{label}' is not UTF-8")))
+}
+
+fn line_too_long(label: &str) -> ReadFailure {
+    ReadFailure::fatal(
+        "line_too_long",
+        format!("'{label}' contains a line over the configured cap"),
+    )
 }
 
 /// Check one more slice of a byte stream for UTF-8 validity, carrying an incomplete trailing
