@@ -88,11 +88,13 @@ try {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
-    foreach ($name in 'CROSS_REVIEW_P4_TEST_HOOK_SCRIPT', 'CROSS_REVIEW_P4_TEST_HOOK_EXPECT', 'CROSS_REVIEW_P4_TEST_HOOK_COUNTER', 'CROSS_REVIEW_P4_TEST_HOOK_RESUME') {
+    foreach ($name in 'CROSS_REVIEW_P4_TEST_HOOK_SCRIPT', 'CROSS_REVIEW_P4_TEST_HOOK_EXPECT', 'CROSS_REVIEW_P4_TEST_HOOK_COUNTER', 'CROSS_REVIEW_P4_TEST_HOOK_RESUME', 'CROSS_REVIEW_P4_TEST_RESUME_GAP_SECS') {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
     & $P4d -r $server -xi | Out-Null
-    foreach ($configurable in 'dm.user.noautocreate=0', 'dm.user.resetpassword=0', 'dm.user.setinitialpasswd=1') {
+    # dm.domain.accessupdate=1: the server moves a client's Access: time after one second rather
+    # than 300, so the resume below runs after it has moved (issue #181).
+    foreach ($configurable in 'dm.user.noautocreate=0', 'dm.user.resetpassword=0', 'dm.user.setinitialpasswd=1', 'dm.domain.accessupdate=1') {
         & $P4d -r $server "-cset $configurable" | Out-Null
     }
     $process = Start-Process -FilePath $P4d -ArgumentList @('-r', "`"$server`"", '-p', $settings.P4PORT) -WindowStyle Hidden -PassThru
@@ -154,7 +156,14 @@ try {
     & $bytes 'edit.uasset' ([byte[]](1, 0, 2, 4, 16))
     Invoke-TestP4 edit -c $declined "$workspace\declined.uasset" | Out-Null
     & $bytes 'declined.uasset' ([byte[]](6, 0, 6, 6))
+    # The resume waits past the server's Access: update, which must not count as a changed client.
+    $accessBefore = (Invoke-TestP4 client -o) -match '^Access:'
+    $env:CROSS_REVIEW_P4_TEST_RESUME_GAP_SECS = '3'
     Invoke-Capture $declined '+TEXT modified 0100020410|No generated text for //depot/declined.uasset (declined by the capture hook).' -Resume
+    $env:CROSS_REVIEW_P4_TEST_RESUME_GAP_SECS = ''
+    $accessAfter = (Invoke-TestP4 client -o) -match '^Access:'
+    if ("$accessBefore" -eq "$accessAfter") { throw "The client's Access: time did not move ($accessAfter), so the resume proved nothing." }
+    Write-Host "PASS: resume stayed incremental across an Access: change ($accessBefore -> $accessAfter)"
 
     Write-Host 'PASS: binary edit, add, delete and move convert in pending, submitted and shelved changes; a re-capture hits the cache; a declined file keeps the change complete.'
 } finally {
