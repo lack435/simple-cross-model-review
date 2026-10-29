@@ -18,6 +18,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    # build.ps1 runs fmt, clippy, the tests and a release build; well under this normally. Bounded so
+    # a hang fails the release instead of holding the runner for the 360-minute default (issue #175).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
