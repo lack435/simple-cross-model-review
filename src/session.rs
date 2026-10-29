@@ -266,6 +266,36 @@ pub struct SessionRecord {
     /// its account was never captured and cannot be verified. See `docs/reviewer-account-profiles.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_identity: Option<ProfileIdentity>,
+    /// The companion repositories (issue #167) this session is bound to, sorted by name. A resume
+    /// must declare the same set, name and root alike. `None` declares none, which is also how
+    /// every record written before this field reads, so existing sessions resume unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companions: Option<Vec<CompanionBinding>>,
+}
+
+/// One companion a session is bound to: its configured name and canonical root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionBinding {
+    pub name: String,
+    pub root: String,
+}
+
+impl CompanionBinding {
+    /// The binding a review declaring `declared` records: sorted by name, `None` when empty.
+    pub fn from_declared(declared: &[crate::companion::Companion]) -> Option<Vec<Self>> {
+        if declared.is_empty() {
+            return None;
+        }
+        let mut out: Vec<Self> = declared
+            .iter()
+            .map(|c| Self {
+                name: c.name.clone(),
+                root: c.root.to_string_lossy().into_owned(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(out)
+    }
 }
 
 /// The tri-state result of loading a session's findings ledger. A single record whose ledger is
@@ -386,6 +416,9 @@ pub struct TurnFacts<'a> {
     /// review path; `None` only leaves the record at the fail-closed legacy state (used by tests that
     /// do not exercise profiles).
     pub profile_identity: Option<ProfileIdentity>,
+    /// The companion set this turn ran with ([`CompanionBinding::from_declared`]). Invariant across
+    /// a session (a mismatched resume is refused before a turn runs), so stored from this turn.
+    pub companions: Option<Vec<CompanionBinding>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -469,6 +502,7 @@ impl SessionStore {
             terminal_reason,
             reviewer_cwd_mode,
             profile_identity,
+            companions,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -552,6 +586,7 @@ impl SessionStore {
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
                 profile_identity: profile_identity.clone(),
+                companions: companions.clone(),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -580,6 +615,7 @@ impl SessionStore {
                 terminal_reason,
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
                 profile_identity: profile_identity.clone(),
+                companions: companions.clone(),
             },
         };
 
@@ -1013,6 +1049,7 @@ pub fn record_test_turn(store: &SessionStore, name: &str, cli_id: &str) -> Sessi
                 findings_ledger: None,
                 terminal_reason: None,
                 reviewer_cwd_mode: "project",
+                companions: None,
                 profile_identity: None,
             },
         )
@@ -1084,6 +1121,7 @@ pub(crate) mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    companions: None,
                     profile_identity: None,
                 },
             )
@@ -1170,6 +1208,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: Some(ident(ProfileSelectorId::Ambient, None, fp)),
         }
     }
@@ -1384,6 +1423,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         store
@@ -1435,6 +1475,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         store
@@ -1494,6 +1535,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         // The old conversation establishes a complete baseline.
@@ -1538,6 +1580,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         store
@@ -1578,6 +1621,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         store
@@ -1625,6 +1669,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         // Tree-only: the worker supplies no capture fields, so none are stored.
@@ -1694,6 +1739,7 @@ pub(crate) mod tests {
             findings_ledger: None,
             terminal_reason: None,
             reviewer_cwd_mode: "project",
+            companions: None,
             profile_identity: None,
         };
         let full = PerforceBaseline::Full {
@@ -1884,6 +1930,7 @@ pub(crate) mod tests {
                     findings_ledger: None,
                     terminal_reason: None,
                     reviewer_cwd_mode: "project",
+                    companions: None,
                     profile_identity: None,
                 },
             )

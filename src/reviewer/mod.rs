@@ -259,8 +259,34 @@ pub struct EvidenceInvocation<'a> {
     /// an in-scope Claude (where it becomes Claude's `current_dir`, replacing the neutral dir).
     pub sterile_dir: Option<&'a Path>,
     /// The generated Claude `--mcp-config` JSON file. `Some` only for an in-scope Claude; Codex
-    /// injects the server through its own config overrides and leaves this `None`.
+    /// injects the server through its own config overrides and leaves this `None`. For Claude it
+    /// lists every server in [`Self::servers`].
     pub mcp_config_file: Option<&'a Path>,
+    /// One more evidence server per companion repository the review declared (issue #167), each an
+    /// unchanged single-root server with its own bundle and nonce. Empty unless declared.
+    pub companions: Vec<CompanionServer<'a>>,
+}
+
+/// A companion repository's evidence server: the MCP server name the reviewer sees its tools under,
+/// and the bundle and nonce it is spawned with.
+pub struct CompanionServer<'a> {
+    pub server_name: String,
+    pub bundle_file: &'a Path,
+    pub nonce: String,
+}
+
+impl EvidenceInvocation<'_> {
+    /// Every evidence server this turn attaches, as `(server name, bundle file, nonce)`: the
+    /// working root's first, then each declared companion's.
+    pub fn servers(&self) -> Vec<(&str, &Path, &str)> {
+        let mut out = vec![(crate::evidence::SERVER_NAME, self.bundle_file, self.nonce)];
+        out.extend(
+            self.companions
+                .iter()
+                .map(|c| (c.server_name.as_str(), c.bundle_file, c.nonce.as_str())),
+        );
+        out
+    }
 }
 
 /// Guard for a verified empty Codex working directory outside the reviewed repository.

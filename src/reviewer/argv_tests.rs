@@ -23,6 +23,7 @@ fn test_evidence<'a>(cfg: &'a Config) -> EvidenceInvocation<'a> {
             .then_some(Path::new("C:\\fake\\sterile-codex-cwd")),
         // Codex injects the server through its own config; only an in-scope Claude uses this.
         mcp_config_file: None,
+        companions: Vec::new(),
     }
 }
 
@@ -35,6 +36,7 @@ fn test_claude_evidence<'a>() -> EvidenceInvocation<'a> {
         nonce: "test-nonce",
         sterile_dir: Some(Path::new("C:\\fake\\sterile-claude-cwd")),
         mcp_config_file: Some(Path::new("C:\\fake\\claude-mcp.json")),
+        companions: Vec::new(),
     }
 }
 
@@ -1112,4 +1114,99 @@ fn an_invocation_applies_the_pinned_home_rather_than_resolving_its_own() {
             "{var} must be absent when nothing was pinned"
         );
     }
+}
+
+/// The full argv for an explicit evidence invocation, so a test can attach companion servers.
+fn argv_with(reviewer: &dyn Reviewer, cfg: &Config, evidence: &EvidenceInvocation) -> Vec<String> {
+    reviewer
+        .invocation(
+            cfg,
+            cfg.primary(),
+            Path::new(r"C:\fake\reviewer.exe"),
+            None,
+            "tmp-1",
+            Some(evidence),
+            None,
+        )
+        .expect("invocation")
+        .command
+        .get_args()
+        .map(|a| a.to_string_lossy().to_string())
+        .collect()
+}
+
+fn with_assets(mut evidence: EvidenceInvocation<'_>) -> EvidenceInvocation<'_> {
+    evidence.companions = vec![crate::reviewer::CompanionServer {
+        server_name: "cross_review_evidence_assets".into(),
+        bundle_file: Path::new(r"C:\fake\assets-bundle.json"),
+        nonce: "test-nonce-c-assets".into(),
+    }];
+    evidence
+}
+
+/// A declared companion repository (issue #167) gets its own complete Codex server block, with its
+/// own bundle and nonce, beside the working root's unchanged one.
+#[test]
+fn codex_gets_one_identical_server_block_per_declared_companion() {
+    let cfg = config(&["codex"]);
+    let plain = argv_with(&CodexReviewer, &cfg, &test_evidence(&cfg));
+    assert!(
+        !plain.iter().any(|a| a.contains("cross_review_evidence_")),
+        "no companion server without a declaration: {plain:?}"
+    );
+
+    let args = argv_with(&CodexReviewer, &cfg, &with_assets(test_evidence(&cfg)));
+    for server in ["cross_review_evidence", "cross_review_evidence_assets"] {
+        for suffix in [
+            "required=true",
+            "enabled=true",
+            "disabled_tools=[]",
+            "env={}",
+            "startup_timeout_sec=15",
+            "default_tools_approval_mode=\"approve\"",
+        ] {
+            let want = format!("mcp_servers.{server}.{suffix}");
+            assert!(args.contains(&want), "missing {want}: {args:?}");
+        }
+    }
+    let args_of = |server: &str| {
+        args.iter()
+            .find(|a| a.starts_with(&format!("mcp_servers.{server}.args=")))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let primary = args_of("cross_review_evidence");
+    let assets = args_of("cross_review_evidence_assets");
+    assert!(
+        primary.contains("bundle.json") && primary.contains("\"test-nonce\""),
+        "{primary}"
+    );
+    assert!(
+        assets.contains("assets-bundle.json") && assets.contains("\"test-nonce-c-assets\""),
+        "{assets}"
+    );
+}
+
+/// For Claude, a declared companion's server is allow-listed beside the working root's, and its
+/// repository gets no native read rule: it is read only through its evidence server.
+#[test]
+fn claude_allows_each_declared_companion_server_and_no_companion_read_rule() {
+    let repo = crate::testutil::temp_dir("cross-review-argv-companion-repo");
+    std::fs::write(repo.join(".git"), b"gitdir: elsewhere").expect("mark git toplevel");
+    let state = crate::testutil::temp_dir("cross-review-argv-companion-state");
+    let cfg = config_at(&repo, Some(&state), &["claude", "--claude-profile", "test"]);
+    let args = argv_with(&ClaudeReviewer, &cfg, &with_assets(test_claude_evidence()));
+    let root = cfg.cwd.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        values_after(&args, "--allowed-tools"),
+        vec![
+            format!("Read({root}/**)"),
+            format!("Grep({root}/**)"),
+            format!("Glob({root}/**)"),
+            "mcp__cross_review_evidence".to_string(),
+            "mcp__cross_review_evidence_assets".to_string(),
+        ],
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains("assets/**")), "{args:?}");
 }

@@ -16,6 +16,7 @@ mod approval;
 mod cancel;
 mod changeset;
 mod codeentry;
+mod companion;
 mod config;
 mod digest;
 mod errors;

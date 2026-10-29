@@ -226,6 +226,21 @@ fork point, the converged hook attests that worktree's `HEAD`, and the session i
 that started it. `root` is refused while `--state-dir` lies inside the repository. Account
 authorization is unaffected: it stays keyed on the directory the server was launched from.
 
+When a change spans **two git repositories** — say, code in an assets repository whose scripts
+generate files committed to this one — configure the second as a **companion** at server start with
+`--companion <name>=<path>` (repeatable; a relative path is under the working root). A review then
+declares it per call with `companions: ["<name>"]`, and the reviewer reads it through its own
+read-only evidence server, `cross_review_evidence_<name>`, with the same tools and the same
+confinement as the working root's. Its change is its current branch against its own fork point. The
+approval gate covers it too: an approve converges only if the complete change of the working root
+**and of every declared companion** was served, and the converged hook fires only if each one's
+committed change still matches. A companion must be a git top level reached without junctions or
+symlinks, separate from the working root and other companions, and disjoint from the state and temp
+directories; anything else is refused at startup. The calling agent can only name a configured
+companion, never a path, and the session is bound to the set it declared. Companions are git only
+and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
+Design: [`docs/companion-repositories-plan.md`](docs/companion-repositories-plan.md).
+
 For **Perforce** (`--vcs perforce`, or `auto` in a workspace with no `.git`), the change is an
 explicit list of changelists named per call in the `change` argument (`"43650"`,
 `"43650,43651"`, or `["43650","43651"]`); it is required, with no default. Details, including
@@ -328,6 +343,12 @@ The tool is listed only when a hook is configured.
   (or on `reviewer_kind`), because a rate-limited primary can fall back to another family.
 - The payload carries nothing the reviewer wrote. `session` is caller-supplied text: treat it as
   data, never interpolate it into a command.
+- A review that declared [companion repositories](#the-change-under-review-is-derived-live) sends
+  `"schema_version": 2` with one more field, `companions`: one object per companion with `name`,
+  `repo_root`, `captured_head`, `base`, `base_source` and `diff_sha256`. Every listed repository
+  passed the same binding check, so `tree_clean` covers them all. Without companions the payload is
+  version 1, unchanged. A commit that moves a companion after convergence skips the hook with
+  `companion_head_does_not_match_review: <name>`.
 
 A minimal hook (PowerShell, `gh` CLI):
 

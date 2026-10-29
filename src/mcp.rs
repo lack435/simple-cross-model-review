@@ -1275,6 +1275,43 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     }
 
+    // Companion repositories (issue #167) are advertised only when the server configured some, with
+    // their names as the enum, so a caller discovers them from the schema and a server without any
+    // advertises nothing new.
+    if !cfg.companions.is_empty() {
+        let menu = cfg
+            .companions
+            .iter()
+            .map(|c| format!("{} = {}", c.name, c.root.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let names: Vec<&str> = cfg.companions.iter().map(|c| c.name.as_str()).collect();
+        let companions_prop = json!({
+            "type": "array",
+            "items": { "type": "string", "enum": names },
+            "uniqueItems": true,
+            "description": format!(
+                "Optional. Configured companion git repositories to include: for a change that spans \
+                 this repository and a paired branch in another (for example generated output here, \
+                 the code that generated it there). Each is served to the reviewer through its own \
+                 read-only evidence server, and a review converges only if every declared \
+                 repository's whole change was served. The session is bound to the set: a resume \
+                 must name the same companions (use fresh:true to change them). Configured: {menu}."
+            )
+        });
+        for tool in tools.iter_mut() {
+            let is_start = matches!(
+                tool["name"].as_str(),
+                Some("cross_model_review") | Some("cross_model_consult")
+            );
+            if is_start {
+                if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+                    props.insert("companions".to_string(), companions_prop.clone());
+                }
+            }
+        }
+    }
+
     // The review "level" preset is advertised only when the primary entry declares at least one
     // level. A server with no levels behaves exactly as before: no `level` property, and
     // additionalProperties:false rejects a stray one. The advertised menu is the primary's — the
@@ -1566,6 +1603,58 @@ mod tests {
         let tool = &response["result"]["tools"][0];
         assert_eq!(tool["inputSchema"]["required"][0], "instructions");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    /// Issue #167: `companions` is advertised on both start tools only when companions are
+    /// configured, with exactly the configured names as its enum.
+    #[test]
+    fn companions_are_advertised_only_when_configured() {
+        let plain = handle_sync(&app(), "tools/list", &Value::Null, &json!(2));
+        for tool in plain["result"]["tools"].as_array().unwrap() {
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .get("companions")
+                    .is_none(),
+                "{tool}"
+            );
+        }
+
+        let mut cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
+        cfg.companions = vec![crate::companion::Companion {
+            name: "assets".into(),
+            root: std::path::PathBuf::from(r"C:\dev\assets"),
+        }];
+        let listed = handle_sync(
+            &Arc::new(App::new(cfg)),
+            "tools/list",
+            &Value::Null,
+            &json!(2),
+        );
+        for name in ["cross_model_review", "cross_model_consult"] {
+            let tool = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .expect("start tool");
+            let prop = &tool["inputSchema"]["properties"]["companions"];
+            assert_eq!(prop["type"], "array", "{tool}");
+            assert_eq!(prop["items"]["enum"], json!(["assets"]), "{tool}");
+            assert!(
+                !tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "companions"),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

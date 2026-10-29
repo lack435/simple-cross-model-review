@@ -5,6 +5,22 @@ Status: **plan** for issue #167, on `plan/companion-repositories`. Cross-review 
 findings raised: f1–f3 accepted and resolved; f4 accepted as real but pre-existing and out of
 scope, which the reviewer confirmed before approving.
 
+**Implementation notes** (`feat/companion-repositories`). Built as planned, with these differences:
+
+- **Health parsing (item 5)** recognises evidence servers by name shape
+  (`evidence::is_evidence_server`: `cross_review_evidence` or `cross_review_evidence_<valid name>`)
+  rather than by threading this turn's set of server names into the parsers. Only servers this
+  process configured can appear (Claude runs under `--strict-mcp-config`, Codex with
+  `--ignore-user-config`), so the shape identifies them, and the parsers keep their signatures.
+  The Codex error-attribution check (`contains(SERVER_NAME)`) already covered companions and is
+  unchanged.
+- **Unserved companions (items 6 and 7)** are not attestable: when any declared companion has no
+  complete served change, the turn's `served` is cleared too, so the hook reports
+  `no_canonical_diff` exactly as for an unserved working root. No new skip reason was needed.
+- **Companion bundles** carry no in-prompt change, and their `change_label`/`status_summary` (what
+  `repository_scope` reports) names the companion and says its change is served by
+  `repository_diff`.
+
 **Revision note (r1 → r2).** Round 1 raised one finding, accepted:
 
 - **f1** (major): every server shared the review nonce, so cursor tokens (`{nonce}-{n}`) collided

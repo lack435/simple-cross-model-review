@@ -548,21 +548,27 @@ fn json_path(p: &Path) -> Result<&str, EvidenceError> {
 /// bundle path, and the per-turn nonce (which is the review id, already in the bundle filename).
 /// `env` is deliberately omitted so the evidence child inherits the reviewer's environment and can
 /// still resolve `git` on `PATH`; it reads only the immutable bundle and the working tree.
+///
+/// `servers` is `(server name, bundle file, nonce)` for every evidence server the turn attaches: the
+/// working root's first, then one per declared companion repository (issue #167), each with its own
+/// bundle and nonce. One file lists them all, named from `nonce` (the review id).
 pub fn write_claude_mcp_config(
     cfg: &crate::config::Config,
     executable: &Path,
-    bundle_file: &Path,
+    servers: &[(&str, &Path, &str)],
     nonce: &str,
 ) -> Result<BundleFile, EvidenceError> {
-    let mut servers = serde_json::Map::new();
-    servers.insert(
-        SERVER_NAME.to_string(),
-        json!({
-            "command": json_path(executable)?,
-            "args": [SERVER_FLAG, json_path(bundle_file)?, nonce],
-        }),
-    );
-    let config = json!({ "mcpServers": Value::Object(servers) });
+    let mut entries = serde_json::Map::new();
+    for (name, bundle_file, server_nonce) in servers {
+        entries.insert(
+            (*name).to_string(),
+            json!({
+                "command": json_path(executable)?,
+                "args": [SERVER_FLAG, json_path(bundle_file)?, server_nonce],
+            }),
+        );
+    }
+    let config = json!({ "mcpServers": Value::Object(entries) });
 
     let dir = capability_dir(cfg)?;
     let path = dir.join(format!("{nonce}-claude-mcp.json"));
@@ -591,6 +597,18 @@ pub fn write_claude_mcp_config(
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
 pub use core::{committed_change_digest, resolve_head};
 pub use git::list_worktrees;
+
+/// Whether an MCP server name is one of this server's evidence servers: the working root's
+/// ([`SERVER_NAME`]) or a companion repository's (`<SERVER_NAME>_<name>`, issue #167). Only servers
+/// this process configured can appear (Claude runs under `--strict-mcp-config`, Codex with
+/// `--ignore-user-config`), so the shape alone identifies them.
+pub fn is_evidence_server(name: &str) -> bool {
+    name == SERVER_NAME
+        || name
+            .strip_prefix(SERVER_NAME)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .is_some_and(|companion| crate::companion::validate_name(companion).is_ok())
+}
 
 /// The nonce-bound serve-record file for one review (retire-capture-modes mechanism 3). Deterministic
 /// from the capability dir and nonce, so the child (`serve_stdio`, deriving it from the bundle's own
@@ -1413,6 +1431,71 @@ fn validate_nonce(nonce: &str) -> Result<(), EvidenceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_server_names_are_the_root_and_well_formed_companions_only() {
+        assert!(is_evidence_server("cross_review_evidence"));
+        assert!(is_evidence_server("cross_review_evidence_assets"));
+        assert!(is_evidence_server("cross_review_evidence_art-2"));
+        for other in [
+            "cross_review_evidenceassets",
+            "cross_review_evidence_",
+            "cross_review_evidence_Assets",
+            "cross_review_evidence_a_b",
+            "cross-review",
+            "",
+        ] {
+            assert!(!is_evidence_server(other), "{other:?}");
+        }
+    }
+
+    /// Issue #167: one Claude MCP config lists every server, each with its own bundle and nonce.
+    #[test]
+    fn the_claude_mcp_config_lists_every_server_with_its_own_bundle_and_nonce() {
+        let state = crate::testutil::temp_dir("evidence-mcp-config-state");
+        let repo = crate::testutil::temp_dir("evidence-mcp-config-repo");
+        let cfg = crate::config::Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+            "--cwd".into(),
+            repo.as_path().to_string_lossy().into_owned(),
+            "--state-dir".into(),
+            state.as_path().to_string_lossy().into_owned(),
+        ])
+        .expect("config");
+        let file = write_claude_mcp_config(
+            &cfg,
+            Path::new(r"C:\fake\cross-review.exe"),
+            &[
+                (
+                    SERVER_NAME,
+                    Path::new(r"C:\fake\rv-9-1-evidence.json"),
+                    "rv-9-1",
+                ),
+                (
+                    "cross_review_evidence_assets",
+                    Path::new(r"C:\fake\rv-9-1-c-assets-evidence.json"),
+                    "rv-9-1-c-assets",
+                ),
+            ],
+            "rv-9-1",
+        )
+        .expect("written");
+        assert!(file.path.ends_with("rv-9-1-claude-mcp.json"));
+        let v: Value = serde_json::from_slice(&fs::read(&file.path).unwrap()).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[SERVER_NAME]["args"][2], "rv-9-1");
+        let assets = &servers["cross_review_evidence_assets"]["args"];
+        assert_eq!(assets[0], SERVER_FLAG);
+        assert!(assets[1]
+            .as_str()
+            .unwrap()
+            .ends_with("rv-9-1-c-assets-evidence.json"));
+        assert_eq!(assets[2], "rv-9-1-c-assets");
+    }
     use crate::testutil::temp_dir;
 
     /// Issue #151: the intake queue holds every call a turn may make, so none waits unread.

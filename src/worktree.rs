@@ -70,7 +70,7 @@ fn strictly_within(path: &Path, root: &Path) -> bool {
 /// The physical location of `path`: canonicalized when it exists, else its nearest existing
 /// ancestor canonicalized with the remaining components re-joined, so a junction anywhere along it
 /// is followed. `None` when no ancestor resolves.
-fn physical(path: &Path) -> Option<PathBuf> {
+pub(crate) fn physical(path: &Path) -> Option<PathBuf> {
     let mut rest = Vec::new();
     let mut cur = path;
     loop {
