@@ -2727,6 +2727,9 @@ struct CaptureOutputs<'a> {
     capture_identity: Option<&'a crate::vcs::baseline::CaptureIdentity>,
     perforce_baseline: Option<&'a crate::vcs::baseline::PerforceBaseline>,
     summary: Option<&'a crate::vcs::CaptureSummary>,
+    /// The capture hook's filled cache for a git turn (issue #174), carried on the evidence bundle
+    /// and the converged-hook binding. `None` without `--capture-hook`, and always for Perforce.
+    git_capture_hook: Option<&'a crate::evidence::generated::GitCaptureHook>,
 }
 
 /// What the attempt that produced the outcome actually did, gathered for the usage record.
@@ -3090,6 +3093,17 @@ impl Job {
             capture.perforce_baseline.clone()
         };
         let mut capture_warnings = capture.warnings;
+        // Git has no static capture, so the capture hook fills its cache here, once per turn and
+        // before any reviewer attempt; every composition of the change then reads it (issue #174).
+        let git_capture_hook = match (&self.cfg.capture_hook, self.cfg.vcs) {
+            (Some(hook), crate::config::Vcs::Git) => {
+                let (git_hook, warnings) =
+                    crate::evidence::generated::prefill(&self.cfg, hook, &self.cfg.cwd);
+                capture_warnings.extend(warnings);
+                Some(git_hook)
+            }
+            _ => None,
+        };
 
         // An `include_change: true` consult that produced no diff must not answer as if a change was
         // shown. The review path's section-7 gate — which would otherwise flag a thin capture — is
@@ -3314,6 +3328,7 @@ impl Job {
                     capture_identity: capture_identity.as_ref(),
                     perforce_baseline: perforce_baseline.as_ref(),
                     summary: capture_summary.as_ref(),
+                    git_capture_hook: git_capture_hook.as_ref(),
                 },
                 &capture_warnings,
                 &mut facts.prompt_bytes,
@@ -3967,6 +3982,7 @@ impl Job {
             capture_identity,
             perforce_baseline,
             summary,
+            git_capture_hook,
         } = captured;
         // A consult diverges from a review only where findings/convergence are concerned; everything
         // to do with account identity, the home lock, evidence setup, spawning, and durable recording
@@ -4141,6 +4157,8 @@ impl Job {
         // The `core.autocrlf` this turn's evidence bundle fixes, kept for the converged-hook binding
         // check so it composes with exactly the setting the served diff was composed with (plan f2).
         let mut turn_autocrlf: Option<crate::evidence::AutoCrlf> = None;
+        // Likewise the capture hook reference the bundle carries, for the same binding check.
+        let mut turn_capture_hook: Option<crate::evidence::generated::GitCaptureHook> = None;
         let evidence_setup =
             if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
                 let executable = std::env::current_exe().map_err(|e| {
@@ -4168,7 +4186,7 @@ impl Job {
                     crate::worktree::recheck(server_root, &self.cfg.cwd)
                         .map_err(errors::evidence_unavailable)?;
                 }
-                let bundle = crate::evidence::Bundle::create(
+                let mut bundle = crate::evidence::Bundle::create(
                     &self.cfg.cwd,
                     self.cfg.vcs,
                     &self.id,
@@ -4182,7 +4200,9 @@ impl Job {
                     claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
                 )
                 .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                bundle.capture_hook = git_capture_hook.cloned();
                 turn_autocrlf = bundle.worktree_autocrlf;
+                turn_capture_hook = bundle.capture_hook.clone();
                 let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
                     .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
                 crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
@@ -5243,7 +5263,7 @@ impl Job {
         } else {
             served_record
                 .as_ref()
-                .and_then(|agg| served_change(agg, turn_autocrlf))
+                .and_then(|agg| served_change(agg, turn_autocrlf, turn_capture_hook.clone()))
         };
         // Each declared companion repository's served change (issue #167), read from its own serve
         // record while it still exists. A companion with none leaves the whole turn unattestable:
@@ -5753,7 +5773,7 @@ fn bind_served<'a>(
     };
     let bound: Option<Vec<crate::hook::ServedCompanion>> = companions
         .map(|(c, nonce, autocrlf)| {
-            served_change(&read_serve_record_aggregate(cfg, nonce), autocrlf).map(|served| {
+            served_change(&read_serve_record_aggregate(cfg, nonce), autocrlf, None).map(|served| {
                 crate::hook::ServedCompanion {
                     name: c.name.clone(),
                     root: c.root.clone(),
@@ -6010,6 +6030,7 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
 fn served_change(
     agg: &DiffServeAggregate,
     autocrlf: Option<crate::evidence::AutoCrlf>,
+    capture_hook: Option<crate::evidence::generated::GitCaptureHook>,
 ) -> Option<crate::hook::ServedChange> {
     if !agg.complete_canonical_terminal {
         return None;
@@ -6025,6 +6046,7 @@ fn served_change(
         base,
         base_source: c.base.clone(),
         autocrlf,
+        capture_hook,
     })
 }
 
@@ -9976,6 +9998,7 @@ mod converged_hook_tests {
             SOURCE,
             &head,
             None,
+            None,
             &Default::default(),
         )
         .unwrap();
@@ -10008,6 +10031,7 @@ mod converged_hook_tests {
                 base,
                 base_source: SOURCE.into(),
                 autocrlf: None,
+                capture_hook: None,
             },
             head,
         })
@@ -10135,6 +10159,7 @@ mod converged_hook_tests {
             SOURCE,
             &ahead,
             None,
+            None,
             &Default::default(),
         )
         .unwrap();
@@ -10159,6 +10184,7 @@ mod converged_hook_tests {
                     base: abase.clone(),
                     base_source: SOURCE.into(),
                     autocrlf: None,
+                    capture_hook: None,
                 },
             }],
         };
@@ -10354,22 +10380,32 @@ mod converged_hook_tests {
                 r#"{{"op":"x","canonical":true,"complete":{complete},"terminal":true,"digest":"{digest}","base":"{base}","base_source":"{SOURCE}","files":1,"insertions":1,"deletions":0,"untracked":0}}"#
             )
         };
-        let served = served_change(&aggregate_serve_records(&op(true, &digest, &base)), None)
-            .expect("bindable");
+        let served = served_change(
+            &aggregate_serve_records(&op(true, &digest, &base)),
+            None,
+            None,
+        )
+        .expect("bindable");
         assert_eq!(served.digest, digest);
         assert_eq!(served.base, base);
         assert_eq!(served.base_source, SOURCE);
 
-        assert!(
-            served_change(&aggregate_serve_records(&op(false, &digest, &base)), None).is_none()
-        );
-        assert!(
-            served_change(&aggregate_serve_records(&op(true, &digest, "abc123")), None).is_none()
-        );
+        assert!(served_change(
+            &aggregate_serve_records(&op(false, &digest, &base)),
+            None,
+            None
+        )
+        .is_none());
+        assert!(served_change(
+            &aggregate_serve_records(&op(true, &digest, "abc123")),
+            None,
+            None
+        )
+        .is_none());
         let no_digest = format!(
             r#"{{"op":"x","canonical":true,"complete":true,"terminal":true,"base":"{base}","base_source":"{SOURCE}","files":1}}"#
         );
-        assert!(served_change(&aggregate_serve_records(&no_digest), None).is_none());
+        assert!(served_change(&aggregate_serve_records(&no_digest), None, None).is_none());
     }
 }
 
@@ -10451,6 +10487,7 @@ mod turn_end_hook_tests {
             source,
             &head,
             None,
+            None,
             &Default::default(),
         )
         .unwrap();
@@ -10482,6 +10519,7 @@ mod turn_end_hook_tests {
                 base,
                 base_source: source.into(),
                 autocrlf: None,
+                capture_hook: None,
             },
         })
     }
@@ -10841,7 +10879,7 @@ mod captured_summary_tests {
             name: "docs".into(),
             root: std::path::PathBuf::from(r"C:\dev\docs"),
         };
-        let root_served = served_change(&aggregate_serve_records(&canonical_op(true)), None);
+        let root_served = served_change(&aggregate_serve_records(&canonical_op(true)), None, None);
         assert!(root_served.is_some());
         let write = |nonce: &str, body: String| {
             let path = crate::evidence::serve_record_path(&cfg, nonce).expect("path");

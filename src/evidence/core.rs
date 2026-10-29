@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use super::generated::GitCaptureHook;
 use super::{Bundle, Drift, EvidenceError, Limits, StampMethod, VcsKind, CODEX_TOOL_TIMEOUT_SECS};
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -1202,6 +1203,7 @@ impl Core {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let staging = self.bundle.staging();
+        let hook = self.bundle.capture_hook.clone();
         let cancel = Arc::clone(&self.cancel);
         let composed = run_bounded_walk(&CHILD_WATCHDOG, "git diff", received_at, move || {
             compose_diff(
@@ -1210,6 +1212,7 @@ impl Core {
                 &head_ep,
                 &path,
                 staging,
+                hook.as_ref(),
                 &limits,
                 &cancel,
                 received_at,
@@ -2659,6 +2662,7 @@ fn compose_diff(
     head: &DiffEndpoint,
     path: &str,
     staging: super::Staging,
+    hook: Option<&GitCaptureHook>,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
@@ -2681,6 +2685,7 @@ fn compose_diff(
         head,
         path,
         staging,
+        hook,
         limits,
         cancel,
         received_at,
@@ -2697,12 +2702,16 @@ fn compose_diff(
 /// from, not a parallel reimplementation, so the two cannot drift apart; and any difference between
 /// them — real or merely formatting — makes the digests differ, which skips the hook rather than
 /// firing it. Both ids must be full object ids; anything else is refused before git runs.
+///
+/// `hook` is the capture hook the served turn's bundle carried (issue #174): the committed
+/// composition reads the same cache entries, so generated text binds exactly like the code diff.
 pub fn committed_change_digest(
     root: &Path,
     base: &str,
     base_source: &str,
     head: &str,
     autocrlf: Option<super::AutoCrlf>,
+    hook: Option<&GitCaptureHook>,
     limits: &Limits,
 ) -> Result<String, EvidenceError> {
     if !valid_object_id(base) || !valid_object_id(head) {
@@ -2722,6 +2731,7 @@ pub fn committed_change_digest(
             autocrlf,
             lfs: false,
         },
+        hook,
         limits,
         &cancel,
         Instant::now(),
@@ -2729,6 +2739,50 @@ pub fn committed_change_digest(
     crate::digest::Fingerprint::of(composed.text.as_bytes())
         .map(|f| f.sha256)
         .ok_or_else(|| EvidenceError::new("provider_failed", "the SHA-256 digest is unavailable"))
+}
+
+/// The branch base the canonical diff resolves (`branch-base`): its object id and source label. The
+/// capture hook's prefill derives its binary inputs against exactly this base.
+pub fn branch_base(root: &Path, limits: &Limits) -> Result<(String, String), EvidenceError> {
+    let cancel = AtomicBool::new(false);
+    resolve_branch_base(root, limits, &cancel, Instant::now())
+}
+
+/// Whether an untracked file is binary by the capture hook's rule (plan r3 f21): its bounded read
+/// holds a NUL anywhere, or it did not fit. An uncertain file counts as binary.
+fn untracked_is_binary(content: &str, truncated: bool) -> bool {
+    truncated || content.contains('\0')
+}
+
+/// The untracked files the capture hook converts: those its globs match that are binary by
+/// [`untracked_is_binary`], read exactly as the composition reads them, so the parent's prefill and
+/// the child's composition list the same files.
+pub fn untracked_binaries(
+    root: &Path,
+    hook: &GitCaptureHook,
+    limits: &Limits,
+) -> Result<Vec<String>, EvidenceError> {
+    let cancel = AtomicBool::new(false);
+    let (paths, _) = super::git::untracked_paths(root, limits, &cancel, Instant::now())?;
+    Ok(paths
+        .into_iter()
+        .filter(|p| hook.matches(p))
+        .filter(|p| {
+            read_untracked(root, p, limits)
+                .is_ok_and(|(content, truncated)| untracked_is_binary(&content, truncated))
+        })
+        .collect())
+}
+
+/// The working-tree file `rel`, resolved inside `root` and opened, with the **open handle**
+/// verified to still be inside the root; `None` when missing or a link leads out of the root. The
+/// capture hook reads only through such a handle, never by reopening the path, so a concurrent
+/// path or reparse-point swap cannot hand a converter bytes from outside the root (#180 review f2).
+pub fn open_contained_file(root: &Path, rel: &str, limits: &Limits) -> Option<File> {
+    let safe = resolve_existing_bounded(root, limits.max_path_bytes as usize, rel, false).ok()?;
+    let file = File::open(&safe).ok()?;
+    verify_open_file(&file, &safe, root).ok()?;
+    Some(file)
 }
 
 /// `HEAD` as a full object id, through the isolated runner, or `None` when it does not resolve (an
@@ -2741,6 +2795,10 @@ pub fn resolve_head(root: &Path, limits: &Limits) -> Result<Option<String>, Evid
 /// [`compose_diff`] after the base is resolved: the header naming the resolved base, the tracked
 /// diff, and — for a working-tree head — the untracked files. Split out so the converged-hook binding
 /// check composes `base..head` through the very same code (see [`committed_change_digest`]).
+///
+/// With a capture hook (issue #174), an untracked binary file it matches is listed rather than
+/// inlined, and a whole-change composition (`path` empty) ends with the generated text read from the
+/// hook's cache; an entry that is absent or over budget makes the composition incomplete.
 #[allow(clippy::too_many_arguments)]
 fn compose_resolved(
     root: &Path,
@@ -2749,6 +2807,7 @@ fn compose_resolved(
     head: &DiffEndpoint,
     path: &str,
     staging: super::Staging,
+    hook: Option<&GitCaptureHook>,
     limits: &Limits,
     cancel: &AtomicBool,
     received_at: Instant,
@@ -2783,6 +2842,7 @@ fn compose_resolved(
 
     let mut complete = true;
     let mut untracked_files = 0usize;
+    let mut binary_untracked: Vec<String> = Vec::new();
     let mut out = String::new();
     out.push_str(&format!(
         "# repository_diff base {base_source} = {base_token}\n\n"
@@ -2820,6 +2880,13 @@ fn compose_resolved(
         }
         for p in &paths {
             match read_untracked(root, p, limits) {
+                Ok((content, truncated))
+                    if hook.is_some_and(|h| h.matches(p))
+                        && untracked_is_binary(&content, truncated) =>
+                {
+                    out.push_str(&format!("\n=== new binary file: {p} ===\n"));
+                    binary_untracked.push(p.clone());
+                }
                 Ok((content, truncated)) => {
                     out.push_str(&format!("\n=== new file: {p} ===\n"));
                     out.push_str(&content);
@@ -2837,6 +2904,48 @@ fn compose_resolved(
         }
         if !complete {
             out.push_str("\n# note: untracked listing or contents were incomplete\n");
+        }
+    }
+    // Generated text belongs to the whole change only; an index head is exploratory and never binds.
+    let generated_head = match head {
+        DiffEndpoint::Worktree => Some(None),
+        DiffEndpoint::Head => Some(Some("HEAD")),
+        DiffEndpoint::Commit(id) => Some(Some(id.as_str())),
+        _ => None,
+    };
+    if let (Some(hook), Some(head_rev), true) = (hook, generated_head, path.is_empty()) {
+        let derived = super::generated::derive(
+            root,
+            &base_token,
+            head_rev,
+            &binary_untracked,
+            staging,
+            hook,
+            limits,
+            cancel,
+            received_at,
+        );
+        match derived {
+            Ok(inputs) => {
+                let deadline = Instant::now()
+                    + child_budget(received_at)
+                        .min(Duration::from_millis(limits.operation_timeout_ms));
+                let mut digests = super::generated::Digests::new(
+                    root,
+                    hook.max_file_bytes,
+                    limits,
+                    cancel,
+                    deadline,
+                    None,
+                );
+                complete &= super::generated::compose(&mut out, &mut digests, hook, &inputs)
+            }
+            Err(_) => {
+                complete = false;
+                out.push_str(
+                    "\n\n# generated text unavailable: binary files could not be listed\n",
+                );
+            }
         }
     }
     Ok(ComposedDiff {
@@ -2942,6 +3051,7 @@ mod tests {
             page_bytes_ceiling: None,
             worktree_autocrlf: None,
             worktree_lfs: false,
+            capture_hook: None,
         }
     }
 
@@ -4206,6 +4316,7 @@ mod tests {
             &DiffEndpoint::Worktree,
             "",
             staging,
+            None,
             &Limits::default(),
             &cancel,
             Instant::now(),
@@ -4236,7 +4347,8 @@ mod tests {
         );
         let served = served_digest(root, &base, SOURCE, None);
         let committed =
-            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+            committed_change_digest(root, &base, SOURCE, &head, None, None, &Limits::default())
+                .unwrap();
         assert_eq!(served, committed);
     }
 
@@ -4270,6 +4382,7 @@ mod tests {
                     autocrlf: None,
                     lfs: false,
                 },
+                None,
                 &Limits::default(),
                 &AtomicBool::new(false),
                 Instant::now(),
@@ -4309,6 +4422,7 @@ mod tests {
             SOURCE,
             &head,
             Some(AutoCrlf::True),
+            None,
             &Limits::default(),
         )
         .unwrap();
@@ -4356,7 +4470,8 @@ mod tests {
         git_out(root, &[], &["commit", "-q", "-m", "lfs"]).unwrap();
         let head = git_out(root, &[], &["rev-parse", "HEAD"]).unwrap();
         let committed =
-            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+            committed_change_digest(root, &base, SOURCE, &head, None, None, &Limits::default())
+                .unwrap();
         let lfs = Staging {
             autocrlf: None,
             lfs: true,
@@ -4387,7 +4502,8 @@ mod tests {
         };
         let root = dir.as_path();
         let committed =
-            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+            committed_change_digest(root, &base, SOURCE, &head, None, None, &Limits::default())
+                .unwrap();
 
         fs::write(root.join("keep.txt"), "one\nuncommitted\nthree\n").unwrap();
         assert_ne!(served_digest(root, &base, SOURCE, None), committed);
@@ -4408,7 +4524,8 @@ mod tests {
         };
         let root = dir.as_path();
         let committed =
-            committed_change_digest(root, &base, SOURCE, &head, None, &Limits::default()).unwrap();
+            committed_change_digest(root, &base, SOURCE, &head, None, None, &Limits::default())
+                .unwrap();
         assert_ne!(served_digest(root, &base, "HEAD", None), committed);
         assert!(committed_change_digest(
             root,
@@ -4416,11 +4533,320 @@ mod tests {
             SOURCE,
             &head,
             None,
+            None,
             &Limits::default()
         )
         .is_err());
+        assert!(committed_change_digest(
+            root,
+            &base,
+            SOURCE,
+            "HEAD",
+            None,
+            None,
+            &Limits::default()
+        )
+        .is_err());
+    }
+
+    // ---- Capture hook on git (issue #174) ----
+
+    /// The served `branch-base..worktree` composition with a capture hook.
+    fn served_with_hook(root: &Path, base: &str, hook: &GitCaptureHook) -> ComposedDiff {
+        compose_resolved(
+            root,
+            base.to_string(),
+            SOURCE.to_string(),
+            &DiffEndpoint::Worktree,
+            "",
+            Staging::default(),
+            Some(hook),
+            &Limits::default(),
+            &AtomicBool::new(false),
+            Instant::now(),
+        )
+        .expect("served composition")
+    }
+
+    fn sha(text: &str) -> String {
+        crate::digest::Fingerprint::of(text.as_bytes())
+            .unwrap()
+            .sha256
+    }
+
+    /// A repository whose base commit holds `a.bin`, `old.bin` and `keep.txt`, with
+    /// `refs/remotes/origin/HEAD` at that commit so `branch-base` resolves to it.
+    fn hook_repo(name: &str) -> Option<(crate::testutil::TempDir, String)> {
+        crate::reviewer::on_path("git")?;
+        let dir = temp_dir(name);
+        let root = dir.as_path().to_path_buf();
+        git_out(&root, &[], &["init", "-q"])?;
+        fs::write(root.join("a.bin"), [1u8, 0, 2]).unwrap();
+        fs::write(root.join("old.bin"), [9u8, 0, 9]).unwrap();
+        fs::write(root.join("keep.txt"), "text\n").unwrap();
+        git_out(&root, &[], &["add", "-A"])?;
+        git_out(&root, &[], &["commit", "-q", "-m", "base"])?;
+        let base = git_out(&root, &[], &["rev-parse", "HEAD"])?;
+        git_out(
+            &root,
+            &[],
+            &["update-ref", "refs/remotes/origin/HEAD", &base],
+        )?;
+        Some((dir, base))
+    }
+
+    /// The parent's prefill runs the converter once for the change's binary files, and the child's
+    /// composition and the committed binding composition read the same entries: an edit, a rename
+    /// (base read from where it moved from), an untracked binary (listed, not inlined), a declined
+    /// file (one line, still complete) and an unmatched binary (untouched). A source changed after
+    /// prefill is absent, so incomplete.
+    #[test]
+    fn the_capture_hook_prefills_and_every_git_composition_reads_it() {
+        let Some((dir, base)) = hook_repo("capture-hook-git") else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        fs::write(root.join("a.bin"), [1u8, 0, 2, 4]).unwrap();
+        git_out(&root, &[], &["mv", "old.bin", "moved.bin"]).unwrap();
+        fs::write(root.join("new.bin"), [5u8, 0, 5]).unwrap();
+        fs::write(root.join("declined.bin"), [6u8, 0, 6]).unwrap();
+        fs::write(root.join("skip.dat"), [3u8, 0, 3]).unwrap();
+
+        let hook_dir = temp_dir("capture-hook-git-converter");
+        let counter = hook_dir.as_path().join("counter.txt");
+        let script = hook_dir.as_path().join("convert.ps1");
+        fs::write(
+            &script,
+            format!(
+                r#"$in = [Console]::In.ReadToEnd() | ConvertFrom-Json
+Add-Content -LiteralPath '{}' -Value 'run'
+$files = @()
+foreach ($f in $in.files) {{
+    if ($f.path -like '*declined*') {{ continue }}
+    $rec = @{{ id = $f.id; path = ($f.path + '.txt') }}
+    foreach ($side in 'base', 'modified') {{
+        $s = $f.$side
+        if ($null -eq $s -or -not $s.file) {{ continue }}
+        $hex = ([IO.File]::ReadAllBytes($s.file) | ForEach-Object {{ $_.ToString('x2') }}) -join ''
+        $out = Join-Path $in.temp_dir ("$($f.id)-$side.txt")
+        [IO.File]::WriteAllText($out, "TEXT $side $hex`n")
+        $rec["${{side}}_text_file"] = $out
+    }}
+    $files += $rec
+}}
+@{{ files = $files }} | ConvertTo-Json -Depth 5 -Compress
+"#,
+                counter.display()
+            ),
+        )
+        .unwrap();
+        let state = temp_dir("capture-hook-git-state");
+        let arg = |a: &str| ["--capture-hook-arg".to_string(), a.to_string()];
+        let mut args: Vec<String> = [
+            "--reviewer",
+            "codex",
+            "--level",
+            "standard:gpt-5.6-luna:medium",
+            "--vcs",
+            "git",
+            "--cwd",
+            &root.to_string_lossy(),
+            "--state-dir",
+            &state.as_path().to_string_lossy(),
+            "--capture-hook",
+            "powershell",
+            "--capture-hook-glob",
+            "*.bin",
+            "--capture-hook-materialize",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for a in ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"] {
+            args.extend(arg(a));
+        }
+        args.extend(arg(&script.to_string_lossy()));
+        let cfg = crate::config::Config::from_args(&args).expect("config");
+        let runs = || {
+            fs::read_to_string(&counter)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let (hook, warnings) =
+            super::super::generated::prefill(&cfg, cfg.capture_hook.as_ref().unwrap(), &root);
+        assert!(hook.cache_dir.is_some(), "the hook can run");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(runs(), 1);
+        let served = served_with_hook(&root, &base, &hook);
+        for want in [
+            "# generated text (from binary files)",
+            "=== generated: a.bin.txt (from a.bin) ===",
+            "-TEXT base 010002",
+            "+TEXT modified 01000204",
+            "=== generated: moved.bin.txt (from moved.bin) ===",
+            "TEXT base 090009",
+            "=== new binary file: new.bin ===",
+            "+TEXT modified 050005",
+            "=== no generated text for declined.bin ===",
+        ] {
+            assert!(
+                served.text.contains(want),
+                "missing {want:?}:\n{}",
+                served.text
+            );
+        }
         assert!(
-            committed_change_digest(root, &base, SOURCE, "HEAD", None, &Limits::default()).is_err()
+            !served.text.contains("skip.dat.txt"),
+            "an unmatched file is not converted"
         );
+        assert!(served.complete, "{}", served.text);
+
+        // Unchanged sources: the cache answers, the converter does not run again.
+        let (again, _) =
+            super::super::generated::prefill(&cfg, cfg.capture_hook.as_ref().unwrap(), &root);
+        assert_eq!(again, hook);
+        assert_eq!(runs(), 1, "a cache hit must not run the converter");
+
+        // Committing exactly the reviewed content binds: same entries, same bytes.
+        fs::remove_file(root.join("skip.dat")).unwrap();
+        let served = served_with_hook(&root, &base, &hook);
+        git_out(&root, &[], &["add", "-A"]).unwrap();
+        git_out(&root, &[], &["commit", "-q", "-m", "head"]).unwrap();
+        let head = git_out(&root, &[], &["rev-parse", "HEAD"]).unwrap();
+        let limits = Limits::default();
+        let bound = |hook: Option<&GitCaptureHook>| {
+            committed_change_digest(&root, &base, SOURCE, &head, None, hook, &limits).unwrap()
+        };
+        let committed = served_with_hook(&root, &base, &hook);
+        assert_eq!(sha(&committed.text), bound(Some(&hook)));
+        assert!(
+            committed.text.contains("+TEXT modified 050005"),
+            "{}",
+            committed.text
+        );
+        assert_ne!(
+            bound(Some(&hook)),
+            bound(None),
+            "the binding covers the generated text"
+        );
+        assert!(served.complete);
+
+        // A source changed after prefill has no entry: unavailable, and the composition incomplete.
+        fs::write(root.join("a.bin"), [1u8, 0, 2, 8]).unwrap();
+        let stale = served_with_hook(&root, &base, &hook);
+        assert!(stale
+            .text
+            .contains("=== generated text for a.bin unavailable ==="));
+        assert!(!stale.complete);
+    }
+
+    /// A negative entry is complete, an absent one is not, and generated text past its budget is
+    /// omitted and makes the composition incomplete. An oversized file is excluded silently.
+    #[test]
+    fn generated_text_entries_decide_completeness() {
+        use super::super::generated::{key, BinaryInput, Digests, Modified};
+        use crate::capture_cache::{Cache, Entry};
+        let Some((dir, base)) = hook_repo("capture-hook-git-entries") else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        let root = fs::canonicalize(dir.as_path()).unwrap();
+        let cache_dir = temp_dir("capture-hook-git-cache");
+        let hook = GitCaptureHook {
+            identity: "test".into(),
+            cache_dir: Some(cache_dir.as_path().to_string_lossy().into_owned()),
+            globs: vec!["new.bin".into(), "big.bin".into()],
+            max_file_bytes: 16,
+            working_root: root.to_string_lossy().into_owned(),
+        };
+        fs::write(root.join("new.bin"), [5u8, 0, 5]).unwrap();
+        fs::write(root.join("big.bin"), [0u8; 17]).unwrap();
+        let k = key(
+            &hook,
+            &BinaryInput {
+                change_type: crate::capture_hook::ChangeType::Add,
+                path: "new.bin".into(),
+                moved_from: None,
+                base: None,
+                modified: Some(Modified::Worktree("new.bin".into())),
+                excluded: false,
+            },
+            None,
+            Digests::new(
+                &root,
+                16,
+                &Limits::default(),
+                &AtomicBool::new(false),
+                Instant::now(),
+                None,
+            )
+            .modified(&Modified::Worktree("new.bin".into()))
+            .as_deref(),
+        )
+        .unwrap();
+        let cache = Cache::open(cache_dir.as_path()).unwrap();
+
+        let absent = served_with_hook(&root, &base, &hook);
+        assert!(absent
+            .text
+            .contains("=== generated text for new.bin unavailable ==="));
+        assert!(!absent.complete);
+        assert!(
+            !absent.text.contains("big.bin unavailable"),
+            "oversized is excluded"
+        );
+
+        // A hook that could not be set up has no cache: its files are unavailable, never silently
+        // missing from a complete diff (#180 review f1).
+        let unset = GitCaptureHook {
+            cache_dir: None,
+            ..hook.clone()
+        };
+        cache.put(&k, &Entry::Negative).unwrap();
+        let failed = served_with_hook(&root, &base, &unset);
+        assert!(failed
+            .text
+            .contains("=== generated text for new.bin unavailable ==="));
+        assert!(!failed.complete);
+
+        // A blob read past its deadline fails rather than blocking (review f3).
+        let blob = git_out(&root, &[], &["rev-parse", "HEAD:a.bin"]).unwrap();
+        let late = super::super::git::blob_digest(
+            &root,
+            &blob,
+            16,
+            Instant::now(),
+            &AtomicBool::new(false),
+        );
+        assert!(late.is_err());
+        let digest = super::super::git::blob_digest(
+            &root,
+            &blob,
+            16,
+            Instant::now() + Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(digest, crate::digest::sha256(&[1u8, 0, 2]));
+
+        let declined = served_with_hook(&root, &base, &hook);
+        assert!(declined
+            .text
+            .contains("=== no generated text for new.bin ==="));
+        assert!(declined.complete, "{}", declined.text);
+
+        let huge = Entry::Positive {
+            display_path: "new.txt".into(),
+            text: "x".repeat(super::super::generated::GENERATED_BUDGET + 1),
+            note: None,
+        };
+        cache.put(&k, &huge).unwrap();
+        let over = served_with_hook(&root, &base, &hook);
+        assert!(over
+            .text
+            .contains("=== generated text for new.bin omitted: over budget ==="));
+        assert!(!over.complete);
     }
 }

@@ -413,10 +413,10 @@ file has:
 - its `local_path` in the workspace;
 - a `base` and a `modified` side.
 
-Each side has a `ref` (a depot revision or the working-tree path), and a `file` when the server has
+Each side has a `ref` (a depot revision, a git blob id, or the working-tree path), and a `file` when the server has
 written a **snapshot** of it under the `temp_dir` it supplies. Snapshots keep the original file name.
-Working-tree sides are always snapshotted; with `--capture-hook-materialize`, depot sides are
-snapshotted too. Otherwise the converter fetches a side by `ref`. **Read content from `file`
+Working-tree sides are always snapshotted; with `--capture-hook-materialize`, depot revisions and
+git blobs are snapshotted too. Otherwise the converter fetches a side by `ref`. **Read content from `file`
 (or `ref`), not `local_path`:** the snapshot is exactly the bytes the server recorded, so a file that
 changes while the converter runs can never be cached under the wrong content. `local_path` is for
 naming things, such as an asset's package path.
@@ -428,9 +428,11 @@ naming things, such as an asset's package path.
 - either `base_text_file` / `modified_text_file` (UTF-8 text files it wrote inside `temp_dir`; the
   server diffs them), or its own unified diff in `diff_text_file`.
 
-A file it leaves out stays binary. A record that names an unknown id, has the wrong sides for its
-change type, or points outside `temp_dir` is dropped with a warning. A timeout, a nonzero exit or
-unreadable output is a warning too, and the review goes on with the files listed as binary.
+A file it leaves out is **declined**: the converter looked at it and found nothing to review, so it
+is listed in one line ("no generated text for ...") and the capture stays complete. A record that
+names an unknown id, has the wrong sides for its change type, or points outside `temp_dir` is dropped
+with a warning. A timeout, a nonzero exit or unreadable output is a warning too, and the review goes
+on with the files listed as binary. Those files were not examined, so the capture is incomplete.
 
 **How it runs.** As this server's user, in a job object, with no console window. It is stopped only
 by `--capture-hook-timeout-seconds` (default 120, at most `--timeout-seconds`), never for being
@@ -448,10 +450,19 @@ outside every reviewed tree, and is trimmed oldest-first past 256 MiB.
 **Budget.** Generated text has its own 400 kB budget per capture, separate from the code diff.
 A converted file that doesn't fit stays listed as binary, and the capture is marked incomplete.
 
-**Today:** Perforce changes (pending, submitted and shelved), in reviews and in consults with
+**Perforce:** pending, submitted and shelved changes, in reviews and in consults with
 `include_change`. A pending move pairs into one file. A submitted or shelved move is converted as the
-add and the delete Perforce reports, because those revisions carry no move link. Git changes are the
-next step; the design is in [`docs/capture-hook-plan.md`](docs/capture-hook-plan.md).
+add and the delete Perforce reports, because those revisions carry no move link.
+
+**Git:** the server runs the converter once before each turn, over the binary files of the canonical
+change (`branch-base..worktree`): tracked edits, adds, deletes and renames (`--find-renames=50%`; a
+rename is a `move`), plus untracked binary files, which are then listed rather than inlined. The
+reviewer's `repository_diff` of the whole change ends with a `# generated text (from binary files)`
+section read from the cache, so generated text falls under the approval floor: an approval needs it
+served, and a source that changed after the converter ran shows as unavailable and makes the diff
+incomplete until the next turn converts it. The converged hook's binding covers it too. LFS files
+are staged as pointers, so they never reach the converter, and declared companion repositories are
+not converted. The design is in [`docs/capture-hook-plan.md`](docs/capture-hook-plan.md).
 
 ## Following every review from outside the client
 

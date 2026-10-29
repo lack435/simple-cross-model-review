@@ -45,6 +45,7 @@ $script = Join-Path $hookDir 'convert.ps1'
 Add-Content -LiteralPath '$counter' -Value 'run'
 `$files = @()
 foreach (`$f in `$in.files) {
+    if (`$f.path -like '*declined*') { continue }
     `$rec = @{ id = `$f.id; path = (`$f.path + '.txt') }
     foreach (`$side in 'base', 'modified') {
         `$s = `$f.`$side
@@ -60,13 +61,14 @@ foreach (`$f in `$in.files) {
 @{ files = `$files; note = 'hex dump of each side' } | ConvertTo-Json -Depth 5 -Compress
 "@ | Set-Content -LiteralPath $script -Encoding UTF8
 
-function Invoke-Capture([string]$Change, [string]$Expect, [switch]$Shelved) {
+function Invoke-Capture([string]$Change, [string]$Expect, [switch]$Shelved, [switch]$Resume) {
     Remove-Item -LiteralPath $counter -ErrorAction SilentlyContinue
     $env:CROSS_REVIEW_P4_TEST_HOOK_CL = $Change
     $env:CROSS_REVIEW_P4_TEST_HOOK_SCRIPT = $script
     $env:CROSS_REVIEW_P4_TEST_HOOK_EXPECT = $Expect
     $env:CROSS_REVIEW_P4_TEST_HOOK_COUNTER = $counter
     $env:CROSS_REVIEW_P4_TEST_SHELVED = if ($Shelved) { '1' } else { '' }
+    $env:CROSS_REVIEW_P4_TEST_HOOK_RESUME = if ($Resume) { '1' } else { '' }
     Push-Location $PSScriptRoot
     try {
         $ErrorActionPreference = 'Continue'
@@ -86,7 +88,7 @@ try {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
-    foreach ($name in 'CROSS_REVIEW_P4_TEST_HOOK_SCRIPT', 'CROSS_REVIEW_P4_TEST_HOOK_EXPECT', 'CROSS_REVIEW_P4_TEST_HOOK_COUNTER') {
+    foreach ($name in 'CROSS_REVIEW_P4_TEST_HOOK_SCRIPT', 'CROSS_REVIEW_P4_TEST_HOOK_EXPECT', 'CROSS_REVIEW_P4_TEST_HOOK_COUNTER', 'CROSS_REVIEW_P4_TEST_HOOK_RESUME') {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
     & $P4d -r $server -xi | Out-Null
@@ -106,6 +108,7 @@ try {
     & $bytes 'gone.uasset' ([byte[]](7, 0, 7))
     & $bytes 'old.uasset' ([byte[]](9, 0, 9))
     & $bytes 'skip.bin' ([byte[]](3, 0, 3))
+    & $bytes 'declined.uasset' ([byte[]](6, 0, 6))
     Invoke-TestP4 add -t binary "$workspace\..." | Out-Null
     Invoke-TestP4 submit -d 'Synthetic baseline' | Out-Null
 
@@ -142,7 +145,18 @@ try {
     Invoke-TestP4 revert -c $shelf "$workspace\..." | Out-Null
     Invoke-Capture $shelf '-TEXT base 01000204|+TEXT modified 0100020408' -Shelved
 
-    Write-Host 'PASS: binary edit, add, delete and move convert in pending, submitted and shelved changes; a re-capture hits the cache.'
+    # A converted file and one the converter declines: the change stays complete, saves a resume
+    # baseline, and collapses on a resume.
+    $created = "Change: new`nClient: hook-test`nUser: hook-test`nDescription:`n    Declined`n" | Invoke-TestP4 change -i
+    if (($created -join '') -notmatch 'Change (\d+) created') { throw 'No declined changelist.' }
+    $declined = $Matches[1]
+    Invoke-TestP4 edit -c $declined "$workspace\edit.uasset" | Out-Null
+    & $bytes 'edit.uasset' ([byte[]](1, 0, 2, 4, 16))
+    Invoke-TestP4 edit -c $declined "$workspace\declined.uasset" | Out-Null
+    & $bytes 'declined.uasset' ([byte[]](6, 0, 6, 6))
+    Invoke-Capture $declined '+TEXT modified 0100020410|No generated text for //depot/declined.uasset (declined by the capture hook).' -Resume
+
+    Write-Host 'PASS: binary edit, add, delete and move convert in pending, submitted and shelved changes; a re-capture hits the cache; a declined file keeps the change complete.'
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
     [Console]::InputEncoding = $savedInputEncoding

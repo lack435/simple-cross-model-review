@@ -158,8 +158,12 @@ pub fn file_digest(path: &Path) -> Option<[u8; 32]> {
 /// enforced **while streaming**, not only by an earlier metadata check a growing file could outrun
 /// (review f7 on #179).
 pub fn file_digest_capped(path: &Path, max: u64) -> Option<[u8; 32]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
+    reader_digest_capped(std::fs::File::open(path).ok()?, max)
+}
+
+/// [`file_digest_capped`] over an already-open reader, such as a handle whose containment was
+/// verified before reading (#180 review f2).
+pub fn reader_digest_capped(mut file: impl std::io::Read, max: u64) -> Option<[u8; 32]> {
     let mut h = crate::digest::Sha256Stream::new()?;
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -198,16 +202,29 @@ pub fn snapshot_path(temp_dir: &Path, id: &str, modified: bool, source: &str) ->
 /// file that could change underneath it. Fails, removing the partial copy, as soon as more than `max`
 /// bytes have been read (review f7 on #179).
 pub fn snapshot(source: &Path, dest: &Path, max: u64) -> std::io::Result<[u8; 32]> {
-    let result = snapshot_inner(source, dest, max);
+    snapshot_reader(std::fs::File::open(source)?, dest, max)
+}
+
+/// [`snapshot`] from an already-open reader, such as a handle whose containment was verified
+/// before reading (#180 review f2).
+pub fn snapshot_reader(
+    input: impl std::io::Read,
+    dest: &Path,
+    max: u64,
+) -> std::io::Result<[u8; 32]> {
+    let result = snapshot_inner(input, dest, max);
     if result.is_err() {
         let _ = std::fs::remove_file(dest);
     }
     result
 }
 
-fn snapshot_inner(source: &Path, dest: &Path, max: u64) -> std::io::Result<[u8; 32]> {
-    use std::io::{Read, Write};
-    let mut input = std::fs::File::open(source)?;
+fn snapshot_inner(
+    mut input: impl std::io::Read,
+    dest: &Path,
+    max: u64,
+) -> std::io::Result<[u8; 32]> {
+    use std::io::Write;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }

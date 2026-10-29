@@ -84,6 +84,9 @@ pub struct ServedChange {
     pub base: String,
     pub base_source: String,
     pub autocrlf: Option<AutoCrlf>,
+    /// The capture hook the turn's bundle carried (issue #174), so the committed composition reads
+    /// the same generated text the served one did.
+    pub capture_hook: Option<crate::evidence::generated::GitCaptureHook>,
 }
 
 /// Everything needed to fire — or, through `cross_model_review_attest`, re-fire — the hook for one
@@ -264,6 +267,7 @@ pub fn check_binding(root: &Path, served: &ServedChange) -> Result<String, HookR
         &served.base_source,
         &head,
         served.autocrlf,
+        served.capture_hook.as_ref(),
         &limits,
     ) {
         Ok(digest) if digest == served.digest => Ok(head),
@@ -726,6 +730,7 @@ mod tests {
             base: "a".repeat(40),
             base_source: "merge-base(HEAD, refs/remotes/origin/HEAD)".into(),
             autocrlf: None,
+            capture_hook: None,
         }
     }
 

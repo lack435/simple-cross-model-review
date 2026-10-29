@@ -262,6 +262,272 @@ pub fn untracked_paths(
     Ok((paths, complete))
 }
 
+/// One binary file in a diff (issue #174): its status letter (`A`, `M`, `D`, `R`, ...), the old path
+/// of a rename, and its (new) path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryChange {
+    pub status: char,
+    pub old_path: Option<String>,
+    pub path: String,
+}
+
+/// The binary files `spec` changes, with the capture hook's fixed rename options (`--find-renames=
+/// 50%`), so the parent prefill and every composition derive exactly the same list (plan r3 f16).
+/// A binary file is a `-\t-` row of `--numstat -z`; its status comes from `--name-status -z`, joined
+/// on the (new) path. Both run under the same staging overrides as the served diff, so an LFS path
+/// (staged as its pointer, which is text) is never binary here.
+pub fn binary_changes(
+    root: &Path,
+    spec: &[&str],
+    staging: Staging,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Vec<BinaryChange>, EvidenceError> {
+    let run_diff = |extra: &str| -> Result<String, EvidenceError> {
+        let mut args = staging_overrides(root, spec, staging, limits, cancel, received_at)?;
+        args.extend([
+            "diff".to_string(),
+            extra.to_string(),
+            "-z".to_string(),
+            "--find-renames=50%".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-textconv".to_string(),
+        ]);
+        args.extend(spec.iter().map(|s| s.to_string()));
+        run(root, &args, limits, cancel, received_at)
+    };
+    // `--numstat -z`: `a\tb\tpath\0`, or for a rename `a\tb\t\0old\0new\0`.
+    let numstat = run_diff("--numstat")?;
+    let mut binary: BTreeSet<String> = BTreeSet::new();
+    let mut tokens = numstat.split('\0');
+    while let Some(tok) = tokens.next() {
+        if tok.is_empty() {
+            continue;
+        }
+        let mut cols = tok.splitn(3, '\t');
+        let (Some(a), Some(b), Some(rest)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let path = if rest.is_empty() {
+            let _old = tokens.next();
+            tokens.next().unwrap_or("").to_string()
+        } else {
+            rest.to_string()
+        };
+        if a == "-" && b == "-" && !path.is_empty() {
+            binary.insert(path);
+        }
+    }
+    if binary.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `--name-status -z`: `S\0path\0`, or for a rename/copy `R100\0old\0new\0`.
+    let names = run_diff("--name-status")?;
+    let mut out = Vec::new();
+    let mut tokens = names.split('\0').filter(|t| !t.is_empty());
+    while let Some(status) = tokens.next() {
+        let letter = status.chars().next().unwrap_or('?');
+        let (old_path, path) = if matches!(letter, 'R' | 'C') {
+            let old = tokens.next().unwrap_or("").to_string();
+            (Some(old), tokens.next().unwrap_or("").to_string())
+        } else {
+            (None, tokens.next().unwrap_or("").to_string())
+        };
+        if binary.contains(&path) {
+            out.push(BinaryChange {
+                status: letter,
+                // A copy keeps its source; only a rename is a move.
+                old_path: (letter == 'R').then_some(old_path).flatten(),
+                path,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The object id of `rev:path`, or `None` when that path does not exist at `rev`.
+pub fn object_id(
+    root: &Path,
+    rev: &str,
+    path: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<Option<String>, EvidenceError> {
+    let spec = format!("{rev}:{path}");
+    let args = [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        spec.as_str(),
+    ];
+    match run_classified(root, &args, limits, cancel, received_at) {
+        Ok(out) => Ok(Some(out.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(GitFailure::Failed(_)) => Ok(None),
+        Err(e) => Err(e.into_evidence()),
+    }
+}
+
+/// The size in bytes of an object.
+pub fn object_size(
+    root: &Path,
+    id: &str,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<u64, EvidenceError> {
+    let args = ["cat-file", "-s", id].map(String::from);
+    let out = run(root, &args, limits, cancel, received_at)?;
+    out.trim()
+        .parse()
+        .map_err(|_| EvidenceError::new("provider_failed", "cat-file -s gave no size"))
+}
+
+/// Stream blob `id`'s raw bytes from `git cat-file blob` into `sink` (binary-safe; the text runner
+/// is not), with the same isolated configuration as every other command. Bounded like the runner
+/// (#180 review f3): git runs in a kill-on-close job object, and passing `deadline`, a cancel, more
+/// than `max` bytes or a sink error drops the job, which kills it. `Ok(false)` means over `max`.
+fn cat_blob(
+    root: &Path,
+    id: &str,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<bool, EvidenceError> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let fail = |m: String| EvidenceError::new("provider_failed", m);
+    let bin = crate::reviewer::on_path("git").ok_or_else(|| fail("git is not on PATH".into()))?;
+    let job = crate::winjob::JobObject::new()
+        .ok_or_else(|| fail("no job object to contain git".into()))?;
+    let mut command = Command::new(bin);
+    command
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "core.hooksPath=NUL",
+        ])
+        .args(["cat-file", "blob", id])
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = job
+        .spawn_in_job_with_flags(&mut command, crate::hook::CREATE_NO_WINDOW)
+        .map_err(|e| fail(e.to_string()))?;
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| fail("no stdout".into()))?;
+    // The pipe is read on its own thread so a stalled git cannot hold this one past the deadline;
+    // when this function returns early the job is dropped, git dies, and the reader sees EOF.
+    // A read error is sent, not swallowed: an EOF the reader merely assumed would pass a partial
+    // blob off as whole (#180 review f5).
+    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let chunk = out.read(&mut buf).map(|n| buf[..n].to_vec());
+            let end = !matches!(&chunk, Ok(c) if !c.is_empty());
+            if tx.send(chunk).is_err() || end {
+                break;
+            }
+        }
+    });
+    let out_of_time = || fail(format!("git cat-file blob {id} ran out of time"));
+    let mut total: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(EvidenceError::new(
+                "cancelled",
+                "the blob read was cancelled",
+            ));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(out_of_time());
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Err(e)) => return Err(fail(format!("reading git cat-file blob {id}: {e}"))),
+            Ok(Ok(chunk)) => {
+                total += chunk.len() as u64;
+                if total > max {
+                    return Ok(false);
+                }
+                sink(&chunk).map_err(|e| fail(e.to_string()))?;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(fail(format!("git cat-file blob {id} ended without EOF")))
+            }
+        }
+    }
+    loop {
+        match child.try_wait().map_err(|e| fail(e.to_string()))? {
+            Some(status) if status.success() => return Ok(true),
+            Some(_) => return Err(fail(format!("git cat-file blob {id} failed"))),
+            None if Instant::now() >= deadline => return Err(out_of_time()),
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// SHA-256 of blob `id`'s raw bytes, or `None` past `max` bytes. Blobs are immutable, so the same
+/// id always gives the same digest.
+pub fn blob_digest(
+    root: &Path,
+    id: &str,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Option<[u8; 32]>, EvidenceError> {
+    let mut h = crate::digest::Sha256Stream::new()
+        .ok_or_else(|| EvidenceError::new("provider_failed", "sha256 unavailable"))?;
+    let whole = cat_blob(root, id, max, deadline, cancel, |b| {
+        h.update(b);
+        Ok(())
+    })?;
+    Ok(if whole { h.finish() } else { None })
+}
+
+/// Write blob `id` to `dest`, at most `max` bytes; a failed or oversized write removes the file.
+pub fn write_blob(
+    root: &Path,
+    id: &str,
+    dest: &Path,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), EvidenceError> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| EvidenceError::new("provider_failed", e.to_string()))?;
+    let result =
+        cat_blob(root, id, max, deadline, cancel, |b| file.write_all(b)).and_then(|whole| {
+            whole.then_some(()).ok_or_else(|| {
+                EvidenceError::new(
+                    "limit_exceeded",
+                    format!("blob {id} is over the size limit"),
+                )
+            })
+        });
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
 /// `git diff --numstat` counts for a resolved spec: (files, insertions, deletions). A binary file
 /// counts toward `files` but contributes no line counts (git renders it as `-\t-`). Feeds the
 /// serve-record so the caller-facing `captured:` line reports what was served (mechanism 5).
