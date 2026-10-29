@@ -13,6 +13,10 @@ env:
 jobs:
   check:
     runs-on: windows-latest
+    # A normal run takes about three minutes, a cold cache several more. Without a bound a hung
+    # test holds the runner for GitHub's 360-minute default (issue #175: one sat ~37 minutes in Tests
+    # before it was cancelled, leaving no log to say which test).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -37,6 +41,9 @@ jobs:
 
       # No network and no model calls, so these run anywhere.
       - name: Tests
+        # The suite runs in seconds. A step timeout ends a hang while the job can still upload its
+        # log, which then carries libtest's "has been running for over 60 seconds" line naming it.
+        timeout-minutes: 10
         run: cargo test
 
       # Via build.ps1 so CI exercises the same build definition a release uses, including
