@@ -186,9 +186,13 @@ pub enum CaptureSummary {
         changelists: Vec<u64>,
         /// Requested changelists that were skipped, so the count is honestly a subset.
         skipped: usize,
-        /// Captured changelists whose evidence was incomplete (binary/out-of-root/lossy/etc.),
-        /// distinct from skipped. Drives the verdict and the new caller warning.
+        /// Captured changelists whose evidence was incomplete (out-of-root/unreadable/lossy/
+        /// unconfirmed-type etc.), distinct from skipped. Drives the verdict and the new caller
+        /// warning. A changelist short only of known binary files is not counted (issue #189).
         incomplete_changelists: usize,
+        /// Some changelist named known binary files it did not show (issue #189). Not a gap;
+        /// rendered as "(binary files listed, not shown)" after the verdict.
+        binary_listed: bool,
         evidence_units: usize,
         /// The combined diff hit the byte budget. Drives the `diff:` token; segment-level short or
         /// lossy `p4 diff` output is carried by `incomplete_changelists`, not this flag.
@@ -246,10 +250,17 @@ because the budget ran out) and stays a gap; a *binary* file is not (its bytes w
 and does not.
 
 **Perforce `complete`** is `skipped.is_empty() && incomplete_changelists == 0 && !diff_truncated`,
-where `incomplete_changelists` counts captured segments with `complete == false`
-(`src/vcs/perforce.rs` per-segment completeness — a binary or unreadable added file, an
-out-of-root or deleted file, a lossy or truncated `p4 describe`; the Perforce path already folds
-its stream-incompleteness into that per-segment flag). This is deliberately *narrower* than the
+where `incomplete_changelists` counts captured segments that are missing evidence which could hide
+content (`src/vcs/perforce.rs` `shortfall` — an unreadable added file, an out-of-root file, a lossy
+or truncated `p4 describe`; the Perforce path already folds its stream-incompleteness into the
+per-segment flags). *(Update, issue #189.)* A segment short only of **known binary** files — typed
+non-text by `p4 opened`, or found to contain NUL bytes — is not counted: each such file is named in
+the prompt and none could ever be shown as text, so it matches the Git rule above that a binary
+file is an exclusion, not a gap. The summary says so with `(binary files listed, not shown)`. A
+file with no hunk whose type is *not* confirmed (a submitted or shelved add or delete, whose
+content `describe` is never asked for, or an opened file with no type) still counts, because it
+could be text. Resume draws the looser `#184` line (`baseline_whole`) on purpose: there the
+question is whether the file list is whole, not whether every file's text was shown. This is deliberately *narrower* than the
 existing `capture_complete` local, which also requires `identity.client_spec_digest.is_some()`:
 that extra condition governs whether the capture may seed a resume *baseline*, a different question
 from whether the evidence shown this turn was whole.
@@ -357,9 +368,11 @@ Constructed in `perforce::capture` (`src/vcs/perforce.rs`) where the `CapturedCh
 
 - **`changelists`** is the `captured` vector — the changelists that produced a segment.
 - **`skipped`** is `skipped.len()`; its per-changelist reasons are already warned.
-- *(r2)* **`incomplete_changelists`** is the count of captured segments with `complete == false`.
-  It drives the verdict **and** a new caller warning (below), because those segment details are
-  rendered only into the prompt today, so a caller has no other way to see them.
+- *(r2)* **`incomplete_changelists`** is the count of captured segments missing evidence that
+  could hide content (see **Perforce `complete`** above; known binary files do not count, issue
+  #189). It drives the verdict **and** a new caller warning (below), because those segment details
+  are rendered only into the prompt today, so a caller has no other way to see them.
+- **`binary_listed`** is whether some segment short only of known binary files named any.
 - **`evidence_units`** is the count of units across all captured segments
   (`segments.iter().flat_map(|s| &s.units).count()`) — *(r3/r4)* the exact number of units the
   reviewer was *sent*, marked a floor on the requested change whenever anything was missing:
