@@ -2975,9 +2975,10 @@ fn is_known_non_text(depot: &str, opened: &[OpenedFile]) -> bool {
         .is_some_and(|f| is_non_text_type(&f.ptype))
 }
 
-/// Whether a Perforce file type is known and is not diffable text. An empty type is not known.
+/// Whether a Perforce file type confirms there is no text to show (issue #194). Only a positive
+/// match does: an empty, unrecognised or text type leaves the file unconfirmed.
 fn is_non_text_type(ptype: &str) -> bool {
-    !ptype.is_empty() && !is_text_base_type(ptype)
+    is_non_text_base_type(ptype)
 }
 
 /// Whether a Perforce file type's base (before any `+modifiers`) is a known diffable text type.
@@ -2990,7 +2991,17 @@ fn is_text_base_type(ptype: &str) -> bool {
         base,
         // `ctext`/`cxtext` are compressed-storage text -- the content is still text and diffs
         // cleanly, so they belong here alongside the executable/keyword legacy spellings.
-        "text" | "xtext" | "ktext" | "kxtext" | "ltext" | "ctext" | "cxtext" | "unicode" | "utf8"
+        "text"
+            | "xtext"
+            | "ktext"
+            | "kxtext"
+            | "ltext"
+            | "xltext"
+            | "ctext"
+            | "cxtext"
+            | "unicode"
+            | "xunicode"
+            | "utf8"
     )
 }
 
@@ -3309,8 +3320,29 @@ mod tests {
         assert_eq!(meta.files[1].ptype, "");
         assert!(is_non_text_type(&meta.files[0].ptype));
         assert!(!is_non_text_type(&meta.files[1].ptype));
-        assert!(!is_non_text_type("text"));
-        assert!(!is_non_text_type("ktext+x"));
+        // Only a known binary-family type confirms: text, legacy text aliases and anything
+        // unrecognised leave the file unconfirmed.
+        for text in [
+            "text",
+            "ktext+x",
+            "xltext",
+            "xunicode",
+            "utf8",
+            "made-up-type",
+        ] {
+            assert!(!is_non_text_type(text), "{text}");
+        }
+        for binary in [
+            "binary",
+            "ubinary",
+            "utf16",
+            "symlink",
+            "apple",
+            "xbinary+S",
+        ] {
+            assert!(is_non_text_type(binary), "{binary}");
+        }
+        assert!(is_text_base_type("xltext") && is_text_base_type("xunicode+k"));
     }
 
     #[test]
