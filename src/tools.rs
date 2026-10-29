@@ -969,7 +969,23 @@ impl App {
         // lease, like `root` -- onto the per-call config. Roots always come from the server's startup
         // configuration, never from anything relative to a per-call `root`. Parsed strictly: the
         // server does not enforce the schema, so a stray or malformed value is refused, not ignored.
-        let cfg: Arc<Config> = match parse_companions_arg(args, &self.cfg.companions)? {
+        let declared = parse_companions_arg(args, &self.cfg.companions)?;
+        // A companion may be nested in the server's working root (issue #170), and a per-call `root`
+        // is a worktree nested there too; the two must not overlap, or one tree would be reviewed
+        // as both.
+        if let Some(c) = declared.iter().find(|c| {
+            crate::reviewer::is_within(&c.root, &cfg.cwd)
+                || crate::reviewer::is_within(&cfg.cwd, &c.root)
+        }) {
+            return Err(errors::bad_request(format!(
+                "companion '{}' ({}) overlaps the review root ({}); a companion must be a separate \
+                 tree from the root being reviewed.",
+                c.name,
+                c.root.display(),
+                cfg.cwd.display()
+            )));
+        }
+        let cfg: Arc<Config> = match declared {
             declared if declared.is_empty() => cfg,
             declared => {
                 let mut scoped = (*cfg).clone();
@@ -2330,11 +2346,15 @@ impl App {
         // Companion repositories (issue #167): what a review may declare, and whether each still
         // passes the checks a turn will re-run. A failing one does not block reviews that omit it.
         for c in &self.cfg.companions {
-            let state =
-                match crate::companion::recheck(c, &self.cfg.state_dir, &std::env::temp_dir()) {
-                    Ok(()) => "ok".to_string(),
-                    Err(e) => format!("NO - {e}"),
-                };
+            let state = match crate::companion::recheck(
+                c,
+                &self.cfg.cwd,
+                &self.cfg.state_dir,
+                &std::env::temp_dir(),
+            ) {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("NO - {e}"),
+            };
             out.push_str(&format!(
                 "companion:     {} = {} ({state})\n",
                 c.name,
@@ -2537,9 +2557,12 @@ impl App {
                 name: c.name.clone(),
                 root: c.root.clone(),
             };
-            if let Err(why) =
-                crate::companion::recheck(&companion, &self.cfg.state_dir, &std::env::temp_dir())
-            {
+            if let Err(why) = crate::companion::recheck(
+                &companion,
+                &self.cfg.cwd,
+                &self.cfg.state_dir,
+                &std::env::temp_dir(),
+            ) {
                 return Ok(render(HookReport::skipped(format!(
                     "{}: {why}",
                     reason::BINDING_CHECK_FAILED
@@ -4118,114 +4141,122 @@ impl Job {
         // The `core.autocrlf` this turn's evidence bundle fixes, kept for the converged-hook binding
         // check so it composes with exactly the setting the served diff was composed with (plan f2).
         let mut turn_autocrlf: Option<crate::evidence::AutoCrlf> = None;
-        let evidence_setup = if self.spec.reviewer == crate::config::ReviewerKind::Codex
-            || claude_in_scope
-        {
-            let executable = std::env::current_exe().map_err(|e| {
-                errors::evidence_unavailable(format!(
-                    "cannot resolve the running cross-review executable: {e}"
-                ))
-            })?;
-            let sterile = if self.cfg.isolate_reviewer {
-                Some(
-                    crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
-                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
-                )
-            } else {
-                None
-            };
-            let change_label = summary
-                .map(crate::vcs::CaptureSummary::summary)
-                .unwrap_or_else(|| "no selected change was captured".to_string());
-            let status_summary = if capture_warnings.is_empty() {
-                change_label.clone()
-            } else {
-                format!("{}\n{}", change_label, capture_warnings.join("\n"))
-            };
-            if let Some(server_root) = &self.server_root {
-                crate::worktree::recheck(server_root, &self.cfg.cwd)
-                    .map_err(errors::evidence_unavailable)?;
-            }
-            let bundle = crate::evidence::Bundle::create(
-                &self.cfg.cwd,
-                self.cfg.vcs,
-                &self.id,
-                change_label,
-                status_summary,
-                change.map(str::to_string),
-                // An in-scope Claude reviewer reads evidence through Claude Code's MCP client,
-                // which truncates or diverts a tool result past its output cap; page text tools
-                // in Claude-safe slices so a large repository_diff still reaches the model
-                // (issue #114). Codex has no such cap and is served at the full limit.
-                claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
-            )
-            .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            turn_autocrlf = bundle.worktree_autocrlf;
-            let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
-                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
-            // One more unchanged single-root evidence server per declared companion repository
-            // (issue #167), each with its own nonce, so the cursors, diff op ids and files each
-            // server mints never collide with another's.
-            let mut companions = Vec::new();
-            for c in &self.cfg.declared_companions {
-                companions.push(
-                    CompanionEvidence::build(c, &self.cfg, &self.id, &executable, claude_in_scope)
-                        .map_err(errors::evidence_unavailable)?,
-                );
-            }
-            // An in-scope Claude reaches the servers through one generated --mcp-config file;
-            // Codex injects them through its own -c overrides and needs none.
-            let mcp_config_file = if claude_in_scope {
-                let names: Vec<String> = companions
-                    .iter()
-                    .map(|e| e.companion.server_name())
-                    .collect();
-                let mut servers: Vec<(&str, &std::path::Path, &str)> = vec![(
-                    crate::evidence::SERVER_NAME,
-                    bundle_file.path.as_path(),
-                    self.id.as_str(),
-                )];
-                for (e, name) in companions.iter().zip(&names) {
-                    servers.push((name.as_str(), e.bundle_file.path.as_path(), &e.nonce));
-                }
-                Some(
-                    crate::evidence::write_claude_mcp_config(
-                        &self.cfg,
-                        &executable,
-                        &servers,
-                        &self.id,
+        let evidence_setup =
+            if self.spec.reviewer == crate::config::ReviewerKind::Codex || claude_in_scope {
+                let executable = std::env::current_exe().map_err(|e| {
+                    errors::evidence_unavailable(format!(
+                        "cannot resolve the running cross-review executable: {e}"
+                    ))
+                })?;
+                let sterile = if self.cfg.isolate_reviewer {
+                    Some(
+                        crate::reviewer::codex_sterile_dir(&self.cfg, &self.session)
+                            .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
                     )
-                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                } else {
+                    None
+                };
+                let change_label = summary
+                    .map(crate::vcs::CaptureSummary::summary)
+                    .unwrap_or_else(|| "no selected change was captured".to_string());
+                let status_summary = if capture_warnings.is_empty() {
+                    change_label.clone()
+                } else {
+                    format!("{}\n{}", change_label, capture_warnings.join("\n"))
+                };
+                if let Some(server_root) = &self.server_root {
+                    crate::worktree::recheck(server_root, &self.cfg.cwd)
+                        .map_err(errors::evidence_unavailable)?;
+                }
+                let bundle = crate::evidence::Bundle::create(
+                    &self.cfg.cwd,
+                    self.cfg.vcs,
+                    &self.id,
+                    change_label,
+                    status_summary,
+                    change.map(str::to_string),
+                    // An in-scope Claude reviewer reads evidence through Claude Code's MCP client,
+                    // which truncates or diverts a tool result past its output cap; page text tools
+                    // in Claude-safe slices so a large repository_diff still reaches the model
+                    // (issue #114). Codex has no such cap and is served at the full limit.
+                    claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
                 )
+                .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                turn_autocrlf = bundle.worktree_autocrlf;
+                let bundle_file = crate::evidence::write_bundle(&self.cfg, &bundle)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                crate::evidence::handshake(&executable, &bundle_file.path, &self.id)
+                    .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
+                // One more unchanged single-root evidence server per declared companion repository
+                // (issue #167), each with its own nonce, so the cursors, diff op ids and files each
+                // server mints never collide with another's.
+                let mut companions = Vec::new();
+                for c in &self.cfg.declared_companions {
+                    companions.push(
+                        CompanionEvidence::build(
+                            c,
+                            &self.cfg,
+                            // The server's working root, not a per-call worktree root: a nested
+                            // companion (issue #170) is resolved and ignored relative to it.
+                            self.server_root.as_deref().unwrap_or(&self.cfg.cwd),
+                            &self.id,
+                            &executable,
+                            claude_in_scope,
+                        )
+                        .map_err(errors::evidence_unavailable)?,
+                    );
+                }
+                // An in-scope Claude reaches the servers through one generated --mcp-config file;
+                // Codex injects them through its own -c overrides and needs none.
+                let mcp_config_file = if claude_in_scope {
+                    let names: Vec<String> = companions
+                        .iter()
+                        .map(|e| e.companion.server_name())
+                        .collect();
+                    let mut servers: Vec<(&str, &std::path::Path, &str)> = vec![(
+                        crate::evidence::SERVER_NAME,
+                        bundle_file.path.as_path(),
+                        self.id.as_str(),
+                    )];
+                    for (e, name) in companions.iter().zip(&names) {
+                        servers.push((name.as_str(), e.bundle_file.path.as_path(), &e.nonce));
+                    }
+                    Some(
+                        crate::evidence::write_claude_mcp_config(
+                            &self.cfg,
+                            &executable,
+                            &servers,
+                            &self.id,
+                        )
+                        .map_err(|e| errors::evidence_unavailable(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
+                // appends to it, the parent reads it after the run, and dropping this handle at turn
+                // end removes it. It is created **fresh** (truncating), so a stale file left by a
+                // crashed earlier run that happened to reuse this process-local id cannot be read as
+                // this review's records (f4). `None` if the path cannot be resolved or created — a
+                // missing sink fails the gate closed at read time rather than here.
+                let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
+                    .ok()
+                    .and_then(|path| {
+                        std::fs::File::create(&path)
+                            .ok()
+                            .map(|_| crate::evidence::BundleFile { path })
+                    });
+                Some((
+                    executable,
+                    sterile,
+                    bundle_file,
+                    mcp_config_file,
+                    serverecord_file,
+                    companions,
+                ))
             } else {
                 None
             };
-            // Own the serve-record side-channel file for RAII cleanup (mechanism 3): the child
-            // appends to it, the parent reads it after the run, and dropping this handle at turn
-            // end removes it. It is created **fresh** (truncating), so a stale file left by a
-            // crashed earlier run that happened to reuse this process-local id cannot be read as
-            // this review's records (f4). `None` if the path cannot be resolved or created — a
-            // missing sink fails the gate closed at read time rather than here.
-            let serverecord_file = crate::evidence::serve_record_path(&self.cfg, &self.id)
-                .ok()
-                .and_then(|path| {
-                    std::fs::File::create(&path)
-                        .ok()
-                        .map(|_| crate::evidence::BundleFile { path })
-                });
-            Some((
-                executable,
-                sterile,
-                bundle_file,
-                mcp_config_file,
-                serverecord_file,
-                companions,
-            ))
-        } else {
-            None
-        };
 
         // A git review requires the evidence path to deliver the change live and to arm the
         // fail-closed gate (mechanism 4 / f7). Codex always has it; an ambient (unprofiled, or
@@ -5769,11 +5800,12 @@ impl CompanionEvidence {
     fn build(
         c: &crate::companion::Companion,
         cfg: &Config,
+        server_root: &std::path::Path,
         review_id: &str,
         executable: &std::path::Path,
         claude_in_scope: bool,
     ) -> Result<Self, String> {
-        crate::companion::recheck(c, &cfg.state_dir, &std::env::temp_dir())?;
+        crate::companion::recheck(c, server_root, &cfg.state_dir, &std::env::temp_dir())?;
         let nonce = c.nonce(review_id);
         let label = format!(
             "companion repository '{}': its change is its current branch against its own fork \
@@ -9152,6 +9184,35 @@ mod tests {
                 assert_eq!(err.code, "BAD_REQUEST", "root={root}");
                 assert!(err.summary.contains(want), "root={root}: {}", err.summary);
             }
+        }
+    }
+
+    /// Issue #170: a companion may be nested in the working root, and so may a per-call `root`
+    /// worktree; a review that declares a companion overlapping its own review root is refused.
+    #[test]
+    fn a_companion_overlapping_the_review_root_is_refused() {
+        let (_dirs, app, wt) = worktree_app("root-companion-overlap");
+        let mut cfg = (*app.cfg).clone();
+        // Configured directly: the overlap under test is the per-call one, not startup's.
+        cfg.companions = vec![crate::companion::Companion {
+            name: "inside".into(),
+            root: wt.join("engine"),
+        }];
+        let app = App::new(cfg);
+        for start in [App::start_review, App::start_consult] {
+            let err = start(
+                &app,
+                &json!({"instructions": "look", "question": "q", "root": wt,
+                        "companions": ["inside"]}),
+                &RequestCancel::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "BAD_REQUEST");
+            assert!(
+                err.summary.contains("overlaps the review root"),
+                "{}",
+                err.summary
+            );
         }
     }
 

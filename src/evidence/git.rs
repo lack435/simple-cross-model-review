@@ -571,6 +571,41 @@ pub fn list_worktrees(root: &Path, limits: &Limits) -> Result<String, EvidenceEr
     run(root, &args, limits, &AtomicBool::new(false), Instant::now())
 }
 
+/// Whether the repository at `root` ignores the untracked path `rel` (root-relative, `/`-separated),
+/// either directly or because an ancestor directory is ignored (issue #170). Asked through the same
+/// isolated runner that composes the repository's diff, so it sees exactly the ignore rules that
+/// diff honours: the repository's own `.gitignore` files and `info/exclude`, and no global or
+/// system excludes. `ls-files --others --ignored --directory` rather than `check-ignore`, because it
+/// exits 0 either way: "not ignored" is an empty answer, never confused with a failed command.
+pub fn ignores_untracked(root: &Path, rel: &str, limits: &Limits) -> Result<bool, EvidenceError> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "--",
+        rel,
+    ]
+    .map(String::from);
+    let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    let target = format!("{}/", rel.trim_end_matches('/'));
+    Ok(out
+        .split('\0')
+        .filter(|entry| entry.ends_with('/'))
+        .any(|dir| target.starts_with(dir)))
+}
+
+/// Whether the repository at `root` has any index entry at or under `rel` (root-relative,
+/// `/`-separated): a tracked file, including one force-added under an ignored path, or a gitlink.
+/// Such an entry is part of `root`'s own diff whatever the ignore rules say (issue #170, review f2).
+pub fn tracks_under(root: &Path, rel: &str, limits: &Limits) -> Result<bool, EvidenceError> {
+    let args = ["ls-files", "-z", "--", rel].map(String::from);
+    let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    Ok(out.split('\0').any(|entry| !entry.is_empty()))
+}
+
 /// The merge-base of two commits — the branch's fork point when called as `merge_base(HEAD,
 /// upstream)`. `None` when the two share no history. Both arguments are full object ids the handler
 /// already resolved and validated.
