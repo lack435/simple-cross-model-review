@@ -61,9 +61,12 @@ pub enum CaptureSummary {
         changelists: Vec<u64>,
         /// Requested changelists that were skipped, so `changelists` is a subset.
         skipped: usize,
-        /// Captured changelists whose evidence was incomplete (binary/out-of-root/lossy/etc.),
-        /// distinct from skipped.
+        /// Captured changelists whose evidence was incomplete (out-of-root/unreadable/lossy/cut,
+        /// etc.), distinct from skipped.
         incomplete_changelists: usize,
+        /// Some changelist named binary (known non-text) files it did not show (issue #189). Not a
+        /// shortfall: nothing more could be shown for them, so they leave the capture complete.
+        binary_listed: bool,
         /// The exact number of evidence units sent. A floor on the requested change whenever
         /// anything was skipped, incomplete, or truncated.
         evidence_units: usize,
@@ -145,6 +148,7 @@ impl CaptureSummary {
                 changelists,
                 skipped,
                 incomplete_changelists,
+                binary_listed,
                 evidence_units,
                 diff_truncated,
                 complete,
@@ -169,12 +173,19 @@ impl CaptureSummary {
                         None
                     }
                 };
+                let mut verdict = verdict(*complete, reason);
+                // Listed binary files are not a shortfall, but the note says the capture names
+                // files it did not show, so "complete" is not read as "every file's content". A
+                // partial verdict needs no such qualifier: its warnings already send the caller to
+                // the per-file reasons.
+                if *complete && *binary_listed {
+                    verdict.push_str(" (binary files listed, not shown)");
+                }
                 format!(
                     "changelists {} — {units_prefix}{evidence_units} evidence unit{} — \
-                     {diff_token} — {}",
+                     {diff_token} — {verdict}",
                     join_changelists(changelists),
                     plural(*evidence_units),
-                    verdict(*complete, reason),
                 )
             }
         }
@@ -440,10 +451,59 @@ mod tests {
             changelists,
             skipped,
             incomplete_changelists: incomplete,
+            binary_listed: false,
             evidence_units: units,
             diff_truncated,
             complete,
         }
+    }
+
+    fn with_binaries(summary: CaptureSummary) -> CaptureSummary {
+        match summary {
+            CaptureSummary::Perforce {
+                changelists,
+                skipped,
+                incomplete_changelists,
+                evidence_units,
+                diff_truncated,
+                complete,
+                ..
+            } => CaptureSummary::Perforce {
+                changelists,
+                skipped,
+                incomplete_changelists,
+                binary_listed: true,
+                evidence_units,
+                diff_truncated,
+                complete,
+            },
+            git => git,
+        }
+    }
+
+    // Issue #189: binary files listed by name are not a shortfall. The capture stays complete and
+    // the count is named, rather than a partial verdict on every changelist with a binary in it.
+    #[test]
+    fn listed_binary_files_leave_the_capture_complete_and_are_counted() {
+        let one = with_binaries(perforce(vec![43650], 0, 0, 9, false, true));
+        assert_eq!(
+            one.summary(),
+            "changelists 43650 — 9 evidence units — diff within budget — \
+             complete (binary files listed, not shown)"
+        );
+        assert!(one.is_complete());
+        assert_eq!(one.tag(), "p4:43650");
+        // A real shortfall beside them still reads partial, with no qualifier: the warnings
+        // already send the caller to the per-file reasons.
+        let partial = with_binaries(perforce(vec![43650, 43651], 0, 1, 9, false, false));
+        let out = partial.summary();
+        assert!(out.contains("at least 9 evidence units"), "{out}");
+        assert!(
+            out.ends_with(
+                "partial (1 of 2 changelist(s) incomplete or skipped; see warnings below)"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
