@@ -50,8 +50,9 @@ pub fn history(
     Ok((changes, complete))
 }
 
-/// One changelist: with no `path`, its description and diff (`p4 describe -du`); with a `path`,
-/// that file's content as of the changelist (`p4 print`).
+/// One changelist: with no `path`, its description and diff (`p4 describe -du`, with `-S` for a
+/// shelved changelist's shelved diffs); with a `path`, that file's content as of the changelist
+/// (`p4 print`), which for a shelved changelist is its shelved revision.
 pub fn revision(
     root: &Path,
     access: &PerforceAccess,
@@ -61,16 +62,15 @@ pub fn revision(
     cancel: &AtomicBool,
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
+    let state = change_state(root, access, change, limits, cancel, received_at)?;
     if path.is_empty() {
-        let change = change.to_string();
-        return run(
-            root,
-            access,
-            &["describe", "-du", &change],
-            limits,
-            cancel,
-            received_at,
-        );
+        let number = change.to_string();
+        let mut args = vec!["describe", "-du"];
+        if state == (ChangeState::Pending { shelved: true }) {
+            args.push("-S");
+        }
+        args.push(&number);
+        return run(root, access, &args, limits, cancel, received_at);
     }
     let spec = file_spec(root, path)?;
     if spec.ends_with("\\...") {
@@ -80,7 +80,13 @@ pub fn revision(
              or omit path to describe the whole changelist",
         ));
     }
-    let spec = format!("{spec}@{change}");
+    let spec = at_change(
+        &spec,
+        change,
+        state,
+        "read this workspace's file with repository_read, or the change under review with \
+         repository_change",
+    )?;
     run(
         root,
         access,
@@ -93,7 +99,8 @@ pub fn revision(
 
 /// `path` as of changelist `base` against the live workspace (`head` `None`, `p4 diff`), or against
 /// the same path as of changelist `head` (`p4 diff2`). Unified, and ignoring line endings for the
-/// workspace side as the capture does.
+/// workspace side as the capture does. Either changelist may be submitted or shelved (see
+/// [`at_change`]).
 #[allow(clippy::too_many_arguments)]
 pub fn diff(
     root: &Path,
@@ -106,7 +113,13 @@ pub fn diff(
     received_at: Instant,
 ) -> Result<String, EvidenceError> {
     let spec = file_spec(root, path)?;
-    let left = format!("{spec}@{base}");
+    let base_state = change_state(root, access, base, limits, cancel, received_at)?;
+    let left = at_change(
+        &spec,
+        base,
+        base_state,
+        "use a submitted or shelved changelist as 'base'",
+    )?;
     match head {
         // `-f` diffs files that are not opened too: the question is how the workspace differs from
         // that changelist, not only what is checked out.
@@ -119,7 +132,14 @@ pub fn diff(
             received_at,
         ),
         Some(head) => {
-            let right = format!("{spec}@{head}");
+            let head_state = change_state(root, access, head, limits, cancel, received_at)?;
+            let right = at_change(
+                &spec,
+                head,
+                head_state,
+                "omit 'head' to diff 'base' against this workspace, or read the change under \
+                 review with repository_change",
+            )?;
             run(
                 root,
                 access,
@@ -129,6 +149,77 @@ pub fn diff(
                 received_at,
             )
         }
+    }
+}
+
+/// What the server holds for a changelist number (issue #188).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeState {
+    Submitted,
+    Pending { shelved: bool },
+}
+
+/// Look a changelist up with `p4 describe -s` (`-m 1` keeps a large changelist's file list out).
+fn change_state(
+    root: &Path,
+    access: &PerforceAccess,
+    change: u64,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    received_at: Instant,
+) -> Result<ChangeState, EvidenceError> {
+    let number = change.to_string();
+    let text = run(
+        root,
+        access,
+        &["-ztag", "describe", "-s", "-m", "1", &number],
+        limits,
+        cancel,
+        received_at,
+    )?;
+    parse_change_state(&text).ok_or_else(|| {
+        EvidenceError::new(
+            "invalid_arguments",
+            format!("changelist {change} was not found"),
+        )
+    })
+}
+
+/// The state in `p4 -ztag describe -s` output. The description comes before `status` and may span
+/// lines, so only the last `status` line is p4's own; `shelved` is a field after it, present only
+/// when the changelist has shelved files.
+fn parse_change_state(text: &str) -> Option<ChangeState> {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let at = lines.iter().rposition(|l| l.starts_with("... status "))?;
+    let shelved = lines[at + 1..].contains(&"... shelved");
+    match &lines[at]["... status ".len()..] {
+        "submitted" => Some(ChangeState::Submitted),
+        "pending" => Some(ChangeState::Pending { shelved }),
+        "shelved" => Some(ChangeState::Pending { shelved: true }),
+        _ => None,
+    }
+}
+
+/// `spec` as of changelist `change`. A submitted changelist is a point in history (`@n`) and a
+/// shelved one its shelved revision (`@=n`). `@n` on a pending changelist would name the last
+/// submitted revision at or below it, silently hiding the pending edits, and one that is not
+/// shelved has no revision on the server at all, so it is refused with `instead`.
+fn at_change(
+    spec: &str,
+    change: u64,
+    state: ChangeState,
+    instead: &str,
+) -> Result<String, EvidenceError> {
+    match state {
+        ChangeState::Submitted => Ok(format!("{spec}@{change}")),
+        ChangeState::Pending { shelved: true } => Ok(format!("{spec}@={change}")),
+        ChangeState::Pending { shelved: false } => Err(EvidenceError::new(
+            "invalid_arguments",
+            format!(
+                "changelist {change} is pending and not shelved, so its edits exist only in its \
+                 workspace; {instead}"
+            ),
+        )),
     }
 }
 
@@ -295,6 +386,54 @@ mod tests {
         assert_eq!(changes[0]["author"], "alice");
         assert_eq!(changes[0]["subject"], "Fix the thing");
         assert_eq!(changes[1]["subject"], "");
+    }
+
+    #[test]
+    fn change_state_comes_from_the_last_status_line() {
+        let submitted = "... change 1\n... desc first\n... status submitted\n\
+                         ... depotFile0 //depot/a.txt\n";
+        assert_eq!(parse_change_state(submitted), Some(ChangeState::Submitted));
+        let pending = "... change 2\r\n... desc  pending edit\r\n\r\n... status pending\r\n\
+                       ... changeType public\r\n... depotFile0 //depot/a.txt\r\n";
+        assert_eq!(
+            parse_change_state(pending),
+            Some(ChangeState::Pending { shelved: false })
+        );
+        let shelved = "... change 3\n... status pending\n... changeType public\n... shelved \n";
+        assert_eq!(
+            parse_change_state(shelved),
+            Some(ChangeState::Pending { shelved: true })
+        );
+        // A description cannot pass itself off as the status or the shelved field.
+        let spoofed = "... change 4\n... desc x\n... status submitted\n... shelved\n\
+                       ... status pending\n... changeType public\n";
+        assert_eq!(
+            parse_change_state(spoofed),
+            Some(ChangeState::Pending { shelved: false })
+        );
+        assert_eq!(parse_change_state(""), None);
+        assert_eq!(parse_change_state("... status unknown\n"), None);
+    }
+
+    #[test]
+    fn a_changelist_resolves_to_history_the_shelf_or_a_refusal() {
+        assert_eq!(
+            at_change(".\\a.txt", 5, ChangeState::Submitted, "x").unwrap(),
+            ".\\a.txt@5"
+        );
+        assert_eq!(
+            at_change(".\\a.txt", 5, ChangeState::Pending { shelved: true }, "x").unwrap(),
+            ".\\a.txt@=5"
+        );
+        let err = at_change(
+            ".\\a.txt",
+            5,
+            ChangeState::Pending { shelved: false },
+            "omit it",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "invalid_arguments");
+        assert!(err.message.contains("pending") && err.message.ends_with("omit it"));
     }
 
     #[test]

@@ -3,6 +3,8 @@
   Live check of the Perforce evidence tools (issue #183) on a disposable local Perforce server.
   repository_history, repository_revision and repository_diff must list a file's submitted
   changelists, read it as of one, and diff it across changelists and against the workspace.
+  A pending changelist must be refused rather than read as the submitted revision below it,
+  and a shelved one read as its shelf (issue #188).
   Requires p4, p4d and cargo. No model calls or access to an existing depot.
 #>
 [CmdletBinding()]
@@ -73,15 +75,29 @@ View:
         $Matches[1]
     }
     [IO.File]::WriteAllText($file, "version one`n", $utf8)
-    Invoke-TestP4 add -t text $file | Out-Null
+    $other = Join-Path $workspace 'b.txt'
+    [IO.File]::WriteAllText($other, "bee`n", $utf8)
+    Invoke-TestP4 add -t text $file $other | Out-Null
     $first = Submit-Test 'First edit'
     Invoke-TestP4 edit $file | Out-Null
     [IO.File]::WriteAllText($file, "version two`n", $utf8)
     $second = Submit-Test 'Second edit'
-    # A pending edit, so the workspace differs from both submitted revisions.
-    Invoke-TestP4 edit $file | Out-Null
+    function New-TestChange([string]$Description) {
+        $out = ("Change: new`nDescription:`n`t$Description`n" | Invoke-TestP4 change -i) -join "`n"
+        if ($out -notmatch 'Change (\d+) created') { throw "Change failed: $out" }
+        $Matches[1]
+    }
+    # A pending edit in a numbered changelist, so the workspace differs from both submitted
+    # revisions and the changelist has no revision on the server.
+    $pending = New-TestChange 'Pending edit'
+    Invoke-TestP4 edit -c $pending $file | Out-Null
     [IO.File]::WriteAllText($file, "version three`n", $utf8)
-    $env:CROSS_REVIEW_P4_TEST_EVIDENCE = "$first,$second"
+    # A shelved edit of the other file.
+    $shelved = New-TestChange 'Shelved edit'
+    Invoke-TestP4 edit -c $shelved $other | Out-Null
+    [IO.File]::WriteAllText($other, "bee shelved`n", $utf8)
+    Invoke-TestP4 shelve -c $shelved | Out-Null
+    $env:CROSS_REVIEW_P4_TEST_EVIDENCE = "$first,$second,$pending,$shelved"
 
     Push-Location $PSScriptRoot
     try {
