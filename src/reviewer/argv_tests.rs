@@ -654,6 +654,8 @@ fn a_state_dir_junctioned_into_the_project_cannot_host_the_reviewer_temp_directo
     let cfg = config_at(&project, Some(&link), &["codex"]);
     let err = crate::reviewer::tmp_file(&cfg, "t1", "codex-last.txt").unwrap_err();
     assert!(err.to_string().contains("physically inside"), "{err}");
+    // Refused before creation: no `tmp` directory appeared inside the project (review f2).
+    assert!(!project.join("state").join("tmp").exists());
 
     // A state directory junctioned somewhere outside the project is still fine.
     let outside = root.as_path().join("real-state");
