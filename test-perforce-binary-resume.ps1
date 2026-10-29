@@ -3,8 +3,9 @@
   Regression for #184 using synthetic files in a disposable local Perforce server.
   A pending changelist with text edits plus a binary edit, add and delete must still record a
   Full resume baseline, so the next turn collapses the unchanged text files instead of falling
-  back to a full re-capture. Requires p4, p4d and cargo. No model calls or access to an existing
-  depot.
+  back to a full re-capture. The capture must also be reported complete, naming the binary files,
+  with no "incomplete" warning (#189). Requires p4, p4d and cargo. No model calls or access to an
+  existing depot.
 #>
 [CmdletBinding()]
 param([string]$P4d = 'C:\Program Files\Perforce\DVCS\p4d.exe')
@@ -23,6 +24,7 @@ $settings = @{
     CROSS_REVIEW_P4_TEST_CWD = $workspace
     CROSS_REVIEW_P4_TEST_CL = ''
     CROSS_REVIEW_P4_TEST_SHELVED = ''
+    CROSS_REVIEW_P4_TEST_BINARY_ONLY = '1'
 }
 # Ask Windows for a free loopback port. The server must start successfully before use.
 $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -106,7 +108,9 @@ Description:
     if ($testExit -ne 0) { throw "Resume test failed:`n$output" }
     if ($output.Contains('SKIP delta assertion')) { throw "Turn 1 recorded a Disabled baseline:`n$output" }
     if (-not $output.Contains('resume delta: turn 1 =')) { throw "The resume test did not run:`n$output" }
+    if (-not $output.Contains('binary-only capture:')) { throw "The completeness check did not run:`n$output" }
     Write-Host 'PASS: binary files leave the resume baseline Full, so unchanged text files collapse on the next turn.'
+    Write-Host 'PASS: a changelist short only of binary files is reported complete, with no incomplete warning.'
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
     [Console]::InputEncoding = $savedInputEncoding

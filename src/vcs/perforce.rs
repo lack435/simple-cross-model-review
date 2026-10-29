@@ -229,9 +229,9 @@ pub fn capture(
     let diff_truncated = budget.diff_truncated;
 
     // How much of the requested change did not arrive whole, for the caller summary and its
-    // warnings. A captured-but-incomplete segment (a binary/out-of-root/lossy file) is distinct
-    // from a wholly skipped changelist, and both are distinct from the byte-budget truncation.
-    let incomplete_changelists = segments.iter().filter(|s| !s.complete).count();
+    // warnings. A captured-but-incomplete segment is distinct from a wholly skipped changelist,
+    // and both are distinct from the byte-budget truncation.
+    let (incomplete_changelists, binary_files) = shortfall(&segments);
     let evidence_units = segments.iter().flat_map(|s| &s.units).count();
 
     // Skipped changelists are a bound on the evidence the caller is reading, so they are
@@ -261,8 +261,9 @@ pub fn capture(
     if incomplete_changelists > 0 {
         warnings.push(format!(
             "The captured change was incomplete: {incomplete_changelists} of {} captured \
-             changelist(s) had evidence that could not be fully shown (for example a binary, \
-             out-of-root, or lossily-decoded file); the per-file reasons are in the prompt.",
+             changelist(s) had evidence that could not be fully shown (for example an \
+             out-of-root, unreadable, or lossily-decoded file); the per-file reasons are in the \
+             prompt.",
             captured.len()
         ));
     }
@@ -317,10 +318,11 @@ pub fn capture(
             summary: crate::vcs::CaptureSummary::Perforce {
                 skipped: skipped.len(),
                 incomplete_changelists,
+                binary_files,
                 evidence_units,
                 diff_truncated,
-                // Whole only when nothing was skipped, every captured segment was complete, and
-                // the combined diff was not budget-cut. Narrower than `capture_complete`, which
+                // Whole only when nothing was skipped, every captured segment was complete apart
+                // from listed binary files, and the combined diff was not budget-cut. Narrower than `capture_complete`, which
                 // also gates baseline eligibility on the client-spec digest -- a different
                 // question from whether the evidence shown this turn was whole.
                 complete: skipped.is_empty() && incomplete_changelists == 0 && !diff_truncated,
@@ -335,6 +337,18 @@ pub fn capture(
         perforce_baseline,
         disposition,
     }
+}
+
+/// The captured changelists missing evidence that could hide content (an out-of-root, unreadable,
+/// lossily decoded or cut file), and the binary files listed but not shown. A changelist short
+/// only of binary files (`opaque`) is not counted as incomplete (issue #189): each is named and
+/// none could ever be shown as text, so there is nothing for the caller to act on, and a warning
+/// on every such review would teach callers to ignore the real ones. Resume already draws the
+/// same line (`baseline_whole`, #184).
+fn shortfall(segments: &[Segment]) -> (usize, usize) {
+    let incomplete = segments.iter().filter(|s| !s.baseline_whole).count();
+    let binary = segments.iter().map(|s| s.opaque.len()).sum();
+    (incomplete, binary)
 }
 
 /// How the evidence service should reach the Perforce server for this working root (issue #183):
@@ -3830,6 +3844,43 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn only_a_gap_that_can_hide_content_makes_a_changelist_incomplete() {
+        // Issue #189: binary files are counted, not reported as a shortfall.
+        let segment = |omissions: Vec<String>, opaque: Vec<String>| {
+            let baseline_whole = omissions.is_empty();
+            Segment {
+                change: 42,
+                basis: DiffBasis::Workspace,
+                complete: baseline_whole && opaque.is_empty(),
+                incomplete_reason: None,
+                description: String::new(),
+                listing: String::new(),
+                units: Vec::new(),
+                present_depots: Vec::new(),
+                diff_truncated: false,
+                omissions,
+                opaque,
+                baseline_whole,
+                transitions: Vec::new(),
+                deferred: Vec::new(),
+                generated_note: None,
+            }
+        };
+        let binary = || vec!["`//depot/tool.exe` is a binary edit".to_string()];
+        let out_of_root = || vec!["`//depot/x.rs` is out of the working root".to_string()];
+        assert_eq!(shortfall(&[segment(Vec::new(), Vec::new())]), (0, 0));
+        assert_eq!(shortfall(&[segment(Vec::new(), binary())]), (0, 1));
+        assert_eq!(shortfall(&[segment(out_of_root(), binary())]), (1, 1));
+        assert_eq!(
+            shortfall(&[
+                segment(Vec::new(), binary()),
+                segment(out_of_root(), Vec::new())
+            ]),
+            (1, 1)
+        );
+    }
+
+    #[test]
     fn a_binary_file_leaves_transitions_on_but_a_real_gap_turns_them_off() {
         // Issue #184: a binary file makes the segment incomplete but leaves its file list whole,
         // so a removed text file is still announced. Any other omission does not.
@@ -4325,6 +4376,27 @@ Change 5 by u@c on 2026/01/01\n\n\
         // Turn 1: a full capture, which produces the baseline the next turn deltas against.
         let cap1 = capture(&cfg, &changes, include_shelved, None, &cancel);
         let r1 = cap1.change.as_ref().map(|c| c.rendered.len()).unwrap_or(0);
+        // Issue #189: a changelist short only of binary files reports a complete capture, naming
+        // the binaries, and no "incomplete" warning. Opt-in: only test-perforce-binary-resume.ps1
+        // builds a changelist whose only unshown files are binary.
+        if std::env::var("CROSS_REVIEW_P4_TEST_BINARY_ONLY").is_ok() {
+            let summary = &cap1.change.as_ref().expect("turn 1 change").summary;
+            let line = summary.summary();
+            assert!(summary.is_complete(), "{line}");
+            assert!(
+                line.ends_with("complete (3 binary files listed, not shown)"),
+                "{line}"
+            );
+            assert!(
+                !cap1
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("captured change was incomplete")),
+                "{:?}",
+                cap1.warnings
+            );
+            eprintln!("binary-only capture: {line}");
+        }
         let baseline = cap1.perforce_baseline.clone().expect("turn 1 baseline");
         let identity = cap1.capture_identity.clone().expect("turn 1 identity");
         if !matches!(baseline, baseline::PerforceBaseline::Full { .. }) {
