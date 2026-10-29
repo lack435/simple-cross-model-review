@@ -2123,7 +2123,7 @@ impl Config {
         if reviewer == ReviewerKind::Codex {
             let history = match self.vcs {
                 Vcs::Git => "Use `repository_history` and `repository_revision` for commit history and revisions.",
-                Vcs::Perforce => "`repository_history` and `repository_revision` report unsupported because this service performs no new Perforce network calls.",
+                Vcs::Perforce => "On Perforce, use `repository_history` for submitted changelists, `repository_revision` to describe a changelist or read a file as of one, and `repository_diff` (a path and a base changelist) to compare a file across changelists or against the workspace.",
             };
             let shell = if self.isolate_reviewer {
                 "Your process shell runs from a sterile non-repository directory, so repo-relative shell commands are not a source of evidence -- the evidence tools above are the intended way to read and search this project, and they cover it completely. Do not reach for the shell to read or grep files. Any exceptional absolute-path read must be a single, simple command: composed shell (a pipeline with `|`, a `;`-separated pair, `Select-String`, or a `$var`/expression form) is refused non-interactively by the CLI command policy, and that refusal is final -- do not retry it as a variant, just use the evidence tools instead. Writes remain blocked by the sandbox."
@@ -2169,8 +2169,8 @@ impl Config {
         // no-shell boundary and diff handling, so it does not fall through to the shared shell-based
         // block below.
         if reviewer == ReviewerKind::Claude && evidence_enabled {
-            // `repository_diff` is Git-only in the evidence service (it answers `unsupported` for
-            // Perforce), so it is advertised only on Git (issue #136).
+            // On Perforce, `repository_diff` is exploratory (a path and a base changelist), not the
+            // canonical change, which stays the captured one (issue #183).
             let (tools, history) = match self.vcs {
                 Vcs::Git => (
                     "`repository_scope`, `repository_list`, `repository_search`, \
@@ -2179,8 +2179,8 @@ impl Config {
                 ),
                 Vcs::Perforce => (
                     "`repository_scope`, `repository_list`, `repository_search`, \
-                     `repository_read`, and `repository_change`",
-                    " `repository_diff`, `repository_history` and `repository_revision` report unsupported (this service makes no new Perforce network calls).",
+                     `repository_read`, `repository_change`, and `repository_diff`",
+                    " `repository_history` lists submitted changelists, `repository_revision` describes a changelist or reads a file as of one, and `repository_diff` (a path and a base changelist) compares a file across changelists or against the workspace.",
                 ),
             };
             let mut out = format!(
@@ -2192,7 +2192,7 @@ impl Config {
             if diff_supplied {
                 let past = match self.vcs {
                     Vcs::Git => "read the live tree, search it, and walk history",
-                    Vcs::Perforce => "read the live tree and search it",
+                    Vcs::Perforce => "read the live tree, search it, and walk changelist history",
                 };
                 out.push_str(&format!(
                     "\n\nThe change under review is captured for you and appears below under \
@@ -4727,26 +4727,23 @@ mod tests {
     }
 
     #[test]
-    fn an_evidence_claude_on_perforce_is_not_offered_git_only_tools_issue_136() {
-        // Issue #136 put a profile-pinned Claude on the evidence path for Perforce, where the service
-        // answers `unsupported` for repository_diff/history/revision. Its access text must not list
-        // them as available, and must not tell it to walk history when nothing was captured.
+    fn an_evidence_claude_on_perforce_is_offered_changelist_history_issue_183() {
+        // Issue #136 put a profile-pinned Claude on the evidence path for Perforce; issue #183 gave
+        // that path history, revision and an exploratory diff. Its access text lists all three and
+        // says what each takes on Perforce.
         let cfg =
             Config::from_args(&args(&["--reviewer", "claude", "--vcs", "perforce"])).expect("cfg");
         for diff_supplied in [true, false] {
             let caps = cfg.reviewer_capabilities_of(ReviewerKind::Claude, diff_supplied, true);
             assert!(
-                caps.contains("`repository_read`, and `repository_change`."),
+                caps.contains("`repository_change`, and `repository_diff`."),
                 "{caps}"
             );
             assert!(
-                caps.contains(
-                    "`repository_diff`, `repository_history` and `repository_revision` report \
-                     unsupported"
-                ),
+                caps.contains("`repository_history` lists submitted changelists"),
                 "{caps}"
             );
-            assert!(!caps.contains("walk history"), "{caps}");
+            assert!(!caps.contains("unsupported"), "{caps}");
         }
 
         // Git keeps repository_diff in the available list.
@@ -4766,7 +4763,10 @@ mod tests {
             Config::from_args(&args(&["--reviewer", "codex", "--vcs", "perforce"])).expect("cfg");
         assert!(!read_only.reviewer_can_self_serve_change());
         let caps = read_only.reviewer_capabilities(true);
-        assert!(caps.contains("no new Perforce network calls"), "{caps}");
+        assert!(
+            caps.contains("`repository_history` for submitted changelists"),
+            "{caps}"
+        );
         assert!(
             !caps.contains("inspect the change history yourself"),
             "{caps}"
@@ -4802,7 +4802,7 @@ mod tests {
             "{networked_caps}"
         );
         assert!(
-            networked_caps.contains("no new Perforce network calls"),
+            networked_caps.contains("`repository_history` for submitted changelists"),
             "{networked_caps}"
         );
 

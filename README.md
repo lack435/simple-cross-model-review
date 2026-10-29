@@ -257,6 +257,12 @@ CRLF versus LF) are ignored so they cannot exhaust the diff budget. Spaces, tabs
 content changes are still shown. Opens with no remaining textual changes are named in
 the capture listing. Submitted and shelved diffs and added-file contents are unchanged.
 
+Beyond the captured change, a Perforce reviewer can read history through the evidence tools.
+`repository_history` lists submitted changelists, and `repository_revision` describes a
+changelist or reads a file as of one. `repository_diff` compares a file across changelists or
+against the workspace. These run read-only `p4` commands against the server, as the same client
+the capture used.
+
 ## Re-reviewing after you act on feedback
 
 Sessions are named, and you choose the names. Calling `cross_model_review` again with the same
