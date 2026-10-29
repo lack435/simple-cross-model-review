@@ -151,14 +151,28 @@ pub fn identity(cfg: &CaptureHookConfig, working_root: &Path) -> Option<String> 
 
 /// SHA-256 of a whole file, streamed through a fixed buffer.
 pub fn file_digest(path: &Path) -> Option<[u8; 32]> {
+    file_digest_capped(path, u64::MAX)
+}
+
+/// [`file_digest`], but `None` as soon as more than `max` bytes have been read: the size limit is
+/// enforced **while streaming**, not only by an earlier metadata check a growing file could outrun
+/// (review f7 on #179).
+pub fn file_digest_capped(path: &Path, max: u64) -> Option<[u8; 32]> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
     let mut h = crate::digest::Sha256Stream::new()?;
     let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => h.update(&buf[..n]),
+            Ok(n) => {
+                total += n as u64;
+                if total > max {
+                    return None;
+                }
+                h.update(&buf[..n]);
+            }
             Err(_) => return None,
         }
     }
@@ -181,8 +195,17 @@ pub fn snapshot_path(temp_dir: &Path, id: &str, modified: bool, source: &str) ->
 
 /// Copy `source` into `dest` and return the SHA-256 of exactly the bytes written, in one streaming
 /// pass (plan r5 f25): the digest always describes the snapshot the converter is handed, never a live
-/// file that could change underneath it.
-pub fn snapshot(source: &Path, dest: &Path) -> std::io::Result<[u8; 32]> {
+/// file that could change underneath it. Fails, removing the partial copy, as soon as more than `max`
+/// bytes have been read (review f7 on #179).
+pub fn snapshot(source: &Path, dest: &Path, max: u64) -> std::io::Result<[u8; 32]> {
+    let result = snapshot_inner(source, dest, max);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+fn snapshot_inner(source: &Path, dest: &Path, max: u64) -> std::io::Result<[u8; 32]> {
     use std::io::{Read, Write};
     let mut input = std::fs::File::open(source)?;
     if let Some(parent) = dest.parent() {
@@ -192,10 +215,15 @@ pub fn snapshot(source: &Path, dest: &Path) -> std::io::Result<[u8; 32]> {
     let mut h = crate::digest::Sha256Stream::new()
         .ok_or_else(|| std::io::Error::other("sha256 unavailable"))?;
     let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
     loop {
         let n = input.read(&mut buf)?;
         if n == 0 {
             break;
+        }
+        total += n as u64;
+        if total > max {
+            return Err(std::io::Error::other("file grew past the size limit"));
         }
         h.update(&buf[..n]);
         output.write_all(&buf[..n])?;
@@ -588,10 +616,16 @@ mod tests {
         let src = dir.as_path().join("src.bin");
         let dst = dir.as_path().join("dst.bin");
         std::fs::write(&src, [1u8, 0, 2, 3]).unwrap();
-        let d = snapshot(&src, &dst).unwrap();
+        let d = snapshot(&src, &dst, 4).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), vec![1u8, 0, 2, 3]);
         assert_eq!(Some(d), file_digest(&dst));
         assert_eq!(Some(d), crate::digest::sha256(&[1u8, 0, 2, 3]));
+        // The limit holds while streaming: one byte over fails and leaves no partial copy.
+        let over = dir.as_path().join("over.bin");
+        assert!(snapshot(&src, &over, 3).is_err());
+        assert!(!over.exists());
+        assert!(file_digest_capped(&src, 3).is_none());
+        assert_eq!(file_digest_capped(&src, 4), Some(d));
     }
 
     fn input(id: &str, path: &str, t: ChangeType) -> InputFile {

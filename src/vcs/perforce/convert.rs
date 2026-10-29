@@ -412,7 +412,7 @@ fn assemble(
                 return Assembled::Excluded(notes);
             }
             // Digested in place for the lookup; a miss snapshots it and re-keys (plan r7).
-            match crate::capture_hook::file_digest(&f.local) {
+            match crate::capture_hook::file_digest_capped(&f.local, hook.max_file_bytes) {
                 Some(d) => Some(SideFacts {
                     spec: None,
                     local: Some(f.local.clone()),
@@ -519,7 +519,8 @@ fn convert_misses(
             let path = crate::capture_hook::snapshot_path(&temp, &id, modified, &c.source);
             match (&side.local, &side.spec) {
                 (Some(local), _) => {
-                    let d = crate::capture_hook::snapshot(local, &path).ok()?;
+                    let d =
+                        crate::capture_hook::snapshot(local, &path, hook.max_file_bytes).ok()?;
                     Some((
                         Side {
                             reference: local.to_string_lossy().into_owned(),
