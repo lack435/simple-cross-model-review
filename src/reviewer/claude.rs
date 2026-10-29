@@ -226,6 +226,10 @@ impl Reviewer for ClaudeReviewer {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
+            } else if out.stdout.trim().is_empty() && oauth_refresh_locked(out, None) {
+                // Before the generic classifier, whose "oauth token" match would read the
+                // refresh-lock collision as an expired sign-in (issue #166).
+                errors::reviewer_busy("claude", out.diagnostics())
             } else {
                 super::failure_for(cfg, spec, out)
             }
@@ -464,6 +468,9 @@ fn from_result_document(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if is_error || !out.success {
+            if oauth_refresh_locked(out, Some(parsed)) {
+                return Err(errors::reviewer_busy("claude", out.diagnostics()));
+            }
             let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
 
             // Evidence must contain nothing the model wrote: a partial review mentioning
@@ -759,6 +766,53 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
     health
 }
 
+/// What the Claude CLI says when another Claude Code process holds its OAuth refresh lock (issue
+/// #166), lowercased. Matched together with [`OAUTH_REFRESH_FAILED`].
+const OAUTH_REFRESH_LOCK: &str = "another claude code process is refreshing it";
+/// The sentence that diagnostic opens with, lowercased.
+const OAUTH_REFRESH_FAILED: &str = "failed to refresh oauth token";
+
+/// Whether a failed run is the CLI's OAuth refresh-lock collision (issue #166), **before any model
+/// turn**, which is what makes it safe to retry: `REVIEWER_BUSY` clears the call's findings marker on
+/// the strength of it. So a run that shows any sign of a model turn is never it, whatever it says: an
+/// assistant event in the stream, or a result document reporting `num_turns` above zero (a refresh
+/// can also fail mid-run, after the conversation advanced). Given that, the diagnostic is read from
+/// stderr, which the CLI owns, or from the failed result's text when the text *opens* with it, never
+/// when prose merely mentions it. Anything in doubt keeps its existing classification, which leaves
+/// the marker set. Any other auth failure keeps its own classification.
+fn oauth_refresh_locked(out: &RunOutcome, result: Option<&Value>) -> bool {
+    let assistant_event = out.stdout.lines().any(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+            .as_deref()
+            == Some("assistant")
+    });
+    // Absent is no evidence of a turn; present counts only as exactly numeric zero. A malformed or
+    // null value proves nothing either way, so it is not proof (review f5).
+    let no_turns = match result.and_then(|r| r.get("num_turns")) {
+        None => true,
+        Some(v) => v.as_u64() == Some(0),
+    };
+    if assistant_event || !no_turns {
+        return false;
+    }
+    let is_lock = |s: &str| {
+        let s = s.to_ascii_lowercase();
+        s.contains(OAUTH_REFRESH_FAILED) && s.contains(OAUTH_REFRESH_LOCK)
+    };
+    let result_text = result
+        .and_then(|r| r.get("result"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    is_lock(&out.stderr)
+        || (result_text
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with(OAUTH_REFRESH_FAILED)
+            && is_lock(result_text))
+}
+
 fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
     // The armed reader terminated the child the moment a raw byte/line bound was overrun and
     // recorded which; that is authoritative, so report OUTPUT_TRUNCATED naming the bound before
@@ -850,6 +904,11 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     // never the JSONL body, which can carry model prose.
     if out.success {
         return Err(errors::empty_review("claude", out.diagnostics()));
+    }
+    // Before `classify`, whose "oauth token" match would read the refresh-lock collision as an
+    // expired sign-in (issue #166). With no result event there is no result text, so only stderr.
+    if oauth_refresh_locked(out, None) {
+        return Err(errors::reviewer_busy("claude", out.diagnostics()));
     }
     Err(errors::classify(
         "claude",
@@ -1355,6 +1414,107 @@ mod tests {
         );
         let err = parse_stream_json(cfg().primary(), &outcome(stream, false)).unwrap_err();
         assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
+    }
+
+    /// Issue #166: the CLI's OAuth refresh-lock collision is REVIEWER_BUSY (retryable), whether it
+    /// arrives as the failed result's text or on stderr, but only as the CLI's own diagnostic.
+    #[test]
+    fn the_oauth_refresh_lock_collision_is_busy_not_failed_or_expired() {
+        let diag =
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it or \
+                    exited mid-refresh. This is usually transient; retry in a minute";
+        let result = |text: &str| {
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":true,"result":{}}}"#,
+                serde_json::to_string(text).unwrap()
+            )
+        };
+
+        // As the failed result's text, with no model turn: busy.
+        let err = parse_stream_json(cfg().primary(), &outcome(&result(diag), false)).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+        assert!(
+            err.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("refreshing it"),
+            "{err:?}"
+        );
+
+        // On stderr, with no result event: busy, not AUTH_EXPIRED_MIDRUN ("oauth token").
+        let mut on_stderr = outcome("", false);
+        on_stderr.stderr = diag.to_string();
+        let err = parse_stream_json(cfg().primary(), &on_stderr).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // A turn that reached the model is never busy, wherever the diagnostic appears: busy clears
+        // the findings marker, and a refresh can also fail mid-run, after the conversation advanced
+        // (review f5). Text after an assistant event, stderr after one, or a result reporting turns.
+        let assistant =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        let after_model = format!("{assistant}\n{}", result(diag));
+        let err = parse_stream_json(cfg().primary(), &outcome(&after_model, false)).unwrap_err();
+        assert_ne!(err.code, "REVIEWER_BUSY", "{err:?}");
+        let mut stderr_after_model = outcome(assistant, false);
+        stderr_after_model.stderr = diag.to_string();
+        let err = parse_stream_json(cfg().primary(), &stderr_after_model).unwrap_err();
+        assert_ne!(err.code, "REVIEWER_BUSY", "{err:?}");
+        let with_turns = format!(
+            r#"{{"type":"result","is_error":true,"num_turns":2,"result":{}}}"#,
+            serde_json::to_string(diag).unwrap()
+        );
+        let err = parse_stream_json(cfg().primary(), &outcome(&with_turns, false)).unwrap_err();
+        assert_ne!(err.code, "REVIEWER_BUSY", "{err:?}");
+        // A malformed or null num_turns is not proof of zero turns either; an explicit 0 is.
+        for turns in [r#""2""#, "null", "-1", "0"] {
+            let doc = format!(
+                r#"{{"type":"result","is_error":true,"num_turns":{turns},"result":{}}}"#,
+                serde_json::to_string(diag).unwrap()
+            );
+            let err = parse_stream_json(cfg().primary(), &outcome(&doc, false)).unwrap_err();
+            assert_eq!(
+                err.code == "REVIEWER_BUSY",
+                turns == "0",
+                "{turns}: {err:?}"
+            );
+        }
+
+        // Text that only mentions the diagnostic, rather than opening with it, is not it.
+        let quoted = format!("The log said: {diag}");
+        let err =
+            parse_stream_json(cfg().primary(), &outcome(&result(&quoted), false)).unwrap_err();
+        assert_ne!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // A genuinely expired sign-in keeps its own classification.
+        let mut expired = outcome("", false);
+        expired.stderr = "Failed to refresh OAuth token: invalid_grant".to_string();
+        let err = parse_stream_json(cfg().primary(), &expired).unwrap_err();
+        assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN", "{err:?}");
+
+        // The buffered `json` path (off the evidence path): unparseable stdout with the diagnostic
+        // on stderr is busy too, rather than reaching the generic classifier (review f2).
+        let mut buffered = outcome("", false);
+        buffered.stderr = diag.to_string();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &buffered, None)
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+        // And a buffered result document carrying it as its text, likewise.
+        let err = ClaudeReviewer
+            .parse(
+                &cfg(),
+                cfg().primary(),
+                &outcome(&result(diag), false),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // Rendered as a plain correction that asks for a retry, not a stop-and-escalate.
+        let shown = err.render_for_agent();
+        assert!(shown.starts_with("REQUEST REJECTED"), "{shown}");
+        assert!(!shown.contains("ACTION REQUIRED"), "{shown}");
+        assert!(shown.contains("same call again"), "{shown}");
     }
 
     #[test]

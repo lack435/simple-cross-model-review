@@ -4462,7 +4462,10 @@ impl Job {
                 // already running, so the conversation may have advanced: keep the marker set and let
                 // the findings gate refuse the next call. That includes an account refusal, which is
                 // exactly how a moved account leaves the session non-resumable until it rebaselines.
-                if f.child_never_started {
+                // REVIEWER_BUSY is the one post-spawn exception (issue #166): the CLI failed on its
+                // OAuth refresh lock before any model call, so the conversation did not advance and
+                // the retry its remediation asks for must not be refused.
+                if f.child_never_started || f.failure.code == "REVIEWER_BUSY" {
                     self.clear_findings_marker_after_pre_launch_failure();
                 }
                 return Err(f.failure);

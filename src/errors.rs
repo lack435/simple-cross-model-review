@@ -585,6 +585,28 @@ pub fn reviewer_crashed(reviewer: &str, exit: Option<i32>, detail: impl Into<Str
     .with_detail(detail)
 }
 
+/// The Claude CLI could not refresh its OAuth token because another Claude Code process held the
+/// refresh lock (issue #166). Transient and not an account problem: the CLI failed before any model
+/// call, so the session is unchanged and the same call can simply be made again. Rendered as a plain
+/// correction ([`Failure::is_agent_correctable`]) rather than a stop-and-escalate.
+pub fn reviewer_busy(reviewer: &str, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "REVIEWER_BUSY",
+        format!(
+            "The '{reviewer}' CLI could not refresh its sign-in token because another Claude Code \
+             process held the refresh lock. No model call ran, and the review has NOT been \
+             performed."
+        ),
+        "This is usually transient and is not a sign-in problem, and nothing changed in the \
+         session. Wait a minute, then make the same call again with the same arguments. If it is \
+         still busy after two more tries, stop and tell the user: closing other Claude Code \
+         processes that use the same account, or signing in again with `claude auth login`, \
+         clears it."
+            .to_string(),
+    )
+    .with_detail(detail)
+}
+
 pub fn empty_review(reviewer: &str, detail: impl Into<String>) -> Failure {
     Failure::new(
         "EMPTY_REVIEW",
@@ -915,12 +937,17 @@ impl Failure {
         self
     }
 
-    /// True when the failure is the agent's own fault and it should just retry
-    /// differently, rather than stopping to involve the user.
+    /// True when the agent should just retry (differently, or later) rather than stop to involve
+    /// the user: its own mistake, or a transient refusal that ran nothing (`REVIEWER_BUSY`, whose
+    /// remediation bounds the retries and says when to escalate).
     pub fn is_agent_correctable(&self) -> bool {
         matches!(
             self.code,
-            "BAD_REQUEST" | "SESSION_BUSY" | "SESSION_NOT_RESUMABLE" | "TOO_MANY_RUNNING"
+            "BAD_REQUEST"
+                | "SESSION_BUSY"
+                | "SESSION_NOT_RESUMABLE"
+                | "TOO_MANY_RUNNING"
+                | "REVIEWER_BUSY"
         )
     }
 

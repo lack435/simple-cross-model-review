@@ -446,11 +446,17 @@ Report this to the user:
 Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVAILABLE`,
 `RATE_LIMITED`, `REVIEWERS_EXHAUSTED`, `REVIEWER_ACCOUNT_CHANGED`, `INVALID_REVIEWER_CHAIN`,
 `INVALID_LEVEL`, `INVALID_LEVEL_ON_RESUME`, `PROFILE_IDENTITY_MISMATCH`, `PROFILE_NOT_AUTHORIZED`,
-`TIMEOUT`, `POLICY_BLOCKED`, `SPAWN_FAILED`, `REVIEWER_FAILED`, `EMPTY_REVIEW`, `OUTPUT_TRUNCATED`,
+`TIMEOUT`, `POLICY_BLOCKED`, `SPAWN_FAILED`, `REVIEWER_BUSY`, `REVIEWER_FAILED`, `EMPTY_REVIEW`, `OUTPUT_TRUNCATED`,
 `OUTPUT_INCOMPLETE`, `EVIDENCE_UNAVAILABLE`, `EVIDENCE_CALL_ABANDONED`, `SESSION_NOT_FOUND`,
 `SESSION_NOT_RESUMABLE`, `CANCELLED`, `SERVER_SHUTTING_DOWN`, `INTERNAL_ERROR`. Bad arguments, a
 busy session, a non-resumable session, and too many reviews already running (`TOO_MANY_RUNNING`)
 get a plain correction rather than an escalation, since each is the agent's own call to make.
+
+`REVIEWER_BUSY` is a transient refusal, not a setup problem: the Claude CLI reported that another
+Claude Code process held its OAuth refresh lock, so it failed before any model call. Nothing in the
+session changed, so it comes back as a plain correction telling the caller to wait a minute and make
+the same call again, and to involve the user only if it persists. Any other sign-in failure keeps
+its own code.
 
 `cross_model_review_status` and `--doctor` check the reviewer CLI and auth before anything is
 billed.
