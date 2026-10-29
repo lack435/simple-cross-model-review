@@ -409,6 +409,19 @@ mod tests {
         );
     }
 
+    /// An empty side is zero lines, never one phantom empty line (review f5 on #179): an empty add
+    /// or delete has no hunk at all, and an empty base against content is a pure `-0,0` insertion.
+    #[test]
+    fn an_empty_side_is_zero_lines() {
+        assert!(Lines::of("").lines.is_empty());
+        let empty_add = r(None, Some(""));
+        assert!(!empty_add.contains("@@"), "{empty_add}");
+        let empty_delete = r(Some(""), None);
+        assert!(!empty_delete.contains("@@"), "{empty_delete}");
+        let from_empty = r(Some(""), Some("a\n"));
+        assert!(from_empty.contains("@@ -0,0 +1,1 @@\n+a\n"), "{from_empty}");
+    }
+
     #[test]
     fn a_missing_trailing_newline_is_marked() {
         let t = r(Some("a\nb"), Some("a\nc"));

@@ -510,7 +510,9 @@ fn convert_misses(
     // the snapshot's bytes (plan r5 f25): the key a result is stored under always describes what
     // the converter read.
     let mut inputs: Vec<InputFile> = Vec::new();
-    let mut prepared: Vec<(Candidate, Option<String>, Option<String>)> = Vec::new();
+    // Each prepared input keeps the id it was sent under: a candidate whose snapshot failed is
+    // left out, so ids are not contiguous and must never be re-derived from position (review f1).
+    let mut prepared: Vec<(String, Candidate, Option<String>, Option<String>)> = Vec::new();
     for (n, c) in misses.into_iter().enumerate() {
         let id = format!("f{}", n + 1);
         let snap_digest = |side: &SideFacts, modified: bool| -> Option<(Side, String)> {
@@ -569,12 +571,12 @@ fn convert_misses(
             base,
             modified,
         });
-        prepared.push((c, base_digest, modified_digest));
+        prepared.push((id, c, base_digest, modified_digest));
     }
 
     let change_label = prepared
         .iter()
-        .map(|(c, ..)| c.change)
+        .map(|(_, c, ..)| c.change)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .map(|c| c.to_string())
@@ -599,8 +601,7 @@ fn convert_misses(
     let declined: std::collections::HashSet<String> = result.declined.into_iter().collect();
 
     let mut over_input_budget = 0usize;
-    for (n, (c, base_digest, modified_digest)) in prepared.into_iter().enumerate() {
-        let id = format!("f{}", n + 1);
+    for (id, c, base_digest, modified_digest) in prepared {
         let key = key_of(&c, base_digest.as_deref(), modified_digest.as_deref());
         if let Some(conv) = converted.remove(&id) {
             match crate::textdiff::render(

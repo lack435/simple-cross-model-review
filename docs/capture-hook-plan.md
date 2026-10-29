@@ -106,7 +106,8 @@ findings from a real p4d (2025.2, `test-perforce-capture-hook.ps1`):
   in the changelist's file list is now mapped.
 - **Deferral rather than removal.** A binary file the globs match is set aside at its binary site
   instead of becoming an omission. If it is not converted, it gets back exactly the omission it would
-  have had. With no `--capture-hook`, capture output is unchanged byte for byte.
+  have had. With no `--capture-hook`, capture output is unchanged, except for the deliberate fix
+  below for submitted adds and deletes, which were misreported before.
 - **`--capture-hook` with no `--capture-hook-glob` is a startup error.** Without a glob the hook could
   never be offered a file, so this is refused rather than left silently inert.
 
@@ -116,9 +117,13 @@ seven points. All are adopted here, and the implementation PR's review covers th
 
 1. **Cost per turn.**
    - `--capture-hook-max-file-bytes` (default 16 MiB). A side larger than that is never copied,
-     digested, downloaded or sent. Its size is checked first, from file metadata, `git cat-file -s`
-     or `p4 fstat` `fileSize`. Such a file stays listed as binary, exactly as an unmatched file does,
-     and does **not** make the capture incomplete.
+     digested, downloaded or sent **by the capture hook**. Its size is checked first, from file
+     metadata, `git cat-file -s` or `p4 fstat` `fileSize`. Such a file is treated exactly as an
+     unmatched file. On git, that means it is listed as binary and does **not** make the
+     composition incomplete. On Perforce, a binary file left as an omission has always made its
+     changelist incomplete, and an excluded file does the same, no worse than today. The capture's
+     own pre-existing bounded reads are unchanged: a text-typed file is read before it is found to
+     hold a NUL. The limit governs only what the hook path adds.
    - Separately, a cache lookup digests the live file **in place**, and the snapshot into `temp_dir`
      is taken **only on a miss**. A re-review of unchanged files therefore copies nothing.
    - r5 f25's guarantee still holds. A miss stores its result under the digest of the snapshot the
