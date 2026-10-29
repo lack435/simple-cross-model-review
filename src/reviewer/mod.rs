@@ -2445,6 +2445,22 @@ pub fn tmp_file(cfg: &Config, tmp_id: &str, name: &str) -> std::io::Result<PathB
             dir.display()
         )));
     }
+    // A junction *above* it (a state directory junctioned into the repository) leaves `tmp` an
+    // ordinary directory that is physically inside the reviewed tree. What matters is where the
+    // write lands, so judge the physical location, junctions followed, against the reviewed root and
+    // every declared companion. A junctioned state directory elsewhere stays legitimate.
+    let outside = crate::worktree::state_dir_is_outside(&dir, &cfg.cwd)
+        && cfg
+            .declared_companions
+            .iter()
+            .all(|c| crate::worktree::state_dir_is_outside(&dir, &c.root));
+    if !outside {
+        return Err(std::io::Error::other(format!(
+            "the reviewer temp directory {} is physically inside a reviewed repository; refusing \
+             to write there. Point --state-dir at a directory outside every reviewed repository.",
+            dir.display()
+        )));
+    }
     Ok(dir.join(format!("{tmp_id}-{name}")))
 }
 

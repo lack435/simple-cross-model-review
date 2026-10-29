@@ -638,6 +638,36 @@ fn a_junction_at_the_reviewer_temp_directory_is_refused() {
 }
 
 #[test]
+fn a_state_dir_junctioned_into_the_project_cannot_host_the_reviewer_temp_directory() {
+    // Issue #168, review f1: a junction *above* `tmp` (the state directory itself, junctioned into
+    // the project) leaves `tmp` a plain directory that is physically inside the project.
+    let root = crate::testutil::temp_dir("tmp-dir-ancestor-junction");
+    let project = root.as_path().join("project");
+    let elsewhere = root.as_path().join("elsewhere");
+    std::fs::create_dir_all(project.join("state")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let link = elsewhere.join("state");
+    assert!(
+        crate::testutil::make_junction(&link, &project.join("state")),
+        "mklink /J failed"
+    );
+    let cfg = config_at(&project, Some(&link), &["codex"]);
+    let err = crate::reviewer::tmp_file(&cfg, "t1", "codex-last.txt").unwrap_err();
+    assert!(err.to_string().contains("physically inside"), "{err}");
+
+    // A state directory junctioned somewhere outside the project is still fine.
+    let outside = root.as_path().join("real-state");
+    std::fs::create_dir_all(&outside).unwrap();
+    let link2 = elsewhere.join("state2");
+    assert!(
+        crate::testutil::make_junction(&link2, &outside),
+        "mklink /J failed"
+    );
+    let cfg = config_at(&project, Some(&link2), &["codex"]);
+    crate::reviewer::tmp_file(&cfg, "t2", "codex-last.txt").expect("outside the project");
+}
+
+#[test]
 fn codex_sterile_directory_is_empty_outside_and_stable_across_turns() {
     let root = crate::testutil::temp_dir("codex-sterile-root");
     let state = crate::testutil::temp_dir("codex-sterile-state");
