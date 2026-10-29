@@ -385,14 +385,27 @@ pub fn object_size(
         .map_err(|_| EvidenceError::new("provider_failed", "cat-file -s gave no size"))
 }
 
-/// SHA-256 of blob `id`'s raw bytes, streamed from `git cat-file blob` through a fixed buffer
-/// (binary-safe; the text runner is not). `None` past `max` bytes. The caller checks the object's
-/// size first; blobs are immutable, so the same id always gives the same digest.
-pub fn blob_digest(root: &Path, id: &str, max: u64) -> Result<Option<[u8; 32]>, EvidenceError> {
+/// Stream blob `id`'s raw bytes from `git cat-file blob` into `sink` (binary-safe; the text runner
+/// is not), with the same isolated configuration as every other command. Bounded like the runner
+/// (#180 review f3): git runs in a kill-on-close job object, and passing `deadline`, a cancel, more
+/// than `max` bytes or a sink error drops the job, which kills it. `Ok(false)` means over `max`.
+fn cat_blob(
+    root: &Path,
+    id: &str,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<bool, EvidenceError> {
     use std::io::Read;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
     let fail = |m: String| EvidenceError::new("provider_failed", m);
     let bin = crate::reviewer::on_path("git").ok_or_else(|| fail("git is not on PATH".into()))?;
-    let mut child = Command::new(bin)
+    let job = crate::winjob::JobObject::new()
+        .ok_or_else(|| fail("no job object to contain git".into()))?;
+    let mut command = Command::new(bin);
+    command
         .args([
             "--no-pager",
             "-c",
@@ -407,72 +420,104 @@ pub fn blob_digest(root: &Path, id: &str, max: u64) -> Result<Option<[u8; 32]>, 
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    let mut child = job
+        .spawn_in_job_with_flags(&mut command, crate::hook::CREATE_NO_WINDOW)
         .map_err(|e| fail(e.to_string()))?;
     let mut out = child
         .stdout
         .take()
         .ok_or_else(|| fail("no stdout".into()))?;
-    let mut h =
-        crate::digest::Sha256Stream::new().ok_or_else(|| fail("sha256 unavailable".into()))?;
-    let mut buf = [0u8; 64 * 1024];
+    // The pipe is read on its own thread so a stalled git cannot hold this one past the deadline;
+    // when this function returns early the job is dropped, git dies, and the reader sees EOF.
+    let (tx, rx) = sync_channel::<Vec<u8>>(4);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = out.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let out_of_time = || fail(format!("git cat-file blob {id} ran out of time"));
     let mut total: u64 = 0;
-    let mut over = false;
     loop {
-        let n = out.read(&mut buf).map_err(|e| fail(e.to_string()))?;
-        if n == 0 {
-            break;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(EvidenceError::new(
+                "cancelled",
+                "the blob read was cancelled",
+            ));
         }
-        total += n as u64;
-        if total > max {
-            over = true;
-            break;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(out_of_time());
         }
-        h.update(&buf[..n]);
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(chunk) => {
+                total += chunk.len() as u64;
+                if total > max {
+                    return Ok(false);
+                }
+                sink(&chunk).map_err(|e| fail(e.to_string()))?;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
-    if over {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Ok(None);
+    loop {
+        match child.try_wait().map_err(|e| fail(e.to_string()))? {
+            Some(status) if status.success() => return Ok(true),
+            Some(_) => return Err(fail(format!("git cat-file blob {id} failed"))),
+            None if Instant::now() >= deadline => return Err(out_of_time()),
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
     }
-    let status = child.wait().map_err(|e| fail(e.to_string()))?;
-    if !status.success() {
-        return Err(fail(format!("git cat-file blob {id} failed")));
-    }
-    Ok(h.finish())
 }
 
-/// Write blob `id` to `dest`, streamed straight to the file (binary-safe; the text runner is not).
-/// The caller checks the object's size first. Same isolated configuration as every other command.
-pub fn write_blob(root: &Path, id: &str, dest: &Path) -> Result<(), EvidenceError> {
-    let fail = |m: String| EvidenceError::new("provider_failed", m);
-    let bin = crate::reviewer::on_path("git").ok_or_else(|| fail("git is not on PATH".into()))?;
-    let file = std::fs::File::create(dest).map_err(|e| fail(e.to_string()))?;
-    let status = Command::new(bin)
-        .args([
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=",
-            "-c",
-            "core.hooksPath=NUL",
-        ])
-        .args(["cat-file", "blob", id])
-        .current_dir(root)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "NUL")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(file)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| fail(e.to_string()))?;
-    if status.success() {
+/// SHA-256 of blob `id`'s raw bytes, or `None` past `max` bytes. Blobs are immutable, so the same
+/// id always gives the same digest.
+pub fn blob_digest(
+    root: &Path,
+    id: &str,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Option<[u8; 32]>, EvidenceError> {
+    let mut h = crate::digest::Sha256Stream::new()
+        .ok_or_else(|| EvidenceError::new("provider_failed", "sha256 unavailable"))?;
+    let whole = cat_blob(root, id, max, deadline, cancel, |b| {
+        h.update(b);
         Ok(())
-    } else {
+    })?;
+    Ok(if whole { h.finish() } else { None })
+}
+
+/// Write blob `id` to `dest`, at most `max` bytes; a failed or oversized write removes the file.
+pub fn write_blob(
+    root: &Path,
+    id: &str,
+    dest: &Path,
+    max: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), EvidenceError> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| EvidenceError::new("provider_failed", e.to_string()))?;
+    let result =
+        cat_blob(root, id, max, deadline, cancel, |b| file.write_all(b)).and_then(|whole| {
+            whole.then_some(()).ok_or_else(|| {
+                EvidenceError::new(
+                    "limit_exceeded",
+                    format!("blob {id} is over the size limit"),
+                )
+            })
+        });
+    drop(file);
+    if result.is_err() {
         let _ = std::fs::remove_file(dest);
-        Err(fail(format!("git cat-file blob {id} failed")))
     }
+    result
 }
 
 /// `git diff --numstat` counts for a resolved spec: (files, insertions, deletions). A binary file

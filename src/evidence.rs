@@ -606,7 +606,7 @@ pub use core::read_contained_file;
 /// The converged-hook binding check's two git reads (issue #142), exposed from the private `core`
 /// module so the parent composes `base..HEAD` through the same code the evidence server served from.
 pub use core::{
-    branch_base, committed_change_digest, contained_worktree_file, resolve_head, untracked_binaries,
+    branch_base, committed_change_digest, open_contained_file, resolve_head, untracked_binaries,
 };
 pub use git::{ignores_untracked, list_worktrees, tracks_under};
 

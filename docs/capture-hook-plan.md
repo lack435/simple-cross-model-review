@@ -118,10 +118,17 @@ findings from a real p4d (2025.2, `test-perforce-capture-hook.ps1`):
   binding's `committed_change_digest` all call it, so they cannot drift apart. Digests are
   `sha256:<hex>` of raw bytes, the same form as Perforce's local sides. Blob digests are memoized by
   object id, since a blob never changes.
-- **Containment.** A worktree side is digested and snapshotted only after it resolves inside the
-  working root through the handle-checked open the evidence reads use. A side that does not (a link
-  leading out) is excluded exactly like an oversized one, so a converter is never handed bytes from
-  outside the root.
+- **Containment.** A worktree side is digested and snapshotted only **through** a handle opened
+  inside the working root and verified after opening, the check the evidence reads use; the path is
+  never reopened, so a concurrent reparse-point swap cannot redirect the read. A side that does not
+  resolve inside the root (a link leading out) is excluded exactly like an oversized one.
+- **Failing closed when the hook cannot be set up.** If the converter's identity or the cache cannot
+  be set up, the bundle still carries the hook, with no cache. Every lookup is then absent, so a
+  change with matched binaries is served incomplete and cannot be approved, rather than reading as
+  complete with their text silently missing.
+- **Blob reads are bounded.** `git cat-file blob` runs in a kill-on-close job object and is read on
+  its own thread, so the request deadline, a cancel or the size cap ends it. Blob digests are
+  memoized only for one composition or prefill.
 - **Where the section appears.** Only in a whole-change composition (`path` empty) with a worktree,
   `HEAD` or commit head. An index head is exploratory and never binds, so it gets none.
 - **The untracked rule is hook-scoped.** An untracked file is listed as binary only when a glob

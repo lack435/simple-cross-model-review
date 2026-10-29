@@ -2774,14 +2774,15 @@ pub fn untracked_binaries(
         .collect())
 }
 
-/// The working-tree file `rel`, resolved inside `root` and verified through an open handle, or
-/// `None` (missing, or a link leading out of the root). The capture hook digests and snapshots only
-/// such a path, so a converter is never handed bytes from outside the working root.
-pub fn contained_worktree_file(root: &Path, rel: &str, limits: &Limits) -> Option<PathBuf> {
+/// The working-tree file `rel`, resolved inside `root` and opened, with the **open handle**
+/// verified to still be inside the root; `None` when missing or a link leads out of the root. The
+/// capture hook reads only through such a handle, never by reopening the path, so a concurrent
+/// path or reparse-point swap cannot hand a converter bytes from outside the root (#180 review f2).
+pub fn open_contained_file(root: &Path, rel: &str, limits: &Limits) -> Option<File> {
     let safe = resolve_existing_bounded(root, limits.max_path_bytes as usize, rel, false).ok()?;
     let file = File::open(&safe).ok()?;
     verify_open_file(&file, &safe, root).ok()?;
-    Some(safe)
+    Some(file)
 }
 
 /// `HEAD` as a full object id, through the isolated runner, or `None` when it does not resolve (an
@@ -2925,7 +2926,20 @@ fn compose_resolved(
             received_at,
         );
         match derived {
-            Ok(inputs) => complete &= super::generated::compose(&mut out, root, hook, &inputs),
+            Ok(inputs) => {
+                let deadline = Instant::now()
+                    + child_budget(received_at)
+                        .min(Duration::from_millis(limits.operation_timeout_ms));
+                let mut digests = super::generated::Digests::new(
+                    root,
+                    hook.max_file_bytes,
+                    limits,
+                    cancel,
+                    deadline,
+                    None,
+                );
+                complete &= super::generated::compose(&mut out, &mut digests, hook, &inputs)
+            }
             Err(_) => {
                 complete = false;
                 out.push_str(
@@ -4662,7 +4676,7 @@ foreach ($f in $in.files) {{
 
         let (hook, warnings) =
             super::super::generated::prefill(&cfg, cfg.capture_hook.as_ref().unwrap(), &root);
-        let hook = hook.expect("the hook can run");
+        assert!(hook.cache_dir.is_some(), "the hook can run");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(runs(), 1);
         let served = served_with_hook(&root, &base, &hook);
@@ -4692,7 +4706,7 @@ foreach ($f in $in.files) {{
         // Unchanged sources: the cache answers, the converter does not run again.
         let (again, _) =
             super::super::generated::prefill(&cfg, cfg.capture_hook.as_ref().unwrap(), &root);
-        assert_eq!(again.as_ref(), Some(&hook));
+        assert_eq!(again, hook);
         assert_eq!(runs(), 1, "a cache hit must not run the converter");
 
         // Committing exactly the reviewed content binds: same entries, same bytes.
@@ -4732,7 +4746,7 @@ foreach ($f in $in.files) {{
     /// omitted and makes the composition incomplete. An oversized file is excluded silently.
     #[test]
     fn generated_text_entries_decide_completeness() {
-        use super::super::generated::{key, modified_sha256, BinaryInput, Modified};
+        use super::super::generated::{key, BinaryInput, Digests, Modified};
         use crate::capture_cache::{Cache, Entry};
         let Some((dir, base)) = hook_repo("capture-hook-git-entries") else {
             eprintln!("skipping: git is not on PATH");
@@ -4742,7 +4756,7 @@ foreach ($f in $in.files) {{
         let cache_dir = temp_dir("capture-hook-git-cache");
         let hook = GitCaptureHook {
             identity: "test".into(),
-            cache_dir: cache_dir.as_path().to_string_lossy().into_owned(),
+            cache_dir: Some(cache_dir.as_path().to_string_lossy().into_owned()),
             globs: vec!["new.bin".into(), "big.bin".into()],
             max_file_bytes: 16,
             working_root: root.to_string_lossy().into_owned(),
@@ -4756,11 +4770,20 @@ foreach ($f in $in.files) {{
                 path: "new.bin".into(),
                 moved_from: None,
                 base: None,
-                modified: Some(Modified::Worktree(root.join("new.bin"))),
+                modified: Some(Modified::Worktree("new.bin".into())),
                 excluded: false,
             },
             None,
-            modified_sha256(&root, &Modified::Worktree(root.join("new.bin")), 16).as_deref(),
+            Digests::new(
+                &root,
+                16,
+                &Limits::default(),
+                &AtomicBool::new(false),
+                Instant::now(),
+                None,
+            )
+            .modified(&Modified::Worktree("new.bin".into()))
+            .as_deref(),
         )
         .unwrap();
         let cache = Cache::open(cache_dir.as_path()).unwrap();
@@ -4775,7 +4798,39 @@ foreach ($f in $in.files) {{
             "oversized is excluded"
         );
 
+        // A hook that could not be set up has no cache: its files are unavailable, never silently
+        // missing from a complete diff (#180 review f1).
+        let unset = GitCaptureHook {
+            cache_dir: None,
+            ..hook.clone()
+        };
         cache.put(&k, &Entry::Negative).unwrap();
+        let failed = served_with_hook(&root, &base, &unset);
+        assert!(failed
+            .text
+            .contains("=== generated text for new.bin unavailable ==="));
+        assert!(!failed.complete);
+
+        // A blob read past its deadline fails rather than blocking (review f3).
+        let blob = git_out(&root, &[], &["rev-parse", "HEAD:a.bin"]).unwrap();
+        let late = super::super::git::blob_digest(
+            &root,
+            &blob,
+            16,
+            Instant::now(),
+            &AtomicBool::new(false),
+        );
+        assert!(late.is_err());
+        let digest = super::super::git::blob_digest(
+            &root,
+            &blob,
+            16,
+            Instant::now() + Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(digest, crate::digest::sha256(&[1u8, 0, 2]));
+
         let declined = served_with_hook(&root, &base, &hook);
         assert!(declined
             .text

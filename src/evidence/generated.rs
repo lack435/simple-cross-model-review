@@ -15,8 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +32,10 @@ pub const GENERATED_BUDGET: usize = 400_000;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCaptureHook {
     pub identity: String,
-    pub cache_dir: String,
+    /// `None` when the hook could not be set up this turn (no identity, no cache). Every lookup is
+    /// then absent, so a composition with matched binaries is incomplete rather than silently
+    /// missing their text (#180 review f1).
+    pub cache_dir: Option<String>,
     pub globs: Vec<String>,
     pub max_file_bytes: u64,
     /// The canonical working root the keys were computed under.
@@ -51,8 +53,8 @@ impl GitCaptureHook {
 /// Where a modified side's bytes are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modified {
-    /// The working-tree file at this absolute, contained path.
-    Worktree(PathBuf),
+    /// The working-tree file at this root-relative path, read only through a contained handle.
+    Worktree(String),
     /// A committed blob.
     Blob(String),
 }
@@ -89,13 +91,12 @@ fn blob_side(
     }
 }
 
-/// A worktree side: its contained path, and whether it is excluded (over the limit, or not
-/// resolvable inside the root).
+/// A worktree side, and whether it is excluded (over the limit, or not resolvable inside the root).
 fn worktree_side(root: &Path, path: &str, max: u64, limits: &Limits) -> (Option<Modified>, bool) {
-    match super::contained_worktree_file(root, path, limits) {
-        Some(abs) => {
-            let size = std::fs::metadata(&abs).map_or(u64::MAX, |m| m.len());
-            (Some(Modified::Worktree(abs)), size > max)
+    match super::open_contained_file(root, path, limits) {
+        Some(file) => {
+            let size = file.metadata().map_or(u64::MAX, |m| m.len());
+            (Some(Modified::Worktree(path.to_string())), size > max)
         }
         None => (None, true),
     }
@@ -181,35 +182,70 @@ pub fn derive(
     Ok(out)
 }
 
-fn blob_memo() -> &'static Mutex<HashMap<String, String>> {
-    static MEMO: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn sha256_label(d: &[u8; 32]) -> String {
     format!("sha256:{}", crate::digest::to_hex(d))
 }
 
-/// A blob's content digest, memoized by object id (blobs are immutable). `None` when it cannot be
-/// read within `max`.
-pub fn blob_sha256(root: &Path, id: &str, max: u64) -> Option<String> {
-    if let Some(d) = blob_memo().lock().ok()?.get(id) {
-        return Some(d.clone());
-    }
-    let d = sha256_label(&super::git::blob_digest(root, id, max).ok()??);
-    if let Ok(mut m) = blob_memo().lock() {
-        m.insert(id.to_string(), d.clone());
-    }
-    Some(d)
+/// Digests the sides of one composition or prefill. Blob digests are memoized by object id for its
+/// lifetime only (#180 review f4); blob reads are bounded by `deadline` (review f3), and worktree
+/// reads go through a contained handle (review f2).
+pub struct Digests<'a> {
+    pub root: &'a Path,
+    pub max: u64,
+    pub limits: &'a Limits,
+    pub cancel: &'a AtomicBool,
+    /// When every blob read must have finished: the request deadline in the child.
+    pub deadline: Instant,
+    /// The parent instead gives each blob read its own allowance.
+    pub per_read: Option<Duration>,
+    memo: HashMap<String, String>,
 }
 
-/// A modified side's content digest, capped at `max`.
-pub fn modified_sha256(root: &Path, side: &Modified, max: u64) -> Option<String> {
-    match side {
-        Modified::Worktree(p) => {
-            crate::capture_hook::file_digest_capped(p, max).map(|d| sha256_label(&d))
+impl<'a> Digests<'a> {
+    pub fn new(
+        root: &'a Path,
+        max: u64,
+        limits: &'a Limits,
+        cancel: &'a AtomicBool,
+        deadline: Instant,
+        per_read: Option<Duration>,
+    ) -> Self {
+        Self {
+            root,
+            max,
+            limits,
+            cancel,
+            deadline,
+            per_read,
+            memo: HashMap::new(),
         }
-        Modified::Blob(id) => blob_sha256(root, id, max),
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.per_read.map_or(self.deadline, |d| Instant::now() + d)
+    }
+
+    /// A blob's content digest; `None` when it cannot be read within `max` in time.
+    pub fn blob(&mut self, id: &str) -> Option<String> {
+        if let Some(d) = self.memo.get(id) {
+            return Some(d.clone());
+        }
+        let deadline = self.deadline();
+        let d = super::git::blob_digest(self.root, id, self.max, deadline, self.cancel).ok()??;
+        let d = sha256_label(&d);
+        self.memo.insert(id.to_string(), d.clone());
+        Some(d)
+    }
+
+    /// A modified side's content digest.
+    pub fn modified(&mut self, side: &Modified) -> Option<String> {
+        match side {
+            Modified::Worktree(rel) => {
+                let file = super::open_contained_file(self.root, rel, self.limits)?;
+                crate::capture_hook::reader_digest_capped(file, self.max).map(|d| sha256_label(&d))
+            }
+            Modified::Blob(id) => self.blob(id),
+        }
     }
 }
 
@@ -233,13 +269,13 @@ pub fn key(
 }
 
 /// `input`'s cache key from its live sides, or `None` when a side cannot be read.
-fn live_key(root: &Path, hook: &GitCaptureHook, input: &BinaryInput) -> Option<String> {
+fn live_key(digests: &mut Digests, hook: &GitCaptureHook, input: &BinaryInput) -> Option<String> {
     let base = match &input.base {
-        Some(id) => Some(blob_sha256(root, id, hook.max_file_bytes)?),
+        Some(id) => Some(digests.blob(id)?),
         None => None,
     };
     let modified = match &input.modified {
-        Some(m) => Some(modified_sha256(root, m, hook.max_file_bytes)?),
+        Some(m) => Some(digests.modified(m)?),
         None => None,
     };
     key(hook, input, base.as_deref(), modified.as_deref())
@@ -250,7 +286,7 @@ fn live_key(root: &Path, hook: &GitCaptureHook, input: &BinaryInput) -> Option<S
 /// converter run) or does not fit the budget. A negative entry and an excluded file are complete.
 pub fn compose(
     out: &mut String,
-    root: &Path,
+    digests: &mut Digests,
     hook: &GitCaptureHook,
     inputs: &[BinaryInput],
 ) -> bool {
@@ -258,12 +294,15 @@ pub fn compose(
     if live.is_empty() {
         return true;
     }
-    let cache = Cache::open(Path::new(&hook.cache_dir)).ok();
+    let cache = hook
+        .cache_dir
+        .as_ref()
+        .and_then(|d| Cache::open(Path::new(d)).ok());
     let mut complete = true;
     let mut remaining = GENERATED_BUDGET;
     out.push_str("\n\n# generated text (from binary files)\n");
     for input in live {
-        let entry = live_key(root, hook, input).and_then(|k| cache.as_ref()?.get(&k));
+        let entry = live_key(digests, hook, input).and_then(|k| cache.as_ref()?.get(&k));
         match entry {
             Some(Entry::Positive {
                 display_path, text, ..
@@ -311,7 +350,11 @@ impl Drop for TempDir {
 
 /// Fill the cache for this turn's canonical change (`branch-base..worktree`), before the turn: look
 /// each binary input up, run the converter once for the misses, and store what it returns. Returns
-/// the hook reference for the bundle, `None` when the hook cannot run at all, plus the warnings.
+/// the hook reference for the bundle, plus the warnings.
+///
+/// The reference is returned even when the hook cannot be set up, with no cache (#180 review f1):
+/// every lookup is then absent, so a change with matched binaries is served incomplete and cannot be
+/// approved, instead of reading as complete with their text silently missing.
 ///
 /// A missed worktree side is snapshotted and its result stored under the **snapshot's** digest
 /// (plan r5 f25, r7): if the file changed meanwhile, the live key differs and the composition reads
@@ -320,47 +363,45 @@ pub fn prefill(
     cfg: &crate::config::Config,
     hook: &CaptureHookConfig,
     root: &Path,
-) -> (Option<GitCaptureHook>, Vec<String>) {
+) -> (GitCaptureHook, Vec<String>) {
     let mut warnings = Vec::new();
-    let Ok(root) = std::fs::canonicalize(root) else {
-        warnings.push("capture hook: the working root could not be resolved".to_string());
-        return (None, warnings);
-    };
-    let Some(identity) = crate::capture_hook::identity(hook, &root) else {
-        warnings.push(
-            "capture hook: the converter's identity could not be computed (a file it covers is \
-             unreadable); binary files stay listed as binary"
-                .to_string(),
-        );
-        return (None, warnings);
-    };
-    let cache_dir = match super::server_owned_dir(cfg, "cross-review-capture-cache") {
-        Ok(d) => d,
-        Err(e) => {
-            warnings.push(format!(
-                "capture hook: no safe cache directory ({}); binary files stay listed as binary",
-                e.message
-            ));
-            return (None, warnings);
-        }
-    };
-    let cache = match Cache::open(&cache_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            warnings.push(format!(
-                "capture hook: the cache could not be opened ({e}); binary files stay listed as \
-                 binary"
-            ));
-            return (None, warnings);
-        }
-    };
-    let git_hook = GitCaptureHook {
-        identity,
-        cache_dir: cache_dir.to_string_lossy().into_owned(),
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut git_hook = GitCaptureHook {
+        identity: String::new(),
+        cache_dir: None,
         globs: hook.globs.clone(),
         max_file_bytes: hook.max_file_bytes,
         working_root: root.to_string_lossy().into_owned(),
     };
+    let unavailable = |why: String| {
+        format!(
+            "capture hook: {why}; files it matches are shown as unavailable and the change is \
+             incomplete"
+        )
+    };
+    let Some(identity) = crate::capture_hook::identity(hook, &root) else {
+        warnings.push(unavailable(
+            "the converter's identity could not be computed (a file it covers is unreadable)"
+                .to_string(),
+        ));
+        return (git_hook, warnings);
+    };
+    git_hook.identity = identity;
+    let cache = super::server_owned_dir(cfg, "cross-review-capture-cache")
+        .map_err(|e| format!("no safe cache directory ({})", e.message))
+        .and_then(|dir| {
+            Cache::open(&dir)
+                .map(|c| (dir, c))
+                .map_err(|e| format!("the cache could not be opened ({e})"))
+        });
+    let (cache_dir, cache) = match cache {
+        Ok(ok) => ok,
+        Err(why) => {
+            warnings.push(unavailable(why));
+            return (git_hook, warnings);
+        }
+    };
+    git_hook.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
     let limits = Limits::default();
     let cancel = AtomicBool::new(false);
@@ -387,7 +428,7 @@ pub fn prefill(
                 "capture hook: the binary files could not be listed ({})",
                 e.message
             ));
-            return (Some(git_hook), warnings);
+            return (git_hook, warnings);
         }
     };
     let excluded = inputs.iter().filter(|i| i.excluded).count();
@@ -398,175 +439,204 @@ pub fn prefill(
             hook.max_file_bytes
         ));
     }
+    let per_read = Duration::from_millis(limits.operation_timeout_ms);
+    let mut digests = Digests::new(
+        &root,
+        hook.max_file_bytes,
+        &limits,
+        &cancel,
+        Instant::now(),
+        Some(per_read),
+    );
     let misses: Vec<&BinaryInput> = inputs
         .iter()
         .filter(|i| !i.excluded)
         .filter(|i| {
-            live_key(&root, &git_hook, i)
+            live_key(&mut digests, &git_hook, i)
                 .and_then(|k| cache.get(&k))
                 .is_none()
         })
         .collect();
     if !misses.is_empty() {
-        warnings.extend(convert_misses(
-            cfg, hook, &git_hook, &cache, &root, &base, &misses,
-        ));
+        let run = Run {
+            cfg,
+            hook,
+            git_hook: &git_hook,
+            cache: &cache,
+            base: &base,
+        };
+        warnings.extend(run.convert_misses(&mut digests, &misses));
     }
     cache.evict(crate::capture_cache::MAX_CACHE_BYTES);
-    (Some(git_hook), warnings)
+    (git_hook, warnings)
 }
 
-/// Snapshot the misses, run the converter once, and cache its results; returns the warnings.
-#[allow(clippy::too_many_arguments)]
-fn convert_misses(
-    cfg: &crate::config::Config,
-    hook: &CaptureHookConfig,
-    git_hook: &GitCaptureHook,
-    cache: &Cache,
-    root: &Path,
-    base: &str,
-    misses: &[&BinaryInput],
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let temp = match super::server_owned_dir(cfg, "cross-review-capture-hook") {
-        Ok(dir) => dir.join(crate::digest::random_hex_token(8).unwrap_or_else(|| "run".into())),
-        Err(e) => {
-            warnings.push(format!(
-                "capture hook: no safe temp directory ({}); its files stay binary",
-                e.message
-            ));
+/// What [`Run::convert_misses`] needs besides the digests and the misses.
+struct Run<'a> {
+    cfg: &'a crate::config::Config,
+    hook: &'a CaptureHookConfig,
+    git_hook: &'a GitCaptureHook,
+    cache: &'a Cache,
+    base: &'a str,
+}
+
+impl Run<'_> {
+    /// Snapshot the misses, run the converter once, and cache its results; returns the warnings.
+    fn convert_misses(&self, digests: &mut Digests, misses: &[&BinaryInput]) -> Vec<String> {
+        let hook = self.hook;
+        let root = digests.root;
+        let mut warnings = Vec::new();
+        let temp = match super::server_owned_dir(self.cfg, "cross-review-capture-hook") {
+            Ok(dir) => dir.join(crate::digest::random_hex_token(8).unwrap_or_else(|| "run".into())),
+            Err(e) => {
+                warnings.push(format!(
+                    "capture hook: no safe temp directory ({}); its files stay binary",
+                    e.message
+                ));
+                return warnings;
+            }
+        };
+        let _cleanup = TempDir(temp.clone());
+        if std::fs::create_dir_all(&temp).is_err() {
+            warnings.push("capture hook: its temp directory could not be created".to_string());
             return warnings;
         }
-    };
-    let _cleanup = TempDir(temp.clone());
-    if std::fs::create_dir_all(&temp).is_err() {
-        warnings.push("capture hook: its temp directory could not be created".to_string());
-        return warnings;
-    }
 
-    // Each prepared input keeps the id it was sent under and the digests of exactly the bytes the
-    // converter is handed, which its result is stored under.
-    let mut inputs: Vec<InputFile> = Vec::new();
-    let mut prepared: Vec<(String, &BinaryInput, Option<String>, Option<String>)> = Vec::new();
-    for (n, b) in misses.iter().enumerate() {
-        let id = format!("f{}", n + 1);
-        let blob = |blob_id: &str, modified: bool| -> Option<(Side, String)> {
-            let digest = blob_sha256(root, blob_id, hook.max_file_bytes)?;
-            let file = if hook.materialize {
-                let path = crate::capture_hook::snapshot_path(&temp, &id, modified, &b.path);
-                std::fs::create_dir_all(path.parent()?).ok()?;
-                super::git::write_blob(root, blob_id, &path).ok()?;
-                Some(path.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            Some((
-                Side {
-                    reference: blob_id.to_string(),
-                    file,
-                },
-                digest,
-            ))
-        };
-        let base_side = b.base.as_deref().map(|id| blob(id, false));
-        let modified_side = b.modified.as_ref().map(|m| match m {
-            Modified::Worktree(abs) => {
-                let path = crate::capture_hook::snapshot_path(&temp, &id, true, &b.path);
-                let d = crate::capture_hook::snapshot(abs, &path, hook.max_file_bytes).ok()?;
+        // Each prepared input keeps the id it was sent under and the digests of exactly the bytes
+        // the converter is handed, which its result is stored under.
+        let mut inputs: Vec<InputFile> = Vec::new();
+        let mut prepared: Vec<(String, &BinaryInput, Option<String>, Option<String>)> = Vec::new();
+        for (n, b) in misses.iter().enumerate() {
+            let id = format!("f{}", n + 1);
+            let blob = |digests: &mut Digests, blob_id: &str, modified: bool| {
+                let digest = digests.blob(blob_id)?;
+                let file = if hook.materialize {
+                    let path = crate::capture_hook::snapshot_path(&temp, &id, modified, &b.path);
+                    std::fs::create_dir_all(path.parent()?).ok()?;
+                    let deadline = digests.deadline();
+                    super::git::write_blob(
+                        root,
+                        blob_id,
+                        &path,
+                        hook.max_file_bytes,
+                        deadline,
+                        digests.cancel,
+                    )
+                    .ok()?;
+                    Some(path.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
                 Some((
                     Side {
-                        reference: abs.to_string_lossy().into_owned(),
-                        file: Some(path.to_string_lossy().into_owned()),
+                        reference: blob_id.to_string(),
+                        file,
                     },
-                    sha256_label(&d),
+                    digest,
                 ))
-            }
-            Modified::Blob(blob_id) => blob(blob_id, true),
-        });
-        // A side that could not be prepared leaves the file unconverted: absent, so incomplete.
-        if matches!(base_side, Some(None)) || matches!(modified_side, Some(None)) {
-            continue;
-        }
-        let (base_side, base_digest) = base_side
-            .flatten()
-            .map_or((None, None), |(s, d)| (Some(s), Some(d)));
-        let (modified_side, modified_digest) = modified_side
-            .flatten()
-            .map_or((None, None), |(s, d)| (Some(s), Some(d)));
-        inputs.push(InputFile {
-            id: id.clone(),
-            path: b.path.clone(),
-            change_type: b.change_type,
-            moved_from: b.moved_from.clone(),
-            local_path: Some(root.join(&b.path).to_string_lossy().into_owned()),
-            base: base_side,
-            modified: modified_side,
-        });
-        prepared.push((id, b, base_digest, modified_digest));
-    }
-
-    let result = crate::capture_hook::run(
-        hook,
-        "git",
-        root,
-        &temp,
-        &format!("{base}..worktree"),
-        &inputs,
-        crate::winjob::JobObject::new,
-    );
-    warnings.extend(result.warnings);
-    let mut converted: HashMap<String, crate::capture_hook::Converted> = result
-        .converted
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
-        .collect();
-    let declined: HashSet<String> = result.declined.into_iter().collect();
-    let mut budget = RenderBudget::per_capture();
-    let cancel = AtomicBool::new(false);
-    let mut over_input_budget = 0usize;
-    for (id, b, base_digest, modified_digest) in prepared {
-        let Some(k) = key(
-            git_hook,
-            b,
-            base_digest.as_deref(),
-            modified_digest.as_deref(),
-        ) else {
-            continue;
-        };
-        if let Some(conv) = converted.remove(&id) {
-            match crate::textdiff::render(
-                &Sides {
-                    source: &b.path,
-                    display: &conv.display_path,
-                    moved_from: b.moved_from.as_deref(),
-                    base: conv.base_text.as_deref(),
-                    modified: conv.modified_text.as_deref(),
-                    supplied_diff: conv.diff_text.as_deref(),
-                },
-                &mut budget,
-                &cancel,
-            ) {
-                Rendered::Text(text) => {
-                    let _ = cache.put(
-                        &k,
-                        &Entry::Positive {
-                            display_path: conv.display_path,
-                            text,
-                            note: result.note.clone(),
+            };
+            let base_side = b.base.as_deref().map(|id| blob(digests, id, false));
+            let modified_side = b.modified.as_ref().map(|m| match m {
+                Modified::Worktree(rel) => {
+                    let path = crate::capture_hook::snapshot_path(&temp, &id, true, &b.path);
+                    let file = super::open_contained_file(root, rel, digests.limits)?;
+                    let d = crate::capture_hook::snapshot_reader(file, &path, hook.max_file_bytes)
+                        .ok()?;
+                    Some((
+                        Side {
+                            reference: root.join(rel).to_string_lossy().into_owned(),
+                            file: Some(path.to_string_lossy().into_owned()),
                         },
-                    );
+                        sha256_label(&d),
+                    ))
                 }
-                Rendered::OverBudget => over_input_budget += 1,
+                Modified::Blob(blob_id) => blob(digests, blob_id, true),
+            });
+            // A side that could not be prepared leaves the file unconverted: absent, so incomplete.
+            if matches!(base_side, Some(None)) || matches!(modified_side, Some(None)) {
+                continue;
             }
-        } else if declined.contains(&id) {
-            let _ = cache.put(&k, &Entry::Negative);
+            let (base_side, base_digest) = base_side
+                .flatten()
+                .map_or((None, None), |(s, d)| (Some(s), Some(d)));
+            let (modified_side, modified_digest) = modified_side
+                .flatten()
+                .map_or((None, None), |(s, d)| (Some(s), Some(d)));
+            inputs.push(InputFile {
+                id: id.clone(),
+                path: b.path.clone(),
+                change_type: b.change_type,
+                moved_from: b.moved_from.clone(),
+                local_path: Some(root.join(&b.path).to_string_lossy().into_owned()),
+                base: base_side,
+                modified: modified_side,
+            });
+            prepared.push((id, b, base_digest, modified_digest));
         }
+
+        let result = crate::capture_hook::run(
+            hook,
+            "git",
+            root,
+            &temp,
+            &format!("{}..worktree", self.base),
+            &inputs,
+            crate::winjob::JobObject::new,
+        );
+        warnings.extend(result.warnings);
+        let mut converted: HashMap<String, crate::capture_hook::Converted> = result
+            .converted
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect();
+        let declined: HashSet<String> = result.declined.into_iter().collect();
+        let mut budget = RenderBudget::per_capture();
+        let cancel = AtomicBool::new(false);
+        let mut over_input_budget = 0usize;
+        for (id, b, base_digest, modified_digest) in prepared {
+            let Some(k) = key(
+                self.git_hook,
+                b,
+                base_digest.as_deref(),
+                modified_digest.as_deref(),
+            ) else {
+                continue;
+            };
+            if let Some(conv) = converted.remove(&id) {
+                match crate::textdiff::render(
+                    &Sides {
+                        source: &b.path,
+                        display: &conv.display_path,
+                        moved_from: b.moved_from.as_deref(),
+                        base: conv.base_text.as_deref(),
+                        modified: conv.modified_text.as_deref(),
+                        supplied_diff: conv.diff_text.as_deref(),
+                    },
+                    &mut budget,
+                    &cancel,
+                ) {
+                    Rendered::Text(text) => {
+                        let _ = self.cache.put(
+                            &k,
+                            &Entry::Positive {
+                                display_path: conv.display_path,
+                                text,
+                                note: result.note.clone(),
+                            },
+                        );
+                    }
+                    Rendered::OverBudget => over_input_budget += 1,
+                }
+            } else if declined.contains(&id) {
+                let _ = self.cache.put(&k, &Entry::Negative);
+            }
+        }
+        if over_input_budget > 0 {
+            warnings.push(format!(
+                "capture hook: {over_input_budget} converted file(s) were not rendered because the \
+                 capture's input-byte budget was spent; they stay listed as binary"
+            ));
+        }
+        warnings
     }
-    if over_input_budget > 0 {
-        warnings.push(format!(
-            "capture hook: {over_input_budget} converted file(s) were not rendered because the \
-             capture's input-byte budget was spent; they stay listed as binary"
-        ));
-    }
-    warnings
 }

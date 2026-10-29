@@ -3100,7 +3100,7 @@ impl Job {
                 let (git_hook, warnings) =
                     crate::evidence::generated::prefill(&self.cfg, hook, &self.cfg.cwd);
                 capture_warnings.extend(warnings);
-                git_hook
+                Some(git_hook)
             }
             _ => None,
         };
