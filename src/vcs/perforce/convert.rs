@@ -286,7 +286,8 @@ fn capture_hook_setup(cfg: &Config, hook: &CaptureHookConfig) -> Result<(String,
 }
 
 fn restore(seg: &mut Segment, note: String) {
-    seg.omissions.push(note);
+    // Still binary: incomplete, but its file list is whole, so `baseline_whole` stands (#184).
+    seg.opaque.push(note);
     seg.complete = false;
     if seg.incomplete_reason.is_none() {
         seg.incomplete_reason =
