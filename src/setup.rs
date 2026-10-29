@@ -1465,7 +1465,7 @@ mod tests {
             "--level".into(),
             "standard:claude-opus-4-8:medium".into(),
             "--claude-profile".into(),
-            "ruckus".into(),
+            "work".into(),
         ])
         .expect("config")
     }
@@ -1484,7 +1484,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(failure.code, "BAD_REQUEST");
             assert!(failure.summary.contains("profile:default"));
-            assert!(failure.summary.contains("profile:ruckus"));
+            assert!(failure.summary.contains("profile:work"));
             assert!(
                 !base.exists(),
                 "a rejected target must not create setup state"
@@ -1502,7 +1502,7 @@ mod tests {
         let selected = configured_setup_spec(
             &cfg,
             ReviewerKind::Claude,
-            &ProfileSelector::Named("ruckus".into()),
+            &ProfileSelector::Named("work".into()),
             &base,
         )
         .unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
     fn setup_matches_explicit_homes_but_rejects_other_homes_and_families() {
         let base = temp_dir();
         let mut cfg = claude_profile_config();
-        let named = ProfileSelector::Named("ruckus".into());
+        let named = ProfileSelector::Named("work".into());
         let home = crate::profile::resolve_home(&named, ReviewerKind::Claude, Some(&base))
             .unwrap()
             .unwrap();
@@ -1551,7 +1551,7 @@ mod tests {
         let home = temp_dir();
         let cfg = claude_profile_config();
         let adapter = crate::reviewer::for_kind(ReviewerKind::Claude);
-        let selector = ProfileSelector::Named("ruckus".into());
+        let selector = ProfileSelector::Named("work".into());
         for (account_file, expected) in [
             (None, "Unavailable"),
             (Some("invalid json"), "Unavailable"),
