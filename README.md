@@ -235,8 +235,11 @@ confinement as the working root's. Its change is its current branch against its 
 approval gate covers it too: an approve converges only if the complete change of the working root
 **and of every declared companion** was served, and the converged hook fires only if each one's
 committed change still matches. A companion must be a git top level reached without junctions or
-symlinks, separate from the working root and other companions, and disjoint from the state and temp
-directories; anything else is refused at startup. The calling agent can only name a configured
+symlinks, separate from other companions, and disjoint from the state and temp directories. It is
+normally a sibling of the working root; it may also sit **inside** it — a vendored engine kept as its
+own repository, say — but only while the working root's `.gitignore` ignores it, so its files never
+reach the working root's diff as well. That is checked at startup and again every turn. Anything
+else is refused. The calling agent can only name a configured
 companion, never a path, and the session is bound to the set it declared. Companions are git only
 and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
 Design: [`docs/companion-repositories-plan.md`](docs/companion-repositories-plan.md).

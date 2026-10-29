@@ -9,6 +9,13 @@
 //! directories, `Config::tmp_dir()`, the session and usage files), so a companion disjoint from both
 //! bases cannot contain any of them, and the per-directory "outside the working root" checks need no
 //! companion awareness. See `docs/companion-repositories-plan.md`.
+//!
+//! A companion is normally a sibling of the working root. It may also sit **inside** it (issue
+//! #170: a vendored engine kept as its own repository and listed in the primary's `.gitignore`), but
+//! only while the primary ignores it. An ignored directory contributes nothing to the primary's diff,
+//! untracked files included, so no file is ever certified by two servers. That is checked at startup
+//! and again every turn, so removing the ignore rule later refuses the companion rather than letting
+//! its files reach both diffs.
 
 use std::path::{Path, PathBuf};
 
@@ -108,10 +115,56 @@ fn check_root(name: &str, root: &Path, state_dir: &Path, temp_dir: &Path) -> Res
     require_disjoint(name, root, temp_dir, "temp directory")
 }
 
+/// How a companion relates to the working root. Anything but `Nested` or `Separate` is refused.
+fn check_against_root(name: &str, root: &Path, cwd: &Path) -> Result<(), String> {
+    if crate::reviewer::is_within(cwd, root) {
+        return Err(format!(
+            "companion '{name}' ({}) is or contains the working root ({}); a companion must be a \
+             separate repository",
+            root.display(),
+            cwd.display()
+        ));
+    }
+    if !crate::reviewer::is_within(root, cwd) {
+        return Ok(());
+    }
+    // Nested (issue #170): allowed only while the primary ignores it, so its files can never also
+    // appear in the primary's diff.
+    let rel = root
+        .strip_prefix(cwd)
+        .ok()
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "companion '{name}' ({}) is inside the working root ({}) but its path relative to \
+                 it cannot be determined",
+                root.display(),
+                cwd.display()
+            )
+        })?;
+    match crate::evidence::ignores_untracked(cwd, &rel, &crate::evidence::Limits::default()) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "companion '{name}' ({}) is inside the working root ({}) but the working root does not \
+             ignore it; add `{rel}/` to its .gitignore, or move the companion outside it",
+            root.display(),
+            cwd.display()
+        )),
+        Err(e) => Err(format!(
+            "companion '{name}' ({}) is inside the working root, and whether the working root \
+             ignores it could not be checked: {}",
+            root.display(),
+            e.message
+        )),
+    }
+}
+
 /// Resolve every configured companion at startup. A relative path joins `cwd`. Refuses a Perforce
 /// working root, duplicate names, a path that does not resolve, a reparse point anywhere along it,
-/// a directory that is not a git toplevel, and any overlap with the working root, another
-/// companion, the state directory or `temp_dir`.
+/// a directory that is not a git toplevel, one that is or contains the working root, one inside it
+/// that the working root does not ignore (issue #170), and any overlap with another companion, the
+/// state directory or `temp_dir`.
 pub fn resolve_all(
     raw: &[(String, String)],
     cwd: &Path,
@@ -150,14 +203,7 @@ pub fn resolve_all(
         })?;
         let root = crate::config::normalize_dir(resolved);
         check_root(name, &root, state_dir, temp_dir).map_err(|e| format!("--{e}"))?;
-        if overlaps(&root, cwd) {
-            return Err(format!(
-                "--companion '{name}' ({}) overlaps the working root ({}); a companion must be a \
-                 separate repository",
-                root.display(),
-                cwd.display()
-            ));
-        }
+        check_against_root(name, &root, cwd).map_err(|e| format!("--{e}"))?;
         if let Some(other) = out.iter().find(|c| overlaps(&root, &c.root)) {
             return Err(format!(
                 "--companion '{name}' ({}) overlaps companion '{}' ({})",
@@ -175,8 +221,15 @@ pub fn resolve_all(
 }
 
 /// Re-check, just before a turn uses it, that a companion still resolves to its configured root
-/// and still passes every startup check against this turn's temp directory. Cheap, not a lock.
-pub fn recheck(c: &Companion, state_dir: &Path, temp_dir: &Path) -> Result<(), String> {
+/// and still passes every startup check against this turn's temp directory, including, for one
+/// nested in the server's working root `server_root`, that the working root still ignores it. Cheap,
+/// not a lock.
+pub fn recheck(
+    c: &Companion,
+    server_root: &Path,
+    state_dir: &Path,
+    temp_dir: &Path,
+) -> Result<(), String> {
     let again = std::fs::canonicalize(&c.root)
         .map(crate::config::normalize_dir)
         .map_err(|e| format!("companion '{}' ({}): {e}", c.name, c.root.display()))?;
@@ -188,7 +241,8 @@ pub fn recheck(c: &Companion, state_dir: &Path, temp_dir: &Path) -> Result<(), S
             again.display()
         ));
     }
-    check_root(&c.name, &c.root, state_dir, temp_dir)
+    check_root(&c.name, &c.root, state_dir, temp_dir)?;
+    check_against_root(&c.name, &c.root, server_root)
 }
 
 #[cfg(test)]
@@ -335,7 +389,7 @@ pub(crate) mod tests {
         let rel = vec![("assets".to_string(), r"..\assets".to_string())];
         let rel = resolve_all(&rel, &l.primary, Vcs::Git, &l.state, &l.temp).unwrap();
         assert_eq!(rel[0].root, l.assets);
-        recheck(&rel[0], &l.state, &l.temp).unwrap();
+        recheck(&rel[0], &l.primary, &l.state, &l.temp).unwrap();
     }
 
     #[test]
@@ -478,6 +532,67 @@ pub(crate) mod tests {
         .contains("state directory"));
     }
 
+    /// Issue #170: a companion nested in the working root is accepted only while the working root
+    /// ignores it, directly or through an ignored parent, and the per-turn recheck refuses it once
+    /// the ignore rule is gone. A plain (non-repository) subdirectory is refused either way.
+    #[test]
+    fn a_nested_companion_is_accepted_only_while_the_working_root_ignores_it() {
+        let l = layout("companion-nested");
+        let engine = l.primary.join("engine");
+        init_repo(&engine);
+        let resolve = |name: &str, path: &Path| {
+            resolve_all(&one(name, path), &l.primary, Vcs::Git, &l.state, &l.temp)
+        };
+
+        // Not ignored: refused, saying how to fix it.
+        let err = resolve("engine", &engine).unwrap_err();
+        assert!(
+            err.contains("does not ignore it") && err.contains("engine/"),
+            "{err}"
+        );
+
+        // Ignored directly: accepted, and the recheck passes.
+        std::fs::write(l.primary.join(".gitignore"), "engine/\n").unwrap();
+        let c = resolve("engine", &engine).expect("ignored nested companion");
+        recheck(&c[0], &l.primary, &l.state, &l.temp).expect("still ignored");
+
+        // The ignore rule removed after startup: the recheck refuses it.
+        std::fs::write(l.primary.join(".gitignore"), "").unwrap();
+        let err = recheck(&c[0], &l.primary, &l.state, &l.temp).unwrap_err();
+        assert!(err.contains("does not ignore it"), "{err}");
+
+        // Ignored through an ignored parent directory: accepted.
+        let deep = l.primary.join("vendor").join("sdk");
+        init_repo(&deep);
+        std::fs::write(l.primary.join(".gitignore"), "vendor/\n").unwrap();
+        resolve("sdk", &deep).expect("under an ignored parent");
+
+        // A plain subdirectory, even an ignored one, is not a repository.
+        let plain = l.primary.join("vendor").join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(resolve("plain", &plain)
+            .unwrap_err()
+            .contains("not the top level"));
+    }
+
+    /// A companion that contains the working root is refused, ignored or not (issue #170 keeps the
+    /// other direction closed).
+    #[test]
+    fn a_companion_containing_the_working_root_is_refused() {
+        let l = layout("companion-contains");
+        let inner = l.assets.join("inner-primary");
+        init_repo(&inner);
+        let err = resolve_all(
+            &one("assets", &l.assets),
+            &inner,
+            Vcs::Git,
+            &l.state,
+            &l.temp,
+        )
+        .unwrap_err();
+        assert!(err.contains("contains the working root"), "{err}");
+    }
+
     #[test]
     fn recheck_refuses_a_moved_companion_and_a_temp_dir_that_now_overlaps() {
         let l = layout("companion-recheck");
@@ -493,9 +608,9 @@ pub(crate) mod tests {
         // This turn's temp directory sits inside the companion.
         let temp_now = l.assets.join("t");
         std::fs::create_dir_all(&temp_now).unwrap();
-        assert!(recheck(&c, &l.state, &temp_now).is_err());
+        assert!(recheck(&c, &l.primary, &l.state, &temp_now).is_err());
         // The repository is gone.
         std::fs::remove_dir_all(&l.assets).unwrap();
-        assert!(recheck(&c, &l.state, &l.temp).is_err());
+        assert!(recheck(&c, &l.primary, &l.state, &l.temp).is_err());
     }
 }

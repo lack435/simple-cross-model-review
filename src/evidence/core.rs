@@ -4229,6 +4229,58 @@ mod tests {
         assert_eq!(served, committed);
     }
 
+    /// Issue #170: a separate repository nested in the working root and ignored by it contributes
+    /// nothing to the working root's served diff, even with uncommitted and untracked changes of its
+    /// own, so a nested companion's files are never certified by two servers.
+    #[test]
+    fn an_ignored_nested_repository_never_reaches_the_served_diff() {
+        let Some((dir, base, _head)) = binding_repo("nested-ignored", &[], "\n") else {
+            eprintln!("skipping: git unavailable");
+            return;
+        };
+        let root = dir.as_path();
+        let engine = root.join("engine");
+        fs::create_dir_all(&engine).unwrap();
+        git_out(&engine, &[], &["init", "-q"]).expect("nested init");
+        fs::write(engine.join("tracked.c"), "int v = 1;\n").unwrap();
+        git_out(&engine, &[], &["add", "-A"]).unwrap();
+        git_out(&engine, &[], &["commit", "-q", "-m", "engine"]).unwrap();
+        fs::write(engine.join("tracked.c"), "int v = 2;\n").unwrap();
+        fs::write(engine.join("untracked.c"), "int w;\n").unwrap();
+
+        let compose = || {
+            compose_resolved(
+                root,
+                base.clone(),
+                SOURCE.to_string(),
+                &DiffEndpoint::Worktree,
+                "",
+                Staging {
+                    autocrlf: None,
+                    lfs: false,
+                },
+                &Limits::default(),
+                &AtomicBool::new(false),
+                Instant::now(),
+            )
+            .expect("served composition")
+            .text
+        };
+        fs::write(root.join(".gitignore"), "engine/\n").unwrap();
+        let served = compose();
+        // The `.gitignore` itself is a legitimate untracked file of the primary; nothing *inside*
+        // the nested repository may appear.
+        for inside in ["engine/tracked.c", "engine/untracked.c", "int v", "int w"] {
+            assert!(!served.contains(inside), "{inside} leaked: {served}");
+        }
+        assert!(
+            crate::evidence::ignores_untracked(root, "engine", &Limits::default()).unwrap(),
+            "the check the companion relies on agrees"
+        );
+        fs::write(root.join(".gitignore"), "").unwrap();
+        assert!(!crate::evidence::ignores_untracked(root, "engine", &Limits::default()).unwrap());
+    }
+
     /// The #135 shape: LF blobs checked out as CRLF. With the checkout's `core.autocrlf` re-applied
     /// (as the evidence bundle does) the two compositions agree; without it the worktree diff is a
     /// whole-file rewrite and they differ — a false *skip*, never a false fire.

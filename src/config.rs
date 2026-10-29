@@ -2529,8 +2529,9 @@ COMPANION REPOSITORIES (issue #167; off unless --companion is given):
                               <name> is 1-16 of a-z, 0-9 and '-', starting with a letter;
                               a relative <path> is under the working root. The path must
                               be a git toplevel reached without junctions or symlinks,
-                              separate from the working root and other companions, and
-                              disjoint from the state and temp directories. Git only;
+                              separate from other companions, and disjoint from the
+                              state and temp directories. It may be inside the working
+                              root only if the working root git-ignores it. Git only;
                               not with --allow-reviewer-config.
 
 LIFECYCLE EVENT HOOK (issue #152; off unless --on-event is given):
