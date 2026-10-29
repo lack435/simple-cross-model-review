@@ -175,8 +175,10 @@ impl CaptureSummary {
                 };
                 let mut verdict = verdict(*complete, reason);
                 // Listed binary files are not a shortfall, but the note says the capture names
-                // files it did not show, so "complete" is not read as "every file's content".
-                if *binary_listed {
+                // files it did not show, so "complete" is not read as "every file's content". A
+                // partial verdict needs no such qualifier: its warnings already send the caller to
+                // the per-file reasons.
+                if *complete && *binary_listed {
                     verdict.push_str(" (binary files listed, not shown)");
                 }
                 format!(
@@ -491,14 +493,14 @@ mod tests {
         );
         assert!(one.is_complete());
         assert_eq!(one.tag(), "p4:43650");
-        // A real shortfall beside them still reads partial, and still names them.
+        // A real shortfall beside them still reads partial, with no qualifier: the warnings
+        // already send the caller to the per-file reasons.
         let partial = with_binaries(perforce(vec![43650, 43651], 0, 1, 9, false, false));
         let out = partial.summary();
         assert!(out.contains("at least 9 evidence units"), "{out}");
         assert!(
             out.ends_with(
-                "partial (1 of 2 changelist(s) incomplete or skipped; see warnings below) \
-                 (binary files listed, not shown)"
+                "partial (1 of 2 changelist(s) incomplete or skipped; see warnings below)"
             ),
             "{out}"
         );

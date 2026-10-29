@@ -287,7 +287,10 @@ fn capture_hook_setup(cfg: &Config, hook: &CaptureHookConfig) -> Result<(String,
 
 fn restore(seg: &mut Segment, note: String) {
     // Still binary: incomplete, but its file list is whole, so `baseline_whole` stands (#184).
+    // Unlike a plain binary file, though, the converter could have shown it and did not, so the
+    // caller is still told the changelist is incomplete (#189). A decline never comes here.
     seg.opaque.push(note);
+    seg.opaque_unconfirmed = true;
     seg.complete = false;
     if seg.incomplete_reason.is_none() {
         seg.incomplete_reason =

@@ -191,7 +191,7 @@ pub enum CaptureSummary {
         /// warning. A changelist short only of known binary files is not counted (issue #189).
         incomplete_changelists: usize,
         /// Some changelist named known binary files it did not show (issue #189). Not a gap;
-        /// rendered as "(binary files listed, not shown)" after the verdict.
+        /// rendered as "(binary files listed, not shown)" after a complete verdict.
         binary_listed: bool,
         evidence_units: usize,
         /// The combined diff hit the byte budget. Drives the `diff:` token; segment-level short or
@@ -253,17 +253,20 @@ and does not.
 where `incomplete_changelists` counts captured segments that are missing evidence which could hide
 content (`src/vcs/perforce.rs` `shortfall` — an unreadable added file, an out-of-root file, a lossy
 or truncated `p4 describe`; the Perforce path already folds its stream-incompleteness into the
-per-segment flags). *(Update, issue #189.)* A segment short only of **known binary** files — typed
-non-text by `p4 opened`, or found to contain NUL bytes — is not counted: each such file is named in
-the prompt and none could ever be shown as text, so it matches the Git rule above that a binary
-file is an exclusion, not a gap. The summary says so with `(binary files listed, not shown)`. A
-file with no hunk whose type is *not* confirmed (a submitted or shelved add or delete, whose
-content `describe` is never asked for, or an opened file with no type) still counts, because it
-could be text. Resume draws the looser `#184` line (`baseline_whole`) on purpose: there the
-question is whether the file list is whole, not whether every file's text was shown. This is deliberately *narrower* than the
-existing `capture_complete` local, which also requires `identity.client_spec_digest.is_some()`:
-that extra condition governs whether the capture may seed a resume *baseline*, a different question
-from whether the evidence shown this turn was whole.
+per-segment flags). This is deliberately *narrower* than the existing `capture_complete` local,
+which also requires `identity.client_spec_digest.is_some()`: that extra condition governs whether
+the capture may seed a resume *baseline*, a different question from whether the evidence shown this
+turn was whole.
+
+*(Update, issue #189.)* A segment short only of **known binary** files — typed non-text by
+`p4 opened`, or found to contain NUL bytes — is not counted: each such file is named in the prompt
+and none could ever be shown as text, so it matches the Git rule above that a binary file is an
+exclusion, not a gap. A complete summary says so with `(binary files listed, not shown)`. A file
+with no hunk whose type is *not* confirmed (a submitted or shelved add or delete, whose content
+`describe` is never asked for, or an opened file with no type) still counts, because it could be
+text, and so does a file the capture hook was asked to convert and could not. Resume draws the
+looser `#184` line (`baseline_whole`) on purpose: there the question is whether the file list is
+whole, not whether every file's text was shown.
 
 **Set relationship** *(r2, corrected):* `complete` is the **stricter** condition — `complete`
 implies the diff and every other stream was whole, but a whole diff does **not** imply `complete`.
