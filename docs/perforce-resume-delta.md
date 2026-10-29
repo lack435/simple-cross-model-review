@@ -16,14 +16,15 @@ un-persistable turn records `Disabled` and re-captures in full rather than risk 
 collapse. Two deliberate **conservatisms** remain (both only ever *disable* elision, never elide
 wrongly) as candidate follow-ups:
 
-- **`Full` is gated on whole-segment completeness.** A changelist records a `Full` baseline
-  only when every segment is `complete` — no per-file omission at all. So a changelist that
-  contains an out-of-root, binary, or omitted file — including a deleted file whose content could
-  not be shown (a per-file omission) — records `Disabled` and
-  will not elide next turn, even though its *other* files are perfectly elidable. The design's
-  finer "complete inventory vs complete unit" split (invariant 4) would let those files collapse;
-  the implementation takes the stricter line. This is the main saving left on the table for mixed
-  changelists.
+- **`Full` is gated on whole-segment completeness, binary files aside.** A changelist records a
+  `Full` baseline only when every segment has no per-file omission at all, except files left out
+  only because they have no text to show — binary, of a known non-text type, or content-free, or
+  a submitted/shelved add whose content is not captured (issue #184). Such a file hides nothing a re-capture would show (its note is the same every turn and
+  its bytes never reach the reviewer either way), so it keeps the segment's own `complete` flag
+  false but leaves its file list whole. A changelist with an out-of-root, unreadable, cut, or
+  otherwise omitted file still records `Disabled` and will not elide next turn, even though its
+  *other* files are perfectly elidable. The design's finer "complete inventory vs complete unit"
+  split (invariant 4) would let those files collapse; the implementation takes the stricter line.
 - **The authoritative shelf ledger (`describe -s -S`, invariant 4) is not yet added,** and
   removed/restored transition notes are emitted **only for the pending workspace basis** —
   suppressed for submitted (immutable, so a "removed" file could only be a capture artifact) and
@@ -144,7 +145,8 @@ each transition:
 - key gone this turn → **removed** — asserted **only when both inventories are known
   complete** (see completeness); a truncated listing could otherwise fake a removal.
 - key present but now `no-diff` where it was a diff (an edit restored to depot content, still
-  open) → rendered as *"restored to its depot revision; the diff you saw no longer applies"* —
+  open) → rendered as *"has no diff this turn: restored to its depot revision, or listed under
+  Not shown (for example, now binary); the diff you saw no longer applies"* —
   never silently dropped, never elided.
 - kind/action/type change → shown in full.
 - **matched (elided) unit** → the collapsed line is *not* hashed; instead the prior full
@@ -309,8 +311,9 @@ An explicit three-state value on the session, written explicitly every turn (nev
 `SessionStore`'s "retain old `Option` if new is `None`" behaviour, `src/session.rs:169`,
 `:173`):
 
-- `Full(inventory)` — the previous persisted turn captured every changelist completely and
-  suppressed no metadata/notes; only this state permits elision.
+- `Full(inventory)` — the previous persisted turn captured every changelist completely, apart
+  from binary files (issue #184), and suppressed no metadata/notes; only this state permits
+  elision.
 - `Disabled` — the previous persisted turn was incomplete in any way invariant 4 lists, or
   exceeded the entry/byte caps; the next turn full-captures.
 - absent — first turn, a git session, a cross-backend/poisoned record, or a record predating

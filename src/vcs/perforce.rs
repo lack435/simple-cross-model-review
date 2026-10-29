@@ -269,12 +269,12 @@ pub fn capture(
 
     // This turn's baseline for the *next* resume. Conservatively `Full` only when the whole
     // capture is trustworthy: the client spec was confirmed, no changelist was skipped, and
-    // every segment is complete (so its file list is whole and every unit was fully shown). Any
-    // shortfall records `Disabled`, so the next turn re-captures in full rather than eliding
-    // against a set that might be missing files or hunks.
+    // every segment is whole apart from binary files (so its file list is whole and every unit
+    // was fully shown). Any other shortfall records `Disabled`, so the next turn re-captures in
+    // full rather than eliding against a set that might be missing files or hunks.
     let capture_complete = identity.client_spec_digest.is_some()
         && skipped.is_empty()
-        && segments.iter().all(|s| s.complete);
+        && segments.iter().all(|s| s.baseline_whole);
     // `inventory` returns `None` if any complete unit could not be fingerprinted (fail-closed).
     let full = capture_complete
         .then(|| inventory(&segments))
@@ -474,8 +474,19 @@ struct Segment {
     /// Whether this changelist's diff was cut short by the combined-diff budget, so the
     /// render says so where the diff is shown, not only in the caller's warnings.
     diff_truncated: bool,
-    /// Per-file omission notes (out-of-root, binary, unreadable, unmapped, ...).
+    /// Per-file omission notes (out-of-root, unreadable, unmapped, ...).
     omissions: Vec<String>,
+    /// Notes for files left out only because they have no text to show: binary, of a known
+    /// non-text type, or content-free -- or a submitted/shelved add, whose content `describe`
+    /// is never asked for (no `-a`) (issue #184). Rendered with `omissions` and they make the
+    /// segment incomplete, but they are kept apart because such a file hides nothing a
+    /// re-capture would show -- its note is the same every turn and its bytes never reach the
+    /// reviewer either way -- so it does not stop the segment seeding a resume baseline.
+    opaque: Vec<String>,
+    /// Whether this segment may seed a `Full` resume baseline and carry transition notes:
+    /// complete apart from `opaque` files, so its file list is whole and every unit was fully
+    /// shown. Unaffected by `convert::run`, which only adds complete units or `opaque` notes.
+    baseline_whole: bool,
     /// Cross-turn transition notes produced by the resume delta: files that left the changelist
     /// ("removed") or are still present but no longer have a diff ("restored to depot"). Empty
     /// on a full capture.
@@ -688,7 +699,7 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
             unit.collapsed = matched;
         }
 
-        if !seg.complete {
+        if !seg.baseline_whole {
             continue;
         }
         // Removed/restored transitions are only meaningful for a **pending** changelist, whose
@@ -718,8 +729,9 @@ fn apply_elision(segments: &mut [Segment], prior: &[baseline::InventoryEntry]) {
             }
             if seg.present_depots.iter().any(|d| d == &entry.depot) {
                 seg.transitions.push(format!(
-                    "`{}` -- restored to its depot revision; the diff you saw last turn no longer \
-                     applies.",
+                    "`{}` -- has no diff this turn: it was restored to its depot revision, or it \
+                     is listed under \"Not shown\" below (for example, it is now binary). The diff \
+                     you saw last turn no longer applies.",
                     safe_label(&entry.depot)
                 ));
             } else {
@@ -858,6 +870,8 @@ impl<'a> P4<'a> {
                 present_depots: Vec::new(),
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, false, false),
+                opaque: Vec::new(),
+                baseline_whole: false,
                 transitions: Vec::new(),
                 deferred: Vec::new(),
                 generated_note: None,
@@ -894,6 +908,7 @@ impl<'a> P4<'a> {
         let mut units = Vec::new();
         let mut present_depots = Vec::new();
         let mut omissions = Vec::new();
+        let mut opaque = Vec::new();
         let mut complete = true;
         let mut diff_truncated = false;
         let mut deferred = Vec::new();
@@ -972,7 +987,7 @@ impl<'a> P4<'a> {
                     // hook's globs match it, deferred to the hook (issue #174), which gives the
                     // same note back if it does not convert the file.
                     let note = format!(
-                        "`{}` ({}) has no textual diff in the changelist (binary or content-free).",
+                        "`{}` ({}) has no textual diff in the changelist: it is binary or                          content-free, or it is an add, whose content is not captured.",
                         safe_label(&file.depot),
                         file.action
                     );
@@ -986,10 +1001,7 @@ impl<'a> P4<'a> {
                                 rev: file.rev.clone(),
                                 moved_file: None,
                             }),
-                        _ => {
-                            complete = false;
-                            omissions.push(note);
-                        }
+                        _ => opaque.push(note),
                     }
                 }
             }
@@ -1026,8 +1038,10 @@ impl<'a> P4<'a> {
         // lossy/truncated metadata list) AND every unit it produced is itself complete (not
         // budget-cut, not over-cap, not lossy, and with a valid comparator). Any shortfall records
         // `Disabled`, so an incomplete capture never seeds a `Full` inventory or a transition note
-        // against an unreliable file list.
-        let complete = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        // against an unreliable file list. Binary files (`opaque`) are the one exception: they
+        // make the segment incomplete but leave its file list whole (issue #184).
+        let baseline_whole = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        let complete = baseline_whole && opaque.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some affected files are out of the working root, binary, or otherwise not shown"
                 .to_string()
@@ -1044,6 +1058,8 @@ impl<'a> P4<'a> {
             present_depots,
             diff_truncated,
             omissions,
+            opaque,
+            baseline_whole,
             transitions: Vec::new(),
             deferred,
             generated_note: None,
@@ -1101,6 +1117,8 @@ impl<'a> P4<'a> {
                 present_depots: meta.files.iter().map(|f| f.depot.clone()).collect(),
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, false, false),
+                opaque: Vec::new(),
+                baseline_whole: false,
                 transitions: Vec::new(),
                 deferred: Vec::new(),
                 generated_note: None,
@@ -1149,6 +1167,8 @@ impl<'a> P4<'a> {
                 present_depots: meta.files.iter().map(|f| f.depot.clone()).collect(),
                 diff_truncated: false,
                 omissions: truncation_notes(meta.truncated, opened_truncated, false),
+                opaque: Vec::new(),
+                baseline_whole: false,
                 transitions: Vec::new(),
                 deferred: Vec::new(),
                 generated_note: None,
@@ -1161,6 +1181,7 @@ impl<'a> P4<'a> {
 
         let mut listing = String::new();
         let mut omissions = Vec::new();
+        let mut opaque = Vec::new();
         let mut units = Vec::new();
         let mut present_depots = Vec::new();
         let mut edit_targets: Vec<String> = Vec::new();
@@ -1218,6 +1239,17 @@ impl<'a> P4<'a> {
                 ));
                 continue;
             }
+            // A missing or unrecognised type tag is not evidence that the file is binary, so it
+            // is a plain omission and not `opaque` (issue #184 review).
+            if !is_text_base_type(&file.ptype) && !is_non_text_base_type(&file.ptype) {
+                complete = false;
+                omissions.push(format!(
+                    "`{}` has file type `{}`, which is not recognised, so it was not shown.",
+                    safe_label(&file.depot),
+                    safe_label(&file.ptype)
+                ));
+                continue;
+            }
             let local = local.expect("in_root implies a mapped local path");
             path_by_depot.insert(file.depot.clone(), local.clone());
             local_by_depot.insert(file.depot.clone(), local_label);
@@ -1234,7 +1266,7 @@ impl<'a> P4<'a> {
                          text diff for it.",
                         safe_label(&file.depot)
                     );
-                    self.defer_or_omit(&mut deferred, &mut omissions, file, &local, note);
+                    self.defer_or_omit(&mut deferred, &mut opaque, file, &local, note);
                 }
                 ActionKind::Edit => edit_targets.push(file.depot.clone()),
                 ActionKind::Add => adds.push((file.depot.clone(), local)),
@@ -1248,9 +1280,7 @@ impl<'a> P4<'a> {
                          content is not shown.",
                         safe_label(&file.depot)
                     );
-                    if !self.defer_or_omit(&mut deferred, &mut omissions, file, &local, note) {
-                        complete = false;
-                    }
+                    self.defer_or_omit(&mut deferred, &mut opaque, file, &local, note);
                 }
                 ActionKind::Delete => delete_targets.push(file.depot.clone()),
                 ActionKind::Other => {
@@ -1447,10 +1477,10 @@ impl<'a> P4<'a> {
                     .zip(path_by_depot.get(depot.as_str()));
                 match deferrable {
                     Some((file, path)) => {
-                        if !self.defer_or_omit(&mut deferred, &mut omissions, file, path, note) {
-                            complete = false;
-                        }
+                        self.defer_or_omit(&mut deferred, &mut opaque, file, path, note);
                     }
+                    // No opened record for a file we just printed is an anomaly, not just a
+                    // binary file, so it stays a full omission.
                     None => {
                         complete = false;
                         omissions.push(note);
@@ -1493,6 +1523,8 @@ impl<'a> P4<'a> {
         // the shared budgets. Each becomes an `AddBody` unit whose comparator is the
         // no-depot-base sentinel.
         let mut cl_omissions = Omissions::new("added-file content", "opened-for-add file");
+        // Binary adds are capped the same way but kept apart, as `opaque` (issue #184).
+        let mut binary_adds = Omissions::new("added-file content", "opened-for-add file");
         for (depot, local) in adds {
             if budget.files_examined >= MAX_UNTRACKED_EXAMINED
                 || budget.files_included >= MAX_UNTRACKED_FILES
@@ -1518,7 +1550,7 @@ impl<'a> P4<'a> {
                     Some(file) if self.defers(&root_relative(&local, self.cwd)) => {
                         deferred.push(convert::Deferred::of_opened(file, &local, note))
                     }
-                    _ => cl_omissions.push(note),
+                    _ => binary_adds.push(note),
                 }
                 continue;
             }
@@ -1542,7 +1574,7 @@ impl<'a> P4<'a> {
                     Some(file) if self.defers(&root_relative(&local, self.cwd)) => {
                         deferred.push(convert::Deferred::of_opened(file, &local, note))
                     }
-                    _ => cl_omissions.push(note),
+                    _ => binary_adds.push(note),
                 }
                 continue;
             }
@@ -1562,6 +1594,8 @@ impl<'a> P4<'a> {
         }
         let report = cl_omissions.finish();
         omissions.extend(report.notes);
+        // Only `push` is used on it, so it has no capture-level notes, only per-file ones.
+        opaque.extend(binary_adds.finish().notes);
         if !report.capture_level.is_empty() {
             complete = false;
         }
@@ -1571,8 +1605,10 @@ impl<'a> P4<'a> {
         // lossy/truncated metadata list) AND every unit it produced is itself complete (not
         // budget-cut, not over-cap, not lossy, and with a valid comparator). Any shortfall records
         // `Disabled`, so an incomplete capture never seeds a `Full` inventory or a transition note
-        // against an unreliable file list.
-        let complete = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        // against an unreliable file list. Binary files (`opaque`) are the one exception: they
+        // make the segment incomplete but leave its file list whole (issue #184).
+        let baseline_whole = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        let complete = baseline_whole && opaque.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some opened files are out of the working root, binary, unread, or of an action not \
              diffed here"
@@ -1590,6 +1626,8 @@ impl<'a> P4<'a> {
             present_depots,
             diff_truncated,
             omissions,
+            opaque,
+            baseline_whole,
             transitions: Vec::new(),
             deferred,
             generated_note: None,
@@ -1644,6 +1682,7 @@ impl<'a> P4<'a> {
         let mut units = Vec::new();
         let mut present_depots = Vec::new();
         let mut omissions = Vec::new();
+        let mut opaque = Vec::new();
         let mut complete = true;
         let mut deferred: Vec<convert::Deferred> = Vec::new();
         let mut diff_truncated = false;
@@ -1692,7 +1731,7 @@ impl<'a> P4<'a> {
                 // hunk. Labelled, never dropped silently -- or deferred to the capture hook when
                 // its globs match (issue #174).
                 let note = format!(
-                    "`{}` has no textual diff in the shelf (binary or content-free).",
+                    "`{}` has no textual diff in the shelf: it is binary or content-free, or it                      is an add, whose content is not captured.",
                     safe_label(&section.depot)
                 );
                 match local {
@@ -1707,10 +1746,7 @@ impl<'a> P4<'a> {
                             moved_file: None,
                         })
                     }
-                    _ => {
-                        complete = false;
-                        omissions.push(note);
-                    }
+                    _ => opaque.push(note),
                 }
                 continue;
             }
@@ -1748,8 +1784,10 @@ impl<'a> P4<'a> {
         // lossy/truncated metadata list) AND every unit it produced is itself complete (not
         // budget-cut, not over-cap, not lossy, and with a valid comparator). Any shortfall records
         // `Disabled`, so an incomplete capture never seeds a `Full` inventory or a transition note
-        // against an unreliable file list.
-        let complete = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        // against an unreliable file list. Binary files (`opaque`) are the one exception: they
+        // make the segment incomplete but leave its file list whole (issue #184).
+        let baseline_whole = complete && omissions.is_empty() && units.iter().all(|u| u.complete);
+        let complete = baseline_whole && opaque.is_empty();
         let incomplete_reason = (!complete).then(|| {
             "some shelved files are out of the working root, binary, or otherwise not shown"
                 .to_string()
@@ -1766,6 +1804,8 @@ impl<'a> P4<'a> {
             present_depots,
             diff_truncated,
             omissions,
+            opaque,
+            baseline_whole,
             transitions: Vec::new(),
             deferred,
             generated_note: None,
@@ -2014,9 +2054,9 @@ fn render(
             out.push('\n');
         }
 
-        if !seg.omissions.is_empty() {
+        if !seg.omissions.is_empty() || !seg.opaque.is_empty() {
             out.push_str("#### Not shown for this changelist\n\n");
-            for note in &seg.omissions {
+            for note in seg.omissions.iter().chain(&seg.opaque) {
                 out.push_str(&format!("- {note}\n"));
             }
             out.push_str(
@@ -2113,23 +2153,19 @@ impl<'a> P4<'a> {
     }
 
     /// Defer a pending binary file to the capture hook when its globs match, else record `note`
-    /// as an omission exactly as before. Returns whether it was deferred; the caller marks the
-    /// changelist incomplete only when it was not (a deferred file's completeness is settled by
-    /// `convert::run`).
+    /// as an `opaque` omission (a deferred file's completeness is settled by `convert::run`).
     fn defer_or_omit(
         &self,
         deferred: &mut Vec<convert::Deferred>,
-        omissions: &mut Vec<String>,
+        opaque: &mut Vec<String>,
         file: &OpenedFile,
         local: &Path,
         note: String,
-    ) -> bool {
+    ) {
         if self.defers(&root_relative(local, self.cwd)) {
             deferred.push(convert::Deferred::of_opened(file, local, note));
-            true
         } else {
-            omissions.push(note);
-            false
+            opaque.push(note);
         }
     }
 
@@ -2855,6 +2891,29 @@ fn is_text_base_type(ptype: &str) -> bool {
     )
 }
 
+/// Whether a Perforce file type's base is a known type with no text to show. Its omission note is
+/// the same every turn, so it does not stop the resume baseline (`opaque`, issue #184). A type
+/// that is neither this nor text is unrecognised, and is a plain omission.
+fn is_non_text_base_type(ptype: &str) -> bool {
+    let base = ptype.split('+').next().unwrap_or(ptype).trim();
+    matches!(
+        base,
+        "binary"
+            | "ubinary"
+            | "xbinary"
+            | "uxbinary"
+            | "tempobj"
+            | "ctempobj"
+            | "xtempobj"
+            | "resource"
+            | "uresource"
+            | "apple"
+            | "symlink"
+            | "utf16"
+            | "xutf16"
+    )
+}
+
 /// Whether a resolved local path is inside the **working root** (`cwd`).
 ///
 /// Confined to `cwd`, not the client root: the reviewer's own reads are scoped to `cwd`, so
@@ -3431,6 +3490,19 @@ Change 5 by u@c on 2026/01/01\n\n\
         ] {
             assert!(!is_text_base_type(t), "{t} should not be diffable text");
         }
+        // Known non-text types are `opaque`; an unknown or empty type is neither, so it stays a
+        // plain omission that disables the resume baseline (issue #184).
+        for t in [
+            "binary", "binary+l", "ubinary", "tempobj", "apple", "utf16", "symlink",
+        ] {
+            assert!(is_non_text_base_type(t), "{t} should be known non-text");
+        }
+        for t in ["text", "utf8", "brandnewtype", ""] {
+            assert!(
+                !is_non_text_base_type(t),
+                "{t} should not be known non-text"
+            );
+        }
     }
 
     #[test]
@@ -3561,6 +3633,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             present_depots: vec!["//d/a".into()],
             diff_truncated: false,
             omissions: Vec::new(),
+            opaque: Vec::new(),
+            baseline_whole: true,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
@@ -3583,6 +3657,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             present_depots: Vec::new(),
             diff_truncated: false,
             omissions: Vec::new(),
+            opaque: Vec::new(),
+            baseline_whole: true,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
@@ -3632,6 +3708,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             present_depots: vec!["//depot/a".into(), "//depot/b".into()],
             diff_truncated: false,
             omissions: Vec::new(),
+            opaque: Vec::new(),
+            baseline_whole: true,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
@@ -3674,6 +3752,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             ],
             diff_truncated: false,
             omissions: Vec::new(),
+            opaque: Vec::new(),
+            baseline_whole: true,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
@@ -3718,6 +3798,79 @@ Change 5 by u@c on 2026/01/01\n\n\
     }
 
     #[test]
+    fn a_binary_file_leaves_transitions_on_but_a_real_gap_turns_them_off() {
+        // Issue #184: a binary file makes the segment incomplete but leaves its file list whole,
+        // so a removed text file is still announced. Any other omission does not.
+        let segment = |omissions: Vec<String>, baseline_whole: bool| Segment {
+            change: 42,
+            basis: DiffBasis::Workspace,
+            complete: false,
+            incomplete_reason: Some("some opened files are binary".into()),
+            description: String::new(),
+            listing: String::new(),
+            units: Vec::new(),
+            present_depots: vec!["//depot/tool.exe".into()],
+            diff_truncated: false,
+            omissions,
+            opaque: vec!["`//depot/tool.exe` is a binary edit".into()],
+            baseline_whole,
+            transitions: Vec::new(),
+            deferred: Vec::new(),
+            generated_note: None,
+        };
+        let gone = Unit::text_diff(
+            "//depot/gone.rs".into(),
+            Some("3".into()),
+            "gone.rs".into(),
+            "was here".into(),
+            true,
+        );
+        let prior = vec![baseline::InventoryEntry {
+            change: 42,
+            basis: baseline::Basis::Workspace,
+            kind: baseline::UnitKind::TextDiff,
+            depot: "//depot/gone.rs".into(),
+            comparator: "3".into(),
+            fingerprint: unit_fingerprint(42, baseline::Basis::Workspace, &gone),
+        }];
+
+        let mut binary_only = segment(Vec::new(), true);
+        apply_elision(std::slice::from_mut(&mut binary_only), &prior);
+        assert!(
+            binary_only
+                .transitions
+                .iter()
+                .any(|t| t.contains("gone.rs") && t.contains("no longer")),
+            "{:?}",
+            binary_only.transitions
+        );
+
+        let mut real_gap = segment(vec!["`//depot/x` maps outside the root".into()], false);
+        apply_elision(std::slice::from_mut(&mut real_gap), &prior);
+        assert!(
+            real_gap.transitions.is_empty(),
+            "{:?}",
+            real_gap.transitions
+        );
+    }
+
+    #[test]
+    fn render_lists_binary_files_with_the_other_omissions() {
+        let mut seg = segment_fixture(DiffBasis::Workspace, false);
+        seg.opaque = vec!["`//depot/tool.exe` is a binary edit".into()];
+        let out = render_fixture(&[seg], &[]);
+        let section = out
+            .split("#### Not shown for this changelist")
+            .nth(1)
+            .expect("a not-shown section");
+        assert!(section.contains("maps outside the working root"), "{out}");
+        assert!(
+            section.contains("`//depot/tool.exe` is a binary edit"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn apply_elision_does_not_collapse_when_the_base_revision_moved() {
         // Same file, same body, but the comparator revision changed -- the diff is against a
         // different base, so it must be re-shown, not collapsed.
@@ -3738,6 +3891,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             present_depots: vec!["//depot/a".into()],
             diff_truncated: false,
             omissions: Vec::new(),
+            opaque: Vec::new(),
+            baseline_whole: true,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
@@ -3797,6 +3952,8 @@ Change 5 by u@c on 2026/01/01\n\n\
             present_depots: vec!["//depot/a".into(), "//depot/b".into()],
             diff_truncated: false,
             omissions: vec!["`//depot/c` maps outside the working root".into()],
+            opaque: Vec::new(),
+            baseline_whole: complete,
             transitions: Vec::new(),
             deferred: Vec::new(),
             generated_note: None,
