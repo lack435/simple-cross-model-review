@@ -1737,9 +1737,9 @@ impl<'a> P4<'a> {
         // fills those in as sections with no hunk, so the loop below lists and notes them like a
         // binary edit rather than dropping them silently. If that list cannot be read, the
         // changelist is marked incomplete instead.
-        let ledger = match self.describe_tagged(cl, true) {
-            Some(Ok(ledger)) => Some(ledger),
-            Some(Err(_)) => None,
+        let (ledger, ledger_error) = match self.describe_tagged(cl, true) {
+            Some(Ok(ledger)) => (Some(ledger), None),
+            Some(Err(reason)) => (None, Some(reason)),
             None => return CaptureOne::Cancelled,
         };
         let ledger_whole = ledger.as_ref().is_some_and(|l| !l.truncated);
@@ -1748,10 +1748,24 @@ impl<'a> P4<'a> {
             .map(|l| fill_from_shelf_ledger(&mut sections, &l.files))
             .unwrap_or_default();
         if sections.is_empty() {
-            return CaptureOne::Skipped(format!(
-                "changelist {cl} has no shelved files to review (nothing is shelved, or the shelf \
-                 is not accessible)"
-            ));
+            // Skipped, which the caller is warned about with this reason: with no section and no
+            // file list there is nothing to list. Only a file list that was read says the shelf
+            // is empty; otherwise the reason says the list could not be read, not that nothing
+            // is shelved.
+            return CaptureOne::Skipped(match ledger_error {
+                Some(reason) => format!(
+                    "changelist {cl}'s shelf could not be listed, so any shelved adds or deletes \
+                     (which have no diff section) are not in the review: {reason}"
+                ),
+                None if !ledger_whole => format!(
+                    "changelist {cl}'s shelf could not be listed in full, so any shelved adds or \
+                     deletes (which have no diff section) are not in the review"
+                ),
+                None => format!(
+                    "changelist {cl} has no shelved files to review (nothing is shelved, or the \
+                     shelf is not accessible)"
+                ),
+            });
         }
 
         let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
