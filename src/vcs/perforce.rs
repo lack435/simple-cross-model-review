@@ -1036,7 +1036,8 @@ impl<'a> P4<'a> {
                     // hook's globs match it, deferred to the hook (issue #174), which gives the
                     // same note back if it does not convert the file.
                     let note = format!(
-                        "`{}` ({}) has no textual diff in the changelist: it is binary or                          content-free, or it is an add, whose content is not captured.",
+                        "`{}` ({}) has no textual diff in the changelist: it is binary or \
+                         content-free, or it is an add, whose content is not captured.",
                         safe_label(&file.depot),
                         file.action
                     );
@@ -1050,9 +1051,11 @@ impl<'a> P4<'a> {
                                 rev: file.rev.clone(),
                                 moved_file: None,
                             }),
+                        // Unconfirmed unless `describe` typed it non-text: with no hunk, a text file
+                        // here is an add or delete whose content was not shown (issue #194).
                         _ => {
                             opaque.push(note);
-                            opaque_unconfirmed = true;
+                            opaque_unconfirmed |= !is_non_text_type(&file.ptype);
                         }
                     }
                 }
@@ -1792,7 +1795,8 @@ impl<'a> P4<'a> {
                 // hunk. Labelled, never dropped silently -- or deferred to the capture hook when
                 // its globs match (issue #174).
                 let note = format!(
-                    "`{}` has no textual diff in the shelf: it is binary or content-free, or it                      is an add, whose content is not captured.",
+                    "`{}` has no textual diff in the shelf: it is binary or content-free, or it \
+                     is an add, whose content is not captured.",
                     safe_label(&section.depot)
                 );
                 match local {
@@ -1807,9 +1811,11 @@ impl<'a> P4<'a> {
                             moved_file: None,
                         })
                     }
+                    // Unconfirmed unless the header typed it non-text (issue #194).
                     _ => {
                         opaque.push(note);
-                        opaque_unconfirmed = true;
+                        opaque_unconfirmed |=
+                            !section.ptype.as_deref().is_some_and(is_non_text_type);
                     }
                 }
                 continue;
@@ -2562,6 +2568,9 @@ struct AffectedFile {
     /// `rev<N>` from `describe -s`: the revision this changelist created (submitted) or the base
     /// revision (pending). Used only by the capture hook (issue #174).
     rev: Option<String>,
+    /// `type<N>` from `describe -s`, empty when absent: what confirms that a file with no hunk
+    /// is binary rather than a text add or delete whose content was not shown (issue #194).
+    ptype: String,
 }
 
 struct DiffSection {
@@ -2572,6 +2581,9 @@ struct DiffSection {
     /// taken against. `None` when the header carried no revision, which makes the unit
     /// non-elidable rather than eliding against an unknown basis.
     rev: Option<String>,
+    /// The file type from the header, when it had one: what confirms that a section with no
+    /// hunk is binary rather than a text file whose content was not shown (issue #194).
+    ptype: Option<String>,
     body: String,
 }
 
@@ -2733,6 +2745,7 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
     let mut depots: BTreeMap<usize, String> = BTreeMap::new();
     let mut actions: BTreeMap<usize, String> = BTreeMap::new();
     let mut revs: BTreeMap<usize, String> = BTreeMap::new();
+    let mut types: BTreeMap<usize, String> = BTreeMap::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -2766,6 +2779,10 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
                 if let Ok(n) = n.parse::<usize>() {
                     revs.insert(n, val.to_string());
                 }
+            } else if let Some(n) = key.strip_prefix("type") {
+                if let Ok(n) = n.parse::<usize>() {
+                    types.insert(n, val.to_string());
+                }
             }
         }
         i += 1;
@@ -2781,6 +2798,7 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
                 .get(&n)
                 .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
                 .cloned(),
+            ptype: types.get(&n).cloned().unwrap_or_default(),
         })
         .collect();
     Some(DescribeMeta {
@@ -2800,30 +2818,32 @@ fn parse_describe_ztag(raw: &str) -> Option<DescribeMeta> {
 fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
     let text = normalize(raw);
     let mut sections = Vec::new();
-    let mut current: Option<(String, Option<String>, String)> = None;
+    let mut current: Option<DiffSection> = None;
     for line in text.lines() {
         if let Some((depot, rev)) = parse_diff_header(line) {
-            if let Some((d, r, b)) = current.take() {
-                sections.push(DiffSection {
-                    depot: d,
-                    rev: r,
-                    body: b,
-                });
-            }
-            current = Some((depot, rev, String::new()));
-        } else if let Some((_, _, body)) = current.as_mut() {
-            body.push_str(line);
-            body.push('\n');
+            sections.extend(current.take());
+            current = Some(DiffSection {
+                depot,
+                rev,
+                ptype: header_type(line),
+                body: String::new(),
+            });
+        } else if let Some(section) = current.as_mut() {
+            section.body.push_str(line);
+            section.body.push('\n');
         }
     }
-    if let Some((d, r, b)) = current.take() {
-        sections.push(DiffSection {
-            depot: d,
-            rev: r,
-            body: b,
-        });
-    }
+    sections.extend(current);
     sections
+}
+
+/// The file type in a `==== ... (type) ====` describe header (issue #194). Taken from the last
+/// ` (`, so a parenthesis in the file name cannot pose as it.
+fn header_type(line: &str) -> Option<String> {
+    let inner = line.strip_prefix("==== ")?.strip_suffix(" ====")?;
+    let (_, tail) = inner.rsplit_once(" (")?;
+    let ptype = tail.strip_suffix(')')?;
+    (!ptype.is_empty()).then(|| ptype.to_string())
 }
 
 /// The result of stripping the leading unified-diff file header from one file's `p4 diff -du`
@@ -2952,7 +2972,13 @@ fn is_known_non_text(depot: &str, opened: &[OpenedFile]) -> bool {
     opened
         .iter()
         .find(|f| f.depot == depot)
-        .is_some_and(|f| !f.ptype.is_empty() && !is_text_base_type(&f.ptype))
+        .is_some_and(|f| is_non_text_type(&f.ptype))
+}
+
+/// Whether a Perforce file type confirms there is no text to show (issue #194). Only a positive
+/// match does: an empty, unrecognised or text type leaves the file unconfirmed.
+fn is_non_text_type(ptype: &str) -> bool {
+    is_non_text_base_type(ptype)
 }
 
 /// Whether a Perforce file type's base (before any `+modifiers`) is a known diffable text type.
@@ -2965,7 +2991,17 @@ fn is_text_base_type(ptype: &str) -> bool {
         base,
         // `ctext`/`cxtext` are compressed-storage text -- the content is still text and diffs
         // cleanly, so they belong here alongside the executable/keyword legacy spellings.
-        "text" | "xtext" | "ktext" | "kxtext" | "ltext" | "ctext" | "cxtext" | "unicode" | "utf8"
+        "text"
+            | "xtext"
+            | "ktext"
+            | "kxtext"
+            | "ltext"
+            | "xltext"
+            | "ctext"
+            | "cxtext"
+            | "unicode"
+            | "xunicode"
+            | "utf8"
     )
 }
 
@@ -3269,7 +3305,7 @@ mod tests {
         // single-line fields and indexed files that follow it.
         let raw = "\u{feff}... change 43650\r\n... client alice_ws\r\n\
 ... desc Add cross-review\r\n\r\nSecond paragraph of the description.\r\n\
-... status pending\r\n... depotFile0 //depot/a\r\n... action0 edit\r\n\
+... status pending\r\n... depotFile0 //depot/a\r\n... action0 edit\r\n... type0 binary+l\r\n\
 ... depotFile1 //depot/b\r\n... action1 add\r\n";
         let meta = parse_describe_ztag(raw).expect("meta");
         assert!(!meta.submitted);
@@ -3279,6 +3315,34 @@ mod tests {
         assert_eq!(meta.files.len(), 2);
         assert_eq!(meta.files[0].depot, "//depot/a");
         assert_eq!(meta.files[1].action, "add");
+        // Issue #194: the type confirms a no-hunk file is binary; a missing one confirms nothing.
+        assert_eq!(meta.files[0].ptype, "binary+l");
+        assert_eq!(meta.files[1].ptype, "");
+        assert!(is_non_text_type(&meta.files[0].ptype));
+        assert!(!is_non_text_type(&meta.files[1].ptype));
+        // Only a known binary-family type confirms: text, legacy text aliases and anything
+        // unrecognised leave the file unconfirmed.
+        for text in [
+            "text",
+            "ktext+x",
+            "xltext",
+            "xunicode",
+            "utf8",
+            "made-up-type",
+        ] {
+            assert!(!is_non_text_type(text), "{text}");
+        }
+        for binary in [
+            "binary",
+            "ubinary",
+            "utf16",
+            "symlink",
+            "apple",
+            "xbinary+S",
+        ] {
+            assert!(is_non_text_type(binary), "{binary}");
+        }
+        assert!(is_text_base_type("xltext") && is_text_base_type("xunicode+k"));
     }
 
     #[test]
@@ -3395,6 +3459,29 @@ Change 5 by u@c on 2026/01/01\n\n\
             ("//depot/a.rs".to_string(), Some("5".to_string()))
         );
         assert_eq!(parse_diff_header("no header here"), None);
+        // Issue #194: the type is the last parenthesised word, whatever the name holds.
+        assert_eq!(
+            header_type("==== //depot/a.rs#5 (text) ===="),
+            Some("text".to_string())
+        );
+        assert_eq!(
+            header_type("==== //depot/a (copy).bin#2 (binary+l) ===="),
+            Some("binary+l".to_string())
+        );
+        assert_eq!(
+            header_type("==== //depot/a.rs#5 - //ws/a.rs (ktext) ===="),
+            Some("ktext".to_string())
+        );
+        assert_eq!(header_type("==== //depot/a.rs#5 ===="), None);
+        assert_eq!(header_type("==== //depot/a.rs#5 () ===="), None);
+        let sections = parse_describe_diff(
+            "==== //depot/b.bin#1 (binary) ====\n\n\n==== //depot/t.txt#1 (text) ====\n\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].ptype.as_deref(), Some("binary"));
+        assert!(sections[0].body.trim().is_empty());
+        assert_eq!(sections[1].ptype.as_deref(), Some("text"));
+        assert!(sections[1].body.contains("+b"));
         // The `@rev` form of the comparator is captured too.
         assert_eq!(split_rev("//depot/a@=99"), Some("=99".to_string()));
         assert_eq!(split_rev("//depot/a"), None);

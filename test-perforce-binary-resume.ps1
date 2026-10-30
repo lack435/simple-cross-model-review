@@ -4,8 +4,9 @@
   A pending changelist with text edits plus a binary edit, add and delete must still record a
   Full resume baseline, so the next turn collapses the unchanged text files instead of falling
   back to a full re-capture. The capture must also be reported complete, naming the binary files,
-  with no "incomplete" warning (#189). Requires p4, p4d and cargo. No model calls or access to an
-  existing depot.
+  with no "incomplete" warning (#189), and the same holds once the changelist is shelved and once
+  it is submitted (#194). Requires p4, p4d and cargo. No model calls or access to an existing
+  depot.
 #>
 [CmdletBinding()]
 param([string]$P4d = 'C:\Program Files\Perforce\DVCS\p4d.exe')
@@ -98,19 +99,37 @@ Description:
     # Two captures of the same changelist through the real capture path: turn 1 records the
     # baseline and turn 2 resumes against it. Before #184 turn 1 recorded Disabled, and the test
     # printed its SKIP line instead of asserting the delta.
-    Push-Location $PSScriptRoot
-    try {
-        $ErrorActionPreference = 'Continue' # cargo's ordinary progress is on stderr
-        $output = (& cargo test live_resume_delta_collapses_unchanged_files -- --nocapture 2>&1 | Out-String)
-        $testExit = $LASTEXITCODE
-        $ErrorActionPreference = 'Stop'
-    } finally { Pop-Location }
-    if ($testExit -ne 0) { throw "Resume test failed:`n$output" }
-    if ($output.Contains('SKIP delta assertion')) { throw "Turn 1 recorded a Disabled baseline:`n$output" }
-    if (-not $output.Contains('resume delta: turn 1 =')) { throw "The resume test did not run:`n$output" }
-    if (-not $output.Contains('binary-only capture:')) { throw "The completeness check did not run:`n$output" }
-    Write-Host 'PASS: binary files leave the resume baseline Full, so unchanged text files collapse on the next turn.'
-    Write-Host 'PASS: a changelist short only of binary files is reported complete, with no incomplete warning.'
+    function Invoke-ResumeTest([string]$Basis) {
+        Push-Location $PSScriptRoot
+        try {
+            $ErrorActionPreference = 'Continue' # cargo's ordinary progress is on stderr
+            $output = (& cargo test live_resume_delta_collapses_unchanged_files -- --nocapture 2>&1 | Out-String)
+            $testExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+        } finally { Pop-Location }
+        if ($testExit -ne 0) { throw "Resume test ($Basis) failed:`n$output" }
+        if ($output.Contains('SKIP delta assertion')) { throw "Turn 1 ($Basis) recorded a Disabled baseline:`n$output" }
+        if (-not $output.Contains('resume delta: turn 1 =')) { throw "The resume test ($Basis) did not run:`n$output" }
+        if (-not $output.Contains('binary-only capture:')) { throw "The completeness check ($Basis) did not run:`n$output" }
+        Write-Host "PASS ($Basis): binary files leave the resume baseline Full, so unchanged text files collapse on the next turn."
+        Write-Host "PASS ($Basis): a changelist short only of binary files is reported complete, with no incomplete warning."
+    }
+    Invoke-ResumeTest 'pending'
+
+    # The same changelist shelved and reverted, so only its shelf is reviewable, then submitted:
+    # those paths learn a file's type from `describe` rather than `opened` (#194).
+    $cl = $env:CROSS_REVIEW_P4_TEST_CL
+    Invoke-TestP4 shelve -c $cl | Out-Null
+    Invoke-TestP4 revert -w -c $cl "//binresume-test/..." | Out-Null
+    $env:CROSS_REVIEW_P4_TEST_SHELVED = '1'
+    Invoke-ResumeTest 'shelved'
+    Remove-Item Env:CROSS_REVIEW_P4_TEST_SHELVED
+    Invoke-TestP4 unshelve -s $cl -c $cl | Out-Null
+    Invoke-TestP4 shelve -d -c $cl | Out-Null
+    $submitted = (Invoke-TestP4 submit -c $cl) -join "`n"
+    if ($submitted -notmatch 'Change (\d+) submitted') { throw "Submit failed: $submitted" }
+    $env:CROSS_REVIEW_P4_TEST_CL = $Matches[1]
+    Invoke-ResumeTest 'submitted'
 } finally {
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
     [Console]::InputEncoding = $savedInputEncoding
