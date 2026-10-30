@@ -2368,9 +2368,10 @@ impl<'a> P4<'a> {
         if out.cancelled {
             return None;
         }
+        let command = describe_label(cl, shelved);
         if !out.success {
             return Some(Err(format!(
-                "`p4 describe -s {cl}` failed: {}",
+                "`{command}` failed: {}",
                 first_line(&out.diagnostics())
             )));
         }
@@ -2382,8 +2383,7 @@ impl<'a> P4<'a> {
                 Some(Ok(meta))
             }
             None => Some(Err(format!(
-                "`p4 describe -s {cl}` returned no usable metadata (restricted or unknown \
-                 changelist)"
+                "`{command}` returned no usable metadata (restricted or unknown changelist)"
             ))),
         }
     }
@@ -2887,6 +2887,15 @@ fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
     }
     sections.extend(current);
     sections
+}
+
+/// The `describe -s` command [`P4::describe_tagged`] ran, as its errors name it.
+fn describe_label(cl: u64, shelved: bool) -> String {
+    if shelved {
+        format!("p4 describe -s -S {cl}")
+    } else {
+        format!("p4 describe -s {cl}")
+    }
 }
 
 /// Add a hunk-less section for every shelved file in `ledger` that `describe -S -du` gave no
@@ -3461,6 +3470,9 @@ mod tests {
         assert_eq!(sections[3].rev.as_deref(), Some("1"));
         assert_eq!(actions.get("//depot/new.txt"), Some(&"add"));
         assert_eq!(actions.get("//depot/old.txt"), Some(&"move/delete"));
+        // A ledger error names the command that actually ran.
+        assert_eq!(describe_label(7, true), "p4 describe -s -S 7");
+        assert_eq!(describe_label(7, false), "p4 describe -s 7");
     }
 
     #[test]
