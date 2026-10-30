@@ -1731,12 +1731,41 @@ impl<'a> P4<'a> {
             }
         };
 
-        let sections = parse_describe_diff(&raw);
+        let mut sections = parse_describe_diff(&raw);
+        // `describe -S -du` has a section only for a shelved file with something to diff (an edit
+        // or a move/add): an add, a delete or a move/delete has none. The shelf's own file list
+        // fills those in as sections with no hunk, so the loop below lists and notes them like a
+        // binary edit rather than dropping them silently. If that list cannot be read, the
+        // changelist is marked incomplete instead.
+        let (ledger, ledger_error) = match self.describe_tagged(cl, true) {
+            Some(Ok(ledger)) => (Some(ledger), None),
+            Some(Err(reason)) => (None, Some(reason)),
+            None => return CaptureOne::Cancelled,
+        };
+        let ledger_whole = ledger.as_ref().is_some_and(|l| !l.truncated);
+        let actions = ledger
+            .as_ref()
+            .map(|l| fill_from_shelf_ledger(&mut sections, &l.files))
+            .unwrap_or_default();
         if sections.is_empty() {
-            return CaptureOne::Skipped(format!(
-                "changelist {cl} has no shelved files to review (nothing is shelved, or the shelf \
-                 is not accessible)"
-            ));
+            // Skipped, which the caller is warned about with this reason: with no section and no
+            // file list there is nothing to list. Only a file list that was read says the shelf
+            // is empty; otherwise the reason says the list could not be read, not that nothing
+            // is shelved.
+            return CaptureOne::Skipped(match ledger_error {
+                Some(reason) => format!(
+                    "changelist {cl}'s shelf could not be listed, so any shelved adds or deletes \
+                     (which have no diff section) are not in the review: {reason}"
+                ),
+                None if !ledger_whole => format!(
+                    "changelist {cl}'s shelf could not be listed in full, so any shelved adds or \
+                     deletes (which have no diff section) are not in the review"
+                ),
+                None => format!(
+                    "changelist {cl} has no shelved files to review (nothing is shelved, or the \
+                     shelf is not accessible)"
+                ),
+            });
         }
 
         let (wheres, where_truncated) = self.where_of(sections.iter().map(|s| s.depot.as_str()));
@@ -1751,6 +1780,13 @@ impl<'a> P4<'a> {
         let mut deferred: Vec<convert::Deferred> = Vec::new();
         let mut diff_truncated = false;
 
+        if !ledger_whole {
+            complete = false;
+            omissions.push(format!(
+                "`p4 describe -s -S {cl}` could not be read in full, so shelved adds and deletes \
+                 (which have no diff section) may be missing from this list."
+            ));
+        }
         for note in truncation_notes(false, false, where_truncated) {
             complete = false;
             omissions.push(note);
@@ -1795,9 +1831,13 @@ impl<'a> P4<'a> {
                 // hunk. Labelled, never dropped silently -- or deferred to the capture hook when
                 // its globs match (issue #174).
                 let note = format!(
-                    "`{}` has no textual diff in the shelf: it is binary or content-free, or it \
-                     is an add, whose content is not captured.",
-                    safe_label(&section.depot)
+                    "`{}`{} has no textual diff in the shelf: it is binary or content-free, or \
+                     its content (an add) or removed content (a delete) is not captured.",
+                    safe_label(&section.depot),
+                    actions
+                        .get(section.depot.as_str())
+                        .map(|a| format!(" ({})", safe_label(a)))
+                        .unwrap_or_default()
                 );
                 match local {
                     Some(WhereResult::Mapped(path)) if self.defers(&local_label) => {
@@ -2312,13 +2352,26 @@ impl<'a> P4<'a> {
     /// `Some(Err)` is a changelist we could not read (bad number, no access): skip it, do not
     /// treat it as empty. `None` is cancellation.
     fn describe_meta(&self, cl: u64) -> Option<Result<DescribeMeta, String>> {
-        let out = self.run(&["-ztag", "describe", "-s", &cl.to_string()], "")?;
+        self.describe_tagged(cl, false)
+    }
+
+    /// `p4 -ztag describe -s`, or with `shelved` its `-S` form, whose file list is the shelf's
+    /// rather than the opened files'.
+    fn describe_tagged(&self, cl: u64, shelved: bool) -> Option<Result<DescribeMeta, String>> {
+        let number = cl.to_string();
+        let mut args = vec!["-ztag", "describe", "-s"];
+        if shelved {
+            args.push("-S");
+        }
+        args.push(&number);
+        let out = self.run(&args, "")?;
         if out.cancelled {
             return None;
         }
+        let command = describe_label(cl, shelved);
         if !out.success {
             return Some(Err(format!(
-                "`p4 describe -s {cl}` failed: {}",
+                "`{command}` failed: {}",
                 first_line(&out.diagnostics())
             )));
         }
@@ -2330,8 +2383,7 @@ impl<'a> P4<'a> {
                 Some(Ok(meta))
             }
             None => Some(Err(format!(
-                "`p4 describe -s {cl}` returned no usable metadata (restricted or unknown \
-                 changelist)"
+                "`{command}` returned no usable metadata (restricted or unknown changelist)"
             ))),
         }
     }
@@ -2835,6 +2887,38 @@ fn parse_describe_diff(raw: &str) -> Vec<DiffSection> {
     }
     sections.extend(current);
     sections
+}
+
+/// The `describe -s` command [`P4::describe_tagged`] ran, as its errors name it.
+fn describe_label(cl: u64, shelved: bool) -> String {
+    if shelved {
+        format!("p4 describe -s -S {cl}")
+    } else {
+        format!("p4 describe -s {cl}")
+    }
+}
+
+/// Add a hunk-less section for every shelved file in `ledger` that `describe -S -du` gave no
+/// section (an add, a delete, a move/delete), typed and revisioned from the ledger, so it is
+/// listed and noted rather than silently missing. Returns each ledger file's action by depot.
+fn fill_from_shelf_ledger<'a>(
+    sections: &mut Vec<DiffSection>,
+    ledger: &'a [AffectedFile],
+) -> BTreeMap<&'a str, &'a str> {
+    for file in ledger {
+        if !sections.iter().any(|s| s.depot == file.depot) {
+            sections.push(DiffSection {
+                depot: file.depot.clone(),
+                rev: file.rev.clone(),
+                ptype: (!file.ptype.is_empty()).then(|| file.ptype.clone()),
+                body: String::new(),
+            });
+        }
+    }
+    ledger
+        .iter()
+        .map(|f| (f.depot.as_str(), f.action.as_str()))
+        .collect()
 }
 
 /// The file type in a `==== ... (type) ====` describe header (issue #194). Taken from the last
@@ -3343,6 +3427,52 @@ mod tests {
             assert!(is_non_text_type(binary), "{binary}");
         }
         assert!(is_text_base_type("xltext") && is_text_base_type("xunicode+k"));
+    }
+
+    #[test]
+    fn shelved_files_with_no_diff_section_are_filled_in_from_the_shelf_ledger() {
+        // `describe -S -du` gives an edit and a move/add a section, but not an add, a delete or a
+        // move/delete (verified on p4d 2026.1); each must still reach the capture.
+        let mut sections = parse_describe_diff(
+            "==== //depot/b.bin#1 (binary) ====\n\n==== //depot/t.txt#1 (text) ====\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let file = |depot: &str, action: &str, ptype: &str| AffectedFile {
+            depot: depot.into(),
+            action: action.into(),
+            rev: Some("1".into()),
+            ptype: ptype.into(),
+        };
+        let ledger = vec![
+            file("//depot/b.bin", "edit", "binary"),
+            file("//depot/gone.bin", "delete", "binary"),
+            file("//depot/new.txt", "add", "text"),
+            file("//depot/old.txt", "move/delete", ""),
+            file("//depot/t.txt", "edit", "text"),
+        ];
+        let actions = fill_from_shelf_ledger(&mut sections, &ledger);
+        let depots: Vec<&str> = sections.iter().map(|s| s.depot.as_str()).collect();
+        assert_eq!(
+            depots,
+            [
+                "//depot/b.bin",
+                "//depot/t.txt",
+                "//depot/gone.bin",
+                "//depot/new.txt",
+                "//depot/old.txt"
+            ]
+        );
+        // The diffed sections are untouched; the filled-in ones have no hunk and the ledger type.
+        assert!(sections[1].body.contains("+b"));
+        assert!(sections[2..].iter().all(|s| s.body.is_empty()));
+        assert_eq!(sections[2].ptype.as_deref(), Some("binary"));
+        assert_eq!(sections[3].ptype.as_deref(), Some("text"));
+        assert_eq!(sections[4].ptype, None);
+        assert_eq!(sections[3].rev.as_deref(), Some("1"));
+        assert_eq!(actions.get("//depot/new.txt"), Some(&"add"));
+        assert_eq!(actions.get("//depot/old.txt"), Some(&"move/delete"));
+        // A ledger error names the command that actually ran.
+        assert_eq!(describe_label(7, true), "p4 describe -s -S 7");
+        assert_eq!(describe_label(7, false), "p4 describe -s 7");
     }
 
     #[test]
@@ -4536,6 +4666,12 @@ Change 5 by u@c on 2026/01/01\n\n\
                 "{:?}",
                 cap1.warnings
             );
+            // Every binary add and delete is named, on every basis: a shelf gives them no diff
+            // section, and they used to vanish from a shelved capture without a note.
+            let rendered = &cap1.change.as_ref().expect("turn 1 change").rendered;
+            for name in ["//depot/new.bin", "//depot/gone.bin"] {
+                assert!(rendered.contains(name), "{name} missing from:\n{rendered}");
+            }
             eprintln!("binary-only capture: {line}");
         }
         let baseline = cap1.perforce_baseline.clone().expect("turn 1 baseline");
