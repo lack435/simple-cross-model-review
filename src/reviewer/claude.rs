@@ -226,10 +226,31 @@ impl Reviewer for ClaudeReviewer {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
-            } else if out.stdout.trim().is_empty() && oauth_refresh_locked(out, None) {
+            } else if !out.cancelled
+                && !out.timed_out
+                && !out.policy_stalled
+                && oauth_refresh_locked(out, None)
+            {
                 // Before the generic classifier, whose "oauth token" match would read the
-                // refresh-lock collision as an expired sign-in (issue #166).
-                errors::reviewer_busy("claude", out.diagnostics())
+                // refresh-lock collision as an expired sign-in (issue #166). After the terminal
+                // conditions, though: a cancelled or timed-out run belongs to `failure_for`,
+                // whatever its stderr happens to mention.
+                //
+                // Buffered mode carries no per-line `assistant` events, and a failed parse
+                // leaves no result document to read `num_turns` from, so empty stdout is the
+                // only evidence available here that no model call ran. With it, the collision is
+                // the retryable REVIEWER_BUSY. Without it -- stdout nonempty but not a result
+                // document -- the turn may have advanced the conversation before the refresh
+                // failed, and then neither verdict is true: not busy, which asserts the session
+                // is unchanged (#166 review f5), and not an expired sign-in, which `classify`
+                // would reach on "oauth token" and answer with a re-login over a transient lock.
+                // Report the crash carrying the CLI's own diagnostic, which says the collision is
+                // usually transient, and leave the reading to the human.
+                if out.stdout.trim().is_empty() {
+                    errors::reviewer_busy("claude", out.diagnostics())
+                } else {
+                    errors::reviewer_crashed("claude", out.exit, out.diagnostics())
+                }
             } else {
                 super::failure_for(cfg, spec, out)
             }
@@ -1445,6 +1466,43 @@ mod tests {
             "{}",
             err.remediation
         );
+    }
+    /// The buffered path must not answer a refresh-lock collision with an *auth* verdict just
+    /// because stdout held something unparseable. Buffered mode has no `assistant` events and a
+    /// failed parse has no `num_turns`, so empty stdout is the only proof here that nothing ran:
+    /// with it the collision is REVIEWER_BUSY, without it neither busy nor expired is true, and
+    /// the one thing that must not happen is `classify` reaching "oauth token" and telling the
+    /// user to re-login over a transient lock (round-1 review f1).
+    #[test]
+    fn a_buffered_lock_collision_is_never_reported_as_an_expired_signin() {
+        let diag = "Failed to refresh OAuth token: another Claude Code process is refreshing it or "
+            .to_string()
+            + "exited mid-refresh. This is usually transient; retry in a minute";
+        let buffered = |stdout: &str| {
+            let mut out = outcome(stdout, false);
+            out.stderr = diag.clone();
+            out
+        };
+
+        // Empty stdout: nothing ran, so the retryable verdict stands.
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &buffered(""), None)
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // Nonempty but unparseable: reported as the crash it is, never as an expired sign-in.
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &buffered("not json at all"), None)
+            .unwrap_err();
+        assert_eq!(err.code, "REVIEWER_FAILED", "{err:?}");
+
+        // A cancelled run belongs to the terminal conditions, whatever its stderr mentions.
+        let mut cancelled = buffered("not json at all");
+        cancelled.cancelled = true;
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &cancelled, None)
+            .unwrap_err();
+        assert_eq!(err.code, "CANCELLED", "{err:?}");
     }
     /// Issue #166: the CLI's OAuth refresh-lock collision is REVIEWER_BUSY (retryable), whether it
     /// arrives as the failed result's text or on stderr, but only as the CLI's own diagnostic.

@@ -185,7 +185,9 @@ const PROFILE_LOGIN_NOTE: &str = "If this reviewer is pinned to an account profi
      which the review does not read. Sign the profile in itself instead, from an agent \
      session:\n\n\
      \x20 cross_model_setup_profile { reviewer: \"<claude|codex>\", profile: \"<name>\", \
-     login: true }";
+     login: true }\n\n\
+     For a reviewer pinned to an explicit home (--claude-config-dir / --codex-home), pass that \
+     path as `home` in place of `profile`.";
 
 pub fn not_authenticated(reviewer: &str, detail: impl Into<String>) -> Failure {
     let (login_cmd, note) = match reviewer {
