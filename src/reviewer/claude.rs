@@ -1416,6 +1416,36 @@ mod tests {
         assert_eq!(err.code, "RATE_LIMITED", "{err:?}");
     }
 
+    /// How the CLI words an expired sign-in on a headless run: the access token is past
+    /// `expiresAt` and the refresh did not go through. It names neither a token nor
+    /// credentials, so before the classifier learned the phrase this fell through to
+    /// REVIEWER_FAILED -- "the CLI exited unsuccessfully", with no remediation, for what is
+    /// only an expired sign-in.
+    #[test]
+    fn a_headless_oauth_session_expiry_is_auth_expired_not_a_crash() {
+        let diag = "Failed to authenticate: OAuth session expired and could not be refreshed";
+
+        let mut on_stderr = outcome("", false);
+        on_stderr.stderr = diag.to_string();
+        let err = parse_stream_json(cfg().primary(), &on_stderr).unwrap_err();
+        assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN", "{err:?}");
+
+        // The buffered `json` path (off the evidence path) reaches the same classifier.
+        let mut buffered = outcome("", false);
+        buffered.stderr = diag.to_string();
+        let err = ClaudeReviewer
+            .parse(&cfg(), cfg().primary(), &buffered, None)
+            .unwrap_err();
+        assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN", "{err:?}");
+
+        // The remediation names the profile login, not only the terminal one: a reviewer pinned
+        // to an account profile is not repaired by signing in the ambient config home.
+        assert!(
+            err.remediation.contains("cross_model_setup_profile"),
+            "{}",
+            err.remediation
+        );
+    }
     /// Issue #166: the CLI's OAuth refresh-lock collision is REVIEWER_BUSY (retryable), whether it
     /// arrives as the failed result's text or on stderr, but only as the CLI's own diagnostic.
     #[test]

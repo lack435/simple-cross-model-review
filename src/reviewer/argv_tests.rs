@@ -1282,3 +1282,25 @@ fn claude_allows_each_declared_companion_server_and_no_companion_read_rule() {
     );
     assert!(!args.iter().any(|a| a.contains("assets/**")), "{args:?}");
 }
+
+/// The version probe shows one line verbatim and never a screenful: a CLI that ignores
+/// `--version` and prints its help must not push that into a status response.
+#[test]
+fn a_version_probe_takes_one_plausible_line_or_nothing() {
+    use crate::reviewer::first_version_line;
+
+    assert_eq!(
+        first_version_line("2.1.308 (Claude Code)\n").as_deref(),
+        Some("2.1.308 (Claude Code)")
+    );
+    // Leading blank lines are skipped and the line is trimmed.
+    assert_eq!(
+        first_version_line("\n  codex-cli 0.5.1  \ntrailing noise\n").as_deref(),
+        Some("codex-cli 0.5.1")
+    );
+    assert_eq!(first_version_line("").as_deref(), None);
+    assert_eq!(first_version_line("   \n\t\n").as_deref(), None);
+    // Implausibly long: dropped rather than shown.
+    let help = "x".repeat(200);
+    assert_eq!(first_version_line(&help).as_deref(), None);
+}
