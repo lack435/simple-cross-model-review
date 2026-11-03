@@ -226,7 +226,7 @@ impl Reviewer for ClaudeReviewer {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
-            } else if oauth_refresh_locked(out, None) {
+            } else if lock_diagnostic_present(out, None) {
                 // Intercepted ahead of the generic classifier, whose "oauth token" match would
                 // answer the refresh-lock collision with a re-login (issue #166) -- but only to
                 // keep that wrong remediation away. The retryable REVIEWER_BUSY is not available
@@ -488,6 +488,17 @@ fn from_result_document(
         if is_error || !out.success {
             if oauth_refresh_locked(out, Some(parsed)) {
                 return Err(errors::reviewer_busy("claude", out.diagnostics()));
+            }
+            // The collision, but without proof that no model turn ran: a document whose
+            // `num_turns` is absent or not a number, or a stream that showed a turn. Neither
+            // verdict is true, so report the crash rather than let `classify` answer a transient
+            // lock with a re-login (round-3 review f4).
+            if lock_diagnostic_present(out, Some(parsed)) {
+                return Err(errors::reviewer_crashed(
+                    "claude",
+                    out.exit,
+                    out.diagnostics(),
+                ));
             }
             let subtype = parsed.get("subtype").and_then(Value::as_str).unwrap_or("");
 
@@ -790,31 +801,16 @@ const OAUTH_REFRESH_LOCK: &str = "another claude code process is refreshing it";
 /// The sentence that diagnostic opens with, lowercased.
 const OAUTH_REFRESH_FAILED: &str = "failed to refresh oauth token";
 
-/// Whether a failed run is the CLI's OAuth refresh-lock collision (issue #166), **before any model
-/// turn**, which is what makes it safe to retry: `REVIEWER_BUSY` clears the call's findings marker on
-/// the strength of it. So a run that shows any sign of a model turn is never it, whatever it says: an
-/// assistant event in the stream, or a result document reporting `num_turns` above zero (a refresh
-/// can also fail mid-run, after the conversation advanced). Given that, the diagnostic is read from
-/// stderr, which the CLI owns, or from the failed result's text when the text *opens* with it, never
-/// when prose merely mentions it. Anything in doubt keeps its existing classification, which leaves
-/// the marker set. Any other auth failure keeps its own classification.
-fn oauth_refresh_locked(out: &RunOutcome, result: Option<&Value>) -> bool {
-    let assistant_event = out.stdout.lines().any(|line| {
-        serde_json::from_str::<Value>(line.trim())
-            .ok()
-            .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
-            .as_deref()
-            == Some("assistant")
-    });
-    // Absent is no evidence of a turn; present counts only as exactly numeric zero. A malformed or
-    // null value proves nothing either way, so it is not proof (review f5).
-    let no_turns = match result.and_then(|r| r.get("num_turns")) {
-        None => true,
-        Some(v) => v.as_u64() == Some(0),
-    };
-    if assistant_event || !no_turns {
-        return false;
-    }
+/// Whether the CLI's OAuth refresh-lock diagnostic (issue #166) is present at all, with no claim
+/// about whether a model turn ran. Read from stderr, which the CLI owns, or from a failed result
+/// text that *opens* with it -- never from prose that merely mentions it.
+///
+/// Split from [`oauth_refresh_locked`] because the callers need both answers. The collision *with*
+/// proof that nothing ran is the retryable REVIEWER_BUSY. The collision *without* that proof is
+/// neither busy nor an expired sign-in, so it is reported as the crash it is rather than handed to
+/// `classify`, whose "oauth token" match would prescribe a re-login for a transient lock
+/// (round-3 review f4).
+fn lock_diagnostic_present(out: &RunOutcome, result: Option<&Value>) -> bool {
     let is_lock = |s: &str| {
         let s = s.to_ascii_lowercase();
         s.contains(OAUTH_REFRESH_FAILED) && s.contains(OAUTH_REFRESH_LOCK)
@@ -829,6 +825,36 @@ fn oauth_refresh_locked(out: &RunOutcome, result: Option<&Value>) -> bool {
             .to_ascii_lowercase()
             .starts_with(OAUTH_REFRESH_FAILED)
             && is_lock(result_text))
+}
+
+/// Whether a failed run is the CLI's OAuth refresh-lock collision **before any model turn**, which
+/// is what makes it safe to retry: `REVIEWER_BUSY` clears the call's findings marker on the
+/// strength of it. So a run that shows any sign of a turn is never it, whatever it says, and so is
+/// a run whose turn count cannot be established.
+///
+/// The evidence is an `assistant` event in the stream, or the result document's own `num_turns`.
+/// For a document that exists, only an explicit numeric zero is evidence of no turn: absent, null
+/// or unparseable leaves the count unknown, and unknown is not proof (round-3 review f4 -- a
+/// malformed or future-schema document would otherwise clear the marker on nothing). With no
+/// document at all, `num_turns` says nothing either way and the `assistant` scan is the evidence,
+/// which is why the buffered parse-error path -- where neither signal exists -- never reaches a
+/// busy verdict at all.
+fn oauth_refresh_locked(out: &RunOutcome, result: Option<&Value>) -> bool {
+    let assistant_event = out.stdout.lines().any(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+            .as_deref()
+            == Some("assistant")
+    });
+    let no_turns = match result {
+        None => true,
+        Some(r) => r.get("num_turns").and_then(Value::as_u64) == Some(0),
+    };
+    if assistant_event || !no_turns {
+        return false;
+    }
+    lock_diagnostic_present(out, result)
 }
 
 fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Failure> {
@@ -927,6 +953,14 @@ fn parse_stream_json(spec: &ReviewerSpec, out: &RunOutcome) -> Result<Parsed, Fa
     // expired sign-in (issue #166). With no result event there is no result text, so only stderr.
     if oauth_refresh_locked(out, None) {
         return Err(errors::reviewer_busy("claude", out.diagnostics()));
+    }
+    // Present but with a turn shown: the crash, not an expired sign-in (round-3 review f4).
+    if lock_diagnostic_present(out, None) {
+        return Err(errors::reviewer_crashed(
+            "claude",
+            out.exit,
+            out.diagnostics(),
+        ));
     }
     Err(errors::classify(
         "claude",
@@ -1498,6 +1532,35 @@ mod tests {
         let err = parse_stream_json(cfg().primary(), &buffered("")).unwrap_err();
         assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
     }
+    /// Round-3 review f4: for a result document that exists, an absent or non-numeric `num_turns`
+    /// leaves the turn count unknown, and unknown is not proof that nothing ran. A malformed or
+    /// future-schema document carrying the lock diagnostic must not clear the findings marker on
+    /// the strength of a missing field -- nor become an expired sign-in instead.
+    #[test]
+    fn a_result_document_without_num_turns_is_not_proof_of_no_turn() {
+        let diag = concat!(
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it ",
+            "or exited mid-refresh. This is usually transient; retry in a minute"
+        );
+        let doc = |turns: &str| {
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":true,{turns}"result":{}}}"#,
+                serde_json::to_string(diag).unwrap()
+            )
+        };
+
+        // An explicit zero is the evidence, so the retryable verdict stands.
+        let doc_zero = doc(r#""num_turns":0,"#);
+        let err = parse_stream_json(cfg().primary(), &outcome(&doc_zero, false)).unwrap_err();
+        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+
+        // Absent, null, or not a number: unknown, so neither busy nor an expired sign-in.
+        for turns in ["", r#""num_turns":null,"#, r#""num_turns":"0","#] {
+            let doc = doc(turns);
+            let err = parse_stream_json(cfg().primary(), &outcome(&doc, false)).unwrap_err();
+            assert_eq!(err.code, "REVIEWER_FAILED", "turns {turns:?}: {err:?}");
+        }
+    }
     /// Issue #166: the CLI's OAuth refresh-lock collision is REVIEWER_BUSY (retryable), whether it
     /// arrives as the failed result's text or on stderr, but only as the CLI's own diagnostic.
     #[test]
@@ -1505,9 +1568,11 @@ mod tests {
         let diag =
             "Failed to refresh OAuth token: another Claude Code process is refreshing it or \
                     exited mid-refresh. This is usually transient; retry in a minute";
+        // `num_turns: 0` is what makes these the busy case: for a document that exists, only an
+        // explicit numeric zero establishes that no turn ran (round-3 review f4).
         let result = |text: &str| {
             format!(
-                r#"{{"type":"result","subtype":"success","is_error":true,"result":{}}}"#,
+                r#"{{"type":"result","subtype":"success","is_error":true,"num_turns":0,"result":{}}}"#,
                 serde_json::to_string(text).unwrap()
             )
         };
