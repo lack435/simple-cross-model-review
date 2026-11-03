@@ -149,6 +149,10 @@ The essentials:
 --min-usage-status <lvl>     Proactive gate (claude): 'ample' skips on warning-or-worse,
                             'warning' skips only when rejected.
 --timeout-seconds <n>        Per-turn budget. Default 1800. Max 86400 (24h).
+--evidence-max-calls <n>     Repository-evidence calls the reviewer may make per turn. Raise for
+                            a large branch. Default 96. Max 1024. No disabling value.
+--evidence-max-bytes <n>     Total evidence bytes served per turn, counted on the serialized
+                            responses. Default 2097152 (2 MiB). Max 67108864 (64 MiB).
 --max-concurrent-reviews <n> Per-process cap on reviews running at once. Default 8. 0 disables.
 --session-max-turns <n>      Refuse to resume a session past this many turns. Default 10.
 --session-max-idle-seconds <n>

@@ -177,7 +177,13 @@ impl Default for Limits {
             max_lines: 2000,
             default_lines: 300,
             max_change_bytes: 192 * 1024,
-            default_change_bytes: 48 * 1024,
+            // At the request maximum, so a reviewer that passes no `limit_bytes` pages the change
+            // in as few calls as the transport allows. This used to be 48 KiB, which cost a 416 KB
+            // diff nine pages instead of three — and every re-walk of it nine more (issue #197).
+            // Safe because `Core::page_end` now bounds a page by the serialized envelope, so the
+            // raised default cannot push a page past `max_response_bytes`; a Claude reviewer is
+            // unaffected either way, since `CLAUDE_PAGE_BYTES_CEILING` still binds first.
+            default_change_bytes: 192 * 1024,
             max_history: 200,
             default_history: 40,
             operation_timeout_ms: 15_000,
@@ -186,7 +192,10 @@ impl Default for Limits {
 }
 
 impl Limits {
-    fn validate(&self) -> Result<(), EvidenceError> {
+    /// Crate-visible so the flag parsing can be tested against the invariant it has to respect:
+    /// no accepted `--evidence-max-*` pair may produce limits the evidence server would reject
+    /// when it reads its bundle (issue #197).
+    pub(crate) fn validate(&self) -> Result<(), EvidenceError> {
         let positive = [
             self.max_request_bytes as u64,
             self.max_response_bytes as u64,
@@ -213,6 +222,9 @@ impl Limits {
             || self.max_response_bytes as u64 > self.max_total_bytes
             || self.max_request_bytes > 1024 * 1024
             || self.max_response_bytes > 1024 * 1024
+            // A response has to have room for a page *and* the envelope around it, or `page_end`
+            // would hand back a one-character page and no walk could finish (issue #197).
+            || self.max_response_bytes as usize <= core::ENVELOPE_RESERVE
         {
             return Err(EvidenceError::new(
                 "invalid_bundle",
@@ -433,6 +445,7 @@ impl Bundle {
 }
 
 impl Bundle {
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         root: &Path,
         vcs: crate::config::Vcs,
@@ -441,12 +454,12 @@ impl Bundle {
         status_summary: String,
         change: Option<String>,
         page_bytes_ceiling: Option<u32>,
+        limits: Limits,
     ) -> Result<Self, EvidenceError> {
         validate_nonce(nonce)?;
         let canonical = fs::canonicalize(root).map_err(|e| {
             EvidenceError::new("invalid_root", format!("cannot canonicalize root: {e}"))
         })?;
-        let limits = Limits::default();
         // Deliberately not `?`: a stamp that cannot be computed is an advisory signal lost, not a
         // review to refuse. Before issue #86 a working root with more than `max_files` entries --
         // a vendored engine tree is enough -- failed here and took the whole review with it.
@@ -1027,11 +1040,17 @@ fn serve_requests<W: Write>(
             if request_id.is_some() {
                 cancellations.finish(&cancel);
             }
+            core.rollback_pending();
             continue;
         };
         if request_id.is_some() && cancellations.finish(&cancel) {
             // MCP cancellation abandons this request only. Suppress its response, then clear the
             // request-scoped flag so later calls remain usable on the same transport.
+            //
+            // The reviewer never receives this page, so nothing it staged may land: no bytes
+            // charged, no cursor consumed and above all no serve-record, which the approval gate
+            // would otherwise read as a page that was served (issue #197).
+            core.rollback_pending();
             continue;
         }
         let mut encoded = serde_json::to_vec(&response)
@@ -1053,12 +1072,26 @@ fn serve_requests<W: Write>(
             };
             encoded = serde_json::to_vec(&replacement)
                 .map_err(|e| EvidenceError::new("protocol_write_failed", e.to_string()))?;
+            // The page itself is not going out, so discard what it staged. `Core::page_end` makes
+            // this unreachable for a text page unless the request id alone overran the reserve;
+            // either way the reviewer gets a retryable error and its cursor back (issue #197).
+            core.rollback_pending();
         }
-        writer
+        let written = writer
             .write_all(&encoded)
             .and_then(|_| writer.write_all(b"\n"))
-            .and_then(|_| writer.flush())
-            .map_err(|e| EvidenceError::new("protocol_write_failed", e.to_string()))?;
+            .and_then(|_| writer.flush());
+        // The one honest commit point: the response is on the wire. Not that the reviewer *read*
+        // it — a client-side timer can still discard it with no error here, and proving receipt is
+        // the coverage attestation `docs/retire-capture-modes.md` deliberately does not attempt.
+        // What this does guarantee is that nothing is charged for, consumed or recorded as served
+        // unless the bytes were actually written (issue #197, review rounds 2-4).
+        if written.is_ok() {
+            core.commit_pending();
+        } else {
+            core.rollback_pending();
+        }
+        written.map_err(|e| EvidenceError::new("protocol_write_failed", e.to_string()))?;
     }
     Ok(())
 }
@@ -1232,8 +1265,10 @@ pub fn readiness(cfg: &crate::config::Config) -> Result<String, EvidenceError> {
         "no-model evidence readiness check".to_string(),
         None,
         // The readiness handshake only lists tools; it never pages a text tool, so the served-page
-        // ceiling is immaterial here.
+        // ceiling is immaterial here. The configured budget still goes in, so the handshake
+        // exercises exactly the bundle a review would get (issue #197).
         None,
+        cfg.evidence_limits(),
     )?;
     let file = write_bundle(cfg, &bundle)?;
     let exe = std::env::current_exe()
@@ -1589,6 +1624,62 @@ mod tests {
     }
     use crate::testutil::temp_dir;
 
+    /// `repository_scope` returns `limits` serialized straight from the struct, against an output
+    /// schema whose field list is written out by hand — and Codex validates `structuredContent`
+    /// against that schema. So a new `Limits` field that nobody adds to `limits_schema` makes the
+    /// scope response violate its own contract, silently, for one reviewer and not the other.
+    /// Nothing checked the two agreed until issue #197 went looking.
+    #[test]
+    fn limits_schema_declares_exactly_the_fields_limits_has() {
+        let serialized = serde_json::to_value(Limits::default()).unwrap();
+        let actual: std::collections::BTreeSet<&str> = serialized
+            .as_object()
+            .expect("limits serialize to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let schema = limits_schema();
+        let declared: std::collections::BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("declared properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            declared, actual,
+            "limits_schema() and the Limits struct have drifted"
+        );
+        let required: std::collections::BTreeSet<&str> = schema["required"]
+            .as_array()
+            .expect("a required list")
+            .iter()
+            .map(|v| v.as_str().expect("field names are strings"))
+            .collect();
+        assert_eq!(
+            required, actual,
+            "every field is always present, so every field is required"
+        );
+    }
+
+    /// Issue #197: a response must have room for a page *and* its envelope, or `page_end` would
+    /// serve one character at a time and no walk could finish.
+    #[test]
+    fn limits_must_leave_room_for_the_response_envelope() {
+        let at_the_reserve = Limits {
+            max_response_bytes: core::ENVELOPE_RESERVE as u32,
+            ..Limits::default()
+        };
+        assert_eq!(
+            at_the_reserve.validate().unwrap_err().code,
+            "invalid_bundle"
+        );
+        let just_over = Limits {
+            max_response_bytes: core::ENVELOPE_RESERVE as u32 + 1,
+            ..Limits::default()
+        };
+        assert!(just_over.validate().is_ok());
+    }
+
     /// Issue #151: the intake queue holds every call a turn may make, so none waits unread.
     #[test]
     fn the_intake_queue_holds_a_whole_turn_of_calls() {
@@ -1623,6 +1714,7 @@ mod tests {
             "captured".into(),
             Some("diff".into()),
             None,
+            Limits::default(),
         )
         .unwrap()
     }
@@ -1657,6 +1749,7 @@ mod tests {
             "captured".into(),
             Some("diff".into()),
             None,
+            Limits::default(),
         )
         .unwrap();
         assert_eq!(p4.worktree_autocrlf, None);
@@ -1692,6 +1785,10 @@ mod tests {
         let mut core = core::Core::new(bundle(dir.as_path())).unwrap();
         let scope = handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"repository_scope"}}), &mut core, Instant::now()).unwrap();
         assert_eq!(scope["result"]["isError"], false);
+        // `handle` sits below the commit point: in production `serve_requests` applies a call's
+        // staged effects once the response is written (issue #197), so a test driving `handle`
+        // directly has to do the same between calls.
+        core.commit_pending();
         let unknown = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cross_model_review","arguments":{}}}), &mut core, Instant::now()).unwrap();
         assert_eq!(unknown["result"]["isError"], true);
         assert_eq!(

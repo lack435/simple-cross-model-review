@@ -322,6 +322,22 @@ against a non-threat and cannot work anyway (see "Threat model").
     base per f4) or *left mid-pagination* (a cursor remained unfollowed) and the reviewer approved
     anyway → fail closed, because it approved on evidence known to be partial.
 
+- **Revision note (issue #197): the floor is unchanged, and a walk is now resumable at the page that
+  broke.** Two things about *how* the floor is satisfied changed, neither relaxing it:
+  - A canonical walk interrupted mid-chain — a page refused by the byte budget, cancelled, replaced
+    as oversized, or lost — used to consume its cursor regardless, so the only way to finish was a
+    fresh pull that recomposed from byte 0. Repeated re-walks are what exhausted the budget in #197.
+    A page's effects (its byte charge, its cursor, its serve-record) now commit as one unit, only
+    once the response has been written, so an interrupted page is retried at the same offset.
+  - That also closed a false-approval path: the serve-record used to be appended *before* the byte
+    accounting and before the outer transport checks, so a terminal page the reviewer received only
+    as an error — or never received at all — was recorded as served, and this floor read it as
+    proof. A record is now written only for a page that was actually written out.
+  - What the commit claims is deliberately narrow: **the server wrote the response**, not that the
+    reviewer received or read it. A client-side timer can still discard a response with no
+    server-visible error. That is the same line drawn below under "the anti-gaming line stays cut" —
+    only the request is server-observable — so no acknowledgement protocol was added.
+
 - **Revision note (r5 → r6): the floor's *response* is resumable, not a hard stop, and it retries
   once first.** The *requirement* above is unchanged — an approval still demands the complete
   canonical diff, paged to its terminal page, this turn — but the way an unmet floor is handled was

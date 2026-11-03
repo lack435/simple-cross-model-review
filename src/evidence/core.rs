@@ -520,10 +520,76 @@ struct CursorPage {
     source_complete: bool,
 }
 
+/// Bytes held back from `max_response_bytes` so everything wrapped around a text page fits beside
+/// it (issue #197).
+///
+/// Every part of that wrapper has a fixed shape and so a computable worst case: the JSON-RPC
+/// object and its `result` / `content` / `structuredContent` framing, the cursor token
+/// (`{nonce}-{16 hex}`, with a bounded nonce), `text_result`'s fixed keys with its numeric fields
+/// at their bounds, and the trailing newline — which `serve_requests` writes *after* its size
+/// check, so it must be reserved here.
+///
+/// The request id is the one variable part. Its honest bound is `max_request_bytes` (64 KiB), a
+/// quarter of the response budget, and reserving that would shrink every page by 25% for a client
+/// that does not exist. So the reserve covers a generous id and an id past it falls through to the
+/// existing `response_too_large` replacement — which is safe only because that path no longer
+/// destroys the walk: it costs one retryable page, not a lost review (plan r4, review round 4).
+pub(super) const ENVELOPE_RESERVE: usize = 4096;
+
+/// One `repository_diff` pull, held for the life of its cursor chain (issue #197).
+///
+/// The composed text lives here once per operation rather than being cloned into every
+/// continuation cursor, so a chain of N pages keeps one copy instead of N and a cursor stranded by
+/// a lost page does not pin a second. `canonical` and `complete` live here too because they are
+/// properties of the *pull*, not of a page: `diff_cursor` reads them back out to record them on
+/// every continuation serve-record, which is what the approval gate aggregates.
+///
+/// `digest` lets a fresh pull of an unchanged tree share this operation's text instead of
+/// allocating another copy (plan r4; review round 3 f7). Operation *ids* stay distinct, so the
+/// gate's per-op grouping is unaffected — only the `Arc` is shared.
+struct DiffOp {
+    text: Arc<str>,
+    canonical: bool,
+    complete: bool,
+    digest: Option<String>,
+}
+
+/// State one evidence call wants to apply, held until the response is known to have been written
+/// (issue #197).
+///
+/// The byte counter, the cursor map, the `ops` map and the serve-record file have to move together
+/// or not at all. Committing them inside [`Core`] is too early: `serve_requests` can still suppress
+/// the response on MCP cancellation or replace an oversized one with `response_too_large`, and the
+/// write itself comes after both — so a page committed in `Core` could be charged for, have its
+/// cursor consumed and be recorded `terminal: true` while the reviewer received only an error. That
+/// last part is a false-approval path, since the gate reads the serve-record.
+///
+/// So a call stages its effects here and `serve_requests` calls [`Core::commit_pending`] once the
+/// bytes are on the wire, or [`Core::rollback_pending`] on any path that does not write.
+#[derive(Default)]
+struct PendingCommit {
+    /// Charged to `returned_bytes` on commit. Already checked against the budget.
+    bytes: u64,
+    /// A cursor removed by this call, restored on rollback so the page can simply be retried.
+    cursor_taken: Option<(String, CursorPage)>,
+    /// A cursor this call minted, dropped on rollback.
+    cursor_stored: Option<String>,
+    /// An operation this call minted, dropped on rollback.
+    op_stored: Option<String>,
+    /// An operation whose chain ended on this page, dropped on *commit*.
+    op_finished: Option<String>,
+    /// Appended to the serve-record file on commit, and never written on rollback.
+    serve_record: Option<Value>,
+}
+
 pub struct Core {
     bundle: Bundle,
     root: PathBuf,
     cursors: HashMap<String, CursorPage>,
+    /// Live `repository_diff` pulls, keyed by the operation id `first_diff_page` mints.
+    ops: HashMap<String, DiffOp>,
+    /// The effects of the call in flight; see [`PendingCommit`].
+    pending: Option<PendingCommit>,
     next_cursor: u64,
     calls: u32,
     returned_bytes: u64,
@@ -549,6 +615,12 @@ pub struct Core {
     /// Injecting the bound beats sleeping in a test: the assertion stays deterministic and the
     /// suite stays fast.
     walk_watchdog: &'static ReadWatchdog,
+    /// The pool the child-process routes (`git diff`, `git history`, the Perforce commands) run
+    /// under. A seam on exactly the same terms as `walk_watchdog`: production always gets
+    /// `CHILD_WATCHDOG`, capped at two because the service is serial. A test harness is not
+    /// serial, so tests that merely *use* one of those routes draw on a roomier pool of their own
+    /// rather than refusing each other with `read_unavailable` (issue #197).
+    child_watchdog: &'static ReadWatchdog,
     /// `SEARCH_SLICE_MS`, injectable for the same reason `walk_watchdog` is.
     search_slice: Duration,
 }
@@ -580,6 +652,8 @@ impl Core {
             bundle,
             root,
             cursors: HashMap::new(),
+            ops: HashMap::new(),
+            pending: None,
             next_cursor: 0,
             calls: 0,
             returned_bytes: 0,
@@ -588,6 +662,7 @@ impl Core {
             cancel,
             serve_record: None,
             walk_watchdog: &WALK_WATCHDOG,
+            child_watchdog: &CHILD_WATCHDOG,
             search_slice: Duration::from_millis(SEARCH_SLICE_MS),
         })
     }
@@ -610,11 +685,22 @@ impl Core {
         }
     }
 
-    /// Dispatch a call whose receipt clock starts now. Convenience for tests and any caller that
-    /// is not measuring against Codex's client-side timer.
+    /// Dispatch a call whose receipt clock starts now, committing it as a written response would.
+    /// Convenience for tests and any caller that is not measuring against Codex's client-side
+    /// timer.
+    ///
+    /// The commit is part of the convenience: in production it belongs to `serve_requests`, which
+    /// applies it only once the bytes are written (issue #197). A test driving `Core` directly
+    /// still has to leave the same state behind, or the next call would inherit staged effects that
+    /// never landed. Tests that need the uncommitted half drive
+    /// [`Core::call_with_receipt`] and [`Core::rollback_pending`] themselves.
     #[cfg(test)]
     pub fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, EvidenceError> {
-        self.call_with_receipt(name, arguments, Instant::now())
+        let result = self.call_with_receipt(name, arguments, Instant::now());
+        if result.is_ok() {
+            self.commit_pending();
+        }
+        result
     }
 
     /// Dispatch a call, measuring the read watchdog's budget from `received_at` — the instant the
@@ -627,6 +713,34 @@ impl Core {
         arguments: &Value,
         received_at: Instant,
     ) -> Result<Value, EvidenceError> {
+        let result = self.dispatch_with_receipt(name, arguments, received_at);
+        if let Err(error) = &result {
+            // A refused call is recorded, and whatever it staged is discarded: an in-band error is
+            // not written as a response page, so nothing it set up may survive (issue #197).
+            if error.code == "limit_exceeded" {
+                // Recorded immediately rather than staged. A refusal has no response page to
+                // commit, and it is precisely the turn that ran out of budget whose evidence the
+                // parent needs — a rationed turn is otherwise indistinguishable from a reviewer
+                // that gave up on the merits, because `reviewer_blocked` comes only from the
+                // reviewer's own verdict. Carries no `op`, so the floor aggregate ignores it.
+                self.append_serve_record(&json!({"refused": error.code}));
+            }
+            self.rollback_pending();
+        }
+        result
+    }
+
+    fn dispatch_with_receipt(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        received_at: Instant,
+    ) -> Result<Value, EvidenceError> {
+        // Nothing may be in flight when a call begins: every caller either commits or rolls back.
+        // A leftover means a path missed that, and inheriting it would apply one page's effects to
+        // another, so discard it rather than build on it.
+        debug_assert!(self.pending.is_none(), "a staged commit outlived its call");
+        self.rollback_pending();
         if self.cancel.load(Ordering::Acquire) {
             return Err(EvidenceError::new(
                 "cancelled",
@@ -708,17 +822,66 @@ impl Core {
                 "evidence response exceeded the configured byte cap",
             ));
         }
-        self.returned_bytes = self
+        // Checked, not committed. `returned_bytes` used to be assigned before this comparison, so a
+        // page refused here left the counter permanently over budget and every retry of it failed
+        // too — which is why a reviewer that lost one page had to abandon the whole walk and start
+        // again from byte 0 (issue #197, review round 1 f3). The charge now rides on the pending
+        // commit and lands only once the response is written.
+        let prospective = self
             .returned_bytes
             .checked_add(bytes)
             .ok_or_else(|| EvidenceError::new("limit_exceeded", "byte counter overflow"))?;
-        if self.returned_bytes > self.bundle.limits.max_total_bytes {
+        if prospective > self.bundle.limits.max_total_bytes {
             return Err(EvidenceError::new(
                 "limit_exceeded",
                 "cumulative evidence byte budget exhausted",
             ));
         }
+        self.pending
+            .get_or_insert_with(PendingCommit::default)
+            .bytes = bytes;
         Ok(result)
+    }
+
+    /// Apply the call in flight: charge its bytes, retire a finished operation, and append its
+    /// serve-record. Called by `serve_requests` once the response bytes are on the wire.
+    pub fn commit_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.returned_bytes = self.returned_bytes.saturating_add(pending.bytes);
+        if let Some(op) = pending.op_finished {
+            self.ops.remove(&op);
+        }
+        if let Some(record) = pending.serve_record {
+            self.append_serve_record(&record);
+        }
+    }
+
+    /// Discard the call in flight: restore the cursor it consumed, drop what it minted, charge
+    /// nothing, and write no serve-record. Called by `serve_requests` on every path that does not
+    /// write the response — MCP cancellation, the `response_too_large` replacement, a write error —
+    /// and after an in-band error, so a refused page can simply be retried at the same offset.
+    ///
+    /// The call itself still counted against `max_calls`: the work was done, and a reviewer that
+    /// retries must not be able to loop for free.
+    pub fn rollback_pending(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if let Some(token) = pending.cursor_stored {
+            self.cursors.remove(&token);
+        }
+        if let Some(op) = pending.op_stored {
+            self.ops.remove(&op);
+        }
+        if let Some((token, page)) = pending.cursor_taken {
+            self.cursors.insert(token, page);
+        }
+    }
+
+    fn stage(&mut self) -> &mut PendingCommit {
+        self.pending.get_or_insert_with(PendingCommit::default)
     }
 
     fn scope(&mut self, received_at: Instant) -> Result<Value, EvidenceError> {
@@ -1120,10 +1283,24 @@ impl Core {
     /// ceiling (Codex) are bounded only by the requested limit.
     fn page_end(&self, text: &str, start: usize, limit: usize) -> usize {
         let hard = utf8_end(text, start.saturating_add(limit).min(text.len()));
-        match self.bundle.page_bytes_ceiling {
+        let hard = match self.bundle.page_bytes_ceiling {
             Some(ceiling) => encoded_bounded_end(text, start, hard, ceiling as usize),
             None => hard,
-        }
+        };
+        // And never more than the transport will actually send. `max_response_bytes` is checked
+        // twice: by `Core` against the serialized result, and by `serve_requests` against the whole
+        // JSON-RPC envelope, which *replaces* an oversized response with `response_too_large` after
+        // `handle` has returned. Without this bound a reviewer that asks for a 192 KiB page of
+        // escape-heavy diff gets refused for asking a legal question, and before issue #197 that
+        // also destroyed its cursor chain. Binds only when escaping pushes a page past the cap,
+        // because `max_change_bytes` (192 KiB) already sits below `max_response_bytes` (256 KiB).
+        encoded_bounded_end(text, start, hard, self.envelope_page_budget())
+    }
+
+    /// Encoded bytes a single text page may occupy, so the whole JSON-RPC envelope around it stays
+    /// under `max_response_bytes`.
+    fn envelope_page_budget(&self) -> usize {
+        (self.bundle.limits.max_response_bytes as usize).saturating_sub(ENVELOPE_RESERVE)
     }
 
     fn change(&mut self, args: &serde_json::Map<String, Value>) -> Result<Value, EvidenceError> {
@@ -1176,7 +1353,7 @@ impl Core {
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
         let (commits, source_complete) =
-            run_bounded_walk(&CHILD_WATCHDOG, "git history", received_at, move || {
+            run_bounded_walk(self.child_watchdog, "git history", received_at, move || {
                 super::git::history(&root, &path, &before, &limits, &cancel, received_at)
             })?;
         self.first_page(
@@ -1220,9 +1397,12 @@ impl Core {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
-        let text = run_bounded_walk(&CHILD_WATCHDOG, "git revision", received_at, move || {
-            super::git::revision(&root, &id, &path, &limits, &cancel, received_at)
-        })?;
+        let text = run_bounded_walk(
+            self.child_watchdog,
+            "git revision",
+            received_at,
+            move || super::git::revision(&root, &id, &path, &limits, &cancel, received_at),
+        )?;
         self.first_text_page("repository_revision", text, limit, "content")
     }
 
@@ -1265,7 +1445,7 @@ impl Core {
         let staging = self.bundle.staging();
         let hook = self.bundle.capture_hook.clone();
         let cancel = Arc::clone(&self.cancel);
-        let composed = run_bounded_walk(&CHILD_WATCHDOG, "git diff", received_at, move || {
+        let composed = run_bounded_walk(self.child_watchdog, "git diff", received_at, move || {
             compose_diff(
                 &root,
                 &base_ep,
@@ -1319,7 +1499,7 @@ impl Core {
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
         let (changes, source_complete) =
-            run_bounded_walk(&CHILD_WATCHDOG, "p4 changes", received_at, move || {
+            run_bounded_walk(self.child_watchdog, "p4 changes", received_at, move || {
                 super::perforce::history(
                     &root,
                     &access,
@@ -1365,7 +1545,7 @@ impl Core {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
-        let text = run_bounded_walk(&CHILD_WATCHDOG, "p4 revision", received_at, move || {
+        let text = run_bounded_walk(self.child_watchdog, "p4 revision", received_at, move || {
             super::perforce::revision(&root, &access, change, &path, &limits, &cancel, received_at)
         })?;
         self.first_text_page("repository_revision", text, limit, "content")
@@ -1406,7 +1586,7 @@ impl Core {
         let root = self.root.clone();
         let limits = self.bundle.limits.clone();
         let cancel = Arc::clone(&self.cancel);
-        let text = run_bounded_walk(&CHILD_WATCHDOG, "p4 diff", received_at, move || {
+        let text = run_bounded_walk(self.child_watchdog, "p4 diff", received_at, move || {
             super::perforce::diff(
                 &root,
                 &access,
@@ -1432,31 +1612,56 @@ impl Core {
         limit: usize,
     ) -> Result<Value, EvidenceError> {
         let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
-        let text = composed.text;
         // A content digest of the *whole* composed diff (which begins with the resolved-base header,
         // so the base is inside it) identifies this canonical change exactly. The approval gate uses
         // it to tell a benign repeat pull of one unchanged change from a mid-review re-pull of a
         // *drifted* one: same digest is the same change, and numstat counts alone cannot prove that
         // (two different edits can share a files/±line tally). Digested here, before paging, so every
         // page of this operation is anchored to the same identity (issue #121 review f1/f2).
-        let digest = crate::digest::Fingerprint::of(text.as_bytes()).map(|f| f.sha256);
+        let digest = crate::digest::Fingerprint::of(composed.text.as_bytes()).map(|f| f.sha256);
+        // A fresh pull of an unchanged tree shares the text already held for an equal-digest
+        // operation rather than allocating a second copy of it. Repeated pulls are exactly what
+        // issue #197 is about, so the usual case for this is the one that used to cost most. Only
+        // the `Arc` is shared: op ids stay distinct, so `aggregate_serve_records` still groups and
+        // digest-checks each pull separately (review round 3 f7, confirmed round 4).
+        let text: Arc<str> = digest
+            .as_ref()
+            .and_then(|d| {
+                self.ops
+                    .values()
+                    .find(|existing| existing.digest.as_deref() == Some(d.as_str()))
+                    .map(|existing| Arc::clone(&existing.text))
+            })
+            .unwrap_or_else(|| Arc::from(composed.text.as_str()));
         let end = self.page_end(&text, 0, limit);
         let content = text[..end].to_string();
         let terminal = end >= text.len();
+        self.ops.insert(
+            op.clone(),
+            DiffOp {
+                text,
+                canonical,
+                complete: composed.complete,
+                digest: digest.clone(),
+            },
+        );
         let cursor = if terminal {
             None
         } else {
             Some(self.store_cursor(
                 "repository_diff",
-                vec![json!({
-                    "text": text, "offset": end, "op": op,
-                    "canonical": canonical, "complete": composed.complete
-                })],
+                vec![json!({"offset": end, "op": op})],
                 0,
                 true,
             ))
         };
-        self.append_serve_record(&json!({
+        let staged = self.stage();
+        staged.op_stored = Some(op.clone());
+        // A one-page pull is born finished: retire the operation when this page commits, rather
+        // than leaving its text held for the rest of the turn.
+        staged.op_finished = terminal.then(|| op.clone());
+        staged.cursor_stored = cursor.clone();
+        staged.serve_record = Some(json!({
             "op": op,
             "canonical": canonical,
             "complete": composed.complete,
@@ -1481,11 +1686,6 @@ impl Core {
             .values
             .first()
             .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?;
-        let text = item
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
-            .to_string();
         let offset = item
             .get("offset")
             .and_then(Value::as_u64)
@@ -1494,16 +1694,22 @@ impl Core {
         let op = item
             .get("op")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .ok_or_else(|| EvidenceError::new("invalid_cursor", "malformed diff cursor"))?
             .to_string();
-        let canonical = item
-            .get("canonical")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let complete = item
-            .get("complete")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // The text, and the identity this chain records, live on the operation rather than in every
+        // cursor (issue #197). An operation missing here means its chain was already retired.
+        let diff_op = self.ops.get(&op).ok_or_else(|| {
+            EvidenceError::new(
+                "invalid_cursor",
+                "the diff this cursor continues is no longer held; pull repository_diff again",
+            )
+        })?;
+        let text = Arc::clone(&diff_op.text);
+        let canonical = diff_op.canonical;
+        let complete = diff_op.complete;
+        // Hold the consumed cursor so a page that is refused, cancelled, replaced or lost can be
+        // retried at this very offset instead of forcing a fresh pull from byte 0 (round 1 f3).
+        self.stage().cursor_taken = Some((token.to_string(), state));
         let end = self.page_end(&text, offset, limit);
         let content = text[offset..end].to_string();
         let terminal = end >= text.len();
@@ -1512,15 +1718,15 @@ impl Core {
         } else {
             Some(self.store_cursor(
                 "repository_diff",
-                vec![json!({
-                    "text": text, "offset": end, "op": op,
-                    "canonical": canonical, "complete": complete
-                })],
+                vec![json!({"offset": end, "op": op})],
                 0,
                 true,
             ))
         };
-        self.append_serve_record(&json!({
+        let staged = self.stage();
+        staged.cursor_stored = cursor.clone();
+        staged.op_finished = terminal.then(|| op.clone());
+        staged.serve_record = Some(json!({
             "op": op,
             "canonical": canonical,
             "complete": complete,
@@ -1585,15 +1791,19 @@ impl Core {
             let root = root.clone();
             let limits = limits.clone();
             let cancel = Arc::clone(&cancel);
-            let outcome =
-                run_bounded_walk(&CHILD_WATCHDOG, "git ls-files", received_at, move || {
+            let outcome = run_bounded_walk(
+                self.child_watchdog,
+                "git ls-files",
+                received_at,
+                move || {
                     Ok(super::git::reviewable_paths(
                         &root,
                         &limits,
                         &cancel,
                         received_at,
                     ))
-                })?;
+                },
+            )?;
             match scan_source(outcome) {
                 ScanSource::Refused(e) => return Err(e),
                 other => other,
@@ -4035,6 +4245,7 @@ mod tests {
                 "captured".into(),
                 Some(change),
                 Some(ceiling as u32),
+                Limits::default(),
             )
             .unwrap();
             let mut core = Core::new(bundle).unwrap();
@@ -4116,6 +4327,7 @@ mod tests {
             "captured".into(),
             None,
             Some(ceiling as u32),
+            Limits::default(),
         )
         .unwrap();
         let mut core = Core::new(bundle).unwrap();
@@ -4162,6 +4374,7 @@ mod tests {
             "captured".into(),
             None,
             Some(ceiling as u32),
+            Limits::default(),
         )
         .unwrap();
         let mut core = Core::new(bundle).unwrap();
@@ -5510,5 +5723,265 @@ foreach ($f in $in.files) {{
             .text
             .contains("=== generated text for new.bin omitted: over budget ==="));
         assert!(!over.complete);
+    }
+
+    // ---- issue #197: the paging transaction, the operation lifecycle, and the envelope bound ----
+
+    /// A child pool of this test module's own, with headroom — the same remedy, and the same
+    /// reasoning, as `ISOLATED_WALK` one pool over. The production pool is capped at two because
+    /// the service is serial; a test harness is not, so tests that compose a real diff refuse each
+    /// other (and whatever else the suite is running) with `read_unavailable`. Serializing only
+    /// these tests was not enough: the cap is global and other tests draw on it too.
+    static ISOLATED_CHILD_LIVE: AtomicUsize = AtomicUsize::new(0);
+    static ISOLATED_CHILD: ReadWatchdog = ReadWatchdog {
+        budget: Duration::from_millis(REQUEST_BUDGET_MS),
+        attempt_cap: Duration::from_millis(REQUEST_BUDGET_MS),
+        backoff: Duration::ZERO,
+        max_attempts: 1,
+        live: &ISOLATED_CHILD_LIVE,
+        cap: 64,
+    };
+
+    /// A bundle over `binding_repo`'s worktree, with a serve-record sink and overridable limits.
+    ///
+    /// The record goes in a directory of its own, never in the repository: the canonical diff
+    /// composes untracked files in, so a record file under the root would change the very diff
+    /// these tests page — and make a second pull of an unchanged tree differ from the first. That
+    /// is issue #197's own inflation mechanism, and it caught this fixture first.
+    #[allow(clippy::type_complexity)]
+    fn diff_core(
+        name: &str,
+        tune: impl FnOnce(&mut Limits),
+    ) -> Option<(
+        crate::testutil::TempDir,
+        crate::testutil::TempDir,
+        String,
+        Core,
+        PathBuf,
+    )> {
+        let (dir, base, _head) = binding_repo(name, &[], "\n")?;
+        let root = dir.as_path().to_path_buf();
+        let mut bundle = git_bundle(&root);
+        let mut limits = Limits::default();
+        tune(&mut limits);
+        bundle.limits = limits;
+        let mut core = Core::new(bundle).unwrap();
+        core.child_watchdog = &ISOLATED_CHILD;
+        let outside = temp_dir(&format!("{name}-rec"));
+        let record = outside.as_path().join("serverecord.jsonl");
+        core.set_serve_record(record.clone());
+        Some((dir, outside, base, core, record))
+    }
+
+    fn records(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The whole point of holding the text on the operation: a chain of N pages keeps one copy of
+    /// the composed diff, not N, and no cursor carries one.
+    #[test]
+    fn a_diff_chain_holds_one_copy_of_the_text_and_retires_it_on_the_terminal_page() {
+        let Some((_dir, _rec_dir, base, mut core, _rec)) = diff_core("ev197-chain", |_| {}) else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        let mut page = core
+            .call("repository_diff", &json!({"base": base, "limit_bytes": 64}))
+            .unwrap();
+        let mut pages = 1;
+        while let Some(cursor) = page["cursor"].as_str().map(str::to_string) {
+            assert_eq!(
+                core.ops.len(),
+                1,
+                "one live operation, whatever the page count"
+            );
+            let held = core.cursors.values().next().expect("the live cursor");
+            assert!(
+                held.values[0].get("text").is_none(),
+                "a cursor must not carry the diff text: {:?}",
+                held.values[0]
+            );
+            page = core
+                .call(
+                    "repository_diff",
+                    &json!({"cursor": cursor, "limit_bytes": 64}),
+                )
+                .unwrap();
+            pages += 1;
+        }
+        assert!(
+            pages > 2,
+            "the fixture diff should take several 64-byte pages, took {pages}"
+        );
+        // Terminal page committed, so the operation and its text are gone rather than held for the
+        // rest of the turn.
+        assert!(core.ops.is_empty(), "a finished operation is retired");
+        assert!(
+            core.cursors.is_empty(),
+            "no cursor outlives a terminal page"
+        );
+    }
+
+    /// The rollback half of the transaction. A page refused by the cumulative byte cap must leave
+    /// the counter untouched and its cursor usable, so the reviewer retries that page instead of
+    /// recomposing the whole diff from byte 0 — the behaviour issue #197 was actually about.
+    #[test]
+    fn a_page_refused_by_the_byte_cap_rolls_back_and_the_same_cursor_still_works() {
+        // Room for a couple of small pages and no more.
+        // A small, *consistent* budget: `validate` requires one whole response to fit the
+        // cumulative cap, and a response must clear the envelope reserve. So a page is up to
+        // 4 KiB here and the whole turn is 8 KiB — room for the first page and not the second.
+        let Some((dir, _rec_dir, base, mut core, rec)) = diff_core("ev197-rollback", |l| {
+            l.max_response_bytes = 8 * 1024;
+            l.max_total_bytes = 8 * 1024;
+        }) else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        // Make the change big enough to need several of those pages. An untracked file does it,
+        // since the canonical diff composes those in whole — the same property that inflates the
+        // served diff well past `git diff` in issue #197.
+        fs::write(dir.as_path().join("big.txt"), "x\n".repeat(8 * 1024)).unwrap();
+        let first = core
+            .call(
+                "repository_diff",
+                &json!({"base": base, "limit_bytes": 4000}),
+            )
+            .unwrap();
+        let cursor = first["cursor"]
+            .as_str()
+            .expect("a multi-page diff")
+            .to_string();
+        let charged = core.returned_bytes;
+        assert!(charged > 0, "the first page committed its bytes");
+        // The next page of the same size cannot fit what is left of the budget.
+        let err = core
+            .call(
+                "repository_diff",
+                &json!({"cursor": cursor.clone(), "limit_bytes": 4000}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "limit_exceeded", "{}", err.message);
+        assert_eq!(
+            core.returned_bytes, charged,
+            "a refused page must charge nothing"
+        );
+        assert!(
+            core.cursors.contains_key(&cursor),
+            "the refused page's cursor is restored, so it can be retried"
+        );
+        assert_eq!(
+            core.ops.len(),
+            1,
+            "its operation is still held for the retry"
+        );
+        // And the retry works, at the same offset, with a page that fits.
+        let retried = core
+            .call(
+                "repository_diff",
+                &json!({"cursor": cursor, "limit_bytes": 16}),
+            )
+            .unwrap();
+        assert!(retried["diff"].as_str().is_some_and(|d| !d.is_empty()));
+        // The refusal is reported to the caller, and carries no `op` so the floor ignores it.
+        let written = records(&rec);
+        let refusals: Vec<&Value> = written
+            .iter()
+            .filter(|r| r.get("refused").is_some())
+            .collect();
+        assert_eq!(refusals.len(), 1, "{written:?}");
+        assert!(refusals[0].get("op").is_none());
+    }
+
+    /// The false-approval half. A page the reviewer never received must not be recorded as served:
+    /// the gate reads these records, and `terminal: true` on an undelivered page is what let an
+    /// approval rest on a diff that was never finished.
+    #[test]
+    fn a_rolled_back_page_writes_no_serve_record() {
+        let Some((_dir, _rec_dir, base, mut core, rec)) = diff_core("ev197-record", |_| {}) else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        // One page, terminal, but rolled back as cancellation or `response_too_large` would.
+        let page = core
+            .call_with_receipt("repository_diff", &json!({"base": base}), Instant::now())
+            .unwrap();
+        assert_eq!(
+            page["complete"], true,
+            "the fixture diff fits one default page"
+        );
+        core.rollback_pending();
+        assert!(
+            records(&rec).is_empty(),
+            "an undelivered page is not evidence: {:?}",
+            records(&rec)
+        );
+        assert!(
+            core.ops.is_empty(),
+            "and its operation is dropped, not left held"
+        );
+        assert_eq!(core.returned_bytes, 0, "and nothing is charged");
+        // Committing the same page instead does record it.
+        core.call("repository_diff", &json!({"base": base}))
+            .unwrap();
+        let written = records(&rec);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0]["terminal"], true);
+    }
+
+    /// An equal-digest re-pull shares the held text instead of allocating a second copy, which is
+    /// what bounds retention to one copy per distinct diff content (review round 3 f7).
+    #[test]
+    fn a_repeat_pull_of_an_unchanged_diff_shares_the_held_text() {
+        let Some((_dir, _rec_dir, base, mut core, _rec)) = diff_core("ev197-share", |_| {}) else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        // Page sizes small enough that both pulls stay open while we compare them.
+        let args = json!({"base": base, "limit_bytes": 64});
+        let a = core.call("repository_diff", &args).unwrap();
+        assert!(
+            a["cursor"].is_string(),
+            "need an unfinished chain to hold the op"
+        );
+        let b = core.call("repository_diff", &args).unwrap();
+        assert!(b["cursor"].is_string());
+        assert_eq!(core.ops.len(), 2, "two distinct operations");
+        let mut held = core.ops.values();
+        let (first, second) = (held.next().unwrap(), held.next().unwrap());
+        assert_eq!(first.digest, second.digest, "same tree, same digest");
+        assert!(
+            Arc::ptr_eq(&first.text, &second.text),
+            "an equal-digest re-pull shares one allocation"
+        );
+    }
+
+    /// `max_change_bytes` sits under `max_response_bytes`, so only escaping can push a page past
+    /// the transport cap. Before issue #197 that refused a legal request and destroyed the chain.
+    #[test]
+    fn a_page_of_escape_heavy_text_still_fits_the_response_cap() {
+        let dir = temp_dir("ev197-envelope");
+        let core = Core::new(bundle(dir.as_path())).unwrap();
+        let limits = Limits::default();
+        // Every byte costs 6 encoded, the worst `json_escaped_char_len` case.
+        let text: String = std::iter::repeat_n('\u{1}', limits.max_change_bytes as usize).collect();
+        let end = core.page_end(&text, 0, limits.max_change_bytes as usize);
+        assert!(end > 0, "a page must always advance");
+        assert!(
+            end < text.len(),
+            "this input is only interesting if the bound actually bit"
+        );
+        // A worst-case-shaped result: the page, plus a cursor token of the real format.
+        let page = text_result("diff", text[..end].to_string(), end, Some("n".repeat(96)));
+        let encoded = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            encoded <= limits.max_response_bytes as usize,
+            "a served page must fit the response cap: {encoded} bytes"
+        );
     }
 }
