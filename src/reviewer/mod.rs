@@ -1317,6 +1317,28 @@ pub fn codex_sterile_dir(cfg: &Config, session: &str) -> std::io::Result<Sterile
     Err(last.unwrap_or_else(|| std::io::Error::other("no safe sterile directory is available")))
 }
 
+/// How long a `--version` probe may take before it is abandoned. Generous for a cold start of a
+/// large Node binary, short enough that a hung CLI cannot stall a status call for long.
+const CLI_VERSION_PROBE: Duration = Duration::from_secs(15);
+
+/// The longest `--version` line worth showing. A CLI that ignores the flag and prints its help
+/// instead should not be able to push a screenful into a status response.
+const MAX_CLI_VERSION_LINE: usize = 120;
+
+/// The first non-empty line of a `--version` probe's stdout, trimmed, or `None` when there is
+/// none or it is implausibly long.
+///
+/// Deliberately not parsed into a version number: each CLI prints a line of its own shape
+/// (`2.1.308 (Claude Code)`, `codex-cli 0.5.1`), and the caller shows it rather than comparing
+/// it. Nothing in this server decides anything from the value.
+fn first_version_line(stdout: &str) -> Option<String> {
+    let line = stdout.lines().find(|l| !l.trim().is_empty())?.trim();
+    if line.len() > MAX_CLI_VERSION_LINE {
+        return None;
+    }
+    Some(line.to_string())
+}
+
 pub trait Reviewer: Send + Sync {
     /// Cheap check that the CLI exists and is signed in. Runs before we spend a
     /// model call, so an unconfigured machine fails fast and legibly.
@@ -1331,6 +1353,31 @@ pub trait Reviewer: Send + Sync {
         spec: &ReviewerSpec,
         cancel: &AtomicBool,
     ) -> Result<String, Failure>;
+
+    /// The reviewer CLI's own version string, for `status` / `--doctor` only -- never the review
+    /// path, which should not pay a spawn for a diagnostic.
+    ///
+    /// A reviewer CLI that is only ever invoked by this server does not self-update: the vendor
+    /// updaters run from an interactive session, and these children are print-mode runs in an
+    /// isolated config home. On a machine where cross-review was the Claude CLI's only caller the
+    /// binary sat a month behind on a build whose headless OAuth refresh was broken, and the
+    /// status output named only the resolved path -- so the drift was invisible while it expired
+    /// the reviewer's sign-in every eight hours. The version is what makes it visible.
+    ///
+    /// Best-effort by construction: `None` when the probe fails, times out, or prints nothing.
+    /// A diagnostic that could fail a status call would be worse than no diagnostic.
+    fn cli_version(&self, bin: &Path, cfg: &Config, cancel: &AtomicBool) -> Option<String> {
+        let mut cmd = Command::new(bin);
+        // Outside the project, like every other probe: `--version` must not be the one child
+        // that loads the reviewed repository's configuration.
+        cmd.current_dir(neutral_dir(cfg));
+        cmd.arg("--version");
+        let out = run(cmd, "", CLI_VERSION_PROBE, cancel).ok()?;
+        if !out.success {
+            return None;
+        }
+        first_version_line(&out.stdout)
+    }
 
     /// Build the command for one child.
     ///

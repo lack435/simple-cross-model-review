@@ -520,8 +520,9 @@ session's latest envelope.
 
 ## When the reviewer is unavailable
 
-The tool call fails loudly with a machine-readable code, an explanation, and the exact
-remediation to hand the user:
+The tool call fails loudly with a machine-readable code, an explanation, and the
+remediation to hand the user. Abbreviated here -- the real block also covers a reviewer
+pinned to an account profile, which a terminal login does not reach:
 
 ```
 CROSS-MODEL REVIEW FAILED

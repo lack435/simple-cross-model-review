@@ -2262,6 +2262,16 @@ impl App {
             match self.ensure_ready_for(i, &AtomicBool::new(false)) {
                 Ok(ready) => {
                     out.push_str(&format!("cli:           {}\n", ready.bin.display()));
+                    // Beside the path, because the path alone hid a month-old reviewer binary
+                    // on a machine where this server was its only caller (see `cli_version`).
+                    // Silent when the probe says nothing -- a diagnostic never fails a status.
+                    if let Some(version) = reviewer::for_kind(spec.reviewer).cli_version(
+                        &ready.bin,
+                        &self.cfg,
+                        &AtomicBool::new(false),
+                    ) {
+                        out.push_str(&format!("cli version:   {version}\n"));
+                    }
                     out.push_str(&format!(
                         "auth:          {}\n",
                         ready.auth.replace('\n', " ")

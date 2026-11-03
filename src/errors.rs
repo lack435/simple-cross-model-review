@@ -174,6 +174,21 @@ pub fn cli_not_found(reviewer: &str, tried: &[String]) -> Failure {
     .with_detail(format!("Looked for:\n{}", tried.join("\n")))
 }
 
+/// Appended to both sign-in failures. The terminal login they name signs in the *ambient*
+/// config home, which a reviewer pinned to an account profile never reads -- so for a pinned
+/// reviewer that command reports success and changes nothing the review will use. Stated as
+/// text rather than threaded through as a parameter: the classifier that raises these holds the
+/// reviewer's stderr, not its chain entry, and naming both paths costs three lines against
+/// plumbing a profile selector into every call site.
+const PROFILE_LOGIN_NOTE: &str = "If this reviewer is pinned to an account profile \
+     (--claude-profile / --codex-profile), the login above signs in the ambient config home, \
+     which the review does not read. Sign the profile in itself instead, from an agent \
+     session:\n\n\
+     \x20 cross_model_setup_profile { reviewer: \"<claude|codex>\", profile: \"<name>\", \
+     login: true }\n\n\
+     For a reviewer pinned to an explicit home (--claude-config-dir / --codex-home), pass that \
+     path as `home` in place of `profile`.";
+
 pub fn not_authenticated(reviewer: &str, detail: impl Into<String>) -> Failure {
     let (login_cmd, note) = match reviewer {
         "codex" => ("codex login", "This signs in with your ChatGPT account."),
@@ -191,7 +206,8 @@ pub fn not_authenticated(reviewer: &str, detail: impl Into<String>) -> Failure {
              To fix it, run this in a terminal:\n\n\
              \x20 {login_cmd}\n\n\
              {note}\n\n\
-             Once it reports success, retry the review."
+             Once it reports success, retry the review.\n\n\
+             {PROFILE_LOGIN_NOTE}"
         ),
     )
     .with_detail(detail)
@@ -214,7 +230,8 @@ pub fn auth_expired(reviewer: &str, detail: impl Into<String>) -> Failure {
              rejected (expired or revoked).\n\n\
              To fix it, run this in a terminal:\n\n\
              \x20 {login_cmd}\n\n\
-             Then retry the review."
+             Then retry the review.\n\n\
+             {PROFILE_LOGIN_NOTE}"
         ),
     )
     .with_detail(detail)
@@ -1029,6 +1046,13 @@ pub fn classify(
         "token expired",
         "expired credentials",
         "oauth token",
+        // How the Claude CLI words it when a headless run finds the access token past its
+        // `expiresAt` and the refresh does not go through: "Failed to authenticate: OAuth
+        // session expired and could not be refreshed". It names neither a token nor
+        // credentials, so without this it fell through to the generic REVIEWER_FAILED and the
+        // caller was handed "the CLI exited unsuccessfully" with no remediation -- a sign-in
+        // expiry that reads as a crash.
+        "oauth session expired",
     ]) {
         return auth_expired(reviewer, detail);
     }
