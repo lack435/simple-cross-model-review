@@ -303,7 +303,32 @@ Use the existing capture budget as the parent ceiling and add per-call limits be
 - bounded MCP request and response sizes; and
 - cancellation propagated from review cancellation and job termination.
 
-All counters use checked arithmetic. Directory walks are iterative and deterministic. The
+**What those numbers bound, and what they do not** (added for issue #197, which found the
+question unanswered anywhere — `git log -S` puts the original `max_calls: 96` / `max_total_bytes:
+2 MiB` / `default_change_bytes: 48 KiB` in the first evidence-service commit with an empty message
+body):
+
+- They are a **cost and runaway bound**, not a security boundary. Nothing in the read-only posture,
+  the path confinement or the isolation depends on their values; the reviewer still cannot write,
+  and still cannot read outside the root, whatever they are set to. What they limit is how much one
+  turn may read and how many calls it may spend doing so.
+- They are therefore **configurable**: `--evidence-max-calls` and `--evidence-max-bytes` raise the
+  per-turn budget, per repository (each companion server keeps its own). Neither has a 0-disables
+  form, because `repository_scope` reports `limits` to the reviewer against an output schema that
+  pins every field to `minimum: 1`, and Codex validates `structuredContent` against it.
+- `max_response_bytes` and the page sizes are a **different kind of limit** and are not
+  configurable: they keep a single response transportable. A page is bounded by the serialized
+  JSON-RPC envelope (`Core::page_end`, less `ENVELOPE_RESERVE`), so a legal `limit_bytes` can never
+  produce a response the transport has to replace.
+- The per-turn budget interacts with the approval floor, which is why #197 existed: an approving
+  turn must be served the *complete* canonical diff, and that walk is charged to the same budget
+  that funds reading the code. A walk is now resumable at the page that broke rather than only from
+  byte 0, and refusals are reported to the caller, so a budget that is genuinely too small says so
+  instead of surfacing as the reviewer's own `blocked` verdict.
+
+All counters use checked arithmetic, and a page's byte charge is applied only once its response has
+been written — never when it is refused, cancelled, or replaced (issue #197). Directory walks are
+iterative and deterministic. The
 child logs diagnostics only to stderr. Phase 0 verifies whether Codex's MCP child inherits
 the outer reviewer job. Independently, the evidence service puts every provider subprocess
 in its own kill-on-close job, watches stdio EOF/parent death, and terminates its provider job

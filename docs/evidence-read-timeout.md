@@ -238,6 +238,12 @@ stdio) runs **outside** that job (Phase 0 observed exactly this — see
 budget (`Limits::max_calls`), a pathological run could strand on the order of ~192 blocked threads,
 each holding a file handle and a stack.
 
+> **Since issue #197, `max_calls` is configurable** (`--evidence-max-calls`, default 96, max 1024),
+> so this worst case scales with it: at the maximum it would be ~2,048 rather than ~192. That does
+> not change the conclusion below, because the bound that actually holds is the hard worker cap, not
+> the call budget — the cap is what converts unbounded growth into a deterministic in-band error,
+> and it is unchanged. The call budget only sets how many times a turn can try.
+
 So accumulation is capped explicitly rather than assumed away. The service holds an atomic counter
 of **outstanding abandoned read workers**. When a read times out, the worker is abandoned and the
 counter increments; when an abandoned worker's syscall finally returns and it exits, it decrements.

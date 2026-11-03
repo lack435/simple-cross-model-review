@@ -785,6 +785,16 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 /// cap is derived from the timeout, which makes those deadline sites easier to reach.
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+/// Upper bound on `--evidence-max-calls`. The evidence server sizes its intake queue from this
+/// budget (`evidence::intake_slots`, clamped at 1024), so a larger value buys no more queue, and
+/// `docs/evidence-read-timeout.md` derives its abandoned-worker analysis from the same number.
+pub const MAX_EVIDENCE_CALLS: u32 = 1024;
+
+/// Upper bound on `--evidence-max-bytes`. A cost bound rather than a correctness one: the per-
+/// response cap and the page sizes are what keep any single response transportable, so this only
+/// limits how much a single turn may read in total.
+pub const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Headroom folded into the collect wait cap on top of the capture budget and the reviewer turn.
 /// It covers the tail after the reviewer clock stops — output drain, transcript parse, session
 /// persistence — so a single blocking `cross_model_review_result` observes the terminal state in
@@ -881,6 +891,12 @@ pub struct Config {
     /// `docs/reviewer-account-profiles-impl.md` (Phase 3 → Allowlist store, `[f7]`).
     pub launch_root: PathBuf,
     pub timeout: Duration,
+    /// The reviewer's per-turn evidence budget: how many calls it may make, and how many bytes it
+    /// may be served in total (issue #197). Neither has a 0-disables form — see the parser. Applied
+    /// to `Limits::default()` by [`Config::evidence_limits`], which is the only place the flags
+    /// become limits, and carried to the evidence server in its bundle.
+    pub evidence_max_calls: u32,
+    pub evidence_max_bytes: u64,
     /// Refuse to resume a session idle longer than this. Zero disables the check. See
     /// `DEFAULT_RESUME_MAX_IDLE_SECS`. A tripped session is refused with
     /// SESSION_NOT_RESUMABLE, not silently restarted, so the caller decides to start fresh.
@@ -1016,6 +1032,18 @@ pub struct AuthorizedHome {
 }
 
 impl Config {
+    /// The per-turn evidence budget to hand the evidence server, as the flags configure it
+    /// (issue #197). The only place `--evidence-max-calls` / `--evidence-max-bytes` become
+    /// `Limits`; everything else in `Limits` keeps its default, which `Limits::validate` then
+    /// re-checks for consistency when the server reads its bundle.
+    pub fn evidence_limits(&self) -> crate::evidence::Limits {
+        crate::evidence::Limits {
+            max_calls: self.evidence_max_calls,
+            max_total_bytes: self.evidence_max_bytes,
+            ..crate::evidence::Limits::default()
+        }
+    }
+
     pub fn from_args(args: &[String]) -> Result<Self, String> {
         // The immutable launch root, captured from the ambient process cwd *before* any argument
         // is read, so no flag — least of all `--cwd` — can influence it. This is the Phase 3
@@ -1040,6 +1068,8 @@ impl Config {
         let mut stagnant_session_turns = DEFAULT_STAGNANT_SESSION_TURNS;
         let mut block_repair_attempts = DEFAULT_BLOCK_REPAIR_ATTEMPTS;
         let mut block_repair_timeout_secs = DEFAULT_BLOCK_REPAIR_TIMEOUT_SECS;
+        let mut evidence_max_calls = crate::evidence::Limits::default().max_calls;
+        let mut evidence_max_bytes = crate::evidence::Limits::default().max_total_bytes;
         let mut max_concurrent_reviews = DEFAULT_MAX_CONCURRENT_REVIEWS;
         let mut max_policy_denials = DEFAULT_MAX_POLICY_DENIALS;
         let mut max_policy_idle_secs = DEFAULT_MAX_POLICY_IDLE_SECS;
@@ -1187,6 +1217,49 @@ impl Config {
                         return Err(format!(
                             "--timeout-seconds must be at most {MAX_TIMEOUT_SECS} ({}h), got {timeout_secs}",
                             MAX_TIMEOUT_SECS / 3600
+                        ));
+                    }
+                }
+                // The reviewer's per-turn evidence budget (issue #197). Neither flag has a
+                // 0-disables form, unlike the resume limits: the budget is reported to the reviewer
+                // inside `repository_scope`, whose output schema pins every `Limits` field to
+                // `minimum: 1`, and Codex validates `structuredContent` against it.
+                "--evidence-max-calls" => {
+                    let v = take("--evidence-max-calls")?;
+                    evidence_max_calls = v.parse().map_err(|_| {
+                        format!("--evidence-max-calls must be an integer, got '{v}'")
+                    })?;
+                    if evidence_max_calls == 0 {
+                        return Err(
+                            "--evidence-max-calls must be greater than 0 (there is no value that \
+                             disables the evidence budget)"
+                                .into(),
+                        );
+                    }
+                    if evidence_max_calls > MAX_EVIDENCE_CALLS {
+                        return Err(format!(
+                            "--evidence-max-calls must be at most {MAX_EVIDENCE_CALLS}, got {evidence_max_calls}"
+                        ));
+                    }
+                }
+                "--evidence-max-bytes" => {
+                    let v = take("--evidence-max-bytes")?;
+                    evidence_max_bytes = v.parse().map_err(|_| {
+                        format!(
+                            "--evidence-max-bytes must be an integer number of bytes, got '{v}'"
+                        )
+                    })?;
+                    let floor = crate::evidence::Limits::default().max_response_bytes as u64;
+                    if evidence_max_bytes < floor {
+                        return Err(format!(
+                            "--evidence-max-bytes must be at least {floor}, one whole response \
+                             (max_response_bytes), got {evidence_max_bytes}"
+                        ));
+                    }
+                    if evidence_max_bytes > MAX_EVIDENCE_BYTES {
+                        return Err(format!(
+                            "--evidence-max-bytes must be at most {MAX_EVIDENCE_BYTES} ({} MiB), got {evidence_max_bytes}",
+                            MAX_EVIDENCE_BYTES / (1024 * 1024)
                         ));
                     }
                 }
@@ -1593,6 +1666,8 @@ impl Config {
             cwd,
             launch_root,
             timeout: Duration::from_secs(timeout_secs),
+            evidence_max_calls,
+            evidence_max_bytes,
             resume_max_idle: Duration::from_secs(resume_max_idle_secs),
             resume_max_turns,
             stagnant_session_turns,
@@ -2517,6 +2592,16 @@ OPTIONS:
                               Optional; unset never gates.
   --cwd <path>                Working root for the reviewer. Default: this process's cwd.
   --timeout-seconds <n>       Hard kill for a single review turn. Default: 1800. Max: 86400 (24h).
+  --evidence-max-calls <n>    How many repository-evidence calls the reviewer may make in one
+                              turn. Raise it for a large branch: a reviewer must be served the
+                              whole change before it can approve, and that walk plus the reads
+                              it funds share this budget. Refusals past it are reported to the
+                              caller as a warning. There is no value that disables it.
+                              Default: 96. Max: 1024.
+  --evidence-max-bytes <n>    Total bytes of repository evidence the reviewer may be served in
+                              one turn. Same reasoning as above; counted on the serialized
+                              responses, so it is not the raw diff size. At least one whole
+                              response (262144). Default: 2097152 (2 MiB). Max: 67108864 (64 MiB).
   --max-concurrent-reviews <n>
                               Per-process cap on reviews running at once. A backstop against a
                               runaway caller, not a normal limit; a serial flow runs one at a
@@ -4116,6 +4201,61 @@ mod tests {
         ]))
         .expect_err("a non-integer is rejected");
         assert!(err.contains("--stagnant-session-turns"), "{err}");
+    }
+
+    /// Issue #197. The one flag pair with no disabling value: the budget is reported to the
+    /// reviewer inside `repository_scope`, whose schema pins every `Limits` field to `minimum: 1`.
+    #[test]
+    fn evidence_budget_flags_default_override_and_refuse_a_disabling_value() {
+        let defaults = crate::evidence::Limits::default();
+        let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
+        assert_eq!(cfg.evidence_max_calls, defaults.max_calls);
+        assert_eq!(cfg.evidence_max_bytes, defaults.max_total_bytes);
+        assert_eq!(cfg.evidence_limits().max_calls, defaults.max_calls);
+
+        let cfg = Config::from_args(&args(&[
+            "--reviewer",
+            "codex",
+            "--evidence-max-calls",
+            "400",
+            "--evidence-max-bytes",
+            "8388608",
+        ]))
+        .expect("config");
+        assert_eq!(cfg.evidence_max_calls, 400);
+        assert_eq!(cfg.evidence_max_bytes, 8 * 1024 * 1024);
+        // And the overrides are what actually reach the evidence server, with the rest of `Limits`
+        // left at its default and still internally consistent.
+        let limits = cfg.evidence_limits();
+        assert_eq!(limits.max_calls, 400);
+        assert_eq!(limits.max_total_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.max_response_bytes, defaults.max_response_bytes);
+        assert!(limits.validate().is_ok());
+
+        let cases = [
+            (vec!["--evidence-max-calls", "0"], "--evidence-max-calls"),
+            (
+                vec!["--evidence-max-calls", "99999"],
+                "--evidence-max-calls",
+            ),
+            (vec!["--evidence-max-calls", "lots"], "--evidence-max-calls"),
+            (vec!["--evidence-max-bytes", "0"], "--evidence-max-bytes"),
+            // Below one whole response, which `Limits::validate` would reject outright.
+            (vec!["--evidence-max-bytes", "1024"], "--evidence-max-bytes"),
+            (
+                vec!["--evidence-max-bytes", "999999999999"],
+                "--evidence-max-bytes",
+            ),
+        ];
+        for (flag, expected) in cases {
+            let mut argv = vec!["--reviewer", "codex"];
+            argv.extend(flag.iter().copied());
+            let err =
+                Config::from_args(&args(&argv)).expect_err(&format!("{flag:?} should be rejected"));
+            assert!(err.contains(expected), "{err}");
+        }
+        assert!(USAGE.contains("--evidence-max-calls"));
+        assert!(USAGE.contains("--evidence-max-bytes"));
     }
 
     #[test]

@@ -2373,6 +2373,12 @@ impl App {
         }
         out.push_str(&format!("turn timeout:  {}s\n", self.cfg.timeout.as_secs()));
         out.push_str(&format!(
+            "evidence budget: {} calls, {} MiB per turn (per repository; raise with \
+             --evidence-max-calls / --evidence-max-bytes)\n",
+            self.cfg.evidence_max_calls,
+            self.cfg.evidence_max_bytes / (1024 * 1024),
+        ));
+        out.push_str(&format!(
             "resume limits: {}, {} (a session past either is refused, not silently restarted)\n",
             match self.cfg.resume_max_turns {
                 0 => "no turn cap".to_string(),
@@ -4208,6 +4214,7 @@ impl Job {
                     // in Claude-safe slices so a large repository_diff still reaches the model
                     // (issue #114). Codex has no such cap and is served at the full limit.
                     claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
+                    self.cfg.evidence_limits(),
                 )
                 .map_err(|e| errors::evidence_unavailable(e.to_string()))?;
                 bundle.capture_hook = git_capture_hook.cloned();
@@ -4888,6 +4895,18 @@ impl Job {
                             .map(|c| format!("'{}'", c.name))
                             .collect::<Vec<_>>()
                             .join(", ")
+                    ));
+                }
+                // A rationed turn, said out loud (issue #197). Without this the caller sees only the
+                // reviewer's own verdict — and a reviewer refused evidence until it gives up reports
+                // `blocked`, which reads as its judgement rather than as a budget it ran into. No
+                // outcome is inferred from this: the count is evidence for the caller, not a verdict.
+                if agg.refusals > 0 {
+                    warnings_from_repair.push(format!(
+                        "the repository evidence service refused {} call(s) this turn for want of \
+                         budget, so the reviewer saw less of the change than it asked for. Re-review \
+                         this session, or raise --evidence-max-calls / --evidence-max-bytes.",
+                        agg.refusals
                     ));
                 }
                 floored
@@ -5861,6 +5880,9 @@ impl CompanionEvidence {
             label,
             None,
             claude_in_scope.then_some(crate::evidence::CLAUDE_PAGE_BYTES_CEILING),
+            // Each companion server keeps its own budget, so the configured value is per
+            // repository, as `docs/companion-repositories-plan.md` already notes.
+            cfg.evidence_limits(),
         )
         .map_err(|e| format!("companion '{}': {e}", c.name))?;
         let bundle_file = crate::evidence::write_bundle(cfg, &bundle)
@@ -5898,6 +5920,12 @@ struct DiffServeAggregate {
     /// Counts from the canonical operation, for the caller-facing `captured:` line (mechanism 5).
     /// `None` when no canonical operation was served.
     canonical: Option<CanonicalServe>,
+    /// How many evidence calls the service refused for want of budget (`limit_exceeded`) this turn
+    /// (issue #197). Reported to the caller because nothing else distinguishes a turn that was
+    /// rationed from a reviewer that gave up on the merits: `reviewer_blocked` is set only from the
+    /// reviewer's own verdict, and the server never infers it. Not part of the floor — a refusal
+    /// says the turn was thin, not that the change was served.
+    refusals: usize,
 }
 
 /// The canonical diff's resolved base and counts, taken from the serve-record, for the `captured:`
@@ -5944,6 +5972,7 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
     let mut any_diff = false;
+    let mut refusals = 0usize;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -5952,6 +5981,12 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        // A budget refusal carries no `op`: it is not a page and takes no part in the floor, only
+        // in what the caller is told about how thin the turn was (issue #197).
+        if value.get("refused").is_some() {
+            refusals += 1;
+            continue;
+        }
         let Some(op) = value.get("op").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -6040,6 +6075,7 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         any_diff,
         complete_canonical_terminal,
         canonical,
+        refusals,
     }
 }
 
@@ -6469,6 +6505,25 @@ mod tests {
         // A canonical op, complete and terminal in one page: floor cleared.
         let a = aggregate_serve_records(&op("x", true, true, d1, 8, false));
         assert!(a.any_diff && a.complete_canonical_terminal);
+        assert_eq!(a.refusals, 0);
+
+        // Issue #197: a budget refusal is counted for the caller and takes no part in the floor.
+        // It carries no `op`, so it can neither open an operation nor complete one — a turn that
+        // ran out of budget still has to have been served the whole change to approve.
+        let refused = aggregate_serve_records(
+            "{\"refused\":\"limit_exceeded\"}\n{\"refused\":\"limit_exceeded\"}",
+        );
+        assert_eq!(refused.refusals, 2);
+        assert!(
+            !refused.any_diff && !refused.complete_canonical_terminal,
+            "refusals are not evidence of anything being served"
+        );
+        let served_then_refused = aggregate_serve_records(&format!(
+            "{}\n{{\"refused\":\"limit_exceeded\"}}",
+            op("x", true, true, d1, 8, false)
+        ));
+        assert!(served_then_refused.complete_canonical_terminal);
+        assert_eq!(served_then_refused.refusals, 1);
 
         // A canonical op paged across two calls, terminal on the second: cleared. Only the first page
         // carries the digest and counts; the continuation carries the op id.
