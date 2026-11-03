@@ -5968,6 +5968,16 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         /// Content hash of the whole composed diff, from this operation's first page — the identity
         /// two canonical operations must share to be the same change. `None` if no page carried one.
         digest: Option<String>,
+        /// Two separate pulls were recorded under this one op id. An op is minted once per
+        /// `repository_diff` within a process, so this cannot happen legitimately; it is kept as a
+        /// fail-closed belt against a future collision, because the consequence is a false approval
+        /// (issue #200). A collided op keeps no digest, and `agree` reads a missing digest as
+        /// disagreement — which also poisons the whole canonical set, as it should.
+        collided: bool,
+        /// How many first (non-continuation) pages this op recorded; more than one is a collision.
+        first_pages: u32,
+        saw_canonical: bool,
+        saw_exploratory: bool,
         counts: Option<CanonicalServe>,
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
@@ -6002,10 +6012,34 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
             complete: true,
             ..Op::default()
         });
-        entry.canonical |= bool_field("canonical").unwrap_or(false);
+        let is_canonical = bool_field("canonical").unwrap_or(false);
+        let is_first_page = !bool_field("continuation").unwrap_or(false);
+        entry.canonical |= is_canonical;
         // A page missing `complete`, or reporting it false, downgrades the operation: fail-safe.
         entry.complete &= bool_field("complete").unwrap_or(false);
-        entry.terminal |= bool_field("terminal").unwrap_or(false);
+        // Terminal evidence for the canonical floor comes only from *canonical* pages. `canonical`
+        // and `terminal` are ORed independently, so without this an exploratory diff recorded under
+        // the same op id as a canonical pull that stopped early would donate its `terminal: true`
+        // and the merged op would read as a complete canonical walk (issue #200, review f1).
+        if is_canonical {
+            entry.terminal |= bool_field("terminal").unwrap_or(false);
+        }
+        // Signs that two separate pulls were recorded under one op id. Within a process an op id is
+        // minted once per `repository_diff`, so an op has exactly one first page and one canonical
+        // status; either being doubled means two pulls collided, and a collided op must not clear
+        // the floor whatever its parts say.
+        if is_first_page {
+            if entry.first_pages > 0 {
+                entry.collided = true;
+            }
+            entry.first_pages += 1;
+        }
+        if is_canonical {
+            entry.saw_canonical = true;
+        } else {
+            entry.saw_exploratory = true;
+        }
+        entry.collided |= entry.saw_canonical && entry.saw_exploratory;
         // The digest and counts ride on this operation's first page (the record carrying them), and
         // stay bound to *this* op id — not overwritten by a later, possibly different, canonical op.
         // The digest is the reconciliation identity; the counts are only for the `captured:` line.
@@ -6050,6 +6084,14 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     // case); a drifted re-pull that was left mid-pagination does not, because its digest differs. A
     // canonical op that never reached its terminal page, a canonical op with no digest at all (review
     // f2), and a narrowed/exploratory diff (never canonical) all still fail closed.
+    // A collided op has no trustworthy identity: drop it so `agree` fails closed on it, and drop
+    // its counts so the caller is not shown one pull's numbers for another's (issue #200).
+    for op in ops.values_mut() {
+        if op.collided {
+            op.digest = None;
+            op.counts = None;
+        }
+    }
     let canonical_ops: Vec<&Op> = ops.values().filter(|o| o.canonical).collect();
     // Same change across every canonical op: all must carry a digest, and all digests must be equal. A
     // canonical op missing its digest is a disagreement — fail closed rather than guess.
@@ -6506,6 +6548,71 @@ mod tests {
         let a = aggregate_serve_records(&op("x", true, true, d1, 8, false));
         assert!(a.any_diff && a.complete_canonical_terminal);
         assert_eq!(a.refusals, 0);
+
+        // Issue #200: two canonical first pages recorded under one op id are two different pulls
+        // merged into one record. The last digest used to win, which defeated the agreement check
+        // entirely — one op trivially agrees with itself, so a mid-review drift became invisible.
+        // Op ids are unique per evidence-server process now, so this is belt: it must fail closed.
+        let collided = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("x", true, true, d2, 9, false)
+        ));
+        assert!(
+            !collided.complete_canonical_terminal,
+            "two pulls merged under one op id cannot clear the floor"
+        );
+        // Whereas the same two pulls under their own op ids are two canonical ops that disagree,
+        // which is the case the digest check was built for and already handled.
+        let distinct = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("y", true, true, d2, 9, false)
+        ));
+        assert!(!distinct.complete_canonical_terminal);
+        // Even with *identical* digests. An op id is minted once per `repository_diff` within a
+        // process, so two first pages under one id is a collision however alike they look, and the
+        // op cannot be trusted to describe one pull.
+        let repeated = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("x", true, true, d1, 8, false)
+        ));
+        assert!(
+            !repeated.complete_canonical_terminal,
+            "two first pages under one op id is a collision whatever the digests say"
+        );
+
+        // Review f1 on the fix: `canonical` and `terminal` are ORed independently, so a collision
+        // could borrow terminal evidence from an *exploratory* diff. A canonical pull that stopped
+        // short, plus a non-canonical single-page diff under the same op id, must not add up to a
+        // complete canonical walk — and the digest guard alone would not catch it, since
+        // non-canonical records carry no digest to conflict with.
+        let borrowed = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, false, d1, 8, false),
+            r#"{"op":"x","canonical":false,"complete":true,"terminal":true}"#
+        ));
+        assert!(
+            !borrowed.complete_canonical_terminal,
+            "a canonical pull cannot borrow a terminal page from an exploratory diff"
+        );
+        // Nor may a canonical pull with no digest of its own be handed one by a colliding pull —
+        // a canonical op without a digest has always had to fail closed.
+        let donated = aggregate_serve_records(&format!(
+            "{}\n{}",
+            r#"{"op":"x","canonical":true,"complete":true,"terminal":true}"#,
+            op("x", true, true, d2, 9, false)
+        ));
+        assert!(!donated.complete_canonical_terminal);
+        // A legitimate canonical pull paged across calls is untouched by any of this: one first
+        // page, one canonical status, terminal on its own last page.
+        let paged_ok = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, false, d1, 8, false),
+            op("x", true, true, "", 0, true)
+        ));
+        assert!(paged_ok.complete_canonical_terminal);
 
         // Issue #197: a budget refusal is counted for the caller and takes no part in the floor.
         // It carries no `op`, so it can neither open an operation nor complete one — a turn that

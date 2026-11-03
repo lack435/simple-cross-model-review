@@ -588,6 +588,17 @@ pub struct Core {
     cursors: HashMap<String, CursorPage>,
     /// Live `repository_diff` pulls, keyed by the operation id `first_diff_page` mints.
     ops: HashMap<String, DiffOp>,
+    /// Distinguishes this evidence-server process from any other that writes to the same
+    /// serve-record file (issue #200).
+    ///
+    /// Operation ids used to be `{nonce}-diff-{calls}`, and the nonce is the *review* id: a block
+    /// or evidence repair reuses it, with a fresh `Core` whose call counter restarts at 0, while
+    /// appending to the serve-record the main run already wrote. So two processes could mint the
+    /// same op id, and `aggregate_serve_records` groups by op id — merging two different pulls into
+    /// one record whose digest is simply whichever was written last. That defeats the
+    /// digest-agreement check that exists to catch a mid-review re-pull of a *drifted* change
+    /// (issue #121): two disagreeing pulls collapse into one op that trivially agrees with itself.
+    launch: String,
     /// The effects of the call in flight; see [`PendingCommit`].
     pending: Option<PendingCommit>,
     next_cursor: u64,
@@ -653,6 +664,17 @@ impl Core {
             root,
             cursors: HashMap::new(),
             ops: HashMap::new(),
+            // Process id plus the nanoseconds this `Core` was built, the same shape the status
+            // preflight uses for its own one-off ids. Two evidence servers in one review run
+            // sequentially, so a reused process id is conceivable; the timestamp settles it.
+            launch: format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ),
             pending: None,
             next_cursor: 0,
             calls: 0,
@@ -1611,7 +1633,9 @@ impl Core {
         composed: ComposedDiff,
         limit: usize,
     ) -> Result<Value, EvidenceError> {
-        let op = format!("{}-diff-{}", self.bundle.nonce, self.calls);
+        // `launch` is what keeps this unique against a repair child that reuses the review nonce
+        // and restarts its call counter (issue #200).
+        let op = format!("{}-diff-{}-{}", self.bundle.nonce, self.launch, self.calls);
         // A content digest of the *whole* composed diff (which begins with the resolved-base header,
         // so the base is inside it) identifies this canonical change exactly. The approval gate uses
         // it to tell a benign repeat pull of one unchanged change from a mid-review re-pull of a
@@ -5971,6 +5995,48 @@ foreach ($f in $in.files) {{
             Arc::ptr_eq(&first.text, &second.text),
             "an equal-digest re-pull shares one allocation"
         );
+    }
+
+    /// Issue #200. A block or evidence repair runs as a *second* evidence-server process under the
+    /// same review nonce, appending to the same serve-record, with a fresh `Core` whose call
+    /// counter restarts at 0. Op ids built from `{nonce}-diff-{calls}` therefore collided, and
+    /// `aggregate_serve_records` groups by op id — so two different pulls merged into one record
+    /// and the later digest silently became the op's identity. Op ids must differ per process.
+    #[test]
+    fn two_evidence_servers_under_one_nonce_mint_different_op_ids() {
+        let Some((_dir, _rec_dir, base, mut first, rec_a)) = diff_core("ev200-a", |_| {}) else {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        };
+        // A second Core over the same root, with the *same* bundle nonce — what a repair child
+        // gets, since `run_block_repair` reuses the review id and the bundle.
+        let mut bundle = git_bundle(_dir.as_path());
+        bundle.limits = Limits::default();
+        let mut second = Core::new(bundle).unwrap();
+        second.child_watchdog = &ISOLATED_CHILD;
+        let rec_b = rec_a.parent().unwrap().join("second.jsonl");
+        second.set_serve_record(rec_b.clone());
+        assert_eq!(
+            first.bundle.nonce, second.bundle.nonce,
+            "the premise: a repair reuses the review nonce"
+        );
+
+        let args = json!({"base": base});
+        first.call("repository_diff", &args).unwrap();
+        second.call("repository_diff", &args).unwrap();
+        let op_of = |path: &PathBuf| {
+            records(path)[0]["op"]
+                .as_str()
+                .expect("a recorded op id")
+                .to_string()
+        };
+        let (a, b) = (op_of(&rec_a), op_of(&rec_b));
+        assert_ne!(
+            a, b,
+            "two evidence servers under one nonce must not share an op id"
+        );
+        // Both still start with the review nonce, which is what ties them to this review.
+        assert!(a.starts_with(&first.bundle.nonce) && b.starts_with(&second.bundle.nonce));
     }
 
     /// The transaction is not a `repository_diff` privilege (review f1 on the implementation).
