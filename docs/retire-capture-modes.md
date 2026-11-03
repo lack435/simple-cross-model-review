@@ -48,6 +48,16 @@ canonical diffs.**
   of the serve-record contract, not new coverage attestation. **Round 4 resolved f1 and f3**
   (verdict: approve-with-comments).
 
+  > **Issue #200.** The operation id must be unique per evidence-server *process*, not only per
+  > review. A block or evidence repair reuses the review nonce, appends to the same serve-record,
+  > and starts a fresh call counter — so `{nonce}-diff-{calls}` collided across the two, and the
+  > aggregate merged two separate pulls into one op whose digest was whichever was written last.
+  > That defeated the digest-agreement check added for issue #121: a single op trivially agrees
+  > with itself, so a tree that drifted between the main run and its repair became invisible. Op ids
+  > now carry a per-process `{launch}` component, and the aggregate drops the digest of any op that
+  > is handed two conflicting ones, so a future collision fails closed rather than resolving by
+  > overwrite.
+
 **Revision note (r4 → r5).** Round 4 raised one minor finding, **f7**: mechanism 4 still described the
 canonical diff as a "single `repository_diff` call," contradicting the multi-call logical operation of
 mechanism 3 and risking an implementation that excludes cursor-follow pages from the operation. Fixed:

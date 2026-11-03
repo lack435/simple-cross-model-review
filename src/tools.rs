@@ -5968,6 +5968,9 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         /// Content hash of the whole composed diff, from this operation's first page — the identity
         /// two canonical operations must share to be the same change. `None` if no page carried one.
         digest: Option<String>,
+        /// Two canonical first pages under one op id disagreed about the content digest. Treated as
+        /// no digest at all, which `agree` reads as disagreement (issue #200).
+        digest_conflict: bool,
         counts: Option<CanonicalServe>,
     }
     let mut ops: std::collections::HashMap<String, Op> = std::collections::HashMap::new();
@@ -6011,7 +6014,18 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
         // The digest is the reconciliation identity; the counts are only for the `captured:` line.
         if bool_field("canonical").unwrap_or(false) {
             if let Some(digest) = value.get("digest").and_then(serde_json::Value::as_str) {
-                entry.digest = Some(digest.to_string());
+                // Two first pages under one op id means two pulls were recorded as one, and the
+                // last write would silently become the op's identity — defeating the
+                // digest-agreement check, since one op trivially agrees with itself (issue #200).
+                // Op ids are now unique per evidence-server process, so this should be
+                // unreachable; it fails closed rather than trusting that. A conflicted op keeps no
+                // digest, and `agree` below reads a missing digest as disagreement.
+                if entry.digest.as_deref().is_some_and(|seen| seen != digest) {
+                    entry.digest_conflict = true;
+                }
+                if !entry.digest_conflict {
+                    entry.digest = Some(digest.to_string());
+                }
             }
             if let Some(files) = value.get("files").and_then(serde_json::Value::as_u64) {
                 entry.counts = Some(CanonicalServe {
@@ -6050,6 +6064,12 @@ fn aggregate_serve_records(contents: &str) -> DiffServeAggregate {
     // case); a drifted re-pull that was left mid-pagination does not, because its digest differs. A
     // canonical op that never reached its terminal page, a canonical op with no digest at all (review
     // f2), and a narrowed/exploratory diff (never canonical) all still fail closed.
+    // A conflicted op has no usable identity: drop it so `agree` fails closed on it (issue #200).
+    for op in ops.values_mut() {
+        if op.digest_conflict {
+            op.digest = None;
+        }
+    }
     let canonical_ops: Vec<&Op> = ops.values().filter(|o| o.canonical).collect();
     // Same change across every canonical op: all must carry a digest, and all digests must be equal. A
     // canonical op missing its digest is a disagreement — fail closed rather than guess.
@@ -6506,6 +6526,35 @@ mod tests {
         let a = aggregate_serve_records(&op("x", true, true, d1, 8, false));
         assert!(a.any_diff && a.complete_canonical_terminal);
         assert_eq!(a.refusals, 0);
+
+        // Issue #200: two canonical first pages recorded under one op id are two different pulls
+        // merged into one record. The last digest used to win, which defeated the agreement check
+        // entirely — one op trivially agrees with itself, so a mid-review drift became invisible.
+        // Op ids are unique per evidence-server process now, so this is belt: it must fail closed.
+        let collided = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("x", true, true, d2, 9, false)
+        ));
+        assert!(
+            !collided.complete_canonical_terminal,
+            "two pulls merged under one op id cannot clear the floor"
+        );
+        // Whereas the same two pulls under their own op ids are two canonical ops that disagree,
+        // which is the case the digest check was built for and already handled.
+        let distinct = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("y", true, true, d2, 9, false)
+        ));
+        assert!(!distinct.complete_canonical_terminal);
+        // And a repeated *identical* digest under one op id is not a conflict: still cleared.
+        let repeated = aggregate_serve_records(&format!(
+            "{}\n{}",
+            op("x", true, true, d1, 8, false),
+            op("x", true, true, d1, 8, false)
+        ));
+        assert!(repeated.complete_canonical_terminal);
 
         // Issue #197: a budget refusal is counted for the caller and takes no part in the floor.
         // It carries no `op`, so it can neither open an operation nor complete one — a turn that

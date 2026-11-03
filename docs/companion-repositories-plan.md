@@ -75,8 +75,10 @@ one root per process, and every assumption would have to be reopened:
 
 - `Core` holds one `root`, one drift cache (`observed_stamp`), one `calls`/`returned_bytes` budget
   (`src/evidence/core.rs:486-517`).
-- Cursor tokens are `{nonce}-{n}` and diff op ids `{nonce}-diff-{calls}`, with no repository in
-  them (`core.rs:1600`, `core.rs:1231`).
+- Cursor tokens are `{nonce}-{n}` and diff op ids `{nonce}-diff-{launch}-{calls}`, with no
+  repository in them (`core.rs:1600`, `core.rs:1231`). (`{launch}` was added for issue #200: it
+  distinguishes two evidence-server *processes* under one review nonce, which is a different axis
+  from the per-repository separation this plan is about.)
 - The serve record is one file per nonce, with no repository key on any line (`core.rs:1256-1268`,
   `src/evidence.rs:599-604`).
 - `require_only` key lists (`core.rs:627-659`), the eight input schemas (`evidence.rs:1158-1250`),
@@ -213,7 +215,7 @@ presentation difference, not a capability one.
   companion's is `{review_id}-c-<name>` (the name grammar fits `validate_nonce`'s
   `[A-Za-z0-9_-]{1,128}`, `evidence.rs:1398-1411`). The nonce is the namespace for everything a
   server mints, so this one choice separates all of it:
-  - cursor tokens `{nonce}-{n:016x}` (`core.rs:1600`) and diff op ids `{nonce}-diff-{calls}`
+  - cursor tokens `{nonce}-{n:016x}` (`core.rs:1600`) and diff op ids `{nonce}-diff-{launch}-{calls}`
     (`core.rs:1231`). With a shared nonce, two servers mint *identical* tokens, so a cursor the
     reviewer sends to the wrong server would silently continue that server's own operation and both
     serve records could read complete over mixed pages. With distinct nonces a misrouted cursor is

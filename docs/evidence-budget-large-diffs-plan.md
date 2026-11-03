@@ -549,7 +549,7 @@ Three things round 4 checked that the plan had asserted rather than proved:
 
 - **Digest sharing cannot confuse the gate.** `aggregate_serve_records` groups by operation id
   while *separately* requiring canonical operations' digests to agree (`src/tools.rs:5945-6027`),
-  and op ids stay unique as `{nonce}-diff-{calls}`. Sharing one text `Arc` between two operations
+  and op ids stay unique as `{nonce}-diff-{launch}-{calls}` (`{launch}` per issue #200). Sharing one text `Arc` between two operations
   with equal digests therefore cannot merge serve records or mix `canonical` / `complete` flags.
   This was the interaction I was least sure of.
 - **The oversized-request-id residual is acceptable.** A conforming client can send a large id,
