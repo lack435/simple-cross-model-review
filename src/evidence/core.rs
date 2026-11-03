@@ -1660,7 +1660,6 @@ impl Core {
         // A one-page pull is born finished: retire the operation when this page commits, rather
         // than leaving its text held for the rest of the turn.
         staged.op_finished = terminal.then(|| op.clone());
-        staged.cursor_stored = cursor.clone();
         staged.serve_record = Some(json!({
             "op": op,
             "canonical": canonical,
@@ -1707,9 +1706,6 @@ impl Core {
         let text = Arc::clone(&diff_op.text);
         let canonical = diff_op.canonical;
         let complete = diff_op.complete;
-        // Hold the consumed cursor so a page that is refused, cancelled, replaced or lost can be
-        // retried at this very offset instead of forcing a fresh pull from byte 0 (round 1 f3).
-        self.stage().cursor_taken = Some((token.to_string(), state));
         let end = self.page_end(&text, offset, limit);
         let content = text[offset..end].to_string();
         let terminal = end >= text.len();
@@ -1724,7 +1720,6 @@ impl Core {
             ))
         };
         let staged = self.stage();
-        staged.cursor_stored = cursor.clone();
         staged.op_finished = terminal.then(|| op.clone());
         staged.serve_record = Some(json!({
             "op": op,
@@ -2020,6 +2015,11 @@ impl Core {
                 source_complete,
             },
         );
+        // Staged here rather than by each caller, so *every* paginated route is transactional by
+        // construction — not only `repository_diff` (review f1). A page whose response is never
+        // written leaves no successor behind, whatever tool produced it. Each route stores at most
+        // one cursor per call, so one slot is enough.
+        self.stage().cursor_stored = Some(token.clone());
         token
     }
 
@@ -2031,11 +2031,23 @@ impl Core {
             )
         })?;
         if state.operation != operation {
+            // Put it back: a cursor offered to the wrong tool is a caller mistake, not a reason to
+            // destroy a cursor the right tool could still use.
+            self.cursors.insert(token.to_string(), state);
             return Err(EvidenceError::new(
                 "invalid_cursor",
                 "cursor does not match this operation",
             ));
         }
+        // Held for restoration, on the same terms as `store_cursor` above: if this page's response
+        // is refused, cancelled, replaced or unwritten, the cursor it consumed comes back and the
+        // page is retried at the same offset instead of restarting the pagination (review f1).
+        //
+        // The clone is transient — dropped at commit or rollback — and small for every route but
+        // `text_cursor`, whose cursors still carry their text (`repository_revision` and the
+        // Perforce diff); there it is one extra copy of that text for the duration of the call.
+        // `repository_diff` is unaffected: since issue #197 its cursors hold `{op, offset}` only.
+        self.stage().cursor_taken = Some((token.to_string(), state.clone()));
         Ok(state)
     }
 
@@ -5958,6 +5970,76 @@ foreach ($f in $in.files) {{
         assert!(
             Arc::ptr_eq(&first.text, &second.text),
             "an equal-digest re-pull shares one allocation"
+        );
+    }
+
+    /// The transaction is not a `repository_diff` privilege (review f1 on the implementation).
+    /// Every paginated route takes and stores its cursors through the same two helpers, so a page
+    /// whose response is never written leaves the pagination exactly as it found it — otherwise a
+    /// cancelled `repository_list` continuation would strand the walk on `invalid_cursor`.
+    #[test]
+    fn a_rolled_back_page_restores_a_non_diff_cursor_too() {
+        let dir = temp_dir("ev197-generic-cursor");
+        for i in 0..4 {
+            fs::write(dir.as_path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let first = core
+            .call("repository_list", &json!({"path": "", "limit": 1}))
+            .unwrap();
+        let cursor = first["cursor"]
+            .as_str()
+            .expect("more entries than the limit")
+            .to_string();
+        // Take a continuation and then lose it, as cancellation or an unwritten response would.
+        let page = core
+            .call_with_receipt(
+                "repository_list",
+                &json!({"cursor": cursor.clone(), "limit": 1}),
+                Instant::now(),
+            )
+            .unwrap();
+        let successor = page["cursor"].as_str().map(str::to_string);
+        core.rollback_pending();
+        assert!(
+            core.cursors.contains_key(&cursor),
+            "the consumed cursor is restored"
+        );
+        if let Some(successor) = successor {
+            assert!(
+                !core.cursors.contains_key(&successor),
+                "and the undelivered successor is not left behind"
+            );
+        }
+        // So the same continuation can simply be asked for again.
+        let retried = core
+            .call("repository_list", &json!({"cursor": cursor, "limit": 1}))
+            .unwrap();
+        assert_eq!(retried["entries"], page["entries"]);
+    }
+
+    /// A cursor handed to the wrong tool is a caller mistake, and must not cost the caller the
+    /// cursor: the route that owns it can still continue.
+    #[test]
+    fn a_cursor_offered_to_the_wrong_tool_survives_the_refusal() {
+        let dir = temp_dir("ev197-cursor-route");
+        for i in 0..4 {
+            fs::write(dir.as_path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut core = Core::new(bundle(dir.as_path())).unwrap();
+        let first = core
+            .call("repository_list", &json!({"path": "", "limit": 1}))
+            .unwrap();
+        let cursor = first["cursor"].as_str().expect("a cursor").to_string();
+        let err = core
+            .call("repository_search", &json!({"cursor": cursor.clone()}))
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_cursor", "{}", err.message);
+        let resumed = core.call("repository_list", &json!({"cursor": cursor, "limit": 1}));
+        assert!(
+            resumed.is_ok(),
+            "the list cursor still works: {:?}",
+            resumed.err()
         );
     }
 

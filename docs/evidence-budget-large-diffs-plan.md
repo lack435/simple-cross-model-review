@@ -197,6 +197,16 @@ What that requires:
   `text_cursor` path used by revisions and Perforce diffs are not migrated and keep their current
   shape (round-3 f6).
 
+  **Implementation note.** The transaction ended up broader than this section described. Review of
+  the implementation pointed out that staging only the diff path left every other paginated route
+  (`repository_list` / `search` / `history` / `change` / `revision`) mutating `Core.cursors`
+  directly, so a cancelled or unwritten continuation there still stranded its walk on
+  `invalid_cursor`. Staging moved into the shared `store_cursor` / `take_cursor` helpers instead, so
+  every route is transactional by construction and the diff path carries no special case. A cursor
+  offered to the wrong tool is also put back rather than destroyed. The cost is one transient clone
+  of the consumed cursor per continuation, which matters only for `text_cursor`'s routes, whose
+  cursors still carry their text.
+
   **Operation lifecycle**, so a `DiffOp` does not outlive its use (round-3 f7):
 
   - terminal page commits → drop the op;
