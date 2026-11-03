@@ -226,31 +226,28 @@ impl Reviewer for ClaudeReviewer {
                 truncated
             } else if out.success {
                 errors::empty_review("claude", out.diagnostics())
-            } else if !out.cancelled
-                && !out.timed_out
-                && !out.policy_stalled
-                && oauth_refresh_locked(out, None)
-            {
-                // Before the generic classifier, whose "oauth token" match would read the
-                // refresh-lock collision as an expired sign-in (issue #166). After the terminal
-                // conditions, though: a cancelled or timed-out run belongs to `failure_for`,
-                // whatever its stderr happens to mention.
+            } else if oauth_refresh_locked(out, None) {
+                // Intercepted ahead of the generic classifier, whose "oauth token" match would
+                // answer the refresh-lock collision with a re-login (issue #166) -- but only to
+                // keep that wrong remediation away. The retryable REVIEWER_BUSY is not available
+                // on this path at all.
                 //
-                // Buffered mode carries no per-line `assistant` events, and a failed parse
-                // leaves no result document to read `num_turns` from, so empty stdout is the
-                // only evidence available here that no model call ran. With it, the collision is
-                // the retryable REVIEWER_BUSY. Without it -- stdout nonempty but not a result
-                // document -- the turn may have advanced the conversation before the refresh
-                // failed, and then neither verdict is true: not busy, which asserts the session
-                // is unchanged (#166 review f5), and not an expired sign-in, which `classify`
-                // would reach on "oauth token" and answer with a re-login over a transient lock.
-                // Report the crash carrying the CLI's own diagnostic, which says the collision is
-                // usually transient, and leave the reading to the human.
-                if out.stdout.trim().is_empty() {
-                    errors::reviewer_busy("claude", out.diagnostics())
-                } else {
-                    errors::reviewer_crashed("claude", out.exit, out.diagnostics())
-                }
+                // Busy is justified by one thing, "no model call ran", because `tools` clears the
+                // call's findings marker on the strength of it. `oauth_refresh_locked`
+                // establishes that from an `assistant` event or a result's `num_turns`, and this
+                // branch has neither: buffered mode emits a single document at the end, and we
+                // are here because that document did not parse. Empty stdout is then absence of
+                // evidence rather than proof -- the CLI can advance the conversation and die
+                // before emitting anything -- so claiming busy would clear the marker for a turn
+                // that may have advanced. That is the one mistake here worth failing closed
+                // against, so the whole branch reports the crash it is, carrying the CLI's own
+                // diagnostic, which says the collision is usually transient.
+                //
+                // This reverses the buffered half of #166 (its review f2), which read empty
+                // stdout as that proof. The stream path keeps busy: there the evidence is real.
+                // The terminal conditions are not re-checked here -- `collect_run` routes a
+                // cancelled, timed-out or policy-stalled turn to `failure_for` before any parser.
+                errors::reviewer_crashed("claude", out.exit, out.diagnostics())
             } else {
                 super::failure_for(cfg, spec, out)
             }
@@ -1467,42 +1464,39 @@ mod tests {
             err.remediation
         );
     }
-    /// The buffered path must not answer a refresh-lock collision with an *auth* verdict just
-    /// because stdout held something unparseable. Buffered mode has no `assistant` events and a
-    /// failed parse has no `num_turns`, so empty stdout is the only proof here that nothing ran:
-    /// with it the collision is REVIEWER_BUSY, without it neither busy nor expired is true, and
-    /// the one thing that must not happen is `classify` reaching "oauth token" and telling the
-    /// user to re-login over a transient lock (round-1 review f1).
+    /// Round-2 review f1: the buffered path can never earn REVIEWER_BUSY, and must never answer
+    /// a refresh-lock collision with an *auth* verdict either.
+    ///
+    /// Busy is justified only by "no model call ran", and buffered mode offers no evidence of
+    /// that here -- no per-line `assistant` events, and no `num_turns` once the document has
+    /// failed to parse. Empty stdout is absence of evidence, not proof: the CLI can advance the
+    /// conversation and die before emitting anything, and busy would clear the findings marker
+    /// for it. So both buffered shapes report the crash, while the stream path -- where an
+    /// `assistant` event really does rule a turn out -- keeps busy. The one outcome that must
+    /// never appear is the expired sign-in `classify` reaches on "oauth token", which would
+    /// prescribe a re-login for a transient lock.
     #[test]
-    fn a_buffered_lock_collision_is_never_reported_as_an_expired_signin() {
-        let diag = "Failed to refresh OAuth token: another Claude Code process is refreshing it or "
-            .to_string()
-            + "exited mid-refresh. This is usually transient; retry in a minute";
+    fn a_buffered_lock_collision_is_never_busy_and_never_an_expired_signin() {
+        let diag = concat!(
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it ",
+            "or exited mid-refresh. This is usually transient; retry in a minute"
+        );
         let buffered = |stdout: &str| {
             let mut out = outcome(stdout, false);
-            out.stderr = diag.clone();
+            out.stderr = diag.to_string();
             out
         };
 
-        // Empty stdout: nothing ran, so the retryable verdict stands.
-        let err = ClaudeReviewer
-            .parse(&cfg(), cfg().primary(), &buffered(""), None)
-            .unwrap_err();
+        for stdout in ["", "not a result document"] {
+            let err = ClaudeReviewer
+                .parse(&cfg(), cfg().primary(), &buffered(stdout), None)
+                .unwrap_err();
+            assert_eq!(err.code, "REVIEWER_FAILED", "stdout {stdout:?}: {err:?}");
+        }
+
+        // The stream path has the evidence, so it keeps the retryable verdict.
+        let err = parse_stream_json(cfg().primary(), &buffered("")).unwrap_err();
         assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
-
-        // Nonempty but unparseable: reported as the crash it is, never as an expired sign-in.
-        let err = ClaudeReviewer
-            .parse(&cfg(), cfg().primary(), &buffered("not json at all"), None)
-            .unwrap_err();
-        assert_eq!(err.code, "REVIEWER_FAILED", "{err:?}");
-
-        // A cancelled run belongs to the terminal conditions, whatever its stderr mentions.
-        let mut cancelled = buffered("not json at all");
-        cancelled.cancelled = true;
-        let err = ClaudeReviewer
-            .parse(&cfg(), cfg().primary(), &cancelled, None)
-            .unwrap_err();
-        assert_eq!(err.code, "CANCELLED", "{err:?}");
     }
     /// Issue #166: the CLI's OAuth refresh-lock collision is REVIEWER_BUSY (retryable), whether it
     /// arrives as the failed result's text or on stderr, but only as the CLI's own diagnostic.
@@ -1579,14 +1573,15 @@ mod tests {
         let err = parse_stream_json(cfg().primary(), &expired).unwrap_err();
         assert_eq!(err.code, "AUTH_EXPIRED_MIDRUN", "{err:?}");
 
-        // The buffered `json` path (off the evidence path): unparseable stdout with the diagnostic
-        // on stderr is busy too, rather than reaching the generic classifier (review f2).
+        // The buffered `json` path (off the evidence path) is the exception, and no longer busy:
+        // it has no turn evidence to read, so it reports the crash instead. See the branch in
+        // `parse`, and `a_buffered_lock_collision_is_never_busy_and_never_an_expired_signin`.
         let mut buffered = outcome("", false);
         buffered.stderr = diag.to_string();
         let err = ClaudeReviewer
             .parse(&cfg(), cfg().primary(), &buffered, None)
             .unwrap_err();
-        assert_eq!(err.code, "REVIEWER_BUSY", "{err:?}");
+        assert_eq!(err.code, "REVIEWER_FAILED", "{err:?}");
         // And a buffered result document carrying it as its text, likewise.
         let err = ClaudeReviewer
             .parse(
