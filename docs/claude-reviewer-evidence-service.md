@@ -436,6 +436,15 @@ reviewer's own scoping:
   skip the gate entirely. The parent already knows at capture time whether the change is
   empty/incomplete (`CaptureSummary::complete` / the `captured` signal), so the gate fires only on
   that sliver.
+
+  *Revision note (issue #203), verified from the reviewer transcripts of the three failures reported
+  there: none was a transport failure. Two fresh turns read only through built-in Read/Grep/Glob
+  (20 and 25 calls, no `repository_*` call, no tool errors) and one resumed turn called no tools. The
+  gate is unchanged and built-in reads still do not count. What changed is that the reviewer is told
+  the requirement on every thin turn (`prompt::THIN_CAPTURE_NOTE`), and the failure names which case
+  occurred (`EvidenceHealth::shortfall`), the capture it fired on, and that the reviewer ran. The
+  check remains "at least one successful content call": it does not prove the omitted part was the
+  part that was read.*
 - **Preamble (§4)** stays as defense-in-depth, not the enforcement.
 
 This is the one place the loop moved me from "no runtime machinery" to "scoped runtime

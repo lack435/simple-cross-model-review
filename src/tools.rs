@@ -4170,6 +4170,14 @@ impl Job {
             && summary
                 .as_ref()
                 .map_or(true, |s| s.is_empty() || !s.is_complete());
+        // Perforce keeps the hard gate on a thin capture (see where it fires, below). Its reviewer
+        // is told so up front, and the failure names the capture it was thin about (issue #203).
+        let thin_capture_gated = capture_thin && self.cfg.vcs != crate::config::Vcs::Git;
+        let thin_capture = thin_capture_gated.then(|| match summary.as_ref() {
+            None => ("not captured at all", None),
+            Some(s) if s.is_empty() => ("empty", Some(s.summary())),
+            Some(s) => ("incomplete", Some(s.summary())),
+        });
         // The `core.autocrlf` this turn's evidence bundle fixes, kept for the converged-hook binding
         // check so it composes with exactly the setting the served diff was composed with (plan f2).
         let mut turn_autocrlf: Option<crate::evidence::AutoCrlf> = None;
@@ -4395,6 +4403,11 @@ impl Job {
         } else {
             change
         };
+        // Carried with the change so it reaches every turn, a resumed one included, and regardless
+        // of `--no-preamble`: the gate it describes applies regardless too.
+        let noted_change =
+            thin_capture_gated.then(|| prompt::with_thin_capture_note(prompt_change));
+        let prompt_change = noted_change.as_deref().or(prompt_change);
         let text = if is_consult {
             // A consult never asks for a machine block (no nonce) or a prior-findings digest: it has
             // no ledger to reconcile. The follow-up framing and the "no findings list" preamble come
@@ -4565,11 +4578,16 @@ impl Job {
         // to fall back on. For git this early return is retired in favour of the resumable evidence
         // floor + in-turn auto-repair applied around `finalize_turn` below: a git turn that read no
         // content is downgraded to a resumable `changes_requested`, not lost.
-        if capture_thin && !evidence_ok && self.cfg.vcs != crate::config::Vcs::Git {
+        if let (Some((capture_state, capture_line)), false) = (&thin_capture, evidence_ok) {
+            let shortfall = evidence_health.as_ref().map_or_else(
+                || crate::reviewer::claude::EvidenceHealth::default().shortfall(),
+                crate::reviewer::claude::EvidenceHealth::shortfall,
+            );
             return Err(errors::evidence_review_too_thin(
-                "the captured change was empty or incomplete and the reviewer did not obtain healthy \
-                 content evidence (no successful content call, or the evidence transport failed), \
-                 so the review would rest on less than the intended change",
+                capture_state,
+                &shortfall.what,
+                shortfall.service_fault,
+                thin_review_detail(capture_line.as_deref(), capture_warnings),
             ));
         }
         if let Some(health) = &evidence_health {
@@ -5453,6 +5471,18 @@ const EVIDENCE_CAPABLE_REVIEWER_HINT: &str =
     "Use a Codex reviewer, or a Claude reviewer that is profile-pinned (--claude-profile), \
      shell-less, isolated, and on the default read rules (on git, with --cwd at the repository \
      root).";
+
+/// What the section-7 gate's failure shows about the capture it fired on (issue #203): the same
+/// `captured:` line and warnings a completed review would have carried, which a failed one otherwise
+/// loses.
+fn thin_review_detail(capture_line: Option<&str>, warnings: &[String]) -> String {
+    let mut out = format!("captured: {}", capture_line.unwrap_or("nothing"));
+    for warning in warnings {
+        out.push_str("\nwarning: ");
+        out.push_str(warning);
+    }
+    out
+}
 
 /// Whether a single reviewer entry can provide the read-only evidence service a consult requires.
 /// The Codex reviewer always can; a Claude reviewer can only on the evidence path — a

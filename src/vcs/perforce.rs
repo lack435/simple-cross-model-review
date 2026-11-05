@@ -66,6 +66,8 @@ const MAX_INVENTORY_BYTES: usize = 4_000_000;
 /// the segment is marked incomplete and says so, rather than diffing forever. Generous enough that
 /// ordinary changelists are unaffected.
 const MAX_EDIT_DIFFS: usize = 1_000;
+/// At most this many per-file reasons in the caller's incomplete-capture warning.
+const MAX_SHORTFALL_REASONS: usize = 20;
 
 /// The prior turn's persisted state, handed to a resumed Perforce capture so it can collapse
 /// files byte-identical to what the reviewer already saw. Assembled by `tools.rs` from the
@@ -257,14 +259,13 @@ pub fn capture(
         ));
     }
     // Captured-but-incomplete changelists are prompt-only otherwise; the caller cannot see the
-    // prompt, so the count reaches it here too (the per-file reasons stay in the prompt).
+    // prompt, so the count and the per-file reasons reach it here too (issue #203).
     if incomplete_changelists > 0 {
         warnings.push(format!(
             "The captured change was incomplete: {incomplete_changelists} of {} captured \
-             changelist(s) had evidence that could not be fully shown (for example an \
-             out-of-root, unreadable, or lossily-decoded file); the per-file reasons are in the \
-             prompt.",
-            captured.len()
+             changelist(s) had evidence that could not be fully shown: {}.",
+            captured.len(),
+            shortfall_reasons(&segments)
         ));
     }
 
@@ -349,6 +350,44 @@ fn shortfall(segments: &[Segment]) -> (usize, bool) {
     let incomplete = segments.iter().filter(|s| short(s)).count();
     let binary_listed = segments.iter().any(|s| !short(s) && !s.opaque.is_empty());
     (incomplete, binary_listed)
+}
+
+/// The per-file reasons behind the changelists [`shortfall`] counts as incomplete, one line and
+/// bounded, for the caller's warning. A file cut at a size cap has no omission note of its own: its
+/// unit is what records it.
+fn shortfall_reasons(segments: &[Segment]) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    for seg in segments {
+        if seg.baseline_whole && !seg.opaque_unconfirmed {
+            continue;
+        }
+        reasons.extend(seg.omissions.iter().cloned());
+        reasons.extend(seg.units.iter().filter(|u| !u.complete).map(|u| {
+            let why = if u.kind == baseline::UnitKind::TextDiff && u.comparator.is_empty() {
+                "its diff names no base revision that could be read"
+            } else {
+                "it was not shown in full: it hit a size cap, ended early or did not decode cleanly"
+            };
+            format!("`{}`: {why}", safe_label(&u.depot))
+        }));
+        reasons.extend(seg.opaque.iter().cloned());
+    }
+    if reasons.is_empty() {
+        return "no per-file reason was recorded".to_string();
+    }
+    let mut out = reasons
+        .iter()
+        .take(MAX_SHORTFALL_REASONS)
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if reasons.len() > MAX_SHORTFALL_REASONS {
+        out.push_str(&format!(
+            "; and {} more (all are in the prompt)",
+            reasons.len() - MAX_SHORTFALL_REASONS
+        ));
+    }
+    out
 }
 
 /// How the evidence service should reach the Perforce server for this working root (issue #183):
@@ -4282,6 +4321,58 @@ Change 5 by u@c on 2026/01/01\n\n\
         );
         assert!(capped.text.contains("description truncated"));
         assert!(capped.text.len() < long.len());
+    }
+
+    #[test]
+    fn shortfall_reasons_name_each_file_including_one_cut_at_a_size_cap() {
+        // Issue #203: a size-capped add has no omission note, only an incomplete unit, and it is the
+        // case that left a caller with a partial capture and no reason it could see.
+        let mut seg = segment_fixture(DiffBasis::Workspace, false);
+        seg.units[1].complete = false;
+        seg.opaque = vec!["`//depot/d` is binary".into()];
+        let out = shortfall_reasons(&[seg]);
+        assert!(
+            out.contains("`//depot/c` maps outside the working root"),
+            "{out}"
+        );
+        assert!(
+            out.contains("`//depot/b`: it was not shown in full"),
+            "{out}"
+        );
+        assert!(out.contains("`//depot/d` is binary"), "{out}");
+        assert!(
+            !out.contains("//depot/a"),
+            "a whole unit is no reason: {out}"
+        );
+
+        // A diff with no readable base revision is incomplete for that reason, not for its size.
+        let mut no_base = segment_fixture(DiffBasis::Workspace, false);
+        no_base.units[0] = Unit::text_diff("//depot/a".into(), None, "a".into(), "b".into(), true);
+        let out = shortfall_reasons(&[no_base]);
+        assert!(
+            out.contains("`//depot/a`: its diff names no base revision"),
+            "{out}"
+        );
+        assert!(!out.contains("size cap"), "{out}");
+
+        // A whole segment contributes nothing, whatever it holds.
+        let whole = segment_fixture(DiffBasis::Workspace, true);
+        assert_eq!(
+            shortfall_reasons(&[whole]),
+            "no per-file reason was recorded"
+        );
+
+        // Bounded, one line, and honest about what it left out.
+        let mut many = segment_fixture(DiffBasis::Workspace, false);
+        many.omissions = (0..MAX_SHORTFALL_REASONS + 3)
+            .map(|i| format!("note\n{i}"))
+            .collect();
+        let out = shortfall_reasons(&[many]);
+        assert!(!out.contains('\n'), "{out}");
+        assert!(
+            out.ends_with("; and 3 more (all are in the prompt)"),
+            "{out}"
+        );
     }
 
     fn segment_fixture(basis: DiffBasis, complete: bool) -> Segment {

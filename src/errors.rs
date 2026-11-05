@@ -16,6 +16,9 @@ pub struct Failure {
     pub summary: String,
     pub remediation: String,
     pub detail: Option<String>,
+    /// The reviewer ran and its answer was refused, so "did not run" would misreport this failure
+    /// (issue #203). Its detail is then the server's own diagnosis, not the reviewer CLI's output.
+    pub reviewer_ran: bool,
 }
 
 impl Failure {
@@ -29,6 +32,7 @@ impl Failure {
             summary: summary.into(),
             remediation: remediation.into(),
             detail: None,
+            reviewer_ran: false,
         }
     }
 
@@ -50,17 +54,25 @@ impl Failure {
         out.push_str(&self.summary);
         out.push_str("\n\n");
         out.push_str("=== ACTION REQUIRED ===\n");
+        out.push_str(if self.reviewer_ran {
+            "A reviewer ran, but no review was accepted, so there is no review feedback. "
+        } else {
+            "The external review did not run, so there is no review feedback. "
+        });
         out.push_str(
-            "The external review did not run, so there is no review feedback. Stop the current \
-             task now. Do not review the work yourself in place of the external reviewer, and do \
-             not continue as if the review had passed.\n\n\
+            "Stop the current task now. Do not review the work yourself in place of the external \
+             reviewer, and do not continue as if the review had passed.\n\n\
              Report this to the user:\n\n",
         );
         out.push_str(&self.remediation);
         out.push_str("\n\nThen wait for the user before proceeding.\n");
         out.push_str("=======================\n");
         if let Some(detail) = &self.detail {
-            out.push_str("\n--- diagnostic output from the reviewer CLI ---\n");
+            out.push_str(if self.reviewer_ran {
+                "\n--- diagnostic detail ---\n"
+            } else {
+                "\n--- diagnostic output from the reviewer CLI ---\n"
+            });
             out.push_str(detail);
             out.push('\n');
         }
@@ -387,13 +399,15 @@ pub fn reviewer_account_changed(detail: impl Into<String>, a_reviewer_ran: bool)
          home.\n\n\
          The review has NOT been performed."
     };
-    Failure::new(
+    let mut failure = Failure::new(
         "REVIEWER_ACCOUNT_CHANGED",
         "A reviewer skipped for low usage remaining was measured on an account this profile home no \
          longer presents (it changed or is unreadable), so the chain is not actually exhausted; retry.",
         remediation,
     )
-    .with_detail(detail)
+    .with_detail(detail);
+    failure.reviewer_ran = a_reviewer_ran;
+    failure
 }
 
 pub fn timed_out(reviewer: &str, secs: u64, detail: impl Into<String>) -> Failure {
@@ -531,28 +545,49 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
-/// The section-7 runtime evidence gate for an in-scope Claude review: the reviewer **ran**, but the
-/// captured change was empty or incomplete AND it obtained no successful content evidence call or
-/// its evidence transport failed, so the review would rest on less than the intended change. Keeps
-/// the `EVIDENCE_UNAVAILABLE` code
-/// (the caller's action -- stop, do not self-review, re-run -- is the same) but with a message
-/// accurate to the runtime case: the startup `evidence_unavailable` wording ("could not be
-/// provided", "was not started") would misreport this, which is the class of bug AGENTS.md names.
-pub fn evidence_review_too_thin(detail: impl Into<String>) -> Failure {
-    Failure::new(
+/// The section-7 runtime evidence gate for an in-scope Claude review on Perforce: the reviewer
+/// **ran**, but the captured change was empty or incomplete AND it obtained no successful content
+/// evidence call or its evidence transport failed, so the review would rest on less than the
+/// intended change. Keeps the `EVIDENCE_UNAVAILABLE` code (the caller's action -- stop, do not
+/// self-review, re-run -- is the same) but with a message accurate to the runtime case: the startup
+/// `evidence_unavailable` wording ("could not be provided", "was not started") would misreport this,
+/// which is the class of bug AGENTS.md names.
+///
+/// `shortfall` says which of the cases this turn was (issue #203), and `service_fault` picks the
+/// advice: only an explicit transport failure is worth checking on. The advice never asks for the changelist to
+/// be submitted, which would defeat reviewing it first. The turn left the findings marker set, so a
+/// plain resume would be refused and the retry has to be a fresh one.
+pub fn evidence_review_too_thin(
+    capture_state: &str,
+    shortfall: &str,
+    service_fault: bool,
+    detail: impl Into<String>,
+) -> Failure {
+    let cause = if service_fault {
+        "An evidence call failed in transport during the turn. Run \
+         cross_model_review_status to check it, then retry. If it recurs, report it against this \
+         project."
+    } else {
+        "This does not show a fault in the evidence service, or in the changelist: do not submit or \
+         change it for this. Retry. If it recurs, report it against this project."
+    };
+    let mut failure = Failure::new(
         "EVIDENCE_UNAVAILABLE",
-        "The review ran, but the captured change was empty or incomplete and the reviewer did not \
-         obtain healthy content evidence -- either it made no successful content evidence call, or \
-         the evidence transport failed -- so the review would rest on less than the intended change \
-         and was not accepted.",
-        "The captured change was empty or incomplete (for example an uncommitted or empty range), \
-         and the reviewer did not read the whole change through a healthy evidence service (no \
-         successful content call, or the evidence transport failed), so the review cannot be \
-         trusted. Re-run once the change is committed or the range is non-empty and the evidence \
-         service is healthy. The review has NOT been accepted; do not substitute your own read of \
-         the change.",
+        format!(
+            "The reviewer ran, but its review was not accepted: the captured change was \
+             {capture_state} and {shortfall}, so the review could rest on less than the intended \
+             change."
+        ),
+        format!(
+            "{cause} Use `fresh: true` (or a new session name) for the retry, carrying any \
+             still-open findings and your dismissals into the new instructions: this turn cannot be \
+             resumed, and the reviewer's answer from it was discarded. Do not substitute your own \
+             read of the change."
+        ),
     )
-    .with_detail(detail)
+    .with_detail(detail);
+    failure.reviewer_ran = true;
+    failure
 }
 
 /// The reviewer CLI abandoned one repository-evidence call on its own per-call timeout and the turn
@@ -743,6 +778,7 @@ pub fn session_not_resumable(session: &str, reason: String) -> Failure {
              matter into the new instructions, since the reviewer will not remember them."
         ),
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -767,6 +803,7 @@ pub fn store_corrupt(session: &str, store_path: &str) -> Failure {
              retry. The corrupt file has been left untouched for recovery."
         ),
         detail: Some("state_corrupt".to_string()),
+        reviewer_ran: false,
     }
 }
 
@@ -779,6 +816,7 @@ pub fn bad_request(summary: impl Into<String>) -> Failure {
         remediation: format!("{summary} Correct the tool arguments and call it again."),
         summary,
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -792,6 +830,7 @@ pub fn invalid_level(summary: impl Into<String>) -> Failure {
         remediation: format!("{summary} Correct the 'level' argument and call it again."),
         summary,
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -810,6 +849,7 @@ pub fn invalid_level_on_resume(summary: impl Into<String>) -> Failure {
         ),
         summary,
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -876,6 +916,7 @@ pub fn session_leased(session: &str, detail: String) -> Failure {
              this review under a different session name."
         ),
         detail: None,
+        reviewer_ran: false,
     };
     if !detail.trim().is_empty() {
         failure = failure.with_detail(detail);
@@ -902,6 +943,7 @@ pub fn server_shutting_down() -> Failure {
                       in flight."
             .to_string(),
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -919,6 +961,7 @@ pub fn session_busy(session: &str, review_id: &str) -> Failure {
              the next turn."
         ),
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -936,6 +979,7 @@ pub fn too_many_running(limit: u32) -> Failure {
                       finish or cancel them rather than starting more."
             .to_string(),
         detail: None,
+        reviewer_ran: false,
     }
 }
 
@@ -1135,6 +1179,69 @@ mod fallback_tests {
             "the mixed remediation must direct to a fresh retry: {}",
             mixed.remediation
         );
+        // ...and the rendered lead agrees with it rather than saying nothing ran (issue #203).
+        let rendered = mixed.render();
+        assert!(rendered.contains("A reviewer ran"), "{rendered}");
+        assert!(!rendered.contains("did not run"), "{rendered}");
+        assert!(pre_start.render().contains("did not run"));
+    }
+
+    #[test]
+    fn a_review_refused_after_it_ran_does_not_say_it_did_not_run() {
+        // Issue #203: the same code covers a startup refusal and a turn that ran and was rejected,
+        // and the second used to be told both things at once.
+        let f = evidence_review_too_thin(
+            "incomplete",
+            "the reviewer made no tool calls this turn",
+            false,
+            "captured: changelists 1 -- partial",
+        );
+        assert_eq!(f.code, "EVIDENCE_UNAVAILABLE");
+        let text = f.render();
+        assert!(
+            text.contains("A reviewer ran, but no review was accepted"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The reviewer ran, but its review was not accepted: the captured"),
+            "{text}"
+        );
+        assert!(!text.contains("did not run"), "{text}");
+        assert!(
+            text.contains("the reviewer made no tool calls this turn"),
+            "{text}"
+        );
+        assert!(text.contains("--- diagnostic detail ---"), "{text}");
+        assert!(
+            !text.contains("from the reviewer CLI"),
+            "the detail is the server's: {text}"
+        );
+        // The advice a pending changelist cannot follow is gone, and the retry it needs is named.
+        assert!(!text.contains("once the change is committed"), "{text}");
+        assert!(text.contains("do not submit or change it"), "{text}");
+        assert!(text.contains("fresh: true"), "{text}");
+        assert!(!text.contains("cross_model_review_status"), "{text}");
+
+        // Only a failed service sends the caller to check on the service.
+        let f = evidence_review_too_thin("incomplete", "a call failed", true, "");
+        assert!(
+            f.remediation.contains("cross_model_review_status"),
+            "{}",
+            f.remediation
+        );
+        assert!(
+            !f.remediation.contains("do not submit"),
+            "{}",
+            f.remediation
+        );
+
+        // The startup refusal under the same code still says it did not run.
+        let startup = evidence_unavailable("no handshake").render();
+        assert!(
+            startup.contains("The external review did not run"),
+            "{startup}"
+        );
+        assert!(startup.contains("from the reviewer CLI"), "{startup}");
     }
 
     #[test]

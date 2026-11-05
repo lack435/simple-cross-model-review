@@ -552,6 +552,12 @@ Codes: `CLI_NOT_FOUND`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED_MIDRUN`, `MODEL_UNAVA
 busy session, a non-resumable session, and too many reviews already running (`TOO_MANY_RUNNING`)
 get a plain correction rather than an escalation, since each is the agent's own call to make.
 
+`EVIDENCE_UNAVAILABLE` has two forms. One says the evidence service could not be provided, so the
+review did not start. The other, for a Claude review of a partial or empty Perforce capture, says the
+reviewer ran but its review was not accepted, because no `repository_*` content call succeeded in that
+turn or the evidence transport failed. It names which case occurred and the capture's per-file
+reasons. Retry that one with `fresh: true`; the changelist does not need to be submitted.
+
 `REVIEWER_BUSY` is a transient refusal, not a setup problem: the Claude CLI reported that another
 Claude Code process held its OAuth refresh lock, so it failed before any model call. Nothing in the
 session changed, so it comes back as a plain correction telling the caller to wait a minute and make
