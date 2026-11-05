@@ -554,9 +554,11 @@ get a plain correction rather than an escalation, since each is the agent's own 
 
 `EVIDENCE_UNAVAILABLE` has two forms. One says the evidence service could not be provided, so the
 review did not start. The other, for a Claude review of a partial or empty Perforce capture, says the
-reviewer ran but its review was not accepted, because no `repository_*` content call succeeded in that
-turn or the evidence transport failed. It names which case occurred and the capture's per-file
-reasons. Retry that one with `fresh: true`; the changelist does not need to be submitted.
+reviewer ran but its review was not accepted, usually because the evidence transport failed. It names
+what happened and the capture's per-file reasons. Retry that one with `fresh: true`; the changelist
+does not need to be submitted. A reviewer that merely read nothing through `repository_*` is asked
+once to read what the capture left out, and if that does not settle it the turn comes back as a
+resumable `changes_requested` with `evidence_incomplete`, so re-review it on the same session.
 
 `REVIEWER_BUSY` is a transient refusal, not a setup problem: the Claude CLI reported that another
 Claude Code process held its OAuth refresh lock, so it failed before any model call. Nothing in the
