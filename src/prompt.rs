@@ -387,6 +387,23 @@ pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -
     s
 }
 
+/// What a Perforce reviewer is told when its capture is empty or incomplete. Without it the prompt
+/// offers built-in Read/Grep/Glob first and calls the evidence tools a way to look *past* a capture
+/// it also calls authoritative, while the section-7 gate counts only the evidence tools. Reviewers
+/// took the built-ins, or answered a follow-up with no tools at all, and lost the whole turn to the
+/// gate (issue #203). Says nothing to loosen the gate: this is the requirement stated in advance,
+/// and it asks for the missing part itself because the gate can only see that some call succeeded.
+pub const THIN_CAPTURE_NOTE: &str = "**This capture is not the whole change**; its own notes above say what is missing. Before you reach a verdict, read what it leaves out with the repository evidence tools: `repository_read` for a file that was cut short or omitted. Anything you could not recover goes under \"What I could not check\". Built-in Read, Grep and Glob do not count here: on a capture like this one the review is rejected unless a `repository_*` content call (not `repository_scope`) succeeds during this turn, and that includes a turn that only answers a follow-up question. That check only shows the service answered; it does not make a review that skipped the missing part a complete one.";
+
+/// The change as the prompt shows it when the capture is thin: the note follows whatever was
+/// captured, and stands alone when nothing was.
+pub fn with_thin_capture_note(change: Option<&str>) -> String {
+    match change {
+        Some(change) => format!("{}\n\n{THIN_CAPTURE_NOTE}", change.trim_end()),
+        None => THIN_CAPTURE_NOTE.to_string(),
+    }
+}
+
 /// One evidence-repair follow-up: the reviewer's answer would not clear the per-turn evidence floor
 /// (an approval not served the whole current change, or a turn that read no repository content), so
 /// ask it once — in the same conversation — to pull the complete current canonical diff and decide
@@ -758,6 +775,22 @@ mod tests {
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
         assert!(change_at < guidance_at, "{text}");
+    }
+
+    #[test]
+    fn the_thin_capture_note_states_the_gate_with_or_without_a_change() {
+        // Issue #203: the note has to name the tools the gate counts and the ones it does not, and
+        // to cover the follow-up turn that otherwise reads nothing.
+        for needed in [
+            "`repository_read`",
+            "Built-in Read, Grep and Glob",
+            "follow-up",
+        ] {
+            assert!(THIN_CAPTURE_NOTE.contains(needed), "{needed}");
+        }
+        let noted = with_thin_capture_note(Some("the change\n\n"));
+        assert_eq!(noted, format!("the change\n\n{THIN_CAPTURE_NOTE}"));
+        assert_eq!(with_thin_capture_note(None), THIN_CAPTURE_NOTE);
     }
 
     #[test]

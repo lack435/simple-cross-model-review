@@ -643,14 +643,110 @@ pub(crate) fn claude_evidence_ineligibility(
 /// `invalid_arguments` are indistinguishable from a disconnect and used to poison an otherwise
 /// complete review. Unknown/unmarked error shapes still fail closed. The whole stream is read so a
 /// success followed by a later transport failure cannot slip through.
+///
+/// The other fields exist only to say *why* a thin-capture review fell short (issue #203); they
+/// never change the verdict `is_ok` gives.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct EvidenceHealth {
     pub content_call_succeeded: bool,
     pub transport_error: bool,
     application_error_codes: Vec<String>,
+    /// `tool: bounded error text`, one per transport/unknown error, in stream order.
+    transport_errors: Vec<String>,
+    /// Content calls whose `tool_result` never appeared in the stream.
+    unanswered_content_calls: Vec<String>,
+    /// A `repository_scope` call answered. It returns no content, so it never clears the gate.
+    scope_call_succeeded: bool,
+    /// Built-in Read/Grep/Glob calls. They read real files, but outside the evidence service, so
+    /// the gate does not count them.
+    builtin_read_calls: usize,
+}
+
+/// Why a thin-capture review fell short of the section-7 gate, from the turn's own tool events.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EvidenceShortfall {
+    /// One clause naming what happened, to follow "the captured change was ... and".
+    pub what: String,
+    /// An explicit transport failure was seen. Anything less is not called a service fault, because
+    /// the stream cannot tell a lost call from a CLI that simply stopped.
+    pub service_fault: bool,
+}
+
+/// At most this many named tools or codes in a shortfall clause.
+const MAX_SHORTFALL_ITEMS: usize = 5;
+/// Bound on the error text kept from one transport failure.
+const MAX_TRANSPORT_ERROR_CHARS: usize = 160;
+
+fn bounded_list(items: &[String]) -> String {
+    let mut out = items
+        .iter()
+        .take(MAX_SHORTFALL_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if items.len() > MAX_SHORTFALL_ITEMS {
+        out.push_str(&format!("; +{} more", items.len() - MAX_SHORTFALL_ITEMS));
+    }
+    out
 }
 
 impl EvidenceHealth {
+    /// What kept a thin-capture turn from clearing the gate. Meaningful only when `is_ok` is false.
+    /// A failed transport is named first because it condemns the turn even beside a success.
+    pub(crate) fn shortfall(&self) -> EvidenceShortfall {
+        let (what, service_fault) = if self.transport_error {
+            (
+                format!(
+                    "an evidence call failed outside the evidence service's own responses, which \
+                     is treated as a transport failure ({})",
+                    bounded_list(&self.transport_errors)
+                ),
+                true,
+            )
+        } else if !self.unanswered_content_calls.is_empty() {
+            (
+                format!(
+                    "a content evidence call has no result in the reviewer's output ({}), which \
+                     does not show whether the service or the CLI lost it",
+                    bounded_list(&self.unanswered_content_calls)
+                ),
+                false,
+            )
+        } else if !self.application_error_codes.is_empty() {
+            (
+                format!(
+                    "the evidence service answered, but only with in-band tool errors, so no call \
+                     returned content ({})",
+                    bounded_list(&self.application_error_codes)
+                ),
+                false,
+            )
+        } else if self.scope_call_succeeded {
+            (
+                "the reviewer called only `repository_scope`, which returns no content".to_string(),
+                false,
+            )
+        } else if self.builtin_read_calls > 0 {
+            (
+                format!(
+                    "the reviewer made no `repository_*` content call: it used only built-in \
+                     Read/Grep/Glob ({} call(s)), which this check does not count",
+                    self.builtin_read_calls
+                ),
+                false,
+            )
+        } else {
+            (
+                "the reviewer made no tool calls this turn".to_string(),
+                false,
+            )
+        };
+        EvidenceShortfall {
+            what,
+            service_fault,
+        }
+    }
+
     /// Whether a thin-capture review may be trusted: real content evidence was obtained and the
     /// evidence transport stayed usable. In-band application errors are visible to the reviewer and
     /// do not make the service unavailable.
@@ -728,9 +824,12 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
         let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
         crate::evidence::is_evidence_server(server).then(|| tool.to_string())
     };
-    // tool_use ids: all evidence calls, and the content (non-scope) subset.
-    let mut evidence_ids: HashSet<String> = HashSet::new();
-    let mut content_ids: HashSet<String> = HashSet::new();
+    // tool_use ids: all evidence calls by tool, and the content (non-scope) subset, in first-seen
+    // order so a report of them is stable. Built-ins by id, since a CLI may repeat an event.
+    let mut evidence_ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut content_ids: Vec<String> = Vec::new();
+    let mut builtin_ids: HashSet<String> = HashSet::new();
+    let mut answered: HashSet<String> = HashSet::new();
     let mut health = EvidenceHealth::default();
     for line in stdout.lines() {
         let line = line.trim();
@@ -752,14 +851,21 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
                         continue;
                     }
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let id = item.get("id").and_then(Value::as_str);
                     let Some(tool) = evidence_tool(name) else {
+                        if let (true, Some(id)) = (matches!(name, "Read" | "Grep" | "Glob"), id) {
+                            builtin_ids.insert(id.to_string());
+                        }
                         continue;
                     };
-                    if let Some(id) = item.get("id").and_then(Value::as_str) {
-                        evidence_ids.insert(id.to_string());
-                        if tool.starts_with("repository_") && tool != "repository_scope" {
-                            content_ids.insert(id.to_string());
+                    if let Some(id) = id {
+                        if tool.starts_with("repository_")
+                            && tool != "repository_scope"
+                            && !evidence_ids.contains_key(id)
+                        {
+                            content_ids.push(id.to_string());
                         }
+                        evidence_ids.insert(id.to_string(), tool);
                     }
                 }
             }
@@ -771,9 +877,10 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
                     let Some(id) = item.get("tool_use_id").and_then(Value::as_str) else {
                         continue;
                     };
-                    if !evidence_ids.contains(id) {
+                    let Some(tool) = evidence_ids.get(id) else {
                         continue;
-                    }
+                    };
+                    answered.insert(id.to_string());
                     let is_error = item
                         .get("is_error")
                         .and_then(Value::as_bool)
@@ -783,8 +890,13 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
                             health.application_error_codes.push(code);
                         } else {
                             health.transport_error = true;
+                            health
+                                .transport_errors
+                                .push(format!("{tool}: {}", transport_error_text(item)));
                         }
-                    } else if content_ids.contains(id) {
+                    } else if tool == "repository_scope" {
+                        health.scope_call_succeeded = true;
+                    } else if content_ids.iter().any(|c| c == id) {
                         health.content_call_succeeded = true;
                     }
                 }
@@ -792,7 +904,37 @@ pub(crate) fn claude_evidence_health(stdout: &str) -> EvidenceHealth {
             _ => {}
         }
     }
+    health.unanswered_content_calls = content_ids
+        .iter()
+        .filter(|id| !answered.contains(*id))
+        .filter_map(|id| evidence_ids.get(id).cloned())
+        .collect();
+    health.builtin_read_calls = builtin_ids.len();
     health
+}
+
+/// The CLI's text for a failed evidence call, flattened to one bounded line for the caller. It is
+/// the CLI's or the transport's message, not repository content: the evidence server's own errors
+/// are marked and never reach here.
+fn transport_error_text(item: &Value) -> String {
+    let text = match item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "no error text".to_string();
+    }
+    let mut out: String = flat.chars().take(MAX_TRANSPORT_ERROR_CHARS).collect();
+    if flat.chars().count() > MAX_TRANSPORT_ERROR_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// What the Claude CLI says when another Claude Code process holds its OAuth refresh lock (issue
@@ -1791,6 +1933,99 @@ mod tests {
             Some("3d759777-4801-4e26-b6c5-4fbdb70adbbf")
         );
         assert!(parsed.denials.is_empty());
+    }
+
+    #[test]
+    fn evidence_shortfall_names_which_case_the_turn_was() {
+        // Issue #203. The first three are the shapes of real turns the gate refused: fresh reviews
+        // that read only through built-ins, and a resumed turn that called no tools at all.
+        fn tool_use(name: &str, id: &str) -> String {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}"}}]}}}}"#
+            )
+        }
+        fn evidence(tool: &str, id: &str) -> String {
+            tool_use(&format!("mcp__cross_review_evidence__{tool}"), id)
+        }
+        fn answered(id: &str) -> String {
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}"}}]}}}}"#
+            )
+        }
+        fn failed(id: &str, content: &str) -> String {
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":true,"content":{}}}]}}}}"#,
+                serde_json::to_string(content).unwrap()
+            )
+        }
+        let shortfall = |lines: &[String]| {
+            let health = claude_evidence_health(&lines.join("\n"));
+            assert!(!health.is_ok(), "every case here must stay refused");
+            health.shortfall()
+        };
+
+        // Built-ins only, counted once though the CLI repeated the event. Not the service's fault.
+        let s = shortfall(&[
+            tool_use("Grep", "b1"),
+            tool_use("Grep", "b1"),
+            answered("b1"),
+            tool_use("Read", "b2"),
+            answered("b2"),
+            tool_use("Glob", "b3"),
+            answered("b3"),
+        ]);
+        assert!(
+            s.what.contains("built-in Read/Grep/Glob (3 call(s))"),
+            "{}",
+            s.what
+        );
+        assert!(!s.service_fault);
+
+        // Nothing called at all: a follow-up answered from memory.
+        let s = shortfall(&[]);
+        assert_eq!(s.what, "the reviewer made no tool calls this turn");
+        assert!(!s.service_fault);
+
+        // Scope alone answered, so the service is up but returned no content.
+        let s = shortfall(&[evidence("repository_scope", "s1"), answered("s1")]);
+        assert!(s.what.contains("only `repository_scope`"), "{}", s.what);
+        assert!(!s.service_fault);
+
+        // In-band errors only: the service answered, and the codes say with what.
+        let marked = format!("{}:not_found: gone", crate::evidence::TOOL_ERROR_MARKER);
+        let s = shortfall(&[evidence("repository_read", "a1"), failed("a1", &marked)]);
+        assert!(s.what.contains("in-band tool errors"), "{}", s.what);
+        assert!(s.what.contains("not_found"), "{}", s.what);
+        assert!(!s.service_fault);
+
+        // A call with no result names its operation, but the stream cannot say who lost it, so it
+        // is not called a service fault.
+        let s = shortfall(&[evidence("repository_read", "n1")]);
+        assert!(
+            s.what
+                .contains("no result in the reviewer's output (repository_read)"),
+            "{}",
+            s.what
+        );
+        assert!(!s.service_fault);
+
+        // A transport failure names the operation and its bounded text, and outranks a success
+        // beside it, which is the case where the gate refuses despite content having arrived.
+        let long = format!("MCP error:\nconnection closed {}", "x".repeat(400));
+        let s = shortfall(&[
+            evidence("repository_read", "t1"),
+            answered("t1"),
+            evidence("repository_search", "t2"),
+            failed("t2", &long),
+        ]);
+        assert!(
+            s.what
+                .contains("repository_search: MCP error: connection closed"),
+            "{}",
+            s.what
+        );
+        assert!(s.what.chars().count() < 400, "{}", s.what);
+        assert!(s.service_fault);
     }
 
     #[test]

@@ -406,7 +406,8 @@ caller today:
 - **Perforce — incomplete segments.** When `incomplete_changelists > 0`, emit a warning naming how
   many captured changelists were incomplete and that their per-file reasons are in the prompt. This
   mirrors the existing skipped-changelist and diff-truncation warnings, which already reach the
-  caller.
+  caller. *(Issue #203: the warning now carries those per-file reasons itself, bounded, including a
+  file cut at a size cap, because the caller cannot see the prompt.)*
 
 Every other capture-level gap already warns, so no change is needed there. The result:
 `complete == false` iff at least one capture-completeness warning was emitted — while the per-file
