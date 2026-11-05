@@ -545,10 +545,10 @@ pub fn evidence_unavailable(detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
-/// The section-7 runtime evidence gate for an in-scope Claude review on Perforce: the reviewer
-/// **ran**, but the captured change was empty or incomplete AND it obtained no successful content
-/// evidence call or its evidence transport failed, so the review would rest on less than the
-/// intended change. Keeps the `EVIDENCE_UNAVAILABLE` code (the caller's action -- stop, do not
+/// The section-7 runtime evidence gate's hard failure for an in-scope Claude review on Perforce: the
+/// reviewer **ran**, but the captured change was empty or incomplete AND its evidence transport
+/// failed, or it obtained no successful content call and has no conversation to repair (issue #205),
+/// so the review would rest on less than the intended change. Keeps the `EVIDENCE_UNAVAILABLE` code (the caller's action -- stop, do not
 /// self-review, re-run -- is the same) but with a message accurate to the runtime case: the startup
 /// `evidence_unavailable` wording ("could not be provided", "was not started") would misreport this,
 /// which is the class of bug AGENTS.md names.

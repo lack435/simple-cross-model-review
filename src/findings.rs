@@ -2101,16 +2101,41 @@ impl EvidenceCoverage {
 /// already non-converged, and its recovery path is block-repair, not this. The in-turn auto-repair is
 /// expected to satisfy the floor before this ever fires; this is the fail-closed backstop for when it
 /// could not.
-pub fn apply_evidence_floor(
-    mut eval: TurnEvaluation,
-    coverage: EvidenceCoverage,
-) -> TurnEvaluation {
+pub fn apply_evidence_floor(eval: TurnEvaluation, coverage: EvidenceCoverage) -> TurnEvaluation {
     if !eval.envelope.structured {
         return eval;
     }
     if coverage.clears_floor(eval.envelope.verdict) {
         return eval;
     }
+    downgrade_for_evidence(
+        eval,
+        "the reviewer was not served the current, complete change this turn (an approval requires \
+         the whole canonical branch-base..worktree diff, paged to its end; every turn must read some \
+         repository content), so its verdict was recorded as changes_requested rather than trusted. \
+         The session is still resumable: re-review it, pulling the complete current diff, so the \
+         judgement rests on the whole change.",
+    )
+}
+
+/// The Perforce counterpart of [`apply_evidence_floor`] (issue #205), for a thin capture whose
+/// answer no successful `repository_*` content call stands behind. The caller has already decided
+/// that, from the reviewer's stream, so there is no coverage to weigh. A degraded turn is left alone
+/// for the same reason as there.
+pub fn apply_thin_capture_floor(eval: TurnEvaluation) -> TurnEvaluation {
+    if !eval.envelope.structured {
+        return eval;
+    }
+    downgrade_for_evidence(
+        eval,
+        "the capture was not the whole change and no repository_* content call stands behind this \
+         answer, so its verdict was recorded as changes_requested rather than trusted. The session \
+         is still resumable: re-review it, so the reviewer can read what the capture left out.",
+    )
+}
+
+/// Record a turn whose evidence fell short as a resumable `changes_requested`.
+fn downgrade_for_evidence(mut eval: TurnEvaluation, warning: &str) -> TurnEvaluation {
     // Never let an unproven approval stand as an approval, on either channel.
     eval.envelope.verdict = MachineVerdict::Changes;
     let reason = [
@@ -2123,14 +2148,7 @@ pub fn apply_evidence_floor(
     eval.envelope.non_convergence_reason = reason;
     eval.envelope.converged = false;
     eval.envelope.outcome = Outcome::from_reason(reason);
-    eval.envelope.warnings.push(
-        "the reviewer was not served the current, complete change this turn (an approval requires \
-         the whole canonical branch-base..worktree diff, paged to its end; every turn must read some \
-         repository content), so its verdict was recorded as changes_requested rather than trusted. \
-         The session is still resumable: re-review it, pulling the complete current diff, so the \
-         judgement rests on the whole change."
-            .to_string(),
-    );
+    eval.envelope.warnings.push(warning.to_string());
     eval
 }
 
@@ -3578,6 +3596,37 @@ mod tests {
                 complete_canonical: false,
             },
         );
+        assert_eq!(ev.envelope.non_convergence_reason, before);
+    }
+
+    #[test]
+    fn thin_capture_floor_never_lets_an_unread_approval_converge() {
+        // Issue #205: the turn stays resumable, but its approval is not reported as one.
+        let ev = clean_approve("rv-ev-6");
+        assert!(ev.envelope.converged);
+        let ev = apply_thin_capture_floor(ev);
+        assert!(!ev.envelope.converged);
+        assert_eq!(ev.envelope.verdict, MachineVerdict::Changes);
+        assert_eq!(
+            ev.envelope.non_convergence_reason,
+            Some(NonConvergenceReason::EvidenceIncomplete)
+        );
+        assert_eq!(ev.envelope.outcome, Outcome::ChangesRequested);
+        let warning = ev.envelope.warnings.last().unwrap();
+        assert!(warning.contains("repository_* content call"), "{warning}");
+        assert!(!warning.contains("branch-base"), "git wording: {warning}");
+    }
+
+    #[test]
+    fn thin_capture_floor_does_not_touch_a_degraded_turn() {
+        let ev = finalize_turn(
+            assess_turn("s", 1, "rv-ev-7", "no block at all", None),
+            Budget::default(),
+            0,
+        );
+        assert!(!ev.envelope.structured);
+        let before = ev.envelope.non_convergence_reason;
+        let ev = apply_thin_capture_floor(ev);
         assert_eq!(ev.envelope.non_convergence_reason, before);
     }
 

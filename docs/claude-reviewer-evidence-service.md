@@ -445,6 +445,13 @@ reviewer's own scoping:
   occurred (`EvidenceHealth::shortfall`), the capture it fired on, and that the reviewer ran. The
   check remains "at least one successful content call": it does not prove the omitted part was the
   part that was read.*
+
+  *Revision note (issue #205): a Perforce turn that merely read nothing is no longer lost. It is asked
+  once, in the same conversation, to read what the capture left out (`prompt::thin_capture_repair`);
+  its verdict stands only if that answer is structured and that run made a successful content call.
+  Otherwise the turn is a resumable `changes_requested` / `evidence_incomplete`
+  (`findings::apply_thin_capture_floor`), never an approval. A transport failure on either run, and a
+  turn with no conversation to repair, remain the hard `EVIDENCE_UNAVAILABLE` above.*
 - **Preamble (§4)** stays as defense-in-depth, not the enforcement.
 
 This is the one place the loop moved me from "no runtime machinery" to "scoped runtime

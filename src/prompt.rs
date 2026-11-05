@@ -393,7 +393,7 @@ pub fn block_repair(corrective: &str, nonce: &str, prior_digest: Option<&str>) -
 /// took the built-ins, or answered a follow-up with no tools at all, and lost the whole turn to the
 /// gate (issue #203). Says nothing to loosen the gate: this is the requirement stated in advance,
 /// and it asks for the missing part itself because the gate can only see that some call succeeded.
-pub const THIN_CAPTURE_NOTE: &str = "**This capture is not the whole change**; its own notes above say what is missing. Before you reach a verdict, read what it leaves out with the repository evidence tools: `repository_read` for a file that was cut short or omitted. Anything you could not recover goes under \"What I could not check\". Built-in Read, Grep and Glob do not count here: on a capture like this one the review is rejected unless a `repository_*` content call (not `repository_scope`) succeeds during this turn, and that includes a turn that only answers a follow-up question. That check only shows the service answered; it does not make a review that skipped the missing part a complete one.";
+pub const THIN_CAPTURE_NOTE: &str = "**This capture is not the whole change**; its own notes above say what is missing. Before you reach a verdict, read what it leaves out with the repository evidence tools: `repository_read` for a file that was cut short or omitted. Anything you could not recover goes under \"What I could not check\". Built-in Read, Grep and Glob do not count here: on a capture like this one the verdict is not accepted unless a `repository_*` content call (not `repository_scope`) succeeds during this turn, and that includes a turn that only answers a follow-up question. That check only shows the service answered; it does not make a review that skipped the missing part a complete one.";
 
 /// The change as the prompt shows it when the capture is thin: the note follows whatever was
 /// captured, and stands alone when nothing was.
@@ -402,6 +402,26 @@ pub fn with_thin_capture_note(change: Option<&str>) -> String {
         Some(change) => format!("{}\n\n{THIN_CAPTURE_NOTE}", change.trim_end()),
         None => THIN_CAPTURE_NOTE.to_string(),
     }
+}
+
+/// The Perforce evidence repair (issue #205): the capture was thin and the turn made no successful
+/// `repository_*` content call. Like [`evidence_repair`] this is a re-review, and its answer replaces
+/// the turn's, but there is no canonical diff to ask for, so it asks for the part that is missing.
+pub fn thin_capture_repair(nonce: &str, prior_digest: Option<&str>) -> String {
+    let mut s = String::new();
+    s.push_str("## Read what the capture left out before your verdict stands\n\n");
+    s.push_str(
+        "The change you were shown is not the whole change, and this turn made no successful \
+         `repository_*` content call, so your answer cannot be accepted yet. Built-in Read, Grep and \
+         Glob do not count.\n\n\
+         Use `repository_read` to read what the capture says it left out, then decide again: if the \
+         change is correct, approve; if the missing part changes your answer, say so and name the \
+         finding. Anything you could not recover goes under \"What I could not check\". Re-emit your \
+         prose review and your machine block reflecting this decision.\n\n",
+    );
+    s.push_str(&machine_block_section(nonce, prior_digest));
+    s.push('\n');
+    s
 }
 
 /// One evidence-repair follow-up: the reviewer's answer would not clear the per-turn evidence floor
@@ -775,6 +795,25 @@ mod tests {
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
         assert!(change_at < guidance_at, "{text}");
+    }
+
+    #[test]
+    fn the_thin_capture_repair_asks_for_the_missing_part_and_a_new_block() {
+        let out = thin_capture_repair("rv-1", Some("f1 (open)"));
+        assert!(out.contains("`repository_read`"), "{out}");
+        assert!(
+            out.contains("Built-in Read, Grep and Glob do not count"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("branch-base"),
+            "no canonical diff here: {out}"
+        );
+        assert!(
+            out.contains("rv-1"),
+            "the block contract carries the nonce: {out}"
+        );
+        assert!(out.contains("f1 (open)"), "the digest carries over: {out}");
     }
 
     #[test]

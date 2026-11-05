@@ -137,10 +137,12 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   accepted, but the session stays **resumable** — just re-review it on the same session (the reviewer
   is reminded to pull the complete diff) rather than rebaselining. This replaced a gate that stranded
   legitimate converging reviews; `EVIDENCE_UNAVAILABLE` now means only that the evidence *service*
-  could not be proved available (or a Perforce review with no content), not that a git reviewer merely
-  needed one more look at the diff. The Perforce case says "The reviewer ran, but its review was not
-  accepted" and names what fell short: read it, retry with `fresh: true`, and do not submit the
-  changelist to get past it.
+  could not be proved available (or a Perforce review whose evidence transport failed), not that a
+  reviewer merely needed one more look. The Perforce case says "The reviewer ran, but its review was
+  not accepted" and names what fell short: read it, retry with `fresh: true`, and do not submit the
+  changelist to get past it. A Perforce review of a partial capture that simply read nothing gets the
+  same one in-turn ask and the same resumable `evidence_incomplete`, so re-review that on the same
+  session too.
 - Summarise the outcome for the user: what the reviewer flagged, what changed in response,
   and what is still disputed. Keep findings the reviewer has confirmed resolved separate
   from ones you argued against — they are not the same claim.

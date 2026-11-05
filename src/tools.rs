@@ -50,6 +50,14 @@ struct RunFailure {
     child_never_started: bool,
 }
 
+/// What a repair run answered, and what its own stream shows about the evidence it read. The stream
+/// goes no further than `collect_run`, so this is the only way a repair's reads can count (issue
+/// #205).
+struct RepairAnswer {
+    text: String,
+    evidence: crate::reviewer::claude::EvidenceHealth,
+}
+
 impl RunFailure {
     /// A run that simply did not work. A repair degrades and commits normally; a main run reports
     /// the failure.
@@ -3881,7 +3889,7 @@ impl Job {
         authorized_start: Option<&crate::config::AuthorizedHome>,
         usage_key: Option<&str>,
         main: &mut reviewer::Parsed,
-    ) -> Result<String, RunFailure> {
+    ) -> Result<RepairAnswer, RunFailure> {
         // Pre-spawn identity + method probe, against the *pinned* home and account.
         if let Some(start) = authorized_start {
             let resolved = self
@@ -3935,6 +3943,11 @@ impl Job {
             },
         );
         self.registry.set_phase(&self.id, Phase::Finalizing);
+        let evidence = run
+            .as_ref()
+            .ok()
+            .map(|o| crate::reviewer::claude::claude_evidence_health(&o.stdout))
+            .unwrap_or_default();
 
         // The account must still be the pinned one now that this child has run, checked before
         // anything from the run is stored, parsed or returned and again before its answer is
@@ -3972,7 +3985,10 @@ impl Job {
         main.denials.extend(parsed.denials.iter().cloned());
         main.warnings
             .extend(parsed.warnings.iter().map(|w| format!("block repair: {w}")));
-        Ok(parsed.text)
+        Ok(RepairAnswer {
+            text: parsed.text,
+            evidence,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4170,7 +4186,7 @@ impl Job {
             && summary
                 .as_ref()
                 .map_or(true, |s| s.is_empty() || !s.is_complete());
-        // Perforce keeps the hard gate on a thin capture (see where it fires, below). Its reviewer
+        // Perforce gates a thin capture on the reviewer's own stream (see where it fires, below). Its reviewer
         // is told so up front, and the failure names the capture it was thin about (issue #203).
         let thin_capture_gated = capture_thin && self.cfg.vcs != crate::config::Vcs::Git;
         let thin_capture = thin_capture_gated.then(|| match summary.as_ref() {
@@ -4573,22 +4589,14 @@ impl Job {
         // than resuming onto a rejected turn. Fail closed to a lost (re-runnable) review, never a
         // possibly-thin approval. A non-empty complete capture skips this entirely (`capture_thin` is
         // false), so the common review pays nothing.
-        // Perforce keeps the hard fail-closed gate: it has no `repository_diff`, so the serve-record
-        // evidence floor below (git only) cannot cover it, and there is no canonical-diff auto-repair
-        // to fall back on. For git this early return is retired in favour of the resumable evidence
-        // floor + in-turn auto-repair applied around `finalize_turn` below: a git turn that read no
-        // content is downgraded to a resumable `changes_requested`, not lost.
-        if let (Some((capture_state, capture_line)), false) = (&thin_capture, evidence_ok) {
-            let shortfall = evidence_health.as_ref().map_or_else(
-                || crate::reviewer::claude::EvidenceHealth::default().shortfall(),
-                crate::reviewer::claude::EvidenceHealth::shortfall,
-            );
-            return Err(errors::evidence_review_too_thin(
-                capture_state,
-                &shortfall.what,
-                shortfall.service_fault,
-                thin_review_detail(capture_line.as_deref(), capture_warnings),
-            ));
+        // Perforce has no `repository_diff`, so the serve-record floor below (git only) cannot cover
+        // it, and this stream is its only evidence. A transport failure stays a hard failure here. A
+        // turn that simply read nothing no longer loses the review (issue #205): it goes through its
+        // own in-turn repair and resumable floor, around `finalize_turn` below.
+        if let (Some(capture), false) = (&thin_capture, evidence_ok) {
+            if let Some(health) = evidence_health.as_ref().filter(|h| h.transport_error) {
+                return Err(thin_review_refusal(capture, health, capture_warnings));
+            }
         }
         if let Some(health) = &evidence_health {
             parsed.warnings.extend(health.warnings());
@@ -4666,7 +4674,9 @@ impl Job {
                     usage_key,
                     &mut parsed,
                 ) {
-                    Ok(repair_text) => {
+                    Ok(RepairAnswer {
+                        text: repair_text, ..
+                    }) => {
                         // Any prose the reviewer wrote alongside the block is kept rather than dropped:
                         // a repair answer is transport, but "I have reconsidered f2" arriving on one is
                         // still the reviewer talking, and discarding it silently is how that goes
@@ -4788,7 +4798,9 @@ impl Job {
                             usage_key,
                             &mut parsed,
                         ) {
-                            Ok(repair_text) => {
+                            Ok(RepairAnswer {
+                                text: repair_text, ..
+                            }) => {
                                 // The re-review's own answer is this turn's answer when it is
                                 // structured: reconcile it against the same prior state the main run
                                 // used, so its verdict may legitimately change now that it saw the
@@ -4866,6 +4878,102 @@ impl Job {
                 }
             }
 
+            // The Perforce counterpart (issue #205). A thin capture whose reviewer made no successful
+            // `repository_*` content call is asked once, in the same conversation, to read what the
+            // capture leaves out and decide again. Its verdict stands only if that answer is
+            // structured and that run read something. Any other outcome leaves the floor unmet, so
+            // no verdict from this turn can converge.
+            let mut thin_floor_unmet = thin_capture.is_some() && !evidence_ok;
+            if let (Some(capture), true, false, false) = (
+                &thin_capture,
+                thin_floor_unmet,
+                self.cancel.load(std::sync::atomic::Ordering::SeqCst),
+                repair_refused_on_account,
+            ) {
+                // With no conversation to resume there is nothing to ask and nothing to record a
+                // resumable turn against, so this stays a lost review.
+                let Some(target) = repair_target.as_deref() else {
+                    let health = evidence_health.unwrap_or_default();
+                    return Err(thin_review_refusal(capture, &health, capture_warnings));
+                };
+                let repair_prompt = crate::prompt::thin_capture_repair(
+                    &self.id,
+                    assessment.prior_digest().as_deref(),
+                );
+                *prompt_bytes = prompt_bytes.saturating_add(repair_prompt.len());
+                match self.run_block_repair(
+                    target,
+                    &repair_prompt,
+                    evidence_invocation.as_ref(),
+                    authorized_start.as_ref(),
+                    usage_key,
+                    &mut parsed,
+                ) {
+                    Ok(answer) => {
+                        if answer.evidence.transport_error {
+                            return Err(thin_review_refusal(
+                                capture,
+                                &answer.evidence,
+                                capture_warnings,
+                            ));
+                        }
+                        warnings_from_repair.extend(answer.evidence.warnings());
+                        let reassessed = crate::findings::assess_turn(
+                            &self.session,
+                            turn,
+                            &self.id,
+                            &answer.text,
+                            prior_snapshot.clone(),
+                        );
+                        if reassessed.is_structured() {
+                            let prior_marker = assessment.block_repair_marker();
+                            let prior_notes = assessment.block_repair_notes();
+                            assessment = reassessed.carry_prior_repair(prior_marker, prior_notes);
+                            thin_floor_unmet = !answer.evidence.content_call_succeeded;
+                            warnings_from_repair.push(
+                                "the reviewer made no successful repository_* content call on a \
+                                 capture that was not the whole change, so it was asked once to \
+                                 read what the capture left out; the verdict below is its answer."
+                                    .to_string(),
+                            );
+                        } else {
+                            warnings_from_repair.push(
+                                "the reviewer was asked to read what the capture left out but did \
+                                 not return a usable answer, so its verdict was not trusted."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(RunFailure {
+                        failure,
+                        account_refusal,
+                        child_never_started: _,
+                    }) => {
+                        if account_refusal {
+                            // The same security refusal the repairs above handle: the turn will not
+                            // be recorded, so the session cannot be resumed.
+                            repair_refused_on_account = true;
+                            warnings_from_repair.push(format!(
+                                "the profile home's account changed while this turn was running: \
+                                 the repair response was discarded unread and this turn was not \
+                                 recorded, so session '{}' cannot be resumed. Start a fresh review \
+                                 (fresh: true) carrying the still-open findings. ({}: {})",
+                                self.session,
+                                failure.code,
+                                failure.summary.trim()
+                            ));
+                        } else {
+                            warnings_from_repair.push(format!(
+                                "the reviewer was asked to read what the capture left out and the \
+                                 attempt failed ({}): {}",
+                                failure.code,
+                                failure.summary.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+
             let turn_eval = crate::findings::finalize_turn(
                 assessment,
                 crate::findings::Budget::default(),
@@ -4876,7 +4984,8 @@ impl Job {
             // this turn, and every turn must have read some content. When unmet — after the auto-repair
             // above had its one chance — the turn is downgraded to a resumable `changes_requested`
             // (EvidenceIncomplete), never accepted as an approval and never hard-failed. Perforce is
-            // excluded (no `repository_diff`); its evidence is gated by the health early-return above.
+            // excluded (no `repository_diff`). A transport failure or a turn with no conversation to
+            // repair hard-fails above; any other unread thin capture gets its own floor just below.
             let turn_eval = if evidence_setup.is_some() && self.cfg.vcs == crate::config::Vcs::Git {
                 let agg = read_serve_record_aggregate(&self.cfg, &self.id);
                 // Every declared companion repository (issue #167) must clear the same floor as the
@@ -4931,6 +5040,21 @@ impl Job {
             } else {
                 turn_eval
             };
+            // The floor warns on a structured turn. A degraded one is its no-op, but it read nothing
+            // either and the caller is about to read its prose, so that one is warned here.
+            let turn_eval = if thin_floor_unmet {
+                if !turn_eval.envelope.structured {
+                    warnings_from_repair.push(
+                        "this turn's answer rests on less than the intended change: the capture \
+                         was not the whole of it and no repository_* content call succeeded for \
+                         that answer."
+                            .to_string(),
+                    );
+                }
+                crate::findings::apply_thin_capture_floor(turn_eval)
+            } else {
+                turn_eval
+            };
             let ledger: Option<serde_json::Value> =
                 Some(serde_json::to_value(&turn_eval.ledger).unwrap_or(serde_json::Value::Null));
             let terminal = terminal_reason_for(&turn_eval.envelope);
@@ -4952,8 +5076,8 @@ impl Job {
         // the whole current change first. Where this used to `return Err(EVIDENCE_UNAVAILABLE)` and
         // strand the session (the reviewer never pulled the diff, or approved on a narrowed slice), an
         // unmet floor is now a resumable `changes_requested` (EvidenceIncomplete) — the approval is
-        // still never accepted, but a converging review is re-reviewed rather than lost. Perforce is
-        // unaffected: it has no `repository_diff`, so it keeps the health early-return above.
+        // still never accepted, but a converging review is re-reviewed rather than lost. Perforce has
+        // its own repair and floor beside it (issue #205), keyed on the reviewer's stream.
 
         // A cumulative reporter gives the thread's running total, so this turn's cost is
         // the difference from the last one. Without this the first turn looks right and
@@ -5471,6 +5595,22 @@ const EVIDENCE_CAPABLE_REVIEWER_HINT: &str =
     "Use a Codex reviewer, or a Claude reviewer that is profile-pinned (--claude-profile), \
      shell-less, isolated, and on the default read rules (on git, with --cwd at the repository \
      root).";
+
+/// The section-7 gate's hard failure on a Perforce capture: a transport failure, or a turn with no
+/// conversation to repair.
+fn thin_review_refusal(
+    (capture_state, capture_line): &(&str, Option<String>),
+    health: &crate::reviewer::claude::EvidenceHealth,
+    warnings: &[String],
+) -> Failure {
+    let shortfall = health.shortfall();
+    errors::evidence_review_too_thin(
+        capture_state,
+        &shortfall.what,
+        shortfall.service_fault,
+        thin_review_detail(capture_line.as_deref(), warnings),
+    )
+}
 
 /// What the section-7 gate's failure shows about the capture it fired on (issue #203): the same
 /// `captured:` line and warnings a completed review would have carried, which a failed one otherwise
