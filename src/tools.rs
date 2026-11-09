@@ -3858,6 +3858,39 @@ impl Job {
         Ok(parsed)
     }
 
+    /// The pre-spawn checks of the first attempt, repeated before a `REVIEWER_BUSY` relaunch (issue
+    /// #207): the allowlist is re-resolved and must still authorize the *same* home and account that
+    /// were pinned at the top of the attempt, and the full identity + auth-method probe runs again
+    /// against that pinned account. Ambient reviews (`pinned == None`) are unguarded, as before.
+    fn recheck_before_busy_relaunch(
+        &self,
+        pinned: Option<&crate::config::AuthorizedHome>,
+    ) -> Result<(), Failure> {
+        let now = self.cfg.resolve_authorized_home_with_account(&self.spec)?;
+        if now.as_ref() != pinned {
+            return Err(errors::profile_identity_mismatch(
+                self.spec.reviewer.as_str(),
+                "the profile's authorization changed while the server waited to relaunch a reviewer \
+                 that hit the Claude OAuth refresh lock; the relaunch is refused rather than run \
+                 under a different account",
+            ));
+        }
+        if let Some(start) = pinned {
+            let resolved = self.reviewer.resolve_home_identity(
+                &self.bin,
+                &self.cfg,
+                &start.home,
+                &self.cancel,
+            )?;
+            crate::reviewer::assert_profile_identity(
+                self.spec.reviewer.as_str(),
+                &resolved,
+                &start.account,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Run one block-repair child: resume `target`, send `prompt`, and return its text.
     ///
     /// This is the second run inside one turn, and everything that makes that safe lives here:
@@ -4498,6 +4531,17 @@ impl Job {
         let launch_started = std::time::Instant::now();
         let mut busy_retries: u32 = 0;
         let (evidence_health, collected) = loop {
+            // A relaunch repeats the pre-spawn checks above against the account pinned for the first
+            // attempt (review f1): the 10-30s wait is long enough for a profile to be de-authorized or
+            // to move to another sign-in method on the same account, which the post-run fingerprint
+            // check alone would not see. Nothing ran on the busy attempt, so a refusal here clears the
+            // marker as the busy failure would have.
+            if busy_retries > 0 {
+                if let Err(refusal) = self.recheck_before_busy_relaunch(authorized_start.as_ref()) {
+                    self.clear_findings_marker_after_pre_launch_failure();
+                    return Err(refusal);
+                }
+            }
             let invocation = match self.reviewer.invocation(
                 &self.cfg,
                 &self.spec,
