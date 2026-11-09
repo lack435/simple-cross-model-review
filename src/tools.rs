@@ -5626,9 +5626,10 @@ fn job_noun(kind: crate::registry::JobKind) -> &'static str {
 /// refreshes, which takes seconds; the observed manual retry after ~20s succeeded.
 const BUSY_RETRY_LIMIT: u32 = 3;
 
-/// What a relaunch reserves for its pre-spawn identity probe, which has its own fixed 30s bound in
-/// the Claude adapter (review f2).
-const BUSY_RELAUNCH_PROBE_RESERVE: Duration = Duration::from_secs(30);
+/// What a relaunch reserves for its pre-spawn identity probe: the same preflight cap the collect
+/// wait is sized with -- the adapter's 30s auth deadline plus its output-drain grace (review f2).
+const BUSY_RELAUNCH_PROBE_RESERVE: Duration =
+    Duration::from_secs(crate::config::PREFLIGHT_CAP_SECS);
 
 /// The wait before busy retry number `retries + 1` -- 10s, 20s, 30s -- or `None` when the retries are
 /// spent or the wait plus the relaunch's identity probe would not leave the relaunch any of the
@@ -11423,8 +11424,8 @@ mod busy_retry_tests {
 
     #[test]
     fn never_waits_past_the_turn_budget() {
-        // The wait and the relaunch's 30s probe reserve must both fit inside the turn.
-        let turn = Duration::from_secs(60);
+        // The wait and the relaunch's 40s probe reserve must both fit inside the turn.
+        let turn = Duration::from_secs(70);
         assert_eq!(busy_retry_delay(0, Duration::from_secs(25), turn), None);
         assert_eq!(
             busy_retry_delay(0, Duration::from_secs(19), turn),
