@@ -1804,7 +1804,7 @@ mod tests {
         let shown = err.render_for_agent();
         assert!(shown.starts_with("REQUEST REJECTED"), "{shown}");
         assert!(!shown.contains("ACTION REQUIRED"), "{shown}");
-        assert!(shown.contains("same call again"), "{shown}");
+        assert!(shown.contains("same call once more"), "{shown}");
     }
 
     #[test]

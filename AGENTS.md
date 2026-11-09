@@ -99,8 +99,9 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   the entire premise of this project. `cross_model_review_status` checks the reviewer CLI
   and auth for free, before anything is billed. The one exception is `REVIEWER_BUSY`, which
   comes back as a plain correction, not a failure to escalate: the Claude CLI hit its OAuth
-  refresh lock before any model call, so nothing ran and the session is unchanged. Wait a
-  minute and make the same call again, at most twice, then stop and tell the user.
+  refresh lock before any model call, so nothing ran and the session is unchanged. The server
+  has already relaunched it three times over about a minute before returning it, so wait a
+  minute and make the same call once more, then stop and tell the user.
 - **Read the result's `outcome` field rather than reassembling one from the other fields.**
   `converged` stop, `changes_requested` act and re-review, `escalate` and `rebaseline` both mean a
   person decides — the second because the session itself cannot continue, so carry the still-open

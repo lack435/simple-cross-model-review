@@ -650,8 +650,9 @@ pub fn reviewer_busy(reviewer: &str, detail: impl Into<String>) -> Failure {
              performed."
         ),
         "This is usually transient and is not a sign-in problem, and nothing changed in the \
-         session. Wait a minute, then make the same call again with the same arguments. If it is \
-         still busy after two more tries, stop and tell the user: closing other Claude Code \
+         session. The server already waited and relaunched the reviewer several times before \
+         returning this. Wait a minute, then make the same call once more with the same \
+         arguments. If it is still busy, stop and tell the user: closing other Claude Code \
          processes that use the same account, or signing in again with `claude auth login`, \
          clears it."
             .to_string(),

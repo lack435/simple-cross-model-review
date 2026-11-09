@@ -562,9 +562,12 @@ resumable `changes_requested` with `evidence_incomplete`, so re-review it on the
 
 `REVIEWER_BUSY` is a transient refusal, not a setup problem: the Claude CLI reported that another
 Claude Code process held its OAuth refresh lock, so it failed before any model call. Nothing in the
-session changed, so it comes back as a plain correction telling the caller to wait a minute and make
-the same call again, and to involve the user only if it persists. Any other sign-in failure keeps
-its own code.
+session changed. The server absorbs the usual case itself: it waits and relaunches the reviewer up
+to three times (after 10, 20 and 30 seconds, inside the turn's `--timeout-seconds`), and a review
+that needed this says so in its warnings. Only when every relaunch also hits the lock does the call
+return `REVIEWER_BUSY`, as a plain correction telling the caller to wait a minute and make the same
+call once more, and to involve the user if it persists. Any other sign-in failure keeps its own code
+and is never retried.
 
 `cross_model_review_status` and `--doctor` check the reviewer CLI and auth before anything is
 billed.
