@@ -4620,20 +4620,31 @@ impl Job {
                     self.clear_findings_marker_after_pre_launch_failure();
                     return Err(errors::cancelled());
                 }
-                // A relaunch repeats the pre-spawn checks above against the account pinned for the
-                // first attempt (review f1): the wait is long enough for a profile to be de-authorized
-                // or to move to another sign-in method on the same account, which the post-run
-                // fingerprint check alone would not see. Nothing ran on the busy attempt, so a refusal
-                // clears the marker as the busy failure would have.
-                if let Err(refusal) = self.recheck_before_busy_relaunch(authorized_start.as_ref()) {
-                    self.clear_findings_marker_after_pre_launch_failure();
-                    return Err(refusal);
-                }
-                // `busy_retry_delay` reserved time for that probe; if it still overran, the relaunch
-                // would start with no budget, so return the busy result it was meant to recover
-                // (review f2).
-                if launch_started.elapsed() < self.cfg.timeout {
-                    continue;
+                // Re-check the budget now the wait is over: the probe and the relaunch must both fit,
+                // or the relaunch would start with no budget, so the busy result it was meant to
+                // recover is returned instead (review f2). Checked again after the probe for the same
+                // reason, should it overrun its cap.
+                let fits = || {
+                    launch_started
+                        .elapsed()
+                        .saturating_add(BUSY_RELAUNCH_PROBE_RESERVE)
+                        < self.cfg.timeout
+                };
+                if fits() {
+                    // A relaunch repeats the pre-spawn checks above against the account pinned for
+                    // the first attempt (review f1): the wait is long enough for a profile to be
+                    // de-authorized or to move to another sign-in method on the same account, which
+                    // the post-run fingerprint check alone would not see. Nothing ran on the busy
+                    // attempt, so a refusal clears the marker as the busy failure would have.
+                    if let Err(refusal) =
+                        self.recheck_before_busy_relaunch(authorized_start.as_ref())
+                    {
+                        self.clear_findings_marker_after_pre_launch_failure();
+                        return Err(refusal);
+                    }
+                    if launch_started.elapsed() < self.cfg.timeout {
+                        continue;
+                    }
                 }
             }
             break (evidence_health, collected);
