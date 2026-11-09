@@ -4488,80 +4488,114 @@ impl Job {
                 }
             },
         );
-        let invocation = match self.reviewer.invocation(
-            &self.cfg,
-            &self.spec,
-            &self.bin,
-            resume_id,
-            &self.id,
-            evidence_invocation.as_ref(),
-            authorized_start.as_ref(),
-        ) {
-            Ok(inv) => inv,
-            Err(e) => {
-                // Building the invocation failed (e.g. a temp last-message file could not be
-                // created): no child process was ever started, so the reviewer conversation could
-                // not have advanced and this session's findings ledger is not stale. Undo this turn's
-                // findings marker (for a non-fresh call, whose marker was absent on entry) so the
-                // next call is not refused — and, for Perforce, so Job::run's `.pending`
-                // full-recapture fallback stays reachable.
-                self.clear_findings_marker_after_pre_launch_failure();
-                return Err(errors::spawn_failed(
-                    self.spec.reviewer.as_str(),
-                    &self.bin.display().to_string(),
-                    e.to_string(),
-                ));
+        // The launch loop. It runs once, except when the Claude CLI fails on its OAuth refresh lock
+        // before any model call (`REVIEWER_BUSY`, issue #166): that collision is another process
+        // holding the lock for a few seconds, so the server waits and launches again rather than
+        // handing every caller the same retry policy (issue #207). Each attempt is a whole launch --
+        // invocation, run and `collect_run` with both of its account checks -- so a retry is checked
+        // exactly as the first attempt was, and the attempts share the one `--timeout-seconds`
+        // budget. When the budget of retries runs out, the last `REVIEWER_BUSY` is returned as before.
+        let launch_started = std::time::Instant::now();
+        let mut busy_retries: u32 = 0;
+        let (evidence_health, collected) = loop {
+            let invocation = match self.reviewer.invocation(
+                &self.cfg,
+                &self.spec,
+                &self.bin,
+                resume_id,
+                &self.id,
+                evidence_invocation.as_ref(),
+                authorized_start.as_ref(),
+            ) {
+                Ok(inv) => inv,
+                Err(e) => {
+                    // Building the invocation failed (e.g. a temp last-message file could not be
+                    // created): no child process was ever started, so the reviewer conversation could
+                    // not have advanced and this session's findings ledger is not stale. Undo this
+                    // turn's findings marker (for a non-fresh call, whose marker was absent on entry)
+                    // so the next call is not refused — and, for Perforce, so Job::run's `.pending`
+                    // full-recapture fallback stays reachable.
+                    self.clear_findings_marker_after_pre_launch_failure();
+                    return Err(errors::spawn_failed(
+                        self.spec.reviewer.as_str(),
+                        &self.bin.display().to_string(),
+                        e.to_string(),
+                    ));
+                }
+            };
+
+            let last_message_file = invocation.last_message_file.clone();
+
+            let run = reviewer::run_observed(
+                invocation.command,
+                &text,
+                self.cfg.timeout.saturating_sub(launch_started.elapsed()),
+                &self.cancel,
+                // The armed Claude path raises the stdout cap and terminates a runaway stream at
+                // the byte/line bound; every other path keeps the retain-and-drain default. See
+                // docs/usage-remaining-gate.md.
+                self.reviewer.output_limits(&self.cfg, &self.spec),
+                // Policy fail-fast (issue #68): Codex-only, disabled when --max-policy-denials is 0.
+                reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
+                |activity| {
+                    self.registry
+                        .report_activity(&self.id, activity.output_bytes);
+                },
+            );
+            self.registry.set_phase(&self.id, Phase::Finalizing);
+
+            // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json`
+            // output before `run` is consumed by collect_run. Only meaningful on the in-scope Claude
+            // path (whose invocation forced stream-json); absent everywhere else. `is_ok()` requires
+            // BOTH a successful content call AND no transport/infrastructure error. In-band tool
+            // errors do not condemn the service: the reviewer received them and they are surfaced as
+            // warnings below. A failed run has no Ok outcome to read -- collect_run below returns its
+            // error first, so the gate is never reached for it.
+            let evidence_health = capture_thin.then(|| {
+                run.as_ref()
+                    .ok()
+                    .map(|o| crate::reviewer::claude::claude_evidence_health(&o.stdout))
+                    .unwrap_or_default()
+            });
+
+            // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both
+            // live in `collect_run`, which is also where the headroom observation and the parse
+            // happen, in that one order. See there for why the two account checks are not
+            // redundant — the short version is that the usage store is written before the parse and
+            // the review is delivered after it, so one check cannot cover both.
+            let collected = self.collect_run(
+                run,
+                authorized_start.as_ref(),
+                usage_key,
+                last_message_file.as_deref(),
+            );
+            let busy = matches!(&collected, Err(f) if f.failure.code == "REVIEWER_BUSY");
+            if let Some(delay) = busy
+                .then(|| busy_retry_delay(busy_retries, launch_started.elapsed(), self.cfg.timeout))
+                .flatten()
+            {
+                busy_retries += 1;
+                eprintln!(
+                    "cross-review: {} hit the Claude OAuth refresh lock before any model call; \
+                     retrying in {}s (retry {busy_retries} of {BUSY_RETRY_LIMIT})",
+                    self.id,
+                    delay.as_secs()
+                );
+                self.registry.set_phase(&self.id, Phase::Launching);
+                if !sleep_unless_cancelled(delay, &self.cancel) {
+                    // Cancelled while waiting: nothing ran, so the marker goes as for BUSY itself.
+                    self.clear_findings_marker_after_pre_launch_failure();
+                    return Err(errors::cancelled());
+                }
+                continue;
             }
+            break (evidence_health, collected);
         };
-
-        let last_message_file = invocation.last_message_file.clone();
-
-        let run = reviewer::run_observed(
-            invocation.command,
-            &text,
-            self.cfg.timeout,
-            &self.cancel,
-            // The armed Claude path raises the stdout cap and terminates a runaway stream at the
-            // byte/line bound; every other path keeps the retain-and-drain default. See
-            // docs/usage-remaining-gate.md.
-            self.reviewer.output_limits(&self.cfg, &self.spec),
-            // Policy fail-fast (issue #68): Codex-only, disabled when --max-policy-denials is 0.
-            reviewer::PolicyStall::for_run(&self.cfg, &self.spec),
-            |activity| {
-                self.registry
-                    .report_activity(&self.id, activity.output_bytes);
-            },
-        );
-        self.registry.set_phase(&self.id, Phase::Finalizing);
-
-        // Section-7 (f4) evidence-health observation, taken from the reviewer's `stream-json` output
-        // before `run` is consumed by collect_run. Only meaningful on the in-scope Claude path (whose
-        // invocation forced stream-json); absent everywhere else. `is_ok()` requires BOTH a
-        // successful content call AND no transport/infrastructure error. In-band tool errors do not
-        // condemn the service: the reviewer received them and they are surfaced as warnings below.
-        // A failed run has no Ok outcome to read -- collect_run below returns its error first, so the
-        // gate is never reached for it.
-        let evidence_health = capture_thin.then(|| {
-            run.as_ref()
-                .ok()
-                .map(|o| crate::reviewer::claude::claude_evidence_health(&o.stdout))
-                .unwrap_or_default()
-        });
         let evidence_ok = evidence_health
             .as_ref()
             .is_some_and(crate::reviewer::claude::EvidenceHealth::is_ok);
 
-        // Switch guard [f4], part 2 of 2, plus the pre-observation check in front of it: both live in
-        // `collect_run`, which is also where the headroom observation and the parse happen, in that
-        // one order. See there for why the two account checks are not redundant — the short version is
-        // that the usage store is written before the parse and the review is delivered after it, so
-        // one check cannot cover both.
-        let mut parsed = match self.collect_run(
-            run,
-            authorized_start.as_ref(),
-            usage_key,
-            last_message_file.as_deref(),
-        ) {
+        let mut parsed = match collected {
             Ok(parsed) => parsed,
             Err(f) => {
                 // A `Spawn` failure means the child never started — same reasoning as the invocation
@@ -4600,6 +4634,13 @@ impl Job {
         }
         if let Some(health) = &evidence_health {
             parsed.warnings.extend(health.warnings());
+        }
+        if busy_retries > 0 {
+            parsed.warnings.push(format!(
+                "The Claude CLI hit its OAuth refresh lock (another Claude Code process was \
+                 refreshing the token) before any model call; the server waited and relaunched the \
+                 reviewer {busy_retries} time(s). This review is from the attempt that ran."
+            ));
         }
 
         // Evaluate the reviewer's machine block against the prior ledger: extract, reconcile, and
@@ -5530,6 +5571,37 @@ fn job_noun(kind: crate::registry::JobKind) -> &'static str {
     match kind {
         crate::registry::JobKind::Review => "review",
         crate::registry::JobKind::Consult => "consult",
+    }
+}
+
+/// How many times one turn relaunches a reviewer that failed on the Claude CLI's OAuth refresh lock
+/// before any model call (issue #207). The collision is another process holding the lock while it
+/// refreshes, which takes seconds; the observed manual retry after ~20s succeeded.
+const BUSY_RETRY_LIMIT: u32 = 3;
+
+/// The wait before busy retry number `retries + 1` -- 10s, 20s, 30s -- or `None` when the retries are
+/// spent or the wait would not leave the relaunch any of the turn's `timeout` budget. A refusal here
+/// returns the `REVIEWER_BUSY` the caller would have had before issue #207.
+fn busy_retry_delay(retries: u32, elapsed: Duration, timeout: Duration) -> Option<Duration> {
+    if retries >= BUSY_RETRY_LIMIT {
+        return None;
+    }
+    let delay = Duration::from_secs(10 * u64::from(retries + 1));
+    (elapsed.saturating_add(delay) < timeout).then_some(delay)
+}
+
+/// Sleep for `total`, waking early if `cancel` is raised. `false` means it was cancelled.
+fn sleep_unless_cancelled(total: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(200)));
     }
 }
 
@@ -11267,5 +11339,52 @@ mod captured_summary_tests {
         // No companions: the root binds alone, exactly as before.
         let (served, companions) = bind_served(&cfg, root_served, std::iter::empty());
         assert!(served.is_some() && companions.is_empty());
+    }
+}
+
+/// Issue #207: the in-server retry of a `REVIEWER_BUSY` OAuth refresh-lock collision.
+#[cfg(test)]
+mod busy_retry_tests {
+    use super::*;
+
+    const TURN: Duration = Duration::from_secs(1800);
+
+    #[test]
+    fn retries_three_times_with_growing_waits_then_gives_up() {
+        let waits: Vec<_> = (0..=BUSY_RETRY_LIMIT)
+            .map(|n| busy_retry_delay(n, Duration::from_secs(2), TURN))
+            .collect();
+        assert_eq!(
+            waits,
+            vec![
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(20)),
+                Some(Duration::from_secs(30)),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn never_waits_past_the_turn_budget() {
+        // 25s used of a 30s turn: a 10s wait would leave the relaunch nothing, so BUSY is returned.
+        let turn = Duration::from_secs(30);
+        assert_eq!(busy_retry_delay(0, Duration::from_secs(25), turn), None);
+        assert_eq!(
+            busy_retry_delay(0, Duration::from_secs(19), turn),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(busy_retry_delay(1, Duration::from_secs(10), turn), None);
+    }
+
+    #[test]
+    fn the_wait_ends_early_on_cancel() {
+        let cancel = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        assert!(!sleep_unless_cancelled(Duration::from_secs(30), &cancel));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let cancel = AtomicBool::new(false);
+        assert!(sleep_unless_cancelled(Duration::from_millis(50), &cancel));
     }
 }
