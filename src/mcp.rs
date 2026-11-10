@@ -309,6 +309,14 @@ impl ProgressReporter {
                 let mut complete = lock.lock().unwrap_or_else(|e| e.into_inner());
                 let mut progress = 0u64;
                 loop {
+                    // Checked before every wait, under the lock, not only after one (issue #210).
+                    // `Drop` can set `complete` and notify before this thread first waits -- a
+                    // result call that returns at once usually does -- and a notify with no waiter
+                    // is lost, so waiting first would sleep a whole interval and hold `Drop`'s join,
+                    // and with it the tool response, for that long.
+                    if *complete {
+                        break;
+                    }
                     let (next, waited) = changed
                         .wait_timeout(complete, interval)
                         .unwrap_or_else(|e| e.into_inner());
@@ -1992,6 +2000,46 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Issue #210: a result call that returns at once (`wait_seconds: 0`) must not be held up by its
+    /// progress reporter. Stopping the reporter before its thread first waits used to be a lost
+    /// wakeup: the thread then slept a whole interval (30s in production) and the join in `Drop`,
+    /// which runs before the tool response is sent, waited with it.
+    #[test]
+    fn stopping_progress_before_its_first_wait_does_not_wait_an_interval() {
+        let app = app();
+        let (review_id, _cancel) = app
+            .registry()
+            .try_start("progress-now", crate::registry::JobKind::Review, 1, false)
+            .expect("start");
+        let params = json!({
+            "name": "cross_model_review_result",
+            "arguments": {"review_id": review_id, "wait_seconds": 0},
+            "_meta": {"progressToken": "now"}
+        });
+        // Repeated, because the lost wakeup needs the stop to win the race against the reporter
+        // thread reaching its first wait; dropping straight after starting makes that the usual case.
+        for _ in 0..20 {
+            let recorder = Recorder::default();
+            let writer = recorder.writer();
+            let request = Arc::new(RequestCancel::new());
+            let started = std::time::Instant::now();
+            let reporter = ProgressReporter::start_with_interval(
+                &app,
+                &writer,
+                &params,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("progress reporter");
+            drop(reporter);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "stopping the progress reporter waited {:?}",
+                started.elapsed()
+            );
         }
     }
 
