@@ -1,154 +1,165 @@
-# Rewinding the reviewer after an unrecorded turn (issue #209)
+# Rewinding a Claude reviewer after a cancelled turn (issue #209)
 
-Status: **plan**, not implemented.
+Status: **plan**, not implemented. Cut down after its first cross-model review; see "What was
+cut, and why".
 
 ## Problem
 
-Every reviewer turn sets the findings write-ahead marker before the reviewer starts, and clears it
-only once the turn is durably recorded. A turn that is cancelled, times out, crashes, or fails after
-the child started leaves the marker set. The next non-`fresh` call is then refused
-`SESSION_NOT_RESUMABLE`. That refusal exists because the reviewer CLI's own conversation may now be
-*ahead* of the ledger. A reviewer that raised a blocker in a turn the server never recorded may
-believe that blocker is on the record, not raise it again, and let the session converge without it.
+A reviewer turn sets the findings write-ahead marker before it starts the reviewer. Three kinds of
+failure clear it again, because they provably ran nothing:
 
-The cost is the one #209 reports. The caller has to start `fresh: true`, the reviewer loses its
-memory of the session, and the open findings have to be carried across by hand.
+- the invocation could not be built;
+- the child process never started;
+- `REVIEWER_BUSY` (#166/#207): the Claude CLI hit its OAuth refresh lock before any model call.
 
-## The observation that makes this fixable
+Otherwise the marker is cleared only once the turn is durably recorded. Any other failure after the
+child started leaves it set, and that includes `cross_model_review_cancel`. The next non-`fresh`
+call is then refused `SESSION_NOT_RESUMABLE`.
 
-The ledger never needs rolling back. An unrecorded turn writes nothing to it, so it already stands
-at the last durable turn. Only the reviewer CLI's conversation is ahead. If the conversation can be
-rewound to the point where the ledger stands, the two agree again and the session can resume
+The refusal protects against the reviewer CLI's conversation being *ahead* of the ledger. A reviewer
+that raised a blocker in a turn the server never recorded may believe the blocker is on the record,
+not raise it again, and let the session converge without it.
+
+#209 is the cost of that. A caller cancelled a re-review because the change had moved on. The
+session was then refused, and going `fresh: true` lost the reviewer's memory and meant carrying the
+open findings across by hand.
+
+## The fix in one line
+
+After an explicit cancel, rewind the reviewer's conversation to the last recorded turn. The ledger is
+already there: a cancelled turn records nothing. The two then agree again, and the session resumes
 normally.
 
-Both reviewer CLIs can do that. **Verified** on 2026-11-10 with real calls. In each case turn 1 asked
-the model to remember ALPHA and turn 2 to remember BRAVO. After a rewind past turn 2, the model was
-asked what it remembered:
+## Verified mechanism (Claude)
 
-- **Codex 0.165.0.** `codex exec` has no rewind. The experimental `codex app-server` JSON-RPC
-  protocol does: `initialize`, then `thread/resume {threadId, excludeTurns: true}`, then
-  `thread/revert {threadId, beforeTurnId}`. A revert without the resume fails with "thread not
-  found". The revert needs no sign-in and makes no model call. Codex keeps the original rollout file
-  and writes a new one for the same thread id, whose `history_base` points at the old file up to the
-  reverted turn. **`codex exec resume <thread>` honours it:** it answered `ALPHA` only. Turn ids come
-  from `thread/turns/list`. Each turn carries `startedAt` (seconds), and the schema documents turn
-  ids as UUIDv7, so each id embeds its start time in milliseconds. Also verified on a copy of a real
-  5-turn review thread: `turns/list` went from 5 turns to 4.
-- **Claude Code.** The hidden flag `--resume-session-at <uuid>`, with `--fork-session`. The value
-  must be the top-level `uuid` of a stream-json `assistant` event; the API message id (`msg_…`)
-  produced no answer. The fork answered `ALPHA` under a new session id. A plain resume of the
-  original still answered `ALPHA, BRAVO`, so the original conversation is untouched.
+Verified on 2026-11-10 with real calls on Haiku. Turn 1 asked the model to remember ALPHA and turn
+2 to remember BRAVO. Then:
 
-Neither interface is a supported one: `app-server` is marked experimental, and
-`--resume-session-at` is absent from `--help`. That is why every rewind below falls back to today's
-refusal when it cannot be carried out, rather than to something weaker.
+- `claude -p --resume <id> --resume-session-at <uuid> --fork-session`, with `<uuid>` set to the
+  top-level `uuid` of turn 1's last stream-json `assistant` event, answered `ALPHA`, under a new
+  session id.
+- The API message id (`msg_…`) in place of the `uuid` produced no answer.
+- A plain `--resume <id>` of the original still answered `ALPHA, BRAVO`, so the fork leaves the
+  original conversation untouched.
+
+`--resume-session-at` does not appear in `--help`. Because it could change without notice, every
+step below falls back to today's refusal, never to something weaker.
 
 ## Design
 
-### What the server remembers
+### 1. Remember where each recorded turn ends
 
-Two new optional fields on `SessionRecord`, written by `record_turn`:
+`SessionRecord` gains one optional field, `claude_rewind_uuid`, written by `record_turn` for a Claude
+reviewer. It is the `uuid` of the last `assistant` event of the **last reviewer run the turn
+spawned**: the main run, or the final block or evidence repair.
 
-- `recorded_at_ms`: wall-clock milliseconds when the turn was durably recorded.
-- `claude_rewind_uuid`: for a Claude reviewer, the `uuid` of the last `assistant` event of the last
-  run whose answer the turn used: the main run, or the block repair that produced the accepted block.
-  Absent when that run's output was not stream-json; see scope.
+It is written **only if every run the turn spawned completed and was parsed cleanly.** A repair that
+failed after it started may have advanced the conversation in ways the stream does not show. A
+run with no stream-json output has no `uuid`. In either case the field is cleared, so that turn can
+never be the target of a rewind.
 
-The findings write-ahead marker gets content instead of being empty: the wall-clock milliseconds
-at which it was set, `mark_ms`, plus a `rewindable` flag. An empty marker, as written by today's
-binary, is read as not rewindable, so an upgrade changes nothing for a session already stuck.
+### 2. Mark a cancelled turn as rewindable, and only that
 
-### When a rewind is allowed
+The marker stays an empty file on every path that writes it today, which means "not rewindable".
+There is one new write. When the worker's run of a turn ends in `CANCELLED` after its child started,
+and the turn did not record, the worker rewrites the marker with the conversation it belongs to:
 
-At the existing marker gate in `start_review`, for a non-`fresh` call, before the refusal:
+```json
+{"rewind_after_cancel": {"cli_session_id": "<record.cli_session_id>", "turns": <record.turns>}}
+```
 
-1. The marker is **readable, rewindable, and set after the last record**, meaning
-   `mark_ms > record.recorded_at_ms`. If instead `mark_ms <= recorded_at_ms`, the turn *was*
-   recorded and only the marker clear failed. Then the conversation already matches the ledger: clear
-   the marker and resume with no rewind.
-2. A record exists. A failed turn 1 has nothing to rewind to; it keeps today's refusal, and
-   `fresh: true` costs nothing there.
-3. Every check `resume_block` already makes still passes: reviewer, model, working root, kind,
-   bindings, turn and idle limits.
-4. The reviewer has a rewind point. For Codex that is `recorded_at_ms`. For Claude it is
-   `claude_rewind_uuid`.
+Nothing else writes this content. Every other way a marker can be left set therefore keeps today's
+refusal unchanged:
 
-Anything else gives today's refusal, unchanged.
+- a crash, at any point;
+- the post-run account refusal (switch guard);
+- the resumed-session-id mismatch;
+- a timeout or policy stall;
+- a failed record or a failed marker clear.
 
-**An account refusal is never rewindable.** When the post-run switch guard refuses a turn because
-the profile's account moved, the marker is deliberately left set so that the session rebaselines.
-That path rewrites the marker with `rewindable: false`. A crash leaves the marker as written, which
-is rewindable: the ledger is then simply at the last durable turn, as for a cancel.
+It also covers these:
 
-### Doing the rewind
+- **A crash between the cancel and the rewrite** leaves the empty marker, which is not rewindable.
+  That is the safe direction.
+- **A cancelled `fresh: true` attempt** has no record identity to write: its conversation is new,
+  and the stored record still points at the old one. It writes nothing, so it stays refused.
+- **A cancel that lands after the turn recorded** never reaches this path: the marker is already
+  cleared, and the next call resumes normally.
 
-The rewind runs inside `attempt`, **after** the pre-spawn authorization and identity checks and with
-the per-home setup lock held, exactly where the reviewer itself would launch. It runs **before**
-this turn's write-ahead marker is written. So a rewind that fails returns today's refusal, and the
-next call sees the same marker and can try again.
+### 3. At the gate, allow exactly one case
 
-- **Codex.** Start `codex app-server` with the same resolved binary, controlled environment and
-  pinned `CODEX_HOME`. Call `initialize`, then `thread/resume`, then `thread/turns/list` in ascending
-  order. Revert before the first turn whose start time, taken from its UUIDv7 id, is after
-  `recorded_at_ms`. If there is no such turn, the failed run never started one and there is nothing
-  to revert. Two sanity checks, either of which refuses:
-  - the number of turns kept is at least `record.turns`, since every recorded server turn left at
-    least one Codex turn;
-  - the revert reports success, and a second `turns/list` shows exactly the kept prefix.
-  
-  These guard against clock trouble or a protocol change reverting recorded history. The process is
-  bounded by a short timeout, run under the job object, and reaped like every other child.
-- **Claude.** There is no separate step. The launch adds
-  `--resume-session-at <claude_rewind_uuid> --fork-session` to the usual `--resume <id>`. The fork
-  comes back under a new session id. That turn's record stores it as `cli_session_id`, and
-  `resumed_session_id_mismatch` accepts it for exactly this launch. Its `claude_rewind_uuid` is taken
-  from the forked run, as on any other turn.
+In `start_review`, at the existing marker gate, for a non-`fresh` call: when the marker parses as
+`rewind_after_cancel`, its `cli_session_id` and `turns` equal the stored record's, the record has a
+`claude_rewind_uuid`, the reviewer is Claude, and every existing `resume_block` check passes, the
+call proceeds as a **rewound resume** instead of being refused. Anything else returns today's
+refusal, word for word.
 
-### What the caller sees
+### 4. The rewound launch
 
-A rewound turn carries a warning: the previous turn did not finish, and the reviewer was rewound to
-the last recorded turn, N. Findings from the unrecorded turn are not on the record, and the
-reviewer no longer remembers them. The `cross_model_review_cancel` reply gains one sentence: the
-next call in the session resumes from the last recorded turn where the reviewer supports it, and
-otherwise needs `fresh: true`.
+The Claude invocation adds `--resume-session-at <claude_rewind_uuid> --fork-session` to its usual
+`--resume <cli_session_id>`. The launch is otherwise identical: same pre-spawn checks, same lock,
+same write-ahead marker, now empty again.
 
-Consults use the same marker, and a consult conversation is resumed the same way. The same rewind
-applies, with no ledger involved.
+The run comes back under the fork's new session id:
 
-## The boundary that moves
+- `resumed_session_id_mismatch` accepts a different id for exactly this launch.
+- The turn's record stores the new id as `cli_session_id` and the run's new `claude_rewind_uuid`.
+- A block repair resumes the fork, through `parsed.session_id` as today.
 
-This adds a **second way of starting the Codex CLI** next to the reviewer launch: a short-lived
-`codex app-server` that runs no model and only edits the thread's history in the pinned profile
-home. Before implementation, check and record in this doc:
+If the rewound turn itself fails, the stored record is unchanged. The next call sees a new marker:
+an empty one, or another cancel marker bound to the same record, which rewinds from the same point
+again.
 
-- whether `thread/resume` starts MCP servers, plugins or network connections (the test output
-  included a `remoteControl/status/changed` notification);
-- which configuration it loads. `app-server` has no `--ignore-user-config` in its `--help`, so find
-  out whether the pinned home's `config.toml`, if present, can change what it does;
-- that it writes nothing outside the pinned home's thread store.
+### 5. What the caller sees
 
-If any of these cannot be confined to what `codex exec` already does under the reviewer's posture,
-the Codex half is cut and Codex keeps today's refusal. The Claude half adds no new process.
+- **A rewound turn** carries a warning: the previous turn was cancelled, and the reviewer was
+  rewound to turn N, the last recorded one. It does not remember the cancelled turn, and nothing from
+  it is on the record.
+- **The `cross_model_review_cancel` reply** says what will happen next:
+  - **Claude reviewer whose last turn has a rewind point:** the next call in the session resumes from
+    the last recorded turn.
+  - **Otherwise:** the next call needs `fresh: true`, carrying the open findings, which the reply
+    lists by id and title from the stored ledger.
 
-## Scope cuts
+  That second case is also the whole improvement for Codex.
+- **Consults** use the same marker and the same resume, so the same rewind applies, with no ledger
+  involved.
 
-- **Claude's buffered output path** (no stream-json, so no assistant `uuid`) gets no rewind point and
-  keeps today's refusal. The git and evidence paths are stream-json; this covers the ambient Perforce
-  case.
-- **A failed turn 1** keeps today's refusal. There is no memory to lose.
-- **No retry loop** around a failed rewind: the refusal says so, and the caller can try again or go
-  `fresh`.
+## What was cut, and why
+
+The first draft also rewound Codex, through `thread/revert` in the experimental `codex app-server`
+protocol. That works: verified with `codex exec resume` after a revert. It also rewound after any
+unrecorded turn, not only a cancel. The plan's first review raised six findings; four were major.
+Most came from those two choices, so both were cut rather than fortified (AGENTS.md, "How much
+rigor, and where"):
+
+- **Codex.** Its exec stream carries no turn id, so the cutoff had to come from wall-clock times.
+  Those are open to clock skew, and a server turn can contain several CLI turns (f1). It also needs
+  a second, long-lived way of starting the Codex CLI, without `--ignore-user-config`, that would have
+  to be shown to match the reviewer's whole isolation posture (f4). The issue was reported against a
+  Claude reviewer. Codex keeps today's refusal, with the better cancel reply.
+- **Any unrecorded turn.** Every path that deliberately leaves the marker set for a forced
+  rebaseline would have needed an exclusion, and the exclusions were not crash-durable (f2). An
+  opt-in written only by the cancel path inverts that: the default stays a refusal.
+
+The verified Codex mechanism is recorded here in case a later issue wants it:
+`initialize` → `thread/resume {threadId, excludeTurns: true}` → `thread/revert {threadId,
+beforeTurnId}`. It needs no sign-in, makes no model call, and `codex exec resume` honours it.
 
 ## Tests
 
-- Unit: marker content round trip, with an empty or legacy marker read as not rewindable; the
-  eligibility table (rewindable or not, `mark_ms` against `recorded_at_ms`, no record, account
-  refusal); choosing the Codex revert point from a turn list, including no turn to revert, a clock
-  anomaly, and too few kept turns; the Claude launch flags; the forked session id accepted only on a
-  rewound launch; capture of `claude_rewind_uuid` from the main run and from a repair.
-- Fake app-server: a scripted JSON-RPC peer for the Codex step, covering success, an error from
-  `thread/revert`, an unchanged `turns/list` after a revert, and a timeout.
-- End to end, which costs tokens: `smoke.ps1 -Reviewer codex` and `-Reviewer claude`, plus a manual
-  check in each direction: review, re-review, cancel the re-review mid-turn, then call again on the
-  same session. Expect a resumed turn with the rewind warning, a reviewer that remembers turn 1, and
-  the ledger unchanged.
+- **Unit:**
+  - marker round trip, with an empty or unparseable marker read as not rewindable;
+  - the gate table: marker kind, identity match or mismatch, a missing `claude_rewind_uuid`, a Codex
+    reviewer, a `fresh` call;
+  - `claude_rewind_uuid` captured from the main run, from the final repair, and cleared when any run
+    failed after starting or produced no stream-json;
+  - the rewound launch's flags;
+  - the fork's session id accepted only on a rewound launch;
+  - the cancel reply's two forms.
+- **End to end,** which costs tokens:
+  - `smoke.ps1 -Reviewer claude`;
+  - a manual Claude check: review, re-review, cancel the re-review mid-turn, call again on the same
+    session. Expect a resumed turn with the rewind warning, a reviewer that remembers turn 1, and the
+    ledger unchanged.
+  - `smoke.ps1 -Reviewer codex`, to confirm Codex is unchanged.
