@@ -223,6 +223,9 @@ pub struct Parsed {
     /// went wrong -- a cumulative figure looks like a plausible per-turn one right up
     /// until you compare two turns.
     pub usage_is_cumulative: bool,
+    /// Claude only: the `uuid` of this run's last stream-json `assistant` event, the point a later
+    /// rewind resumes at (issue #209). `None` for Codex and for buffered Claude output.
+    pub rewind_point: Option<String>,
 }
 
 /// Normalize a CLI-reported session id at the adapter boundary: trim surrounding whitespace and

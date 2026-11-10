@@ -1099,7 +1099,26 @@ impl App {
         // call must not silently start a clean, convergeable turn 1 over it. Fail-closed: an
         // unreadable marker refuses too. `fresh: true` (which sets `prior = None` by choice) is the
         // explicit escape hatch and skips this. See also the Perforce note below.
+        //
+        // One exception (issue #209): a marker the worker rewrote after an explicit **cancel**,
+        // bound to the stored record, on a Claude session with a rewind point. That turn recorded
+        // nothing, so the ledger already stands at the last recorded turn; the reviewer is rewound
+        // to the same point (`--resume-session-at --fork-session`) and the session resumes. See
+        // `docs/cancel-rewind-plan.md` and [`cancel_rewind_target`].
+        let mut rewind: Option<(String, session::CancelRewind)> = None;
         if !fresh
+            && matches!(
+                self.sessions.findings_marker_state(&session),
+                crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
+            )
+        {
+            rewind = prior.as_ref().and_then(|record| {
+                let bound = self.sessions.findings_marker_cancel_rewind(&session)?;
+                cancel_rewind_target(&cfg, record, &bound).map(|uuid| (uuid, bound))
+            });
+        }
+        if !fresh
+            && rewind.is_none()
             && matches!(
                 self.sessions.findings_marker_state(&session),
                 crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable
@@ -1445,7 +1464,10 @@ impl App {
             },
             // Non-fresh calls passed the findings gate, so their marker was absent on entry; fresh
             // calls skipped it. Used to decide whether a pre-launch failure may clear the marker.
-            findings_marker_absent_on_entry: !fresh,
+            // A rewound call's marker was present on entry (the cancel marker), so it may not clear
+            // it; it restores the cancel marker instead (see `rewind`).
+            findings_marker_absent_on_entry: !fresh && rewind.is_none(),
+            rewind,
             kind,
             cancel,
             _lease: Some(lease),
@@ -2601,6 +2623,72 @@ impl App {
         )))
     }
 
+    /// What the cancel did to the job's session (issue #209), for the cancel reply. Read from what
+    /// the worker actually left behind, once it has finished (#209 code review f2): the findings
+    /// marker and the stored record. It is not predicted, because a cancel can land before the
+    /// reviewer starts, or after the turn already recorded, and each of those leaves a different
+    /// state. It states only the cancel's own effect. Whether the next call resumes also depends on
+    /// checks that are independent of the cancel (turn and idle limits, a terminal state, the call's
+    /// own arguments), which `resume_block` makes then and which this note does not promise.
+    fn after_cancel_note(&self, id: &str) -> String {
+        let Some(snap) = self.registry.snapshot(id) else {
+            return String::new();
+        };
+        if snap.status == crate::registry::Status::Running {
+            // The worker had not finished within the wait; say nothing rather than guess.
+            return String::new();
+        }
+        let session = &snap.session;
+        let record = self.sessions.get_checked(session).ok().flatten();
+        match self.sessions.findings_marker_state(session) {
+            crate::session::MarkerState::Absent => match record {
+                Some(r) => format!(
+                    "The cancel left nothing unfinished: session '{session}' stands at turn {}, \
+                     its last recorded turn, as it did before.\n",
+                    r.turns
+                ),
+                None => String::new(),
+            },
+            crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable => {
+                let rewinds = record.as_ref().is_some_and(|r| {
+                    self.sessions
+                        .findings_marker_cancel_rewind(session)
+                        .is_some_and(|bound| cancel_rewind_target(&self.cfg, r, &bound).is_some())
+                });
+                if let (true, Some(r)) = (rewinds, &record) {
+                    return format!(
+                        "The cancelled turn is not on the record. On the next call to session \
+                         '{session}', the reviewer is rewound to turn {}, the last recorded turn, \
+                         instead of the session being refused because of the cancel.\n",
+                        r.turns
+                    );
+                }
+                let open: Vec<String> = match record.as_ref().map(|r| r.ledger_load()) {
+                    Some(session::LedgerLoad::Valid(l)) => l
+                        .findings
+                        .iter()
+                        .filter(|f| f.status.is_open())
+                        .map(|f| format!("  - {}: {}", f.id, f.title))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let carry = if open.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Carry these open findings into its instructions:\n{}",
+                        open.join("\n")
+                    )
+                };
+                format!(
+                    "Because of the cancelled turn, the next call on session '{session}' is refused \
+                     a resume and needs fresh: true, which starts a new reviewer \
+                     conversation.{carry}\n"
+                )
+            }
+        }
+    }
+
     pub fn cancel(&self, args: &Value) -> Result<String, Failure> {
         let id = string_arg(args, "review_id")
             .ok_or_else(|| errors::bad_request("'review_id' is required."))?;
@@ -2622,9 +2710,15 @@ impl App {
             }
         }
         if self.cancel_review(&id) {
-            // Give the worker a moment to reap the child so the report is accurate.
-            std::thread::sleep(Duration::from_millis(300));
-            Ok(format!("Review '{id}' was cancelled. The reviewer process has been stopped and there is no review feedback.\n"))
+            // Let the worker reap the child and settle the session's marker, so the report, and the
+            // note on what the next call will do, describe what actually happened. Bounded: a worker
+            // that has not finished by then gets no note rather than a guess.
+            self.registry.wait(&id, Duration::from_secs(10), &|| false);
+            Ok(format!(
+                "Review '{id}' was cancelled. The reviewer process has been stopped and there is no \
+                 review feedback.\n{}",
+                self.after_cancel_note(&id)
+            ))
         } else {
             Ok(format!("Review '{id}' had already finished; nothing to cancel. Collect it with cross_model_review_result.\n"))
         }
@@ -2715,6 +2809,11 @@ struct Job {
     /// turn set, which it must not drop. Note this is *not* the same as `resume_id.is_some()`: a
     /// non-fresh turn 1 with no record still passed the gate and can clear.
     findings_marker_absent_on_entry: bool,
+    /// `Some((uuid, bound))` when this turn is a **rewound resume** after a cancelled turn (issue
+    /// #209): the Claude reviewer is resumed at `uuid` with `--fork-session`, and `bound` is the cancel
+    /// marker that allowed it, restored if this turn fails before any child starts so the session
+    /// stays rewindable. `None` on every other turn.
+    rewind: Option<(String, session::CancelRewind)>,
     /// Which start path drives this job: [`JobKind::Review`] runs the full findings/convergence
     /// pipeline; [`JobKind::Consult`] skips assessment, the block, the ledger and the envelope, and
     /// carries the reviewer's prose straight through. Every consult divergence in `attempt`/`run` is
@@ -3745,7 +3844,44 @@ impl Job {
     /// full-recapture path reachable. A `fresh` call does not clear: it bypassed the gate and may be
     /// sitting on a marker an earlier failed turn set, which it must not silently drop. A failed
     /// clear only over-refuses the next call (the safe direction), so it is warned, not fatal.
+    /// After an explicit cancel of a turn whose child had started (issue #209), rewrite the findings
+    /// marker to say so, bound to the record this turn resumed: its conversation id and turn count.
+    /// Only a non-`fresh` resume has a record to bind to (`resume_id` is its conversation id, and the
+    /// record has `turn - 1` turns); a fresh attempt or a new session writes nothing and stays refused
+    /// as before. A failed write leaves the empty marker, which is the safe direction.
+    fn mark_cancel_rewindable(&self, resume_id: Option<&str>, turn: u32) {
+        let Some(cli_session_id) = resume_id else {
+            return;
+        };
+        if !(self.findings_marker_absent_on_entry || self.rewind.is_some()) {
+            return;
+        }
+        let bound = session::CancelRewind {
+            cli_session_id: cli_session_id.to_string(),
+            turns: turn.saturating_sub(1),
+        };
+        if let Err(e) = self.sessions.mark_findings_cancelled(&self.session, &bound) {
+            eprintln!(
+                "cross-review: warning: could not mark the cancelled turn on session '{}' as \
+                 rewindable: {e}; the next call will need fresh: true",
+                self.session
+            );
+        }
+    }
+
     fn clear_findings_marker_after_pre_launch_failure(&self) {
+        // A rewound turn (issue #209) entered on the cancel marker. Nothing ran, so put that marker
+        // back rather than clearing it: the session is exactly as rewindable as it was.
+        if let Some((_, bound)) = &self.rewind {
+            if let Err(e) = self.sessions.mark_findings_cancelled(&self.session, bound) {
+                eprintln!(
+                    "cross-review: warning: could not restore the cancel marker for session '{}' \
+                     after a pre-launch failure: {e}; the next call may be refused",
+                    self.session
+                );
+            }
+            return;
+        }
         if !self.findings_marker_absent_on_entry {
             return;
         }
@@ -3957,6 +4093,10 @@ impl Job {
             })?;
         let last_message_file = invocation.last_message_file.clone();
 
+        // From here the repair may advance the conversation, so the turn no longer has a known
+        // rewind point (issue #209). Only a repair that completes cleanly below sets a new one.
+        main.rewind_point = None;
+
         // A repair child is a reviewer running, not finalization. The main attempt has already set
         // `Finalizing`, so without this the progress a caller sees during the whole repair timeout
         // says the turn is wrapping up while a model call is in flight.
@@ -4018,6 +4158,7 @@ impl Job {
         main.denials.extend(parsed.denials.iter().cloned());
         main.warnings
             .extend(parsed.warnings.iter().map(|w| format!("block repair: {w}")));
+        main.rewind_point = parsed.rewind_point.clone();
         Ok(RepairAnswer {
             text: parsed.text,
             evidence,
@@ -4531,7 +4672,7 @@ impl Job {
         let launch_started = std::time::Instant::now();
         let mut busy_retries: u32 = 0;
         let (evidence_health, collected) = loop {
-            let invocation = match self.reviewer.invocation(
+            let mut invocation = match self.reviewer.invocation(
                 &self.cfg,
                 &self.spec,
                 &self.bin,
@@ -4556,6 +4697,13 @@ impl Job {
                     ));
                 }
             };
+            // A rewound resume (issue #209): the same `--resume`, continued only up to the last
+            // recorded turn and forked, so the cancelled turn is not in the conversation.
+            if let Some((uuid, _)) = &self.rewind {
+                if self.spec.reviewer == ReviewerKind::Claude {
+                    crate::reviewer::claude::add_rewind_args(&mut invocation.command, uuid);
+                }
+            }
 
             let last_message_file = invocation.last_message_file.clone();
 
@@ -4667,6 +4815,10 @@ impl Job {
                 // the retry its remediation asks for must not be refused.
                 if f.child_never_started || f.failure.code == "REVIEWER_BUSY" {
                     self.clear_findings_marker_after_pre_launch_failure();
+                } else if f.failure.code == "CANCELLED" {
+                    // Issue #209: an explicit cancel after the child started. The turn recorded
+                    // nothing, so mark the marker rewindable, bound to the record this turn resumed.
+                    self.mark_cancel_rewindable(resume_id, turn);
                 }
                 return Err(f.failure);
             }
@@ -4692,6 +4844,14 @@ impl Job {
         }
         if let Some(health) = &evidence_health {
             parsed.warnings.extend(health.warnings());
+        }
+        if self.rewind.is_some() {
+            parsed.warnings.push(format!(
+                "The previous turn on this session was cancelled before it was recorded, so the \
+                 reviewer was rewound to turn {}, the last recorded turn, before this one ran. It \
+                 does not remember the cancelled turn, and nothing from it is on the record.",
+                turn.saturating_sub(1)
+            ));
         }
         if busy_retries > 0 {
             parsed.warnings.push(format!(
@@ -4740,15 +4900,19 @@ impl Job {
             // a new one to ask for a block would produce a block describing a review that never
             // happened — so there is no repair on that path. Likewise when the main run already failed
             // the identity check: its conversation is one the server has decided not to trust.
-            let repair_target: Option<String> =
-                if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
-                    None
-                } else {
-                    parsed
-                        .session_id
-                        .clone()
-                        .or_else(|| resume_id.map(str::to_string))
-                };
+            let repair_target: Option<String> = if self.rewind.is_some() {
+                // A rewound resume's repairs continue the fork, and only a fork that reported its
+                // own new id (review f7): falling back to `resume_id` would repair the original,
+                // un-rewound conversation.
+                rewound_fork_id(resume_id, parsed.session_id.as_deref()).map(str::to_string)
+            } else if resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref()) {
+                None
+            } else {
+                parsed
+                    .session_id
+                    .clone()
+                    .or_else(|| resume_id.map(str::to_string))
+            };
             let mut attempts_left = self.cfg.block_repair_attempts;
             while let Some(request) = crate::findings::plan_repair(
                 &assessment,
@@ -5236,7 +5400,27 @@ impl Job {
         // under the id we resumed with. Skipping the record -- as this used to -- kept the
         // mapping but never advanced the baseline, so the next turn subtracted against a
         // stale total and double-counted this one.
-        let record_under = parsed.session_id.as_deref().or(resume_id);
+        // A cancel that landed after the main run, during a block or evidence repair or while the
+        // turn was being finalized (#209 code review f1), cancels the whole turn: nothing is
+        // recorded, exactly as for a cancel during the main run. Each repair treats its own
+        // CANCELLED as a degraded repair, which would otherwise record a turn whose conversation
+        // holds the cancelled repair. The conversation is rewound past all of it on the next call.
+        if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            self.mark_cancel_rewindable(resume_id, turn);
+            return Err(errors::cancelled());
+        }
+
+        // A rewound resume records under the fork's own id, and only if it reported one (f7).
+        let fork_id = self
+            .rewind
+            .as_ref()
+            .and_then(|_| rewound_fork_id(resume_id, parsed.session_id.as_deref()));
+        let rewound_without_fork_id = self.rewind.is_some() && fork_id.is_none();
+        let record_under = if self.rewind.is_some() {
+            fork_id
+        } else {
+            parsed.session_id.as_deref().or(resume_id)
+        };
         // A resume whose reviewer answered under a *different* nonempty session id is a conversation
         // identity change: the id that answered is not the one we resumed, so this turn's reviewer
         // never held the session's earlier turn-by-turn history -- only the injected findings digest
@@ -5248,8 +5432,9 @@ impl Job {
         // fresh; the prior ledger is preserved on disk for that handoff. The review prose below is
         // unaffected. A fresh turn (`resume_id` is `None`) and a resume that echoes the same id or no
         // id at all are all unaffected.
-        let resumed_id_mismatch =
-            resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref());
+        // A rewound resume answers under a new id by design; it is judged by `rewound_fork_id`.
+        let resumed_id_mismatch = self.rewind.is_none()
+            && resumed_session_id_mismatch(resume_id, parsed.session_id.as_deref());
         // Whether the findings write-ahead marker was successfully cleared after a durable record.
         // A durable turn whose marker clear *failed* leaves the marker set, so the next non-fresh
         // call will be refused at the findings gate -- such a turn must not advertise itself as
@@ -5267,6 +5452,16 @@ impl Job {
                 "cross-review: warning: the profile account changed during a block repair on                  session '{}'; not recording, leaving the session non-resumable",
                 self.session
             );
+            false
+        } else if rewound_without_fork_id {
+            warnings.push(format!(
+                "This turn rewound the reviewer to the last recorded turn after a cancel, but the \
+                 reviewer did not report the new conversation id the rewind creates, so it cannot \
+                 be shown that the rewind took effect. This turn was not recorded and session '{}' \
+                 cannot be resumed: start a fresh review (fresh: true) carrying the still-open \
+                 findings into the new instructions. The review below is still valid.",
+                self.session
+            ));
             false
         } else if resumed_id_mismatch {
             warnings.push(format!(
@@ -5302,6 +5497,12 @@ impl Job {
                     match self.sessions.record_turn(
                         &self.session,
                         session::TurnFacts {
+                            // A rewound turn continues the stored session under the fork's new id
+                            // (issue #209), so it counts as one more turn on it.
+                            forked_from: fork_id.and(resume_id),
+                            // Where this turn left the conversation, for a later rewind. Cleared by
+                            // any repair that started (see `run_block_repair`).
+                            claude_rewind_uuid: parsed.rewind_point.clone(),
                             reviewer: self.spec.reviewer.as_str(),
                             cli_session_id: session_id,
                             model: &self.spec.model,
@@ -5600,6 +5801,50 @@ impl Job {
 /// nonempty session id that differs from it. A fresh turn (`resume_id` is `None`), a resume that
 /// echoes the same id, and a resume that reports no id at all (handled as "still the same thread")
 /// are all *not* mismatches.
+/// The Claude rewind point a cancel marker may resume at, or `None` when the session must be
+/// refused as before (issue #209, `docs/cancel-rewind-plan.md`). All of these must hold:
+///
+/// - the marker is bound to *this* record, by conversation id and turn count, so it can never be
+///   applied to a different conversation, nor to a record that moved on since the cancel;
+/// - the session's reviewer is Claude, and its last recorded turn left a rewind point (every run of
+///   that turn completed cleanly and produced stream-json);
+/// - the reviewer's working-directory mode is unchanged (review f8). A changed mode makes
+///   `start_review` drop the record and start a new conversation, which on a call that passed this
+///   gate as a resume would quietly be a turn 1 with no ledger.
+///
+/// Every other check a resume needs is still made by `resume_block`, after this.
+fn cancel_rewind_target(
+    cfg: &Config,
+    record: &session::SessionRecord,
+    bound: &session::CancelRewind,
+) -> Option<String> {
+    if bound.cli_session_id != record.cli_session_id || bound.turns != record.turns {
+        return None;
+    }
+    if record.reviewer != ReviewerKind::Claude.as_str() {
+        return None;
+    }
+    let uuid = record
+        .claude_rewind_uuid
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())?;
+    let entry = cfg.resume_entry_index(record)?;
+    let now_mode = crate::reviewer::reviewer_cwd_mode(cfg, &cfg.reviewers[entry]);
+    let then_mode = record
+        .reviewer_cwd_mode
+        .as_deref()
+        .unwrap_or(crate::reviewer::CWD_MODE_PROJECT);
+    (now_mode == then_mode).then(|| uuid.to_string())
+}
+
+/// The fork id a rewound resume answered under (issue #209), or `None` when it did not report one
+/// of its own: a missing or blank id, or the original id it resumed. `--fork-session` always
+/// answers under a new id, so anything else means the rewind did not take effect as verified, and
+/// the turn is not recorded (review f7).
+fn rewound_fork_id<'a>(resume_id: Option<&str>, reported: Option<&'a str>) -> Option<&'a str> {
+    reported.filter(|r| !r.trim().is_empty() && Some(*r) != resume_id)
+}
+
 fn resumed_session_id_mismatch(resume_id: Option<&str>, reported: Option<&str>) -> bool {
     matches!(
         (resume_id, reported),
@@ -7787,6 +8032,7 @@ mod tests {
         updated_unix: u64,
     ) -> crate::session::SessionRecord {
         crate::session::SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: cfg.primary().reviewer.as_str().to_string(),
             cli_session_id: "sid-1".to_string(),
             model: cfg.primary().model.clone(),
@@ -7815,6 +8061,83 @@ mod tests {
             companions: None,
             profile_identity: None,
         }
+    }
+
+    /// Issue #209: the one case a cancel marker may rewind, and every way it must not.
+    #[test]
+    fn a_cancel_marker_rewinds_only_its_own_claude_record_with_a_rewind_point() {
+        let claude = Config::from_args(&[
+            "--reviewer".into(),
+            "claude".into(),
+            "--level".into(),
+            "standard:claude-opus-4-8:medium".into(),
+        ])
+        .expect("config");
+        let mut rec = record_matching(&claude, 3, 1_000);
+        rec.claude_rewind_uuid = Some("u-3".to_string());
+        rec.reviewer_cwd_mode =
+            Some(crate::reviewer::reviewer_cwd_mode(&claude, claude.primary()).to_string());
+        let bound = session::CancelRewind {
+            cli_session_id: rec.cli_session_id.clone(),
+            turns: rec.turns,
+        };
+        assert_eq!(
+            cancel_rewind_target(&claude, &rec, &bound).as_deref(),
+            Some("u-3")
+        );
+
+        // Bound to another conversation, or to a record that has moved on since the cancel.
+        let other = session::CancelRewind {
+            cli_session_id: "sid-other".into(),
+            ..bound.clone()
+        };
+        assert_eq!(cancel_rewind_target(&claude, &rec, &other), None);
+        let stale = session::CancelRewind {
+            turns: 2,
+            ..bound.clone()
+        };
+        assert_eq!(cancel_rewind_target(&claude, &rec, &stale), None);
+
+        // No rewind point: the last recorded turn had a repair start, or buffered output.
+        let mut no_point = rec.clone();
+        no_point.claude_rewind_uuid = None;
+        assert_eq!(cancel_rewind_target(&claude, &no_point, &bound), None);
+        no_point.claude_rewind_uuid = Some("  ".into());
+        assert_eq!(cancel_rewind_target(&claude, &no_point, &bound), None);
+
+        // A changed working-directory mode would make start_review rebind to a new conversation
+        // (review f8), so it is not rewound either.
+        let mut moved = rec.clone();
+        moved.reviewer_cwd_mode = Some(
+            if moved.reviewer_cwd_mode.as_deref() == Some(crate::reviewer::CWD_MODE_PROJECT) {
+                crate::reviewer::CWD_MODE_NEUTRAL
+            } else {
+                crate::reviewer::CWD_MODE_PROJECT
+            }
+            .to_string(),
+        );
+        assert_eq!(cancel_rewind_target(&claude, &moved, &bound), None);
+
+        // Codex is never rewound (the Codex half was cut from the plan).
+        let codex = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-5.6-luna:max".into(),
+        ])
+        .expect("config");
+        let mut codex_rec = record_matching(&codex, 3, 1_000);
+        codex_rec.claude_rewind_uuid = Some("u-3".into());
+        assert_eq!(cancel_rewind_target(&codex, &codex_rec, &bound), None);
+    }
+
+    /// Review f7: a rewound launch must answer under a new id of its own.
+    #[test]
+    fn a_rewound_launch_needs_its_own_fork_id() {
+        assert_eq!(rewound_fork_id(Some("orig"), Some("fork")), Some("fork"));
+        assert_eq!(rewound_fork_id(Some("orig"), Some("orig")), None);
+        assert_eq!(rewound_fork_id(Some("orig"), None), None);
+        assert_eq!(rewound_fork_id(Some("orig"), Some("  ")), None);
     }
 
     #[test]
@@ -8296,6 +8619,8 @@ mod tests {
             .record_turn(
                 "stalled",
                 session::TurnFacts {
+                    forked_from: None,
+                    claude_rewind_uuid: None,
                     reviewer: "codex",
                     cli_session_id: "thread-1",
                     model: "gpt-5.6-luna",
@@ -9468,6 +9793,7 @@ mod tests {
                 findings,
             }),
             findings_marker_absent_on_entry: true,
+            rewind: None,
             kind: crate::registry::JobKind::Review,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,
@@ -9902,6 +10228,8 @@ mod tests {
             .record_turn(
                 session,
                 crate::session::TurnFacts {
+                    forked_from: None,
+                    claude_rewind_uuid: None,
                     reviewer: "codex",
                     cli_session_id: "cli-1",
                     model: &app.cfg.reviewers[0].model,
@@ -11050,6 +11378,7 @@ mod turn_end_hook_tests {
             prior_include_shelved: None,
             prior_findings: None,
             findings_marker_absent_on_entry: true,
+            rewind: None,
             kind,
             cancel: Arc::new(AtomicBool::new(false)),
             _lease: None,

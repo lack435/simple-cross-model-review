@@ -592,8 +592,34 @@ fn from_result_document(
             // invocation's model-call count, and a resumed turn does not inherit the
             // previous one's totals.
             usage_is_cumulative: false,
+            // Where this run left the conversation, for a later rewind (issue #209). Only a
+            // stream-json run has `assistant` events; the buffered document has none, so it
+            // yields `None`, which means no rewind.
+            rewind_point: last_assistant_uuid(&out.stdout),
         })
     }
+}
+
+/// The top-level `uuid` of the last stream-json `assistant` event in `stdout`: the point
+/// `--resume-session-at` rewinds a conversation to, keeping that message and everything before it
+/// (verified for issue #209; the API `message.id` does not work there). `None` when there is no such
+/// event, as in buffered `--output-format json` output.
+pub(crate) fn last_assistant_uuid(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|v| v.get("uuid").and_then(Value::as_str).map(str::to_string))
+        .find(|u| !u.trim().is_empty())
+}
+
+/// Make a resumed Claude invocation a **rewound** one (issue #209): continue the conversation only
+/// up to the assistant message `uuid`, as a fork under a new session id, so the original
+/// conversation is left untouched. `--resume-session-at` is not in `claude --help`; its behaviour
+/// with `--fork-session` was verified with real calls (see `docs/cancel-rewind-plan.md`).
+pub(crate) fn add_rewind_args(cmd: &mut Command, uuid: &str) {
+    cmd.args(["--resume-session-at", uuid, "--fork-session"]);
 }
 
 /// Parse the armed `--output-format stream-json` JSONL stream into a `Parsed`, enforcing the
@@ -1917,6 +1943,48 @@ mod tests {
             .parse(&cfg(), cfg().primary(), &outcome(&padded, true), None)
             .expect("parse");
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    }
+
+    /// Issue #209: the rewind point is the last `assistant` event's top-level `uuid`, never the API
+    /// `message.id`, and buffered output has none.
+    #[test]
+    fn the_rewind_point_is_the_last_assistant_events_uuid() {
+        let stream = [
+            r#"{"type":"system","subtype":"init","session_id":"s1","uuid":"sys-1"}"#,
+            r#"{"type":"assistant","uuid":"a-1","message":{"id":"msg_1"}}"#,
+            r#"{"type":"user","uuid":"t-1"}"#,
+            r#"{"type":"assistant","uuid":"a-2","message":{"id":"msg_2"}}"#,
+            r#"{"type":"result","subtype":"success","uuid":"r-1","result":"ok"}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_uuid(&stream).as_deref(), Some("a-2"));
+        let buffered = r#"{"type":"result","subtype":"success","session_id":"s1","result":"ok"}"#;
+        assert_eq!(last_assistant_uuid(buffered), None);
+        assert_eq!(
+            last_assistant_uuid(r#"{"type":"assistant","message":{"id":"msg_1"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rewound_invocation_forks_at_the_rewind_point() {
+        let mut cmd = Command::new("claude");
+        cmd.args(["--resume", "orig"]);
+        add_rewind_args(&mut cmd, "a-2");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--resume",
+                "orig",
+                "--resume-session-at",
+                "a-2",
+                "--fork-session"
+            ]
+        );
     }
 
     #[test]

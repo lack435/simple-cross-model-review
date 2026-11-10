@@ -837,6 +837,84 @@ MARKER=<the complete marker you read in the generated text>
     Assert-That 'the server is still healthy afterwards' ($null -ne $ping.result) `
         'the server stopped answering after handling a cancellation'
 
+    if ($Reviewer -eq 'claude') {
+        # Issue #209: a cancelled re-review is rewound, not refused. Each session is told a word on
+        # turn 1 (recorded), told a second word on turn 2 and cancelled while the reviewer runs, then
+        # resumed on turn 3, which must be rewound to turn 1. Run once as a review (the gate, the
+        # warning and the turn count) and once as a consult (the reviewer's memory: a review's final
+        # text can be replaced by the server's in-turn re-review, a consult's never is). Best-effort on
+        # timing like 7b: a turn 2 that finished before the cancel landed is reported, not failed.
+        Write-Host "`n=== 7c. a cancelled re-review is rewound, not refused (Claude) ===" -ForegroundColor Cyan
+        $rewindCheck = {
+            param($Kind)
+            $startTool = if ($Kind -eq 'review') { 'cross_model_review' } else { 'cross_model_consult' }
+            $resultTool = if ($Kind -eq 'review') { 'cross_model_review_result' } else { 'cross_model_consult_result' }
+            $textArg = if ($Kind -eq 'review') { 'instructions' } else { 'question' }
+            $session = "smoke-rewind-$Kind"
+            $begin = {
+                param($Text, [bool]$Fresh)
+                $a = @{ session = $session }
+                $a[$textArg] = $Text
+                if ($Fresh) { $a['fresh'] = $true }
+                Send-Rpc -Method 'tools/call' -Params @{ name = $startTool; arguments = $a } -TimeoutSeconds 60
+            }
+            $collect = {
+                param($Id)
+                $c = $null
+                for ($attempt = 1; $attempt -le 6; $attempt++) {
+                    $c = Send-Rpc -Method 'tools/call' -Params @{
+                        name = $resultTool; arguments = @{ review_id = $Id; wait_seconds = 120 }
+                    } -TimeoutSeconds 300
+                    if ((Get-ToolText $c) -notmatch '\Astatus:\s+running') { break }
+                }
+                Get-ToolText $c
+            }
+            $idOf = { param($R) ([regex]::Match((Get-ToolText $R), 'review_id:\s*(\S+)')).Groups[1].Value }
+            $wordOne = 'ALPHA' + (Get-Random -Maximum 99999)
+            $wordTwo = 'BRAVO' + (Get-Random -Maximum 99999)
+
+            $t1 = & $collect (& $idOf (& $begin "This is cross-review's own end-to-end smoke test, checking that a session remembers earlier turns. Remember this word for a later turn: $wordOne. Otherwise answer as you normally would; the change is test scaffolding and needs no detailed review." $true))
+            Assert-That "$Kind rewind: turn 1 completed" ($t1 -match '\Astatus:\s+completed') $t1
+            # The rewind needs turn 1 to have left a rewind point: every run finished cleanly. A repair
+            # that timed out leaves none, by design, and then there is nothing to exercise.
+            $afterT1 = (Get-Content (Join-Path $stateDir 'sessions.json') -Raw | ConvertFrom-Json).sessions.$session
+            if (-not $afterT1.claude_rewind_uuid) {
+                Write-Host "  (note: $Kind turn 1 left no rewind point, so a repair did not finish; the rewind was not exercised)" `
+                    -ForegroundColor Yellow
+                return
+            }
+
+            $r2 = & $begin "Remember a second word for later: $wordTwo. Then, without calling any tool, write a 1500-word essay on the history of version control systems. The smoke test will stop this turn before you finish." $false
+            Assert-That "$Kind rewind: turn 2 started as a resume" ($r2.result.isError -eq $false) (Get-ToolText $r2)
+            Start-Sleep -Seconds 4
+            $c2 = Get-ToolText (Send-Rpc -Method 'tools/call' -Params @{
+                name = 'cross_model_review_cancel'; arguments = @{ review_id = (& $idOf $r2) }
+            } -TimeoutSeconds 60)
+            Write-Host $c2
+            if ($c2 -notmatch 'was cancelled') {
+                Write-Host "  (note: $Kind turn 2 finished before the cancel landed; the rewind was not exercised)" `
+                    -ForegroundColor Yellow
+                return
+            }
+            Assert-That "$Kind rewind: the cancel reply says the session will be rewound" ($c2 -match 'rewound to turn 1') $c2
+
+            $r3 = & $begin 'Without calling any tool: list every word you have been asked to remember for a later turn in this conversation, on one line as WORDS=<the words, comma-separated>, then answer as you normally would.' $false
+            Assert-That "$Kind rewind: the call after the cancel is not refused" ($r3.result.isError -eq $false) (Get-ToolText $r3)
+            $t3 = & $collect (& $idOf $r3)
+            Assert-That "$Kind rewind: the rewound turn completed" ($t3 -match '\Astatus:\s+completed') $t3
+            Assert-That "$Kind rewind: the rewound turn carries the rewind warning" ($t3 -match 'rewound to turn 1') $t3
+            if ($Kind -eq 'consult') {
+                Assert-That 'consult rewind: the reviewer remembers turn 1' ($t3 -match $wordOne) $t3
+                Assert-That 'consult rewind: the reviewer does not remember the cancelled turn' ($t3 -notmatch $wordTwo) $t3
+            }
+            $saved = Get-Content (Join-Path $stateDir 'sessions.json') -Raw | ConvertFrom-Json
+            Assert-That "$Kind rewind: the rewound turn counts as turn 2 of the same session" `
+                ($saved.sessions.$session.turns -eq 2) ($saved.sessions.$session | ConvertTo-Json -Depth 3)
+        }
+        & $rewindCheck 'review'
+        & $rewindCheck 'consult'
+    }
+
     Write-Host "`n=== 8. sessions persist on disk ===" -ForegroundColor Cyan
     $sessionsFile = Join-Path $stateDir 'sessions.json'
     Assert-That 'session state was written' (Test-Path $sessionsFile) $sessionsFile
