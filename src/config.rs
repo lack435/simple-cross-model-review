@@ -3681,6 +3681,7 @@ mod tests {
         ]))
         .expect("config");
         let mut rec = SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
             model: "gpt-5.6-luna".into(),
@@ -3790,6 +3791,7 @@ mod tests {
         ]))
         .expect("config");
         let rec = |effort: &str| SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: "claude".into(),
             cli_session_id: "t".into(),
             model: "claude-opus-4-8".into(),
@@ -3849,6 +3851,7 @@ mod tests {
             })
         };
         let mut rec = SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
             model: "gpt-5.6-luna".into(),
@@ -3905,6 +3908,7 @@ mod tests {
         ]))
         .expect("config");
         let rec = SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
             model: "gpt-5.6-luna".into(),
@@ -3963,6 +3967,7 @@ mod tests {
     fn a_legacy_record_matches_only_when_unambiguous() {
         use crate::session::SessionRecord;
         let mk = |reviewer: &str, model: &str| SessionRecord {
+            claude_rewind_uuid: None,
             reviewer: reviewer.into(),
             cli_session_id: "t".into(),
             model: model.into(),

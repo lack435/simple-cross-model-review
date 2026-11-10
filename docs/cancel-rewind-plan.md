@@ -1,6 +1,6 @@
 # Rewinding a Claude reviewer after a cancelled turn (issue #209)
 
-Status: **plan**, not implemented. Cut down after its first cross-model review; see "What was
+Status: **implemented** (issue #209). Cut down after its first cross-model review; see "What was
 cut, and why".
 
 ## Problem

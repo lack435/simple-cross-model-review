@@ -438,6 +438,7 @@ impl Reviewer for CodexReviewer {
                 ..events.usage
             },
             usage_is_cumulative: true,
+            rewind_point: None,
         })
     }
 

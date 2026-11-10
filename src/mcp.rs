@@ -1101,9 +1101,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                 "Stop a review that is still running, and free the reviewer. This is the only \
                  operation that stops a running reviewer: abandoning a cross_model_review_result \
                  poll only detaches the wait and leaves the reviewer running. Use it when the work \
-                 it was reviewing has changed underneath it, or the user has moved on. The review \
-                 session itself survives, so a later cross_model_review with the same session name \
-                 still resumes.",
+                 it was reviewing has changed underneath it, or the user has moved on. The reply \
+                 says what the next cross_model_review on the same session will do: a Claude \
+                 reviewer is rewound to the last recorded turn and the session resumes; otherwise, \
+                 once the reviewer had started, the next call needs fresh: true, and the reply lists \
+                 the open findings to carry into it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

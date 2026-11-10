@@ -271,6 +271,28 @@ pub struct SessionRecord {
     /// every record written before this field reads, so existing sessions resume unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companions: Option<Vec<CompanionBinding>>,
+    /// Where a Claude reviewer's conversation stood when this turn was recorded: the top-level
+    /// `uuid` of the last stream-json `assistant` event of the last run the turn spawned (issue
+    /// #209). A later cancelled turn can be rewound to exactly here with `--resume-session-at`.
+    /// `None` for Codex, for buffered (non-stream-json) output, for a turn where any run failed after
+    /// starting (its effect on the conversation is not known), and for a record predating the field;
+    /// every `None` means "no rewind", which keeps today's refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_rewind_uuid: Option<String>,
+}
+
+/// What a cancelled turn's findings marker binds to (issue #209): the stored record it was
+/// resuming, by conversation id and turn count. A rewind is allowed only while the stored record
+/// still matches both, so the marker can never be applied to a different conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRewind {
+    pub cli_session_id: String,
+    pub turns: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MarkerContent {
+    rewind_after_cancel: CancelRewind,
 }
 
 /// One companion a session is bound to: its configured name and canonical root.
@@ -419,6 +441,12 @@ pub struct TurnFacts<'a> {
     /// The companion set this turn ran with ([`CompanionBinding::from_declared`]). Invariant across
     /// a session (a mismatched resume is refused before a turn runs), so stored from this turn.
     pub companions: Option<Vec<CompanionBinding>>,
+    /// The conversation this turn's was forked from, when the turn was a rewound resume (issue
+    /// #209): Claude's `--fork-session` answers under a new session id, but the turn continues the
+    /// stored session, so it counts and inherits as one more turn on it rather than a new session.
+    pub forked_from: Option<&'a str>,
+    /// See [`SessionRecord::claude_rewind_uuid`]. This turn's alone, never inherited.
+    pub claude_rewind_uuid: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -503,6 +531,8 @@ impl SessionStore {
             reviewer_cwd_mode,
             profile_identity,
             companions,
+            forked_from,
+            claude_rewind_uuid,
         } = turn;
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Held across the read and the write: this is a read-modify-write, so another
@@ -519,10 +549,11 @@ impl SessionStore {
         // conversation -- a fresh or rebound reviewer session (a different `cli_session_id`
         // under this name) never saw the old diff, so an incomplete first turn there must store
         // nothing rather than a baseline the new reviewer cannot resume against.
-        let prior = store
-            .sessions
-            .get(name)
-            .filter(|p| p.cli_session_id == cli_session_id);
+        // A rewound turn (issue #209) continues the stored conversation under the fork's new id.
+        let continues = |p: &SessionRecord| {
+            p.cli_session_id == cli_session_id || forked_from == Some(p.cli_session_id.as_str())
+        };
+        let prior = store.sessions.get(name).filter(|p| continues(p));
         let (head_sha, base_sha) = match (&head_sha, &base_sha) {
             (Some(_), Some(_)) => (head_sha, base_sha),
             _ => (
@@ -544,7 +575,7 @@ impl SessionStore {
             // invariant across turns (a mismatched resume is refused before we get here), so
             // carrying this turn's value forward keeps it while tolerating a `None` from a
             // git turn without erasing an existing binding.
-            Some(existing) if existing.cli_session_id == cli_session_id => SessionRecord {
+            Some(existing) if continues(existing) => SessionRecord {
                 turns: existing.turns.saturating_add(1),
                 created_unix: existing.created_unix,
                 updated_unix: now,
@@ -587,6 +618,7 @@ impl SessionStore {
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
                 profile_identity: profile_identity.clone(),
                 companions: companions.clone(),
+                claude_rewind_uuid: claude_rewind_uuid.clone(),
             },
             // New session, or the name was rebound to a fresh reviewer session.
             _ => SessionRecord {
@@ -616,6 +648,7 @@ impl SessionStore {
                 reviewer_cwd_mode: Some(reviewer_cwd_mode.to_string()),
                 profile_identity: profile_identity.clone(),
                 companions: companions.clone(),
+                claude_rewind_uuid: claude_rewind_uuid.clone(),
             },
         };
 
@@ -704,6 +737,28 @@ impl SessionStore {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, b"")
+    }
+
+    /// Rewrite a set findings write-ahead marker to say the turn was **cancelled** and to name the
+    /// recorded conversation it belongs to (issue #209). This is the only content that makes a
+    /// marker rewindable. Every other writer leaves the file empty, which keeps today's refusal, so
+    /// a crash before this write, or a partial write that no longer parses, is the safe direction.
+    pub fn mark_findings_cancelled(&self, name: &str, bound: &CancelRewind) -> io::Result<()> {
+        let body = serde_json::to_vec(&MarkerContent {
+            rewind_after_cancel: bound.clone(),
+        })
+        .map_err(io::Error::other)?;
+        std::fs::write(self.marker_path(name, "findings-pending"), body)
+    }
+
+    /// The cancel binding a findings write-ahead marker carries, or `None` when it carries none:
+    /// absent, empty (every writer but the cancel path), unreadable or unparseable. `None` always
+    /// means "not rewindable".
+    pub fn findings_marker_cancel_rewind(&self, name: &str) -> Option<CancelRewind> {
+        let body = std::fs::read(self.marker_path(name, "findings-pending")).ok()?;
+        serde_json::from_slice::<MarkerContent>(&body)
+            .ok()
+            .map(|m| m.rewind_after_cancel)
     }
 
     /// Clear the findings write-ahead marker after a turn is durably recorded. `Ok(())` on a
@@ -1028,6 +1083,8 @@ pub fn record_test_turn(store: &SessionStore, name: &str, cli_id: &str) -> Sessi
         .record_turn(
             name,
             TurnFacts {
+                forked_from: None,
+                claude_rewind_uuid: None,
                 reviewer: "codex",
                 cli_session_id: cli_id,
                 model: "gpt-5.6-luna",
@@ -1100,6 +1157,8 @@ pub(crate) mod tests {
             .record_turn(
                 name,
                 TurnFacts {
+                    forked_from: None,
+                    claude_rewind_uuid: None,
                     reviewer: "codex",
                     cli_session_id: cli_id,
                     model: "gpt-5.6-luna",
@@ -1187,6 +1246,8 @@ pub(crate) mod tests {
 
     fn ambient_facts(cli: &'static str, fp: Option<&'static str>) -> TurnFacts<'static> {
         TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: cli,
             model: "gpt-5.6-luna",
@@ -1240,6 +1301,59 @@ pub(crate) mod tests {
             .record_turn("s", ambient_facts("thread-1", None))
             .unwrap();
         assert!(rec.profile_identity.unwrap().account_fingerprint.is_none());
+    }
+
+    /// Issue #209: only the cancel path's content makes a marker rewindable.
+    #[test]
+    fn only_a_cancel_marker_carries_a_rewind_binding() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        assert_eq!(store.findings_marker_cancel_rewind("s"), None, "absent");
+        store.mark_findings_pending("s").unwrap();
+        assert_eq!(store.findings_marker_cancel_rewind("s"), None, "empty");
+        let bound = CancelRewind {
+            cli_session_id: "sid".into(),
+            turns: 4,
+        };
+        store.mark_findings_cancelled("s", &bound).unwrap();
+        assert_eq!(store.findings_marker_cancel_rewind("s"), Some(bound));
+        assert_eq!(store.findings_marker_state("s"), MarkerState::Present);
+        // A partial or foreign write never parses as a binding.
+        std::fs::write(
+            store.marker_path("s", "findings-pending"),
+            b"{\"rewind_after",
+        )
+        .unwrap();
+        assert_eq!(store.findings_marker_cancel_rewind("s"), None);
+        // A new turn's mark overwrites it with the empty, non-rewindable marker.
+        store.mark_findings_pending("s").unwrap();
+        assert_eq!(store.findings_marker_cancel_rewind("s"), None);
+    }
+
+    /// Issue #209: a rewound turn answers under the fork's new id but continues the session, so it
+    /// counts as one more turn rather than a new session.
+    #[test]
+    fn a_forked_turn_continues_its_session_under_the_new_id() {
+        let dir = temp_dir();
+        let store = SessionStore::new(&dir);
+        let first = store
+            .record_turn("s", ambient_facts("orig", Some("acct-1")))
+            .unwrap();
+        let mut facts = ambient_facts("fork", Some("acct-1"));
+        facts.forked_from = Some("orig");
+        facts.claude_rewind_uuid = Some("u-2".into());
+        let rec = store.record_turn("s", facts).unwrap();
+        assert_eq!(rec.turns, 2);
+        assert_eq!(rec.created_unix, first.created_unix);
+        assert_eq!(rec.cli_session_id, "fork");
+        assert_eq!(rec.claude_rewind_uuid.as_deref(), Some("u-2"));
+
+        // Without `forked_from`, a different id is a new session, as before.
+        let rebound = store
+            .record_turn("s", ambient_facts("other", Some("acct-1")))
+            .unwrap();
+        assert_eq!(rebound.turns, 1);
+        assert_eq!(rebound.claude_rewind_uuid, None, "never inherited");
     }
 
     #[test]
@@ -1402,6 +1516,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let facts = |usage| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: "thread-1",
             model: "gpt-5.6-luna",
@@ -1454,6 +1570,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |head: Option<&str>, base: Option<&str>| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "claude",
             cli_session_id: "sid-1",
             model: "claude-opus-4-8",
@@ -1514,6 +1632,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |cli: &'static str, head: Option<&str>, base: Option<&str>| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "claude",
             cli_session_id: cli,
             model: "claude-opus-4-8",
@@ -1559,6 +1679,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |changes| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: "thread-1",
             model: "gpt-5.6-luna",
@@ -1600,6 +1722,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |include_change: Option<bool>, diff_mode: Option<&str>| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: "thread-1",
             model: "gpt-5.6-luna",
@@ -1648,6 +1772,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |changes, include_shelved, baseline: Option<PerforceBaseline>| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: "thread-1",
             model: "gpt-5.6-luna",
@@ -1718,6 +1844,8 @@ pub(crate) mod tests {
         let dir = temp_dir();
         let store = SessionStore::new(&dir);
         let facts = |baseline: Option<PerforceBaseline>| TurnFacts {
+            forked_from: None,
+            claude_rewind_uuid: None,
             reviewer: "codex",
             cli_session_id: "thread-1",
             model: "gpt-5.6-luna",
@@ -1909,6 +2037,8 @@ pub(crate) mod tests {
             .record_turn(
                 "default",
                 TurnFacts {
+                    forked_from: None,
+                    claude_rewind_uuid: None,
                     reviewer: "codex",
                     cli_session_id: "thread-1",
                     model: "m",

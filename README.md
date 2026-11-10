@@ -93,6 +93,15 @@ abandoning a collect leaves the reviewer running and the result collectible (onl
 cap (~1890s at the defaults) so one blocking call completes; below it you poll, you do not lose
 work. Design notes: [`docs/single-blocking-collect.md`](docs/single-blocking-collect.md).
 
+**Cancelling a re-review keeps a Claude session resumable.** A cancelled turn records nothing, so
+the findings ledger still stands at the last recorded turn. For a Claude reviewer, the next call on
+the same session rewinds the reviewer's conversation to that same turn and resumes. That needs the
+last recorded turn to have finished cleanly: every run completed, with `stream-json` output. A
+rewound turn says so in its warnings. Any other unfinished turn, including a cancelled Codex turn
+once the reviewer had started, is still refused `SESSION_NOT_RESUMABLE`. The cancel reply says
+which applies and lists the open findings to carry into a `fresh: true` call. Design notes:
+[`docs/cancel-rewind-plan.md`](docs/cancel-rewind-plan.md).
+
 While a collect is open the server emits MCP `notifications/progress` every 30 seconds when the
 client supplied a progress token — the current phase, elapsed time, how recently the reviewer
 was confirmed alive, and how much output has arrived.
