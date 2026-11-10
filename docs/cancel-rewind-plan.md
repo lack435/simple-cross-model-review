@@ -64,7 +64,7 @@ recording as a degraded turn. The conversation can then be slightly ahead of wha
 the next call plain-resumes it. That is existing behaviour on a path with no cancel and no marker,
 and this plan leaves it as it is. All the plan ensures is that such a turn is never used as a
 rewind target. Whether a started-but-failed repair should make its turn non-durable is a separate
-question for a separate issue.
+question for a separate issue: #211.
 
 ### 2. Mark a cancelled turn as rewindable, and only that
 
