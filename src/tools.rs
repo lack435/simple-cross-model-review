@@ -2624,59 +2624,66 @@ impl App {
     }
 
     /// What the next call on a cancelled job's session will do (issue #209), for the cancel reply.
-    /// Predicted from the stored record rather than read from the marker, which the worker may
-    /// still be writing. A cancel that landed before the reviewer started leaves no marker at all,
-    /// so the fallback wording is conditional on that.
+    /// Read from what the worker actually left behind, once it has finished (#209 code review f2):
+    /// the findings marker and the stored record. It is not predicted, because a cancel can land
+    /// before the reviewer starts, or after the turn already recorded, and each of those leaves a
+    /// different state.
     fn after_cancel_note(&self, id: &str) -> String {
         let Some(snap) = self.registry.snapshot(id) else {
             return String::new();
         };
-        let record = self
-            .sessions
-            .get_checked(&snap.session)
-            .ok()
-            .flatten()
-            .filter(|r| snap.resumed && r.turns == snap.turn.saturating_sub(1));
-        let Some(record) = record else {
-            return format!(
-                "Session '{}' has no earlier recorded turn to continue, so start it again with \
-                 fresh: true.\n",
-                snap.session
-            );
-        };
-        let bound = session::CancelRewind {
-            cli_session_id: record.cli_session_id.clone(),
-            turns: record.turns,
-        };
-        if cancel_rewind_target(&self.cfg, &record, &bound).is_some() {
-            return format!(
-                "The next call on session '{}' resumes from turn {}, the last recorded turn: the \
-                 reviewer is rewound past the cancelled turn, and nothing from it is on the record.\n",
-                snap.session, record.turns
-            );
+        if snap.status == crate::registry::Status::Running {
+            // The worker had not finished within the wait; say nothing rather than guess.
+            return String::new();
         }
-        let open: Vec<String> = match record.ledger_load() {
-            session::LedgerLoad::Valid(l) => l
-                .findings
-                .iter()
-                .filter(|f| f.status.is_open())
-                .map(|f| format!("  - {}: {}", f.id, f.title))
-                .collect(),
-            _ => Vec::new(),
-        };
-        let carry = if open.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Carry these open findings into its instructions:\n{}",
-                open.join("\n")
-            )
-        };
-        format!(
-            "If the reviewer had already started, the next call on session '{}' is refused a \
-             resume and needs fresh: true, which starts a new reviewer conversation.{carry}\n",
-            snap.session
-        )
+        let session = &snap.session;
+        let record = self.sessions.get_checked(session).ok().flatten();
+        match self.sessions.findings_marker_state(session) {
+            crate::session::MarkerState::Absent => match record {
+                Some(r) => format!(
+                    "The next call on session '{session}' resumes normally from turn {}, its last \
+                     recorded turn.\n",
+                    r.turns
+                ),
+                None => String::new(),
+            },
+            crate::session::MarkerState::Present | crate::session::MarkerState::Unreadable => {
+                let rewinds = record.as_ref().is_some_and(|r| {
+                    self.sessions
+                        .findings_marker_cancel_rewind(session)
+                        .is_some_and(|bound| cancel_rewind_target(&self.cfg, r, &bound).is_some())
+                });
+                if let (true, Some(r)) = (rewinds, &record) {
+                    return format!(
+                        "The next call on session '{session}' resumes from turn {}, the last \
+                         recorded turn: the reviewer is rewound past the cancelled turn, and \
+                         nothing from it is on the record.\n",
+                        r.turns
+                    );
+                }
+                let open: Vec<String> = match record.as_ref().map(|r| r.ledger_load()) {
+                    Some(session::LedgerLoad::Valid(l)) => l
+                        .findings
+                        .iter()
+                        .filter(|f| f.status.is_open())
+                        .map(|f| format!("  - {}: {}", f.id, f.title))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let carry = if open.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Carry these open findings into its instructions:\n{}",
+                        open.join("\n")
+                    )
+                };
+                format!(
+                    "The next call on session '{session}' will be refused a resume and needs \
+                     fresh: true, which starts a new reviewer conversation.{carry}\n"
+                )
+            }
+        }
     }
 
     pub fn cancel(&self, args: &Value) -> Result<String, Failure> {
@@ -2700,8 +2707,10 @@ impl App {
             }
         }
         if self.cancel_review(&id) {
-            // Give the worker a moment to reap the child so the report is accurate.
-            std::thread::sleep(Duration::from_millis(300));
+            // Let the worker reap the child and settle the session's marker, so the report, and the
+            // note on what the next call will do, describe what actually happened. Bounded: a worker
+            // that has not finished by then gets no note rather than a guess.
+            self.registry.wait(&id, Duration::from_secs(10), &|| false);
             Ok(format!(
                 "Review '{id}' was cancelled. The reviewer process has been stopped and there is no \
                  review feedback.\n{}",
@@ -3850,7 +3859,8 @@ impl Job {
         };
         if let Err(e) = self.sessions.mark_findings_cancelled(&self.session, &bound) {
             eprintln!(
-                "cross-review: warning: could not mark the cancelled turn on session '{}' as                  rewindable: {e}; the next call will need fresh: true",
+                "cross-review: warning: could not mark the cancelled turn on session '{}' as \
+                 rewindable: {e}; the next call will need fresh: true",
                 self.session
             );
         }
@@ -4834,7 +4844,9 @@ impl Job {
         }
         if self.rewind.is_some() {
             parsed.warnings.push(format!(
-                "The previous turn on this session was cancelled before it was recorded, so the                  reviewer was rewound to turn {}, the last recorded turn, before this one ran. It                  does not remember the cancelled turn, and nothing from it is on the record.",
+                "The previous turn on this session was cancelled before it was recorded, so the \
+                 reviewer was rewound to turn {}, the last recorded turn, before this one ran. It \
+                 does not remember the cancelled turn, and nothing from it is on the record.",
                 turn.saturating_sub(1)
             ));
         }
@@ -5385,6 +5397,16 @@ impl Job {
         // under the id we resumed with. Skipping the record -- as this used to -- kept the
         // mapping but never advanced the baseline, so the next turn subtracted against a
         // stale total and double-counted this one.
+        // A cancel that landed after the main run, during a block or evidence repair or while the
+        // turn was being finalized (#209 code review f1), cancels the whole turn: nothing is
+        // recorded, exactly as for a cancel during the main run. Each repair treats its own
+        // CANCELLED as a degraded repair, which would otherwise record a turn whose conversation
+        // holds the cancelled repair. The conversation is rewound past all of it on the next call.
+        if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            self.mark_cancel_rewindable(resume_id, turn);
+            return Err(errors::cancelled());
+        }
+
         // A rewound resume records under the fork's own id, and only if it reported one (f7).
         let fork_id = self
             .rewind
@@ -5430,7 +5452,11 @@ impl Job {
             false
         } else if rewound_without_fork_id {
             warnings.push(format!(
-                "This turn rewound the reviewer to the last recorded turn after a cancel, but the                  reviewer did not report the new conversation id the rewind creates, so it cannot                  be shown that the rewind took effect. This turn was not recorded and session '{}'                  cannot be resumed: start a fresh review (fresh: true) carrying the still-open                  findings into the new instructions. The review below is still valid.",
+                "This turn rewound the reviewer to the last recorded turn after a cancel, but the \
+                 reviewer did not report the new conversation id the rewind creates, so it cannot \
+                 be shown that the rewind took effect. This turn was not recorded and session '{}' \
+                 cannot be resumed: start a fresh review (fresh: true) carrying the still-open \
+                 findings into the new instructions. The review below is still valid.",
                 self.session
             ));
             false
