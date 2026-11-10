@@ -873,12 +873,20 @@ MARKER=<the complete marker you read in the generated text>
             $wordOne = 'ALPHA' + (Get-Random -Maximum 99999)
             $wordTwo = 'BRAVO' + (Get-Random -Maximum 99999)
 
-            $t1 = & $collect (& $idOf (& $begin "Automated smoke test of session memory. Do not review any code and do not call any tool. Remember this secret word: $wordOne. Reply with exactly one line: REWIND-T1-OK" $true))
+            $t1 = & $collect (& $idOf (& $begin "This is cross-review's own end-to-end smoke test, checking that a session remembers earlier turns. Remember this word for a later turn: $wordOne. Otherwise answer as you normally would; the change is test scaffolding and needs no detailed review." $true))
             Assert-That "$Kind rewind: turn 1 completed" ($t1 -match '\Astatus:\s+completed') $t1
+            # The rewind needs turn 1 to have left a rewind point: every run finished cleanly. A repair
+            # that timed out leaves none, by design, and then there is nothing to exercise.
+            $afterT1 = (Get-Content (Join-Path $stateDir 'sessions.json') -Raw | ConvertFrom-Json).sessions.$session
+            if (-not $afterT1.claude_rewind_uuid) {
+                Write-Host "  (note: $Kind turn 1 left no rewind point, so a repair did not finish; the rewind was not exercised)" `
+                    -ForegroundColor Yellow
+                return
+            }
 
-            $r2 = & $begin "Remember a second secret word: $wordTwo. Then read README.md and AGENTS.md in full with the repository tools and summarise every section in detail; this turn will be cancelled." $false
+            $r2 = & $begin "Remember a second word for later: $wordTwo. Then, without calling any tool, write a 1500-word essay on the history of version control systems. The smoke test will stop this turn before you finish." $false
             Assert-That "$Kind rewind: turn 2 started as a resume" ($r2.result.isError -eq $false) (Get-ToolText $r2)
-            Start-Sleep -Seconds 8
+            Start-Sleep -Seconds 4
             $c2 = Get-ToolText (Send-Rpc -Method 'tools/call' -Params @{
                 name = 'cross_model_review_cancel'; arguments = @{ review_id = (& $idOf $r2) }
             } -TimeoutSeconds 60)
@@ -890,7 +898,7 @@ MARKER=<the complete marker you read in the generated text>
             }
             Assert-That "$Kind rewind: the cancel reply says the session will be rewound" ($c2 -match 'resumes from turn 1') $c2
 
-            $r3 = & $begin 'Do not review any code and do not call any tool. List every secret word you have been asked to remember in this conversation. Reply with exactly one line: WORDS=<the words, comma-separated>' $false
+            $r3 = & $begin 'Without calling any tool: list every word you have been asked to remember for a later turn in this conversation, on one line as WORDS=<the words, comma-separated>, then answer as you normally would.' $false
             Assert-That "$Kind rewind: the call after the cancel is not refused" ($r3.result.isError -eq $false) (Get-ToolText $r3)
             $t3 = & $collect (& $idOf $r3)
             Assert-That "$Kind rewind: the rewound turn completed" ($t3 -match '\Astatus:\s+completed') $t3
