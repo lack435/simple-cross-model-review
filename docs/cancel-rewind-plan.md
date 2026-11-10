@@ -10,7 +10,8 @@ failure clear it again, because they provably ran nothing:
 
 - the invocation could not be built;
 - the child process never started;
-- `REVIEWER_BUSY` (#166/#207): the Claude CLI hit its OAuth refresh lock before any model call.
+- `REVIEWER_BUSY` (#166/#207): the Claude CLI hit its OAuth refresh lock before any model call;
+- the pre-spawn checks before a busy relaunch refused (#207), so the relaunch never started.
 
 Otherwise the marker is cleared only once the turn is durably recorded. Any other failure after the
 child started leaves it set, and that includes `cross_model_review_cancel`. The next non-`fresh`
@@ -58,6 +59,13 @@ failed after it started may have advanced the conversation in ways the stream do
 run with no stream-json output has no `uuid`. In either case the field is cleared, so that turn can
 never be the target of a rewind.
 
+**Not changed by this plan:** today, a repair that fails after starting does not stop its turn from
+recording as a degraded turn. The conversation can then be slightly ahead of what was recorded, and
+the next call plain-resumes it. That is existing behaviour on a path with no cancel and no marker,
+and this plan leaves it as it is. All the plan ensures is that such a turn is never used as a
+rewind target. Whether a started-but-failed repair should make its turn non-durable is a separate
+question for a separate issue.
+
 ### 2. Mark a cancelled turn as rewindable, and only that
 
 The marker stays an empty file on every path that writes it today, which means "not rewindable".
@@ -94,6 +102,12 @@ In `start_review`, at the existing marker gate, for a non-`fresh` call: when the
 call proceeds as a **rewound resume** instead of being refused. Anything else returns today's
 refusal, word for word.
 
+**The reviewer's working-directory mode is checked here too** (review f8). Later, `start_review`
+drops the prior record when `reviewer_cwd_mode` has changed since it was written, and starts a new
+conversation. On a rewound resume that would quietly turn a call the caller sent as a resume into a
+turn 1 with no ledger. So the rewind also requires the stored mode to equal the mode of the entry
+that will run. A mismatch gives today's refusal: the caller then chooses `fresh: true` knowingly.
+
 ### 4. The rewound launch
 
 The Claude invocation adds `--resume-session-at <claude_rewind_uuid> --fork-session` to its usual
@@ -102,6 +116,11 @@ same write-ahead marker, now empty again.
 
 The run comes back under the fork's new session id:
 
+- **The main run must report a non-empty session id that differs from the original** (review f7).
+  Today a run with no reported id falls back to the resumed id. On a rewound launch that would point
+  repairs, and the record, at the original, un-rewound conversation. So a missing or unchanged id
+  fails the turn: it is not recorded and the marker stays set, empty, which means today's refusal.
+  The fork id is then the one repair target, passed explicitly.
 - `resumed_session_id_mismatch` accepts a different id for exactly this launch.
 - The turn's record stores the new id as `cli_session_id` and the run's new `claude_rewind_uuid`.
 - A block repair resumes the fork, through `parsed.session_id` as today.
