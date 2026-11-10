@@ -896,7 +896,7 @@ MARKER=<the complete marker you read in the generated text>
                     -ForegroundColor Yellow
                 return
             }
-            Assert-That "$Kind rewind: the cancel reply says the session will be rewound" ($c2 -match 'resumes from turn 1') $c2
+            Assert-That "$Kind rewind: the cancel reply says the session will be rewound" ($c2 -match 'rewound to turn 1') $c2
 
             $r3 = & $begin 'Without calling any tool: list every word you have been asked to remember for a later turn in this conversation, on one line as WORDS=<the words, comma-separated>, then answer as you normally would.' $false
             Assert-That "$Kind rewind: the call after the cancel is not refused" ($r3.result.isError -eq $false) (Get-ToolText $r3)

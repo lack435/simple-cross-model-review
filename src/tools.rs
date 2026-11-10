@@ -2623,11 +2623,13 @@ impl App {
         )))
     }
 
-    /// What the next call on a cancelled job's session will do (issue #209), for the cancel reply.
-    /// Read from what the worker actually left behind, once it has finished (#209 code review f2):
-    /// the findings marker and the stored record. It is not predicted, because a cancel can land
-    /// before the reviewer starts, or after the turn already recorded, and each of those leaves a
-    /// different state.
+    /// What the cancel did to the job's session (issue #209), for the cancel reply. Read from what
+    /// the worker actually left behind, once it has finished (#209 code review f2): the findings
+    /// marker and the stored record. It is not predicted, because a cancel can land before the
+    /// reviewer starts, or after the turn already recorded, and each of those leaves a different
+    /// state. It states only the cancel's own effect. Whether the next call resumes also depends on
+    /// checks that are independent of the cancel (turn and idle limits, a terminal state, the call's
+    /// own arguments), which `resume_block` makes then and which this note does not promise.
     fn after_cancel_note(&self, id: &str) -> String {
         let Some(snap) = self.registry.snapshot(id) else {
             return String::new();
@@ -2641,8 +2643,8 @@ impl App {
         match self.sessions.findings_marker_state(session) {
             crate::session::MarkerState::Absent => match record {
                 Some(r) => format!(
-                    "The next call on session '{session}' resumes normally from turn {}, its last \
-                     recorded turn.\n",
+                    "The cancel left nothing unfinished: session '{session}' stands at turn {}, \
+                     its last recorded turn, as it did before.\n",
                     r.turns
                 ),
                 None => String::new(),
@@ -2655,9 +2657,9 @@ impl App {
                 });
                 if let (true, Some(r)) = (rewinds, &record) {
                     return format!(
-                        "The next call on session '{session}' resumes from turn {}, the last \
-                         recorded turn: the reviewer is rewound past the cancelled turn, and \
-                         nothing from it is on the record.\n",
+                        "The cancelled turn is not on the record. On the next call to session \
+                         '{session}', the reviewer is rewound to turn {}, the last recorded turn, \
+                         instead of the session being refused because of the cancel.\n",
                         r.turns
                     );
                 }
@@ -2679,8 +2681,9 @@ impl App {
                     )
                 };
                 format!(
-                    "The next call on session '{session}' will be refused a resume and needs \
-                     fresh: true, which starts a new reviewer conversation.{carry}\n"
+                    "Because of the cancelled turn, the next call on session '{session}' is refused \
+                     a resume and needs fresh: true, which starts a new reviewer \
+                     conversation.{carry}\n"
                 )
             }
         }
