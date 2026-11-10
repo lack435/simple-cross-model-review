@@ -1102,10 +1102,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
                  operation that stops a running reviewer: abandoning a cross_model_review_result \
                  poll only detaches the wait and leaves the reviewer running. Use it when the work \
                  it was reviewing has changed underneath it, or the user has moved on. The reply \
-                 says what the cancel did to the session: for a Claude reviewer, the next \
-                 cross_model_review on the same session rewinds it to the last recorded turn instead \
-                 of refusing the session; otherwise, once the reviewer had started, the next call \
-                 needs fresh: true, and the reply lists the open findings to carry into it.",
+                 says what the cancel did to the session. For a Claude reviewer whose last recorded \
+                 turn finished cleanly, the next cross_model_review on the same session rewinds the \
+                 reviewer to that turn instead of refusing the session. Otherwise, once the reviewer \
+                 had started, the next call needs fresh: true, and the reply lists the open findings \
+                 to carry into it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

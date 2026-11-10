@@ -134,13 +134,22 @@ again.
 - **A rewound turn** carries a warning: the previous turn was cancelled, and the reviewer was
   rewound to turn N, the last recorded one. It does not remember the cancelled turn, and nothing from
   it is on the record.
-- **The `cross_model_review_cancel` reply** says what will happen next:
-  - **Claude reviewer whose last turn has a rewind point:** the next call in the session resumes from
-    the last recorded turn.
-  - **Otherwise:** the next call needs `fresh: true`, carrying the open findings, which the reply
-    lists by id and title from the stored ledger.
+- **The `cross_model_review_cancel` reply** waits for the worker to finish, up to 10s. It then reads
+  what the cancel left behind and states only the cancel's own effect (code review f2):
+  - **No marker** (the cancel landed before the reviewer started, or after the turn recorded): the
+    session stands at its last recorded turn, as before.
+  - **A cancel marker that passes the gate in step 3:** a Claude reviewer whose last recorded turn
+    has a rewind point. The next call rewinds the reviewer to that turn instead of refusing the
+    session.
+  - **Any other marker:** the next call needs `fresh: true`, carrying the open findings, which the
+    reply lists by id and title from the stored ledger.
 
-  That second case is also the whole improvement for Codex.
+  The reply does not promise that the next call resumes. Checks unrelated to the cancel, such as the
+  turn and idle limits, a terminal state, or the next call's own arguments, are made by
+  `resume_block` at that point. The third case is also the whole improvement for Codex.
+- **A cancel that lands after the main run,** during a block or evidence repair or while the turn is
+  being finalized, cancels the whole turn: nothing is recorded, and the marker is made rewindable as
+  for a main-run cancel (code review f1).
 - **Consults** use the same marker and the same resume, so the same rewind applies, with no ledger
   involved.
 
