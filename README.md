@@ -305,26 +305,28 @@ summarised on every completed review, in `cross_model_review_status`, and by `--
 in [`docs/structured-findings-envelope.md`](docs/structured-findings-envelope.md).
 
 Each line of the usage log is one turn, and **every figure on it is for that turn alone, never a
-running total**. Codex reports a running total for its whole thread; the server subtracts the
-previous turn's total before writing, so a Codex line is per turn like a Claude one. Do not
-subtract between lines.
+running total**. Do not subtract between lines. Codex reports a running total for its whole
+thread; the server subtracts the previous turn's total before writing, and when a resumed turn
+has no stored total to subtract from it leaves `usage` out rather than write a running total as
+one turn.
 
-| Field | Meaning | Reported by |
+| Field | Meaning | Source |
 | --- | --- | --- |
-| `review_id` | `rv-<pid>-<n>`: the server's process id and a counter of jobs that process has started. **Not a turn number**: it restarts with each server process and counts every session's jobs. | both |
-| `session`, `turn` | The named session and its turn number. `turn` is the turn count. | both |
-| `resumed`, `gap_secs` | Whether the turn resumed a conversation, and the seconds since that session's previous turn. | both |
-| `reviewer`, `model`, `effort` | Who ran the turn. | both |
-| `usage.input_tokens` | Uncached input for this turn. Near zero on a well-cached turn, so not the prompt size. | both |
-| `usage.cache_read_tokens` | Input served from the prompt cache this turn. | both |
-| `usage.cache_creation_tokens` | Input written to the prompt cache this turn. | Claude only |
-| `usage.output_tokens` | Output for this turn. | both |
-| `usage.api_calls` | Model calls the reviewer made inside this turn. | both |
-| `usage.cost_usd` | The CLI's own cost for **this turn** (Claude's `total_cost_usd` for that invocation). It rises and falls between turns. | Claude only |
-| `usage.api_duration_ms` | Time the CLI spent waiting on the model this turn. | Claude only |
-| `wall_secs`, `status`, `failure_code` | The turn's wall-clock time, `completed` or `failed`, and the error code on a failure. | both |
+| `review_id` | `rv-<pid>-<n>`: the server's process id and a counter of jobs that process has started. **Not a turn number**: it restarts with each server process and counts every session's jobs. | server |
+| `session`, `turn` | The named session and its turn number. `turn` is the turn count. | server |
+| `resumed`, `gap_secs` | Whether the turn tried to resume an earlier conversation (it may then have failed), and the seconds since that session's previous turn. | server |
+| `reviewer`, `model`, `effort` | Who ran the turn. | server |
+| `wall_secs`, `status`, `failure_code` | The turn's wall-clock time, `completed` or `failed`, and the error code on a failure. | server |
+| `usage.input_tokens` | Uncached input for this turn. Near zero on a well-cached turn, so not the prompt size. | Claude, Codex |
+| `usage.cache_read_tokens` | Input served from the prompt cache this turn. | Claude, Codex |
+| `usage.cache_creation_tokens` | Input written to the prompt cache this turn. | Claude |
+| `usage.output_tokens` | Output for this turn. | Claude, Codex |
+| `usage.api_calls` | Model calls the reviewer made inside this turn. | Claude, Codex |
+| `usage.cost_usd` | The cost the CLI reported for **this turn** (Claude's `total_cost_usd`, summed when the turn made more than one call, e.g. a block repair). It rises and falls between turns. An attempt that was billed but returned no usage, such as a rate-limited one, is not in it. | Claude |
+| `usage.api_duration_ms` | Time the CLI spent waiting on the model this turn. | Claude |
 
-A field a reviewer does not report is left out, not written as zero. The `<machine>` in the file
+A `usage` field is left out, not written as zero, when its source did not report it or its
+per-turn value could not be worked out. The `<machine>` in the file
 name is the computer name, read from `COMPUTERNAME` or, when the launching client strips it (Codex
 does), from Windows itself.
 
