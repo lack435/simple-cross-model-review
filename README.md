@@ -304,11 +304,11 @@ summarised on every completed review, in `cross_model_review_status`, and by `--
 `--no-metrics` turns recording off. How the two CLIs' token counts are normalised is documented
 in [`docs/structured-findings-envelope.md`](docs/structured-findings-envelope.md).
 
-Each line of the usage log is one turn, and **every figure on it is for that turn alone, never a
-running total**. Do not subtract between lines. Codex reports a running total for its whole
-thread; the server subtracts the previous turn's total before writing, and when a resumed turn
-has no stored total to subtract from it leaves `usage` out rather than write a running total as
-one turn.
+Each line of the usage log is one turn, and **every `usage` figure on it is for that turn alone,
+never a running total**. Do not subtract between lines. Codex reports its token counts as running
+totals for the whole thread; the server subtracts the previous turn's totals before writing (its
+`api_calls` already describes just the one run), and when a resumed turn has no stored totals to
+subtract from it leaves `usage` out rather than write a running total as one turn.
 
 | Field | Meaning | Source |
 | --- | --- | --- |
