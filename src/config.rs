@@ -2658,8 +2658,9 @@ OPTIONS:
                               fresh rather than silently handed the stale resume. 0 disables.
                               Applies to every reviewer when given. Default: per the reviewer
                               that created the session -- claude 3300 (55 minutes, just under
-                              its 1h cache lifetime), codex 43200 (12 hours; its cache outlives
-                              that, so the limit only bounds drift).
+                              its 1h cache lifetime), codex 43200 (12 hours; OpenAI states
+                              its cache lasts at least that long -- not verified here -- so
+                              the limit is meant to bound drift rather than cache cost).
   --block-repair-attempts <n>
                               When a reviewer answers without a usable machine-readable
                               findings block, ask it once more -- in the same conversation,

@@ -167,8 +167,9 @@ The essentials:
 --session-max-idle-seconds <n>
                             Refuse to resume a session idle longer than this. Default depends on
                             the reviewer that created the session: claude 3300 (55m, under its
-                            1h prompt cache), codex 43200 (12h; its cache outlives that, so the
-                            limit only bounds drift). A given value applies to both. 0 disables.
+                            1h prompt cache), codex 43200 (12h; OpenAI states its cache lasts at
+                            least that long, not verified here, so the limit is meant to bound
+                            drift). A given value applies to both. 0 disables.
 --stagnant-session-turns <n> End a session going this many turns without raising or resolving
                             a finding while findings are open. Default 3. 0 disables.
 --block-repair-attempts <n>  When a reviewer omits its machine-readable findings block, ask
