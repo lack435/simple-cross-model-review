@@ -1463,7 +1463,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
             "--claude-profile".into(),
             "work".into(),
         ])
@@ -1961,7 +1961,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config")
     }

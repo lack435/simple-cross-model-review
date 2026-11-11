@@ -1,6 +1,6 @@
 # Project-level Codex configuration for cross-review's own repository.
 #
-# This is the reverse of .mcp.json: here Codex is the caller and Claude Opus 4.8 is the
+# This is the reverse of .mcp.json: here Codex is the caller and Claude Opus 5.5 is the
 # reviewer, so the tool can be dogfooded in both directions from one checkout.
 #
 # Both directions point at dist\cross-review.exe on purpose. An earlier version pointed
@@ -45,9 +45,9 @@ args = [
     # Review levels (a caller-selectable model+effort preset; see README "Review levels"). A
     # reviewer's model and effort come only from --level now (--model/--effort were removed), so
     # at least one level is required; --default-level picks the one an omitted `level` uses.
-    "--level", "fast:claude-opus-4-8:low",
-    "--level", "standard:claude-opus-4-8:medium",
-    "--level", "thorough:claude-opus-4-8:high",
+    "--level", "fast:claude-opus-5-5:low",
+    "--level", "standard:claude-opus-5-5:medium",
+    "--level", "thorough:claude-opus-5-5:high",
     "--default-level", "standard",
     "--claude-profile", "work",
 ]

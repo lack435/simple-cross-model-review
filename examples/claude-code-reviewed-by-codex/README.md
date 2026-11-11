@@ -60,7 +60,7 @@ Add `--bin` with its full path:
 ```json
 "args": [
   "--reviewer", "codex",
-  "--level", "standard:gpt-5.6-luna:max",
+  "--level", "standard:gpt-6-luna:max",
   "--bin", "C:\\Users\\you\\AppData\\Roaming\\npm\\codex.cmd"
 ]
 ```

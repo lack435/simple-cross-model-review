@@ -66,7 +66,7 @@ Write-Host "==> provisioning profile '$Profile' for: $($Reviewers -join ', ')" -
 
 $serverArgs = @()
 foreach ($rv in ($Reviewers | Select-Object -Unique)) {
-    $level = if ($rv -eq 'codex') { 'smoke:gpt-5.6-luna:low' } else { 'smoke:claude-opus-4-8:low' }
+    $level = if ($rv -eq 'codex') { 'smoke:gpt-6-luna:low' } else { 'smoke:claude-opus-5-5:low' }
     $serverArgs += @('--reviewer', $rv, '--level', $level, "--$rv-profile", $Profile)
 }
 $serverArgs += @('--state-dir', $stateDir)

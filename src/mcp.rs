@@ -1409,7 +1409,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         Arc::new(App::new(cfg))
@@ -1423,7 +1423,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--timeout-seconds".into(),
             "3600".into(),
         ])
@@ -1534,7 +1534,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let hooked = App::new(cfg).with_hook_runner(Arc::new(Never));
@@ -1554,7 +1554,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
             "--claude-profile".into(),
             "work".into(),
         ])
@@ -1583,7 +1583,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -1634,7 +1634,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         cfg.companions = vec![crate::companion::Companion {
@@ -1692,9 +1692,9 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "fast:gpt-5.6-luna:high".into(),
+            "fast:gpt-6-luna:high".into(),
             "--level".into(),
-            "thorough:gpt-5.6-luna:max".into(),
+            "thorough:gpt-6-luna:max".into(),
             "--default-level".into(),
             "thorough".into(),
         ])
@@ -1724,7 +1724,7 @@ mod tests {
                 "--reviewer".into(),
                 "claude".into(),
                 "--level".into(),
-                "standard:claude-opus-4-8:medium".into(),
+                "standard:claude-opus-5-5:medium".into(),
             ];
             all.extend(args.iter().map(|a| (*a).to_string()));
             let app = Arc::new(App::new(Config::from_args(&all).expect("config")));
@@ -1739,12 +1739,7 @@ mod tests {
         // static --diff capture.
         for args in [
             vec![],
-            vec![
-                "--reviewer",
-                "codex",
-                "--level",
-                "standard:gpt-5.6-luna:max",
-            ],
+            vec!["--reviewer", "codex", "--level", "standard:gpt-6-luna:max"],
         ] {
             let text = describe(&args);
             assert!(text.contains("repository_diff"), "{args:?}: {text}");
@@ -2268,7 +2263,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--bin".into(),
             "C:\\definitely\\not\\here\\codex.exe".into(),
         ])

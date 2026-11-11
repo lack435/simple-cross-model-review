@@ -348,7 +348,7 @@ pub(crate) mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--cwd".into(),
             l.primary.to_string_lossy().into_owned(),
             "--state-dir".into(),

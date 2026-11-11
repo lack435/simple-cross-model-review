@@ -1235,7 +1235,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         assert!(codex_home(&ambient, ambient.primary()).is_some());
@@ -1251,7 +1251,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--codex-profile".into(),
             "work".into(),
         ])
@@ -1396,7 +1396,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config")
     }

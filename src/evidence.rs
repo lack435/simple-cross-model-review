@@ -1584,7 +1584,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--cwd".into(),
             repo.as_path().to_string_lossy().into_owned(),
             "--state-dir".into(),

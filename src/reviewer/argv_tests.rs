@@ -80,7 +80,7 @@ fn inject_level(args: &mut Vec<String>) {
         .unwrap_or("codex");
     let (model, effort) = match crate::config::ReviewerKind::parse(kind) {
         Some(r) => (r.default_model(), r.default_effort()),
-        None => ("gpt-5.6-luna", "max"),
+        None => ("gpt-6-luna", "max"),
     };
     args.push("--level".into());
     args.push(format!("standard:{model}:{effort}"));
@@ -205,12 +205,12 @@ fn claude_argv_carries_the_pinned_model_and_effort() {
         "--claude-profile",
         "test",
         "--level",
-        "only:claude-opus-4-8:xhigh",
+        "only:claude-opus-5-5:xhigh",
     ]);
     let args = argv(&ClaudeReviewer, &cfg, None);
     assert_eq!(
         value_after(&args, "--model").as_deref(),
-        Some("claude-opus-4-8")
+        Some("claude-opus-5-5")
     );
     assert_eq!(value_after(&args, "--effort").as_deref(), Some("xhigh"));
     assert!(
@@ -944,10 +944,10 @@ fn codex_argv_states_the_sandbox_on_every_turn_including_resumes() {
 
 #[test]
 fn codex_argv_carries_model_and_effort_on_both_paths() {
-    let cfg = config(&["codex", "--level", "only:gpt-5.6-luna:xhigh"]);
+    let cfg = config(&["codex", "--level", "only:gpt-6-luna:xhigh"]);
     for resume in [None, Some("019faa01-a2d3-78c0-a67a-2ffe1ca75969")] {
         let args = argv(&CodexReviewer, &cfg, resume);
-        assert_eq!(value_after(&args, "-m").as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(value_after(&args, "-m").as_deref(), Some("gpt-6-luna"));
         assert!(
             args.contains(&"model_reasoning_effort=\"xhigh\"".to_string()),
             "{args:?}"
@@ -1164,9 +1164,9 @@ fn an_invocation_applies_the_pinned_home_rather_than_resolving_its_own() {
             .to_string(),
             "--level".to_string(),
             if var == "CODEX_HOME" {
-                "standard:gpt-5.6-luna:max"
+                "standard:gpt-6-luna:max"
             } else {
-                "standard:claude-opus-4-8:medium"
+                "standard:claude-opus-5-5:medium"
             }
             .to_string(),
         ])

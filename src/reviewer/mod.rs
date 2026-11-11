@@ -2845,7 +2845,7 @@ mod drain_tests {
             "--reviewer".to_string(),
             "claude".to_string(),
             "--level".to_string(),
-            "standard:claude-opus-4-8:medium".to_string(),
+            "standard:claude-opus-5-5:medium".to_string(),
         ])
         .expect("config");
         let out = RunOutcome {
@@ -2880,7 +2880,7 @@ mod drain_tests {
             "--reviewer".to_string(),
             "codex".to_string(),
             "--level".to_string(),
-            "standard:gpt-5.6-luna:max".to_string(),
+            "standard:gpt-6-luna:max".to_string(),
         ])
         .expect("config");
         let out = RunOutcome {
@@ -2975,7 +2975,7 @@ mod drain_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("cfg");
         // The exact count is carried on the outcome (policy_denials), not recomputed from stderr.
@@ -3034,7 +3034,7 @@ mod drain_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("cfg");
         assert!(PolicyStall::for_run(&codex, codex.primary()).is_some());
@@ -3043,7 +3043,7 @@ mod drain_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--max-policy-denials".into(),
             "0".into(),
         ])
@@ -3054,7 +3054,7 @@ mod drain_tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
         ])
         .expect("cfg");
         assert!(PolicyStall::for_run(&claude, claude.primary()).is_none());

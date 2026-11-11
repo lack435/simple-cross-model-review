@@ -1,6 +1,6 @@
 # Codex, reviewed by Claude
 
-The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 4.8.
+The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 5.5.
 
 ## Setup
 
@@ -18,7 +18,7 @@ The caller is Codex (desktop app or CLI); reviews come back from Claude Opus 4.8
    ```toml
    [mcp_servers.cross_review]
    command = "tools/cross-review.exe"
-   args = ["--reviewer", "claude", "--level", "standard:claude-opus-4-8:medium"]
+   args = ["--reviewer", "claude", "--level", "standard:claude-opus-5-5:medium"]
    startup_timeout_sec = 30
    tool_timeout_sec = 2400
    ```
@@ -73,7 +73,7 @@ Add `--bin` with its full path:
 ```toml
 args = [
   "--reviewer", "claude",
-  "--level", "standard:claude-opus-4-8:medium",
+  "--level", "standard:claude-opus-5-5:medium",
   "--bin", "C:\\Users\\you\\.local\\bin\\claude.exe",
 ]
 ```

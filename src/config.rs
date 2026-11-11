@@ -65,8 +65,8 @@ impl ReviewerKind {
             // as releases ship (verified once: `--model opus` reported claude-opus-4-8), so
             // writing the exact id keeps each reviewer fixed to the one chosen here rather
             // than moving out from under us.
-            Self::Claude => "claude-opus-4-8",
-            Self::Codex => "gpt-5.6-luna",
+            Self::Claude => "claude-opus-5-5",
+            Self::Codex => "gpt-6-luna",
         }
     }
 
@@ -76,6 +76,16 @@ impl ReviewerKind {
             Self::Claude => "medium",
             Self::Codex => "max",
         }
+    }
+
+    /// The resume window a session created by this reviewer gets when `--session-max-idle-seconds`
+    /// is not given. Per family because the two vendors' prompt caches live very different lengths
+    /// of time; see the two constants.
+    pub fn default_resume_max_idle(self) -> Duration {
+        Duration::from_secs(match self {
+            Self::Claude => DEFAULT_CLAUDE_RESUME_MAX_IDLE_SECS,
+            Self::Codex => DEFAULT_CODEX_RESUME_MAX_IDLE_SECS,
+        })
     }
 
     pub fn known_efforts(self) -> &'static [&'static str] {
@@ -817,14 +827,18 @@ pub const PREFLIGHT_CAP_SECS: u64 = 40;
 /// state directory admit up to N times this.
 pub const DEFAULT_MAX_CONCURRENT_REVIEWS: u32 = 8;
 
-/// Refuse to resume a review session idle longer than this. Past this window the reviewer's
-/// prompt cache may no longer be warm -- its lifetime depends on how the CLI is
-/// authenticated (an hour on a subscription, five minutes on an API key), which this server
-/// cannot see -- so a resume risks paying to re-read the whole conversation, and the further
-/// a session is from its last turn the more its context may have drifted from the work in
-/// front of it. The default sits just under the one-hour lifetime. The caller is told to
-/// start fresh rather than silently handed the stale resume. Zero disables the check.
-pub const DEFAULT_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
+/// Default resume window for a session created by the Claude reviewer. Past it the reviewer's
+/// prompt cache may no longer be warm -- an hour on a subscription, five minutes on an API key,
+/// which this server cannot see -- so a resume risks paying to re-read the whole conversation.
+/// It sits just under the one-hour lifetime.
+pub const DEFAULT_CLAUDE_RESUME_MAX_IDLE_SECS: u64 = 55 * 60;
+
+/// Default resume window for a session created by the Codex reviewer. OpenAI states that a
+/// ChatGPT-authenticated Codex keeps its prompt cache indefinitely and that API caching can run
+/// for 12 hours (not verified here), so cost is no longer what bounds a Codex resume. What remains
+/// is drift: a session many hours old may no longer match the work in front of it. Twelve hours
+/// holds under either reading of that announcement and still retires a session left overnight.
+pub const DEFAULT_CODEX_RESUME_MAX_IDLE_SECS: u64 = 12 * 60 * 60;
 
 /// Refuse to resume a review session that has already run this many turns. Every turn
 /// re-processes the whole conversation so far, so a long-running session is both expensive
@@ -897,10 +911,12 @@ pub struct Config {
     /// become limits, and carried to the evidence server in its bundle.
     pub evidence_max_calls: u32,
     pub evidence_max_bytes: u64,
-    /// Refuse to resume a session idle longer than this. Zero disables the check. See
-    /// `DEFAULT_RESUME_MAX_IDLE_SECS`. A tripped session is refused with
-    /// SESSION_NOT_RESUMABLE, not silently restarted, so the caller decides to start fresh.
-    pub resume_max_idle: Duration,
+    /// Refuse to resume a session idle longer than this. `None` (the flag not given) means the
+    /// per-family default of the reviewer that created the session, so read it through
+    /// [`Config::resume_max_idle_for`]. `Some(ZERO)` disables the check. A tripped session is
+    /// refused with SESSION_NOT_RESUMABLE, not silently restarted, so the caller decides to start
+    /// fresh.
+    pub resume_max_idle: Option<Duration>,
     /// Refuse to resume a session that has already run this many turns. Zero disables the
     /// check. See `DEFAULT_RESUME_MAX_TURNS`.
     pub resume_max_turns: u32,
@@ -1063,7 +1079,7 @@ impl Config {
         let mut entries: Vec<PendingEntry> = Vec::new();
         let mut cwd: Option<PathBuf> = None;
         let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
-        let mut resume_max_idle_secs = DEFAULT_RESUME_MAX_IDLE_SECS;
+        let mut resume_max_idle_secs: Option<u64> = None;
         let mut resume_max_turns = DEFAULT_RESUME_MAX_TURNS;
         let mut stagnant_session_turns = DEFAULT_STAGNANT_SESSION_TURNS;
         let mut block_repair_attempts = DEFAULT_BLOCK_REPAIR_ATTEMPTS;
@@ -1304,11 +1320,11 @@ impl Config {
                 }
                 "--session-max-idle-seconds" => {
                     let v = take("--session-max-idle-seconds")?;
-                    resume_max_idle_secs = v.parse().map_err(|_| {
+                    resume_max_idle_secs = Some(v.parse().map_err(|_| {
                         format!(
                             "--session-max-idle-seconds must be an integer (0 disables), got '{v}'"
                         )
-                    })?;
+                    })?);
                 }
                 "--block-repair-attempts" => {
                     let v = take("--block-repair-attempts")?;
@@ -1668,7 +1684,7 @@ impl Config {
             timeout: Duration::from_secs(timeout_secs),
             evidence_max_calls,
             evidence_max_bytes,
-            resume_max_idle: Duration::from_secs(resume_max_idle_secs),
+            resume_max_idle: resume_max_idle_secs.map(Duration::from_secs),
             resume_max_turns,
             stagnant_session_turns,
             block_repair_attempts,
@@ -1709,6 +1725,18 @@ impl Config {
         // `reviewers` is non-empty by construction (`from_args` requires `--reviewer`, and
         // `validate_chain` rejects an empty vector), so indexing [0] cannot panic.
         &self.reviewers[0]
+    }
+
+    /// The resume window for a session created by `reviewer` (a session record's stored
+    /// `ReviewerKind::as_str`). An explicit `--session-max-idle-seconds` applies to every reviewer;
+    /// otherwise the creating reviewer's family default. A name that no longer parses gets the
+    /// shorter (Claude) window, so an unknown record is never kept alive longer than either family.
+    pub fn resume_max_idle_for(&self, reviewer: &str) -> Duration {
+        self.resume_max_idle.unwrap_or_else(|| {
+            ReviewerKind::parse(reviewer)
+                .unwrap_or(ReviewerKind::Claude)
+                .default_resume_max_idle()
+        })
     }
 
     /// Whether any chain entry configures a usage minimum. When false, the whole proactive
@@ -1913,7 +1941,7 @@ impl Config {
     /// - **An identity-equivalent entry is invalid.** Two entries equal in reviewer, model,
     ///   effort, *and* bin cannot be a fallback for each other. The whole spec is compared, not
     ///   just `(reviewer, model)`: a distinct `bin` can be a distinct install/account, and model
-    ///   aliases (`opus` vs `claude-opus-4-8`) cannot be canonicalised without asserting a
+    ///   aliases (`opus` vs `claude-opus-5-5`) cannot be canonicalised without asserting a
     ///   mapping this tool has not verified, so a same-model/different-bin (or different-effort)
     ///   fallback stays valid. The bin is compared by path identity (Windows-case- and
     ///   separator-insensitive, via `ReviewerSpec::same_reviewer_identity`), not byte-exactly, so
@@ -2628,7 +2656,10 @@ OPTIONS:
                               warm and its context may have drifted, so a resume risks
                               re-reading the whole conversation. The caller is told to start
                               fresh rather than silently handed the stale resume. 0 disables.
-                              Default: 3300 (55 minutes, just under the 1h cache lifetime).
+                              Applies to every reviewer when given. Default: per the reviewer
+                              that created the session -- claude 3300 (55 minutes, just under
+                              its 1h cache lifetime), codex 43200 (12 hours; its cache outlives
+                              that, so the limit only bounds drift).
   --block-repair-attempts <n>
                               When a reviewer answers without a usable machine-readable
                               findings block, ask it once more -- in the same conversation,
@@ -2823,7 +2854,7 @@ mod tests {
             };
             let (model, effort) = match ReviewerKind::parse(kind) {
                 Some(r) => (r.default_model(), r.default_effort()),
-                None => ("gpt-5.6-luna", "max"),
+                None => ("gpt-6-luna", "max"),
             };
             out.push("--level".to_string());
             out.push(format!("standard:{model}:{effort}"));
@@ -3218,9 +3249,9 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "fast:gpt-5.6-luna:high",
+            "fast:gpt-6-luna:high",
             "--level",
-            "thorough:gpt-5.6-luna:max",
+            "thorough:gpt-6-luna:max",
         ]))
         .unwrap_err();
         assert!(err.contains("no --default-level"), "{err}");
@@ -3230,7 +3261,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "only:gpt-5.6-luna:high",
+            "only:gpt-6-luna:high",
         ]))
         .expect("config");
         assert_eq!(cfg.primary().default_level.as_deref(), Some("only"));
@@ -3240,11 +3271,11 @@ mod tests {
     #[test]
     fn defaults_are_pinned_per_reviewer() {
         let claude = Config::from_args(&args(&["--reviewer", "claude"])).expect("config");
-        assert_eq!(claude.primary().model, "claude-opus-4-8");
+        assert_eq!(claude.primary().model, "claude-opus-5-5");
         assert_eq!(claude.primary().effort, "medium");
 
         let codex = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
-        assert_eq!(codex.primary().model, "gpt-5.6-luna");
+        assert_eq!(codex.primary().model, "gpt-6-luna");
         assert_eq!(codex.primary().effort, "max");
     }
 
@@ -3437,18 +3468,18 @@ mod tests {
             "--reviewer",
             "claude",
             "--level",
-            "standard:claude-opus-4-8:medium",
+            "standard:claude-opus-5-5:medium",
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
         ]))
         .expect("config");
         assert_eq!(cfg.reviewers.len(), 2);
         assert_eq!(cfg.reviewers[0].reviewer, ReviewerKind::Claude);
-        assert_eq!(cfg.reviewers[0].model, "claude-opus-4-8");
+        assert_eq!(cfg.reviewers[0].model, "claude-opus-5-5");
         assert_eq!(cfg.reviewers[1].reviewer, ReviewerKind::Codex);
-        assert_eq!(cfg.reviewers[1].model, "gpt-5.6-luna");
+        assert_eq!(cfg.reviewers[1].model, "gpt-6-luna");
     }
 
     #[test]
@@ -3497,7 +3528,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
             "--reviewer",
             "codex",
             "--level",
@@ -3574,7 +3605,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
         ]))
         .expect("config");
 
@@ -3586,7 +3617,7 @@ mod tests {
 
         // With the level override -> the effective pair, not the base.
         let ov = LevelOverride {
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "xhigh".into(),
         };
         let desc = cfg.describe_reviewer_effective(0, Some(&ov));
@@ -3603,11 +3634,11 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
             "--reviewer",
             "claude",
             "--level",
-            "standard:claude-opus-4-8:high",
+            "standard:claude-opus-5-5:high",
         ]))
         .expect("config");
         let ov = LevelOverride {
@@ -3673,18 +3704,18 @@ mod tests {
             "--reviewer",
             "claude",
             "--level",
-            "standard:claude-opus-4-8:medium",
+            "standard:claude-opus-5-5:medium",
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
         ]))
         .expect("config");
         let mut rec = SessionRecord {
             claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "max".into(),
             cwd: String::new(),
             kind: Some(crate::session::KIND_REVIEW.to_string()),
@@ -3723,9 +3754,9 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "fast:gpt-5.6-luna:high",
+            "fast:gpt-6-luna:high",
             "--level",
-            "standard:gpt-5.6-luna:xhigh",
+            "standard:gpt-6-luna:xhigh",
             "--default-level",
             "standard",
         ]))
@@ -3735,7 +3766,7 @@ mod tests {
         let std = p.resolve_level("standard").expect("declared");
         assert_eq!(
             (std.model.as_str(), std.effort.as_str()),
-            ("gpt-5.6-luna", "xhigh")
+            ("gpt-6-luna", "xhigh")
         );
         assert_eq!(p.default_level.as_deref(), Some("standard"));
 
@@ -3744,9 +3775,9 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "fast:gpt-5.6-luna:high",
+            "fast:gpt-6-luna:high",
             "--level",
-            "fast:gpt-5.6-luna:max",
+            "fast:gpt-6-luna:max",
         ]))
         .unwrap_err();
         assert!(err.contains("declared twice"), "{err}");
@@ -3756,7 +3787,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "fast:gpt-5.6-luna",
+            "fast:gpt-6-luna",
         ]))
         .unwrap_err();
         assert!(err.contains("NAME:MODEL:EFFORT"), "{err}");
@@ -3766,7 +3797,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "fast:gpt-5.6-luna:high",
+            "fast:gpt-6-luna:high",
             "--default-level",
             "thorough",
         ]))
@@ -3777,15 +3808,15 @@ mod tests {
     #[test]
     fn resume_entry_index_matches_a_level_pair_not_only_the_base() {
         use crate::session::{RawBin, SessionRecord};
-        // Base pair is (claude-opus-4-8, medium) via the `standard` default level; the entry also
+        // Base pair is (claude-opus-5-5, medium) via the `standard` default level; the entry also
         // declares thorough=(…, high).
         let cfg = Config::from_args(&args(&[
             "--reviewer",
             "claude",
             "--level",
-            "standard:claude-opus-4-8:medium",
+            "standard:claude-opus-5-5:medium",
             "--level",
-            "thorough:claude-opus-4-8:high",
+            "thorough:claude-opus-5-5:high",
             "--default-level",
             "standard",
         ]))
@@ -3794,7 +3825,7 @@ mod tests {
             claude_rewind_uuid: None,
             reviewer: "claude".into(),
             cli_session_id: "t".into(),
-            model: "claude-opus-4-8".into(),
+            model: "claude-opus-5-5".into(),
             effort: effort.into(),
             cwd: String::new(),
             kind: Some(crate::session::KIND_REVIEW.to_string()),
@@ -3854,7 +3885,7 @@ mod tests {
             claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "max".into(),
             cwd: String::new(),
             kind: Some(crate::session::KIND_REVIEW.to_string()),
@@ -3902,7 +3933,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
             "--bin",
             "C:\\Tools\\codex.exe",
         ]))
@@ -3911,7 +3942,7 @@ mod tests {
             claude_rewind_uuid: None,
             reviewer: "codex".into(),
             cli_session_id: "t".into(),
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "max".into(),
             cwd: String::new(),
             kind: Some(crate::session::KIND_REVIEW.to_string()),
@@ -4009,13 +4040,13 @@ mod tests {
         ]))
         .expect("config");
         assert_eq!(
-            ambiguous.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            ambiguous.resume_entry_index(&mk("codex", "gpt-6-luna")),
             None
         );
         // Exactly one match: resumes.
         let single = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert_eq!(
-            single.resume_entry_index(&mk("codex", "gpt-5.6-luna")),
+            single.resume_entry_index(&mk("codex", "gpt-6-luna")),
             Some(0)
         );
     }
@@ -4026,7 +4057,7 @@ mod tests {
         // --level, whose value carries colons).
         let cfg = Config::from_args(&args(&[
             "--reviewer=claude",
-            "--level=standard:claude-opus-4-8:xhigh",
+            "--level=standard:claude-opus-5-5:xhigh",
         ]))
         .expect("config");
         assert_eq!(cfg.primary().reviewer, ReviewerKind::Claude);
@@ -4267,7 +4298,21 @@ mod tests {
     fn resume_limits_default_override_and_disable() {
         let cfg = Config::from_args(&args(&["--reviewer", "codex"])).expect("config");
         assert_eq!(cfg.resume_max_turns, DEFAULT_RESUME_MAX_TURNS);
-        assert_eq!(cfg.resume_max_idle.as_secs(), DEFAULT_RESUME_MAX_IDLE_SECS);
+        // Unset: each session gets the window of the reviewer family that created it.
+        assert_eq!(cfg.resume_max_idle, None);
+        assert_eq!(
+            cfg.resume_max_idle_for("codex").as_secs(),
+            DEFAULT_CODEX_RESUME_MAX_IDLE_SECS
+        );
+        assert_eq!(
+            cfg.resume_max_idle_for("claude").as_secs(),
+            DEFAULT_CLAUDE_RESUME_MAX_IDLE_SECS
+        );
+        // An unrecognised record name gets the shorter window, never the longer one.
+        assert_eq!(
+            cfg.resume_max_idle_for("something-else").as_secs(),
+            DEFAULT_CLAUDE_RESUME_MAX_IDLE_SECS
+        );
 
         let cfg = Config::from_args(&args(&[
             "--reviewer",
@@ -4279,7 +4324,9 @@ mod tests {
         ]))
         .expect("config");
         assert_eq!(cfg.resume_max_turns, 3);
-        assert_eq!(cfg.resume_max_idle.as_secs(), 120);
+        // An explicit value overrides both families.
+        assert_eq!(cfg.resume_max_idle_for("codex").as_secs(), 120);
+        assert_eq!(cfg.resume_max_idle_for("claude").as_secs(), 120);
 
         // Zero on either disables that check rather than being rejected.
         let cfg = Config::from_args(&args(&[
@@ -4292,7 +4339,8 @@ mod tests {
         ]))
         .expect("config");
         assert_eq!(cfg.resume_max_turns, 0);
-        assert!(cfg.resume_max_idle.is_zero());
+        assert!(cfg.resume_max_idle_for("codex").is_zero());
+        assert!(cfg.resume_max_idle_for("claude").is_zero());
 
         // A non-integer is a configuration mistake, not a value to guess at.
         assert!(Config::from_args(&args(&[
@@ -4783,7 +4831,7 @@ mod tests {
             "--reviewer",
             "codex",
             "--level",
-            "only:gpt-5.6-luna:hyper",
+            "only:gpt-6-luna:hyper",
         ]))
         .expect("unusual effort should warn, not fail");
         assert_eq!(cfg.primary().effort, "hyper");
@@ -5347,7 +5395,7 @@ mod event_hook_flag_tests {
     #[test]
     fn the_capture_hook_parses_validates_and_budgets() {
         let exe = cmd_exe();
-        let base = ["--reviewer", "codex", "--level", "s:gpt-5.6-luna:max"];
+        let base = ["--reviewer", "codex", "--level", "s:gpt-6-luna:max"];
         let plain = Config::from_args(&args(&base)).unwrap();
         assert!(plain.capture_hook.is_none());
 
