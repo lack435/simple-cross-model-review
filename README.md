@@ -165,7 +165,11 @@ The essentials:
 --max-concurrent-reviews <n> Per-process cap on reviews running at once. Default 8. 0 disables.
 --session-max-turns <n>      Refuse to resume a session past this many turns. Default 10.
 --session-max-idle-seconds <n>
-                            Refuse to resume a session idle longer than this. Default 3300.
+                            Refuse to resume a session idle longer than this. Default depends on
+                            the reviewer that created the session: claude 3300 (55m, under its
+                            1h prompt cache), codex 43200 (12h; OpenAI states its cache lasts at
+                            least that long, not verified here, so the limit is meant to bound
+                            drift). A given value applies to both. 0 disables.
 --stagnant-session-turns <n> End a session going this many turns without raising or resolving
                             a finding while findings are open. Default 3. 0 disables.
 --block-repair-attempts <n>  When a reviewer omits its machine-readable findings block, ask
@@ -355,8 +359,8 @@ The tool is listed only when a hook is configured.
 ```json
 {"schema_version": 1, "event": "converged", "outcome": "converged", "trigger": "review",
  "session": "feat/x", "turn": 3, "review_id": "rv-...",
- "reviewer": "OpenAI Codex (codex, model=gpt-5.6-luna, effort=xhigh, bin=...)",
- "reviewer_kind": "codex", "model": "gpt-5.6-luna", "effort": "xhigh", "chain_index": 0,
+ "reviewer": "OpenAI Codex (codex, model=gpt-6-luna, effort=xhigh, bin=...)",
+ "reviewer_kind": "codex", "model": "gpt-6-luna", "effort": "xhigh", "chain_index": 0,
  "captured_head": "<full sha>", "tree_clean": true, "base": "<merge-base sha>",
  "base_source": "merge-base(HEAD, refs/remotes/origin/HEAD)", "diff_sha256": "...",
  "repo_root": "C:\\dev\\repo", "server_version": "..."}
@@ -502,7 +506,7 @@ are `null`:
 {"schema_version": 1, "event": "turn_completed", "kind": "review", "review_id": "rv-...",
  "session": "feat/x", "turn": 2, "resumed": true, "working_root": "C:\\dev\\repo",
  "level": null,
- "reviewer": {"cli": "codex", "model": "gpt-5.6-luna", "effort": "xhigh", "chain_index": 0, "fallback": false},
+ "reviewer": {"cli": "codex", "model": "gpt-6-luna", "effort": "xhigh", "chain_index": 0, "fallback": false},
  "started_at": "2026-10-17T21:04:05.123Z", "finished_at": "2026-10-17T21:12:40.002Z",
  "outcome": "changes_requested", "verdict": "changes", "structured": true,
  "open_count": 2, "total_count": 3, "open_by_severity": {"critical": 0, "major": 1, "minor": 1},

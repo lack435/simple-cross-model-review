@@ -1260,7 +1260,7 @@ mod tests {
             resumed: turn > 1,
             gap_secs: gap,
             reviewer: "claude".into(),
-            model: "claude-opus-4-8".into(),
+            model: "claude-opus-5-5".into(),
             effort: "medium".into(),
             prompt_bytes: 1000,
             diff_bytes: 500,
@@ -1318,7 +1318,7 @@ mod tests {
         with_attempt.v = RECORD_VERSION_ATTEMPTS;
         with_attempt.attempts = vec![Attempt {
             reviewer: "claude".into(),
-            model: "claude-opus-4-8".into(),
+            model: "claude-opus-5-5".into(),
             effort: "medium".into(),
             resolved_bin: None,
             failure_code: "RATE_LIMITED".into(),
@@ -1336,7 +1336,7 @@ mod tests {
         let mut with_skip = record("s", 1, None, usage(1_000, 9_000, 500));
         with_skip.attempts = vec![Attempt {
             reviewer: "claude".into(),
-            model: "claude-opus-4-8".into(),
+            model: "claude-opus-5-5".into(),
             effort: "medium".into(),
             resolved_bin: None,
             failure_code: "USAGE_BELOW_MINIMUM".into(),

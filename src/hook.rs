@@ -714,9 +714,9 @@ mod tests {
             turn: 2,
             cli_session_id: "thread-1".into(),
             turns: 2,
-            reviewer: "OpenAI Codex (codex, model=gpt-5.6-luna, effort=xhigh)".into(),
+            reviewer: "OpenAI Codex (codex, model=gpt-6-luna, effort=xhigh)".into(),
             reviewer_kind: "codex".into(),
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "xhigh".into(),
             chain_index: 0,
             root: PathBuf::from("."),
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(v["review_id"], "rv-1-1");
         assert_eq!(v["chain_index"], 0);
         assert_eq!(v["reviewer_kind"], "codex");
-        assert_eq!(v["model"], "gpt-5.6-luna");
+        assert_eq!(v["model"], "gpt-6-luna");
         assert_eq!(v["base"], "a".repeat(40));
         assert_eq!(v["diff_sha256"], "00".repeat(32));
         assert_eq!(v["repo_root"], "C:\\r");

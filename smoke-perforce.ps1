@@ -131,7 +131,7 @@ View:
     Invoke-TestP4 edit -c $pending $file | Out-Null
     [IO.File]::WriteAllText($file, "version three`n", $utf8)
 
-    $levelModel = if ($Reviewer -eq 'claude') { 'claude-opus-4-8' } else { 'gpt-5.6-luna' }
+    $levelModel = if ($Reviewer -eq 'claude') { 'claude-opus-5-5' } else { 'gpt-6-luna' }
     $effort = if ($Reviewer -eq 'claude') { 'medium' } else { 'low' }
     $serverArgs = @('--reviewer', $Reviewer, '--level', "smoke:${levelModel}:${effort}",
         '--vcs', 'perforce', '--cwd', $workspace, '--state-dir', $stateDir, '--timeout-seconds', '600')

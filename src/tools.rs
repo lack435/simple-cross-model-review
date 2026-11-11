@@ -2414,10 +2414,29 @@ impl App {
                 0 => "no turn cap".to_string(),
                 n => format!("max {n} turns"),
             },
-            if self.cfg.resume_max_idle.is_zero() {
-                "no idle cap".to_string()
-            } else {
-                format!("idle up to {}", fmt_elapsed(self.cfg.resume_max_idle))
+            match self.cfg.resume_max_idle {
+                Some(d) if d.is_zero() => "no idle cap".to_string(),
+                Some(d) => format!("idle up to {}", fmt_elapsed(d)),
+                // Unset: per the family that created the session. List each family in the chain.
+                None => {
+                    let mut kinds: Vec<ReviewerKind> = Vec::new();
+                    for s in &self.cfg.reviewers {
+                        if !kinds.contains(&s.reviewer) {
+                            kinds.push(s.reviewer);
+                        }
+                    }
+                    let parts: Vec<String> = kinds
+                        .iter()
+                        .map(|k| {
+                            format!(
+                                "{} {}",
+                                k.as_str(),
+                                fmt_elapsed(k.default_resume_max_idle())
+                            )
+                        })
+                        .collect();
+                    format!("idle up to {}", parts.join(" / "))
+                }
             },
         ));
         out.push_str(&format!(
@@ -6284,16 +6303,17 @@ fn resume_block(
             record.turns, cfg.resume_max_turns
         ));
     }
-    if !cfg.resume_max_idle.is_zero() {
+    let max_idle = cfg.resume_max_idle_for(&record.reviewer);
+    if !max_idle.is_zero() {
         let idle = now.saturating_sub(record.updated_unix);
-        if idle > cfg.resume_max_idle.as_secs() {
+        if idle > max_idle.as_secs() {
             return Some(format!(
                 "it was last used {} ago, past the configured {} resume window \
                  (--session-max-idle-seconds); by then the reviewer's prompt cache may no \
                  longer be warm and its context may have drifted, so resuming risks paying to \
                  re-read the whole conversation.",
                 fmt_age(idle),
-                fmt_elapsed(cfg.resume_max_idle)
+                fmt_elapsed(max_idle)
             ));
         }
     }
@@ -7695,7 +7715,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--bin".into(),
             bin.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
@@ -7748,7 +7768,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--bin".into(),
             bin.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
@@ -7801,7 +7821,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--bin".into(),
             bin_a.to_string_lossy().into_owned(),
             "--min-usage-remaining".into(),
@@ -7809,7 +7829,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--bin".into(),
             bin_b.to_string_lossy().into_owned(),
             "--state-dir".into(),
@@ -7884,7 +7904,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .unwrap()
         .primary()
@@ -8070,7 +8090,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
         ])
         .expect("config");
         let mut rec = record_matching(&claude, 3, 1_000);
@@ -8123,7 +8143,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let mut codex_rec = record_matching(&codex, 3, 1_000);
@@ -8146,7 +8166,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8163,7 +8183,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8198,7 +8218,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&codex_only, 0), None);
@@ -8208,7 +8228,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
@@ -8223,11 +8243,11 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&fallthrough, 0), Some(1));
@@ -8241,7 +8261,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
         ])
         .expect("config");
         assert_eq!(first_evidence_incapable_entry(&claude_only, 0), Some(0));
@@ -8259,7 +8279,7 @@ mod tests {
                 "--reviewer",
                 "claude",
                 "--level",
-                "standard:claude-opus-4-8:medium",
+                "standard:claude-opus-5-5:medium",
                 "--vcs",
                 "perforce",
                 "--cwd",
@@ -8295,7 +8315,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
             ])
             .expect("cfg"),
         );
@@ -8365,7 +8385,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
             ])
             .expect("cfg"),
         );
@@ -8411,7 +8431,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8453,7 +8473,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8537,7 +8557,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8564,7 +8584,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8623,7 +8643,7 @@ mod tests {
                     claude_rewind_uuid: None,
                     reviewer: "codex",
                     cli_session_id: "thread-1",
-                    model: "gpt-5.6-luna",
+                    model: "gpt-6-luna",
                     effort: "max",
                     cwd: &cfg.cwd.display().to_string(),
                     kind: session::KIND_REVIEW,
@@ -8682,7 +8702,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8713,14 +8733,18 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--session-max-turns".into(),
             "2".into(),
         ])
         .expect("config");
         let now = 1_000_000;
         // Past the turn limit *and* idle past the window, as well as terminal.
-        let mut rec = record_matching(&cfg, 9, now - cfg.resume_max_idle.as_secs() - 60);
+        let mut rec = record_matching(
+            &cfg,
+            9,
+            now - cfg.resume_max_idle_for("codex").as_secs() - 60,
+        );
         rec.terminal_reason = Some("session_stagnant".to_string());
         let reason = resume_block(&cfg, &rec, &[], session::KIND_REVIEW, false, now)
             .expect("terminal is refused");
@@ -8737,7 +8761,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8760,7 +8784,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8817,7 +8841,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8840,7 +8864,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8873,11 +8897,12 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
-        let idle = cfg.resume_max_idle.as_secs();
+        let idle = cfg.resume_max_idle_for("codex").as_secs();
+        assert_eq!(idle, crate::config::DEFAULT_CODEX_RESUME_MAX_IDLE_SECS);
         // Exactly at the window still resumes; one second past it does not.
         assert!(resume_block(
             &cfg,
@@ -8909,7 +8934,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let now = 1_000_000;
@@ -8952,14 +8977,14 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("git cfg");
         let p4 = Config::from_args(&[
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -8990,7 +9015,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--session-max-turns".into(),
             "0".into(),
             "--session-max-idle-seconds".into(),
@@ -9058,7 +9083,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -9080,7 +9105,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -9107,7 +9132,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -9129,7 +9154,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -9152,7 +9177,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -9173,7 +9198,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -9230,7 +9255,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("cfg");
         let now = 1_000_000;
@@ -9268,7 +9293,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("cfg");
         let now = 1_000_000;
@@ -9295,7 +9320,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -9328,7 +9353,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
         ])
@@ -9395,7 +9420,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -9414,7 +9439,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -9430,7 +9455,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -9487,7 +9512,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -9551,7 +9576,7 @@ mod tests {
             capture_summary: Some(git_summary()),
             usage: crate::metrics::Usage::default(),
             envelope: Some(ev.envelope),
-            active: Some("OpenAI Codex (codex, model=gpt-5.6-luna)".into()),
+            active: Some("OpenAI Codex (codex, model=gpt-6-luna)".into()),
             ..completed_outcome(None)
         }
     }
@@ -9561,7 +9586,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -9810,11 +9835,11 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "fast:gpt-5.6-luna:high".into(),
+            "fast:gpt-6-luna:high".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:xhigh".into(),
+            "standard:gpt-6-luna:xhigh".into(),
             "--level".into(),
-            "thorough:gpt-5.6-luna:max".into(),
+            "thorough:gpt-6-luna:max".into(),
             "--default-level".into(),
             "standard".into(),
         ])
@@ -9828,7 +9853,7 @@ mod tests {
         let ov = ov.expect("override present");
         assert_eq!(
             (ov.model.as_str(), ov.effort.as_str()),
-            ("gpt-5.6-luna", "max")
+            ("gpt-6-luna", "max")
         );
         assert!(line.unwrap().contains("thorough"));
 
@@ -9852,11 +9877,11 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:xhigh".into(),
+            "standard:gpt-6-luna:xhigh".into(),
             "--level".into(),
-            "fast:gpt-5.6-luna:high".into(),
+            "fast:gpt-6-luna:high".into(),
             "--level".into(),
-            "thorough:gpt-5.6-luna:max".into(),
+            "thorough:gpt-6-luna:max".into(),
             "--default-level".into(),
             "standard".into(),
         ])
@@ -9904,17 +9929,17 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "thorough:gpt-5.6-luna:max".into(),
+            "thorough:gpt-6-luna:max".into(),
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
         ])
         .expect("cfg");
         let app = App::new(cfg);
         let mut job = over_budget_job(&app, "s", "id");
         job.start_spec_override = Some(LevelOverride {
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "max".into(),
         });
 
@@ -9922,7 +9947,7 @@ mod tests {
         let start = job.effective_entry(0);
         assert_eq!(
             (start.model.as_str(), start.effort.as_str()),
-            ("gpt-5.6-luna", "max")
+            ("gpt-6-luna", "max")
         );
         // The fallback (index 1) is untouched by the override — its own base pair.
         let fb = job.effective_entry(1);
@@ -9939,7 +9964,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "fast:gpt-5.6-luna:high".into(),
+            "fast:gpt-6-luna:high".into(),
         ])
         .expect("cfg");
         let app = App::new(cfg);
@@ -9960,7 +9985,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
             ])
@@ -9988,7 +10013,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "git".into(),
                 "--cwd".into(),
@@ -10064,7 +10089,7 @@ mod tests {
                 "--reviewer".into(),
                 "codex".into(),
                 "--level".into(),
-                "standard:gpt-5.6-luna:max".into(),
+                "standard:gpt-6-luna:max".into(),
                 "--vcs".into(),
                 "perforce".into(),
             ])
@@ -10136,7 +10161,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--vcs".into(),
             "perforce".into(),
             "--state-dir".into(),
@@ -10183,7 +10208,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--state-dir".into(),
             dir.to_string_lossy().into_owned(),
         ])
@@ -10265,7 +10290,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--state-dir".into(),
             dir.to_string_lossy().into_owned(),
         ])
@@ -10414,7 +10439,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -10465,7 +10490,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -10523,7 +10548,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -10560,7 +10585,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = App::new(cfg);
@@ -10592,7 +10617,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let app = Arc::new(App::new(cfg));
@@ -10640,7 +10665,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let max = cfg.max_wait_secs();
@@ -10659,7 +10684,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--timeout-seconds".into(),
             "3600".into(),
         ])
@@ -10677,7 +10702,7 @@ mod tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
         ])
         .expect("config");
         let max = cfg.max_wait_secs();
@@ -10827,7 +10852,7 @@ mod converged_hook_tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
             "--cwd",
             &root.to_string_lossy(),
             "--state-dir",
@@ -10889,9 +10914,9 @@ mod converged_hook_tests {
             turn: 1,
             cli_session_id: record.cli_session_id.clone(),
             turns: record.turns,
-            reviewer: "OpenAI Codex (codex, model=gpt-5.6-luna, effort=max)".into(),
+            reviewer: "OpenAI Codex (codex, model=gpt-6-luna, effort=max)".into(),
             reviewer_kind: "codex".into(),
-            model: "gpt-5.6-luna".into(),
+            model: "gpt-6-luna".into(),
             effort: "max".into(),
             chain_index: 0,
             root: f.app.cfg.cwd.clone(),
@@ -11316,11 +11341,11 @@ mod turn_end_hook_tests {
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:max",
+            "standard:gpt-6-luna:max",
             "--reviewer",
             "claude",
             "--level",
-            "standard:claude-opus-4-8:high",
+            "standard:claude-opus-5-5:high",
             "--cwd",
             &root.to_string_lossy(),
             "--state-dir",
@@ -11397,7 +11422,7 @@ mod turn_end_hook_tests {
                 crate::findings::evaluate_turn_for_test("s", 1, "rv-9-1", &text).envelope,
             ),
             served,
-            active: Some("Anthropic Claude (claude, model=claude-opus-4-8)".into()),
+            active: Some("Anthropic Claude (claude, model=claude-opus-5-5)".into()),
             resumable: true,
             ..Outcome::no_turn()
         }
@@ -11425,7 +11450,7 @@ mod turn_end_hook_tests {
         assert_eq!(payload["trigger"], "review");
         assert_eq!(payload["chain_index"], 1);
         assert_eq!(payload["reviewer_kind"], "claude");
-        assert_eq!(payload["model"], "claude-opus-4-8");
+        assert_eq!(payload["model"], "claude-opus-5-5");
         let att = o.attestable.expect("kept for attest");
         assert_eq!(att.cli_session_id, "thread-9");
         assert_eq!(att.turns, 1);
@@ -11562,7 +11587,7 @@ mod captured_summary_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--state-dir".into(),
             state.as_path().to_string_lossy().into_owned(),
         ])
@@ -11591,7 +11616,7 @@ mod captured_summary_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--state-dir".into(),
             state.as_path().to_string_lossy().into_owned(),
         ])
@@ -11688,7 +11713,7 @@ mod captured_summary_tests {
             "--reviewer".into(),
             "codex".into(),
             "--level".into(),
-            "standard:gpt-5.6-luna:max".into(),
+            "standard:gpt-6-luna:max".into(),
             "--state-dir".into(),
             state.as_path().to_string_lossy().into_owned(),
         ])

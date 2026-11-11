@@ -5558,7 +5558,7 @@ foreach ($f in $in.files) {{
             "--reviewer",
             "codex",
             "--level",
-            "standard:gpt-5.6-luna:medium",
+            "standard:gpt-6-luna:medium",
             "--vcs",
             "git",
             "--cwd",

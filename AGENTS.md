@@ -24,7 +24,7 @@ suggestion. We eat our own dog food: the merge gate for cross-review is cross-re
   shorter client tool timeout fires first the response is suppressed and you see a client-side
   timeout. Either way just call again with the same `review_id` — abandoning a collect no longer
   cancels the review (`cross_model_review_cancel` does). Both directions are already wired up in this
-  checkout — Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 4.8 via
+  checkout — Claude Code gets Codex via [`.mcp.json`](.mcp.json), Codex gets Claude Opus 5.5 via
   [`.codex/config.toml`](.codex/config.toml) — so the reviewer is always the model that did
   not write the diff.
 - **Do not paste a diff into `instructions` in either direction.** For git the reviewer derives
@@ -243,7 +243,7 @@ shipping a stale binary.
 
 - **Never commit `cross-review.exe`.** `dist\` is gitignored; releases are built and
   published by the tag-driven CI workflow, never from a workstation.
-- **Pin models by full id** (`claude-opus-4-8`, `gpt-5.6-luna`). Aliases resolve to older
+- **Pin models by full id** (`claude-opus-5-5`, `gpt-6-luna`). Aliases resolve to older
   models.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **A findings ledger is disposable; do not reach for migration machinery to preserve one.** If a

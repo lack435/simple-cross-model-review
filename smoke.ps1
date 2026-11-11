@@ -99,7 +99,7 @@ if (-not $PSBoundParameters.ContainsKey('Effort') -or [string]::IsNullOrEmpty($E
 
 # --model/--effort were removed: a reviewer's model and effort come only from --level now, so the
 # smoke builds a single default level from -Effort and -Model (or the reviewer's pinned default).
-$levelModel = if ($Model) { $Model } elseif ($Reviewer -eq 'claude') { 'claude-opus-4-8' } else { 'gpt-5.6-luna' }
+$levelModel = if ($Model) { $Model } elseif ($Reviewer -eq 'claude') { 'claude-opus-5-5' } else { 'gpt-6-luna' }
 $serverArgs = @('--reviewer', $Reviewer, '--level', "smoke:${levelModel}:${Effort}", '--timeout-seconds', '600')
 if ($ReviewerBin) { $serverArgs += @('--bin', $ReviewerBin) }
 # The Claude evidence path requires a pinned profile home (an ambient Claude keeps --safe-mode and

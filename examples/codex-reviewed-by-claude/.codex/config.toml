@@ -1,5 +1,5 @@
 # Project-level Codex configuration: register cross-review as an MCP server so Codex
-# can send work to Claude Opus 4.8 for an independent review.
+# can send work to Claude Opus 5.5 for an independent review.
 #
 # Commit this at <your-project>\.codex\config.toml, alongside tools\cross-review.exe.
 # Relative paths resolve against the project root, so this entry travels with the repo
@@ -15,7 +15,7 @@
 command = "tools/cross-review.exe"
 # A reviewer's model and effort come only from --level (--model/--effort were removed); at
 # least one is required. Declare more and add --default-level to offer the caller a menu.
-args = ["--reviewer", "claude", "--level", "standard:claude-opus-4-8:medium"]
+args = ["--reviewer", "claude", "--level", "standard:claude-opus-5-5:medium"]
 
 # The Claude reviewer has no shell, so it reads the repository through the read-only evidence
 # service and derives the change live via its repository_diff tool: the working tree against the

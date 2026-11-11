@@ -1329,7 +1329,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
             "--cwd".into(),
             dir.to_string_lossy().into_owned(),
         ])
@@ -1395,7 +1395,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
             "--claude-profile".into(),
             "work".into(),
         ])
@@ -1548,7 +1548,7 @@ mod tests {
             "--reviewer".into(),
             "claude".into(),
             "--level".into(),
-            "standard:claude-opus-4-8:medium".into(),
+            "standard:claude-opus-5-5:medium".into(),
             "--min-usage-status".into(),
             "warning".into(),
         ])
