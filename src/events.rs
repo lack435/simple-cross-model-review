@@ -448,7 +448,7 @@ fn envelope(turn: &Turn, event: &str, entry: &Entry, finished: Option<SystemTime
         "error_code": null,
         // Only ever an array with `--on-event-include-findings`, on a completed review.
         "findings": null,
-        "host": std::env::var("COMPUTERNAME").ok(),
+        "host": crate::metrics::computer_name(),
         "server_version": env!("CARGO_PKG_VERSION"),
     })
 }

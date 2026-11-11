@@ -304,6 +304,32 @@ summarised on every completed review, in `cross_model_review_status`, and by `--
 `--no-metrics` turns recording off. How the two CLIs' token counts are normalised is documented
 in [`docs/structured-findings-envelope.md`](docs/structured-findings-envelope.md).
 
+Each line of the usage log is one turn, and **every `usage` figure on it is for that turn alone,
+never a running total**. Do not subtract between lines. Codex reports its token counts as running
+totals for the whole thread; the server subtracts the previous turn's totals before writing (its
+`api_calls` already describes just the one run), and when a resumed turn has no stored totals to
+subtract from it leaves `usage` out rather than write a running total as one turn.
+
+| Field | Meaning | Source |
+| --- | --- | --- |
+| `review_id` | `rv-<pid>-<n>`: the server's process id and a counter of jobs that process has started. **Not a turn number**: it restarts with each server process and counts every session's jobs. | server |
+| `session`, `turn` | The named session and its turn number. `turn` is the turn count. | server |
+| `resumed`, `gap_secs` | Whether the turn tried to resume an earlier conversation (it may then have failed), and the seconds since that session's previous turn. | server |
+| `reviewer`, `model`, `effort` | Who ran the turn. | server |
+| `wall_secs`, `status`, `failure_code` | The turn's wall-clock time, `completed` or `failed`, and the error code on a failure. | server |
+| `usage.input_tokens` | Uncached input for this turn. Near zero on a well-cached turn, so not the prompt size. | Claude, Codex |
+| `usage.cache_read_tokens` | Input served from the prompt cache this turn. | Claude, Codex |
+| `usage.cache_creation_tokens` | Input written to the prompt cache this turn. | Claude |
+| `usage.output_tokens` | Output for this turn. | Claude, Codex |
+| `usage.api_calls` | Model calls the reviewer made inside this turn. | Claude, Codex |
+| `usage.cost_usd` | The cost the CLI reported for **this turn** (Claude's `total_cost_usd`, summed when the turn made more than one call, e.g. a block repair). It rises and falls between turns. An attempt that was billed but returned no usage, such as a rate-limited one, is not in it. | Claude |
+| `usage.api_duration_ms` | Time the CLI spent waiting on the model this turn. | Claude |
+
+A `usage` field is left out, not written as zero, when its source did not report it or its
+per-turn value could not be worked out. The `<machine>` in the file
+name is the computer name, read from `COMPUTERNAME` or, when the launching client strips it (Codex
+does), from Windows itself.
+
 ## Reading a completed result
 
 Switch on `outcome`:

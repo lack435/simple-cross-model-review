@@ -750,13 +750,47 @@ impl ReadReport {
     }
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    /// The NetBIOS computer name -- the same value Windows puts in `COMPUTERNAME`. On entry
+    /// `nSize` is the buffer length in UTF-16 units; on success it is the length written,
+    /// excluding the terminator.
+    fn GetComputerNameW(lpBuffer: *mut u16, nSize: *mut u32) -> i32;
+}
+
+/// The computer name from the OS, independent of the environment.
+fn os_computer_name() -> Option<String> {
+    // MAX_COMPUTERNAME_LENGTH is 15; a larger buffer costs nothing and never truncates.
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` is a valid, writable buffer of `len` UTF-16 units, and the call writes at
+    // most that many, updating `len` to the count written on success.
+    let ok = unsafe { GetComputerNameW(buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return None;
+    }
+    let name = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+    (!name.is_empty()).then_some(name)
+}
+
+/// This machine's name: `COMPUTERNAME` when set, else the OS's own answer, else `HOSTNAME`.
+///
+/// The OS fallback exists because a client may launch the server with a restricted
+/// environment -- Codex drops `COMPUTERNAME` -- and an environment-only lookup then put that
+/// server's records under `unknown`, beside the same machine's real name (issue #215).
+pub(crate) fn computer_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(os_computer_name)
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+}
+
 /// A filename-safe tag for this machine, so logs from several machines can share a
 /// directory. Falls back to a constant rather than failing: a log that lands in the wrong
 /// bucket is far better than no log.
 pub(crate) fn host_tag() -> String {
-    let raw = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let raw = computer_name().unwrap_or_else(|| "unknown".to_string());
     let tag: String = raw
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -1247,6 +1281,19 @@ pub fn gap_since(previous_updated_unix: Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
+
+    #[test]
+    fn the_os_computer_name_does_not_depend_on_the_environment() {
+        // Issue #215: a server launched without COMPUTERNAME must still find the machine's name.
+        // The OS lookup reads no environment, so it answers regardless; where COMPUTERNAME is set
+        // (always, under cargo test on Windows) the two must name the same machine.
+        let os = os_computer_name().expect("GetComputerNameW answers");
+        assert!(!os.is_empty());
+        if let Ok(env) = std::env::var("COMPUTERNAME") {
+            assert!(os.eq_ignore_ascii_case(&env), "os={os} env={env}");
+        }
+        assert_ne!(host_tag(), "unknown");
+    }
 
     fn record(session: &str, turn: u32, gap: Option<u64>, usage: Usage) -> Record {
         Record {
