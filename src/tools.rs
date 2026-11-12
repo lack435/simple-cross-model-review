@@ -1399,7 +1399,17 @@ impl App {
 
         let server_root = (cfg.cwd != self.cfg.cwd).then(|| self.cfg.cwd.clone());
         let review_root = server_root.is_some().then(|| cfg.cwd.clone());
+        // Nested git repositories in the review root whose change this review will not serve
+        // (issue #217). Found here, before the worker starts, so the start response can name them
+        // while the caller can still cancel and re-declare; the turn carries the same warnings.
+        let nested = if cfg.vcs == crate::config::Vcs::Git {
+            crate::nested::detect(&cfg.cwd, &self.cfg.companions, &cfg.declared_companions)
+        } else {
+            crate::nested::Detection::default()
+        };
+        let nested_warnings = nested.warnings();
         let job = Job {
+            nested,
             cfg,
             reviewer: Arc::from(reviewer::for_kind(self.cfg.reviewers[start_index].reviewer)),
             spec: self.cfg.reviewers[start_index].clone(),
@@ -1550,6 +1560,13 @@ impl App {
             "budget:    {}\n\n",
             fmt_elapsed(Duration::from_secs(self.cfg.max_wait_secs()))
         ));
+        if !nested_warnings.is_empty() {
+            out.push_str("warnings:\n");
+            for w in &nested_warnings {
+                out.push_str(&format!("- {w}\n"));
+            }
+            out.push('\n');
+        }
         out.push_str(&format!(
             "Collect it with {result_tool} using review_id \"{id}\". That call blocks until the {} \
              is done -- omit wait_seconds to wait to completion in one call -- and reports progress \
@@ -2853,6 +2870,9 @@ struct Job {
     /// `None` unless `--on-event` is configured.
     events: Option<Arc<crate::events::EventSink>>,
     event_turn: Option<crate::events::Turn>,
+    /// Nested git repositories in the review root whose change this turn does not serve (issue
+    /// #217): warned about on the result and named in the reviewer prompt.
+    nested: crate::nested::Detection,
 }
 
 /// The capture's outputs that `attempt` threads onward: the rendered change goes into the
@@ -3235,6 +3255,7 @@ impl Job {
             capture.perforce_baseline.clone()
         };
         let mut capture_warnings = capture.warnings;
+        capture_warnings.extend(self.nested.warnings());
         // Git has no static capture, so the capture hook fills its cache here, once per turn and
         // before any reviewer attempt; every composition of the change then reads it (issue #174).
         let git_capture_hook = match (&self.cfg.capture_hook, self.cfg.vcs) {
@@ -4617,6 +4638,7 @@ impl Job {
         let noted_change =
             thin_capture_gated.then(|| prompt::with_thin_capture_note(prompt_change));
         let prompt_change = noted_change.as_deref().or(prompt_change);
+        let unserved_nested = self.nested.paths();
         let text = if is_consult {
             // A consult never asks for a machine block (no nonce) or a prior-findings digest: it has
             // no ledger to reconcile. The follow-up framing and the "no findings list" preamble come
@@ -4656,6 +4678,7 @@ impl Job {
                 prior_findings_digest: prior_findings_digest.as_deref(),
                 neutral_root,
                 companions: &self.cfg.declared_companions,
+                unserved_nested: &unserved_nested,
             })
         };
         // Reported back through the out-parameter so it survives the error paths below:
@@ -9826,6 +9849,7 @@ mod tests {
             server_root: None,
             events: None,
             event_turn: None,
+            nested: crate::nested::Detection::default(),
         }
     }
 
@@ -11411,6 +11435,7 @@ mod turn_end_hook_tests {
             server_root: None,
             events: None,
             event_turn: None,
+            nested: crate::nested::Detection::default(),
         }
     }
 

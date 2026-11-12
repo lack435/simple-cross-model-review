@@ -29,6 +29,7 @@ mod hook;
 mod lfs;
 mod mcp;
 mod metrics;
+mod nested;
 mod pathcmp;
 mod profile;
 mod prompt;

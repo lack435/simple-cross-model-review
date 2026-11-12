@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -870,6 +870,59 @@ pub fn tracks_under(root: &Path, rel: &str, limits: &Limits) -> Result<bool, Evi
     let args = ["ls-files", "-z", "--", rel].map(String::from);
     let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
     Ok(out.split('\0').any(|entry| !entry.is_empty()))
+}
+
+/// The untracked directories at `root`, ignored or not, each collapsed to one `dir/` entry (issue
+/// #217). No exclude options, so ignored directories are listed too; `--directory` keeps a wholly
+/// untracked tree to one line however large it is, and git never descends into a nested repository,
+/// so `engine/` is reported as itself. Individual untracked files are dropped.
+pub fn untracked_directories(root: &Path, limits: &Limits) -> Result<Vec<String>, EvidenceError> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--directory",
+        "--no-empty-directory",
+    ]
+    .map(String::from);
+    let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    Ok(out
+        .split('\0')
+        .filter(|entry| entry.ends_with('/'))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The top level of the repository git discovers from `dir` (`rev-parse --show-toplevel`). A `.git`
+/// git cannot use makes discovery continue upward, so a caller that means `dir` itself compares
+/// this against it (issue #217).
+pub fn show_toplevel(dir: &Path, limits: &Limits) -> Result<PathBuf, EvidenceError> {
+    let args = ["rev-parse", "--show-toplevel"].map(String::from);
+    let out = run(dir, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    Ok(PathBuf::from(out.trim()))
+}
+
+/// How many entries `git status --porcelain` reports for the repository at `root`: modified, staged
+/// and untracked-not-ignored paths (issue #217).
+pub fn status_entry_count(root: &Path, limits: &Limits) -> Result<usize, EvidenceError> {
+    let args = ["status", "--porcelain", "--untracked-files=normal"].map(String::from);
+    let out = run(root, &args, limits, &AtomicBool::new(false), Instant::now())?;
+    Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+/// `merge-base(HEAD, @{upstream})` for the repository at `root`, or `None` when HEAD or its upstream
+/// does not resolve or they share no history (issue #217: the fallback fork point for a nested
+/// repository with no `origin` default branch).
+pub fn upstream_fork_point(root: &Path, limits: &Limits) -> Result<Option<String>, EvidenceError> {
+    let cancel = AtomicBool::new(false);
+    let now = Instant::now();
+    let Some(head) = resolve_commit(root, "HEAD", limits, &cancel, now)? else {
+        return Ok(None);
+    };
+    let Some(upstream) = resolve_commit(root, "@{upstream}", limits, &cancel, now)? else {
+        return Ok(None);
+    };
+    merge_base(root, &head, &upstream, limits, &cancel, now)
 }
 
 /// The merge-base of two commits — the branch's fork point when called as `merge_base(HEAD,
