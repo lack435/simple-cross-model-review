@@ -460,11 +460,31 @@ impl Bundle {
         let canonical = fs::canonicalize(root).map_err(|e| {
             EvidenceError::new("invalid_root", format!("cannot canonicalize root: {e}"))
         })?;
+        // Every caller passes a root it has just resolved and checked, so one that no longer
+        // canonicalizes to itself *through a junction or symlink* was moved in between -- one swapped
+        // onto it or an ancestor -- and is refused rather than followed (issue #218). A spelling
+        // that merely differs (an 8.3 short name, as CI's temp directory has) is not a move.
+        if !core::same_path(&canonical, root)
+            && crate::winsec::reject_reparse_on_ancestors(root).is_err()
+        {
+            return Err(EvidenceError::new(
+                "invalid_root",
+                format!(
+                    "the root {} now resolves to {}; refusing to serve a moved directory",
+                    root.display(),
+                    canonical.display()
+                ),
+            ));
+        }
+        let is_git = vcs == crate::config::Vcs::Git;
+        // Before anything else runs git in the root (issue #218).
+        if is_git {
+            git::validate_layout(&canonical, &limits)?;
+        }
         // Deliberately not `?`: a stamp that cannot be computed is an advisory signal lost, not a
         // review to refuse. Before issue #86 a working root with more than `max_files` entries --
         // a vendored engine tree is enough -- failed here and took the whole review with it.
         let initial_stamp = core::initial_stamp(&canonical, &limits, vcs.into());
-        let is_git = vcs == crate::config::Vcs::Git;
         let Staging {
             autocrlf: worktree_autocrlf,
             lfs: worktree_lfs,
@@ -1708,9 +1728,22 @@ mod tests {
         );
     }
 
+    /// A Git bundle over `root`, made a git repository first if it is not one: `Bundle::create`
+    /// refuses a Git root git cannot serve (issue #218). Canonical, as every production caller's is.
     fn bundle(root: &Path) -> Bundle {
+        let root = crate::config::normalize_dir(root.to_path_buf());
+        if !root.join(".git").exists() {
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "NUL")
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git init");
+        }
         Bundle::create(
-            root,
+            &root,
             crate::config::Vcs::Git,
             "nonce-1",
             "working tree".into(),
@@ -1756,6 +1789,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p4.worktree_autocrlf, None);
+    }
+
+    fn try_bundle(root: &Path) -> Result<Bundle, EvidenceError> {
+        Bundle::create(
+            root,
+            crate::config::Vcs::Git,
+            "nonce-1",
+            "working tree".into(),
+            "captured".into(),
+            None,
+            None,
+            Limits::default(),
+        )
+    }
+
+    /// Issue #218, follow-up comment: a root that now resolves elsewhere through a junction was
+    /// moved after its caller checked it, and is refused rather than served.
+    #[test]
+    fn a_bundle_refuses_a_root_reached_through_a_junction() {
+        let dir = temp_dir("evidence-moved-root");
+        let base = crate::config::normalize_dir(dir.as_path().to_path_buf());
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        bundle(&real);
+        let link = base.join("link");
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(made, "mklink /J");
+        let err = try_bundle(&link).unwrap_err();
+        assert_eq!(err.code, "invalid_root", "{err:?}");
+        assert!(try_bundle(&real).is_ok());
+    }
+
+    /// Issue #218: every root kind -- primary, per-call worktree, companion -- is built through
+    /// `Bundle::create`, so its layout check is the one that refuses for all of them.
+    #[test]
+    fn a_bundle_refuses_a_repository_whose_core_worktree_points_elsewhere() {
+        let dir = temp_dir("evidence-bundle-core-worktree");
+        let base = crate::config::normalize_dir(dir.as_path().to_path_buf());
+        let (root, other) = (base.join("r"), base.join("other"));
+        for d in [&root, &other] {
+            fs::create_dir(d).unwrap();
+            bundle(d);
+        }
+        let set = Command::new("git")
+            .args(["config", "core.worktree"])
+            .arg(&other)
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(set, "git config core.worktree");
+        let err = try_bundle(&root).unwrap_err();
+        assert_eq!(err.code, "unsafe_git_layout", "{err:?}");
     }
 
     #[test]
