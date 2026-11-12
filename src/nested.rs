@@ -167,12 +167,10 @@ fn detect_with_slots(
     // An abandoned scan blocked in the filesystem cannot be cancelled, so at most
     // `MAX_SCANS_IN_FLIGHT` scan threads exist at once (review f4): past that, a start skips the scan
     // and says so, rather than leaving one more stuck thread behind.
-    if slots
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_SCANS_IN_FLIGHT).then_some(n + 1)
-        })
-        .is_err()
-    {
+    // Claimed optimistically and given straight back when over the cap: a plain add works on every
+    // toolchain, where the closure-based update was renamed.
+    if slots.fetch_add(1, Ordering::AcqRel) >= MAX_SCANS_IN_FLIGHT {
+        slots.fetch_sub(1, Ordering::AcqRel);
         return incomplete(
             "earlier scans have not finished, so this one was not started; the file system may \
              be unresponsive"
