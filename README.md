@@ -261,6 +261,19 @@ readable by name through the working root's own tools; only its certification mo
 server.) Anything else is refused. The calling agent can only name a configured
 companion, never a path, and the session is bound to the set it declared. Companions are git only
 and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
+
+A nested repository that is **not** declared on a review is invisible to it: git never descends into
+it, so its change is in no served diff. A git review therefore looks for nested repositories in the
+review root that have changes (uncommitted, or a branch past its `origin` default-branch fork point,
+or past its `@{upstream}` when there is no default branch), or whose state cannot be determined, and
+are not declared, and names each one,
+with the fix, under `warnings:` in the start response and in every turn's result `warnings`. The
+reviewer prompt names them too, and tells the reviewer to answer BLOCKED rather than review around
+code it can only see quoted. The warning is advisory: it never refuses a review or blocks
+convergence. The scan is shallow, capped, and limited to a few seconds, one `git ls-files` call for the untracked and ignored
+directories plus one level below each, so a nested repository deeper than that is not found; when a
+cap is hit, the warnings say detection stopped early. The working root's own linked worktrees are not
+counted. Design: [`docs/nested-repository-visibility-plan.md`](docs/nested-repository-visibility-plan.md).
 Design: [`docs/companion-repositories-plan.md`](docs/companion-repositories-plan.md).
 
 For **Perforce** (`--vcs perforce`, or `auto` in a workspace with no `.git`), the change is an

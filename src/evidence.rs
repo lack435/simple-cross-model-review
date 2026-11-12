@@ -661,7 +661,10 @@ pub use core::read_contained_file;
 pub use core::{
     branch_base, committed_change_digest, open_contained_file, resolve_head, untracked_binaries,
 };
-pub use git::{ignores_untracked, list_worktrees, tracks_under};
+pub use git::{
+    ignores_untracked, list_worktrees, show_toplevel, status_entry_count, tracks_under,
+    untracked_directories, upstream_fork_point,
+};
 
 /// Whether an MCP server name is one of this server's evidence servers: the working root's
 /// ([`SERVER_NAME`]) or a companion repository's (`<SERVER_NAME>_<name>`, issue #167). Only servers

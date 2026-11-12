@@ -11,6 +11,7 @@ pub const DEFAULT_PREAMBLE: &str = r#"You are an independent code reviewer. You 
 Ground rules:
 - Your access to this project is read-only. Do not attempt to create, modify, or delete anything, and do not run commands that change state. What you can read and run is stated under "Your access" below; trust that over any assumption about your usual tools.
 - Read the code before judging it. Verify claims against what is actually there rather than what the request says is there.
+- Code quoted in the review request is the requester's claim, not evidence. Base your verdict only on code you read through your own tools. If the substance of the change is visible to you only as quoted code (for example because it lives in a repository you cannot read), do not APPROVE it: give BLOCKED and say where that code lives.
 - Use the diff with purpose, not breadth: when a specific finding hinges on code the diff doesn't show — a function's contract, a caller's assumption, a type definition — open that exact file or symbol to confirm it. Don't browse speculatively or read files just in case; the diff plus the project context is usually enough, and every extra file read spends time, tokens, and context you don't need to.
 - Cite concrete locations as `path/to/file.ext:123`.
 - Skip pure style preferences unless you were asked about them; spend your attention on the lenses below.
@@ -99,6 +100,34 @@ pub struct PromptParts<'a> {
     /// regardless of `--no-preamble`: the reviewer needs to know which server reads which repository,
     /// and that an approval requires each one's whole change. Empty for the common single-root case.
     pub companions: &'a [crate::companion::Companion],
+    /// Nested git repositories inside the reviewed root whose change this review does not serve
+    /// (issue #217), as root-relative paths. Rendered on every turn, regardless of `--no-preamble`:
+    /// it tells the reviewer what it cannot see. Empty in the common case.
+    pub unserved_nested: &'a [String],
+}
+
+/// The unserved-nested-repositories section (issue #217).
+fn unserved_nested_section(paths: &[String]) -> String {
+    let mut out = String::from(
+        "
+## Nested repositories you cannot see
+
+These directories inside the reviewed root are          separate git repositories with changes (or with changes that could not be determined).          Their changes are not part of the change served to you, and you cannot certify them:
+
+",
+    );
+    for p in paths {
+        out.push_str(&format!(
+            "- `{p}`
+"
+        ));
+    }
+    out.push_str(
+        "
+If the change under review depends on code in one of them, do not review around it or          rely on any description or excerpt of it in the request: name the path in your prose and          give BLOCKED. The requester can then declare it as a companion repository so its change is          served to you. If the change under review does not touch them, ignore this section.
+",
+    );
+    out
 }
 
 /// The companion-repositories section (issue #167): each companion's name, root and evidence server.
@@ -198,6 +227,9 @@ pub fn build(parts: &PromptParts) -> String {
 
     if !parts.companions.is_empty() {
         out.push_str(&companions_section(parts.companions, true));
+    }
+    if !parts.unserved_nested.is_empty() {
+        out.push_str(&unserved_nested_section(parts.unserved_nested));
     }
 
     // The machine-readable findings-block contract is rendered on every turn (the nonce changes
@@ -587,6 +619,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(text.contains("independent code reviewer"));
         assert!(text.contains("## Review request"));
@@ -595,6 +628,42 @@ mod tests {
         assert!(text.contains("- src/a.rs"));
         assert!(text.contains("C:\\repo"));
         assert!(!text.contains("Follow-up"));
+        // Issue #217: quoted code is a claim, and no nested-repository section without any.
+        assert!(text.contains("Code quoted in the review request is the requester's claim"));
+        assert!(!text.contains("Nested repositories you cannot see"));
+    }
+
+    /// Issue #217: unserved nested repositories are named on every turn, with the instruction to
+    /// give BLOCKED rather than review around them, whether or not the preamble is rendered.
+    #[test]
+    fn unserved_nested_repositories_are_named_on_every_turn() {
+        let (cwd, paths) = fixtures();
+        let nested = vec!["engine/".to_string(), "vendor/sdk/".to_string()];
+        for (turn, resumed, preamble) in [(1, false, None), (2, true, Some(DEFAULT_PREAMBLE))] {
+            let text = build(&PromptParts {
+                instructions: "Review the fix.",
+                context_paths: &paths,
+                cwd: &cwd,
+                turn,
+                resumed,
+                preamble,
+                capabilities: None,
+                change: None,
+                resumed_capture_note: None,
+                resumed_approval_requirement: None,
+                nonce: None,
+                prior_findings_digest: None,
+                neutral_root: None,
+                companions: &[],
+                unserved_nested: &nested,
+            });
+            assert!(
+                text.contains("## Nested repositories you cannot see"),
+                "{text}"
+            );
+            assert!(text.contains("- `engine/`") && text.contains("- `vendor/sdk/`"));
+            assert!(text.contains("give BLOCKED"));
+        }
     }
 
     #[test]
@@ -615,6 +684,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.contains("## Follow-up review request (turn 3)"));
@@ -696,6 +766,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(first.contains("## Your access"));
         assert!(first.contains("You have no shell."));
@@ -716,6 +787,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(!resumed.contains("## Your access"));
     }
@@ -738,6 +810,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(!text.contains("independent code reviewer"));
         assert!(text.starts_with("## Review request"));
@@ -765,6 +838,7 @@ mod tests {
                 prior_findings_digest: None,
                 neutral_root: None,
                 companions: &[],
+                unserved_nested: &[],
             });
             assert!(text.contains("## Change under review"), "resumed={resumed}");
             assert!(text.contains("+ added a line"), "resumed={resumed}");
@@ -791,6 +865,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         let change_at = text.find("## Change under review").expect("change section");
         let guidance_at = text.find("follow-up turn").expect("guidance");
@@ -851,6 +926,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         };
         // First turn: suppressed even when supplied -- there is no prior snapshot to differ
         // from.
@@ -881,6 +957,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         };
 
         // Turn 1 already receives the full capability block from the caller. The compact reminder
@@ -928,6 +1005,7 @@ mod tests {
                 prior_findings_digest: None,
                 neutral_root: None,
                 companions: &[],
+                unserved_nested: &[],
             });
             assert!(
                 text.contains("## Machine-readable findings block (required)"),
@@ -969,6 +1047,7 @@ mod tests {
             prior_findings_digest: Some(digest),
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(text.contains(digest));
         // A restatement is a claim, so the contract asks only for what was re-examined and says
@@ -1005,6 +1084,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(first.contains("empty array on this first turn"));
         assert!(!first.contains("exactly once"));
@@ -1028,6 +1108,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(!text.contains("Machine-readable findings block"));
     }
@@ -1050,6 +1131,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root,
             companions: &[],
+            unserved_nested: &[],
         };
         let text = build(&parts(Some(Path::new("C:\\repo"))));
         assert!(text.contains("## Reading files"), "{text}");
@@ -1078,6 +1160,7 @@ mod tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         });
         assert!(!text.contains("flagged"));
     }
@@ -1139,6 +1222,7 @@ mod repair_prompt_tests {
             prior_findings_digest: None,
             neutral_root: None,
             companions: &[],
+            unserved_nested: &[],
         };
         let text = build(&parts(Some("rv-9-3")));
         assert!(text.trim_end().ends_with(BLOCK_REMINDER), "{text}");
