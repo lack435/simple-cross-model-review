@@ -414,7 +414,9 @@ fn cat_blob(
             "core.hooksPath=NUL",
         ])
         .args(["cat-file", "blob", id])
-        .current_dir(root)
+        .current_dir(root);
+    isolate_env(&mut command, root);
+    command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "NUL")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -771,6 +773,7 @@ fn git_config_status(root: &Path, args: &[&str]) -> Option<ConfigLookup> {
         .current_dir(root)
         .env("GIT_PAGER", "")
         .env("PAGER", "");
+    isolate_env(&mut command, root);
     let output = crate::reviewer::run(
         command,
         "",
@@ -1002,6 +1005,7 @@ fn run_classified(
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "")
         .env("PAGER", "");
+    isolate_env(&mut command, root);
     // Computed here, immediately before the spawn, so the lookup and setup above are charged to the
     // request rather than to the child.
     let budget = super::core::child_budget(received_at)
@@ -1045,6 +1049,368 @@ fn run_classified(
         )));
     }
     Ok(output.stdout)
+}
+
+/// Inherited variables that point git at another repository, object store, index or history file,
+/// or inject configuration (issue #218). Every git child the evidence code spawns has them removed,
+/// so neither the server's environment nor an ambient reviewer's can redirect what it serves.
+/// Removing `GIT_CONFIG_COUNT` also disables every `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`.
+pub(crate) const SCRUBBED_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
+/// A served repository's git layout, validated by [`validate_layout`] (issue #218). Paths are
+/// canonical, without the verbatim prefix, so they can be handed to git as they are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// The working tree's top level: the served root, or the repository top level containing it.
+    pub work_tree: PathBuf,
+    /// The repository's git directory: `<work_tree>/.git`, a linked worktree's
+    /// `<common>/worktrees/<id>`, or a submodule's `.git/modules/<name>`.
+    pub git_dir: PathBuf,
+    /// Where the object store and shared refs live: `git_dir` itself except for a linked worktree.
+    pub common_dir: PathBuf,
+}
+
+/// Roots whose git commands run pinned to a validated [`Layout`]. Registered by the evidence
+/// service for the root it serves ([`pin`]), and consulted at every git spawn in this module.
+///
+/// Keyed on the root's *spelling* (verbatim prefix, separators and case normalized), never on what
+/// it resolves to now: a root redirected through a junction after validation must still find its
+/// pin, so git runs against the validated directories rather than discovering the new target
+/// (review f1). The service passes the same root to every call, so the spelling is stable.
+static PINS: std::sync::Mutex<Vec<(String, Layout)>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a root pinned while it lives; dropping it unpins the root.
+#[derive(Debug)]
+pub struct Pin {
+    key: String,
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut pins = PINS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = pins.iter().position(|(key, _)| *key == self.key) {
+            pins.remove(i);
+        }
+    }
+}
+
+/// Pin `root`'s git commands to `layout` (issue #218): each runs with `GIT_DIR` and `GIT_WORK_TREE`
+/// set, so neither discovery nor `core.worktree` plays any part after validation.
+pub fn pin(root: &Path, layout: Layout) -> Pin {
+    let key = super::core::normalize_path(root);
+    PINS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((key.clone(), layout));
+    Pin { key }
+}
+
+fn pinned(root: &Path) -> Option<Layout> {
+    let pins = PINS.lock().unwrap_or_else(|e| e.into_inner());
+    if pins.is_empty() {
+        return None;
+    }
+    let key = super::core::normalize_path(root);
+    pins.iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, layout)| layout.clone())
+}
+
+/// Remove [`SCRUBBED_ENV`] from `command`, then pin it to `root`'s layout if one is registered.
+pub(crate) fn isolate_env(command: &mut Command, root: &Path) {
+    for key in SCRUBBED_ENV {
+        command.env_remove(key);
+    }
+    if let Some(layout) = pinned(root) {
+        command
+            .env("GIT_DIR", &layout.git_dir)
+            .env("GIT_WORK_TREE", &layout.work_tree);
+    }
+}
+
+/// Canonicalize, without the verbatim prefix. `None` when the path cannot be resolved.
+fn canon(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path)
+        .ok()
+        .map(crate::config::normalize_dir)
+}
+
+/// The largest metadata file [`read_small`] accepts.
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
+
+/// A small metadata file git wrote (`.git`, `commondir`, `gitdir`, alternates), read whole. A file
+/// over [`MAX_METADATA_BYTES`] is an error, never a prefix: git reads all of it, so a check that saw
+/// only the start could pass a file whose later lines matter (review f2).
+fn read_small(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_METADATA_BYTES {
+        return Err(std::io::Error::other(format!(
+            "larger than {MAX_METADATA_BYTES} bytes, which no git metadata file needs to be"
+        )));
+    }
+    Ok(text)
+}
+
+/// Resolve a path git wrote into a metadata file, relative to the directory holding that file.
+fn resolve_written(base: &Path, written: &str) -> Option<PathBuf> {
+    let written = written.trim();
+    if written.is_empty() {
+        return None;
+    }
+    canon(&base.join(written))
+}
+
+/// Check that the repository served at `root` keeps every directory git reads inside itself
+/// (issue #218, `docs/git-metadata-confinement-plan.md`). `root`'s `.git` -- or, when `root` is a
+/// subdirectory, its top level's -- must have one of the three shapes git creates, each tied back to
+/// this working tree; git's own discovery must agree with it (which catches `core.worktree`); the
+/// object store must have no alternates; and no reparse point may sit where git reads objects or
+/// metadata. Anything else is refused with `unsafe_git_layout`.
+pub fn validate_layout(root: &Path, limits: &Limits) -> Result<Layout, EvidenceError> {
+    let refuse = |m: String| EvidenceError::new("unsafe_git_layout", m);
+    let root =
+        canon(root).ok_or_else(|| refuse(format!("{} cannot be resolved", root.display())))?;
+    let args = [
+        "rev-parse",
+        "--show-toplevel",
+        "--git-dir",
+        "--git-common-dir",
+    ]
+    .map(String::from);
+    let out = run(
+        &root,
+        &args,
+        limits,
+        &AtomicBool::new(false),
+        Instant::now(),
+    )?;
+    let mut lines = out.lines();
+    let mut next = |what: &str| {
+        lines
+            .next()
+            .and_then(|line| resolve_written(&root, line))
+            .ok_or_else(|| {
+                refuse(format!(
+                    "git did not report a resolvable {what} for {}",
+                    root.display()
+                ))
+            })
+    };
+    let work_tree = next("top level")?;
+    let reported_git_dir = next("git directory")?;
+    let reported_common_dir = next("common directory")?;
+    if !root.starts_with(&work_tree) {
+        return Err(refuse(format!(
+            "git resolves the working tree of {} to {}, which does not contain it. Is \
+             `core.worktree` set in this repository's config? Unset it to review this directory.",
+            root.display(),
+            work_tree.display()
+        )));
+    }
+    let (git_dir, common_dir) = structural_layout(&work_tree, &refuse)?;
+    if reported_git_dir != git_dir || reported_common_dir != common_dir {
+        return Err(refuse(format!(
+            "git reports {} (common {}) as the git directory of {}, but its `.git` names {} \
+             (common {}); refusing a repository whose metadata disagrees with itself",
+            reported_git_dir.display(),
+            reported_common_dir.display(),
+            work_tree.display(),
+            git_dir.display(),
+            common_dir.display()
+        )));
+    }
+    reject_alternates(&common_dir, &refuse)?;
+    reject_metadata_reparse(&git_dir, &common_dir, &refuse)?;
+    Ok(Layout {
+        work_tree,
+        git_dir,
+        common_dir,
+    })
+}
+
+/// The git and common directories `<work_tree>/.git` names, accepted only in one of the three shapes
+/// git itself creates (plan item 1).
+fn structural_layout(
+    work_tree: &Path,
+    refuse: &dyn Fn(String) -> EvidenceError,
+) -> Result<(PathBuf, PathBuf), EvidenceError> {
+    let dotgit = work_tree.join(".git");
+    let meta = std::fs::symlink_metadata(&dotgit)
+        .map_err(|e| refuse(format!("{}: {e}", dotgit.display())))?;
+    if super::core::metadata_is_reparse(&meta) {
+        return Err(refuse(format!(
+            "{} is a junction or symlink; git metadata must live in a real directory",
+            dotgit.display()
+        )));
+    }
+    if meta.is_dir() {
+        let git_dir = canon(&dotgit)
+            .ok_or_else(|| refuse(format!("{} cannot be resolved", dotgit.display())))?;
+        return Ok((git_dir.clone(), git_dir));
+    }
+    if !meta.is_file() {
+        return Err(refuse(format!(
+            "{} is neither a directory nor a file",
+            dotgit.display()
+        )));
+    }
+    let text = read_small(&dotgit).map_err(|e| refuse(format!("{}: {e}", dotgit.display())))?;
+    let git_dir = text
+        .trim()
+        .strip_prefix("gitdir:")
+        .and_then(|target| resolve_written(work_tree, target))
+        .ok_or_else(|| {
+            refuse(format!(
+                "{} does not name a git directory that resolves",
+                dotgit.display()
+            ))
+        })?;
+    let commondir = git_dir.join("commondir");
+    if commondir.try_exists().unwrap_or(true) {
+        // A linked worktree: `<common>/worktrees/<id>`, pointing back at this `.git` file.
+        let common_dir = git_dir
+            .parent()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("worktrees"))
+            })
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let points_to = read_small(&commondir)
+            .ok()
+            .and_then(|written| resolve_written(&git_dir, &written));
+        let back = read_small(&git_dir.join("gitdir"))
+            .ok()
+            .and_then(|written| resolve_written(&git_dir, &written));
+        return match common_dir {
+            Some(common) if points_to.as_ref() == Some(&common) && back == canon(&dotgit) => {
+                Ok((git_dir, common))
+            }
+            _ => Err(refuse(format!(
+                "{} names {}, which is not a linked worktree of a repository that points back to \
+                 it (expected `<repository>/worktrees/<id>` with matching `commondir` and `gitdir`)",
+                dotgit.display(),
+                git_dir.display()
+            ))),
+        };
+    }
+    // A submodule: under `.git/modules/`, with `core.worktree` pointing back at this working tree.
+    let mut parts = git_dir.components().map(|c| c.as_os_str());
+    let under_modules = parts.by_ref().any(|c| c.eq_ignore_ascii_case(".git"))
+        && parts
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case("modules"));
+    let worktree_set =
+        read_core_worktree(&git_dir).and_then(|written| resolve_written(&git_dir, &written));
+    if under_modules && worktree_set.as_deref() == Some(work_tree) {
+        return Ok((git_dir.clone(), git_dir));
+    }
+    Err(refuse(format!(
+        "{} names {}, which is neither a linked worktree nor a submodule of this working tree; \
+         a `.git` file must name a git directory that points back to it",
+        dotgit.display(),
+        git_dir.display()
+    )))
+}
+
+/// `core.worktree` as written in `<git_dir>/config`, read by git itself. `--file` consults that one
+/// file and, by default, none of its includes. `None` when unset or unreadable.
+fn read_core_worktree(git_dir: &Path) -> Option<String> {
+    let config = git_dir.join("config");
+    let config = config.to_str()?;
+    let args = ["config", "--file", config, "--get", "core.worktree"].map(String::from);
+    run(
+        git_dir,
+        &args,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        Instant::now(),
+    )
+    .ok()
+    .map(|out| out.trim().to_string())
+    .filter(|v| !v.is_empty())
+}
+
+/// Plan item 3: an object store with alternates reads objects from elsewhere.
+fn reject_alternates(
+    common_dir: &Path,
+    refuse: &dyn Fn(String) -> EvidenceError,
+) -> Result<(), EvidenceError> {
+    let path = common_dir.join("objects").join("info").join("alternates");
+    let text = match read_small(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(refuse(format!("{}: {e}", path.display()))),
+    };
+    if text
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        return Err(refuse(format!(
+            "this repository borrows objects from another through {}. Run `git repack -a -d`, then \
+             delete that file, to make it self-contained.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Plan item 4: no reparse point at the git and common directories, their direct children, or the
+/// direct children of `objects` (fan-out, `pack`, `info`). Deeper levels are not walked; see the
+/// plan for why file-level redirects are an accepted residual.
+fn reject_metadata_reparse(
+    git_dir: &Path,
+    common_dir: &Path,
+    refuse: &dyn Fn(String) -> EvidenceError,
+) -> Result<(), EvidenceError> {
+    let check = |path: &Path| -> Result<(), EvidenceError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if super::core::metadata_is_reparse(&meta) => Err(refuse(format!(
+                "{} is a junction or symlink; git metadata must not redirect outside the repository",
+                path.display()
+            ))),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(refuse(format!("{}: {e}", path.display()))),
+        }
+    };
+    let children = |dir: &Path| -> Result<(), EvidenceError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(refuse(format!("{}: {e}", dir.display()))),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| refuse(format!("{}: {e}", dir.display())))?;
+            check(&entry.path())?;
+        }
+        Ok(())
+    };
+    for dir in [git_dir, common_dir] {
+        check(dir)?;
+        children(dir)?;
+    }
+    children(&common_dir.join("objects"))
 }
 
 #[cfg(test)]
@@ -1643,5 +2009,368 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let result = history(&root, "", "", &Limits::default(), &cancel, Instant::now());
         assert!(result.is_err());
+    }
+
+    // ---- issue #218: git metadata must not resolve outside the served root ----
+
+    /// `git` with isolated config, run in `dir`. Panics on failure: these fixtures must build.
+    fn sh(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=test",
+            ])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let ok = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "mklink /J {}", link.display());
+    }
+
+    /// A temp directory holding `r` (the repository under review, one commit) and `other` (an
+    /// unrelated repository with a committed `secret.txt` and an untracked `loose.txt`). Canonical
+    /// paths. `None`, with a note, when git is not on PATH.
+    fn layout_fixture(tag: &str) -> Option<(crate::testutil::TempDir, PathBuf, PathBuf)> {
+        if crate::reviewer::on_path("git").is_none() {
+            eprintln!("skipping {tag}: git is not on PATH");
+            return None;
+        }
+        let dir = crate::testutil::temp_dir(tag);
+        let base = canon(dir.as_path()).unwrap();
+        let (r, other) = (base.join("r"), base.join("other"));
+        for (repo, file) in [(&r, "a.txt"), (&other, "secret.txt")] {
+            std::fs::create_dir(repo).unwrap();
+            sh(repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join(file), "x\n").unwrap();
+            sh(repo, &["add", "."]);
+            sh(repo, &["commit", "-qm", "one"]);
+        }
+        std::fs::write(other.join("loose.txt"), "x\n").unwrap();
+        Some((dir, r, other))
+    }
+
+    fn refused(root: &Path) -> String {
+        let err = validate_layout(root, &Limits::default()).expect_err("layout should be refused");
+        assert_eq!(err.code, "unsafe_git_layout", "{err:?}");
+        err.message
+    }
+
+    fn accepted(root: &Path) -> Layout {
+        validate_layout(root, &Limits::default()).expect("layout should be accepted")
+    }
+
+    #[test]
+    fn a_plain_repository_and_a_subdirectory_of_one_are_accepted() {
+        let Some((_dir, r, _)) = layout_fixture("layout-plain") else {
+            return;
+        };
+        let layout = accepted(&r);
+        assert_eq!(layout.work_tree, r);
+        assert_eq!(layout.git_dir, r.join(".git"));
+        assert_eq!(layout.common_dir, r.join(".git"));
+        std::fs::create_dir(r.join("sub")).unwrap();
+        assert_eq!(accepted(&r.join("sub")), layout);
+    }
+
+    #[test]
+    fn core_worktree_pointing_elsewhere_is_refused() {
+        let Some((_dir, r, other)) = layout_fixture("layout-core-worktree") else {
+            return;
+        };
+        sh(&r, &["config", "core.worktree", other.to_str().unwrap()]);
+        assert!(refused(&r).contains("core.worktree"));
+        // At an ancestor, the top level contains the root, but it is not where `.git` lives.
+        sh(
+            &r,
+            &[
+                "config",
+                "core.worktree",
+                r.parent().unwrap().to_str().unwrap(),
+            ],
+        );
+        refused(&r);
+    }
+
+    #[test]
+    fn alternates_are_refused() {
+        let Some((_dir, r, other)) = layout_fixture("layout-alternates") else {
+            return;
+        };
+        let info = r.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), "# only a comment\n\n").unwrap();
+        accepted(&r);
+        let foreign = other.join(".git").join("objects");
+        std::fs::write(info.join("alternates"), format!("{}\n", foreign.display())).unwrap();
+        assert!(refused(&r).contains("git repack -a -d"));
+    }
+
+    /// Review f2: git reads the whole alternates file, so a check that saw only a padded prefix
+    /// would pass an entry hidden past it. An oversized file is refused outright.
+    #[test]
+    fn an_alternates_entry_hidden_past_the_read_limit_is_refused() {
+        let Some((_dir, r, other)) = layout_fixture("layout-alternates-padded") else {
+            return;
+        };
+        let info = r.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let padding = "
+"
+        .repeat(MAX_METADATA_BYTES as usize);
+        let foreign = other.join(".git").join("objects");
+        std::fs::write(
+            info.join("alternates"),
+            format!(
+                "{padding}{}
+",
+                foreign.display()
+            ),
+        )
+        .unwrap();
+        assert!(refused(&r).contains("larger than"));
+    }
+
+    /// Review f1: the pin is found by the root's spelling, not by what it resolves to now, so a root
+    /// redirected (here: removed) after validation still runs pinned, never by discovery.
+    #[test]
+    fn a_pin_is_found_by_the_roots_spelling_even_after_it_stops_resolving() {
+        let Some((_dir, r, _)) = layout_fixture("layout-pin-spelling") else {
+            return;
+        };
+        let link = r.parent().unwrap().join("link");
+        junction(&link, &r);
+        let verbatim = PathBuf::from(format!(r"\\?\{}", link.display()));
+        let held = pin(&verbatim, accepted(&r));
+        std::fs::remove_dir(&link).unwrap();
+        let layout = pinned(&link).expect("the moved root is still pinned");
+        assert_eq!(layout.work_tree, r);
+        drop(held);
+        assert_eq!(pinned(&link), None);
+    }
+
+    #[test]
+    fn junctions_in_git_metadata_are_refused() {
+        let Some((_dir, r, other)) = layout_fixture("layout-junctions") else {
+            return;
+        };
+        let objects = r.join(".git").join("objects");
+        let fanout = objects.join("zz");
+        junction(&fanout, &other.join(".git").join("objects").join("info"));
+        assert!(refused(&r).contains("junction"));
+        std::fs::remove_dir(&fanout).unwrap();
+        accepted(&r);
+
+        let moved = r.join(".git").join("objects-real");
+        std::fs::rename(&objects, &moved).unwrap();
+        junction(&objects, &moved);
+        refused(&r);
+        std::fs::remove_dir(&objects).unwrap();
+        std::fs::rename(&moved, &objects).unwrap();
+        accepted(&r);
+
+        let dotgit = r.join(".git");
+        let real = r.parent().unwrap().join("r-git");
+        std::fs::rename(&dotgit, &real).unwrap();
+        junction(&dotgit, &real);
+        refused(&r);
+    }
+
+    #[test]
+    fn a_git_file_naming_an_unrelated_repository_is_refused() {
+        let Some((_dir, r, other)) = layout_fixture("layout-borrowed") else {
+            return;
+        };
+        std::fs::remove_dir_all(r.join(".git")).unwrap();
+        let foreign = other.join(".git");
+        std::fs::write(r.join(".git"), format!("gitdir: {}\n", foreign.display())).unwrap();
+        // Git itself takes this at face value, with `r` as the working tree; only the missing
+        // back-pointer tells it apart from a real worktree or submodule.
+        assert!(refused(&r).contains("points back"));
+    }
+
+    #[test]
+    fn linked_worktrees_are_accepted_wherever_they_live() {
+        let Some((_dir, r, _)) = layout_fixture("layout-worktrees") else {
+            return;
+        };
+        let nested = r.join(".claude").join("worktrees").join("w");
+        sh(&r, &["worktree", "add", "-q", nested.to_str().unwrap()]);
+        let sibling = r.parent().unwrap().join("sib");
+        sh(&r, &["worktree", "add", "-q", sibling.to_str().unwrap()]);
+        for wt in [&nested, &sibling] {
+            let wt = canon(wt).unwrap();
+            let layout = accepted(&wt);
+            assert_eq!(layout.work_tree, wt);
+            assert_eq!(layout.common_dir, r.join(".git"));
+            assert!(layout.git_dir.starts_with(r.join(".git").join("worktrees")));
+        }
+        // `--relative-paths` (git 2.48+) writes both pointers relative; older git lacks the flag.
+        let relative = r.parent().unwrap().join("rel");
+        let made = Command::new("git")
+            .args(["worktree", "add", "-q", "--relative-paths"])
+            .arg(&relative)
+            .current_dir(&r)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            assert!(std::fs::read_to_string(relative.join(".git"))
+                .unwrap()
+                .contains("gitdir: .."));
+            accepted(&canon(&relative).unwrap());
+        } else {
+            eprintln!("skipping --relative-paths: this git does not support it");
+        }
+    }
+
+    #[test]
+    fn a_worktree_whose_git_dir_points_back_elsewhere_is_refused() {
+        let Some((_dir, r, _)) = layout_fixture("layout-worktree-mismatch") else {
+            return;
+        };
+        let parent = r.parent().unwrap();
+        let (a, b) = (parent.join("a"), parent.join("b"));
+        sh(&r, &["worktree", "add", "-q", a.to_str().unwrap()]);
+        sh(&r, &["worktree", "add", "-q", b.to_str().unwrap()]);
+        let b_git = std::fs::read_to_string(b.join(".git")).unwrap();
+        std::fs::write(a.join(".git"), b_git).unwrap();
+        refused(&canon(&a).unwrap());
+    }
+
+    #[test]
+    fn a_submodule_is_accepted_only_with_its_back_pointer() {
+        let Some((_dir, r, other)) = layout_fixture("layout-submodule") else {
+            return;
+        };
+        sh(
+            &r,
+            &["submodule", "add", "-q", other.to_str().unwrap(), "sub"],
+        );
+        let sub = canon(&r.join("sub")).unwrap();
+        let layout = accepted(&sub);
+        assert_eq!(layout.work_tree, sub);
+        assert_eq!(layout.git_dir, r.join(".git").join("modules").join("sub"));
+        assert_eq!(layout.common_dir, layout.git_dir);
+        sh(
+            &r,
+            &[
+                "config",
+                "--file",
+                ".git/modules/sub/config",
+                "--unset",
+                "core.worktree",
+            ],
+        );
+        refused(&sub);
+    }
+
+    #[test]
+    fn the_runner_scrubs_inherited_git_variables_and_applies_a_pin() {
+        let envs = |command: &Command| -> Vec<(String, Option<String>)> {
+            command
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        let dir = crate::testutil::temp_dir("layout-isolate-env");
+        let root = canon(dir.as_path()).unwrap();
+        let mut unpinned = Command::new("git");
+        isolate_env(&mut unpinned, &root);
+        let removed = envs(&unpinned);
+        for key in SCRUBBED_ENV {
+            assert!(
+                removed.contains(&(key.to_string(), None)),
+                "{key} is not removed"
+            );
+        }
+        let layout = Layout {
+            work_tree: root.clone(),
+            git_dir: root.join("g"),
+            common_dir: root.join("c"),
+        };
+        let held = pin(&root, layout);
+        let mut pinned = Command::new("git");
+        isolate_env(&mut pinned, &root);
+        let set = envs(&pinned);
+        let value = |key: &str| {
+            set.iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            value("GIT_DIR"),
+            Some(root.join("g").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            value("GIT_WORK_TREE"),
+            Some(root.to_string_lossy().into_owned())
+        );
+        drop(held);
+        let mut after = Command::new("git");
+        isolate_env(&mut after, &root);
+        assert_eq!(
+            envs(&after).iter().find(|(k, _)| k == "GIT_DIR"),
+            Some(&("GIT_DIR".to_string(), None)),
+            "dropping the pin unpins the root"
+        );
+    }
+
+    /// The pin is what keeps a mid-turn `core.worktree` from redirecting a validated root: with it,
+    /// the evidence runner still lists `r`'s own untracked files; without it, `other`'s appear.
+    #[test]
+    fn a_pinned_root_ignores_core_worktree_added_after_validation() {
+        let Some((_dir, r, other)) = layout_fixture("layout-pinned") else {
+            return;
+        };
+        std::fs::write(r.join("mine.txt"), "x\n").unwrap();
+        let untracked = || {
+            untracked_paths(
+                &r,
+                &Limits::default(),
+                &AtomicBool::new(false),
+                Instant::now(),
+            )
+            .map(|(paths, _)| paths)
+            .unwrap_or_default()
+        };
+        let held = pin(&r, accepted(&r));
+        sh(&r, &["config", "core.worktree", other.to_str().unwrap()]);
+        assert_eq!(untracked(), ["mine.txt"]);
+        drop(held);
+        assert!(
+            untracked().iter().any(|p| p == "loose.txt"),
+            "control: unpinned, git follows core.worktree into the other repository"
+        );
     }
 }

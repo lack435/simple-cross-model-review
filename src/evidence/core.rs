@@ -613,6 +613,9 @@ pub struct Core {
     /// describe the scan that ran rather than the one the VCS implies.
     observed_method: Option<StampMethod>,
     cancel: Arc<AtomicBool>,
+    /// Pins every git command this service runs to the layout validated at startup (issue #218).
+    /// Held for the service's life; `None` for Perforce.
+    _git_pin: Option<super::git::Pin>,
     /// The nonce-bound side-channel file each `repository_diff` call appends a serve-record to, for
     /// the parent's `captured:` line and fail-closed gate (retire-capture-modes mechanism 3). `None`
     /// in tests and whenever the parent supplied no path; a missing sink is silent, never fatal — a
@@ -642,7 +645,22 @@ impl Core {
         Self::new_with_cancel(bundle, Arc::new(AtomicBool::new(false)))
     }
 
+    /// A service over a Git bundle whose root is *not* a git repository, which production refuses
+    /// at startup (issue #218): for the tests of how reads degrade when git cannot serve the root.
+    #[cfg(test)]
+    pub fn new_without_layout(bundle: Bundle) -> Result<Self, EvidenceError> {
+        Self::build(bundle, Arc::new(AtomicBool::new(false)), false)
+    }
+
     pub fn new_with_cancel(bundle: Bundle, cancel: Arc<AtomicBool>) -> Result<Self, EvidenceError> {
+        Self::build(bundle, cancel, true)
+    }
+
+    fn build(
+        bundle: Bundle,
+        cancel: Arc<AtomicBool>,
+        check_layout: bool,
+    ) -> Result<Self, EvidenceError> {
         bundle.validate()?;
         let root = fs::canonicalize(&bundle.root).map_err(|e| {
             EvidenceError::new("invalid_root", format!("cannot canonicalize root: {e}"))
@@ -659,6 +677,15 @@ impl Core {
                 "bundle root is not the canonical repository path",
             ));
         }
+        // Validated again here, in the process that serves it, then pinned (issue #218): from now
+        // on git neither discovers the repository nor reads `core.worktree`.
+        let git_pin = match bundle.vcs {
+            VcsKind::Git if check_layout => Some(super::git::pin(
+                &root,
+                super::git::validate_layout(&root, &bundle.limits)?,
+            )),
+            _ => None,
+        };
         Ok(Self {
             bundle,
             root,
@@ -682,6 +709,7 @@ impl Core {
             observed_stamp: None,
             observed_method: None,
             cancel,
+            _git_pin: git_pin,
             serve_record: None,
             walk_watchdog: &WALK_WATCHDOG,
             child_watchdog: &CHILD_WATCHDOG,
@@ -2869,7 +2897,7 @@ fn is_reparse(path: &Path) -> Result<bool, EvidenceError> {
     Ok(metadata_is_reparse(&meta))
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 fn within(path: &Path, root: &Path) -> bool {
@@ -2877,7 +2905,7 @@ fn within(path: &Path, root: &Path) -> bool {
     let root = normalize_path(root);
     path == root || path.starts_with(&(root + "\\"))
 }
-fn normalize_path(path: &Path) -> String {
+pub(super) fn normalize_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('/', "\\");
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         value = format!(r"\\{rest}");
@@ -4236,7 +4264,7 @@ mod tests {
     fn an_unobservable_stamp_reads_as_unknown_and_is_observed_once() {
         let dir = temp_dir("evidence-unknown-drift");
         fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
-        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        let mut core = Core::new_without_layout(git_bundle(dir.as_path())).unwrap();
         core.walk_watchdog = &ISOLATED_WALK;
 
         let read = core
@@ -4563,6 +4591,46 @@ mod tests {
         assert!(!utf8_feed(&mut Vec::new(), b"\xc3\x28"));
     }
 
+    /// Issue #218: the service pins its own root, under the exact spelling it passes to every git
+    /// call, so a `core.worktree` added after startup does not redirect what it lists.
+    #[test]
+    fn the_service_pins_its_root_against_a_later_core_worktree() {
+        if crate::reviewer::on_path("git").is_none() {
+            eprintln!("skipping: git is not on PATH");
+            return;
+        }
+        let dir = temp_dir("evidence-service-pin");
+        let base = fs::canonicalize(dir.as_path()).unwrap();
+        let (root, other) = (base.join("r"), base.join("other"));
+        let git = |cwd: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "NUL")
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        for d in [&root, &other] {
+            fs::create_dir(d).unwrap();
+            git(d, &["init", "-q"]);
+        }
+        fs::write(root.join("mine.txt"), "x\n").unwrap();
+        fs::write(other.join("theirs.txt"), "x\n").unwrap();
+        let core = Core::new(git_bundle(&root)).unwrap();
+        git(&root, &["config", "core.worktree", other.to_str().unwrap()]);
+        let untracked = super::super::git::untracked_paths(
+            &core.root,
+            &Limits::default(),
+            &AtomicBool::new(false),
+            Instant::now(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(untracked, ["mine.txt"]);
+    }
+
     // Git present, root not a work tree: the scan refuses rather than quietly walking a tree the
     // caller declared to be Git. Surfacing the misconfiguration beats scanning the wrong thing.
     #[test]
@@ -4573,7 +4641,7 @@ mod tests {
         }
         let dir = temp_dir("evidence-not-a-worktree");
         fs::write(dir.as_path().join("a.txt"), "hello\n").unwrap();
-        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        let mut core = Core::new_without_layout(git_bundle(dir.as_path())).unwrap();
         core.walk_watchdog = &ISOLATED_WALK;
         // Any refusal is the point. The failure this guards against is the opposite: a *successful*
         // search, which here could only come from having walked the filesystem after Git declined.
@@ -4750,7 +4818,7 @@ mod tests {
     fn naming_a_file_searches_it_even_when_the_enumeration_fails() {
         let dir = temp_dir("evidence-explicit-file");
         fs::write(dir.as_path().join("a.txt"), "needle\n").unwrap();
-        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        let mut core = Core::new_without_layout(git_bundle(dir.as_path())).unwrap();
         core.walk_watchdog = &ISOLATED_WALK;
         let searched = core
             .call(
@@ -4771,7 +4839,7 @@ mod tests {
     #[test]
     fn scan_scope_reports_the_scan_that_ran_not_the_vcs() {
         let dir = temp_dir("evidence-scan-scope");
-        let mut core = Core::new(git_bundle(dir.as_path())).unwrap();
+        let mut core = Core::new_without_layout(git_bundle(dir.as_path())).unwrap();
         core.observed_stamp = Some(Drift::unavailable("stubbed"));
         core.observed_method = Some(StampMethod::Filesystem);
         let scope = core.call("repository_scope", &json!({})).unwrap();

@@ -626,6 +626,15 @@ does not need to be submitted. A reviewer that merely read nothing through `repo
 once to read what the capture left out, and if that does not settle it the turn comes back as a
 resumable `changes_requested` with `evidence_incomplete`, so re-review it on the same session.
 
+A git root whose own metadata reaches outside it also gets `EVIDENCE_UNAVAILABLE`, before the review
+starts (issue #218): a `core.worktree` pointing elsewhere, an `objects/info/alternates` file, a
+`.git` that is itself a junction or symlink or has one among its own entries or those of
+`.git/objects`, or a `.git` file naming a git directory that does not point back to it. Plain clones,
+linked worktrees wherever they live, and submodules are accepted. The message names the cause and the
+fix. This applies to the working root, a per-call `root`, and every companion. The check is defence
+in depth, not a full confinement: deeper links (under `refs`, or individual object files, including
+hard links) are not inspected; see `docs/git-metadata-confinement-plan.md`.
+
 `REVIEWER_BUSY` is a transient refusal, not a setup problem: the Claude CLI reported that another
 Claude Code process held its OAuth refresh lock, so it failed before any model call. Nothing in the
 session changed. The server absorbs the usual case itself: it waits and relaunches the reviewer up
