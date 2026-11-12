@@ -12,6 +12,7 @@
 //! below each collapsed directory. A repository deeper than that is missed without a warning.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::companion::Companion;
 
@@ -23,6 +24,12 @@ const MAX_INSPECTED_DIRS: usize = 512;
 const MAX_CHILDREN_PER_DIR: usize = 256;
 /// At most this many nested repositories are examined.
 const MAX_CANDIDATES: usize = 32;
+/// The whole scan's time budget. It runs before the start response is returned, so it is checked
+/// before every git call and every candidate; a call already running can overrun it by at most
+/// [`GIT_OP_TIMEOUT_MS`].
+const SCAN_BUDGET: Duration = Duration::from_secs(5);
+/// Each git call's own ceiling during the scan, well under the evidence service's default.
+const GIT_OP_TIMEOUT_MS: u64 = 3_000;
 
 /// Whether a nested repository's change could be determined.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +140,20 @@ fn warning(u: &Unserved) -> String {
 /// declared companions. `configured` are the server's companions, matched to a found repository by
 /// physical root; `declared` are the ones this review serves, which are skipped.
 pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> Detection {
-    let limits = crate::evidence::Limits::default();
+    detect_within(root, configured, declared, Instant::now() + SCAN_BUDGET)
+}
+
+/// [`detect`] against an explicit deadline, so a test can exercise an exhausted budget.
+fn detect_within(
+    root: &Path,
+    configured: &[Companion],
+    declared: &[Companion],
+    deadline: Instant,
+) -> Detection {
+    let limits = crate::evidence::Limits {
+        operation_timeout_ms: GIT_OP_TIMEOUT_MS,
+        ..crate::evidence::Limits::default()
+    };
     let mut detection = Detection::default();
     let candidates = match enumerate(root, &limits, &mut detection.incomplete) {
         Some(c) => c,
@@ -152,6 +172,12 @@ pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> 
     let same =
         |a: &Path, b: &Path| crate::reviewer::is_within(a, b) && crate::reviewer::is_within(b, a);
     for rel in candidates {
+        if Instant::now() >= deadline {
+            detection.incomplete.get_or_insert_with(|| {
+                format!("it ran out of its {}s time budget", SCAN_BUDGET.as_secs())
+            });
+            break;
+        }
         let abs = root.join(rel.trim_end_matches('/'));
         let physical = std::fs::canonicalize(&abs)
             .map(crate::config::normalize_dir)
@@ -165,7 +191,7 @@ pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> 
         if declared.iter().any(|c| same(&c.root, &physical)) {
             continue;
         }
-        let Some(state) = state_of(&abs, &limits) else {
+        let Some(state) = state_of(&abs, &limits, deadline) else {
             continue;
         };
         let kind = if let Some(c) = configured.iter().find(|c| same(&c.root, &physical)) {
@@ -238,10 +264,15 @@ fn enumerate(
             found.push(rel.clone());
         }
         // One level down, whether or not `dir` is itself a repository (plan r2 f8).
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                stop(format!("`{rel}` could not be read: {e}"), incomplete);
+                continue;
+            }
         };
-        for (n, entry) in entries.flatten().enumerate() {
+        // Counted before an entry's error is looked at, so unreadable entries use up the cap too.
+        for (n, entry) in entries.enumerate() {
             if n >= MAX_CHILDREN_PER_DIR {
                 stop(
                     format!("more than {MAX_CHILDREN_PER_DIR} entries in `{rel}`"),
@@ -249,6 +280,16 @@ fn enumerate(
                 );
                 break;
             }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    stop(
+                        format!("an entry of `{rel}` could not be read: {e}"),
+                        incomplete,
+                    );
+                    continue;
+                }
+            };
             let child = entry.path();
             if entry.file_name() == ".git" || !is_plain_dir(&child) {
                 continue;
@@ -278,9 +319,29 @@ fn enumerate(
 }
 
 /// The state of the nested repository at `dir`, or `None` when it is clean and on its fork point.
-fn state_of(dir: &Path, limits: &crate::evidence::Limits) -> Option<State> {
+///
+/// Only the **default branch** (`branch_base`, the same base a review's canonical diff uses) can
+/// prove a repository clean. `@{upstream}` is a fallback that can only prove it *changed*: under the
+/// push-to-same-name workflow the upstream is the branch's own remote copy, so a branch level with it
+/// may still carry committed work past its real base (the reason `branch_base` never uses it). A clean
+/// working tree level with its upstream is therefore *unknown*, not clean.
+fn state_of(dir: &Path, limits: &crate::evidence::Limits, deadline: Instant) -> Option<State> {
+    let out_of_time = || {
+        (Instant::now() >= deadline).then(|| {
+            State::Unknown(format!(
+                "the {}s detection time budget ran out before it was examined",
+                SCAN_BUDGET.as_secs()
+            ))
+        })
+    };
+    let failed = |what: &str, e: crate::evidence::EvidenceError| {
+        Some(State::Unknown(format!("{what} failed: {}", e.message)))
+    };
     // A `.git` git cannot use makes it discover the enclosing repository instead, and every answer
     // below would then describe the review root rather than `dir`.
+    if let Some(late) = out_of_time() {
+        return Some(late);
+    }
     match crate::evidence::show_toplevel(dir, limits) {
         Ok(top)
             if crate::reviewer::is_within(&top, dir) && crate::reviewer::is_within(dir, &top) => {}
@@ -290,59 +351,46 @@ fn state_of(dir: &Path, limits: &crate::evidence::Limits) -> Option<State> {
                 top.display()
             )))
         }
-        Err(e) => {
-            return Some(State::Unknown(format!(
-                "`git rev-parse --show-toplevel` failed: {}",
-                e.message
-            )))
-        }
+        Err(e) => return failed("`git rev-parse --show-toplevel`", e),
+    }
+    if let Some(late) = out_of_time() {
+        return Some(late);
     }
     let modified = match crate::evidence::status_entry_count(dir, limits) {
         Ok(n) => n,
-        Err(e) => {
-            return Some(State::Unknown(format!(
-                "`git status` failed: {}",
-                e.message
-            )))
-        }
+        Err(e) => return failed("`git status`", e),
     };
-    let base = match crate::evidence::branch_base(dir, limits) {
-        Ok((base, _)) => Some(base),
+    if let Some(late) = out_of_time() {
+        return Some(late);
+    }
+    let head = match crate::evidence::resolve_head(dir, limits) {
+        Ok(head) => head,
+        Err(e) => return failed("resolving its HEAD", e),
+    };
+    if let Some(late) = out_of_time() {
+        return Some(late);
+    }
+    // `Some(ahead)` only when the answer can be trusted in that direction (see above).
+    let ahead = match crate::evidence::branch_base(dir, limits) {
+        Ok((base, _)) => head.as_ref().map(|head| head != &base),
         Err(e) if e.code == "branch_base_unresolved" => {
+            if let Some(late) = out_of_time() {
+                return Some(late);
+            }
             match crate::evidence::upstream_fork_point(dir, limits) {
-                Ok(base) => base,
-                Err(e) => {
-                    return Some(State::Unknown(format!(
-                        "resolving its upstream failed: {}",
-                        e.message
-                    )))
-                }
+                Ok(Some(base)) if head.as_ref().is_some_and(|head| head != &base) => Some(true),
+                Ok(_) => None,
+                Err(e) => return failed("resolving its upstream", e),
             }
         }
-        Err(e) => {
-            return Some(State::Unknown(format!(
-                "resolving its fork point failed: {}",
-                e.message
-            )))
-        }
-    };
-    let ahead = match &base {
-        None => None,
-        Some(base) => match crate::evidence::resolve_head(dir, limits) {
-            Ok(Some(head)) => Some(&head != base),
-            Ok(None) => None,
-            Err(e) => {
-                return Some(State::Unknown(format!(
-                    "resolving its HEAD failed: {}",
-                    e.message
-                )))
-            }
-        },
+        Err(e) => return failed("resolving its fork point", e),
     };
     match (modified, ahead) {
         (0, Some(false)) => None,
         (0, None) => Some(State::Unknown(
-            "it has no default or upstream branch to compare against".to_string(),
+            "no default branch (`refs/remotes/origin/HEAD`, `main` or `master`) resolved to \
+             compare its branch against"
+                .to_string(),
         )),
         (modified, ahead) => Some(State::Changed { modified, ahead }),
     }
@@ -458,17 +506,21 @@ mod tests {
         // No origin default branch and no upstream: clean, but unknown.
         let d = detect(&l.primary, &[], &[]);
         assert!(
-            matches!(&d.unserved[0].state, State::Unknown(why) if why.contains("no default or upstream")),
+            matches!(&d.unserved[0].state, State::Unknown(why) if why.contains("no default branch")),
             "{d:?}"
         );
-        // An upstream on another remote name, at HEAD: clean and on base.
+        // An upstream on another remote name, at HEAD: still unknown, because an upstream can be the
+        // branch's own remote copy and so cannot prove it has no committed work (review f1).
         git(
             &l.engine,
             &["remote", "add", "fork", "https://example.invalid/fork.git"],
         );
         git(&l.engine, &["update-ref", "refs/remotes/fork/main", "HEAD"]);
         git(&l.engine, &["branch", "-q", "--set-upstream-to=fork/main"]);
-        assert!(detect(&l.primary, &[], &[]).unserved.is_empty());
+        assert!(matches!(
+            &detect(&l.primary, &[], &[]).unserved[0].state,
+            State::Unknown(_)
+        ));
         // A commit past the upstream: changed.
         commit(&l.engine, "fix.cpp");
         assert_eq!(
@@ -593,6 +645,22 @@ mod tests {
         assert!(
             matches!(&u.state, State::Unknown(why) if why.contains("does not recognise")),
             "{u:?}"
+        );
+    }
+
+    /// Review f2: the scan runs before the start response, so an exhausted time budget stops it with
+    /// the incomplete warning rather than holding the response.
+    #[test]
+    fn an_exhausted_time_budget_stops_the_scan_with_a_warning() {
+        let l = layout("nested-deadline");
+        commit(&l.engine, "fix.cpp");
+        let d = detect_within(&l.primary, &[], &[], Instant::now());
+        assert!(d.unserved.is_empty(), "{d:?}");
+        assert!(
+            d.incomplete
+                .as_deref()
+                .is_some_and(|w| w.contains("time budget")),
+            "{d:?}"
         );
     }
 
