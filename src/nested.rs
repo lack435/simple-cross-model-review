@@ -12,6 +12,7 @@
 //! below each collapsed directory. A repository deeper than that is missed without a warning.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::companion::Companion;
@@ -148,20 +149,50 @@ fn warning(u: &Unserved) -> String {
 /// it; past the grace it is abandoned, and the git calls it may still be running end on their own
 /// [`GIT_OP_TIMEOUT_MS`].
 pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> Detection {
+    detect_with_slots(&SCANS_IN_FLIGHT, root, configured, declared)
+}
+
+/// [`detect`] counting its thread against `slots`, so a test can fill its own counter without
+/// disturbing scans other tests run in parallel.
+fn detect_with_slots(
+    slots: &'static AtomicUsize,
+    root: &Path,
+    configured: &[Companion],
+    declared: &[Companion],
+) -> Detection {
     let incomplete = |why: String| Detection {
         unserved: Vec::new(),
         incomplete: Some(why),
     };
+    // An abandoned scan blocked in the filesystem cannot be cancelled, so at most
+    // `MAX_SCANS_IN_FLIGHT` scan threads exist at once (review f4): past that, a start skips the scan
+    // and says so, rather than leaving one more stuck thread behind.
+    if slots
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_SCANS_IN_FLIGHT).then_some(n + 1)
+        })
+        .is_err()
+    {
+        return incomplete(
+            "earlier scans have not finished, so this one was not started; the file system may \
+             be unresponsive"
+                .to_string(),
+        );
+    }
     let (root, configured, declared) = (root.to_path_buf(), configured.to_vec(), declared.to_vec());
     let deadline = Instant::now() + SCAN_BUDGET;
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("nested-repository-scan".into())
         .spawn(move || {
+            // Released however the scan ends, a panic included.
+            let _slot = InFlight(slots);
             // The receiver may already have given up; nothing to do then.
             let _ = tx.send(detect_within(&root, &configured, &declared, deadline));
         });
     if let Err(e) = spawned {
+        // The closure, and with it the slot it would have released, never ran.
+        slots.fetch_sub(1, Ordering::AcqRel);
         return incomplete(format!("the scan could not be started: {e}"));
     }
     match rx.recv_timeout(SCAN_BUDGET + SCAN_GRACE) {
@@ -170,6 +201,19 @@ pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> 
             "it did not finish within its {}s time budget",
             SCAN_BUDGET.as_secs()
         )),
+    }
+}
+
+/// How many scan threads may be running at once across the process.
+const MAX_SCANS_IN_FLIGHT: usize = 4;
+static SCANS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// One scan thread's slot in its counter, released on drop.
+struct InFlight(&'static AtomicUsize);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -457,6 +501,17 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    /// The scan itself, synchronously and with a generous deadline: the thread, slot cap and time
+    /// budget around it have their own tests, and would only make these flaky under parallel load.
+    fn scan(root: &Path, configured: &[Companion], declared: &[Companion]) -> Detection {
+        detect_within(
+            root,
+            configured,
+            declared,
+            Instant::now() + Duration::from_secs(120),
+        )
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
             .args(args)
@@ -512,7 +567,7 @@ mod tests {
     #[test]
     fn a_clean_nested_repository_on_base_is_not_reported() {
         let l = layout("nested-clean");
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert_eq!(d, Detection::default());
         assert!(d.warnings().is_empty());
     }
@@ -521,7 +576,7 @@ mod tests {
     fn uncommitted_and_committed_changes_are_reported_with_the_fix() {
         let l = layout("nested-changed");
         std::fs::write(l.engine.join("f.txt"), "edited").unwrap();
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert_eq!(
             d.unserved,
             vec![Unserved {
@@ -544,7 +599,7 @@ mod tests {
         // The issue's case: committed on a branch, working tree clean.
         git(&l.engine, &["checkout", "-q", "--", "f.txt"]);
         commit(&l.engine, "fix.cpp");
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert_eq!(
             d.unserved[0].state,
             State::Changed {
@@ -560,7 +615,7 @@ mod tests {
         let l = layout("nested-upstream");
         git(&l.engine, &["update-ref", "-d", "refs/remotes/origin/main"]);
         // No origin default branch and no upstream: clean, but unknown.
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert!(
             matches!(&d.unserved[0].state, State::Unknown(why) if why.contains("no default branch")),
             "{d:?}"
@@ -574,13 +629,13 @@ mod tests {
         git(&l.engine, &["update-ref", "refs/remotes/fork/main", "HEAD"]);
         git(&l.engine, &["branch", "-q", "--set-upstream-to=fork/main"]);
         assert!(matches!(
-            &detect(&l.primary, &[], &[]).unserved[0].state,
+            &scan(&l.primary, &[], &[]).unserved[0].state,
             State::Unknown(_)
         ));
         // A commit past the upstream: changed.
         commit(&l.engine, "fix.cpp");
         assert_eq!(
-            detect(&l.primary, &[], &[]).unserved[0].state,
+            scan(&l.primary, &[], &[]).unserved[0].state,
             State::Changed {
                 modified: 0,
                 ahead: Some(true)
@@ -603,7 +658,7 @@ mod tests {
         )
         .unserved
         .is_empty());
-        let d = detect(&l.primary, std::slice::from_ref(&engine), &[]);
+        let d = scan(&l.primary, std::slice::from_ref(&engine), &[]);
         assert_eq!(d.unserved[0].kind, Kind::ConfiguredUndeclared("eng".into()));
         assert!(d.warnings()[0].contains("companions: [\"eng\"]"));
         // A configured companion that shares the basename but lives elsewhere is not suggested.
@@ -611,7 +666,7 @@ mod tests {
             name: "engine".into(),
             root: l.primary.parent().unwrap().join("engine"),
         };
-        let d = detect(&l.primary, &[elsewhere], &[]);
+        let d = scan(&l.primary, &[elsewhere], &[]);
         assert_eq!(d.unserved[0].kind, Kind::Ignored);
         assert!(!d.warnings()[0].contains("companions: [\"engine\"]"));
     }
@@ -622,7 +677,7 @@ mod tests {
         let tools = l.primary.join("tools");
         repo_on_base(&tools);
         commit(&tools, "t.txt");
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         let u = d
             .unserved
             .iter()
@@ -652,7 +707,7 @@ mod tests {
         )
         .unwrap();
         commit(&inner, "i.txt");
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         let rels: Vec<&str> = d.unserved.iter().map(|u| u.rel.as_str()).collect();
         assert!(rels.contains(&"vendor/sdk/"), "{rels:?}");
         assert!(rels.contains(&"engine/third_party/"), "{rels:?}");
@@ -669,7 +724,7 @@ mod tests {
             &["worktree", "add", "-q", "-b", "side", "wt/side"],
         );
         commit(&l.primary.join("wt").join("side"), "w.txt");
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert!(
             d.unserved.iter().all(|u| !u.rel.starts_with("wt/")),
             "{d:?}"
@@ -692,7 +747,7 @@ mod tests {
         let broken = l.primary.join("vendor").join("broken");
         std::fs::create_dir_all(broken.join(".git")).unwrap();
         std::fs::write(broken.join("a.txt"), "a").unwrap();
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         let u = d
             .unserved
             .iter()
@@ -720,6 +775,32 @@ mod tests {
         );
     }
 
+    /// Review f4: abandoned scans cannot pile up. With every slot taken, a scan is not started and
+    /// says why; a finished scan gives its slot back.
+    #[test]
+    fn scans_in_flight_are_capped_and_released() {
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        let l = layout("nested-slots");
+        SLOTS.store(MAX_SCANS_IN_FLIGHT, Ordering::SeqCst);
+        let d = detect_with_slots(&SLOTS, &l.primary, &[], &[]);
+        assert!(
+            d.incomplete
+                .as_deref()
+                .is_some_and(|w| w.contains("earlier scans have not finished")),
+            "{d:?}"
+        );
+        assert_eq!(SLOTS.load(Ordering::SeqCst), MAX_SCANS_IN_FLIGHT);
+        SLOTS.store(0, Ordering::SeqCst);
+        let d = detect_with_slots(&SLOTS, &l.primary, &[], &[]);
+        assert_eq!(d, Detection::default());
+        // The slot is released by the scan thread itself, possibly just after it sent its result.
+        let released = Instant::now() + Duration::from_secs(5);
+        while SLOTS.load(Ordering::SeqCst) != 0 && Instant::now() < released {
+            std::thread::yield_now();
+        }
+        assert_eq!(SLOTS.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn the_children_cap_marks_detection_incomplete() {
         let l = layout("nested-cap");
@@ -728,7 +809,7 @@ mod tests {
             std::fs::create_dir_all(vendor.join(format!("d{i}"))).unwrap();
             std::fs::write(vendor.join(format!("d{i}")).join("x"), "x").unwrap();
         }
-        let d = detect(&l.primary, &[], &[]);
+        let d = scan(&l.primary, &[], &[]);
         assert!(
             d.incomplete
                 .as_deref()
