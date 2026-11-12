@@ -21,8 +21,10 @@ use crate::companion::Companion;
 const MAX_LISTED_DIRS: usize = 4096;
 /// At most this many directories are inspected for `.git` (listed ones plus their children).
 const MAX_INSPECTED_DIRS: usize = 512;
-/// At most this many entries are read from any one directory during the one-level descent.
-const MAX_CHILDREN_PER_DIR: usize = 256;
+/// At most this many subdirectories of any one directory are inspected during the one-level
+/// descent. Only plain subdirectories (and unreadable entries) count: a directory full of files
+/// costs nothing against it (issue #224), and the scan deadline bounds the time spent listing them.
+const MAX_SUBDIRS_PER_DIR: usize = 256;
 /// At most this many nested repositories are examined.
 const MAX_CANDIDATES: usize = 32;
 /// The whole scan's time budget. It runs before the start response is returned, so it is checked
@@ -302,11 +304,6 @@ fn is_repository(dir: &Path) -> std::io::Result<bool> {
     dir.join(".git").try_exists()
 }
 
-/// A real directory, not a junction or symlink: the descent never follows a reparse point.
-fn is_plain_dir(path: &Path) -> std::io::Result<bool> {
-    std::fs::symlink_metadata(path).map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
-}
-
 /// The scan's own message for a time budget that ran out.
 fn out_of_time() -> String {
     format!("it ran out of its {}s time budget", SCAN_BUDGET.as_secs())
@@ -368,41 +365,45 @@ fn enumerate(
                 continue;
             }
         };
-        // Counted before an entry's error is looked at, so unreadable entries use up the cap too.
-        for (n, entry) in entries.enumerate() {
-            if n >= MAX_CHILDREN_PER_DIR {
+        // Only subdirectories and unreadable entries count against the cap; files, junctions and
+        // symlinks are skipped for free (issue #224). The deadline bounds a directory of many files.
+        let mut subdirs = 0usize;
+        for entry in entries {
+            if Instant::now() >= deadline {
+                stop(out_of_time(), incomplete);
+                break 'outer;
+            }
+            // A subdirectory to inspect, or why an entry could not be classified; anything else is
+            // skipped before it is counted.
+            let counted = match entry {
+                Err(e) => Err(format!("an entry of `{rel}` could not be read: {e}")),
+                Ok(entry) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // `DirEntry::file_type` comes from the directory listing itself on Windows (no
+                    // extra system call) and does not follow reparse points: a junction or symlink
+                    // is not `is_dir`, exactly as `symlink_metadata` reports it.
+                    match entry.file_type() {
+                        Ok(ft) if ft.is_dir() && name != ".git" => Ok((name, entry.path())),
+                        Ok(_) => continue,
+                        Err(e) => Err(format!("`{rel}{name}` could not be checked: {e}")),
+                    }
+                }
+            };
+            subdirs += 1;
+            if subdirs > MAX_SUBDIRS_PER_DIR {
                 stop(
-                    format!("more than {MAX_CHILDREN_PER_DIR} entries in `{rel}`"),
+                    format!("more than {MAX_SUBDIRS_PER_DIR} subdirectories in `{rel}`"),
                     incomplete,
                 );
                 break;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    stop(
-                        format!("an entry of `{rel}` could not be read: {e}"),
-                        incomplete,
-                    );
+            let (name, child) = match counted {
+                Ok(subdir) => subdir,
+                Err(why) => {
+                    stop(why, incomplete);
                     continue;
                 }
             };
-            let child = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".git" {
-                continue;
-            }
-            match is_plain_dir(&child) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    stop(
-                        format!("`{rel}{name}` could not be checked: {e}"),
-                        incomplete,
-                    );
-                    continue;
-                }
-            }
             inspected += 1;
             if inspected > MAX_INSPECTED_DIRS {
                 stop(
@@ -843,15 +844,69 @@ mod tests {
     fn the_children_cap_marks_detection_incomplete() {
         let l = layout("nested-cap");
         let vendor = l.primary.join("vendor");
-        for i in 0..=MAX_CHILDREN_PER_DIR {
+        let subdir = |i: usize| {
             std::fs::create_dir_all(vendor.join(format!("d{i}"))).unwrap();
             std::fs::write(vendor.join(format!("d{i}")).join("x"), "x").unwrap();
-        }
+        };
+        // Exactly at the cap: complete.
+        (0..MAX_SUBDIRS_PER_DIR).for_each(subdir);
+        let d = scan(&l.primary, &[], &[]);
+        assert_eq!(d.incomplete, None, "{d:?}");
+        // One past it: incomplete.
+        subdir(MAX_SUBDIRS_PER_DIR);
         let d = scan(&l.primary, &[], &[]);
         assert!(
             d.incomplete
                 .as_deref()
-                .is_some_and(|w| w.contains("entries in `vendor/`")),
+                .is_some_and(|w| w.contains("subdirectories in `vendor/`")),
+            "{d:?}"
+        );
+    }
+
+    /// Issue #224: files do not count against the per-directory cap, so an ignored directory full of
+    /// them neither stops detection early nor hides a nested repository listed after them.
+    #[test]
+    fn a_directory_full_of_files_does_not_stop_detection() {
+        let l = layout("nested-many-files");
+        let vendor = l.primary.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        for i in 0..1000 {
+            std::fs::write(vendor.join(format!("a{i:04}.bin")), "x").unwrap();
+        }
+        let sdk = vendor.join("zz-sdk");
+        repo_on_base(&sdk);
+        commit(&sdk, "s.txt");
+        let d = scan(&l.primary, &[], &[]);
+        assert_eq!(d.incomplete, None, "{d:?}");
+        assert!(
+            d.unserved.iter().any(|u| u.rel == "vendor/zz-sdk/"),
+            "{d:?}"
+        );
+        assert!(d.warnings().iter().all(|w| !w.contains("stopped early")));
+    }
+
+    /// The descent classifies entries from the directory listing; a junction is still not followed,
+    /// even to a repository with a change.
+    #[test]
+    fn a_junction_below_an_ignored_directory_is_not_followed() {
+        let l = layout("nested-junction");
+        let target = l.primary.parent().unwrap().join("elsewhere");
+        repo_on_base(&target);
+        commit(&target, "e.txt");
+        let vendor = l.primary.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let link = vendor.join("linked");
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(made, "mklink /J {}", link.display());
+        let d = scan(&l.primary, &[], &[]);
+        assert_eq!(d.incomplete, None, "{d:?}");
+        assert!(
+            d.unserved.iter().all(|u| u.rel != "vendor/linked/"),
             "{d:?}"
         );
     }
