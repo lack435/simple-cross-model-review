@@ -127,14 +127,20 @@ if it contains `.git`, it is a candidate; **in either case** list its immediate 
 Nested repositories under a *non-ignored* untracked directory are covered by the same rule, since
 git collapses a nested repository to `engine/` whether or not it is ignored.
 
-**Bounds** (r1 f4), every one of which, when hit, stops detection and adds one warning:
-"nested-repository detection stopped early (`<which cap>`); a nested repository with changes may
-not be listed":
+**Bounds** (r1 f4), every one of which, when hit, adds one warning: "nested-repository detection
+stopped early (`<which cap>`); a nested repository with changes may not be listed". They do not all
+stop the same amount of the scan:
 
-- `ls-files` output: at most 4 096 entries read (the runner's byte limit already applies);
-- directories inspected (top-level plus descent): at most 512;
-- entries read per directory during descent: at most 256;
-- candidates: at most 32.
+- listed directories: at most 4 096 kept from the `ls-files` output. The output is read in full, up to
+  the runner's byte limit, and then truncated; the 4 096 kept are still scanned;
+- directories inspected (top-level plus descent): at most 512. This stops the scan;
+- subdirectories per directory during descent: at most 256. Files, junctions and symlinks are not
+  counted. This stops only that directory's descent, and the scan goes on to the next listed
+  directory. It was "entries" until issue #224, when a build-output directory holding tens of thousands
+  of files tripped it on every review; see
+  [`nested-scan-directory-cap-plan.md`](nested-scan-directory-cap-plan.md);
+- candidates: at most 32. This stops the scan;
+- the scan's time budget, also checked while a directory's entries are listed. This stops the scan.
 
 Depth stays one level below a collapsed directory. A nested repository deeper than that is missed
 without a warning; the README says so. That is a deliberate limit, not a scan to chase (#86 removed
