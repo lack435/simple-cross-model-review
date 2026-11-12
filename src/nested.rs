@@ -28,6 +28,8 @@ const MAX_CANDIDATES: usize = 32;
 /// before every git call and every candidate; a call already running can overrun it by at most
 /// [`GIT_OP_TIMEOUT_MS`].
 const SCAN_BUDGET: Duration = Duration::from_secs(5);
+/// How long past [`SCAN_BUDGET`] the scan's partial result is still waited for.
+const SCAN_GRACE: Duration = Duration::from_secs(1);
 /// Each git call's own ceiling during the scan, well under the evidence service's default.
 const GIT_OP_TIMEOUT_MS: u64 = 3_000;
 
@@ -139,8 +141,36 @@ fn warning(u: &Unserved) -> String {
 /// Scan `root` (the review root) for nested git repositories with changes that are not among the
 /// declared companions. `configured` are the server's companions, matched to a found repository by
 /// physical root; `declared` are the ones this review serves, which are skipped.
+///
+/// Runs on its own thread and is waited for at most [`SCAN_BUDGET`] plus [`SCAN_GRACE`], so the start
+/// response it precedes is never held longer than that whatever git or the filesystem do (review f2).
+/// The scan checks the same deadline as it goes and normally returns its partial result just after
+/// it; past the grace it is abandoned, and the git calls it may still be running end on their own
+/// [`GIT_OP_TIMEOUT_MS`].
 pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> Detection {
-    detect_within(root, configured, declared, Instant::now() + SCAN_BUDGET)
+    let incomplete = |why: String| Detection {
+        unserved: Vec::new(),
+        incomplete: Some(why),
+    };
+    let (root, configured, declared) = (root.to_path_buf(), configured.to_vec(), declared.to_vec());
+    let deadline = Instant::now() + SCAN_BUDGET;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("nested-repository-scan".into())
+        .spawn(move || {
+            // The receiver may already have given up; nothing to do then.
+            let _ = tx.send(detect_within(&root, &configured, &declared, deadline));
+        });
+    if let Err(e) = spawned {
+        return incomplete(format!("the scan could not be started: {e}"));
+    }
+    match rx.recv_timeout(SCAN_BUDGET + SCAN_GRACE) {
+        Ok(detection) => detection,
+        Err(_) => incomplete(format!(
+            "it did not finish within its {}s time budget",
+            SCAN_BUDGET.as_secs()
+        )),
+    }
 }
 
 /// [`detect`] against an explicit deadline, so a test can exercise an exhausted budget.
@@ -155,7 +185,7 @@ fn detect_within(
         ..crate::evidence::Limits::default()
     };
     let mut detection = Detection::default();
-    let candidates = match enumerate(root, &limits, &mut detection.incomplete) {
+    let candidates = match enumerate(root, &limits, deadline, &mut detection.incomplete) {
         Some(c) => c,
         None => return detection,
     };
@@ -173,9 +203,7 @@ fn detect_within(
         |a: &Path, b: &Path| crate::reviewer::is_within(a, b) && crate::reviewer::is_within(b, a);
     for rel in candidates {
         if Instant::now() >= deadline {
-            detection.incomplete.get_or_insert_with(|| {
-                format!("it ran out of its {}s time budget", SCAN_BUDGET.as_secs())
-            });
+            detection.incomplete.get_or_insert_with(out_of_time);
             break;
         }
         let abs = root.join(rel.trim_end_matches('/'));
@@ -211,15 +239,19 @@ fn detect_within(
 }
 
 /// Whether `dir` is the top level of a git repository: the same test as a companion's `check_root`.
-fn is_repository(dir: &Path) -> bool {
-    dir.join(".git").try_exists().unwrap_or(false)
+/// An unanswerable probe is an error, not "no" (review f3).
+fn is_repository(dir: &Path) -> std::io::Result<bool> {
+    dir.join(".git").try_exists()
 }
 
 /// A real directory, not a junction or symlink: the descent never follows a reparse point.
-fn is_plain_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
-        .unwrap_or(false)
+fn is_plain_dir(path: &Path) -> std::io::Result<bool> {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+}
+
+/// The scan's own message for a time budget that ran out.
+fn out_of_time() -> String {
+    format!("it ran out of its {}s time budget", SCAN_BUDGET.as_secs())
 }
 
 /// The nested repositories under `root`, as root-relative `dir/` paths. `None` (with `incomplete`
@@ -228,6 +260,7 @@ fn is_plain_dir(path: &Path) -> bool {
 fn enumerate(
     root: &Path,
     limits: &crate::evidence::Limits,
+    deadline: Instant,
     incomplete: &mut Option<String>,
 ) -> Option<Vec<String>> {
     let mut listed = match crate::evidence::untracked_directories(root, limits) {
@@ -251,6 +284,10 @@ fn enumerate(
         incomplete.get_or_insert(why);
     };
     'outer: for rel in listed {
+        if Instant::now() >= deadline {
+            stop(out_of_time(), incomplete);
+            break;
+        }
         let dir = root.join(rel.trim_end_matches('/'));
         inspected += 1;
         if inspected > MAX_INSPECTED_DIRS {
@@ -260,8 +297,10 @@ fn enumerate(
             );
             break;
         }
-        if is_repository(&dir) {
-            found.push(rel.clone());
+        match is_repository(&dir) {
+            Ok(true) => found.push(rel.clone()),
+            Ok(false) => {}
+            Err(e) => stop(format!("`{rel}` could not be checked: {e}"), incomplete),
         }
         // One level down, whether or not `dir` is itself a repository (plan r2 f8).
         let entries = match std::fs::read_dir(&dir) {
@@ -291,8 +330,20 @@ fn enumerate(
                 }
             };
             let child = entry.path();
-            if entry.file_name() == ".git" || !is_plain_dir(&child) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
                 continue;
+            }
+            match is_plain_dir(&child) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    stop(
+                        format!("`{rel}{name}` could not be checked: {e}"),
+                        incomplete,
+                    );
+                    continue;
+                }
             }
             inspected += 1;
             if inspected > MAX_INSPECTED_DIRS {
@@ -302,8 +353,13 @@ fn enumerate(
                 );
                 break 'outer;
             }
-            if is_repository(&child) {
-                found.push(format!("{rel}{}/", entry.file_name().to_string_lossy()));
+            match is_repository(&child) {
+                Ok(true) => found.push(format!("{rel}{name}/")),
+                Ok(false) => {}
+                Err(e) => stop(
+                    format!("`{rel}{name}` could not be checked: {e}"),
+                    incomplete,
+                ),
             }
         }
         if found.len() > MAX_CANDIDATES {
