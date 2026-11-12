@@ -230,7 +230,10 @@ always has it; the Claude reviewer needs a pinned `--claude-profile` — and a g
 refused before it runs. `git` is resolved from PATH and run with a hostile repository's config
 disabled (`diff.external`, textconv, `core.fsmonitor`, and every configured `filter.<driver>` clean
 or process program, so a path such a driver would transform is diffed raw: noisier, never thinner;
-Git LFS paths are instead staged as their pointers by the server's own filter); `repository_diff` accepts only full object
+Git LFS paths are instead staged as their pointers by the server's own filter). Because system config is disabled, the
+server sets one value back itself: Git for Windows' read-side `core.fscache=true` (issue #226), which keeps large working trees
+inside the per-command time limit. Status, ls-files and full-diff output were byte-identical with and without it on the
+measured trees; real symlinks were not tested ([`docs/git-fscache-plan.md`](docs/git-fscache-plan.md)). `repository_diff` accepts only full object
 ids or a closed sentinel set, never a raw ref or option. Full behavior:
 [`docs/retire-capture-modes.md`](docs/retire-capture-modes.md).
 

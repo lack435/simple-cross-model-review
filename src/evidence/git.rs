@@ -406,13 +406,7 @@ fn cat_blob(
         .ok_or_else(|| fail("no job object to contain git".into()))?;
     let mut command = Command::new(bin);
     command
-        .args([
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=",
-            "-c",
-            "core.hooksPath=NUL",
-        ])
+        .args(ISOLATED_PREFIX)
         .args(["cat-file", "blob", id])
         .current_dir(root);
     isolate_env(&mut command, root);
@@ -995,9 +989,7 @@ fn run_classified(
     let bin = crate::reviewer::on_path("git").ok_or(GitFailure::NoGit)?;
     let mut command = Command::new(bin);
     command
-        .arg("--no-pager")
-        .args(["-c", "core.fsmonitor="])
-        .args(["-c", "core.hooksPath=NUL"])
+        .args(ISOLATED_PREFIX)
         .args(args)
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1050,6 +1042,26 @@ fn run_classified(
     }
     Ok(output.stdout)
 }
+
+/// The fixed arguments every isolated git child starts with.
+///
+/// - `core.fsmonitor=` and `core.hooksPath=NUL` keep a repository's own config from running a
+///   program.
+/// - `core.fscache=true` restores the file-system cache Git for Windows enables in the *system*
+///   config, which the runner's `GIT_CONFIG_NOSYSTEM` drops (issue #226). Without it, `git status`
+///   on a 100k-file tree measured ~800 ms against ~55 ms with it. Output was byte-identical in the
+///   measured cases (status, ls-files, full diff, a junction); real symlinks were not tested. It runs
+///   no program, and on a cache miss it lists the parent directory's metadata, which only answers
+///   git's own `lstat`. See `docs/git-fscache-plan.md`. A git without fscache ignores the key.
+const ISOLATED_PREFIX: &[&str] = &[
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.hooksPath=NUL",
+    "-c",
+    "core.fscache=true",
+];
 
 /// Inherited variables that point git at another repository, object store, index or history file,
 /// or inject configuration (issue #218). Every git child the evidence code spawns has them removed,
@@ -2288,6 +2300,26 @@ mod tests {
             ],
         );
         refused(&sub);
+    }
+
+    /// Issue #226: the runner turns Git for Windows' fscache back on, which its config isolation
+    /// would otherwise drop. Command-line `-c` values are visible to `git config --get`, so this
+    /// shows the setting reaching git through the real runner, with no local config setting it.
+    #[test]
+    fn the_runner_enables_fscache() {
+        let Some(dir) = repo("git-fscache") else {
+            return;
+        };
+        let args = ["config".to_string(), "--get".into(), "core.fscache".into()];
+        let out = run(
+            dir.as_path(),
+            &args,
+            &Limits::default(),
+            &AtomicBool::new(false),
+            Instant::now(),
+        )
+        .expect("git config --get core.fscache");
+        assert_eq!(out.trim(), "true");
     }
 
     #[test]
