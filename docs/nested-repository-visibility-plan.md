@@ -5,6 +5,24 @@ gpt-6-luna, effort=xhigh): **converged at round 3**. Eight findings raised: f1 a
 and resolved; f2 resolved by a scope cut (the overclaim and partial checks removed, git-metadata
 confinement for all roots deferred to its own issue), which the reviewer accepted.
 
+**Implementation notes.** Built in two PRs as planned: gaps 1, 2 and 4 in #219 (merged), gap 3 in
+the follow-up. Differences from the plan, each reviewed:
+
+- **Detection runs on a scan thread with a hard bound** (#219 review f2, f4): a 5 s budget checked
+  as it goes, a 6 s wait for its result, 3 s per git call, and at most 4 scan threads in flight
+  process-wide, so a stuck filesystem can neither hold the start response nor pile up threads.
+  Directory and probe errors are detection-incomplete warnings (f3).
+- **`@{upstream}` can only prove a repository changed, never clean** (#219 review f1): level with its
+  upstream and clean is *unknown*, because the upstream may be the branch's own remote copy.
+- **The root's own linked worktrees are excluded** (not anticipated by the plan): without it every
+  `.claude/worktrees/*` reads as a changed nested repository.
+- **Warning wording follows what the server can do**: the `./` form is offered only when the server
+  runs with `--allow-nested-companions` and the review root is its working root; otherwise the
+  warning names `--companion` and the flag.
+- **`./` paths resolve against the server working root**, and a per-call `root` cannot change that.
+  A path that reaches a configured companion's root resolves to that companion under its configured
+  name, and a name and a path to the same repository in one call are refused as a duplicate.
+
 **Revision note (r1 → r2).** Round 1 raised six findings, all accepted:
 
 - **f1** (major): r1 let any calling agent declare a nested path, exposing that repository's git

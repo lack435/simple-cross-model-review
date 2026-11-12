@@ -259,15 +259,29 @@ root tracks nothing under it, so its files never reach the working root's diff a
 checked at startup and again every turn. (Like any ignored path, a nested companion's files stay
 readable by name through the working root's own tools; only its certification moves to its own
 server.) Anything else is refused. The calling agent can only name a configured
-companion, never a path, and the session is bound to the set it declared. Companions are git only
-and need reviewer isolation, so `--companion` is refused beside `--allow-reviewer-config`.
+companion, never a path, unless the server runs with `--allow-nested-companions` (below), and the
+session is bound to the set it declared. Companions are git only and need reviewer isolation, so
+`--companion` is refused beside `--allow-reviewer-config`.
+
+`--allow-nested-companions` (off by default; issue #217) also lets a review declare a nested
+repository without configuring it, as a path starting with `./` relative to the working root:
+`companions: ["./engine"]`. It is held to exactly the checks a configured nested companion passes
+(a git top level reached without junctions, inside the working root, ignored by it with nothing
+tracked under it, disjoint from the state and temp directories, rechecked every turn), and is named
+`n-<directory>` in the session and the hook payload. A `./` entry is always a path and any other
+entry always a configured name; a path that reaches a configured companion's root is that
+companion. **What this widens:** the reviewer can then read that repository's git history, and
+whatever its own git metadata points at, which may lie outside the working root (#218), on the
+calling agent's request rather than the operator's. That is the trust a configured companion
+already gets; the flag extends it to every nested, ignored repository. Git only; not with
+`--allow-reviewer-config`.
 
 A nested repository that is **not** declared on a review is invisible to it: git never descends into
 it, so its change is in no served diff. A git review therefore looks for nested repositories in the
 review root that have changes (uncommitted, or a branch past its `origin` default-branch fork point,
 or past its `@{upstream}` when there is no default branch), or whose state cannot be determined, and
 are not declared, and names each one,
-with the fix, under `warnings:` in the start response and in every turn's result `warnings`. The
+with the fix (the `./` form when the server allows it), under `warnings:` in the start response and in every turn's result `warnings`. The
 reviewer prompt names them too, and tells the reviewer to answer BLOCKED rather than review around
 code it can only see quoted. The warning is advisory: it never refuses a review or blocks
 convergence. The scan is shallow, capped, and limited to a few seconds, one `git ls-files` call for the untracked and ignored

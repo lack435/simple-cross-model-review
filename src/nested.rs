@@ -73,12 +73,20 @@ pub struct Detection {
     pub unserved: Vec<Unserved>,
     /// Why the scan stopped before covering everything it set out to, if it did.
     pub incomplete: Option<String>,
+    /// Whether this review could declare a found repository by `./` path (issue #217: the server
+    /// runs with `--allow-nested-companions` and the review root is its working root), which
+    /// decides the fix the warnings offer.
+    pub path_declarable: bool,
 }
 
 impl Detection {
     /// The caller-facing warnings: one per unserved repository, then one if the scan was incomplete.
     pub fn warnings(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.unserved.iter().map(warning).collect();
+        let mut out: Vec<String> = self
+            .unserved
+            .iter()
+            .map(|u| warning(u, self.path_declarable))
+            .collect();
         if let Some(why) = &self.incomplete {
             out.push(format!(
                 "Detection of nested git repositories stopped early ({why}); a nested repository \
@@ -113,27 +121,27 @@ fn describe(state: &State) -> String {
     }
 }
 
-fn warning(u: &Unserved) -> String {
+fn warning(u: &Unserved, path_declarable: bool) -> String {
     let rel = &u.rel;
     let name = rel.trim_end_matches('/');
     let head = format!(
-        "`{rel}` is a separate git repository inside the reviewed root and {}. This review cannot \
-         see or certify its change.",
+        "`{rel}` is a separate git repository inside the reviewed root and {}. This review cannot          see or certify its change.",
         describe(&u.state)
     );
+    let declare = if path_declarable {
+        format!("re-review with `companions: [\"./{name}\"]`")
+    } else {
+        format!(
+            "configure it as a companion repository (`--companion <name>={name}`) and re-review              with `companions: [\"<name>\"]`, or start the server with              `--allow-nested-companions` and re-review with `companions: [\"./{name}\"]`"
+        )
+    };
     let fix = match &u.kind {
-        Kind::Ignored => format!(
-            "If the change under review includes it, configure it as a companion repository \
-             (`--companion <name>={name}`) and re-review with `companions: [\"<name>\"]`."
-        ),
+        Kind::Ignored => format!("If the change under review includes it, {declare}."),
         Kind::ConfiguredUndeclared(cname) => format!(
-            "It is configured as companion `{cname}`; if the change under review includes it, \
-             re-review with `companions: [\"{cname}\"]`."
+            "It is configured as companion `{cname}`; if the change under review includes it,              re-review with `companions: [\"{cname}\"]`."
         ),
         Kind::NotIgnored => format!(
-            "The reviewed root does not ignore it, so it cannot be a companion; if the change under \
-             review includes it, add `{rel}` to the root's .gitignore and configure it as a \
-             companion repository."
+            "The reviewed root does not ignore it, so it cannot be a companion; if the change under              review includes it, add `{rel}` to the root's .gitignore, then {declare}."
         ),
     };
     format!("{head} {fix}")
@@ -148,8 +156,16 @@ fn warning(u: &Unserved) -> String {
 /// The scan checks the same deadline as it goes and normally returns its partial result just after
 /// it; past the grace it is abandoned, and the git calls it may still be running end on their own
 /// [`GIT_OP_TIMEOUT_MS`].
-pub fn detect(root: &Path, configured: &[Companion], declared: &[Companion]) -> Detection {
-    detect_with_slots(&SCANS_IN_FLIGHT, root, configured, declared)
+pub fn detect(
+    root: &Path,
+    configured: &[Companion],
+    declared: &[Companion],
+    path_declarable: bool,
+) -> Detection {
+    Detection {
+        path_declarable,
+        ..detect_with_slots(&SCANS_IN_FLIGHT, root, configured, declared)
+    }
 }
 
 /// [`detect`] counting its thread against `slots`, so a test can fill its own counter without
@@ -161,8 +177,8 @@ fn detect_with_slots(
     declared: &[Companion],
 ) -> Detection {
     let incomplete = |why: String| Detection {
-        unserved: Vec::new(),
         incomplete: Some(why),
+        ..Detection::default()
     };
     // An abandoned scan blocked in the filesystem cannot be cancelled, so at most
     // `MAX_SCANS_IN_FLIGHT` scan threads exist at once (review f4): past that, a start skips the scan
@@ -608,6 +624,30 @@ mod tests {
         assert!(d.warnings()[0].contains("commits beyond its fork point"));
     }
 
+    /// Issue #217 gap 3: with path declarations available the fix is the `./` form; without, it
+    /// names both `--companion` and the flag.
+    #[test]
+    fn the_fix_offered_depends_on_whether_paths_can_be_declared() {
+        let l = layout("nested-fix-wording");
+        commit(&l.engine, "fix.cpp");
+        let mut d = scan(&l.primary, &[], &[]);
+        let without = d.warnings();
+        assert!(
+            without[0].contains("--companion <name>=engine")
+                && without[0].contains("--allow-nested-companions"),
+            "{}",
+            without[0]
+        );
+        d.path_declarable = true;
+        let with = d.warnings();
+        assert!(
+            with[0].contains(r#"companions: ["./engine"]"#),
+            "{}",
+            with[0]
+        );
+        assert!(!with[0].contains("--companion "), "{}", with[0]);
+    }
+
     #[test]
     fn upstream_is_the_fallback_base_and_no_base_is_unknown() {
         let l = layout("nested-upstream");
@@ -649,7 +689,7 @@ mod tests {
             name: "eng".into(),
             root: l.engine.clone(),
         };
-        assert!(detect(
+        assert!(scan(
             &l.primary,
             std::slice::from_ref(&engine),
             std::slice::from_ref(&engine)
@@ -732,7 +772,7 @@ mod tests {
     #[test]
     fn a_failed_listing_is_an_incomplete_warning_not_an_error() {
         let dir = crate::testutil::temp_dir("nested-not-a-repo");
-        let d = detect(dir.as_path(), &[], &[]);
+        let d = scan(dir.as_path(), &[], &[]);
         assert!(d.unserved.is_empty());
         assert!(d.incomplete.is_some());
         assert!(d.warnings()[0].contains("stopped early"));

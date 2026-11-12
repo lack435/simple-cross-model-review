@@ -1034,6 +1034,11 @@ pub struct Config {
     /// empty on the server's own config; set only on the per-call config `start` builds, as `cwd`
     /// is for a per-call `root`, so everything downstream reads one place.
     pub declared_companions: Vec<crate::companion::Companion>,
+    /// `--allow-nested-companions` (issue #217): a review may also declare, by a `./` path relative
+    /// to the working root, any git repository nested in the working root and ignored by it, without
+    /// it being configured. Off by default, so without it a caller can name only configured
+    /// companions. Git only, and needs reviewer isolation, like `--companion`.
+    pub allow_nested_companions: bool,
 }
 
 /// A resolved, authorized profile home together with the account the allowlist authorized it for.
@@ -1109,6 +1114,7 @@ impl Config {
         let mut event_program: Option<String> = None;
         let mut event_args: Vec<String> = Vec::new();
         let mut companion_args: Vec<(String, String)> = Vec::new();
+        let mut allow_nested_companions = false;
         let mut event_timeout_secs: Option<u64> = None;
         let mut event_include_findings = false;
         let mut capture_program: Option<String> = None;
@@ -1419,6 +1425,7 @@ impl Config {
                 "--companion" => {
                     companion_args.push(crate::companion::parse_flag(&take("--companion")?)?)
                 }
+                "--allow-nested-companions" => allow_nested_companions = true,
                 "--on-event-include-findings" => event_include_findings = true,
                 "--capture-hook" => capture_program = Some(take("--capture-hook")?),
                 "--capture-hook-arg" => capture_args.push(take("--capture-hook-arg")?),
@@ -1667,6 +1674,18 @@ impl Config {
                     .to_string(),
             );
         }
+        if allow_nested_companions && !isolate_reviewer {
+            return Err(
+                "--allow-nested-companions needs reviewer isolation; it cannot be combined with                  --allow-reviewer-config"
+                    .to_string(),
+            );
+        }
+        if allow_nested_companions && vcs != Vcs::Git {
+            return Err(
+                "--allow-nested-companions needs a git working root; Perforce companions are not                  supported"
+                    .to_string(),
+            );
+        }
         // Resolved last, once the state directory every companion must stay disjoint from is known.
         let companions = crate::companion::resolve_all(
             &companion_args,
@@ -1713,6 +1732,7 @@ impl Config {
             status_json: status_flag,
             companions,
             declared_companions: Vec::new(),
+            allow_nested_companions,
         })
     }
 
@@ -2758,6 +2778,13 @@ COMPANION REPOSITORIES (issue #167; off unless --companion is given):
                               state and temp directories. It may be inside the working
                               root only if the working root git-ignores it. Git only;
                               not with --allow-reviewer-config.
+  --allow-nested-companions   Also let a review declare, as companions: ["./<path>"], any
+                              git repository nested in the working root and git-ignored
+                              by it, without configuring it. It is held to the same checks
+                              as a configured nested companion, and is named n-<dir>.
+                              The reviewer can then read that repository's git history
+                              (and whatever its git metadata points at). Git only; not
+                              with --allow-reviewer-config.
 
 CAPTURE HOOK (issue #174; off unless --capture-hook is given):
   --capture-hook <program>    Convert binary files in a change to text the reviewer sees and

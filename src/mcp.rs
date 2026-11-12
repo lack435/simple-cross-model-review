@@ -1286,10 +1286,11 @@ fn tool_definitions(app: &App) -> Vec<Value> {
         }
     }
 
-    // Companion repositories (issue #167) are advertised only when the server configured some, with
-    // their names as the enum, so a caller discovers them from the schema and a server without any
-    // advertises nothing new.
-    if !cfg.companions.is_empty() {
+    // Companion repositories (issue #167) are advertised only when the server configured some, or
+    // accepts nested-repository paths (issue #217, `--allow-nested-companions`), so a server with
+    // neither advertises nothing new. Configured names are an enum unless paths are accepted too, in
+    // which case the items are free strings and the description says which forms are valid.
+    if !cfg.companions.is_empty() || cfg.allow_nested_companions {
         let menu = cfg
             .companions
             .iter()
@@ -1297,17 +1298,27 @@ fn tool_definitions(app: &App) -> Vec<Value> {
             .collect::<Vec<_>>()
             .join("; ");
         let names: Vec<&str> = cfg.companions.iter().map(|c| c.name.as_str()).collect();
+        let items = if cfg.allow_nested_companions {
+            json!({ "type": "string" })
+        } else {
+            json!({ "type": "string", "enum": names })
+        };
+        let configured = if menu.is_empty() {
+            "None are configured.".to_string()
+        } else {
+            format!("Configured: {menu}.")
+        };
+        let paths = if cfg.allow_nested_companions {
+            " Besides a configured name, an entry may be a path starting with './', relative to the              working root, naming a separate git repository nested in the working root and ignored              by it (for example \"./engine\")."
+        } else {
+            ""
+        };
         let companions_prop = json!({
             "type": "array",
-            "items": { "type": "string", "enum": names },
+            "items": items,
             "uniqueItems": true,
             "description": format!(
-                "Optional. Configured companion git repositories to include: for a change that spans \
-                 this repository and a paired branch in another (for example generated output here, \
-                 the code that generated it there). Each is served to the reviewer through its own \
-                 read-only evidence server, and a review converges only if every declared \
-                 repository's whole change was served. The session is bound to the set: a resume \
-                 must name the same companions (use fresh:true to change them). Configured: {menu}."
+                "Optional. Companion git repositories to include: for a change that spans                  this repository and a paired branch in another (for example generated output here,                  the code that generated it there). Each is served to the reviewer through its own                  read-only evidence server, and a review converges only if every declared                  repository's whole change was served. The session is bound to the set: a resume                  must name the same companions (use fresh:true to change them). {configured}{paths}"
             )
         });
         for tool in tools.iter_mut() {
@@ -1664,6 +1675,38 @@ mod tests {
                     .iter()
                     .any(|v| v == "companions"),
                 "{tool}"
+            );
+        }
+
+        // Issue #217: with --allow-nested-companions the property is advertised even with nothing
+        // configured, its items are free strings, and the description gives the './' form.
+        let mut cfg = Config::from_args(&[
+            "--reviewer".into(),
+            "codex".into(),
+            "--level".into(),
+            "standard:gpt-6-luna:max".into(),
+        ])
+        .expect("config");
+        cfg.allow_nested_companions = true;
+        let listed = handle_sync(
+            &Arc::new(App::new(cfg)),
+            "tools/list",
+            &Value::Null,
+            &json!(3),
+        );
+        for name in ["cross_model_review", "cross_model_consult"] {
+            let tool = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .expect("start tool");
+            let prop = &tool["inputSchema"]["properties"]["companions"];
+            assert_eq!(prop["items"], json!({"type": "string"}), "{tool}");
+            let description = prop["description"].as_str().unwrap();
+            assert!(
+                description.contains("'./'") && description.contains("None are configured"),
+                "{description}"
             );
         }
     }

@@ -1,6 +1,6 @@
 //! The four tools, and the state they share.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -977,14 +977,18 @@ impl App {
         // lease, like `root` -- onto the per-call config. Roots always come from the server's startup
         // configuration, never from anything relative to a per-call `root`. Parsed strictly: the
         // server does not enforce the schema, so a stray or malformed value is refused, not ignored.
-        let declared = parse_companions_arg(args, &self.cfg.companions)?;
-        // A companion may be nested in the server's working root (issue #170), and a per-call `root`
-        // is a worktree nested there too; the two must not overlap, or one tree would be reviewed
-        // as both.
-        if let Some(c) = declared.iter().find(|c| {
-            crate::reviewer::is_within(&c.root, &cfg.cwd)
-                || crate::reviewer::is_within(&cfg.cwd, &c.root)
-        }) {
+        // A `./` path (issue #217) is always relative to the server's own working root, never to a
+        // per-call `root` worktree, exactly as configured companion roots are.
+        let temp_dir = std::env::temp_dir();
+        let nested = self.cfg.allow_nested_companions.then(|| {
+            (
+                self.cfg.cwd.as_path(),
+                self.cfg.state_dir.as_path(),
+                temp_dir.as_path(),
+            )
+        });
+        let declared = parse_companions_arg(args, &self.cfg.companions, nested)?;
+        if let Some(c) = companion_overlapping_review_root(&declared, &cfg.cwd, &self.cfg.cwd) {
             return Err(errors::bad_request(format!(
                 "companion '{}' ({}) overlaps the review root ({}); a companion must be a separate \
                  tree from the root being reviewed.",
@@ -1403,7 +1407,14 @@ impl App {
         // (issue #217). Found here, before the worker starts, so the start response can name them
         // while the caller can still cancel and re-declare; the turn carries the same warnings.
         let nested = if cfg.vcs == crate::config::Vcs::Git {
-            crate::nested::detect(&cfg.cwd, &self.cfg.companions, &cfg.declared_companions)
+            crate::nested::detect(
+                &cfg.cwd,
+                &self.cfg.companions,
+                &cfg.declared_companions,
+                // `./` paths resolve against the server's own root, so they are only the fix to
+                // offer when that is the root being reviewed.
+                self.cfg.allow_nested_companions && server_root.is_none(),
+            )
         } else {
             crate::nested::Detection::default()
         };
@@ -6860,60 +6871,120 @@ fn string_arg(args: &Value, key: &str) -> Option<String> {
 }
 
 /// Parse the `companions` request argument (issue #167) against the configured companions. Absent,
-/// null or an empty array declares none. Every entry must be a distinct configured name; the result
-/// keeps the caller's order. An unknown name, or any value when none are configured, is refused with
-/// the configured list so the caller can correct it.
+/// null or an empty array declares none. Every entry must be a distinct configured name, or, when the
+/// server allows nested companions (issue #217, `nested` is `Some((server root, state dir, temp
+/// dir))`), a
+/// `./`-prefixed path to a repository nested in and ignored by the server root; the result keeps the
+/// caller's order. Two entries that reach the same repository are refused as a duplicate. An unknown
+/// name, or any value when nothing can be declared, is refused with what can be, so the caller can
+/// correct it.
 fn parse_companions_arg(
     args: &Value,
     configured: &[crate::companion::Companion],
+    nested: Option<(&Path, &Path, &Path)>,
 ) -> Result<Vec<crate::companion::Companion>, Failure> {
     let items = match args.get("companions") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(items)) => items,
         Some(_) => {
-            return Err(errors::bad_request(
-                "'companions' must be an array of configured companion names.",
-            ))
+            return Err(errors::bad_request(if nested.is_some() {
+                "'companions' must be an array of configured companion names or './' paths."
+            } else {
+                "'companions' must be an array of configured companion names."
+            }))
         }
     };
     let available = || {
-        if configured.is_empty() {
-            "this server has no companion repositories configured (--companion); omit \
-             'companions'"
-                .to_string()
+        let names = if configured.is_empty() {
+            None
         } else {
-            format!(
+            Some(format!(
                 "configured companions: {}",
                 configured
                     .iter()
                     .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
+            ))
+        };
+        match (names, nested.is_some()) {
+            (None, false) => "this server has no companion repositories configured (--companion);                               omit 'companions'"
+                .to_string(),
+            (Some(names), false) => names,
+            (None, true) => "no companions are configured; declare a repository nested in the                              working root and ignored by it as './<path>'"
+                .to_string(),
+            (Some(names), true) => format!(
+                "{names}; or declare a repository nested in the working root and ignored by it as                  './<path>'"
+            ),
         }
     };
+    let same_root =
+        |a: &Path, b: &Path| crate::reviewer::is_within(a, b) && crate::reviewer::is_within(b, a);
     let mut declared: Vec<crate::companion::Companion> = Vec::new();
     for item in items {
-        let Some(name) = item.as_str() else {
+        let Some(entry) = item.as_str() else {
             return Err(errors::bad_request(format!(
-                "'companions' entries must be names; {}.",
+                "'companions' entries must be strings; {}.",
                 available()
             )));
         };
-        let Some(c) = configured.iter().find(|c| c.name == name) else {
-            return Err(errors::bad_request(format!(
-                "'companions' names '{name}', which is not configured; {}.",
-                available()
-            )));
+        let c = if crate::companion::is_path_entry(entry) {
+            let Some((server_root, state_dir, temp_dir)) = nested else {
+                return Err(errors::bad_request(format!(
+                    "'companions' entry '{entry}' is a path, and this server does not accept                      companion paths (start it with --allow-nested-companions to allow them); {}.",
+                    available()
+                )));
+            };
+            crate::companion::resolve_path_entry(
+                entry,
+                server_root,
+                configured,
+                state_dir,
+                temp_dir,
+            )
+            .map_err(|e| errors::bad_request(format!("'companions': {e}.")))?
+        } else {
+            match configured.iter().find(|c| c.name == entry) {
+                Some(c) => c.clone(),
+                None => {
+                    return Err(errors::bad_request(format!(
+                        "'companions' names '{entry}', which is not configured; {}.",
+                        available()
+                    )))
+                }
+            }
         };
-        if declared.iter().any(|d| d.name == c.name) {
+        if declared
+            .iter()
+            .any(|d| d.name == c.name || same_root(&d.root, &c.root))
+        {
             return Err(errors::bad_request(format!(
-                "'companions' names '{name}' more than once."
+                "'companions' names the same repository more than once ('{entry}')."
             )));
         }
-        declared.push(c.clone());
+        declared.push(c);
     }
     Ok(declared)
+}
+
+/// The first declared companion that overlaps a per-call `root` worktree, if any. A companion may be
+/// nested in the server's working root (issue #170), and a per-call `root` is a worktree nested
+/// there too; those two must not overlap, or one tree would be reviewed as both. When the review root
+/// *is* the server's working root there is nothing to check: a nested companion is inside it by
+/// design, and its startup and per-turn checks already keep it out of the root's diff. (Before issue
+/// #217 this check ran in that case too, which refused every nested companion.)
+fn companion_overlapping_review_root<'a>(
+    declared: &'a [crate::companion::Companion],
+    review_root: &Path,
+    server_root: &Path,
+) -> Option<&'a crate::companion::Companion> {
+    if review_root == server_root {
+        return None;
+    }
+    declared.iter().find(|c| {
+        crate::reviewer::is_within(&c.root, review_root)
+            || crate::reviewer::is_within(review_root, &c.root)
+    })
 }
 
 /// Parse the `change` request argument into validated changelist numbers.
@@ -8555,7 +8626,7 @@ mod tests {
     #[test]
     fn the_companions_argument_is_parsed_strictly() {
         let configured = vec![companion("assets", r"C:\a"), companion("docs", r"C:\d")];
-        let parse = |v: Value| parse_companions_arg(&v, &configured);
+        let parse = |v: Value| parse_companions_arg(&v, &configured, None);
         assert!(parse(json!({})).unwrap().is_empty());
         assert!(parse(json!({"companions": null})).unwrap().is_empty());
         assert!(parse(json!({"companions": []})).unwrap().is_empty());
@@ -8570,8 +8641,62 @@ mod tests {
         assert!(parse(json!({"companions": "assets"})).is_err());
         assert!(parse(json!({"companions": [1]})).is_err());
         // A server with none configured refuses any declaration, saying so.
-        let err = parse_companions_arg(&json!({"companions": ["assets"]}), &[]).unwrap_err();
+        let err = parse_companions_arg(&json!({"companions": ["assets"]}), &[], None).unwrap_err();
         assert!(err.summary.contains("no companion"), "{}", err.summary);
+    }
+
+    /// Issue #217: `./` path entries are refused unless the server allows nested companions, and
+    /// when it does they resolve against the server root; a path and a name that reach the same
+    /// repository are one companion, declared twice.
+    #[test]
+    fn companion_paths_need_the_flag_and_resolve_against_the_server_root() {
+        let dir = crate::testutil::temp_dir("companion-path-arg");
+        let base = crate::config::normalize_dir(dir.as_path().to_path_buf());
+        let primary = base.join("primary");
+        let state = base.join("state");
+        let temp = base.join("tmp");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        crate::companion::tests::init_repo(&primary);
+        crate::companion::tests::init_repo(&primary.join("engine"));
+        std::fs::write(primary.join(".gitignore"), "engine/\n").unwrap();
+        let args = json!({"companions": ["./engine"]});
+
+        let err = parse_companions_arg(&args, &[], None).unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
+        assert!(
+            err.summary.contains("--allow-nested-companions"),
+            "{}",
+            err.summary
+        );
+
+        let nested = Some((primary.as_path(), state.as_path(), temp.as_path()));
+        let got = parse_companions_arg(&args, &[], nested).expect("declared by path");
+        assert_eq!(got[0].name, "n-engine");
+        assert_eq!(got[0].root, primary.join("engine"));
+
+        // The same repository by name and by path is a duplicate.
+        let configured = vec![crate::companion::Companion {
+            name: "eng".into(),
+            root: primary.join("engine"),
+        }];
+        let err = parse_companions_arg(
+            &json!({"companions": ["eng", "./engine"]}),
+            &configured,
+            nested,
+        )
+        .unwrap_err();
+        assert!(err.summary.contains("more than once"), "{}", err.summary);
+
+        // A bare word is a configured name only, never a path.
+        let err =
+            parse_companions_arg(&json!({"companions": ["engine"]}), &[], nested).unwrap_err();
+        assert!(err.summary.contains("not configured"), "{}", err.summary);
+
+        // A path outside the server root is refused.
+        let err =
+            parse_companions_arg(&json!({"companions": ["./../x"]}), &[], nested).unwrap_err();
+        assert_eq!(err.code, "BAD_REQUEST");
     }
 
     #[test]
@@ -10079,6 +10204,29 @@ mod tests {
 
     /// Issue #170: a companion may be nested in the working root, and so may a per-call `root`
     /// worktree; a review that declares a companion overlapping its own review root is refused.
+    /// Issue #217: a companion nested in the server's working root is accepted when that root is
+    /// the one being reviewed, and refused only against a per-call `root` it overlaps.
+    #[test]
+    fn a_nested_companion_overlaps_only_a_per_call_root() {
+        let server = PathBuf::from(r"C:\dev\primary");
+        let engine = crate::companion::Companion {
+            name: "engine".into(),
+            root: server.join("engine"),
+        };
+        let declared = std::slice::from_ref(&engine);
+        assert!(companion_overlapping_review_root(declared, &server, &server).is_none());
+        let worktree = server.join(".claude").join("worktrees").join("x");
+        assert!(companion_overlapping_review_root(declared, &worktree, &server).is_none());
+        let inside = crate::companion::Companion {
+            name: "inside".into(),
+            root: worktree.join("engine"),
+        };
+        assert_eq!(
+            companion_overlapping_review_root(std::slice::from_ref(&inside), &worktree, &server),
+            Some(&inside)
+        );
+    }
+
     #[test]
     fn a_companion_overlapping_the_review_root_is_refused() {
         let (_dirs, app, wt) = worktree_app("root-companion-overlap");
