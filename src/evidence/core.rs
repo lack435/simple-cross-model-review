@@ -171,6 +171,61 @@ const STAMP_WATCHDOG: ReadWatchdog = ReadWatchdog {
     cap: READ_WORKER_CAP,
 };
 
+/// The four worker pools one evidence service draws on.
+///
+/// Production is one service per process with a single request thread, so the process-wide
+/// statics above *are* that service's pools. A test binary runs many services at once, one per test
+/// thread, and sharing the statics made parallel tests refuse each other with `read_unavailable`
+/// (issue #222): which tests failed depended on what else was running. So under `cfg(test)` each
+/// test thread gets pools of its own, with the production budgets, caps and read/stamp sharing, which
+/// is the production shape again: one service, one set of pools. Production is unchanged.
+#[derive(Clone, Copy)]
+struct Pools {
+    read: &'static ReadWatchdog,
+    stamp: &'static ReadWatchdog,
+    walk: &'static ReadWatchdog,
+    child: &'static ReadWatchdog,
+}
+
+impl Pools {
+    #[cfg(not(test))]
+    fn current() -> Self {
+        Self {
+            read: &READ_WATCHDOG,
+            stamp: &STAMP_WATCHDOG,
+            walk: &WALK_WATCHDOG,
+            child: &CHILD_WATCHDOG,
+        }
+    }
+
+    #[cfg(test)]
+    fn current() -> Self {
+        thread_local! {
+            static POOLS: Pools = Pools::isolated();
+        }
+        POOLS.with(|pools| *pools)
+    }
+
+    /// Fresh counters behind copies of the production watchdogs. Leaked once per test thread.
+    #[cfg(test)]
+    fn isolated() -> Self {
+        fn counter() -> &'static AtomicUsize {
+            Box::leak(Box::new(AtomicUsize::new(0)))
+        }
+        fn with_live(template: ReadWatchdog, live: &'static AtomicUsize) -> &'static ReadWatchdog {
+            Box::leak(Box::new(ReadWatchdog { live, ..template }))
+        }
+        // The stamp shares the read pool, exactly as `STAMP_WATCHDOG` shares `LIVE_READ_WORKERS`.
+        let read_live = counter();
+        Self {
+            read: with_live(READ_WATCHDOG, read_live),
+            stamp: with_live(STAMP_WATCHDOG, read_live),
+            walk: with_live(WALK_WATCHDOG, counter()),
+            child: with_live(CHILD_WATCHDOG, counter()),
+        }
+    }
+}
+
 /// A read failure that preserves whether the underlying OS error was a transient sharing/lock
 /// contention (retryable) rather than flattening every `io::Error` to `read_failed` and losing the
 /// raw code before the retry predicate can see it (finding f10/f14). The classification is made at
@@ -320,9 +375,13 @@ fn read_job(job: ReadJob) -> Result<ReadOutput, ReadFailure> {
 /// Run a read job under the production watchdog: a detached worker bounded by the receipt-anchored
 /// budget, one retry on a transient failure, and the live-worker cap. Returns a fast in-band error
 /// rather than ever blocking the request loop.
-fn run_bounded_read(job: ReadJob, received_at: Instant) -> Result<ReadOutput, EvidenceError> {
+fn run_bounded_read(
+    watchdog: &ReadWatchdog,
+    job: ReadJob,
+    received_at: Instant,
+) -> Result<ReadOutput, EvidenceError> {
     let label = job.path_label();
-    bounded_attempts(&READ_WATCHDOG, received_at, &label, move || {
+    bounded_attempts(watchdog, received_at, &label, move || {
         let job = job.clone();
         move || read_job(job)
     })
@@ -334,6 +393,7 @@ fn run_bounded_read(job: ReadJob, received_at: Instant) -> Result<ReadOutput, Ev
 /// (no retry — re-walking the whole tree after a timeout is pointless) using the full budget; a
 /// `tree_stamp` error is fatal, not a transient to retry.
 fn run_bounded_stamp(
+    watchdog: &ReadWatchdog,
     root: &Path,
     limits: &Limits,
     source: Option<Vec<String>>,
@@ -343,7 +403,7 @@ fn run_bounded_stamp(
     let root = root.to_path_buf();
     let limits = limits.clone();
     let cancel = Arc::clone(cancel);
-    bounded_attempts(&STAMP_WATCHDOG, received_at, "drift-stamp", move || {
+    bounded_attempts(watchdog, received_at, "drift-stamp", move || {
         let root = root.clone();
         let limits = limits.clone();
         let cancel = Arc::clone(&cancel);
@@ -632,9 +692,13 @@ pub struct Core {
     /// The pool the child-process routes (`git diff`, `git history`, the Perforce commands) run
     /// under. A seam on exactly the same terms as `walk_watchdog`: production always gets
     /// `CHILD_WATCHDOG`, capped at two because the service is serial. A test harness is not
-    /// serial, so tests that merely *use* one of those routes draw on a roomier pool of their own
-    /// rather than refusing each other with `read_unavailable` (issue #197).
+    /// serial: every test thread gets its own pools by default (issue #222, see [`Pools`]), and a
+    /// test running more than one route at once can still opt into a roomier pool (issue #197).
     child_watchdog: &'static ReadWatchdog,
+    /// The pools `repository_read`/search reads and the drift stamp run under: `READ_WATCHDOG` and
+    /// `STAMP_WATCHDOG` in production, this test thread's own in tests (see [`Pools`]).
+    read_watchdog: &'static ReadWatchdog,
+    stamp_watchdog: &'static ReadWatchdog,
     /// `SEARCH_SLICE_MS`, injectable for the same reason `walk_watchdog` is.
     search_slice: Duration,
 }
@@ -679,6 +743,7 @@ impl Core {
         }
         // Validated again here, in the process that serves it, then pinned (issue #218): from now
         // on git neither discovers the repository nor reads `core.worktree`.
+        let pools = Pools::current();
         let git_pin = match bundle.vcs {
             VcsKind::Git if check_layout => Some(super::git::pin(
                 &root,
@@ -711,8 +776,10 @@ impl Core {
             cancel,
             _git_pin: git_pin,
             serve_record: None,
-            walk_watchdog: &WALK_WATCHDOG,
-            child_watchdog: &CHILD_WATCHDOG,
+            walk_watchdog: pools.walk,
+            child_watchdog: pools.child,
+            read_watchdog: pools.read,
+            stamp_watchdog: pools.stamp,
             search_slice: Duration::from_millis(SEARCH_SLICE_MS),
         })
     }
@@ -1105,6 +1172,7 @@ impl Core {
             }
             searched += 1;
             let bytes = match run_bounded_read(
+                self.read_watchdog,
                 ReadJob {
                     target: ReadTarget::Resolved(file.clone()),
                     root: self.root.clone(),
@@ -1185,6 +1253,7 @@ impl Core {
         // budget. The drift stamp is computed afterward on the main thread (below), preserving the
         // original content-errors-before-stamp order (code-review finding f3).
         let output = run_bounded_read(
+            self.read_watchdog,
             ReadJob {
                 target: ReadTarget::Raw(path.clone()),
                 root: self.root.clone(),
@@ -1318,6 +1387,8 @@ impl Core {
             self.bundle.vcs,
             &self.cancel,
             received_at,
+            self.child_watchdog,
+            self.stamp_watchdog,
         )?;
         self.observed_stamp = Some(current_stamp.clone());
         self.observed_method = Some(method);
@@ -2799,7 +2870,16 @@ fn tree_stamp(root: &Path, limits: &Limits, cancel: &AtomicBool) -> Result<Strin
 /// started, and a tree over `max_files` refused it outright. Both now end in `Drift::Unavailable`.
 pub fn initial_stamp(root: &Path, limits: &Limits, vcs: VcsKind) -> Drift {
     let cancel = Arc::new(AtomicBool::new(false));
-    match observe_drift(root, limits, vcs, &cancel, Instant::now()) {
+    let pools = Pools::current();
+    match observe_drift(
+        root,
+        limits,
+        vcs,
+        &cancel,
+        Instant::now(),
+        pools.child,
+        pools.stamp,
+    ) {
         Ok((drift, _)) => drift,
         // Unreachable in practice: nothing cancels a capture-time scan. Kept total rather than
         // unwrapped so a future caller with a real flag cannot panic here.
@@ -2812,12 +2892,15 @@ pub fn initial_stamp(root: &Path, limits: &Limits, vcs: VcsKind) -> Drift {
 /// Sequential, never nested — no worker waits on another pool's worker, so a wedged Git child can
 /// only ever cost the child pool. Every failure becomes `Drift::Unavailable` with the reason
 /// attached; the one exception is cancellation, which is not an observation and stays an error.
+#[allow(clippy::too_many_arguments)]
 fn observe_drift(
     root: &Path,
     limits: &Limits,
     vcs: VcsKind,
     cancel: &Arc<AtomicBool>,
     received_at: Instant,
+    child: &ReadWatchdog,
+    stamp: &ReadWatchdog,
 ) -> Result<(Drift, StampMethod), EvidenceError> {
     let enumeration = if vcs == VcsKind::Git {
         let owned_root = root.to_path_buf();
@@ -2825,7 +2908,7 @@ fn observe_drift(
         let owned_cancel = Arc::clone(cancel);
         // The inner `Result` is deliberate: the watchdog must only report *its own* failure, so
         // the enumeration's classification survives to the match below instead of being flattened.
-        let outcome = run_bounded_walk(&CHILD_WATCHDOG, "git ls-files", received_at, move || {
+        let outcome = run_bounded_walk(child, "git ls-files", received_at, move || {
             Ok(super::git::reviewable_paths(
                 &owned_root,
                 &owned_limits,
@@ -2862,7 +2945,7 @@ fn observe_drift(
         ScanSource::Refused(e) => return Ok((Drift::unavailable(e.to_string()), StampMethod::Git)),
     };
 
-    match run_bounded_stamp(root, limits, source, cancel, received_at) {
+    match run_bounded_stamp(stamp, root, limits, source, cancel, received_at) {
         Ok(sha256) => Ok((Drift::Stamp { method, sha256 }, method)),
         Err(e) if e.code == "cancelled" => Err(e),
         Err(e) => Ok((Drift::unavailable(e.to_string()), method)),
@@ -4680,6 +4763,7 @@ mod tests {
 
         // And a stamp over a set with a hole in it is refused rather than hashed.
         let stamped = run_bounded_stamp(
+            Pools::current().stamp,
             &root,
             &Limits::default(),
             Some(listed.to_vec()),
@@ -4717,7 +4801,9 @@ mod tests {
                 &Limits::default(),
                 VcsKind::Perforce,
                 &cancel,
-                Instant::now()
+                Instant::now(),
+                Pools::current().child,
+                Pools::current().stamp,
             )
             .unwrap_err()
             .code,
