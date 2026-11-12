@@ -247,6 +247,107 @@ pub fn resolve_all(
     Ok(out)
 }
 
+/// Whether a `companions` entry is a path declaration (`./<path>` or `.\<path>`, issue #217) rather
+/// than a configured name. Purely syntactic, so a name never falls back to a path or back.
+pub fn is_path_entry(entry: &str) -> bool {
+    entry.starts_with("./") || entry.starts_with(".\\")
+}
+
+/// The name a path-declared companion is known by: `n-` plus its directory name, lowercased, with
+/// anything outside `[a-z0-9-]` turned into `-`, cut to [`MAX_NAME_LEN`]. The prefix keeps it out of
+/// the way of configured names, which an operator chose.
+fn derived_name(root: &Path) -> String {
+    let base = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut name = String::from("n-");
+    for ch in base.chars() {
+        if name.len() >= MAX_NAME_LEN {
+            break;
+        }
+        name.push(
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+                ch
+            } else {
+                '-'
+            },
+        );
+    }
+    name
+}
+
+/// Resolve a per-review path declaration (issue #217, `--allow-nested-companions`): a repository
+/// nested in the **server** working root `server_root` and ignored by it, named by a `./`-prefixed
+/// path relative to that root. Held to exactly the checks a configured nested companion passes
+/// (`check_root`, then `check_against_root`), and additionally refused unless it resolves inside
+/// `server_root`: a call can never reach a sibling repository, which stays an operator decision. A
+/// path that resolves to a configured companion's root *is* that companion, under its configured
+/// name, so a session binds the same way whichever form named it.
+pub fn resolve_path_entry(
+    entry: &str,
+    server_root: &Path,
+    configured: &[Companion],
+    state_dir: &Path,
+    temp_dir: &Path,
+) -> Result<Companion, String> {
+    let rest = entry
+        .strip_prefix("./")
+        .or_else(|| entry.strip_prefix(".\\"))
+        .ok_or_else(|| format!("companion path '{entry}' must start with './'"))?;
+    let rel = Path::new(rest);
+    let plain = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if rest.trim_matches(['/', '\\']).is_empty() || !plain {
+        return Err(format!(
+            "companion path '{entry}' must name a directory below the working root, with no \
+             '..', '.', drive or root component"
+        ));
+    }
+    let joined = server_root.join(rel);
+    // Checked on the path as given, before canonicalizing, so a junction along it is refused rather
+    // than resolved through.
+    crate::winsec::reject_reparse_on_ancestors(&joined)
+        .map_err(|e| format!("companion path '{entry}' ({}): {e}", joined.display()))?;
+    let root = std::fs::canonicalize(&joined)
+        .map(crate::config::normalize_dir)
+        .map_err(|e| {
+            format!(
+                "companion path '{entry}' ({}) cannot be resolved: {e}",
+                joined.display()
+            )
+        })?;
+    if !crate::reviewer::is_within(&root, server_root)
+        || crate::reviewer::is_within(server_root, &root)
+    {
+        return Err(format!(
+            "companion path '{entry}' resolves to {}, which is not inside the working root ({})",
+            root.display(),
+            server_root.display()
+        ));
+    }
+    if let Some(c) = configured.iter().find(|c| {
+        crate::reviewer::is_within(&c.root, &root) && crate::reviewer::is_within(&root, &c.root)
+    }) {
+        return Ok(c.clone());
+    }
+    let name = derived_name(&root);
+    validate_name(&name).map_err(|_| {
+        format!("companion path '{entry}' does not give a usable companion name ('{name}')")
+    })?;
+    if let Some(c) = configured.iter().find(|c| c.name == name) {
+        return Err(format!(
+            "companion path '{entry}' would be named '{name}', which is already the configured \
+             companion at {}; configure this repository with --companion under another name",
+            c.root.display()
+        ));
+    }
+    check_root(&name, &root, state_dir, temp_dir)?;
+    check_against_root(&name, &root, server_root)?;
+    Ok(Companion { name, root })
+}
+
 /// Re-check, just before a turn uses it, that a companion still resolves to its configured root
 /// and still passes every startup check against this turn's temp directory, including, for one
 /// nested in the server's working root `server_root`, that the working root still ignores it. Cheap,
@@ -633,6 +734,89 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(err.contains("contains the working root"), "{err}");
+    }
+
+    /// Issue #217: a `./` path declaration is accepted only in the #170 shape, inside the working
+    /// root; a configured root keeps its configured name; names never collide silently.
+    #[test]
+    fn a_path_entry_is_accepted_only_for_an_ignored_repository_inside_the_working_root() {
+        let l = layout("companion-path");
+        let engine = l.primary.join("engine");
+        init_repo(&engine);
+        let resolve = |entry: &str, configured: &[Companion]| {
+            resolve_path_entry(entry, &l.primary, configured, &l.state, &l.temp)
+        };
+        assert!(is_path_entry("./engine") && is_path_entry(".\\engine"));
+        assert!(!is_path_entry("engine") && !is_path_entry("../engine"));
+
+        // Not ignored yet: refused with the #170 wording.
+        let err = resolve("./engine", &[]).unwrap_err();
+        assert!(err.contains("does not ignore it"), "{err}");
+
+        std::fs::write(l.primary.join(".gitignore"), "engine/\nvendor/\n").unwrap();
+        let c = resolve("./engine", &[]).expect("ignored nested repository");
+        assert_eq!(c.name, "n-engine");
+        assert_eq!(c.root, engine);
+        assert_eq!(resolve(".\\engine\\", &[]).unwrap(), c);
+        recheck(&c, &l.primary, &l.state, &l.temp).expect("recheck passes");
+
+        // Outside the working root, by `..` or by an absolute path.
+        for bad in ["./../assets", "./engine/../../assets", "./", "./."] {
+            assert!(resolve(bad, &[]).is_err(), "{bad} should be refused");
+        }
+        let abs = format!("./{}", l.assets.display());
+        assert!(resolve(&abs, &[]).is_err());
+
+        // A plain directory is not a repository.
+        std::fs::create_dir_all(l.primary.join("vendor").join("plain")).unwrap();
+        assert!(resolve("./vendor/plain", &[])
+            .unwrap_err()
+            .contains("not the top level"));
+
+        // A configured companion's root resolves to that companion, under its configured name.
+        let configured = Companion {
+            name: "eng".into(),
+            root: engine.clone(),
+        };
+        assert_eq!(
+            resolve("./engine", std::slice::from_ref(&configured)).unwrap(),
+            configured
+        );
+        // A configured companion elsewhere that already holds the derived name: refused.
+        let squatter = Companion {
+            name: "n-engine".into(),
+            root: l.assets.clone(),
+        };
+        assert!(resolve("./engine", &[squatter])
+            .unwrap_err()
+            .contains("already the configured companion"));
+    }
+
+    #[test]
+    fn a_path_entry_through_a_junction_is_refused() {
+        let l = layout("companion-path-junction");
+        let engine = l.primary.join("engine");
+        init_repo(&engine);
+        std::fs::write(l.primary.join(".gitignore"), "engine/\nlink/\n").unwrap();
+        if !crate::testutil::make_junction(&l.primary.join("link"), &engine) {
+            eprintln!("skipping: could not create a junction");
+            return;
+        }
+        let err = resolve_path_entry("./link", &l.primary, &[], &l.state, &l.temp).unwrap_err();
+        assert!(err.contains("reparse point"), "{err}");
+    }
+
+    #[test]
+    fn derived_names_fit_the_grammar() {
+        for (dir, want) in [
+            ("engine", "n-engine"),
+            ("Unreal_Engine 5", "n-unreal-engine-"),
+            ("ab.cd", "n-ab-cd"),
+        ] {
+            let got = derived_name(Path::new(dir));
+            assert_eq!(got, want);
+            validate_name(&got).unwrap();
+        }
     }
 
     #[test]

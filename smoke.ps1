@@ -18,6 +18,7 @@
   .\smoke.ps1 -Reviewer codex -OnEvent
   .\smoke.ps1 -Reviewer claude -Companion
   .\smoke.ps1 -Reviewer codex -CaptureHook
+  .\smoke.ps1 -Reviewer claude -NestedCompanion
 #>
 [CmdletBinding()]
 param(
@@ -60,7 +61,15 @@ param(
     # checkout for the run: the reviewer must quote a marker that exists only in the converter's
     # generated text, never in any file it can read. Costs one more review turn. The file is
     # removed when the smoke ends.
-    [switch]$CaptureHook
+    [switch]$CaptureHook,
+
+    # Also start the server with --allow-nested-companions (issue #217) and create a scratch git
+    # repository nested in this checkout under the ignored target\ directory, with an uncommitted
+    # change: a review that does not declare it must be warned about it at start, and a review that
+    # declares it by './' path must read a marker that exists only in its change, through its own
+    # evidence server. Costs one more review turn (the undeclared one is cancelled at once). The
+    # repository is removed when the smoke ends.
+    [switch]$NestedCompanion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,6 +155,33 @@ if ($Companion) {
     # The change: one untracked file whose only copy of the marker is in the companion.
     Set-Content -LiteralPath (Join-Path $companionDir 'generated.txt') -Value $companionMarker -Encoding ASCII
     $serverArgs += @('--companion', "smokeasset=$companionDir")
+}
+
+# The nested companion lives under target\, which this checkout's .gitignore ignores, so it is in the
+# #170 shape a './' declaration requires. It is not under %TEMP% (the state directory is).
+$nestedDir = $null
+$nestedRel = "target/cross-review-smoke-nested-$PID"
+$nestedMarker = "NESTED-MARKER-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+if ($NestedCompanion) {
+    $nestedDir = Join-Path $PSScriptRoot ($nestedRel -replace '/', '\')
+    New-Item -ItemType Directory -Path $nestedDir -Force | Out-Null
+    function Invoke-NestedGit {
+        param([string[]]$GitArgs)
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & git -C $nestedDir -c user.email=smoke@example.invalid -c user.name=smoke `
+            -c commit.gpgsign=false @GitArgs 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($code -ne 0) { throw "git $($GitArgs -join ' ') failed in the nested repository (exit $code)" }
+    }
+    Invoke-NestedGit @('init', '-q', '-b', 'main')
+    Set-Content -LiteralPath (Join-Path $nestedDir 'base.txt') -Value 'base' -Encoding ASCII
+    Invoke-NestedGit @('add', '-A')
+    Invoke-NestedGit @('commit', '-q', '-m', 'base')
+    Invoke-NestedGit @('update-ref', 'refs/remotes/origin/main', 'HEAD')
+    Set-Content -LiteralPath (Join-Path $nestedDir 'engine.txt') -Value $nestedMarker -Encoding ASCII
+    $serverArgs += @('--allow-nested-companions')
 }
 
 # The capture hook's binary lives in this checkout (untracked, uniquely named, removed in the
@@ -665,6 +701,83 @@ MARKER=<the complete marker you read in the companion's diff>
         Write-Host $compResult
     }
 
+    if ($NestedCompanion) {
+        Write-Host "`n=== 5f. a nested repository: warned when undeclared, served when declared by path ===" -ForegroundColor Cyan
+        $reviewTool = @($list.result.tools | Where-Object { $_.name -eq 'cross_model_review' })[0]
+        $nestedProp = $reviewTool.inputSchema.properties.companions
+        Assert-That 'tools/list advertises companion paths' `
+            (($null -ne $nestedProp) -and ($null -eq $nestedProp.items.enum) -and ($nestedProp.description -match "'\./'")) `
+            ($reviewTool.inputSchema.properties | ConvertTo-Json -Depth 6)
+
+        # Undeclared: the start response names it and the './' fix. Cancelled at once.
+        $undeclared = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{ instructions = 'Smoke test; this review is cancelled immediately.'; session = 'smoke-nested-undeclared'; fresh = $true }
+        } -TimeoutSeconds 60
+        $undeclaredText = Get-ToolText $undeclared
+        $undeclaredId = ([regex]::Match($undeclaredText, 'review_id:\s*(\S+)')).Groups[1].Value
+        if ($undeclaredId) {
+            Send-Rpc -Method 'tools/call' -Params @{
+                name      = 'cross_model_review_cancel'
+                arguments = @{ review_id = $undeclaredId }
+            } -TimeoutSeconds 30 | Out-Null
+        }
+        Assert-That 'an undeclared nested repository with changes is warned about at start' `
+            (($undeclaredText -match 'warnings:') -and ($undeclaredText -match [regex]::Escape("``$nestedRel/``")) -and
+             ($undeclaredText -match [regex]::Escape("companions: [""./$nestedRel""]"))) `
+            $undeclaredText
+
+        # A path outside the working root is refused before anything runs.
+        $badPath = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{ instructions = 'x'; session = 'smoke-nested-bad'; companions = @('./../outside') }
+        } -TimeoutSeconds 30
+        Assert-That 'a companion path outside the working root is refused' `
+            ($badPath.result.isError -eq $true) (Get-ToolText $badPath)
+
+        $nestedInstructions = @'
+This is an automated smoke test of a nested companion repository. Do not review any code. Do not use
+the shell. This change also spans a companion repository, read through its own evidence server (see
+the "Companion repositories" section). Call repository_diff with base "branch-base" and head
+"worktree" on the primary evidence server AND on the companion's evidence server, paging each to the
+end. The companion's change adds one file whose content is a marker beginning NESTED-MARKER-. Reply
+with exactly two lines and nothing else:
+SMOKE-NESTED-OK
+MARKER=<the complete marker you read in the companion's diff>
+'@
+        $nestedStart = Send-Rpc -Method 'tools/call' -Params @{
+            name      = 'cross_model_review'
+            arguments = @{
+                instructions = $nestedInstructions
+                session      = 'smoke-nested'
+                fresh        = $true
+                companions   = @("./$nestedRel")
+            }
+        } -TimeoutSeconds 60
+        $nestedStartText = Get-ToolText $nestedStart
+        Assert-That 'nested review start is not an error' ($nestedStart.result.isError -eq $false) $nestedStartText
+        Assert-That 'a declared nested repository is not warned about' `
+            (-not ($nestedStartText -match [regex]::Escape("``$nestedRel/``"))) $nestedStartText
+        $nestedId = ([regex]::Match($nestedStartText, 'review_id:\s*(\S+)')).Groups[1].Value
+        Assert-That 'a nested review_id was returned' (-not [string]::IsNullOrWhiteSpace($nestedId)) $nestedStartText
+
+        $nestedCollected = $null
+        for ($attempt = 1; $attempt -le 6; $attempt++) {
+            $nestedCollected = Send-Rpc -Method 'tools/call' -Params @{
+                name      = 'cross_model_review_result'
+                arguments = @{ review_id = $nestedId; wait_seconds = 120 }
+            } -TimeoutSeconds 300
+            $text = Get-ToolText $nestedCollected
+            if ($text -notmatch 'status:\s+running') { break }
+            Write-Host "  still running (poll $attempt)" -ForegroundColor DarkGray
+        }
+        $nestedResult = Get-ToolText $nestedCollected
+        Assert-That 'nested review completed' ($nestedResult -match 'status:\s+completed') $nestedResult
+        Assert-That 'the reviewer answered the nested smoke' ($nestedResult -match 'SMOKE-NESTED-OK') $nestedResult
+        Assert-That 'the reviewer read the marker only the nested companion server serves' `
+            ($nestedResult -match [regex]::Escape($nestedMarker)) $nestedResult
+    }
+
     if ($CaptureHook) {
         Write-Host "`n=== 5e. a review whose change includes generated text ===" -ForegroundColor Cyan
         $captureInstructions = @'
@@ -933,6 +1046,12 @@ MARKER=<the complete marker you read in the generated text>
         Assert-That 'the include_change consult recorded its capture contract' `
             ($null -ne $icSession -and $icSession.kind -eq 'consult' -and $icSession.include_change -eq $true) `
             (Get-Content $sessionsFile -Raw)
+        if ($NestedCompanion) {
+            $nestedSession = $saved.sessions.'smoke-nested'
+            Assert-That 'the nested session bound the path companion under its derived name' `
+                ($null -ne $nestedSession -and @($nestedSession.companions).Count -eq 1 -and
+                 $nestedSession.companions[0].name -eq 'n-cross-review-s') (Get-Content $sessionsFile -Raw)
+        }
         if ($Companion) {
             $compSession = $saved.sessions.'smoke-companion'
             Assert-That 'the companion session recorded its companion binding' `
@@ -996,6 +1115,7 @@ finally {
     }
     Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($companionDir) { Remove-Item $companionDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($nestedDir) { Remove-Item $nestedDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($captureAsset) { Remove-Item -LiteralPath $captureAsset -Force -ErrorAction SilentlyContinue }
 }
 
